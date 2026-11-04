@@ -915,6 +915,47 @@ section {
   display: block;
 }
 
+.tg-web-a-frame[hidden] {
+  display: none !important;
+}
+
+.tg-web-account-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: var(--radius-md);
+  border: var(--line) solid var(--border);
+  background: var(--sunken);
+  color: var(--text);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.tg-web-account-tab:hover {
+  border-color: var(--accent);
+}
+
+.tg-web-account-tab.is-active {
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.tg-web-tab-slot {
+  color: var(--accent);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.tg-web-tab-handle,
+.tg-web-tab-quota {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  font-variant-numeric: tabular-nums;
+}
+
 .inspector-col {
   display: grid;
   gap: var(--space-4);
