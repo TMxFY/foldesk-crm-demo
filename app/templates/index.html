@@ -20,6 +20,7 @@
       <a href="#s09">Карточка</a>
       <a href="#digest">Напоминания</a>
       <a href="#accounts">Аккаунт</a>
+      <a href="#s11">Папки</a>
       <a href="#leads">Лиды</a>
     </nav>
     <button type="button" id="theme" class="btn ghost sm" aria-pressed="false">Тема</button>
@@ -51,6 +52,20 @@
           <p data-when="empty" class="hint">Аккаунт ещё не подключён</p>
           <p data-when="error" id="accounts-error" class="msg" role="alert"></p>
           <ul data-when="filled" id="account-list"></ul>
+        </div>
+      </section>
+
+      <section id="s11" aria-labelledby="s11-title">
+        <h2 id="s11-title">Папки Telegram</h2>
+        <label for="folder-account">Для аккаунта
+          <select id="folder-account"></select>
+        </label>
+        <button type="button" id="folders-refresh" class="btn secondary sm">Обновить папки</button>
+        <div id="folders-view" data-state="empty">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
+          <p data-when="empty" class="hint">Папок пока нет</p>
+          <p data-when="error" id="folders-error" class="msg" role="alert"></p>
+          <ul data-when="filled" id="folder-list"></ul>
         </div>
       </section>
 

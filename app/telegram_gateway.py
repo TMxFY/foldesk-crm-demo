@@ -50,6 +50,39 @@ class TelegramGateway(ABC):
         """Probe a saved session. Return health and last_error. Do not log in again."""
         raise GatewayError("Проверка сессии не подключена")
 
+    async def list_folders(self, session_path: str) -> list:
+        """Own Telegram folders. Not members of groups or channels."""
+        raise GatewayError("Папки не подключены")
+
+    async def folder_peers(self, session_path: str, telegram_folder_id: int) -> list:
+        """Personal dialogs already listed in one own folder."""
+        raise GatewayError("Папки не подключены")
+
+
+CHAT_TYPE_REASON = (
+    "В папке стоят типы чатов или ссылки-приглашения. Уберите их в Telegram."
+)
+
+
+def _filter_title(item) -> str:
+    title = getattr(item, "title", "") or ""
+    text = getattr(title, "text", None)
+    if text is not None:
+        title = text
+    if isinstance(title, bytes):
+        title = title.decode("utf-8", "replace")
+    return str(title).strip()
+
+
+def _folder_block_reason(item) -> str | None:
+    # Contacts/Groups/Bots and chatlists with invite links are not an explicit people list.
+    if item.__class__.__name__ == "DialogFilterChatlist":
+        return CHAT_TYPE_REASON
+    flags = ("contacts", "non_contacts", "groups", "broadcasts", "bots")
+    if any(getattr(item, flag, None) for flag in flags):
+        return CHAT_TYPE_REASON
+    return None
+
 
 SESSION_HEALTH = ("active", "offline", "unauthorized", "banned", "frozen")
 
@@ -505,6 +538,96 @@ class TelethonGateway(TelegramGateway):
             }
         ]
 
+    async def list_folders(self, session_path: str) -> list:
+        client, owned = await self._open(session_path)
+        try:
+            items = await self._dialog_filters(client)
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось прочитать папки") from exc
+        finally:
+            if owned:
+                await self._close(session_path)
+        return [_folder_row(item) for item in items]
+
+    async def folder_peers(self, session_path: str, telegram_folder_id: int) -> list:
+        client, owned = await self._open(session_path)
+        try:
+            return await self._explicit_users(client, int(telegram_folder_id))
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось прочитать папку") from exc
+        finally:
+            if owned:
+                await self._close(session_path)
+
+    async def _dialog_filters(self, client) -> list:
+        from telethon.tl.functions.messages import GetDialogFiltersRequest
+        from telethon.tl.types import DialogFilterDefault
+
+        result = await client(GetDialogFiltersRequest())
+        filters = getattr(result, "filters", None)
+        if filters is None and isinstance(result, (list, tuple)):
+            filters = result
+        items = []
+        for item in filters or []:
+            if isinstance(item, DialogFilterDefault) or not hasattr(item, "id"):
+                continue
+            items.append(item)
+        return items
+
+    async def _explicit_users(self, client, telegram_folder_id: int) -> list:
+        # Pinned and included users only. GetParticipants is not called.
+        from telethon.tl.types import User
+
+        match = None
+        for item in await self._dialog_filters(client):
+            if int(item.id) == int(telegram_folder_id):
+                match = item
+                break
+        if match is None:
+            raise GatewayError("Папка не найдена")
+        reason = _folder_block_reason(match)
+        if reason:
+            raise GatewayError(reason)
+        peers = list(getattr(match, "pinned_peers", None) or [])
+        peers.extend(getattr(match, "include_peers", None) or [])
+        seen = set()
+        people = []
+        for peer in peers:
+            if peer.__class__.__name__ not in ("InputPeerUser", "PeerUser"):
+                continue
+            user_id = int(peer.user_id)
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            try:
+                entity = await client.get_entity(peer)
+            except Exception:
+                continue
+            if not isinstance(entity, User) or getattr(entity, "bot", False):
+                continue
+            people.append(
+                {
+                    "telegram_user_id": int(entity.id),
+                    "username": getattr(entity, "username", None),
+                    "name": _person_name(entity),
+                    "peer_type": "user",
+                }
+            )
+        return people
+
+
+def _folder_row(item) -> dict:
+    title = _filter_title(item) or f"Папка {int(item.id)}"
+    return {
+        "telegram_folder_id": int(item.id),
+        "title": title,
+        "blocked_reason": _folder_block_reason(item),
+    }
+
 
 class FakeGateway(TelegramGateway):
     def __init__(
@@ -515,12 +638,23 @@ class FakeGateway(TelegramGateway):
         dialogs=None,
         history=None,
         health=None,
+        folders=None,
     ):
         self.code = code
         self.password = password
         self.needs_password = needs_password
         self.health = health
         self.dialogs = [dict(item) for item in (dialogs or [])]
+        self.folders = []
+        for item in folders or []:
+            self.folders.append(
+                {
+                    "telegram_folder_id": item.get("telegram_folder_id"),
+                    "title": item.get("title") or "",
+                    "blocked_reason": item.get("blocked_reason"),
+                    "peers": [dict(peer) for peer in (item.get("peers") or [])],
+                }
+            )
         self.history = {}
         for peer, rows in (history or {}).items():
             self.history[int(peer)] = [dict(row) for row in rows]
@@ -712,3 +846,48 @@ class FakeGateway(TelegramGateway):
         cap = _history_limit(limit)
         rows = self.history.get(int(peer_id), [])
         return [dict(row) for row in rows[-cap:]]
+
+    async def list_folders(self, session_path: str) -> list:
+        rows = []
+        for item in self.folders:
+            rows.append(
+                {
+                    "telegram_folder_id": int(item["telegram_folder_id"]),
+                    "title": item.get("title") or "",
+                    "blocked_reason": item.get("blocked_reason"),
+                }
+            )
+        return rows
+
+    async def folder_peers(self, session_path: str, telegram_folder_id: int) -> list:
+        wanted = int(telegram_folder_id)
+        match = None
+        for item in self.folders:
+            if int(item["telegram_folder_id"]) == wanted:
+                match = item
+                break
+        if match is None:
+            raise GatewayError("Папка не найдена")
+        if match.get("blocked_reason"):
+            raise GatewayError(str(match["blocked_reason"]))
+        people = []
+        for peer in match.get("peers") or []:
+            if not _folder_person(peer):
+                continue
+            people.append(
+                {
+                    "telegram_user_id": int(peer["telegram_user_id"]),
+                    "username": peer.get("username"),
+                    "name": peer.get("name") or "",
+                    "peer_type": "user",
+                }
+            )
+        return people
+
+
+def _folder_person(peer) -> bool:
+    if not isinstance(peer, dict) or peer.get("is_group"):
+        return False
+    if (peer.get("peer_type") or "user") != "user":
+        return False
+    return peer.get("telegram_user_id") is not None

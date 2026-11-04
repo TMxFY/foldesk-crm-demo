@@ -212,15 +212,29 @@ def init_db(conn: sqlite3.Connection) -> None:
             chat_id TEXT,
             logged_in_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            telegram_folder_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            sync_enabled INTEGER NOT NULL DEFAULT 0 CHECK (sync_enabled IN (0, 1)),
+            blocked_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (account_id, telegram_folder_id)
+        );
         """
     )
     _ensure_column(conn, "leads", "description", "TEXT")
     _ensure_column(conn, "leads", "email", "TEXT")
     _ensure_column(conn, "leads", "url", "TEXT")
+    _ensure_column(conn, "leads", "folder_id", "INTEGER REFERENCES folders(id) ON DELETE SET NULL")
     _ensure_column(conn, "accounts", "health", "TEXT")
     _ensure_column(conn, "accounts", "last_error", "TEXT")
     _ensure_column(conn, "accounts", "updated_at", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
+    conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")
     conn.commit()
 
 

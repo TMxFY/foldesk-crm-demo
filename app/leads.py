@@ -103,9 +103,43 @@ def get_lead(conn, lead_id: int) -> dict:
     return as_dict(row)
 
 
+def _folder_title(conn, folder_id):
+    if not folder_id:
+        return None
+    found = conn.execute(
+        "SELECT title FROM folders WHERE id = ?",
+        (folder_id,),
+    ).fetchone()
+    if found is None:
+        return None
+    return found["title"]
+
+
+def _own_folder(conn, lead_row, folder_id):
+    if folder_id is None or folder_id == "":
+        return None
+    try:
+        folder_id = int(folder_id)
+    except (TypeError, ValueError):
+        raise ValueError("Некорректная папка") from None
+    folder = conn.execute(
+        "SELECT id, account_id FROM folders WHERE id = ?",
+        (folder_id,),
+    ).fetchone()
+    if folder is None:
+        raise ValueError("Папка не найдена")
+    account_id = lead_row["account_id"]
+    if account_id is None:
+        raise ValueError("У лида нет аккаунта")
+    if int(folder["account_id"]) != int(account_id):
+        raise ValueError("Папка другого аккаунта")
+    return int(folder["id"])
+
+
 def lead_card(conn, lead_id: int) -> dict:
     lead = get_lead(conn, lead_id)
     card = dict(lead)
+    card["folder_name"] = _folder_title(conn, lead.get("folder_id"))
     card["notes"] = notes_for_card(conn, lead)
     card["tasks"] = list_tasks(conn, lead_id)
     card["properties"] = list_lead_properties(conn, lead_id)
@@ -113,7 +147,9 @@ def lead_card(conn, lead_id: int) -> dict:
 
 
 def update_lead(conn, lead_id: int, **fields) -> dict:
-    allowed = {"status", "note", "next_step", "name", "description", "email", "url"}
+    allowed = {
+        "status", "note", "next_step", "name", "description", "email", "url", "folder_id",
+    }
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError("Нельзя менять: " + ", ".join(sorted(unknown)))
@@ -124,6 +160,8 @@ def update_lead(conn, lead_id: int, **fields) -> dict:
         return as_dict(row)
     if "status" in fields and fields["status"] not in STATUSES:
         raise ValueError("Неизвестный статус")
+    if "folder_id" in fields:
+        fields["folder_id"] = _own_folder(conn, row, fields["folder_id"])
     if "name" in fields and fields["name"] is not None:
         fields["name"] = str(fields["name"]).strip() or None
     for key in ("description", "email", "url"):

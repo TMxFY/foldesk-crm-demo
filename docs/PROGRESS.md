@@ -14,3 +14,4 @@
 - 2026-11-04 — account health: вход и `POST /api/accounts/{id}/reconnect` пишут `health` и `last_error`. Кнопка «Переподключить» при unauthorized не рисует «активен». `./scripts/verify.sh`: 25 passed. Playwright F01-H1/H3/H4 passed. `feature_list.json` не закрыт.
 - 2026-11-04 — S17 утренний дайджест оператору: `send_morning_digest`, `POST /api/digest/send`, `POST /api/digest/callback`. `./scripts/verify.sh`: 32 passed. Playwright F17 и F05: 10 passed. `feature_list.json` не закрыт.
 - 2026-11-04 — S01 вход через бота: `apply_start_update`, `poll_bot_login`, кнопка «Войти через бота». Телефон+код не ломался. `./scripts/verify.sh`: 39 passed. `feature_list.json` не закрыт.
+- 2026-11-04 — S11 синк своих папок: `pull_folders`, `sync_folder`, папка на карточке. Личные диалоги, без групп и каналов. `./scripts/verify.sh`: 41 passed. `feature_list.json` не закрыт.

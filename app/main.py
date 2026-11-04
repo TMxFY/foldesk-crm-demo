@@ -14,6 +14,7 @@ from app.accounts import confirm_login, confirm_password, list_accounts, reconne
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
 from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply, sync_inbox
+from app.folders import list_folders, pull_folders, sync_folder, update_folder
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
 from app.properties import create_property_def, set_lead_property
@@ -75,6 +76,15 @@ class LeadPatch(BaseModel):
     description: str | None = None
     email: str | None = None
     url: str | None = None
+    folder_id: int | None = None
+
+
+class FolderPullIn(BaseModel):
+    account_id: int
+
+
+class FolderPatch(BaseModel):
+    sync_enabled: bool
 
 
 class ReminderIn(BaseModel):
@@ -342,6 +352,30 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         gateway = _gateway(request)
         return await _call_async(
             reconnect_account, request.app.state.conn, account_id, gateway
+        )
+
+    @app.get("/api/folders")
+    def folders_list(request: Request, account_id: int):
+        return _call(list_folders, request.app.state.conn, account_id)
+
+    @app.post("/api/folders/pull")
+    async def folders_pull(body: FolderPullIn, request: Request):
+        gateway = _gateway(request)
+        return await _call_async(
+            pull_folders, request.app.state.conn, body.account_id, gateway
+        )
+
+    @app.patch("/api/folders/{folder_id}")
+    def folders_patch(folder_id: int, body: FolderPatch, request: Request):
+        return _call(
+            update_folder, request.app.state.conn, folder_id, body.sync_enabled
+        )
+
+    @app.post("/api/folders/{folder_id}/sync")
+    async def folders_sync(folder_id: int, request: Request):
+        gateway = _gateway(request)
+        return await _call_async(
+            sync_folder, request.app.state.conn, folder_id, gateway
         )
 
     @app.get("/api/accounts/{account_id}/dialogs")

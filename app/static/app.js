@@ -56,6 +56,7 @@ const state = {
   selectedDialog: null,
   selectedLeadId: null,
   cards: {},
+  folderLists: {},
 };
 
 let modalSubmit = null;
@@ -175,6 +176,25 @@ function statusSelect(lead, className) {
   return select;
 }
 
+function folderField(lead) {
+  const select = el("select", {
+    "aria-label": "Папка",
+    onchange: (event) => {
+      const raw = event.target.value;
+      patchLead(lead.id, { folder_id: raw ? Number(raw) : null });
+    },
+  });
+  const empty = el("option", { value: "" }, ["Без папки"]);
+  if (!lead.folder_id) empty.selected = true;
+  select.append(empty);
+  (lead.folder_choices || []).forEach((folder) => {
+    const option = el("option", { value: String(folder.id) }, [folder.title]);
+    if (folder.id === lead.folder_id) option.selected = true;
+    select.append(option);
+  });
+  return select;
+}
+
 function textField(lead, field, label) {
   return el("input", {
     value: lead[field] || "",
@@ -260,6 +280,7 @@ function renderAccounts() {
   const list = document.querySelector("#account-list");
   list.replaceChildren();
   if (!state.accounts.length) {
+    fillFolderAccounts();
     setView("#accounts-view", "empty");
     return;
   }
@@ -295,7 +316,106 @@ function renderAccounts() {
     select.append(el("option", { value: String(account.id) }, [label]));
   });
   if (previous) select.value = previous;
+  fillFolderAccounts();
   setView("#accounts-view", "filled");
+}
+
+function fillFolderAccounts() {
+  const select = document.querySelector("#folder-account");
+  if (!select) return;
+  const previous = select.value;
+  const connected = state.accounts.filter((account) => account.status === "connected");
+  select.replaceChildren();
+  connected.forEach((account) => {
+    const label = account.telegram_name || account.phone;
+    select.append(el("option", { value: String(account.id) }, [label]));
+  });
+  if (previous) select.value = previous;
+}
+
+function renderFolderList(rows) {
+  const list = document.querySelector("#folder-list");
+  if (!list) return;
+  list.replaceChildren();
+  if (!rows || !rows.length) {
+    setView("#folders-view", "empty");
+    return;
+  }
+  rows.forEach((folder) => {
+    const body = [
+      el("span", { className: "name" }, [folder.title]),
+    ];
+    if (folder.blocked_reason) {
+      body.push(el("p", { className: "hint" }, [folder.blocked_reason]));
+    }
+    const row = el("li", { className: "account" }, [
+      el("div", {}, body),
+    ]);
+    if (!folder.blocked_reason) {
+      row.append(el("button", {
+        type: "button",
+        className: "btn primary sm",
+        onclick: () => syncFolder(folder),
+      }, ["Синхронизировать"]));
+    }
+    list.append(row);
+  });
+  setView("#folders-view", "filled");
+}
+
+async function loadFolderList() {
+  const select = document.querySelector("#folder-account");
+  if (!select || !select.value) {
+    setView("#folders-view", "empty");
+    return;
+  }
+  const accountId = select.value;
+  try {
+    const rows = await api(`/api/folders?account_id=${accountId}`);
+    state.folderLists[accountId] = rows;
+    renderFolderList(rows);
+  } catch (error) {
+    failRegion("#folders-view", "#folders-error", error);
+  }
+}
+
+async function pullFolders() {
+  const select = document.querySelector("#folder-account");
+  const accountId = select && select.value;
+  if (!accountId) {
+    toast("Нет подключённого аккаунта", "error");
+    return;
+  }
+  setView("#folders-view", "loading");
+  try {
+    const rows = await api("/api/folders/pull", {
+      method: "POST",
+      body: { account_id: Number(accountId) },
+    });
+    state.folderLists[accountId] = rows;
+    renderFolderList(rows);
+  } catch (error) {
+    failRegion("#folders-view", "#folders-error", error);
+  }
+}
+
+async function syncFolder(folder) {
+  try {
+    const result = await api(`/api/folders/${folder.id}/sync`, { method: "POST" });
+    toast(`Новых лидов: ${result.added}`);
+    delete state.cards[state.selectedLeadId];
+    await loadLeads(state.leadQuery, state.selectedLeadId);
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function foldersFor(accountId) {
+  const key = String(accountId);
+  if (state.folderLists[key]) return state.folderLists[key];
+  const rows = await api(`/api/folders?account_id=${accountId}`);
+  state.folderLists[key] = rows;
+  return rows;
 }
 
 function showOperator(text, kind) {
@@ -314,6 +434,7 @@ async function loadOperator() {
 async function loadAccounts() {
   state.accounts = await api("/api/accounts");
   renderAccounts();
+  await loadFolderList();
 }
 
 function chipOn(name) {
@@ -727,6 +848,15 @@ async function renderCard() {
     if (token !== cardToken) return;
     state.cards[id] = lead;
   }
+  lead.folder_choices = [];
+  if (lead.account_id) {
+    try {
+      lead.folder_choices = await foldersFor(lead.account_id);
+    } catch (_err) {
+      lead.folder_choices = [];
+    }
+  }
+  if (token !== cardToken) return;
   paintCard(lead);
   refreshSideNote(id);
 }
@@ -774,6 +904,10 @@ function paintCard(lead) {
     el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
     el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
     el("label", {}, ["Статус", statusSelect(lead)]),
+    el("p", { id: "card-folder" }, [
+      lead.folder_name ? `Папка: ${lead.folder_name}` : "Папка не задана",
+    ]),
+    el("label", {}, ["Папка", folderField(lead)]),
     el("p", { className: "hint" }, [
       lead.username ? `@${lead.username}` : "без ника",
       lead.phone ? ` · ${lead.phone}` : "",
@@ -1306,6 +1440,14 @@ document.querySelector(".chips").addEventListener("click", (event) => {
   const any = [...document.querySelectorAll("[data-chip]")].some((item) => item.getAttribute("aria-pressed") === "true");
   document.querySelector("#chip-note").hidden = !any;
   if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") renderDialogs();
+});
+
+document.querySelector("#folder-account").addEventListener("change", () => {
+  loadFolderList();
+});
+
+document.querySelector("#folders-refresh").addEventListener("click", () => {
+  pullFolders();
 });
 
 document.querySelector("#manual-lead").addEventListener("submit", async (event) => {

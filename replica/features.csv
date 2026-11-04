@@ -17,7 +17,7 @@ feature,area,priority,original,clone,notes
 Уведомление в срок: готово / отложить / открыть лида,reminders,must,yes,yes,S18 сделано отложить и к лиду пишутся
 Добавить лида вручную,leads,must,yes,yes,имя ник телефон заметка ссылка почта
 Проверка дублей,leads,must,yes,yes,ошибка API в тосте; слияния нет
-Синк своих папок Telegram в CRM,leads,should,yes,no,S11 F06; ошибка Chat Types
+Синк своих папок Telegram в CRM,leads,should,yes,yes,S11 личные диалоги своих папок; повтор без дублей; Chat Types и инвайт не синкаются; группы и каналы не импортируются
 Форвард сообщения боту = лид + заметка,leads,should,yes,no,S19
 Кастомные поля и свои названия стадий,pipeline,should,yes,partial,определение и значение на лиде пишутся; свои названия стадий нет
 Фильтры и сохранённые виды воронки,pipeline,should,yes,no,S15
@@ -27,7 +27,7 @@ feature,area,priority,original,clone,notes
 Отметить чат непрочитанным,inbox,should,yes,partial,кнопка есть; маршрута нет
 Напоминание фразой в чате,reminders,should,yes,no,NL + confirm Update
 Чекбокс задачи на карточке,reminders,should,yes,yes,tasks.title и done_at; колонки due_at нет
-Папка Telegram как свойство лида,leads,should,yes,no,changelog 2.4.5
+Папка Telegram как свойство лида,leads,should,yes,yes,имя папки на карточке; смена на свою папку или очистка folder_id
 Open Chat с карточки,inbox,should,yes,partial,открывает чат только если он уже в списке поиска
 Несколько воркспейсов,team,could,yes,no,соло не must
 Инвайт по Telegram username и роли,team,could,yes,no,Admin/Member; Chatter на inbox
