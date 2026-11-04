@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Кабинет лидов</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/design/tokens.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <a class="skip" href="#s04">К списку разговоров</a>
+  <header class="top">
+    <h1 class="brand">Кабинет</h1>
+    <nav class="nav" aria-label="Разделы">
+      <a href="#s04">Входящие</a>
+      <a href="#s05">Переписка</a>
+      <a href="#s06">У чата</a>
+      <a href="#s07">Воронка</a>
+      <a href="#s09">Карточка</a>
+      <a href="#digest">Напоминания</a>
+      <a href="#accounts">Аккаунт</a>
+      <a href="#leads">Лиды</a>
+    </nav>
+    <button type="button" id="theme" class="btn ghost sm" aria-pressed="false">Тема</button>
+  </header>
+  <div class="shell">
+    <div class="list-col">
+      <section id="accounts" aria-labelledby="accounts-title">
+        <h2 id="accounts-title">Аккаунт</h2>
+        <form id="login-form">
+          <label for="phone">Телефон</label>
+          <input id="phone" name="phone" type="tel" autocomplete="tel" required placeholder="+79990000000">
+          <button type="submit" class="btn primary sm">Получить код</button>
+        </form>
+        <form id="code-form" hidden>
+          <label for="code">Код</label>
+          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+          <button type="submit" class="btn primary sm">Подтвердить код</button>
+        </form>
+        <form id="password-form" hidden>
+          <label for="password">Пароль 2FA</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+          <button type="submit" class="btn primary sm">Подтвердить пароль</button>
+        </form>
+        <p id="login-msg" class="msg" role="status"></p>
+        <div id="accounts-view" data-state="loading">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+          <p data-when="empty" class="hint">Аккаунт ещё не подключён</p>
+          <p data-when="error" id="accounts-error" class="msg" role="alert"></p>
+          <ul data-when="filled" id="account-list"></ul>
+        </div>
+      </section>
+
+      <section id="s04" aria-labelledby="s04-title">
+        <h2 id="s04-title">Входящие</h2>
+        <section id="search" aria-labelledby="search-title">
+          <h3 id="search-title">Поиск</h3>
+          <div class="switch" id="search-mode" role="group" aria-label="Где искать">
+            <button type="button" data-mode="crm" class="btn secondary sm" aria-pressed="true">В CRM</button>
+            <button type="button" data-mode="telegram" class="btn ghost sm" aria-pressed="false">В Telegram</button>
+          </div>
+          <form id="search-form" role="search">
+            <label class="tg-only" hidden>Аккаунт
+              <select id="tg-account"></select>
+            </label>
+            <label for="q">Запрос</label>
+            <input id="q" name="q" type="search" placeholder="Имя или @" autocomplete="off">
+            <button type="submit" class="btn primary sm">Найти</button>
+          </form>
+          <div class="chips" role="group" aria-label="Фильтр">
+            <button type="button" class="chip" data-chip="waiting" aria-pressed="false">Ждёт ответа</button>
+            <button type="button" class="chip" data-chip="unread" aria-pressed="false">Непрочитанные</button>
+            <button type="button" class="chip" data-chip="groups" aria-pressed="false">Группы</button>
+            <button type="button" class="chip" data-chip="muted" aria-pressed="false">Без звука</button>
+          </div>
+          <p id="chip-note" class="hint" hidden>В ответе поиска нет этого признака, поэтому список может опустеть.</p>
+        </section>
+        <div id="inbox-view" data-state="empty">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span><span class="sk"></span></div>
+          <p data-when="empty" class="hint">Пока нет разговоров</p>
+          <p data-when="none" class="hint">Ничего не найдено</p>
+          <p data-when="error" id="inbox-error" class="msg" role="alert"></p>
+          <ul data-when="filled" id="dialog-results"></ul>
+        </div>
+      </section>
+    </div>
+
+    <main class="stage">
+      <section id="s05" aria-labelledby="s05-title">
+        <h2 id="s05-title">Переписка</h2>
+        <div id="thread-view" data-state="empty">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk tall"></span></div>
+          <p data-when="empty" class="hint">Выберите разговор слева</p>
+          <div data-when="filled">
+            <div id="thread-head"></div>
+            <p id="thread-error" class="msg" role="alert" hidden></p>
+            <ol id="messages" class="messages"></ol>
+            <p class="hint">В кэше нет сообщений</p>
+            <form id="reply-form">
+              <label for="reply-text">Ответ</label>
+              <textarea id="reply-text" name="text"></textarea>
+              <div class="row">
+                <button type="submit" class="btn primary sm">Отправить</button>
+                <button type="button" class="btn ghost sm" id="mark-unread">Непрочитанное</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <section id="s07" aria-labelledby="s07-title">
+        <h2 id="s07-title">Воронка</h2>
+        <label class="inline" for="stage-filter">Стадия
+          <select id="stage-filter">
+            <option value="">Все</option>
+            <option value="new">Лид</option>
+            <option value="talking">Разговор</option>
+            <option value="waiting">Ждём</option>
+            <option value="won">Выигран</option>
+            <option value="lost">Проигран</option>
+          </select>
+        </label>
+        <p id="filter-note" class="hint" hidden>Фильтр применён</p>
+        <div id="board-view" data-state="loading">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+          <p data-when="error" id="board-error" class="msg" role="alert"></p>
+          <div data-when="empty filled" id="board" class="board"></div>
+        </div>
+      </section>
+
+      <section id="leads" aria-labelledby="leads-title">
+        <h2 id="leads-title">Лиды</h2>
+        <form id="manual-lead" class="manual">
+          <label>Имя <input name="name" autocomplete="name"></label>
+          <label>Ник <input name="username" autocomplete="off"></label>
+          <label>Телефон <input name="phone" type="tel" autocomplete="tel"></label>
+          <button type="submit" class="btn primary sm">Добавить лид</button>
+        </form>
+        <div id="leads-view" data-state="loading">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+          <p data-when="empty" class="hint">Лидов пока нет</p>
+          <p data-when="error" id="leads-error" class="msg" role="alert"></p>
+          <div data-when="filled" class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Имя</th>
+                  <th>Username</th>
+                  <th>Telegram id</th>
+                  <th>Телефон</th>
+                  <th>Статус</th>
+                  <th>Заметка</th>
+                  <th>Следующий шаг</th>
+                  <th>Напоминание</th>
+                </tr>
+              </thead>
+              <tbody id="lead-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside class="panel-col">
+      <section id="s06" aria-labelledby="s06-title">
+        <h2 id="s06-title">Рядом с чатом</h2>
+        <div id="side-view" data-state="empty">
+          <p data-when="empty" class="hint">Выберите разговор</p>
+          <div data-when="nolead" class="stack">
+            <p>К этому чату лид ещё не заведён</p>
+            <button type="button" id="to-leads" class="btn primary sm">В лиды</button>
+          </div>
+          <div data-when="filled" id="side-card"></div>
+          <p data-when="error" id="side-error" class="msg" role="alert"></p>
+        </div>
+      </section>
+
+      <section id="s09" aria-labelledby="s09-title">
+        <h2 id="s09-title">Карточка</h2>
+        <div id="card-view" data-state="empty">
+          <p data-when="empty" class="hint">Выберите лида в списке или на воронке</p>
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
+          <div data-when="filled" id="lead-card"></div>
+          <p data-when="error" id="card-error" class="msg" role="alert"></p>
+        </div>
+      </section>
+
+      <section id="digest" aria-labelledby="digest-title">
+        <h2 id="digest-title">Напоминания</h2>
+        <div id="reminders">
+          <div class="switch" id="reminder-scopes" role="group" aria-label="Срок">
+            <button type="button" data-scope="open" class="btn secondary sm" aria-pressed="true">Открытые</button>
+            <button type="button" data-scope="overdue" class="btn ghost sm" aria-pressed="false">Просроченные</button>
+            <button type="button" data-scope="all" class="btn ghost sm" aria-pressed="false">Все</button>
+          </div>
+          <div id="digest-view" data-state="loading">
+            <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+            <p data-when="empty" class="hint">На сегодня ничего не стоит</p>
+            <div data-when="filled" id="reminder-list"></div>
+            <p data-when="error" id="digest-error" class="msg" role="alert"></p>
+          </div>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="modal" class="modal-root" hidden>
+    <button type="button" class="overlay" id="modal-dismiss" aria-label="Закрыть"></button>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title"></h2>
+      <form id="modal-form"></form>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

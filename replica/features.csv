@@ -1,0 +1,51 @@
+feature,area,priority,original,clone,notes
+Вход через веб или Telegram-бота,onboarding,must,yes,partial,S01; локальная страница без бота и без Google/Apple
+Подключить свой аккаунт Telegram (телефон и код),onboarding,must,yes,yes,F01 S02; не Session+JSON
+Статусы аккаунта и переподключение,onboarding,must,yes,partial,бейдж входа есть; health и reconnect ещё нет
+Список входящих с подключённого аккаунта,inbox,must,yes,partial,S04 поиск диалогов; нет realtime-кэша
+Поиск чата по имени или @username,inbox,must,yes,yes,F02
+Открыть переписку и ответить,inbox,must,yes,partial,S05 шапка и пустая лента; отправка не подключена
+Карточка лида рядом с чатом,inbox,must,yes,partial,S06 из лидов среза; ленты чата нет
+Добавить в CRM из чата если карточки нет,leads,must,yes,yes,F03 edge
+Воронка со стадиями,pipeline,must,yes,yes,S07 пять статусов; без перетаскивания
+Сменить статус на карточке,pipeline,must,yes,yes,Status = custom property
+Найти лида в списке,leads,must,yes,yes,S08 F02
+Карточка: профиль свойства заметки задачи,leads,must,yes,partial,S09 профиль заметка напоминание; задач и своих полей нет
+Заметка на карточке,notes,must,yes,yes,F04 поле leads.note; отдельной ленты notes нет
+Напоминание с датой и временем,reminders,must,yes,yes,F05 S13
+Дайджест задач на день в боте,reminders,must,yes,partial,S17 панель на странице; бота нет
+Уведомление в срок: готово / отложить / открыть лида,reminders,must,yes,partial,S18 сделано и к лиду есть; отложить не сохраняется
+Добавить лида вручную,leads,must,yes,partial,имя ник телефон; нет описания URL email
+Проверка дублей,leads,must,yes,yes,ошибка API в тосте; слияния нет
+Синк своих папок Telegram в CRM,leads,should,yes,no,S11 F06; ошибка Chat Types
+Форвард сообщения боту = лид + заметка,leads,should,yes,no,S19
+Кастомные поля и свои названия стадий,pipeline,should,yes,no,S14 типы из API docs
+Фильтры и сохранённые виды воронки,pipeline,should,yes,no,S15
+Фильтр «ждёт ответа»,inbox,should,yes,partial,чип есть; признака в поиске диалогов нет
+Фильтр непрочитанных,inbox,should,yes,partial,чип есть; признака в поиске диалогов нет
+Связка лид↔аккаунт с которого писали,inbox,should,yes,partial,account_id пишется при «В лиды»
+Отметить чат непрочитанным,inbox,should,yes,partial,кнопка есть; маршрута нет
+Напоминание фразой в чате,reminders,should,yes,no,NL + confirm Update
+Чекбокс задачи на карточке,reminders,should,yes,no,S09
+Папка Telegram как свойство лида,leads,should,yes,no,changelog 2.4.5
+Open Chat с карточки,inbox,should,yes,partial,открывает чат только если он уже в списке поиска
+Несколько воркспейсов,team,could,yes,no,соло не must
+Инвайт по Telegram username и роли,team,could,yes,no,Admin/Member; Chatter на inbox
+Массовое редактирование сделок,pipeline,could,yes,no,changelog 2.2.2
+QR с мини-аппа,leads,could,yes,no,S20 mobile
+Скрин LinkedIn в бота,leads,could,yes,no,вне ядра
+Публичный REST и ключи sk_,integrations,could,yes,no,не блокер среза
+Вебхуки contact.created/updated/deleted,integrations,could,yes,no,API docs
+Группы в инбоксе вкл/выкл,inbox,could,yes,no,лендинг unified inbox
+Массовые рассылки и цепочки,outreach,skip,yes,skip,не клонировать
+Прогрев аккаунтов,outreach,skip,yes,skip,не клонировать
+Парсинг участников групп,research,skip,yes,skip,не клонировать
+Покупка чужих Telegram-аккаунтов,outreach,skip,yes,skip,не свой аккаунт
+Session+JSON мультиаккаунт,outreach,skip,yes,skip,фермы не в срезе
+Lookalike и phone→username,research,skip,yes,skip,их research-продукт
+Готовые базы контактов,research,skip,yes,skip,чужие данные
+Прокси ко всему Telegram TL API,platform,skip,yes,skip,их платформа
+AI sales agent,automation,skip,yes,skip,вне ядра
+Синк подписчиков канала,growth,skip,yes,skip,вне ядра
+Их маркетинговые тексты и стикерпак,brand,skip,yes,skip,не копировать
+Командный round-robin и шаринг логинов,team,skip,yes,skip,не соло-срез
