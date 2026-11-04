@@ -1,0 +1,16 @@
+{
+  "avoid": ["CRM Chat", "CRMChat", "Hintsflow", "crmchat.ai"],
+  "app_store": {
+    "name": "Foldesk",
+    "subtitle": "Local desk for chats",
+    "promotional_text": "Cards, reminders, and a morning digest on one desk. Mass sending stays out.",
+    "description": "Foldesk is a local desk for one person who sells in their own Telegram chats.\n\nConnect your account. Open a chat, keep a card, set a reminder. In the morning the bot sends that day's summary.\n\nWhat is different:\n- No mass sending and no account warmup\n- Your own chat folders land on cards. Groups and channels stay out\n- A forward to the bot becomes a card and a note\n- An empty morning is written as empty\n\nThe price of entry, not the pitch:\n- A list of private chats\n- A status on the card\n- A note next to the thread\n\nThe desk is in Russian.\n\nOne account stays at no charge. The operator plan is $12 a month, or $120 a year. A workshop of up to three people is $29 a month, or $290 a year. When billing exists, cancel is one click and the renewal email names the date and the amount. Billing is not switched on.",
+    "keywords": "leads,reminders,inbox,pipeline,notes,folders,digest,followups,cards,tasks,statuses,telegram",
+    "whats_new": "Connect your account, keep a card, and read the morning summary in the bot."
+  },
+  "google_play": {
+    "title": "Foldesk: Local Desk",
+    "short_description": "Local desk for chats, cards, reminders, and a morning summary.",
+    "full_description": "Foldesk is a local desk for one person who sells in their own Telegram chats.\n\nConnect your account. Open a chat, keep a card, set a reminder. In the morning the bot sends that day's summary.\n\nWhat is different:\n- No mass sending and no account warmup\n- Your own chat folders land on cards. Groups and channels stay out\n- A forward to the bot becomes a card and a note\n- An empty morning is written as empty\n\nThe price of entry, not the pitch:\n- A list of private chats\n- A status on the card\n- A note next to the thread\n\nThe desk is in Russian.\n\nOne account stays at no charge. The operator plan is $12 a month, or $120 a year. A workshop of up to three people is $29 a month, or $290 a year. When billing exists, cancel is one click and the renewal email names the date and the amount. Billing is not switched on."
+  }
+}

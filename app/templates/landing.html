@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Foldesk</title>
+  <meta name="description" content="Один стол для своих чатов: карточки, папки и утренняя сводка. Без рассылок.">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/design/tokens.css">
+  <style>
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: var(--text-base);
+      line-height: var(--leading-base);
+    }
+    a { color: var(--accent); }
+    a:focus-visible, .cta:focus-visible {
+      outline: var(--focus) solid var(--accent);
+      outline-offset: 2px;
+    }
+    .skip {
+      position: absolute;
+      left: var(--space-4);
+      top: -40px;
+      background: var(--surface);
+      color: var(--text);
+      padding: var(--space-2);
+    }
+    .skip:focus { top: var(--space-2); }
+    .wrap { max-width: 880px; margin: 0 auto; padding: var(--space-5); }
+    header { display: flex; justify-content: space-between; align-items: center; }
+    .brand { font-size: var(--text-lg); line-height: var(--leading-lg); margin: 0; }
+    h1 { font-size: 40px; line-height: 48px; font-weight: 600; margin: var(--space-6) 0 var(--space-3); }
+    h2 { font-size: var(--text-xl); line-height: var(--leading-xl); margin: var(--space-6) 0 var(--space-3); }
+    .lede { color: var(--text-muted); font-size: var(--text-lg); line-height: var(--leading-lg); margin: 0 0 var(--space-5); }
+    .cta {
+      display: inline-flex;
+      align-items: center;
+      height: var(--size-lg);
+      padding: 0 var(--space-5);
+      background: var(--accent);
+      color: var(--on-accent);
+      text-decoration: none;
+      border-radius: var(--radius-md);
+      font-weight: 600;
+    }
+    .cta:hover { background: var(--accent-hover); }
+    figure { margin: var(--space-6) 0 0; }
+    img { width: 100%; height: auto; border: var(--line) solid var(--border); border-radius: var(--radius-lg); background: var(--sunken); }
+    figcaption { color: var(--text-muted); font-size: var(--text-sm); line-height: var(--leading-sm); margin-top: var(--space-2); }
+    section { margin-top: var(--space-6); }
+    ol, ul { padding-left: var(--space-5); }
+    li { margin: var(--space-2) 0; }
+    .muted { color: var(--text-muted); }
+    table { width: 100%; border-collapse: collapse; background: var(--surface); }
+    caption { text-align: left; font-weight: 600; margin-bottom: var(--space-3); }
+    th, td { text-align: left; padding: var(--space-3); border-bottom: var(--line) solid var(--border); }
+    th { background: var(--sunken); }
+    .end { margin: var(--space-6) 0; }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#hero">К заголовку</a>
+  <div class="wrap">
+    <header>
+      <p class="brand">Foldesk</p>
+      <a href="#price">Цены</a>
+    </header>
+    <main>
+      <section id="hero" aria-labelledby="hero-title">
+        <h1 id="hero-title">Один стол для своих чатов</h1>
+        <p class="lede">Карточки, папки и утренняя сводка. Без рассылок.</p>
+        <a class="cta" href="/">Открыть стол</a>
+        <figure>
+          <img src="/static/landing-desk.png" width="1440" alt="Стол Foldesk: входящие и карточка">
+          <figcaption>Собранный стол, не макет чужого сайта.</figcaption>
+        </figure>
+      </section>
+      <section aria-labelledby="problem-title">
+        <h2 id="problem-title">Два места, где сделка теряется</h2>
+        <ol>
+          <li>Переписка и следующий шаг живут врозь. Чат закрыли — карточки нет, напоминание не стоит.</li>
+          <li>Кабинет, который ещё и рассылает, тащит чужие аккаунты и прогрев. Соло-продавцу нужен стол, не рупор.</li>
+        </ol>
+        <p class="muted">Чужих отзывов и счётчиков на этой странице нет.</p>
+      </section>
+      <section aria-labelledby="how-title">
+        <h2 id="how-title">Как устроено</h2>
+        <ol>
+          <li>Подключите свой Телеграм. Телефон и код или вход через бота.</li>
+          <li>Откройте разговор и заведите карточку. Статус ставится здесь.</li>
+          <li>Поставьте напоминание. Утром бот пришлёт сводку.</li>
+        </ol>
+      </section>
+      <section aria-labelledby="features-title">
+        <h2 id="features-title">Что на столе</h2>
+        <ul>
+          <li>Без рассылок. Массовые сообщения и прогрев в этот стол не входят.</li>
+          <li>Свои папки. Личные диалоги папки становятся карточками. Группы и каналы не затягиваем.</li>
+          <li>Форвард в бота. Сообщение становится карточкой и заметкой. Повтор того же сообщения не плодит вторую карточку.</li>
+          <li>Сводка утром. Пустой день так и написан. В боте: сделано, отложить, к лиду.</li>
+          <li>Карточка у чата. Личная лента и карточка рядом.</li>
+        </ul>
+        <p class="muted">Вход, не отличие: входящие, поиск, статусы и заметка.</p>
+      </section>
+      <section id="price" aria-labelledby="price-title">
+        <h2 id="price-title">Три ступени</h2>
+        <table>
+          <caption>Предложение. Списания нет, продукты оплаты не созданы.</caption>
+          <thead>
+            <tr>
+              <th>Ступень</th>
+              <th>Для кого</th>
+              <th>Месяц</th>
+              <th>Год</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Стол</td>
+              <td>Один человек, один свой аккаунт</td>
+              <td>$0</td>
+              <td>$0</td>
+            </tr>
+            <tr>
+              <td>Смена</td>
+              <td>Тот же человек. Письмо до списания</td>
+              <td>$12</td>
+              <td>$120</td>
+            </tr>
+            <tr>
+              <td>Мастерская</td>
+              <td>До трёх человек. Четвёртый сам в счёт не встаёт</td>
+              <td>$29</td>
+              <td>$290</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="muted">Год стоит как десять месяцев. Отмена одной кнопкой появится вместе с оплатой. Сейчас оплаты нет.</p>
+      </section>
+      <section aria-labelledby="faq-title">
+        <h2 id="faq-title">Вопросы</h2>
+        <h3>Можно забрать лиды из другой CRM?</h3>
+        <p>Общего импорта нет. Свои папки Телеграма и форвард в бота — есть.</p>
+        <h3>Это рассылка?</h3>
+        <p>Нет.</p>
+        <h3>Как отменить?</h3>
+        <p>Оплаты в продукте нет. Когда появится: одна кнопка, письмо с датой и суммой до списания, цена не прыгает за новое место.</p>
+      </section>
+      <p class="end"><a class="cta" href="/">Открыть стол</a></p>
+    </main>
+  </div>
+</body>
+</html>

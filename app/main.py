@@ -325,6 +325,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def index(request: Request):
         return templates.TemplateResponse(request, "index.html", {"request": request})
 
+    @app.get("/landing", response_class=HTMLResponse)
+    def landing(request: Request):
+        return templates.TemplateResponse(request, "landing.html", {"request": request})
+
     @app.post("/api/accounts/start")
     async def accounts_start(body: StartIn, request: Request):
         gateway = _gateway(request)
