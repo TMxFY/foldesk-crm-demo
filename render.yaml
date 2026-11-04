@@ -7,6 +7,6 @@ services:
     healthCheckPath: /api/accounts
     envVars:
       - key: DEMO_AUTOSEED
-        value: "1"
+        value: "0"
       - key: PORT
         value: "8000"
