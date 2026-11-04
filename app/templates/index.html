@@ -168,6 +168,13 @@
                 <option value="">Все</option>
               </select>
             </label>
+            <label class="inline" for="channel-filter">Канал
+              <select id="channel-filter" aria-label="Канал">
+                <option value="">Все каналы (TG + WA)</option>
+                <option value="telegram">Только Telegram</option>
+                <option value="whatsapp">Только WhatsApp</option>
+              </select>
+            </label>
             <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
             <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Виды</button>
             <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
@@ -341,6 +348,7 @@
             <div class="auth-mode-tabs" role="tablist" aria-label="Способ подключения аккаунта">
               <button type="button" class="auth-tab-btn" id="auth-tab-btn-phone" data-auth-tab="phone" role="tab" aria-selected="true">По номеру (Phone Number)</button>
               <button type="button" class="auth-tab-btn" id="auth-tab-btn-session" data-auth-tab="session" role="tab" aria-selected="false">Session + JSON (ZIP)</button>
+              <button type="button" class="auth-tab-btn" id="auth-tab-btn-whatsapp" data-auth-tab="whatsapp" role="tab" aria-selected="false">WhatsApp (QR / Код)</button>
             </div>
 
             <div id="auth-pane-phone" class="auth-tab-pane">
@@ -386,6 +394,12 @@
 
             <div id="auth-pane-session" class="auth-tab-pane" hidden>
               <div class="session-import-card stack">
+                <label for="session-provider-select">Мессенджер (Provider)
+                  <select id="session-provider-select">
+                    <option value="telegram">Telegram (.session)</option>
+                    <option value="whatsapp">WhatsApp (Multi-Device)</option>
+                  </select>
+                </label>
                 <div class="session-dropzone">
                   <label for="session-import-file" class="session-dropzone-label">
                     <strong>Выберите ZIP-архив или файлы .session + .json</strong>
@@ -416,6 +430,43 @@
                   <button type="button" id="fill-sample-session-btn" class="btn secondary sm">Пример пакета Session + JSON</button>
                   <button type="button" id="import-session-btn" class="btn primary sm">Импортировать Session + JSON</button>
                 </div>
+              </div>
+            </div>
+
+            <div id="auth-pane-whatsapp" class="auth-tab-pane" hidden>
+              <form id="wa-login-form" class="compact-form">
+                <label for="wa-phone-input">Номер WhatsApp
+                  <input id="wa-phone-input" name="phone" type="tel" autocomplete="tel" placeholder="+79990001122">
+                </label>
+                <div class="auth-meta-grid">
+                  <label for="wa-proxy-input">Прокси (Proxy URL / Location)
+                    <input id="wa-proxy-input" name="proxy" type="text" autocomplete="off" placeholder="socks5://user:pass@host:1080 или auto">
+                  </label>
+                  <label for="wa-scope-select">Доступ (Access)
+                    <select id="wa-scope-select" name="access">
+                      <option value="workspace">Workspace (Общий)</option>
+                      <option value="personal">Personal (Личный)</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="row">
+                  <button type="button" id="wa-code-btn" class="btn primary sm">Получить 8-значный код</button>
+                  <button type="button" id="wa-qr-btn" class="btn secondary sm">Показать QR-код</button>
+                </div>
+              </form>
+
+              <div id="wa-pairing-box" class="wa-pairing-box stack" hidden>
+                <div id="wa-code-panel" class="wa-pairing-panel stack">
+                  <strong id="wa-pairing-code-display" class="wa-pairing-code-display">WA84-9201</strong>
+                  <p class="hint">Откройте WhatsApp → Связанные устройства → Связать по номеру телефона</p>
+                </div>
+                <div id="wa-qr-panel" class="wa-pairing-panel stack" hidden>
+                  <div class="wa-qr-wrap">
+                    <img id="wa-qr-image" alt="QR-код WhatsApp">
+                  </div>
+                  <p class="hint">Отсканируйте QR-код в приложении WhatsApp на телефоне</p>
+                </div>
+                <button type="button" id="wa-confirm-btn" class="btn primary sm">Я ввёл код / отсканировал QR — Проверить подключение</button>
               </div>
             </div>
 
@@ -664,6 +715,12 @@
             <label>Имя <input name="name" autocomplete="name" placeholder="Имя контакта"></label>
             <label>Ник <input name="username" autocomplete="off" placeholder="@username"></label>
             <label>Телефон <input name="phone" type="tel" autocomplete="tel" placeholder="+7..."></label>
+            <label>Канал
+              <select name="provider" id="manual-lead-provider">
+                <option value="telegram">Telegram (TG)</option>
+                <option value="whatsapp">WhatsApp (WA)</option>
+              </select>
+            </label>
             <label>Заметка <input name="note" autocomplete="off" placeholder="Контекст сделки"></label>
             <label>Ссылка <input name="url" type="url" autocomplete="off" inputmode="url" placeholder="https://..."></label>
             <label>Почта <input name="email" type="email" autocomplete="email" placeholder="ivan@company.ru"></label>

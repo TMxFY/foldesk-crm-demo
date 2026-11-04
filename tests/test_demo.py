@@ -14,8 +14,8 @@ def test_demo_seed_populates_workspace_and_is_idempotent(tmp_path):
         body = first.json()
         assert body["ok"] is True
         assert body["folders"] == 3
-        assert body["leads"] == 8
-        assert body["dialogs"] == 6
+        assert body["leads"] == 11
+        assert body["dialogs"] == 9
         assert body["reminders"] == 4
         assert body["views"] == 2
 
@@ -24,7 +24,7 @@ def test_demo_seed_populates_workspace_and_is_idempotent(tmp_path):
         account_id = second.json()["account_id"]
 
         accounts = client.get("/api/accounts").json()
-        assert len(accounts) == 3
+        assert len(accounts) == 4
         assert accounts[0]["phone"] == "+79995550101"
         assert accounts[0]["status"] == "connected"
         assert accounts[0]["health"] == "active"
@@ -43,6 +43,10 @@ def test_demo_seed_populates_workspace_and_is_idempotent(tmp_path):
         assert accounts[2]["telegram_name"] == "Максим · Growth"
         assert accounts[2]["daily_limit"] == 15
         assert accounts[2]["sent_today"] == 3
+        assert accounts[3]["phone"] == "+79990007788"
+        assert accounts[3]["telegram_name"] == "Timofei · WhatsApp Business"
+        assert accounts[3]["daily_limit"] == 25
+        assert accounts[3]["sent_today"] == 5
 
         campaigns = client.get("/api/campaigns").json()
         assert len(campaigns) == 2
@@ -64,7 +68,10 @@ def test_demo_seed_populates_workspace_and_is_idempotent(tmp_path):
         }
 
         leads = client.get("/api/leads").json()
-        assert len(leads) == 8
+        assert len(leads) == 11
+        assert {lead["provider"] for lead in leads} == {"telegram", "whatsapp"}
+        wa_leads = [lead for lead in leads if lead["provider"] == "whatsapp"]
+        assert len(wa_leads) == 3
         assert {lead["status"] for lead in leads} == {
             "new",
             "talking",
@@ -103,3 +110,89 @@ def test_demo_seed_populates_workspace_and_is_idempotent(tmp_path):
 
         views = client.get("/api/views").json()
         assert [v["name"] for v in views] == ["VIP в работе", "Ожидают оплаты"]
+
+
+def test_whatsapp_leads_inbox_and_outreach_flow(tmp_path):
+    import asyncio
+    from app.inbox import list_inbox, open_dialog_by_lead, remember_dialogs, send_reply
+    from app.leads import add_lead_from_dialog, create_lead, search_leads
+    from app.outreach import (
+        create_campaign,
+        enroll_leads_from_crm,
+        import_campaign_csv,
+        run_campaign_batch,
+    )
+
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    app = create_app(conn=conn, gateway=None)
+    with TestClient(app) as client:
+        client.post("/api/demo/seed")
+        wa_acc = conn.execute(
+            "SELECT * FROM accounts WHERE provider = 'whatsapp'"
+        ).fetchone()
+        assert wa_acc is not None
+        wa_acc_id = int(wa_acc["id"])
+
+        # 1. Create WhatsApp lead with only phone and name
+        wa_lead = create_lead(
+            conn,
+            account_id=wa_acc_id,
+            name="Сергей Логинов · WA Cargo",
+            phone="+79994445566",
+        )
+        assert wa_lead["provider"] == "whatsapp"
+        assert wa_lead["phone"] == "+79994445566"
+        assert wa_lead["telegram_user_id"] == 79994445566
+
+        # 2. Search leads by provider and phone
+        wa_only = search_leads(conn, provider="whatsapp")
+        assert len(wa_only) == 4
+        by_phone = search_leads(conn, q="9994445566", provider="whatsapp")
+        assert [r["id"] for r in by_phone] == [wa_lead["id"]]
+
+        # 3. Open dialog by WhatsApp lead
+        dlg = open_dialog_by_lead(conn, wa_lead["id"])
+        assert dlg["provider"] == "whatsapp"
+        assert dlg["phone"] == "+79994445566"
+        assert dlg["account_id"] == wa_acc_id
+        assert dlg["telegram_user_id"] == 79994445566
+
+        # 4. Remember dialogs and add_lead_from_dialog for WhatsApp
+        remember_dialogs(
+            conn,
+            wa_acc_id,
+            [{"telegram_user_id": 79997778899, "name": "Олег WA", "phone": "+79997778899"}],
+        )
+        from_dlg = add_lead_from_dialog(conn, wa_acc_id, 79997778899)
+        assert from_dlg["provider"] == "whatsapp"
+        assert from_dlg["phone"] == "+79997778899"
+
+        # 5. Unified inbox includes WhatsApp dialogs and filters by phone
+        wa_inbox = list_inbox(conn, account_id=wa_acc_id, q="4445566")
+        assert len(wa_inbox) == 1
+        assert wa_inbox[0]["provider"] == "whatsapp"
+
+        # 6. WhatsApp Outreach CSV (wa_phone header) + batch run + daily limit increment
+        camp = create_campaign(
+            conn,
+            name="WhatsApp B2B Outreach",
+            account_ids=[wa_acc_id],
+            daily_limit=20,
+            steps=[{"step_order": 1, "delay_hours": 0, "template_text": "Здравствуйте, {name}! Пишем в WhatsApp."}],
+        )
+        csv_res = import_campaign_csv(
+            conn,
+            camp["id"],
+            "name,wa_phone,company\nИгорь Склад,+79998881122,SkladPro\n",
+        )
+        assert csv_res["imported"] == 1
+        en_res = enroll_leads_from_crm(conn, camp["id"], status="new")
+        assert en_res["imported_count"] >= 2
+
+        batch_res = asyncio.run(run_campaign_batch(conn, camp["id"], gateway=None, max_send=2))
+        assert batch_res["sent"] == 2
+        assert batch_res["account"]["sent_today"] == 7  # 5 seeded + 2 sent
+
+        sent_msg = asyncio.run(send_reply(conn, dlg["id"], "Тест ответа в WhatsApp", None))
+        assert sent_msg["direction"] == "out"

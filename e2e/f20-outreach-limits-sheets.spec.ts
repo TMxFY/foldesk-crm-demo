@@ -133,18 +133,18 @@ test('F20-H5 multi-account campaign pool, explicit session verification, and Sof
 
   // 1. Check explicit account connection status & Check All button
   const accounts = page.locator('#accounts');
-  await expect(accounts.locator('#accounts-summary-bar')).toContainText('Подключено: 3');
+  await expect(accounts.locator('#accounts-summary-bar')).toContainText('Подключено: 4');
   await expect(accounts.locator('.account-badges-line .badge').first()).toContainText('Демо-профиль (локально)');
   await accounts.locator('#check-accounts-btn').click();
-  await expect(page.locator('#toast')).toContainText('Проверено аккаунтов: 3');
+  await expect(page.locator('#toast')).toContainText('Проверено аккаунтов: 4');
 
-  // 2. Create a multi-account campaign with all 3 connected accounts
+  // 2. Create a multi-account campaign with all 4 connected accounts
   await page.locator('#campaign-name').fill('SoftUGC Multi-Account Launch');
   await page.locator('#select-all-campaign-accounts').click();
-  await expect(page.locator('#campaign-pool-summary')).toContainText('Пул: 3 аккаунта');
+  await expect(page.locator('#campaign-pool-summary')).toContainText('Пул: 4 аккаунта');
   await page.locator('#create-campaign-btn').click();
   await expect(page.locator('#campaign-list')).toContainText('SoftUGC Multi-Account Launch');
-  await expect(page.locator('#campaign-list')).toContainText('Пул: 3 аккаунта');
+  await expect(page.locator('#campaign-list')).toContainText('Пул: 4 аккаунта');
 
   // 3. Load the real 39-row SoftUGC CSV sample and import into the new campaign
   await page.locator('#fill-sample-csv').click();

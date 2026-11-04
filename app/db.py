@@ -64,7 +64,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             sent_today INTEGER NOT NULL DEFAULT 0,
             sent_date TEXT,
             proxy_url TEXT,
-            access_scope TEXT NOT NULL DEFAULT 'workspace'
+            access_scope TEXT NOT NULL DEFAULT 'workspace',
+            provider TEXT NOT NULL DEFAULT 'telegram',
+            wa_jid TEXT,
+            pairing_code TEXT,
+            qr_code TEXT
         );
 
         CREATE TABLE IF NOT EXISTS leads (
@@ -85,6 +89,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             email TEXT,
             url TEXT,
             dialog_id INTEGER,
+            provider TEXT NOT NULL DEFAULT 'telegram',
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         );
 
@@ -123,6 +128,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             last_from_peer INTEGER NOT NULL DEFAULT 0 CHECK (last_from_peer IN (0, 1)),
             muted INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
             lead_id INTEGER,
+            provider TEXT NOT NULL DEFAULT 'telegram',
+            phone TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (account_id, peer_type, peer_id),
@@ -134,6 +141,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             dialog_id INTEGER NOT NULL,
             telegram_message_id INTEGER NOT NULL,
+            external_message_id TEXT,
             direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
             text TEXT,
             sent_at TEXT NOT NULL,
@@ -327,6 +335,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "leads", "url", "TEXT")
     _ensure_column(conn, "leads", "folder_id", "INTEGER REFERENCES folders(id) ON DELETE SET NULL")
     _ensure_column(conn, "leads", "dialog_id", "INTEGER")
+    _ensure_column(conn, "leads", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
     _ensure_column(conn, "accounts", "health", "TEXT")
     _ensure_column(conn, "accounts", "last_error", "TEXT")
     _ensure_column(conn, "accounts", "updated_at", "TEXT")
@@ -335,6 +344,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "accounts", "sent_date", "TEXT")
     _ensure_column(conn, "accounts", "proxy_url", "TEXT")
     _ensure_column(conn, "accounts", "access_scope", "TEXT NOT NULL DEFAULT 'workspace'")
+    _ensure_column(conn, "accounts", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
+    _ensure_column(conn, "accounts", "wa_jid", "TEXT")
+    _ensure_column(conn, "accounts", "pairing_code", "TEXT")
+    _ensure_column(conn, "accounts", "qr_code", "TEXT")
+    _ensure_column(conn, "dialogs", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
+    _ensure_column(conn, "dialogs", "phone", "TEXT")
+    _ensure_column(conn, "messages", "external_message_id", "TEXT")
     _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
     _ensure_column(
         conn,

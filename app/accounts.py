@@ -9,6 +9,7 @@ import zipfile
 
 from app.db import as_dict, resolve_session, utc_now, utc_today
 from app.telegram_gateway import SESSION_HEALTH, GatewayError
+from app.whatsapp_gateway import WhatsAppGateway, generate_pairing_code, generate_qr_svg
 
 PUBLIC_FIELDS = (
     "id",
@@ -25,6 +26,10 @@ PUBLIC_FIELDS = (
     "sent_date",
     "proxy_url",
     "access_scope",
+    "provider",
+    "wa_jid",
+    "pairing_code",
+    "qr_code",
 )
 
 
@@ -35,27 +40,47 @@ def _public(row: dict) -> dict:
     session_path = str(row.get("session_path") or "")
     is_demo = session_path.startswith("data/sessions/demo")
     session_exists = bool(session_path and resolve_session(session_path).exists())
+    provider = str(row.get("provider") or "telegram").strip().lower()
+    if provider not in ("telegram", "whatsapp"):
+        provider = "telegram"
 
     status = row.get("status")
     health = row.get("health")
-    if status == "pending_code":
-        connection_label = "Не подключён · ждёт код"
-    elif status == "pending_password":
-        connection_label = "Не подключён · ждёт 2FA пароль"
-    elif status != "connected":
-        connection_label = "Не подключён · ошибка входа"
-    elif health in ("unauthorized", "banned", "frozen"):
-        connection_label = "Сессия слетела · нужен вход"
-    elif health == "offline":
-        connection_label = "Нет связи с Telegram"
-    elif is_demo:
-        connection_label = "Демо-профиль (локально)"
-    elif session_exists and health == "active":
-        connection_label = "Подключён · MTProto активен"
+    if provider == "whatsapp":
+        if status == "pending_code":
+            connection_label = "Не подключён · ждёт Pairing-код / QR"
+        elif status != "connected":
+            connection_label = "Не подключён · ошибка входа"
+        elif health in ("unauthorized", "banned", "frozen"):
+            connection_label = "Сессия слетела · нужен вход"
+        elif health == "offline":
+            connection_label = "Нет связи с WhatsApp"
+        elif is_demo:
+            connection_label = "Демо WhatsApp (локально)"
+        elif session_exists and health == "active":
+            connection_label = "Подключён · WhatsApp Web активен"
+        else:
+            connection_label = "Подключён · WhatsApp сессия"
     else:
-        connection_label = "Подключён · сессия сохранена"
+        if status == "pending_code":
+            connection_label = "Не подключён · ждёт код"
+        elif status == "pending_password":
+            connection_label = "Не подключён · ждёт 2FA пароль"
+        elif status != "connected":
+            connection_label = "Не подключён · ошибка входа"
+        elif health in ("unauthorized", "banned", "frozen"):
+            connection_label = "Сессия слетела · нужен вход"
+        elif health == "offline":
+            connection_label = "Нет связи с Telegram"
+        elif is_demo:
+            connection_label = "Демо-профиль (локально)"
+        elif session_exists and health == "active":
+            connection_label = "Подключён · MTProto активен"
+        else:
+            connection_label = "Подключён · сессия сохранена"
 
     out = {key: row.get(key) for key in PUBLIC_FIELDS}
+    out["provider"] = provider
     out["daily_limit"] = daily_limit
     out["sent_today"] = sent_today
     out["sent_date"] = row.get("sent_date") or today
@@ -171,29 +196,50 @@ async def start_login(
     gateway,
     proxy_url: str | None = None,
     access_scope: str = "workspace",
+    provider: str = "telegram",
+    auth_mode: str = "code",
 ) -> dict:
+    norm_provider = "whatsapp" if str(provider or "").strip().lower() == "whatsapp" else "telegram"
+    norm_mode = "qr" if str(auth_mode or "").strip().lower() == "qr" else "code"
     phone = (phone or "").strip()
+    if norm_provider == "whatsapp" and not phone and norm_mode == "qr":
+        phone = "+79990000000"
     if not phone:
         raise ValueError("Укажите телефон")
     clean_proxy = (proxy_url or "").strip() or None
     clean_scope = (access_scope or "workspace").strip() or "workspace"
     cur = conn.execute(
         """
-        INSERT INTO accounts (phone, session_path, status, created_at, proxy_url, access_scope)
-        VALUES (?, '', 'pending_code', ?, ?, ?)
+        INSERT INTO accounts (phone, session_path, status, created_at, proxy_url, access_scope, provider)
+        VALUES (?, '', 'pending_code', ?, ?, ?, ?)
         """,
-        (phone, utc_now(), clean_proxy, clean_scope),
+        (phone, utc_now(), clean_proxy, clean_scope, norm_provider),
     )
     account_id = cur.lastrowid
-    session_path = f"data/sessions/{account_id}.session"
+    if norm_provider == "whatsapp":
+        session_path = f"data/sessions/wa_{account_id}.session"
+    else:
+        session_path = f"data/sessions/{account_id}.session"
     resolve_session(session_path).parent.mkdir(parents=True, exist_ok=True)
     conn.execute(
         "UPDATE accounts SET session_path = ? WHERE id = ?",
         (session_path, account_id),
     )
     conn.commit()
+
+    pairing_code = None
+    qr_code = None
+    if norm_provider == "whatsapp":
+        pairing_code = generate_pairing_code(phone)
+        qr_code = generate_qr_svg(session_path, phone)
+
     try:
-        phone_code_hash = await gateway.request_code(phone, session_path)
+        if norm_provider == "whatsapp" and isinstance(gateway, WhatsAppGateway):
+            phone_code_hash = await gateway.request_code(
+                phone, session_path, auth_mode=norm_mode
+            )
+        else:
+            phone_code_hash = await gateway.request_code(phone, session_path)
     except Exception as exc:
         _mark_error(conn, account_id)
         if isinstance(exc, GatewayError):
@@ -202,15 +248,18 @@ async def start_login(
     conn.execute(
         """
         UPDATE accounts
-        SET phone_code_hash = ?, status = 'pending_code'
+        SET phone_code_hash = ?, status = 'pending_code', pairing_code = ?, qr_code = ?, provider = ?
         WHERE id = ?
         """,
-        (phone_code_hash, account_id),
+        (phone_code_hash, pairing_code, qr_code, norm_provider, account_id),
     )
     conn.commit()
     return {
         "id": account_id,
         "status": "pending_code",
+        "provider": norm_provider,
+        "pairing_code": pairing_code,
+        "qr_code": qr_code,
         "proxy_url": clean_proxy,
         "access_scope": clean_scope,
     }
@@ -335,10 +384,29 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         filename = str(entry.get("filename") or "").strip()
         stem = Path(filename).stem if filename else ""
 
+        raw_provider = (
+            entry.get("provider")
+            or jdata.get("provider")
+            or payload.get("provider")
+            or ""
+        )
+        raw_provider_str = str(raw_provider).strip().lower()
+        raw_wa_jid = entry.get("wa_jid") or jdata.get("wa_jid") or jdata.get("jid")
+        if (
+            raw_provider_str == "whatsapp"
+            or stem.lower().startswith("wa_")
+            or ".wa." in filename.lower()
+            or bool(raw_wa_jid)
+        ):
+            provider = "whatsapp"
+        else:
+            provider = "telegram"
+
         raw_phone = (
             entry.get("phone")
             or jdata.get("phone")
             or jdata.get("phone_number")
+            or (str(raw_wa_jid).split("@")[0] if raw_wa_jid else "")
             or stem
             or ""
         )
@@ -351,6 +419,13 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         else:
             phone = f"+7999000{idx:04d}"
 
+        phone_digits = re.sub(r"\D", "", phone) or f"7999000{idx:04d}"
+        wa_jid = (
+            str(raw_wa_jid).strip()
+            if raw_wa_jid
+            else (f"{phone_digits}@s.whatsapp.net" if provider == "whatsapp" else None)
+        )
+
         username_raw = (
             entry.get("username")
             or entry.get("telegram_username")
@@ -358,18 +433,18 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             or jdata.get("telegram_username")
         )
         username = str(username_raw).strip().lstrip("@") if username_raw else None
-        if not username:
-            username = None
+        if not username or provider == "whatsapp":
+            username = None if provider == "whatsapp" else username
 
         first_name = str(entry.get("first_name") or jdata.get("first_name") or "").strip()
         last_name = str(entry.get("last_name") or jdata.get("last_name") or "").strip()
         combined_fl = " ".join(p for p in (first_name, last_name) if p).strip()
+        default_name = f"WhatsApp {phone}" if provider == "whatsapp" else (username or phone)
         telegram_name = (
             str(entry.get("telegram_name") or entry.get("name") or "").strip()
             or combined_fl
             or str(jdata.get("name") or jdata.get("telegram_name") or "").strip()
-            or username
-            or phone
+            or default_name
         )
 
         tg_id_raw = (
@@ -387,8 +462,11 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             except ValueError:
                 tg_id = None
         if tg_id is None:
-            seed_int = int(hashlib.md5(phone.encode("utf-8")).hexdigest()[:8], 16)
-            tg_id = 77000000 + (seed_int % 9000000)
+            if provider == "whatsapp" and phone_digits.isdigit():
+                tg_id = int(phone_digits[-12:])
+            else:
+                seed_int = int(hashlib.md5(phone.encode("utf-8")).hexdigest()[:8], 16)
+                tg_id = 77000000 + (seed_int % 9000000)
 
         proxy_url = (
             _format_proxy(entry.get("proxy_url"))
@@ -406,7 +484,10 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         except (TypeError, ValueError):
             daily_limit = default_limit
 
-        safe_stem = re.sub(r"[^A-Za-z0-9_+-]", "", stem or phone.lstrip("+")) or f"session_{idx}"
+        raw_stem = stem or (f"wa_{phone_digits}" if provider == "whatsapp" else phone.lstrip("+"))
+        safe_stem = re.sub(r"[^A-Za-z0-9_+-]", "", raw_stem) or f"session_{idx}"
+        if provider == "whatsapp" and not safe_stem.lower().startswith("wa_"):
+            safe_stem = f"wa_{safe_stem}"
         session_path = f"data/sessions/{safe_stem}.session"
         abs_session_path = resolve_session(session_path)
         abs_session_path.parent.mkdir(parents=True, exist_ok=True)
@@ -420,14 +501,22 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         if not sess_bytes and entry.get("session_string"):
             sess_bytes = str(entry["session_string"]).encode("utf-8")
         if not sess_bytes:
-            sess_bytes = f"SQLite format 3\x00{phone}:{tg_id}".encode("utf-8")
+            if provider == "whatsapp":
+                sess_bytes = f"SQLite format 3\x00whatsapp:{phone}".encode("utf-8")
+            else:
+                sess_bytes = f"SQLite format 3\x00{phone}:{tg_id}".encode("utf-8")
 
         abs_session_path.write_bytes(sess_bytes)
 
         existing = conn.execute(
-            "SELECT id FROM accounts WHERE phone = ? ORDER BY id LIMIT 1",
-            (phone,),
+            "SELECT id FROM accounts WHERE phone = ? AND provider = ? ORDER BY id LIMIT 1",
+            (phone, provider),
         ).fetchone()
+        if existing is None:
+            existing = conn.execute(
+                "SELECT id FROM accounts WHERE phone = ? ORDER BY id LIMIT 1",
+                (phone,),
+            ).fetchone()
         if existing:
             account_id = int(existing["id"])
             conn.execute(
@@ -436,7 +525,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 SET session_path = ?, status = 'connected', telegram_user_id = ?,
                     telegram_username = ?, telegram_name = ?, health = 'active',
                     last_error = NULL, updated_at = ?, daily_limit = ?,
-                    proxy_url = ?, access_scope = ?
+                    proxy_url = ?, access_scope = ?, provider = ?, wa_jid = ?
                 WHERE id = ?
                 """,
                 (
@@ -448,6 +537,8 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     daily_limit,
                     proxy_url,
                     access_scope,
+                    provider,
+                    wa_jid,
                     account_id,
                 ),
             )
@@ -458,8 +549,9 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     phone, session_path, status, telegram_user_id,
                     telegram_username, telegram_name, created_at,
                     health, last_error, updated_at, daily_limit,
-                    sent_today, sent_date, proxy_url, access_scope
-                ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, ?, 0, ?, ?, ?)
+                    sent_today, sent_date, proxy_url, access_scope,
+                    provider, wa_jid
+                ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, ?, 0, ?, ?, ?, ?, ?)
                 """,
                 (
                     phone,
@@ -473,6 +565,8 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     today,
                     proxy_url,
                     access_scope,
+                    provider,
+                    wa_jid,
                 ),
             )
             account_id = int(cur.lastrowid)
@@ -481,6 +575,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             gateway._pending[session_path] = {
                 "phone": phone,
                 "state": "connected",
+                "wa_jid": wa_jid,
             }
 
         imported.append(_public(_load(conn, account_id)))
@@ -496,8 +591,12 @@ async def confirm_login(conn, account_id: int, code: str, gateway) -> dict:
     account = _load(conn, account_id)
     if account["status"] == "connected":
         return {"status": "connected"}
+    provider = str(account.get("provider") or "telegram").strip().lower()
+    active_gateway = gateway
+    if provider == "whatsapp" and not isinstance(active_gateway, WhatsAppGateway):
+        active_gateway = WhatsAppGateway()
     try:
-        result = await gateway.confirm_code(
+        result = await active_gateway.confirm_code(
             account["phone"],
             code,
             account.get("phone_code_hash") or "",
@@ -508,7 +607,7 @@ async def confirm_login(conn, account_id: int, code: str, gateway) -> dict:
     except Exception as exc:
         _mark_error(conn, account_id)
         raise GatewayError(str(exc) or "Не удалось подтвердить код") from exc
-    return await _finish_login(conn, account_id, result, gateway)
+    return await _finish_login(conn, account_id, result, active_gateway)
 
 
 async def confirm_password(conn, account_id: int, password: str, gateway) -> dict:
@@ -607,16 +706,20 @@ async def probe_account(conn, account_id: int, gateway) -> dict:
 reconnect_account = probe_account
 
 
-async def check_all_accounts(conn, gateway=None) -> dict:
+async def check_all_accounts(conn, gateway=None, wa_gateway=None) -> dict:
     rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+    wa_gw = wa_gateway or WhatsAppGateway()
     for row in rows:
         d = as_dict(row)
         if d.get("status") != "connected":
             continue
         account_id = int(d["id"])
         session_path = str(d.get("session_path") or "")
+        provider = str(d.get("provider") or "telegram").strip().lower()
         is_demo = session_path.startswith("data/sessions/demo")
-        if is_demo and gateway is None:
+        if provider == "whatsapp":
+            await probe_account(conn, account_id, wa_gw)
+        elif is_demo and gateway is None:
             _write_health(conn, account_id, "active", None)
         elif gateway is not None:
             await probe_account(conn, account_id, gateway)
@@ -635,7 +738,8 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
         conn.execute(
             """
             UPDATE accounts
-            SET status = ?, telegram_user_id = ?, telegram_username = ?, telegram_name = ?
+            SET status = ?, telegram_user_id = ?, telegram_username = ?, telegram_name = ?,
+                wa_jid = COALESCE(?, wa_jid)
             WHERE id = ?
             """,
             (
@@ -643,6 +747,7 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
                 result.get("telegram_user_id"),
                 result.get("telegram_username"),
                 result.get("telegram_name"),
+                result.get("wa_jid"),
                 account_id,
             ),
         )

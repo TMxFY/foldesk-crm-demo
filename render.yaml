@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: foldesk-crm-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/accounts
+    envVars:
+      - key: DEMO_AUTOSEED
+        value: "1"
+      - key: PORT
+        value: "8000"

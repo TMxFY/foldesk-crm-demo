@@ -352,9 +352,9 @@ def test_multi_session_inbox_open_by_lead_and_property_defs(tmp_path):
 
         # Query multi-session inbox (account_id=0 -> All sessions)
         all_inbox = client.get("/api/inbox", params={"account_id": 0}).json()
-        assert len(all_inbox) == 7  # 6 seeded on a1 + 1 created on a2
+        assert len(all_inbox) == 10  # 6 seeded on a1 + 3 WhatsApp seeded + 1 created on a2
         account_ids_in_inbox = {d["account_id"] for d in all_inbox}
-        assert account_ids_in_inbox == {a1, a2}
+        assert {a1, a2}.issubset(account_ids_in_inbox)
         assert all(d.get("account_phone") and d.get("account_name") for d in all_inbox)
 
         # Query inbox for session a2 specifically

@@ -17,16 +17,34 @@ DEMO3_PHONE = "+79990003344"
 DEMO3_SESSION = "data/sessions/demo3.session"
 DEMO3_TG_ID = 700102
 
+DEMO_WA_PHONE = "+79990007788"
+DEMO_WA_SESSION = "data/sessions/demo_wa.session"
+DEMO_WA_TG_ID = 700103
+DEMO_WA_JID = "79990007788@s.whatsapp.net"
+
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _cleanup_existing_demo(conn) -> None:
-    lead_tg_ids = tuple(range(800101, 800125))
+    lead_tg_ids = tuple(range(800101, 800125)) + (
+        79993014455,
+        79993025566,
+        79993036677,
+    )
     acc_rows = conn.execute(
-        "SELECT id FROM accounts WHERE phone IN (?, ?, ?) OR session_path IN (?, ?, ?)",
-        (DEMO_PHONE, DEMO2_PHONE, DEMO3_PHONE, DEMO_SESSION, DEMO2_SESSION, DEMO3_SESSION),
+        "SELECT id FROM accounts WHERE phone IN (?, ?, ?, ?) OR session_path IN (?, ?, ?, ?)",
+        (
+            DEMO_PHONE,
+            DEMO2_PHONE,
+            DEMO3_PHONE,
+            DEMO_WA_PHONE,
+            DEMO_SESSION,
+            DEMO2_SESSION,
+            DEMO3_SESSION,
+            DEMO_WA_SESSION,
+        ),
     ).fetchall()
     acc_ids = [row["id"] for row in acc_rows]
 
@@ -101,12 +119,25 @@ def seed_demo(conn) -> dict:
         INSERT INTO accounts (
             phone, session_path, status, telegram_user_id,
             telegram_username, telegram_name, created_at,
-            health, last_error, updated_at, daily_limit, sent_today, sent_date
-        ) VALUES (?, ?, 'connected', ?, 'maxim_growth_tg', 'Максим · Growth', ?, 'active', NULL, ?, 15, 3, ?)
+            health, last_error, updated_at, daily_limit, sent_today, sent_date, provider
+        ) VALUES (?, ?, 'connected', ?, 'maxim_growth_tg', 'Максим · Growth', ?, 'active', NULL, ?, 15, 3, ?, 'telegram')
         """,
         (DEMO3_PHONE, DEMO3_SESSION, DEMO3_TG_ID, now, now, today),
     )
     account3_id = cur3.lastrowid
+
+    cur_wa = conn.execute(
+        """
+        INSERT INTO accounts (
+            phone, session_path, status, telegram_user_id,
+            telegram_username, telegram_name, created_at,
+            health, last_error, updated_at, daily_limit, sent_today, sent_date,
+            provider, wa_jid
+        ) VALUES (?, ?, 'connected', ?, NULL, 'Timofei · WhatsApp Business', ?, 'active', NULL, ?, 25, 5, ?, 'whatsapp', ?)
+        """,
+        (DEMO_WA_PHONE, DEMO_WA_SESSION, DEMO_WA_TG_ID, now, now, today, DEMO_WA_JID),
+    )
+    wa_account_id = cur_wa.lastrowid
 
     folders_spec = [
         (10, "VIP Клиенты", 1, None),
@@ -313,6 +344,83 @@ def seed_demo(conn) -> dict:
                 ("Поставить напоминание на возврат в Q1", True),
             ],
         },
+        {
+            "provider": "whatsapp",
+            "account_id": wa_account_id,
+            "telegram_user_id": 79993014455,
+            "username": "kirill_boxberry_wa",
+            "name": "Кирилл Сафонов · BoxBerry Logistics",
+            "phone": "+79993014455",
+            "status": "new",
+            "note": "Пишет в WhatsApp по интеграции отдела логистики (12 номеров)",
+            "next_step": "Отправить коммерческое предложение в WhatsApp",
+            "description": "Федеральный логистический оператор, переводят поддержку и B2B-сейлзов в единый WhatsApp + Telegram инбокс.",
+            "email": "k.safonov@boxberry-b2b.ru",
+            "url": "https://boxberry.ru",
+            "folder": None,
+            "amount_text": "$3,200",
+            "amount_cents": 320000,
+            "company": "BoxBerry Logistics",
+            "notes": [
+                "Обратился в WhatsApp Business после вебинара, хотят подключить 12 номеров менеджеров.",
+                "Критично видеть переписки WhatsApp и Telegram в одном окне.",
+            ],
+            "tasks": [
+                ("Подготовить расчёт тарифа на 12 WhatsApp + Telegram линий", False),
+                ("Показать QR-подключение WhatsApp на демо", False),
+            ],
+        },
+        {
+            "provider": "whatsapp",
+            "account_id": wa_account_id,
+            "telegram_user_id": 79993025566,
+            "username": "alina_medline_wa",
+            "name": "Алина Белова · MedLine Clinic",
+            "phone": "+79993025566",
+            "status": "talking",
+            "note": "Согласовываем шаблон WhatsApp-рассылки по базе клиентов",
+            "next_step": "Запустить тестовую батч-рассылку на 50 номеров",
+            "description": "Сеть частных клиник премиум-сегмента, основная коммуникация с VIP-клиентами идёт в WhatsApp.",
+            "email": "a.belova@medline.clinic",
+            "url": "https://medline.clinic",
+            "folder": None,
+            "amount_text": "$2,700",
+            "amount_cents": 270000,
+            "company": "MedLine Clinic",
+            "notes": [
+                "Провели демо WhatsApp-инбокса, команде понравилась карточка сделки справа от чата.",
+                "Готовим CSV-базу для первой сервисной рассылки.",
+            ],
+            "tasks": [
+                ("Проверить CSV-шаблон с номерами WhatsApp", True),
+                ("Запустить тестовый батч с дневным лимитом 25 сообщений", False),
+            ],
+        },
+        {
+            "provider": "whatsapp",
+            "account_id": wa_account_id,
+            "telegram_user_id": 79993036677,
+            "username": "ruslan_auto_wa",
+            "name": "Руслан Каримов · AutoImport Pro",
+            "phone": "+79993036677",
+            "status": "waiting",
+            "note": "Ждём оплату счёта за полугодовой доступ (WhatsApp + Telegram)",
+            "next_step": "Проверить зачисление средств и выдать доступы РОПу",
+            "description": "Импорт автомобилей под ключ, отдел продаж общается с покупателями параллельно в WhatsApp и Telegram.",
+            "email": "ruslan@autoimport.pro",
+            "url": "https://autoimport.pro",
+            "folder": None,
+            "amount_text": "$1,950",
+            "amount_cents": 195000,
+            "company": "AutoImport Pro",
+            "notes": [
+                "Договорились на пакет 5 Telegram + 3 WhatsApp аккаунта, счёт выставлен на ИП.",
+            ],
+            "tasks": [
+                ("Отправить договор и счёт в WhatsApp", True),
+                ("Настроить рабочие места для 8 сейлзов после оплаты", False),
+            ],
+        },
     ]
 
     prop_amount = create_property_def(conn, name="Сумма сделки", type_="amount", object_type="lead")
@@ -320,18 +428,23 @@ def seed_demo(conn) -> dict:
 
     lead_ids_by_username = {}
     for idx, item in enumerate(leads_spec):
-        stamp = _iso(now_dt - timedelta(minutes=(len(leads_spec) - idx) * 7))
-        folder_id = folder_map[item["folder"]]
+        lead_provider = item.get("provider") or "telegram"
+        lead_acc_id = item.get("account_id") or account_id
+        if lead_provider == "whatsapp":
+            stamp = _iso(now_dt - timedelta(minutes=10 + idx * 3))
+        else:
+            stamp = _iso(now_dt - timedelta(minutes=(8 - idx) * 7))
+        folder_id = folder_map[item["folder"]] if item.get("folder") else None
         lcur = conn.execute(
             """
             INSERT INTO leads (
                 account_id, telegram_user_id, username, name, phone,
                 status, note, next_step, created_at, updated_at,
-                description, email, url, folder_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                description, email, url, folder_id, provider
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                account_id,
+                lead_acc_id,
                 item["telegram_user_id"],
                 item["username"],
                 item["name"],
@@ -345,6 +458,7 @@ def seed_demo(conn) -> dict:
                 item["email"],
                 item["url"],
                 folder_id,
+                lead_provider,
             ),
         )
         lead_id = lcur.lastrowid
@@ -465,28 +579,77 @@ def seed_demo(conn) -> dict:
                 (6003, "in", "Давайте завтра созвонимся на 15 минут, расскажу про наши процессы.", -300),
             ],
         },
+        {
+            "account_id": wa_account_id,
+            "provider": "whatsapp",
+            "phone": "+79993014455",
+            "username": "kirill_boxberry_wa",
+            "peer_id": 79993014455,
+            "title": "Кирилл Сафонов · BoxBerry Logistics",
+            "unread_count": 2,
+            "last_from_peer": 1,
+            "messages": [
+                (7001, "in", "Добрый день! Пишу вам на рабочий WhatsApp. Мы ищем CRM, где можно вести и WhatsApp, и Telegram сделки в одном окне.", -190),
+                (7002, "out", "Кирилл, здравствуйте! Да, в Foldesk WhatsApp подключается по QR-коду за 15 секунд и попадает в единый инбокс.", -170),
+                (7003, "in", "Отлично! У нас 12 менеджеров по корпоративным клиентам. Пришлите, пожалуйста, КП и условия пилота сюда в WhatsApp.", -20),
+            ],
+        },
+        {
+            "account_id": wa_account_id,
+            "provider": "whatsapp",
+            "phone": "+79993025566",
+            "username": "alina_medline_wa",
+            "peer_id": 79993025566,
+            "title": "Алина Белова · MedLine Clinic",
+            "unread_count": 1,
+            "last_from_peer": 1,
+            "messages": [
+                (8001, "in", "Тимофей, здравствуйте! Протестировали приём заявок через WhatsApp — всё летает.", -310),
+                (8002, "out", "Алина, супер! Мы также добавили CSV-импорт номеров с поддержкой колонок WhatsApp и контролем суточных лимитов.", -280),
+                (8003, "in", "Супер, базу на 50 контактов подготовили. Давайте сегодня запустим первую волну!", -35),
+            ],
+        },
+        {
+            "account_id": wa_account_id,
+            "provider": "whatsapp",
+            "phone": "+79993036677",
+            "username": "ruslan_auto_wa",
+            "peer_id": 79993036677,
+            "title": "Руслан Каримов · AutoImport Pro",
+            "unread_count": 0,
+            "last_from_peer": 0,
+            "messages": [
+                (8501, "in", "Привет! Скиньте реквизиты сюда в WhatsApp, сегодня проведём оплату за полгода.", -500),
+                (8502, "out", "Руслан, добрый день! Направил счёт на $1,950. Как пройдёт платёж — сразу подключим ваши WhatsApp и Telegram номера.", -450),
+            ],
+        },
     ]
 
     dialog_count = 0
     message_count = 0
     for d_spec in dialogs_spec:
         lead_id = lead_ids_by_username[d_spec["username"]]
+        dlg_acc_id = d_spec.get("account_id") or account_id
+        dlg_provider = d_spec.get("provider") or "telegram"
+        dlg_phone = d_spec.get("phone")
         msgs = d_spec["messages"]
         last_sent_at = _iso(now_dt + timedelta(minutes=msgs[-1][3]))
         last_preview = msgs[-1][2][:120]
         dcur = conn.execute(
             """
             INSERT INTO dialogs (
-                account_id, peer_type, peer_id, username, title,
+                account_id, peer_type, peer_id, username, title, phone, provider,
                 is_group, unread_count, last_message_at, last_message_preview,
                 last_from_peer, muted, lead_id, created_at, updated_at
-            ) VALUES (?, 'user', ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?)
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
-                account_id,
+                dlg_acc_id,
                 d_spec["peer_id"],
                 d_spec["username"],
                 d_spec["title"],
+                dlg_phone,
+                dlg_provider,
                 d_spec["unread_count"],
                 last_sent_at,
                 last_preview,

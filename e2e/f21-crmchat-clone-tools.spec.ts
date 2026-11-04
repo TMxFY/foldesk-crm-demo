@@ -110,7 +110,7 @@ test('F21-H4 Multi-session Inbox switcher and direct message sending across sess
   const switcher = page.locator('#inbox-session-switcher');
   await expect(switcher).toBeVisible();
   const pills = switcher.locator('.inbox-session-pill');
-  await expect(pills).toHaveCount(4); // "Все сессии" + 3 connected demo accounts
+  await expect(pills).toHaveCount(5); // "Все сессии" + 4 connected demo accounts (3 TG + 1 WA)
 
   // Switch to a specific Telegram session and back to All sessions
   await pills.nth(1).click();

@@ -1499,7 +1499,7 @@ section {
 /* Row 4: Manual Lead + Leads Table */
 .manual {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr)) auto;
+  grid-template-columns: repeat(7, minmax(0, 1fr)) auto;
   gap: var(--space-2);
   align-items: end;
   padding: var(--space-3);
@@ -1978,7 +1978,7 @@ td input, td select { min-width: 110px; height: var(--size-sm); }
 /* Account Auth Tabs & Session + JSON Import */
 .auth-mode-tabs {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-1);
   padding: var(--space-1);
   background: var(--sunken);
@@ -2211,6 +2211,89 @@ td input, td select { min-width: 110px; height: var(--size-sm); }
   background: var(--surface);
   border: var(--line) solid var(--border);
   border-radius: var(--radius-md);
+}
+
+/* Multi-Messenger Channel Badges (TG / WA) & WhatsApp Pairing UI */
+.channel-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.channel-badge.channel-tg {
+  color: #1e40af;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+}
+
+.channel-badge.channel-wa {
+  color: #065f46;
+  background: #d1fae5;
+  border: 1px solid #6ee7b7;
+}
+
+.dialog-name-row,
+.thread-title-group,
+.lead-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.lead-name-cell {
+  width: 100%;
+}
+
+.wa-pairing-box {
+  padding: var(--space-3);
+  background: var(--surface);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-md);
+  text-align: center;
+}
+
+.wa-pairing-panel {
+  align-items: center;
+  justify-items: center;
+}
+
+.wa-pairing-code-display {
+  display: inline-block;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  border: var(--line) solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 22px;
+  line-height: 28px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+.wa-qr-wrap {
+  display: inline-grid;
+  place-items: center;
+  padding: var(--space-2);
+  background: #ffffff;
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+#wa-qr-image {
+  width: 160px;
+  height: 160px;
+  display: block;
 }
 
 @media (max-width: 1180px) {

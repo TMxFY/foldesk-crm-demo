@@ -1,3 +1,4 @@
+import re
 import sqlite3
 
 from app.accounts import check_daily_limit, increment_daily_sent
@@ -5,8 +6,39 @@ from app.db import as_dict, utc_now
 from app.telegram_gateway import GatewayError
 
 
+def _account_provider(conn, account_id: int, *, require_exists: bool = False) -> str:
+    row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if row is None:
+        if require_exists:
+            raise LookupError("account")
+        return "telegram"
+    data = as_dict(row)
+    prov = (data.get("provider") or "telegram").strip().lower()
+    return prov if prov in ("telegram", "whatsapp") else "telegram"
+
+
+def _extract_dialog_phone(item: dict, peer_id: int | None, provider: str) -> str | None:
+    raw = (item.get("phone") or "").strip()
+    if raw:
+        digits = re.sub(r"\D", "", raw)
+        if digits and len(digits) >= 7:
+            return raw if raw.startswith("+") else f"+{digits}"
+        return raw
+    if provider == "whatsapp" and peer_id is not None:
+        peer_str = str(peer_id).strip()
+        if peer_str.isdigit() and 7 <= len(peer_str) <= 15 and not peer_str.startswith("900"):
+            return f"+{peer_str}"
+    return None
+
+
 def _public(row) -> dict:
     data = as_dict(row)
+    provider = data.get("provider") or "telegram"
+    phone = data.get("phone")
+    if not phone and provider == "whatsapp":
+        peer_str = str(data.get("peer_id") or "").strip()
+        if peer_str.isdigit() and 7 <= len(peer_str) <= 15 and not peer_str.startswith("900"):
+            phone = f"+{peer_str}"
     out = {
         "id": data["id"],
         "dialog_id": data["id"],
@@ -14,6 +46,8 @@ def _public(row) -> dict:
         "telegram_user_id": data["peer_id"],
         "username": data["username"],
         "name": data["title"] or "",
+        "phone": phone,
+        "provider": provider,
         "peer_type": data["peer_type"],
         "unread_count": data["unread_count"],
         "muted": data["muted"],
@@ -33,29 +67,38 @@ def _public(row) -> dict:
 
 
 def remember_dialogs(conn, account_id: int, people: list) -> list:
+    acc_provider = _account_provider(conn, account_id)
     now = utc_now()
     saved = []
     for person in people:
         peer_id = person.get("telegram_user_id")
+        if peer_id is None and person.get("phone"):
+            digits = re.sub(r"\D", "", str(person["phone"]))
+            if len(digits) >= 7:
+                peer_id = int(digits[-12:])
         if peer_id is None:
             continue
         title = (person.get("name") or "").strip()
         username = person.get("username")
         if username is not None:
             username = str(username).strip().lstrip("@") or None
+        provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
+        phone = _extract_dialog_phone(person, int(peer_id), provider)
         conn.execute(
             """
             INSERT INTO dialogs (
-                account_id, peer_type, peer_id, username, title,
+                account_id, peer_type, peer_id, username, title, phone, provider,
                 is_group, unread_count, last_from_peer, muted,
                 created_at, updated_at
-            ) VALUES (?, 'user', ?, ?, ?, 0, 0, 0, 0, ?, ?)
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
             ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
                 username = excluded.username,
                 title = excluded.title,
+                phone = COALESCE(excluded.phone, dialogs.phone),
+                provider = COALESCE(excluded.provider, dialogs.provider),
                 updated_at = excluded.updated_at
             """,
-            (account_id, int(peer_id), username, title, now, now),
+            (account_id, int(peer_id), username, title, phone, provider, now, now),
         )
         row = conn.execute(
             """
@@ -77,11 +120,15 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
     if (message.get("direction") or "in") != "in":
         raise ValueError("Нужно входящее")
     peer_id = message.get("telegram_user_id")
+    if peer_id is None and message.get("phone"):
+        digits = re.sub(r"\D", "", str(message["phone"]))
+        if len(digits) >= 7:
+            peer_id = int(digits[-12:])
     if peer_id is None:
         raise ValueError("Это не личный диалог")
-    account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
-    if account is None:
-        raise LookupError("account")
+    acc_provider = _account_provider(conn, account_id, require_exists=True)
+    provider = str(message.get("provider") or acc_provider or "telegram").strip().lower()
+    phone = _extract_dialog_phone(message, int(peer_id), provider)
     now = utc_now()
     title = (message.get("name") or "").strip()
     username = message.get("username")
@@ -93,20 +140,22 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
     conn.execute(
         """
         INSERT INTO dialogs (
-            account_id, peer_type, peer_id, username, title,
+            account_id, peer_type, peer_id, username, title, phone, provider,
             is_group, unread_count, last_message_at, last_message_preview,
             last_from_peer, muted, created_at, updated_at
-        ) VALUES (?, 'user', ?, ?, ?, 0, 1, ?, ?, 1, 0, ?, ?)
+        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 1, ?, ?, 1, 0, ?, ?)
         ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
             username = COALESCE(excluded.username, dialogs.username),
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
+            phone = COALESCE(excluded.phone, dialogs.phone),
+            provider = COALESCE(excluded.provider, dialogs.provider),
             unread_count = dialogs.unread_count + 1,
             last_message_at = excluded.last_message_at,
             last_message_preview = excluded.last_message_preview,
             last_from_peer = 1,
             updated_at = excluded.updated_at
         """,
-        (account_id, int(peer_id), username, title, sent_at, preview, now, now),
+        (account_id, int(peer_id), username, title, phone, provider, sent_at, preview, now, now),
     )
     row = conn.execute(
         """
@@ -140,9 +189,7 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
 
 
 def sync_inbox(conn, account_id: int, people: list) -> list:
-    account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
-    if account is None:
-        raise LookupError("account")
+    acc_provider = _account_provider(conn, account_id, require_exists=True)
     now = utc_now()
     saved = []
     try:
@@ -152,12 +199,18 @@ def sync_inbox(conn, account_id: int, people: list) -> list:
             if (person.get("peer_type") or "user") != "user":
                 continue
             peer_id = person.get("telegram_user_id")
+            if peer_id is None and person.get("phone"):
+                digits = re.sub(r"\D", "", str(person["phone"]))
+                if len(digits) >= 7:
+                    peer_id = int(digits[-12:])
             if peer_id is None:
                 continue
             title = (person.get("name") or "").strip()
             username = person.get("username")
             if username is not None:
                 username = str(username).strip().lstrip("@") or None
+            provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
+            phone = _extract_dialog_phone(person, int(peer_id), provider)
             unread = person.get("unread_count") if "unread_count" in person else None
             if unread is not None:
                 unread = max(0, int(unread))
@@ -173,13 +226,15 @@ def sync_inbox(conn, account_id: int, people: list) -> list:
             conn.execute(
                 """
                 INSERT INTO dialogs (
-                    account_id, peer_type, peer_id, username, title,
+                    account_id, peer_type, peer_id, username, title, phone, provider,
                     is_group, unread_count, last_message_at, last_message_preview,
                     last_from_peer, muted, created_at, updated_at
-                ) VALUES (?, 'user', ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
+                ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
                     username = COALESCE(excluded.username, dialogs.username),
                     title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
+                    phone = COALESCE(excluded.phone, dialogs.phone),
+                    provider = COALESCE(excluded.provider, dialogs.provider),
                     unread_count = COALESCE(?, dialogs.unread_count),
                     last_message_at = COALESCE(excluded.last_message_at, dialogs.last_message_at),
                     last_message_preview = COALESCE(excluded.last_message_preview, dialogs.last_message_preview),
@@ -191,6 +246,8 @@ def sync_inbox(conn, account_id: int, people: list) -> list:
                     int(peer_id),
                     username,
                     title,
+                    phone,
+                    provider,
                     0 if unread is None else unread,
                     sent_at,
                     preview,
@@ -222,6 +279,8 @@ def list_inbox(conn, account_id: int | None = None, q: str = "") -> list:
             """
             SELECT
                 d.*,
+                COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                d.phone AS phone,
                 a.phone AS account_phone,
                 COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
                 a.telegram_username AS account_username
@@ -241,6 +300,8 @@ def list_inbox(conn, account_id: int | None = None, q: str = "") -> list:
             """
             SELECT
                 d.*,
+                COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                d.phone AS phone,
                 a.phone AS account_phone,
                 COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
                 a.telegram_username AS account_username
@@ -259,16 +320,24 @@ def list_inbox(conn, account_id: int | None = None, q: str = "") -> list:
     if not needle:
         return found
     folded = needle.casefold()
-    return [
-        row for row in found
-        if folded in " ".join((
+    needle_digits = re.sub(r"\D", "", needle)
+    matched = []
+    for row in found:
+        phone_str = row.get("phone") or ""
+        phone_digits = re.sub(r"\D", "", phone_str)
+        blob = " ".join((
             row.get("name") or "",
             row.get("username") or "",
+            phone_str,
+            phone_digits,
             str(row.get("telegram_user_id") or ""),
             row.get("account_name") or "",
             row.get("account_phone") or "",
+            row.get("provider") or "",
         )).casefold()
-    ]
+        if folded in blob or (needle_digits and len(needle_digits) >= 3 and needle_digits in phone_digits):
+            matched.append(row)
+    return matched
 
 
 def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> dict:
@@ -280,17 +349,32 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
     now = utc_now()
 
     explicit_acc_id = int(account_id) if (account_id is not None and int(account_id) > 0) else None
+    explicit_acc = None
     if explicit_acc_id is not None:
         acc_check = conn.execute("SELECT * FROM accounts WHERE id = ?", (explicit_acc_id,)).fetchone()
         if acc_check is None:
             raise LookupError("account")
+        explicit_acc = as_dict(acc_check)
+
+    lead_provider = (lead.get("provider") or "telegram").strip().lower()
+    lead_phone = (lead.get("phone") or "").strip() or None
+    phone_digits = re.sub(r"\D", "", lead_phone or "")
+    wa_peer_id = int(phone_digits[-12:]) if (phone_digits and len(phone_digits) >= 7) else None
+
+    if explicit_acc is not None:
+        wanted_provider = (explicit_acc.get("provider") or "telegram").strip().lower()
+    else:
+        wanted_provider = lead_provider
 
     # 1. Try existing dialog on requested account (or any account if not specified)
     existing_dlg = None
     if explicit_acc_id is not None:
         existing_dlg = conn.execute(
             """
-            SELECT d.*, a.phone AS account_phone,
+            SELECT d.*,
+                   COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                   d.phone AS phone,
+                   a.phone AS account_phone,
                    COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
                    a.telegram_username AS account_username
             FROM dialogs d
@@ -300,6 +384,8 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
               AND (
                   d.lead_id = ?
                   OR (? IS NOT NULL AND d.peer_id = ?)
+                  OR (? IS NOT NULL AND d.peer_id = ?)
+                  OR (? IS NOT NULL AND d.phone IS NOT NULL AND d.phone = ?)
                   OR (? IS NOT NULL AND d.username IS NOT NULL AND lower(d.username) = lower(?))
               )
             ORDER BY d.id LIMIT 1
@@ -309,6 +395,10 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
                 lid,
                 lead.get("telegram_user_id"),
                 lead.get("telegram_user_id"),
+                wa_peer_id,
+                wa_peer_id,
+                lead_phone,
+                lead_phone,
                 lead.get("username"),
                 lead.get("username"),
             ),
@@ -316,25 +406,36 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
     else:
         existing_dlg = conn.execute(
             """
-            SELECT d.*, a.phone AS account_phone,
+            SELECT d.*,
+                   COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                   d.phone AS phone,
+                   a.phone AS account_phone,
                    COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
                    a.telegram_username AS account_username
             FROM dialogs d
             JOIN accounts a ON a.id = d.account_id
             WHERE d.peer_type = 'user'
+              AND COALESCE(d.provider, a.provider, 'telegram') = ?
               AND (
                   d.id = ?
                   OR d.lead_id = ?
                   OR (? IS NOT NULL AND d.peer_id = ?)
+                  OR (? IS NOT NULL AND d.peer_id = ?)
+                  OR (? IS NOT NULL AND d.phone IS NOT NULL AND d.phone = ?)
                   OR (? IS NOT NULL AND d.username IS NOT NULL AND lower(d.username) = lower(?))
               )
             ORDER BY (d.lead_id = ?) DESC, d.id LIMIT 1
             """,
             (
+                wanted_provider,
                 lead.get("dialog_id") or -1,
                 lid,
                 lead.get("telegram_user_id"),
                 lead.get("telegram_user_id"),
+                wa_peer_id,
+                wa_peer_id,
+                lead_phone,
+                lead_phone,
                 lead.get("username"),
                 lead.get("username"),
                 lid,
@@ -343,12 +444,24 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
 
     if existing_dlg is not None:
         dlg_id = int(existing_dlg["id"])
-        conn.execute("UPDATE dialogs SET lead_id = ? WHERE id = ?", (lid, dlg_id))
+        conn.execute(
+            """
+            UPDATE dialogs
+            SET lead_id = ?,
+                phone = COALESCE(phone, ?),
+                provider = COALESCE(provider, ?)
+            WHERE id = ?
+            """,
+            (lid, lead_phone, wanted_provider, dlg_id),
+        )
         conn.execute("UPDATE leads SET dialog_id = ? WHERE id = ?", (dlg_id, lid))
         conn.commit()
         refreshed = conn.execute(
             """
-            SELECT d.*, a.phone AS account_phone,
+            SELECT d.*,
+                   COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                   d.phone AS phone,
+                   a.phone AS account_phone,
                    COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
                    a.telegram_username AS account_username
             FROM dialogs d
@@ -363,8 +476,22 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
     target_acc_id = explicit_acc_id
     if target_acc_id is None and lead.get("account_id"):
         acc_row = conn.execute(
-            "SELECT id FROM accounts WHERE id = ? AND status = 'connected'",
+            "SELECT * FROM accounts WHERE id = ? AND status = 'connected'",
             (int(lead["account_id"]),),
+        ).fetchone()
+        if acc_row:
+            target_acc_id = int(acc_row["id"])
+    if target_acc_id is None:
+        acc_row = conn.execute(
+            "SELECT id FROM accounts WHERE status = 'connected' AND COALESCE(provider, 'telegram') = ? ORDER BY id LIMIT 1",
+            (wanted_provider,),
+        ).fetchone()
+        if acc_row:
+            target_acc_id = int(acc_row["id"])
+    if target_acc_id is None:
+        acc_row = conn.execute(
+            "SELECT id FROM accounts WHERE COALESCE(provider, 'telegram') = ? ORDER BY id LIMIT 1",
+            (wanted_provider,),
         ).fetchone()
         if acc_row:
             target_acc_id = int(acc_row["id"])
@@ -381,29 +508,47 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
     if target_acc_id is None:
         raise ValueError("Подключите хотя бы один Telegram-аккаунт для открытия чата")
 
-    peer_id = int(lead.get("telegram_user_id") or (900000 + lid))
+    acc_provider = _account_provider(conn, target_acc_id)
+    is_whatsapp = (wanted_provider == "whatsapp" or acc_provider == "whatsapp")
+    dialog_provider = "whatsapp" if is_whatsapp else "telegram"
+
+    if dialog_provider == "whatsapp":
+        if wa_peer_id is not None:
+            peer_id = wa_peer_id
+        elif lead.get("telegram_user_id"):
+            peer_id = int(lead["telegram_user_id"])
+        else:
+            peer_id = 900000 + lid
+    else:
+        peer_id = int(lead.get("telegram_user_id") or (900000 + lid))
+
     username = (lead.get("username") or "").strip().lstrip("@") or None
-    title = (lead.get("name") or "").strip() or username or lead.get("phone") or f"Лид #{lid}"
+    title = (lead.get("name") or "").strip() or username or lead_phone or f"Лид #{lid}"
     preview = (lead.get("note") or lead.get("description") or "Контакт из CRM · готов к диалогу")[:120]
 
     conn.execute(
         """
         INSERT INTO dialogs (
-            account_id, peer_type, peer_id, username, title,
+            account_id, peer_type, peer_id, username, title, phone, provider,
             is_group, unread_count, last_message_at, last_message_preview,
             last_from_peer, muted, lead_id, created_at, updated_at
-        ) VALUES (?, 'user', ?, ?, ?, 0, 0, ?, ?, 0, 0, ?, ?, ?)
+        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 0, ?, ?, ?)
         ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
             username = COALESCE(excluded.username, dialogs.username),
             title = CASE WHEN dialogs.title IS NULL OR dialogs.title = '' THEN excluded.title ELSE dialogs.title END,
+            phone = COALESCE(excluded.phone, dialogs.phone),
+            provider = COALESCE(excluded.provider, dialogs.provider),
             lead_id = excluded.lead_id,
             updated_at = excluded.updated_at
         """,
-        (target_acc_id, peer_id, username, title, now, preview, lid, now, now),
+        (target_acc_id, peer_id, username, title, lead_phone, dialog_provider, now, preview, lid, now, now),
     )
     created_row = conn.execute(
         """
-        SELECT d.*, a.phone AS account_phone,
+        SELECT d.*,
+               COALESCE(d.provider, a.provider, 'telegram') AS provider,
+               d.phone AS phone,
+               a.phone AS account_phone,
                COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
                a.telegram_username AS account_username
         FROM dialogs d
@@ -419,10 +564,11 @@ def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> di
         SET dialog_id = ?,
             account_id = COALESCE(account_id, ?),
             telegram_user_id = COALESCE(telegram_user_id, ?),
+            provider = COALESCE(provider, ?),
             updated_at = ?
         WHERE id = ?
         """,
-        (dlg_id, target_acc_id, peer_id, now, lid),
+        (dlg_id, target_acc_id, peer_id, dialog_provider, now, lid),
     )
     conn.commit()
     return _public(created_row)

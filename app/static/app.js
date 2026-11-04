@@ -458,6 +458,25 @@ function initials(name) {
   return letters ? letters.toUpperCase() : "?";
 }
 
+function normalizeProvider(raw) {
+  return String(raw || "telegram").trim().toLowerCase() === "whatsapp" ? "whatsapp" : "telegram";
+}
+
+function channelBadgeHtml(provider) {
+  const isWa = normalizeProvider(provider) === "whatsapp";
+  return isWa
+    ? '<span class="channel-badge channel-wa" title="WhatsApp">WA</span>'
+    : '<span class="channel-badge channel-tg" title="Telegram">TG</span>';
+}
+
+function channelBadgeEl(provider) {
+  const isWa = normalizeProvider(provider) === "whatsapp";
+  return el("span", {
+    className: `channel-badge ${isWa ? "channel-wa" : "channel-tg"}`,
+    title: isWa ? "WhatsApp" : "Telegram",
+  }, [isWa ? "WA" : "TG"]);
+}
+
 function statusSelect(lead, className) {
   const select = el("select", {
     "aria-label": "Статус",
@@ -555,8 +574,24 @@ function bucket(reminder) {
 
 function resumeLogin(account) {
   state.loginId = account.id;
-  document.querySelector("#code-form").hidden = account.status !== "pending_code";
-  document.querySelector("#password-form").hidden = account.status !== "pending_password";
+  if (normalizeProvider(account.provider) === "whatsapp") {
+    waCurrentAccountId = account.id;
+    waCurrentPairingCode = account.pairing_code || generateWaPairingCode(account.phone);
+    switchAuthTab("whatsapp");
+    const pairingBox = document.querySelector("#wa-pairing-box");
+    const codePanel = document.querySelector("#wa-code-panel");
+    const qrPanel = document.querySelector("#wa-qr-panel");
+    const codeDisplay = document.querySelector("#wa-pairing-code-display");
+    const qrImage = document.querySelector("#wa-qr-image");
+    if (pairingBox) pairingBox.hidden = false;
+    if (codePanel) codePanel.hidden = false;
+    if (qrPanel) qrPanel.hidden = false;
+    if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode;
+    if (qrImage) qrImage.src = account.qr_code || account.qr_svg || DEFAULT_WA_QR_SVG;
+  } else {
+    document.querySelector("#code-form").hidden = account.status !== "pending_code";
+    document.querySelector("#password-form").hidden = account.status !== "pending_password";
+  }
   if (state.viewMode === "sheet") openSheetPopup("login");
 }
 
@@ -604,7 +639,8 @@ function accountWord(count) {
 function accountConnectionLabel(account) {
   if (account.connection_label) return account.connection_label;
   if (account.is_demo) return "Демо-профиль (локально)";
-  if (account.status === "connected") return "Подключён · MTProto активен";
+  const isWa = normalizeProvider(account.provider) === "whatsapp";
+  if (account.status === "connected") return isWa ? "Подключён · WhatsApp Web активен" : "Подключён · MTProto активен";
   if (account.status === "pending_code") return "Не подключён · ждёт код";
   if (account.status === "pending_password") return "Не подключён · ждёт пароль";
   return "Сессия слетела · нужен вход";
@@ -682,6 +718,7 @@ function renderAccounts() {
     const identityBlock = el("div", { className: "account-identity" }, [
       el("div", { className: "account-title-line" }, [
         el("span", { className: "conn-dot", "data-conn": connState, "aria-hidden": "true" }, []),
+        channelBadgeEl(account.provider),
         el("span", { className: "name" }, [label]),
         subParts.length ? el("span", { className: "hint" }, [subParts.join(" · ")]) : null,
       ].filter(Boolean)),
@@ -852,11 +889,13 @@ function fillCampaignAccounts() {
     return;
   }
   connected.forEach((account) => {
+    const isWa = normalizeProvider(account.provider) === "whatsapp";
+    const prefix = isWa ? "[WA]" : "[TG]";
     const label = account.telegram_name || account.telegram_username || account.phone;
     const sent = Number(account.sent_today) || 0;
     const limit = Number(account.daily_limit) || 20;
     select.append(
-      el("option", { value: String(account.id) }, [`${label} (${sent}/${limit} сегодня)`]),
+      el("option", { value: String(account.id) }, [`${prefix} ${label} (${sent}/${limit} сегодня)`]),
     );
   });
   if (previous && [...select.options].some((opt) => opt.value === previous)) {
@@ -877,6 +916,8 @@ function fillCampaignAccounts() {
   if (poolHost) {
     connected.forEach((account) => {
       const accId = Number(account.id);
+      const isWa = normalizeProvider(account.provider) === "whatsapp";
+      const prefix = isWa ? "[WA]" : "[TG]";
       const label = account.telegram_name || account.telegram_username || account.phone;
       const sent = Number(account.sent_today) || 0;
       const limit = Number(account.daily_limit) || 20;
@@ -897,7 +938,8 @@ function fillCampaignAccounts() {
       poolHost.append(
         el("label", { className: "pool-check-chip" }, [
           checkbox,
-          el("span", { className: "pool-check-name" }, [label]),
+          channelBadgeEl(account.provider),
+          el("span", { className: "pool-check-name" }, [`${prefix} ${label}`]),
           el("span", { className: "pool-check-meta" }, [`${sent}/${limit}`]),
         ]),
       );
@@ -1130,6 +1172,8 @@ function renderCampaigns() {
 
     const poolChecks = connectedAccounts.map((account) => {
       const accId = Number(account.id);
+      const isWa = normalizeProvider(account.provider) === "whatsapp";
+      const prefix = isWa ? "[WA]" : "[TG]";
       const accLabel = account.telegram_name || account.telegram_username || account.phone;
       const box = el("input", {
         type: "checkbox",
@@ -1144,7 +1188,8 @@ function renderCampaigns() {
       });
       return el("label", { className: "pool-check-chip" }, [
         box,
-        el("span", { className: "pool-check-name" }, [accLabel]),
+        channelBadgeEl(account.provider),
+        el("span", { className: "pool-check-name" }, [`${prefix} ${accLabel}`]),
         el("span", { className: "pool-check-meta" }, [`${Number(account.sent_today) || 0}/${Number(account.daily_limit) || 20}`]),
       ]);
     });
@@ -1169,7 +1214,13 @@ function renderCampaigns() {
       connectedAccounts.length > 1 ? attachAllBtn : null,
     ].filter(Boolean));
 
+    const campProviders = attachedAccounts.length
+      ? [...new Set(attachedAccounts.map((acc) => normalizeProvider(acc.provider)))]
+      : ["telegram"];
+    const channelBadges = campProviders.map((prov) => channelBadgeEl(prov));
+
     const badgeNodes = [
+      ...channelBadges,
       el("span", { className: `badge ${statusPair[1]}` }, [statusPair[0]]),
       el("span", { className: "badge b-new" }, [poolSummaryLabel]),
       el("span", { className: "badge b-talk" }, [
@@ -1441,6 +1492,8 @@ function renderInboxSessionSwitcher() {
 
   connected.forEach((account) => {
     const key = String(account.id);
+    const isWa = normalizeProvider(account.provider) === "whatsapp";
+    const prefix = isWa ? "WA" : "TG";
     const uname = account.telegram_username || account.username;
     const label = uname ? `@${uname}` : (account.telegram_name || account.phone || `#${account.id}`);
     const pill = el("button", {
@@ -1449,7 +1502,7 @@ function renderInboxSessionSwitcher() {
       "data-session-filter": key,
       "aria-pressed": activeKey === key ? "true" : "false",
       onclick: () => switchInboxSession(key),
-    }, [label]);
+    }, [`${prefix} · ${label}`]);
     host.append(pill);
   });
 
@@ -1459,8 +1512,9 @@ function renderInboxSessionSwitcher() {
     } else {
       const found = connected.find((acc) => String(acc.id) === activeKey);
       const foundUname = found && (found.telegram_username || found.username);
+      const foundPrefix = found && normalizeProvider(found.provider) === "whatsapp" ? "WA" : "TG";
       badge.textContent = found
-        ? `Сессия: ${foundUname ? `@${foundUname}` : (found.telegram_name || found.phone)}`
+        ? `Сессия: ${foundPrefix} · ${foundUname ? `@${foundUname}` : (found.telegram_name || found.phone)}`
         : "Активная сессия";
     }
   }
@@ -1522,20 +1576,26 @@ function renderDialogs() {
   list.replaceChildren();
   matched.forEach((dialog) => {
     const name = dialog.name || "Без имени";
-    const user = dialog.username ? `@${dialog.username}` : "без ника";
+    const ownerAcc = (state.accounts || []).find((acc) => Number(acc.id) === Number(dialog.account_id))
+      || selectedAccount();
+    const provider = normalizeProvider(dialog.provider || (ownerAcc && ownerAcc.provider) || "telegram");
+    const user = dialog.username
+      ? `@${dialog.username}`
+      : (provider === "whatsapp" && dialog.phone ? dialog.phone : "без ника");
     const sub = dialog.last_message_preview ? `${user} · ${dialog.last_message_preview}` : user;
     const current = state.selectedDialog
       && state.selectedDialog.telegram_user_id === dialog.telegram_user_id;
-    const ownerAcc = (state.accounts || []).find((acc) => Number(acc.id) === Number(dialog.account_id))
-      || selectedAccount();
     const ownerUname = ownerAcc && (ownerAcc.telegram_username || ownerAcc.username);
     const sessionTag = ownerAcc
       ? el("span", { className: "dialog-session-pill" }, [
-        ownerUname ? `@${ownerUname}` : (ownerAcc.telegram_name || ownerAcc.phone || `TG #${ownerAcc.id}`),
+        ownerUname ? `@${ownerUname}` : (ownerAcc.telegram_name || ownerAcc.phone || `#${ownerAcc.id}`),
       ])
       : null;
     const who = el("span", {}, [
-      el("span", { className: "name" }, [name]),
+      el("span", { className: "dialog-name-row" }, [
+        channelBadgeEl(provider),
+        el("span", { className: "name" }, [name]),
+      ]),
       el("span", { className: "preview" }, [sub]),
       sessionTag,
     ].filter(Boolean));
@@ -1577,10 +1637,19 @@ function renderThread() {
   }
   setView("#thread-view", "filled");
   const name = dialog.name || "Без имени";
+  const ownerAcc = (state.accounts || []).find((acc) => Number(acc.id) === Number(dialog.account_id))
+    || selectedAccount();
+  const provider = normalizeProvider(dialog.provider || (ownerAcc && ownerAcc.provider) || "telegram");
+  const contactHint = dialog.username
+    ? `@${dialog.username}${dialog.phone ? ` · ${dialog.phone}` : ""}`
+    : (dialog.phone || "без ника");
   document.querySelector("#thread-head").replaceChildren(
-    el("h3", { className: "name" }, [name]),
+    el("div", { className: "thread-title-group" }, [
+      channelBadgeEl(provider),
+      el("h3", { className: "name" }, [name]),
+    ]),
     el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
-    el("p", { className: "hint" }, [dialog.username ? `@${dialog.username}` : "без ника"]),
+    el("p", { className: "hint" }, [contactHint]),
   );
   const items = state.messages || [];
   document.querySelector("#messages").replaceChildren(...items.map((message) => (
@@ -1653,11 +1722,19 @@ function renderSide() {
   state.selectedLeadId = lead.id;
   const badge = BADGE[lead.status] || "b-new";
   const label = (STATUSES.find(([value]) => value === lead.status) || ["", lead.status])[1];
+  const provider = normalizeProvider(lead.provider || dialog.provider || "telegram");
+  const handleParts = [
+    lead.username ? `@${lead.username}` : (provider === "whatsapp" && lead.phone ? lead.phone : "без ника"),
+  ];
+  if (lead.phone && handleParts[0] !== lead.phone) handleParts.push(lead.phone);
   document.querySelector("#side-card").replaceChildren(
     el("div", { className: "panel" }, [
       el("h3", { className: "name" }, [lead.name || "Без имени"]),
-      el("span", { className: `badge ${badge}` }, [label]),
-      el("p", { className: "hint" }, [lead.username ? `@${lead.username}` : "без ника"]),
+      el("div", { className: "row" }, [
+        channelBadgeEl(provider),
+        el("span", { className: `badge ${badge}` }, [label]),
+      ]),
+      el("p", { className: "hint" }, [handleParts.join(" · ")]),
       el("p", { className: "note" }, [sideNoteText(lead)]),
       el("p", { className: "hint" }, [lead.next_step ? `Дальше: ${lead.next_step}` : "Следующий шаг не задан"]),
       el("a", {
@@ -2019,9 +2096,14 @@ function paintCard(lead) {
     ? el("ol", { className: "timeline" }, notes)
     : el("p", { className: "hint" }, ["Заметок пока нет"]);
   const href = safeHref(lead.url);
+  const provider = normalizeProvider(lead.provider || "telegram");
   const profile = [
-    el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
+    el("div", { className: "row" }, [
+      channelBadgeEl(provider),
+      el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
+    ]),
     el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
+    el("label", {}, ["Телефон", textField(lead, "phone", "Телефон")]),
     el("label", {}, ["Статус", statusSelect(lead)]),
     el("p", { id: "card-folder" }, [
       lead.folder_name ? `Папка: ${lead.folder_name}` : "Папка не задана",
@@ -2061,15 +2143,17 @@ function paintCard(lead) {
 }
 
 function pipelineFilters() {
+  const channelNode = document.querySelector("#channel-filter");
   return {
     status: document.querySelector("#stage-filter").value,
     folderId: document.querySelector("#folder-filter").value,
+    channel: channelNode ? channelNode.value : "",
   };
 }
 
 function updateFilterNote() {
-  const { status, folderId } = pipelineFilters();
-  const on = Boolean(status || folderId || state.leadQuery);
+  const { status, folderId, channel } = pipelineFilters();
+  const on = Boolean(status || folderId || channel || state.leadQuery);
   document.querySelector("#filter-note").hidden = !on;
   document.querySelector("#board").dataset.filtered = on ? "true" : "false";
 }
@@ -2153,6 +2237,8 @@ async function savePipelineView() {
 async function resetPipelineView() {
   document.querySelector("#stage-filter").value = "";
   document.querySelector("#folder-filter").value = "";
+  const channelNode = document.querySelector("#channel-filter");
+  if (channelNode) channelNode.value = "";
   document.querySelector("#saved-view").value = "";
   document.querySelector("#view-name").value = "";
   if (state.mode === "crm") {
@@ -2200,7 +2286,7 @@ function updateWorkspaceStats() {
 }
 
 function renderBoard() {
-  const { status: stage, folderId } = pipelineFilters();
+  const { status: stage, folderId, channel } = pipelineFilters();
   const board = document.querySelector("#board");
   board.replaceChildren();
   STATUSES.forEach(([value, label]) => {
@@ -2208,13 +2294,17 @@ function renderBoard() {
       if (lead.status !== value) return false;
       if (stage && stage !== value) return false;
       if (folderId && String(lead.folder_id || "") !== folderId) return false;
+      if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
       return true;
     });
     const items = cards.length
       ? cards.map((lead) => {
         const current = lead.id === state.selectedLeadId;
         const nameText = lead.name || "Без имени";
-        const userText = lead.username ? `@${lead.username}` : "без ника";
+        const provider = normalizeProvider(lead.provider || "telegram");
+        const userText = lead.username
+          ? `@${lead.username}`
+          : (provider === "whatsapp" && lead.phone ? lead.phone : "без ника");
         const bodyNodes = [
           el("span", { className: "card-top" }, [
             el("span", { className: "name" }, [nameText]),
@@ -2228,6 +2318,7 @@ function renderBoard() {
         }
         const folderTitle = folderTitleById(lead.folder_id);
         const tagNodes = [
+          channelBadgeEl(provider),
           el("span", { className: "card-pill" }, [folderTitle || label]),
         ];
         if (lead.phone) {
@@ -2311,7 +2402,16 @@ function reminderForm(lead) {
 function renderLeadTable() {
   const body = document.querySelector("#lead-rows");
   body.replaceChildren();
-  state.leads.forEach((lead) => {
+  const { channel } = pipelineFilters();
+  const filteredLeads = state.leads.filter((lead) => {
+    if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
+    return true;
+  });
+  filteredLeads.forEach((lead) => {
+    const provider = normalizeProvider(lead.provider || "telegram");
+    const contactText = lead.username
+      ? `@${lead.username}`
+      : (provider === "whatsapp" && lead.phone ? lead.phone : "");
     const row = el("tr", {
       onclick: () => {
         state.selectedLeadId = lead.id;
@@ -2319,8 +2419,13 @@ function renderLeadTable() {
         renderBoard();
       },
     }, [
-      el("td", {}, [textField(lead, "name", "Имя")]),
-      el("td", {}, [lead.username ? `@${lead.username}` : ""]),
+      el("td", {}, [
+        el("div", { className: "lead-name-cell" }, [
+          channelBadgeEl(provider),
+          textField(lead, "name", "Имя"),
+        ]),
+      ]),
+      el("td", {}, [contactText]),
       el("td", { className: "num" }, [lead.telegram_user_id ?? ""]),
       el("td", { className: "num" }, [lead.phone || ""]),
       el("td", {}, [statusSelect(lead)]),
@@ -2565,7 +2670,7 @@ async function loadInbox() {
   state.dialogQuery = "";
   state.inbox = "filled";
   renderDialogs();
-  openInboxLive(select.value);
+  openInboxLive(targetAccountId);
 }
 
 async function searchTelegram(query) {
@@ -2659,14 +2764,20 @@ document.querySelector("#bot-login").addEventListener("click", async () => {
 
 function switchAuthTab(mode) {
   const isSession = mode === "session";
+  const isWhatsapp = mode === "whatsapp";
+  const isPhone = !isSession && !isWhatsapp;
   const btnPhone = document.querySelector("#auth-tab-btn-phone");
   const btnSession = document.querySelector("#auth-tab-btn-session");
+  const btnWhatsapp = document.querySelector("#auth-tab-btn-whatsapp");
   const panePhone = document.querySelector("#auth-pane-phone");
   const paneSession = document.querySelector("#auth-pane-session");
-  if (btnPhone) btnPhone.setAttribute("aria-selected", isSession ? "false" : "true");
+  const paneWhatsapp = document.querySelector("#auth-pane-whatsapp");
+  if (btnPhone) btnPhone.setAttribute("aria-selected", isPhone ? "true" : "false");
   if (btnSession) btnSession.setAttribute("aria-selected", isSession ? "true" : "false");
-  if (panePhone) panePhone.hidden = isSession;
+  if (btnWhatsapp) btnWhatsapp.setAttribute("aria-selected", isWhatsapp ? "true" : "false");
+  if (panePhone) panePhone.hidden = !isPhone;
   if (paneSession) paneSession.hidden = !isSession;
+  if (paneWhatsapp) paneWhatsapp.hidden = !isWhatsapp;
 }
 
 const authTabBtnPhone = document.querySelector("#auth-tab-btn-phone");
@@ -2677,6 +2788,129 @@ if (authTabBtnPhone) {
 const authTabBtnSession = document.querySelector("#auth-tab-btn-session");
 if (authTabBtnSession) {
   authTabBtnSession.addEventListener("click", () => switchAuthTab("session"));
+}
+
+const authTabBtnWhatsapp = document.querySelector("#auth-tab-btn-whatsapp");
+if (authTabBtnWhatsapp) {
+  authTabBtnWhatsapp.addEventListener("click", () => switchAuthTab("whatsapp"));
+}
+
+const DEFAULT_WA_QR_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><rect width="160" height="160" rx="12" fill="#ffffff"/><rect x="16" y="16" width="40" height="40" fill="none" stroke="#065f46" stroke-width="6"/><rect x="28" y="28" width="16" height="16" fill="#065f46"/><rect x="104" y="16" width="40" height="40" fill="none" stroke="#065f46" stroke-width="6"/><rect x="116" y="28" width="16" height="16" fill="#065f46"/><rect x="16" y="104" width="40" height="40" fill="none" stroke="#065f46" stroke-width="6"/><rect x="28" y="116" width="16" height="16" fill="#065f46"/><rect x="70" y="24" width="16" height="16" fill="#065f46"/><rect x="70" y="64" width="24" height="24" fill="#065f46"/><rect x="104" y="76" width="20" height="16" fill="#065f46"/><rect x="72" y="108" width="16" height="28" fill="#065f46"/><rect x="108" y="108" width="28" height="28" fill="#065f46"/></svg>'
+);
+
+let waCurrentAccountId = null;
+let waCurrentPairingCode = "";
+
+function generateWaPairingCode(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  const tail = (digits.slice(-4) || "9201").padStart(4, "0"); // taste-skill-ignore
+  return `WA84-${tail}`;
+}
+
+async function startWhatsappLogin(mode) {
+  showError(null);
+  const phoneInput = document.querySelector("#wa-phone-input");
+  const proxyInput = document.querySelector("#wa-proxy-input");
+  const scopeSelect = document.querySelector("#wa-scope-select");
+  const rawPhone = (phoneInput && phoneInput.value.trim()) || "";
+  if (mode === "code" && !rawPhone) {
+    toast("Укажите номер телефона WhatsApp", "error");
+    if (phoneInput) phoneInput.focus();
+    return;
+  }
+  const phone = rawPhone || "+79990001122";
+  const proxyUrl = (proxyInput && proxyInput.value.trim()) || null;
+  const accessScope = (scopeSelect && scopeSelect.value) || "workspace";
+  const btn = mode === "qr" ? document.querySelector("#wa-qr-btn") : document.querySelector("#wa-code-btn");
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+  }
+  try {
+    const res = await api("/api/accounts/start", {
+      method: "POST",
+      body: {
+        phone,
+        provider: "whatsapp",
+        auth_mode: mode,
+        proxy_url: proxyUrl,
+        access_scope: accessScope,
+      },
+    });
+    waCurrentAccountId = res.id;
+    state.loginId = res.id;
+    waCurrentPairingCode = res.pairing_code || generateWaPairingCode(phone);
+    const pairingBox = document.querySelector("#wa-pairing-box");
+    const codePanel = document.querySelector("#wa-code-panel");
+    const qrPanel = document.querySelector("#wa-qr-panel");
+    const codeDisplay = document.querySelector("#wa-pairing-code-display");
+    const qrImage = document.querySelector("#wa-qr-image");
+    if (pairingBox) pairingBox.hidden = false;
+    if (codePanel) codePanel.hidden = false;
+    if (qrPanel) qrPanel.hidden = false;
+    if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode;
+    if (qrImage) qrImage.src = res.qr_code || res.qr_svg || res.qr_url || DEFAULT_WA_QR_SVG;
+    await loadAccounts();
+  } catch (error) {
+    showError(error);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+    }
+  }
+}
+
+const waCodeBtn = document.querySelector("#wa-code-btn");
+if (waCodeBtn) {
+  waCodeBtn.addEventListener("click", () => startWhatsappLogin("code"));
+}
+
+const waQrBtn = document.querySelector("#wa-qr-btn");
+if (waQrBtn) {
+  waQrBtn.addEventListener("click", () => startWhatsappLogin("qr"));
+}
+
+const waLoginForm = document.querySelector("#wa-login-form");
+if (waLoginForm) {
+  waLoginForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    startWhatsappLogin("code");
+  });
+}
+
+const waConfirmBtn = document.querySelector("#wa-confirm-btn");
+if (waConfirmBtn) {
+  waConfirmBtn.addEventListener("click", async () => {
+    const targetId = waCurrentAccountId || state.loginId;
+    if (!targetId) {
+      toast("Сначала запросите код или QR-код", "error");
+      return;
+    }
+    waConfirmBtn.disabled = true;
+    waConfirmBtn.setAttribute("aria-busy", "true");
+    try {
+      await api(`/api/accounts/${targetId}/code`, {
+        method: "POST",
+        body: {
+          code: waCurrentPairingCode || "qr",
+          provider: "whatsapp",
+        },
+      });
+      const pairingBox = document.querySelector("#wa-pairing-box");
+      if (pairingBox) pairingBox.hidden = true;
+      await loadAccounts();
+      await loadInbox();
+      closeSheetPopup();
+      toast("Аккаунт WhatsApp подключён", "ok");
+    } catch (error) {
+      showError(error);
+    } finally {
+      waConfirmBtn.disabled = false;
+      waConfirmBtn.removeAttribute("aria-busy");
+    }
+  });
 }
 
 const openSessionImportPopupBtn = document.querySelector("#open-session-import-popup");
@@ -2764,6 +2998,7 @@ if (importSessionBtn) {
   importSessionBtn.addEventListener("click", async () => {
     const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
     const rawJson = (area && area.value.trim()) || "";
+    const provider = document.querySelector("#session-provider-select")?.value || "telegram";
     const proxy = document.querySelector("#session-proxy-select")?.value
       || document.querySelector("#account-proxy-select")?.value
       || "auto";
@@ -2790,11 +3025,13 @@ if (importSessionBtn) {
       const bodyPayload = Array.isArray(parsed)
         ? {
           sessions: parsed,
+          provider,
           proxy_url: proxy,
           access_scope: access,
         }
         : {
           ...parsed,
+          provider,
           json_data: parsed,
           filename: uploadedSessionFilename || parsed.session_file || "session.json",
           proxy_url: proxy,
@@ -3269,17 +3506,20 @@ document.querySelector("#manual-lead").addEventListener("submit", async (event) 
   const button = event.target.querySelector("button[type=submit]");
   button.disabled = true;
   try {
+    const provider = form.get("provider") || "telegram";
     const lead = await api("/api/leads", {
       method: "POST",
       body: {
         name: form.get("name"),
         username: form.get("username"),
         phone: form.get("phone"),
+        provider,
         note: form.get("note"),
         url: form.get("url"),
         email: form.get("email"),
       },
     });
+    if (!lead.provider) lead.provider = provider;
     event.target.reset();
     state.leadCache[lead.id] = lead;
     await loadLeads(state.leadQuery, lead.id);
@@ -3343,6 +3583,15 @@ document.querySelector("#folder-filter").addEventListener("change", () => {
   document.querySelector("#saved-view").value = "";
   renderBoard();
 });
+
+const channelFilterSelect = document.querySelector("#channel-filter");
+if (channelFilterSelect) {
+  channelFilterSelect.addEventListener("change", () => {
+    document.querySelector("#saved-view").value = "";
+    renderBoard();
+    renderLeadTable();
+  });
+}
 
 document.querySelector("#save-view").addEventListener("click", () => {
   savePipelineView()

@@ -93,6 +93,12 @@ def _upsert_contact_to_crm(
     description: str | None = None,
     now: str,
 ) -> tuple[int, bool]:
+    provider = "telegram"
+    if account_id is not None:
+        acc_row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+        if acc_row is not None:
+            provider = (as_dict(acc_row).get("provider") or "telegram").strip().lower()
+
     existing = conn.execute(
         "SELECT * FROM leads WHERE telegram_user_id = ? ORDER BY id LIMIT 1",
         (int(telegram_user_id),),
@@ -129,8 +135,8 @@ def _upsert_contact_to_crm(
             """
             INSERT INTO leads (
                 account_id, telegram_user_id, username, name, phone,
-                status, note, next_step, created_at, updated_at, description
-            ) VALUES (?, ?, ?, ?, ?, 'new', ?, 'Написать первое сообщение', ?, ?, ?)
+                status, note, next_step, created_at, updated_at, description, provider
+            ) VALUES (?, ?, ?, ?, ?, 'new', ?, 'Написать первое сообщение', ?, ?, ?, ?)
             """,
             (
                 account_id,
@@ -142,6 +148,7 @@ def _upsert_contact_to_crm(
                 now,
                 now,
                 description,
+                provider,
             ),
         )
         lead_id = int(cur.lastrowid)
@@ -151,17 +158,19 @@ def _upsert_contact_to_crm(
         conn.execute(
             """
             INSERT INTO dialogs (
-                account_id, peer_type, peer_id, username, title,
+                account_id, peer_type, peer_id, username, title, phone, provider,
                 is_group, unread_count, last_from_peer, muted, lead_id,
                 created_at, updated_at
-            ) VALUES (?, 'user', ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)
             ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
                 username = COALESCE(excluded.username, dialogs.username),
                 title = CASE WHEN dialogs.title IS NULL OR dialogs.title = '' THEN excluded.title ELSE dialogs.title END,
+                phone = COALESCE(excluded.phone, dialogs.phone),
+                provider = COALESCE(excluded.provider, dialogs.provider),
                 lead_id = COALESCE(dialogs.lead_id, excluded.lead_id),
                 updated_at = excluded.updated_at
             """,
-            (account_id, int(telegram_user_id), username, name, lead_id, now, now),
+            (account_id, int(telegram_user_id), username, name, phone, provider, lead_id, now, now),
         )
         dlg_row = conn.execute(
             "SELECT id FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?",

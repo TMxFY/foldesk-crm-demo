@@ -59,6 +59,9 @@ HEADER_ALIASES = {
     "tel": "phone",
     "телефон": "phone",
     "номер": "phone",
+    "whatsapp": "phone",
+    "wa": "phone",
+    "wa_phone": "phone",
     "company": "company",
     "org": "company",
     "компания": "company",
@@ -249,6 +252,16 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None) -> in
                 WHERE account_id = ? AND lead_id = ?
                 """,
                 (account_id, int(rec["lead_id"])),
+            ).fetchone()
+        if dialog is None and rec.get("phone"):
+            phone_digits = re.sub(r"\D", "", str(rec["phone"]))
+            peer_cand = int(phone_digits[-12:]) if phone_digits and len(phone_digits) >= 7 else -1
+            dialog = conn.execute(
+                """
+                SELECT last_from_peer, last_message_at FROM dialogs
+                WHERE account_id = ? AND peer_type = 'user' AND (phone = ? OR peer_id = ?)
+                """,
+                (account_id, rec["phone"], peer_cand),
             ).fetchone()
         if dialog and int(dialog["last_from_peer"] or 0) == 1:
             conn.execute(
@@ -718,7 +731,20 @@ def _parse_csv_rows(csv_text: str, column_mapping: dict | None = None) -> list[d
     return parsed
 
 
+def _account_provider(conn, account_id: int | None) -> str:
+    if account_id is None:
+        return "telegram"
+    row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+    if row is None:
+        return "telegram"
+    prov = (as_dict(row).get("provider") or "telegram").strip().lower()
+    return prov if prov in ("telegram", "whatsapp") else "telegram"
+
+
 def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) -> tuple[int, int]:
+    provider = str(item.get("provider") or _account_provider(conn, account_id) or "telegram").strip().lower()
+    if provider not in ("telegram", "whatsapp"):
+        provider = "telegram"
     username = _clean_handle(item.get("username"))
     company = _clean_company_title(item.get("company"))
     name = (item.get("name") or "").strip() or None
@@ -740,6 +766,10 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
             tg_id = int(str(tg_id_raw).strip())
         except ValueError:
             tg_id = None
+    if tg_id is None and provider == "whatsapp" and phone:
+        digits = re.sub(r"\D", "", phone)
+        if len(digits) >= 7:
+            tg_id = int(digits[-12:])
 
     lead_row = None
     if tg_id is not None:
@@ -770,6 +800,8 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
                 "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
                 (existing_tg_id, now, lead_id),
             )
+        if phone and not lead_row["phone"]:
+            conn.execute("UPDATE leads SET phone = ?, updated_at = ? WHERE id = ?", (phone, now, lead_id))
         if url_val and not lead_row["url"]:
             conn.execute("UPDATE leads SET url = ?, updated_at = ? WHERE id = ?", (url_val, now, lead_id))
         if combined_note and not lead_row["note"]:
@@ -780,8 +812,8 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
         """
         INSERT INTO leads (
             account_id, telegram_user_id, username, name, phone,
-            status, note, next_step, created_at, updated_at, description, url
-        ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)
+            status, note, next_step, created_at, updated_at, description, url, provider
+        ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             account_id,
@@ -795,6 +827,7 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
             now,
             company,
             url_val,
+            provider,
         ),
     )
     lead_id = int(cur.lastrowid)
@@ -949,6 +982,10 @@ def enroll_leads_from_crm(
     camp_row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
     if camp_row is None:
         raise LookupError("campaign")
+    camp = as_dict(camp_row)
+    account_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
+    camp_providers = {_account_provider(conn, aid) for aid in account_ids if aid}
+    primary_provider = next(iter(camp_providers)) if len(camp_providers) == 1 else None
 
     sql = "SELECT * FROM leads"
     clauses = []
@@ -967,6 +1004,9 @@ def enroll_leads_from_crm(
         if folder_id is not None:
             clauses.append("folder_id = ?")
             params.append(int(folder_id))
+        if primary_provider is not None:
+            clauses.append("COALESCE(provider, 'telegram') = ?")
+            params.append(primary_provider)
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY id"
@@ -988,23 +1028,32 @@ def enroll_leads_from_crm(
 
     for lead in lead_rows:
         lid = int(lead["id"])
+        lead_provider = (lead.get("provider") or primary_provider or "telegram").strip().lower()
         username = _clean_handle(lead.get("username"))
         phone = (lead.get("phone") or "").strip() or None
         tg_id = lead.get("telegram_user_id")
         name = (lead.get("name") or "").strip() or None
 
-        if not username or not tg_id:
+        if not username or not tg_id or not phone:
             dlg = conn.execute(
                 "SELECT * FROM dialogs WHERE lead_id = ? ORDER BY id LIMIT 1",
                 (lid,),
             ).fetchone()
             if dlg is not None:
-                if not username and dlg["username"]:
-                    username = _clean_handle(dlg["username"])
-                if not tg_id and dlg["peer_id"]:
-                    tg_id = int(dlg["peer_id"])
-                if not name and dlg["title"]:
-                    name = str(dlg["title"]).strip()
+                dlg_dict = as_dict(dlg)
+                if not username and dlg_dict.get("username"):
+                    username = _clean_handle(dlg_dict["username"])
+                if not tg_id and dlg_dict.get("peer_id"):
+                    tg_id = int(dlg_dict["peer_id"])
+                if not phone and dlg_dict.get("phone"):
+                    phone = str(dlg_dict["phone"]).strip()
+                if not name and dlg_dict.get("title"):
+                    name = str(dlg_dict["title"]).strip()
+
+        if tg_id is None and lead_provider == "whatsapp" and phone:
+            digits = re.sub(r"\D", "", phone)
+            if len(digits) >= 7:
+                tg_id = int(digits[-12:])
 
         if tg_id is None:
             tg_id = 900000 + lid
@@ -1073,30 +1122,48 @@ def enroll_leads_from_crm(
     }
 
 
-def _ensure_recipient_dialog(conn, account_id: int, rec: dict, now: str) -> dict:
-    peer_id = int(rec.get("telegram_user_id") or (900000 + int(rec.get("lead_id") or rec["id"])))
+def _ensure_recipient_dialog(
+    conn, account_id: int, rec: dict, now: str, provider: str | None = None
+) -> dict:
+    resolved_provider = (provider or _account_provider(conn, account_id) or "telegram").strip().lower()
+    phone = (rec.get("phone") or "").strip() or None
+    phone_digits = re.sub(r"\D", "", phone or "")
+    if resolved_provider == "whatsapp":
+        if phone_digits and len(phone_digits) >= 7:
+            peer_id = int(phone_digits[-12:])
+            if not phone.startswith("+"):
+                phone = f"+{phone_digits}"
+        elif rec.get("telegram_user_id"):
+            peer_id = int(rec["telegram_user_id"])
+        else:
+            peer_id = 900000 + int(rec.get("lead_id") or rec["id"])
+    else:
+        peer_id = int(rec.get("telegram_user_id") or (900000 + int(rec.get("lead_id") or rec["id"])))
+
     username = _clean_handle(rec.get("username"))
     title = (rec.get("name") or "").strip()
     if rec.get("company") and rec["company"] not in title:
         title = f"{title} · {rec['company']}" if title else rec["company"]
     if not title:
-        title = username or str(peer_id)
+        title = username or phone or str(peer_id)
     lead_id = rec.get("lead_id")
 
     conn.execute(
         """
         INSERT INTO dialogs (
-            account_id, peer_type, peer_id, username, title,
+            account_id, peer_type, peer_id, username, title, phone, provider,
             is_group, unread_count, last_from_peer, muted, lead_id,
             created_at, updated_at
-        ) VALUES (?, 'user', ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)
+        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)
         ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
             username = COALESCE(excluded.username, dialogs.username),
             title = CASE WHEN dialogs.title IS NULL OR dialogs.title = '' THEN excluded.title ELSE dialogs.title END,
+            phone = COALESCE(excluded.phone, dialogs.phone),
+            provider = COALESCE(excluded.provider, dialogs.provider),
             lead_id = COALESCE(dialogs.lead_id, excluded.lead_id),
             updated_at = excluded.updated_at
         """,
-        (account_id, peer_id, username, title, lead_id, now, now),
+        (account_id, peer_id, username, title, phone, resolved_provider, lead_id, now, now),
     )
     row = conn.execute(
         "SELECT * FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?",
@@ -1213,6 +1280,7 @@ async def run_campaign_batch(
 
         chosen_account_id = chosen_state["id"]
         account_raw = chosen_state["raw"]
+        acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
         session_path = str(account_raw.get("session_path") or "")
         use_gateway = gateway is not None and not session_path.startswith("data/sessions/demo")
 
@@ -1228,44 +1296,68 @@ async def run_campaign_batch(
 
         now = utc_now()
         try:
-            if use_gateway and rec.get("username") and (not rec.get("telegram_user_id") or int(rec["telegram_user_id"]) >= 900000):
-                found = await gateway.search_dialogs(session_path, f"@{rec['username']}", limit=1)
-                if found and found[0].get("telegram_user_id"):
-                    real_tg_id = int(found[0]["telegram_user_id"])
-                    rec["telegram_user_id"] = real_tg_id
-                    conn.execute(
-                        "UPDATE campaign_recipients SET telegram_user_id = ? WHERE id = ?",
-                        (real_tg_id, rec["id"]),
+            if acc_provider == "whatsapp":
+                dialog = _ensure_recipient_dialog(
+                    conn, chosen_account_id, rec, now, provider="whatsapp"
+                )
+                phone_digits = re.sub(
+                    r"\D", "", str(rec.get("phone") or dialog.get("phone") or "")
+                )
+                peer_target = phone_digits or rec.get("telegram_user_id") or dialog["peer_id"]
+                if use_gateway:
+                    sent = await gateway.send_message(
+                        session_path, peer_target, rendered_text
                     )
-                    if rec.get("lead_id"):
-                        try:
-                            conn.execute(
-                                "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
-                                (real_tg_id, now, rec["lead_id"]),
-                            )
-                        except sqlite3.IntegrityError:
-                            pass
-
-            dialog = _ensure_recipient_dialog(conn, chosen_account_id, rec, now)
-
-            if use_gateway:
-                peer_target = (
-                    f"@{rec['username']}"
-                    if (int(dialog["peer_id"]) >= 900000 and rec.get("username"))
-                    else dialog["peer_id"]
-                )
-                sent = await gateway.send_message(
-                    session_path, peer_target, rendered_text, None
-                )
-                tg_mid = int(sent["telegram_message_id"])
-                sent_at = str(sent.get("sent_at") or now)
+                    tg_mid = int(sent["telegram_message_id"])
+                    sent_at = str(sent.get("sent_at") or now)
+                else:
+                    next_row = conn.execute(
+                        "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+                        (dialog["id"],),
+                    ).fetchone()
+                    tg_mid = int(next_row["next_id"])
+                    sent_at = now
             else:
-                next_row = conn.execute(
-                    "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
-                    (dialog["id"],),
-                ).fetchone()
-                tg_mid = int(next_row["next_id"])
-                sent_at = now
+                if use_gateway and rec.get("username") and (not rec.get("telegram_user_id") or int(rec["telegram_user_id"]) >= 900000):
+                    found = await gateway.search_dialogs(session_path, f"@{rec['username']}", limit=1)
+                    if found and found[0].get("telegram_user_id"):
+                        real_tg_id = int(found[0]["telegram_user_id"])
+                        rec["telegram_user_id"] = real_tg_id
+                        conn.execute(
+                            "UPDATE campaign_recipients SET telegram_user_id = ? WHERE id = ?",
+                            (real_tg_id, rec["id"]),
+                        )
+                        if rec.get("lead_id"):
+                            try:
+                                conn.execute(
+                                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                                    (real_tg_id, now, rec["lead_id"]),
+                                )
+                            except sqlite3.IntegrityError:
+                                pass
+
+                dialog = _ensure_recipient_dialog(
+                    conn, chosen_account_id, rec, now, provider="telegram"
+                )
+
+                if use_gateway:
+                    peer_target = (
+                        f"@{rec['username']}"
+                        if (int(dialog["peer_id"]) >= 900000 and rec.get("username"))
+                        else dialog["peer_id"]
+                    )
+                    sent = await gateway.send_message(
+                        session_path, peer_target, rendered_text, None
+                    )
+                    tg_mid = int(sent["telegram_message_id"])
+                    sent_at = str(sent.get("sent_at") or now)
+                else:
+                    next_row = conn.execute(
+                        "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+                        (dialog["id"],),
+                    ).fetchone()
+                    tg_mid = int(next_row["next_id"])
+                    sent_at = now
         except Exception as exc:
             conn.execute(
                 """

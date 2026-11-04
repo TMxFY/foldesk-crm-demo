@@ -62,6 +62,7 @@ from app.reminders import complete_reminder, create_reminder, list_reminders, po
 from app.tasks import create_task, set_task_done
 from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
 from app.views import list_views, save_view
+from app.whatsapp_gateway import WhatsAppGateway
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -82,9 +83,11 @@ def load_env_file() -> None:
 
 
 class StartIn(BaseModel):
-    phone: str
+    phone: str = ""
     proxy_url: str | None = None
     access_scope: str = "workspace"
+    provider: str = "telegram"
+    auth_mode: str = "code"
 
 
 class AccountSettingsPatch(BaseModel):
@@ -123,6 +126,7 @@ class LeadIn(BaseModel):
     description: str | None = None
     email: str | None = None
     url: str | None = None
+    provider: str | None = None
 
 
 class LeadPatch(BaseModel):
@@ -247,6 +251,25 @@ def _gateway(request: Request):
     return gateway
 
 
+def _gateway_for_provider(request: Request, provider: str = "telegram"):
+    norm = str(provider or "telegram").strip().lower()
+    if norm == "whatsapp":
+        wa_gw = getattr(request.app.state, "wa_gateway", None)
+        if wa_gw is None:
+            wa_gw = WhatsAppGateway()
+            request.app.state.wa_gateway = wa_gw
+        return wa_gw
+    return _gateway(request)
+
+
+def _gateway_for_account(request: Request, account_id: int):
+    try:
+        account = load_account(request.app.state.conn, account_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Не найдено") from exc
+    return _gateway_for_provider(request, account.get("provider") or "telegram")
+
+
 def _call(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
@@ -315,14 +338,22 @@ async def ensure_private_inbox(app, account_id: int) -> None:
     async with app.state.inbox_sync_lock:
         if account_id in synced:
             return
-        gateway = app.state.gateway
-        if gateway is None:
-            return
         try:
             account = load_account(app.state.conn, account_id)
         except LookupError:
             return
         if account["status"] != "connected":
+            return
+        if str(account.get("session_path") or "").startswith("data/sessions/demo"):
+            synced.add(account_id)
+            return
+        provider = str(account.get("provider") or "telegram").strip().lower()
+        gateway = (
+            getattr(app.state, "wa_gateway", None)
+            if provider == "whatsapp"
+            else app.state.gateway
+        )
+        if gateway is None:
             return
         try:
             people = await gateway.load_inbox(account["session_path"], limit=30)
@@ -338,14 +369,19 @@ async def ensure_private_inbox(app, account_id: int) -> None:
 
 
 async def start_account_watch(app, account_id: int) -> None:
-    gateway = app.state.gateway
-    if gateway is None:
-        return
     try:
         account = load_account(app.state.conn, account_id)
     except LookupError:
         return
     if account["status"] != "connected":
+        return
+    provider = str(account.get("provider") or "telegram").strip().lower()
+    gateway = (
+        getattr(app.state, "wa_gateway", None)
+        if provider == "whatsapp"
+        else app.state.gateway
+    )
+    if gateway is None:
         return
     await ensure_private_inbox(app, account_id)
     existing = app.state.inbox_tasks.get(account_id)
@@ -379,12 +415,13 @@ async def start_account_watch(app, account_id: int) -> None:
 
 
 async def start_connected_watches(app) -> None:
-    if app.state.gateway is None:
-        return
     rows = app.state.conn.execute(
-        "SELECT id FROM accounts WHERE status = 'connected'"
+        "SELECT id, provider FROM accounts WHERE status = 'connected'"
     ).fetchall()
     for row in rows:
+        provider = str(row["provider"] or "telegram").strip().lower()
+        if provider != "whatsapp" and app.state.gateway is None:
+            continue
         await start_account_watch(app, row["id"])
 
 
@@ -415,8 +452,16 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     if conn is None:
         conn = connect()
     init_db(conn)
+    if os.getenv("DEMO_AUTOSEED", "").strip().lower() in ("1", "true", "yes"):
+        existing_acc = conn.execute("SELECT COUNT(*) AS cnt FROM accounts").fetchone()
+        if not existing_acc or int(existing_acc["cnt"] or 0) == 0:
+            try:
+                seed_demo(conn)
+            except Exception:
+                pass
     app.state.conn = conn
     app.state.gateway = gateway
+    app.state.wa_gateway = WhatsAppGateway()
     app.state.inbox_hub = InboxHub()
     app.state.inbox_tasks = {}
     app.state.inbox_synced = set()
@@ -444,7 +489,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/accounts/start")
     async def accounts_start(body: StartIn, request: Request):
-        gateway = _gateway(request)
+        gateway = _gateway_for_provider(request, body.provider)
         return await _call_async(
             start_login,
             request.app.state.conn,
@@ -452,6 +497,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             gateway,
             proxy_url=body.proxy_url,
             access_scope=body.access_scope,
+            provider=body.provider,
+            auth_mode=body.auth_mode,
         )
 
     @app.post("/api/accounts/import-session")
@@ -460,10 +507,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             payload = await request.json()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        provider = str((payload if isinstance(payload, dict) else {}).get("provider") or "telegram").strip().lower()
+        gw = request.app.state.wa_gateway if provider == "whatsapp" else request.app.state.gateway
         imported = _call(
             import_session_accounts,
             request.app.state.conn,
-            request.app.state.gateway,
+            gw,
             payload,
         )
         return {"imported": imported, "count": len(imported)}
@@ -485,7 +534,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/accounts/{account_id}/code")
     async def accounts_code(account_id: int, body: CodeIn, request: Request):
-        gateway = _gateway(request)
+        gateway = _gateway_for_account(request, account_id)
         result = await _call_async(
             confirm_login, request.app.state.conn, account_id, body.code, gateway
         )
@@ -495,7 +544,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/accounts/{account_id}/password")
     async def accounts_password(account_id: int, body: PasswordIn, request: Request):
-        gateway = _gateway(request)
+        gateway = _gateway_for_account(request, account_id)
         result = await _call_async(
             confirm_password, request.app.state.conn, account_id, body.password, gateway
         )
@@ -513,6 +562,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             check_all_accounts,
             request.app.state.conn,
             request.app.state.gateway,
+            request.app.state.wa_gateway,
         )
 
     @app.patch("/api/accounts/{account_id}/limit")
@@ -523,7 +573,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/accounts/{account_id}/reconnect")
     async def accounts_reconnect(account_id: int, request: Request):
-        gateway = _gateway(request)
+        gateway = _gateway_for_account(request, account_id)
         return await _call_async(
             reconnect_account, request.app.state.conn, account_id, gateway
         )
@@ -560,7 +610,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
         if account["status"] != "connected":
             raise HTTPException(status_code=400, detail="Аккаунт не подключён")
-        gateway = _gateway(request)
+        gateway = _gateway_for_account(request, account_id)
         try:
             found = await gateway.search_dialogs(account["session_path"], q, limit=30)
         except GatewayError as exc:
@@ -578,6 +628,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 body.telegram_user_id,
                 body.username,
                 body.name,
+                phone=body.phone,
+                provider=body.provider,
             )
         return _call(
             create_lead,
@@ -593,6 +645,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             description=body.description,
             email=body.email,
             url=body.url,
+            provider=body.provider,
         )
 
     @app.get("/api/leads")
@@ -601,6 +654,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         q: str = "",
         status: str = "",
         folder_id: int | None = None,
+        provider: str = "",
     ):
         return _call(
             search_leads,
@@ -608,6 +662,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             q,
             status or None,
             folder_id,
+            provider=provider or None,
         )
 
     @app.get("/api/views")
@@ -804,7 +859,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         conn = request.app.state.conn
         demo_row = conn.execute(
             """
-            SELECT d.peer_type, d.is_group, a.status, a.session_path
+            SELECT d.peer_type, d.is_group, a.status, a.session_path, a.provider, a.id AS account_id
             FROM dialogs d
             JOIN accounts a ON a.id = d.account_id
             WHERE d.id = ?
@@ -818,13 +873,20 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             demo_row
             and (
                 str(demo_row["session_path"] or "").startswith("data/sessions/demo")
-                or (request.app.state.gateway is None and not has_tg_creds)
+                or (
+                    str(demo_row["provider"] or "telegram").strip().lower() != "whatsapp"
+                    and request.app.state.gateway is None
+                    and not has_tg_creds
+                )
             )
             and demo_row["status"] == "connected"
             and demo_row["peer_type"] == "user"
             and not int(demo_row["is_group"] or 0)
         ):
             return _call(list_messages, conn, dialog_id, 50)
+        if demo_row and str(demo_row["provider"] or "telegram").strip().lower() == "whatsapp":
+            gateway = _gateway_for_provider(request, "whatsapp")
+            return await _call_async(get_thread, conn, dialog_id, gateway)
         gateway = _gateway(request)
         return await _call_async(
             get_thread, conn, dialog_id, gateway
@@ -835,7 +897,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         conn = request.app.state.conn
         demo_row = conn.execute(
             """
-            SELECT a.session_path
+            SELECT a.session_path, a.provider
             FROM dialogs d
             JOIN accounts a ON a.id = d.account_id
             WHERE d.id = ?
@@ -845,7 +907,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         has_tg_creds = bool(
             os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
         )
-        if (
+        if demo_row and str(demo_row["provider"] or "telegram").strip().lower() == "whatsapp":
+            gateway = _gateway_for_provider(request, "whatsapp")
+        elif (
             demo_row
             and request.app.state.gateway is None
             and (
@@ -979,7 +1043,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         max_send = body.max_send if body is not None else None
         camp_row = request.app.state.conn.execute(
             """
-            SELECT a.session_path
+            SELECT a.session_path, a.provider
             FROM campaigns c
             LEFT JOIN accounts a ON a.id = c.account_id
             WHERE c.id = ?
@@ -992,10 +1056,15 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         if (
             camp_row
             and request.app.state.gateway is None
-            and (
-                str(camp_row["session_path"] or "").startswith("data/sessions/demo")
-                or not has_tg_creds
-            )
+            and str(camp_row["session_path"] or "").startswith("data/sessions/demo")
+        ):
+            gateway = None
+        elif camp_row and str(camp_row["provider"] or "").strip().lower() == "whatsapp":
+            gateway = _gateway_for_provider(request, "whatsapp")
+        elif (
+            camp_row
+            and request.app.state.gateway is None
+            and not has_tg_creds
         ):
             gateway = None
         elif camp_row and camp_row["session_path"]:

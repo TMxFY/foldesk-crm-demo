@@ -1,0 +1,14 @@
+.venv/
+.git/
+.grok/
+.claude/
+.gstack/
+.pytest_cache/
+.taste-skill/
+node_modules/
+test-results/
+playwright-report/
+web-clone-recon/
+data/*.db
+data/sessions/*
+.env
