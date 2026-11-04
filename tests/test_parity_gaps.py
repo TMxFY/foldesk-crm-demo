@@ -1,10 +1,14 @@
-from fastapi.testclient import TestClient
+import asyncio
+from datetime import datetime, timedelta, timezone
 
-from app.db import connect, init_db
+from fastapi.testclient import TestClient
+from telethon.tl.types import Channel, User
+
+from app.db import connect, init_db, utc_now
 from app.leads import create_lead, search_leads
 from app.main import create_app
 from app.reminders import create_reminder
-from app.telegram_gateway import FakeGateway, GatewayError
+from app.telegram_gateway import FakeGateway, GatewayError, TelethonGateway
 
 DIALOGS = [
     {"telegram_user_id": 42, "username": "ivan", "name": "Иван Петров"},
@@ -116,7 +120,13 @@ def test_inbox_cache_and_one_reply(tmp_path):
         assert refused.status_code == 400
         assert "не подключён" in refused.text
         assert calls == ["один ответ"]
-        assert len(client.get(f"/api/dialogs/{dialog['id']}/messages").json()) == 1
+        closed = client.get(f"/api/dialogs/{dialog['id']}/messages")
+        assert closed.status_code == 400
+        assert "не подключён" in closed.text
+        stored = conn.execute(
+            "SELECT text FROM messages WHERE dialog_id = ?", (dialog["id"],)
+        ).fetchall()
+        assert [row[0] for row in stored] == ["один ответ"]
 
 
 def test_reply_does_not_store_when_gateway_fails(tmp_path):
@@ -138,6 +148,158 @@ def test_reply_does_not_store_when_gateway_fails(tmp_path):
         assert failed.status_code == 400
         assert "сеть" in failed.text
         assert client.get(f"/api/dialogs/{dialog['id']}/messages").json() == []
+
+
+def _history_rows(count=60):
+    rows = []
+    for i in range(1, count + 1):
+        rows.append({
+            "telegram_message_id": 100 + i,
+            "text": f"m{i}",
+            "sent_at": f"2020-01-01T{i // 3600:02d}:{(i // 60) % 60:02d}:{i % 60:02d}",
+            "direction": "in" if i % 2 else "out",
+        })
+    return rows
+
+
+def test_personal_thread_loads_fifty_then_keeps_reply(tmp_path):
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    gateway = FakeGateway(code="11111", dialogs=DIALOGS, history={42: _history_rows()})
+    fetches = []
+
+    async def spy(session_path, peer_id, limit=50):
+        fetches.append((int(peer_id), limit))
+        return await FakeGateway.fetch_messages(gateway, session_path, peer_id, limit)
+
+    gateway.fetch_messages = spy
+    app = create_app(conn=conn, gateway=gateway)
+    with TestClient(app) as client:
+        started = client.post("/api/accounts/start", json={"phone": "+79990001122"})
+        account_id = started.json()["id"]
+        client.post(f"/api/accounts/{account_id}/code", json={"code": "11111"})
+        dialog = client.get(
+            f"/api/accounts/{account_id}/dialogs", params={"q": "@ivan"}
+        ).json()[0]
+        listed = client.get(f"/api/dialogs/{dialog['id']}/messages")
+        assert listed.status_code == 200
+        body = listed.json()
+        assert [row["text"] for row in body] == [f"m{i}" for i in range(11, 61)]
+        assert body[0]["direction"] == "in"
+        assert fetches == [(42, 50)]
+        sent = client.post(
+            f"/api/dialogs/{dialog['id']}/messages", json={"text": "живой ответ"}
+        )
+        assert sent.status_code == 200
+        assert sent.json()["direction"] == "out"
+        assert sent.json()["telegram_message_id"] not in {100 + i for i in range(1, 61)}
+        again = client.get(f"/api/dialogs/{dialog['id']}/messages")
+        assert again.status_code == 200
+        texts = [row["text"] for row in again.json()]
+        assert texts[-1] == "живой ответ"
+        assert "живой ответ" in texts
+        assert len(texts) == 50
+        assert "m11" not in texts
+
+
+def test_thread_refuses_closed_account_and_non_personal(tmp_path):
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    gateway = FakeGateway(code="11111", dialogs=DIALOGS)
+    fetches = []
+
+    async def spy(session_path, peer_id, limit=50):
+        fetches.append(int(peer_id))
+        return await FakeGateway.fetch_messages(gateway, session_path, peer_id, limit)
+
+    gateway.fetch_messages = spy
+    app = create_app(conn=conn, gateway=gateway)
+    with TestClient(app) as client:
+        started = client.post("/api/accounts/start", json={"phone": "+100"})
+        account_id = started.json()["id"]
+        client.post(f"/api/accounts/{account_id}/code", json={"code": "11111"})
+        dialog = client.get(
+            f"/api/accounts/{account_id}/dialogs", params={"q": "@ivan"}
+        ).json()[0]
+        conn.execute("UPDATE accounts SET status = 'error' WHERE id = ?", (account_id,))
+        conn.commit()
+        closed = client.get(f"/api/dialogs/{dialog['id']}/messages")
+        assert closed.status_code == 400
+        assert "не подключён" in closed.text
+        assert closed.json() != []
+        now = utc_now()
+        conn.execute("UPDATE accounts SET status = 'connected' WHERE id = ?", (account_id,))
+        conn.execute(
+            """
+            INSERT INTO dialogs (
+                account_id, peer_type, peer_id, title, is_group,
+                unread_count, last_from_peer, muted, created_at, updated_at
+            ) VALUES (?, 'channel', 99, 'канал', 0, 0, 0, 0, ?, ?)
+            """,
+            (account_id, now, now),
+        )
+        conn.execute(
+            "UPDATE dialogs SET is_group = 1 WHERE id = ?", (dialog["id"],)
+        )
+        conn.commit()
+        channel_id = conn.execute(
+            "SELECT id FROM dialogs WHERE peer_type = 'channel'"
+        ).fetchone()[0]
+        channel = client.get(f"/api/dialogs/{channel_id}/messages")
+        grouped = client.get(f"/api/dialogs/{dialog['id']}/messages")
+        assert channel.status_code == 400
+        assert "не личный" in channel.text
+        assert grouped.status_code == 400
+        assert "не личный" in grouped.text
+        assert fetches == []
+
+
+def test_telethon_history_keeps_users_and_last_fifty():
+    gateway = TelethonGateway()
+    user = User(id=42)
+    channel = Channel(id=7, title="news", photo=None, date=None, broadcast=True)
+
+    class Msg:
+        def __init__(self, mid):
+            self.id = mid
+            self.out = mid % 2 == 0
+            self.message = f"m{mid}"
+            self.date = datetime(2020, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=mid)
+            self.reply_to = type("Reply", (), {"reply_to_msg_id": 3})() if mid == 12 else None
+
+    class Client:
+        def __init__(self, entity):
+            self.entity = entity
+            self.reads = 0
+
+        async def get_entity(self, peer):
+            return self.entity
+
+        async def get_messages(self, entity, limit=50):
+            self.reads += 1
+            assert limit == 50
+            assert entity is user
+            return [Msg(i) for i in range(60, 0, -1)]
+
+    user_client = Client(user)
+    channel_client = Client(channel)
+
+    async def run():
+        rows = await gateway._history(user_client, 42, 80)
+        assert user_client.reads == 1
+        assert [row["telegram_message_id"] for row in rows] == list(range(11, 61))
+        assert rows[0]["direction"] == "in"
+        assert rows[1]["reply_to_telegram_message_id"] == 3
+        assert rows[1]["sent_at"] == "2020-01-01T00:12:00"
+        try:
+            await gateway._history(channel_client, 7, 50)
+        except GatewayError as exc:
+            assert "не личный" in str(exc)
+        else:
+            raise AssertionError("канал не должен открываться")
+        assert channel_client.reads == 0
+
+    asyncio.run(run())
 
 
 def test_create_lead_keeps_optional_blanks_empty(tmp_path):

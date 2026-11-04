@@ -374,6 +374,8 @@ async function selectDialog(dialog) {
     const error = document.querySelector("#thread-error");
     error.hidden = false;
     error.textContent = loadError;
+    const gap = document.querySelector("#thread-gap");
+    if (gap) gap.hidden = true;
   }
   renderSide();
 }

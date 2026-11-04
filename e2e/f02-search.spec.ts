@@ -137,6 +137,25 @@ test('F02-E6 send shows the server error and no bubble', async ({ page }) => {
   await expect(thread.getByText('не уйдёт')).toHaveCount(0);
 });
 
+test('F02-H5 personal history sits beside the card', async ({ page }) => {
+  await connect(page);
+  await page.getByRole('button', { name: 'В Telegram' }).click();
+  await page.getByLabel('Запрос').fill('@petr');
+  await page.getByRole('button', { name: 'Найти' }).click();
+  await page.getByRole('button', { name: /Пётр/ }).click();
+  const thread = page.getByRole('region', { name: 'Переписка' });
+  const card = page.getByRole('region', { name: 'Рядом с чатом' });
+  await expect(thread.getByText('был в телеграме')).toBeVisible();
+  await expect(card.getByText('К этому чату лид ещё не заведён')).toBeVisible();
+  await expect(thread.getByText('Сообщений пока нет')).toBeHidden();
+  await thread.getByLabel('Ответ').fill('ответ петру');
+  await thread.getByRole('button', { name: 'Отправить' }).click();
+  await expect(thread.getByText('был в телеграме')).toBeVisible();
+  await expect(thread.getByText('ответ петру')).toBeVisible();
+  await expect(thread.getByRole('listitem')).toHaveCount(2);
+  await expect(card.getByRole('button', { name: 'В лиды' })).toBeVisible();
+});
+
 test('F02-H3 Telegram name search finds the accented dialog', async ({ page }) => {
   await connect(page);
   await page.getByRole('button', { name: 'В Telegram' }).click();

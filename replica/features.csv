@@ -4,8 +4,8 @@ feature,area,priority,original,clone,notes
 Статусы аккаунта и переподключение,onboarding,must,yes,partial,бейдж входа есть; health и reconnect ещё нет
 Список входящих с подключённого аккаунта,inbox,must,yes,partial,S04 кэш SQLite после поиска; сокета нет
 Поиск чата по имени или @username,inbox,must,yes,yes,F02
-Открыть переписку и ответить,inbox,must,yes,partial,S05 одно сообщение в подключённый чат; лента Telegram не догружается
-Карточка лида рядом с чатом,inbox,must,yes,partial,S06 из лидов среза; ленты чата нет
+Открыть переписку и ответить,inbox,must,yes,yes,S05 до 50 личных сообщений и ответ в ту же ленту
+Карточка лида рядом с чатом,inbox,must,yes,yes,S06 карточка у ленты личного чата
 Добавить в CRM из чата если карточки нет,leads,must,yes,yes,F03 edge
 Воронка со стадиями,pipeline,must,yes,yes,S07 пять статусов; без перетаскивания
 Сменить статус на карточке,pipeline,must,yes,yes,Status = custom property

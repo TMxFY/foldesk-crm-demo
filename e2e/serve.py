@@ -15,7 +15,22 @@ DIALOGS = [
     {"telegram_user_id": 42, "username": "ivan", "name": "Иван Петров"},
     {"telegram_user_id": 43, "username": "olga", "name": "Ольга"},
     {"telegram_user_id": 44, "username": "emile", "name": "Кафе Émile 😀"},
+    {"telegram_user_id": 45, "username": "petr", "name": "Пётр"},
 ]
+
+PETR_HISTORY = [
+    {
+        "telegram_message_id": 9001,
+        "text": "был в телеграме",
+        "sent_at": "2020-01-01T00:00:00",
+        "direction": "in",
+    }
+]
+
+
+def seed_history(gateway) -> None:
+    gateway.history.clear()
+    gateway.history[45] = [dict(row) for row in PETR_HISTORY]
 
 TMP = Path(__file__).resolve().parent / ".tmp"
 TMP.mkdir(exist_ok=True)
@@ -30,6 +45,7 @@ class E2EGateway(FakeGateway):
             needs_password=False,
             dialogs=DIALOGS,
         )
+        seed_history(self)
 
     async def request_code(self, phone: str, session_path: str) -> str:
         # +79990000002 asks for 2FA. Any other phone connects after the code.
@@ -55,6 +71,8 @@ def build():
         conn.commit()
         gateway._pending.clear()
         gateway.needs_password = False
+        gateway._message_seq = 0
+        seed_history(gateway)
         return {"ok": True}
 
     return app

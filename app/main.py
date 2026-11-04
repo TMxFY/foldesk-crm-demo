@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from app.accounts import confirm_login, confirm_password, list_accounts, start_login
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
-from app.inbox import list_inbox, list_messages, remember_dialogs, send_reply
+from app.inbox import get_thread, list_inbox, remember_dialogs, send_reply
 from app.leads import add_lead_from_dialog, create_lead, get_lead, search_leads, update_lead
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.telegram_gateway import GatewayError, TelethonGateway
@@ -248,8 +248,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(list_inbox, request.app.state.conn, account_id, q)
 
     @app.get("/api/dialogs/{dialog_id}/messages")
-    def dialog_messages(dialog_id: int, request: Request):
-        return _call(list_messages, request.app.state.conn, dialog_id)
+    async def dialog_messages(dialog_id: int, request: Request):
+        gateway = _gateway(request)
+        return await _call_async(
+            get_thread, request.app.state.conn, dialog_id, gateway
+        )
 
     @app.post("/api/dialogs/{dialog_id}/messages")
     async def dialog_send(dialog_id: int, body: MessageIn, request: Request):

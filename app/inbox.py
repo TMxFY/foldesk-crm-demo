@@ -90,19 +90,101 @@ def list_inbox(conn, account_id: int, q: str = "") -> list:
     ]
 
 
-def list_messages(conn, dialog_id: int) -> list:
+def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
     dialog = conn.execute("SELECT id FROM dialogs WHERE id = ?", (dialog_id,)).fetchone()
     if dialog is None:
         raise LookupError("dialog")
-    rows = conn.execute(
-        """
-        SELECT * FROM messages
-        WHERE dialog_id = ?
-        ORDER BY sent_at, id
-        """,
-        (dialog_id,),
-    ).fetchall()
+    if limit is None:
+        rows = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE dialog_id = ?
+            ORDER BY sent_at, id
+            """,
+            (dialog_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT * FROM messages
+                WHERE dialog_id = ?
+                ORDER BY sent_at DESC, id DESC
+                LIMIT ?
+            ) ORDER BY sent_at, id
+            """,
+            (dialog_id, int(limit)),
+        ).fetchall()
     return [as_dict(row) for row in rows]
+
+
+def _cache_messages(conn, dialog_id: int, items: list) -> None:
+    now = utc_now()
+    normalized = [_normalize_message(item, now) for item in items]
+    try:
+        for message_id, direction, text, sent_at, reply_to in normalized:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    dialog_id, telegram_message_id, direction, text, sent_at,
+                    reply_to_telegram_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+                    direction = excluded.direction,
+                    text = excluded.text,
+                    sent_at = excluded.sent_at,
+                    reply_to_telegram_message_id = excluded.reply_to_telegram_message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (dialog_id, message_id, direction, text, sent_at, reply_to, now, now),
+            )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("Не удалось записать историю") from exc
+
+
+def _normalize_message(item, now: str):
+    if not isinstance(item, dict) or item.get("telegram_message_id") is None:
+        raise GatewayError("История без номера сообщения")
+    direction = item.get("direction") or "in"
+    if direction not in ("in", "out"):
+        raise GatewayError("Непонятное направление сообщения")
+    text = item.get("text")
+    if text is not None:
+        text = str(text)
+    sent_at = item.get("sent_at") or now
+    reply = item.get("reply_to_telegram_message_id")
+    return (
+        int(item["telegram_message_id"]),
+        direction,
+        text,
+        str(sent_at),
+        int(reply) if reply else None,
+    )
+
+
+async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
+    dialog = conn.execute("SELECT * FROM dialogs WHERE id = ?", (dialog_id,)).fetchone()
+    if dialog is None:
+        raise LookupError("dialog")
+    dialog = as_dict(dialog)
+    if dialog["peer_type"] != "user" or int(dialog["is_group"] or 0):
+        raise ValueError("Это не личный диалог")
+    account = conn.execute(
+        "SELECT * FROM accounts WHERE id = ?", (dialog["account_id"],)
+    ).fetchone()
+    if account is None:
+        raise LookupError("account")
+    account = as_dict(account)
+    if account["status"] != "connected":
+        raise ValueError("Аккаунт не подключён")
+    cap = 50 if limit is None else max(1, min(int(limit), 50))
+    fetched = await gateway.fetch_messages(account["session_path"], dialog["peer_id"], cap)
+    if not isinstance(fetched, list):
+        raise GatewayError("История без списка")
+    _cache_messages(conn, dialog_id, fetched[-cap:])
+    return list_messages(conn, dialog_id, cap)
 
 
 async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) -> dict:

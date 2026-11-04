@@ -32,6 +32,10 @@ class TelegramGateway(ABC):
     async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
         raise GatewayError("Отправка не подключена")
 
+    async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
+        """Last personal-dialog messages, oldest first. Not groups or channels."""
+        raise GatewayError("История не подключена")
+
 
 def _session_name(session_path: str) -> str:
     # Telethon appends .session itself. The stored path already has the suffix.
@@ -46,6 +50,24 @@ def _person_name(user) -> str:
     first = getattr(user, "first_name", None) or ""
     last = getattr(user, "last_name", None) or ""
     return " ".join(part for part in (first, last) if part).strip()
+
+
+def _stamp(sent) -> str:
+    if sent is None:
+        return utc_now()
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return sent.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _history_limit(limit) -> int:
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = 50
+    if cap < 1:
+        cap = 1
+    return min(cap, 50)
 
 
 class TelethonGateway(TelegramGateway):
@@ -196,19 +218,61 @@ class TelethonGateway(TelegramGateway):
         finally:
             if owned:
                 await self._close(session_path)
-        sent = getattr(msg, "date", None)
-        if sent is None:
-            sent_at = utc_now()
-        else:
-            if sent.tzinfo is None:
-                sent = sent.replace(tzinfo=timezone.utc)
-            sent_at = sent.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         return {
             "telegram_message_id": int(msg.id),
             "text": getattr(msg, "message", None) or body,
-            "sent_at": sent_at,
+            "sent_at": _stamp(getattr(msg, "date", None)),
             "direction": "out",
         }
+
+    async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
+        client, owned = await self._open(session_path)
+        try:
+            return await self._history(client, peer_id, limit)
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
+        finally:
+            if owned:
+                await self._close(session_path)
+
+    async def _history(self, client, peer_id: int, limit: int) -> list:
+        # get_messages is newest-first. A channel or chat id is not a personal dialog.
+        from telethon.tl.types import User
+
+        cap = _history_limit(limit)
+        try:
+            entity = await client.get_entity(int(peer_id))
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось открыть диалог") from exc
+        if not isinstance(entity, User):
+            raise GatewayError("Это не личный диалог")
+        try:
+            raw = await client.get_messages(entity, limit=cap)
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
+        rows = []
+        for msg in raw or []:
+            mid = getattr(msg, "id", None)
+            if mid is None:
+                continue
+            reply = getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None)
+            rows.append(
+                {
+                    "telegram_message_id": int(mid),
+                    "text": getattr(msg, "message", None),
+                    "sent_at": _stamp(getattr(msg, "date", None)),
+                    "direction": "out" if getattr(msg, "out", False) else "in",
+                    "reply_to_telegram_message_id": int(reply) if reply else None,
+                }
+            )
+        rows.reverse()
+        return rows[-cap:]
 
     async def _resolve_username(self, client, query: str) -> list:
         from telethon.tl.types import User
@@ -229,11 +293,14 @@ class TelethonGateway(TelegramGateway):
 
 
 class FakeGateway(TelegramGateway):
-    def __init__(self, code="12345", password="secret", needs_password=False, dialogs=None):
+    def __init__(self, code="12345", password="secret", needs_password=False, dialogs=None, history=None):
         self.code = code
         self.password = password
         self.needs_password = needs_password
         self.dialogs = [dict(item) for item in (dialogs or [])]
+        self.history = {}
+        for peer, rows in (history or {}).items():
+            self.history[int(peer)] = [dict(row) for row in rows]
         self._pending = {}
         self.sent = []
         self._message_seq = 0
@@ -315,10 +382,24 @@ class FakeGateway(TelegramGateway):
         if not body:
             raise GatewayError("Напишите сообщение")
         self._message_seq += 1
+        used = {
+            int(row.get("telegram_message_id") or 0)
+            for row in self.history.get(int(peer_id), [])
+        }
+        while self._message_seq in used:
+            self._message_seq += 1
         self.sent.append({"peer_id": int(peer_id), "text": body, "reply_to": reply_to})
-        return {
+        record = {
             "telegram_message_id": self._message_seq,
             "text": body,
             "sent_at": utc_now(),
             "direction": "out",
+            "reply_to_telegram_message_id": int(reply_to) if reply_to else None,
         }
+        self.history.setdefault(int(peer_id), []).append(dict(record))
+        return record
+
+    async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
+        cap = _history_limit(limit)
+        rows = self.history.get(int(peer_id), [])
+        return [dict(row) for row in rows[-cap:]]
