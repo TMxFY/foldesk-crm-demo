@@ -887,6 +887,21 @@ function renderAccounts() {
       actionsWrap.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => resumeLogin(account) }, [caption]));
     }
     if (account.status === "connected") {
+      if (account.tg_web_ready) {
+        actionsWrap.append(
+          el("button", {
+            type: "button",
+            className: "btn primary sm",
+            onclick: async () => {
+              state.inboxChatMode = "tgweb";
+              await switchInboxSession(String(account.id));
+              activateSheet("inbox");
+              const panel = document.querySelector("#tg-web-a-panel");
+              if (panel && state.viewMode !== "sheet") panel.scrollIntoView({ block: "nearest" });
+            },
+          }, ["Telegram Web (/a/)"]),
+        );
+      }
       actionsWrap.append(
         el("button", {
           type: "button",
@@ -954,11 +969,11 @@ function renderAccounts() {
     const row = el("li", { className: "account" }, [mainRow, limitBar]);
     list.append(row);
   });
-  if (pending && state.loginId == null) resumeLogin(pending);
+  if (pending && state.loginId == null && connected.length === 0) resumeLogin(pending);
   const select = document.querySelector("#tg-account");
   const previous = select.value;
   if (accountsSection) {
-    accountsSection.dataset.hasConnected = (connected.length > 0 && !pending) ? "true" : "false";
+    accountsSection.dataset.hasConnected = (connected.length > 0 && state.loginId == null) ? "true" : "false";
   }
   select.replaceChildren();
   connected.forEach((account) => {
@@ -1688,6 +1703,87 @@ function renderInboxSessionSwitcher() {
         ? `Сессия: ${foundPrefix} · ${foundUname ? `@${foundUname}` : (found.telegram_name || found.phone)}`
         : "Активная сессия";
     }
+  }
+  syncTelegramWebAPanel(connected);
+}
+
+function setInboxChatMode(mode) {
+  state.inboxChatMode = mode === "crm" ? "crm" : "tgweb";
+  const connected = (state.accounts || []).filter((account) => account.status === "connected");
+  syncTelegramWebAPanel(connected);
+}
+
+function syncTelegramWebAPanel(connected) {
+  const panel = document.querySelector("#tg-web-a-panel");
+  const frameWrap = document.querySelector("#tg-web-a-frame-wrap");
+  const frame = document.querySelector("#tg-web-a-frame");
+  const badge = document.querySelector("#tg-web-a-session-badge");
+  const pillsHost = document.querySelector("#tg-web-a-account-pills");
+  const extLink = document.querySelector("#tg-web-a-external-link");
+  const btnTgWeb = document.querySelector("#inbox-mode-tgweb");
+  const btnCrm = document.querySelector("#inbox-mode-crm");
+  if (!panel || !frame) return;
+
+  const grid = document.querySelector(".messenger-grid");
+  const webReady = (connected || []).filter((acc) => Boolean(acc.tg_web_ready));
+  if (!webReady.length) {
+    panel.hidden = true;
+    if (grid) grid.dataset.tgwebActive = "false";
+    return;
+  }
+
+  panel.hidden = false;
+  const mode = state.inboxChatMode === "crm" ? "crm" : "tgweb";
+  if (grid) grid.dataset.tgwebActive = mode === "tgweb" ? "true" : "false";
+  const activeKey = String(state.inboxSessionFilter || "all");
+  const target = webReady.find((acc) => String(acc.id) === activeKey) || webReady[0];
+  const targetUrl = `/a/?account_id=${encodeURIComponent(String(target.id))}`;
+
+  if (badge) {
+    const uname = target.telegram_username ? `@${target.telegram_username}` : target.phone;
+    const tname = target.telegram_name ? ` (${target.telegram_name})` : "";
+    badge.textContent = `${uname}${tname} · Авто-вход MTProto`;
+  }
+  if (extLink) {
+    extLink.href = targetUrl;
+  }
+  if (pillsHost) {
+    pillsHost.replaceChildren();
+    if (webReady.length > 1) {
+      webReady.forEach((acc) => {
+        const key = String(acc.id);
+        const uname = acc.telegram_username ? `@${acc.telegram_username}` : (acc.telegram_name || acc.phone);
+        pillsHost.append(
+          el("button", {
+            type: "button",
+            className: "chip session-pill",
+            "aria-pressed": String(target.id) === key ? "true" : "false",
+            onclick: () => switchInboxSession(key),
+          }, [uname]),
+        );
+      });
+    }
+  }
+  if (btnTgWeb && btnCrm) {
+    btnTgWeb.className = mode === "tgweb" ? "btn secondary sm" : "btn ghost sm";
+    btnTgWeb.setAttribute("aria-pressed", mode === "tgweb" ? "true" : "false");
+    btnCrm.className = mode === "crm" ? "btn secondary sm" : "btn ghost sm";
+    btnCrm.setAttribute("aria-pressed", mode === "crm" ? "true" : "false");
+    if (!btnTgWeb.dataset.bound) {
+      btnTgWeb.dataset.bound = "1";
+      btnTgWeb.addEventListener("click", () => setInboxChatMode("tgweb"));
+    }
+    if (!btnCrm.dataset.bound) {
+      btnCrm.dataset.bound = "1";
+      btnCrm.addEventListener("click", () => setInboxChatMode("crm"));
+    }
+  }
+  if (frameWrap) {
+    frameWrap.hidden = mode === "crm";
+  }
+  if (mode === "tgweb" && frame.dataset.loadedAccountId !== String(target.id)) {
+    frame.dataset.loadedAccountId = String(target.id);
+    frame.src = targetUrl;
   }
 }
 

@@ -213,6 +213,26 @@
       </section>
 
       <div class="messenger-grid" data-sheet="inbox">
+        <div id="tg-web-a-panel" class="surface-box tg-web-a-panel" hidden>
+          <div class="tg-web-a-toolbar">
+            <div class="row">
+              <strong class="tg-web-a-title">Telegram Web (/a/)</strong>
+              <span id="tg-web-a-session-badge" class="badge b-ok">Авто-вход MTProto</span>
+              <div id="tg-web-a-account-pills" class="row"></div>
+            </div>
+            <div class="row">
+              <div class="switch" role="group" aria-label="Режим чатов">
+                <button type="button" id="inbox-mode-tgweb" class="btn secondary sm" aria-pressed="true">Telegram Web (/a/)</button>
+                <button type="button" id="inbox-mode-crm" class="btn ghost sm" aria-pressed="false">CRM Чаты + Карточка</button>
+              </div>
+              <a id="tg-web-a-external-link" href="/a/" target="_blank" rel="noopener" class="btn primary sm">Открыть /a/ во весь экран ↗</a>
+            </div>
+          </div>
+          <div id="tg-web-a-frame-wrap" class="tg-web-a-frame-wrap">
+            <iframe id="tg-web-a-frame" class="tg-web-a-frame" title="Telegram Web A" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+          </div>
+        </div>
+
         <section id="s04" class="surface-box pane-col" aria-labelledby="s04-title">
           <div class="pane-head">
             <h2 id="s04-title">Входящие</h2>

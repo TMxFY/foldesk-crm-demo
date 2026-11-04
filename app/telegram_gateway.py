@@ -315,12 +315,19 @@ class TelethonGateway(TelegramGateway):
         client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
         await client.connect()
         self._clients[session_path] = client
-        return client, True
+        return client, False
 
     async def _close(self, session_path: str) -> None:
         client = self._clients.pop(session_path, None)
         if client is not None and client.is_connected():
             await client.disconnect()
+
+    async def close_all(self) -> None:
+        for path in list(self._clients.keys()):
+            try:
+                await self._close(path)
+            except Exception:
+                pass
 
     async def request_code(self, phone: str, session_path: str) -> str:
         async with self._session_lock(session_path):
@@ -331,9 +338,8 @@ class TelethonGateway(TelegramGateway):
             except GatewayError:
                 raise
             except Exception as exc:
-                raise GatewayError(str(exc) or "Не удалось отправить код") from exc
-            finally:
                 await self._close(session_path)
+                raise GatewayError(str(exc) or "Не удалось отправить код") from exc
 
     async def confirm_code(
         self, phone: str, code: str, phone_code_hash: str, session_path: str

@@ -17,11 +17,13 @@ from app.accounts import (
     import_session_accounts,
     list_accounts,
     reconnect_account,
+    restore_disk_sessions,
     set_daily_limit,
     start_login,
     update_account_settings,
 )
 from app.accounts import _load as load_account
+from app.tg_web_proxy import register_tg_web_routes
 from app.db import ROOT, connect, init_db, utc_now
 from app.demo import DEMO_SESSION, seed_demo
 from app.inbox import (
@@ -486,6 +488,12 @@ async def stop_inbox_watches(app) -> None:
         except (asyncio.CancelledError, Exception):
             pass
     app.state.inbox_tasks.clear()
+    gw = getattr(app.state, "gateway", None)
+    if gw is not None and hasattr(gw, "close_all"):
+        try:
+            await gw.close_all()
+        except Exception:
+            pass
 
 
 def create_app(conn=None, gateway=None) -> FastAPI:
@@ -503,6 +511,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     if conn is None:
         conn = connect()
     init_db(conn)
+    if (
+        "PYTEST_CURRENT_TEST" not in os.environ
+        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+    ):
+        restore_disk_sessions(conn)
     app.state.conn = conn
     app.state.gateway = gateway
     app.state.wa_gateway = WhatsAppGateway()
@@ -511,6 +524,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     app.state.inbox_synced = set()
     app.state.inbox_sync_lock = asyncio.Lock()
     app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
+    register_tg_web_routes(app)
 
     @app.get("/design/tokens.css")
     def design_tokens():

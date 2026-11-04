@@ -573,3 +573,64 @@ def test_dynamic_csv_column_variables_and_direct_chat_open(tmp_path):
         assert msg_res.status_code == 200
         assert msg_res.json()["text"] == "Привет напрямую из Telegram Web сессии в CRM!"
 
+
+def test_tg_web_a_session_init_js_and_persistence(tmp_path):
+    import sqlite3
+
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    sess_file = tmp_path / "telethon_real.session"
+    with sqlite3.connect(sess_file) as sconn:
+        sconn.execute(
+            "CREATE TABLE sessions (dc_id INTEGER PRIMARY KEY, server_address TEXT, port INTEGER, auth_key BLOB, takeout_id INTEGER)"
+        )
+        fake_key = bytes(range(256))
+        sconn.execute(
+            "INSERT INTO sessions VALUES (4, '149.154.167.91', 443, ?, NULL)",
+            (fake_key,),
+        )
+        # Pad table so file size >= 4096 bytes
+        sconn.execute("CREATE TABLE entities (id INTEGER PRIMARY KEY, hash INTEGER NOT NULL, username TEXT, phone INTEGER, name TEXT, date INTEGER)")
+        for idx in range(1, 80):
+            sconn.execute(
+                "INSERT INTO entities VALUES (?, ?, ?, NULL, ?, 0)",
+                (idx, idx * 1000, f"user_{idx}", "Pad" * 20),
+            )
+        sconn.commit()
+
+    now = utc_now()
+    cur = conn.execute(
+        """
+        INSERT INTO accounts (
+            phone, session_path, status, telegram_user_id,
+            telegram_username, telegram_name, created_at,
+            health, updated_at, daily_limit, sent_today, provider
+        ) VALUES ('+905346380943', ?, 'connected', 5680938518, 'tim_cros', 'Tim Korznikov', ?, 'active', ?, 25, 0, 'telegram')
+        """,
+        (str(sess_file), now, now),
+    )
+    conn.commit()
+    acc_id = int(cur.lastrowid)
+
+    gateway = FakeGateway(code="11111")
+    app = create_app(conn=conn, gateway=gateway)
+    with TestClient(app) as client:
+        accs = client.get("/api/accounts").json()
+        assert len(accs) == 1
+        assert accs[0]["tg_web_ready"] is True
+
+        js_res = client.get(f"/a/foldesk-session-init.js?account_id={acc_id}")
+        assert js_res.status_code == 200
+        assert "var dc = 4;" in js_res.text
+        assert "_auth_key" in js_res.text
+        assert "5680938518" in js_res.text
+        assert fake_key.hex() in js_res.text
+
+        # Calling /api/accounts/start for the already connected phone reuses the session instead of creating pending_code
+        again = client.post("/api/accounts/start", json={"phone": "+905346380943"})
+        assert again.status_code == 200
+        assert again.json()["status"] == "connected"
+        assert again.json()["id"] == acc_id
+        assert len(client.get("/api/accounts").json()) == 1
+
+

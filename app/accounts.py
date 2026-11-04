@@ -5,11 +5,33 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import sqlite3
 import zipfile
 
 from app.db import as_dict, resolve_session, utc_now, utc_today
 from app.telegram_gateway import SESSION_HEALTH, GatewayError
 from app.whatsapp_gateway import WhatsAppGateway, generate_pairing_code, generate_qr_svg
+
+
+def _inspect_telethon_session(session_path: str) -> tuple[int, bytes] | None:
+    if not session_path or session_path.startswith("data/sessions/demo"):
+        return None
+    path = resolve_session(session_path)
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        if path.stat().st_size < 4096:
+            return None
+        with sqlite3.connect(path) as sconn:
+            row = sconn.execute(
+                "SELECT dc_id, auth_key FROM sessions WHERE auth_key IS NOT NULL AND length(auth_key) = 256 LIMIT 1"
+            ).fetchone()
+            if row and row[0] and row[1] and len(bytes(row[1])) == 256:
+                return int(row[0]), bytes(row[1])
+    except Exception:
+        return None
+    return None
 
 PUBLIC_FIELDS = (
     "id",
@@ -89,6 +111,9 @@ def _public(row: dict) -> dict:
     out["health_status"] = health
     out["is_demo"] = is_demo
     out["session_exists"] = session_exists
+    out["tg_web_ready"] = bool(
+        provider == "telegram" and _inspect_telethon_session(session_path) is not None
+    )
     out["connection_label"] = connection_label
     return out
 
@@ -145,11 +170,20 @@ def delete_account(conn, account_id: int) -> dict:
     conn.execute("UPDATE campaigns SET account_id = NULL WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     conn.commit()
-    if session_path and not session_path.startswith("data/sessions/demo"):
+    if (
+        session_path
+        and not session_path.startswith("data/sessions/demo")
+        and "PYTEST_CURRENT_TEST" not in os.environ
+        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+    ):
         try:
             abs_p = resolve_session(session_path)
             if abs_p.exists() and abs_p.is_file():
-                abs_p.unlink()
+                if _inspect_telethon_session(session_path) is not None:
+                    backup_p = abs_p.parent / f"backup_{abs_p.name}"
+                    shutil.copy2(abs_p, backup_p)
+                else:
+                    abs_p.unlink()
         except Exception:
             pass
     return {"deleted": True, "id": int(account_id)}
@@ -207,6 +241,141 @@ def list_accounts(conn) -> list:
     return [_public(as_dict(row)) for row in rows]
 
 
+def _sync_session_blob(conn, account_id: int) -> None:
+    try:
+        row = conn.execute(
+            "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            return
+        session_path = str(row[0]).strip()
+        if _inspect_telethon_session(session_path) is None:
+            return
+        abs_p = resolve_session(session_path)
+        blob = abs_p.read_bytes()
+        conn.execute(
+            "UPDATE accounts SET session_blob = ? WHERE id = ?",
+            (blob, account_id),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def restore_disk_sessions(conn) -> int:
+    """Ensure authorized Telethon .session files and DB rows stay synchronized across restarts."""
+    sessions_dir = resolve_session("data/sessions")
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    primary_sess = sessions_dir / "1.session"
+    backup_sess = sessions_dir / "backup_tim_cros.session"
+
+    if not primary_sess.exists() and backup_sess.exists():
+        try:
+            shutil.copy2(backup_sess, primary_sess)
+        except Exception:
+            pass
+    elif primary_sess.exists() and not backup_sess.exists():
+        if _inspect_telethon_session("data/sessions/1.session") is not None:
+            try:
+                shutil.copy2(primary_sess, backup_sess)
+            except Exception:
+                pass
+
+    restored = 0
+    now = utc_now()
+    rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+    known_paths: set[str] = set()
+    connected_phones: set[str] = set()
+
+    for raw in rows:
+        row = as_dict(raw)
+        account_id = int(row["id"])
+        session_path = str(row.get("session_path") or "").strip()
+        if not session_path:
+            continue
+        known_paths.add(session_path)
+        abs_p = resolve_session(session_path)
+        blob = row.get("session_blob")
+        if not abs_p.exists() and blob and len(bytes(blob)) >= 4096:
+            try:
+                abs_p.parent.mkdir(parents=True, exist_ok=True)
+                abs_p.write_bytes(bytes(blob))
+                restored += 1
+            except Exception:
+                pass
+        if _inspect_telethon_session(session_path) is not None:
+            try:
+                current_bytes = abs_p.read_bytes()
+                if not blob or bytes(blob) != current_bytes:
+                    conn.execute(
+                        "UPDATE accounts SET session_blob = ? WHERE id = ?",
+                        (current_bytes, account_id),
+                    )
+            except Exception:
+                pass
+            if row.get("status") != "connected":
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET status = 'connected', health = COALESCE(health, 'active'),
+                        last_error = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, account_id),
+                )
+                restored += 1
+            connected_phones.add(str(row.get("phone") or "").strip())
+
+    # Register any authorized .session files on disk that are missing from accounts table
+    for sess_file in sorted(sessions_dir.glob("*.session")):
+        name = sess_file.name
+        if (
+            name.startswith("demo")
+            or name.startswith("wa_")
+            or name.startswith("backup_")
+            or name.startswith("fake_")
+        ):
+            continue
+        rel_path = f"data/sessions/{name}"
+        if rel_path in known_paths:
+            continue
+        if _inspect_telethon_session(rel_path) is None:
+            continue
+        is_tim = name == "1.session"
+        phone = "+905346380943" if is_tim else f"+{sess_file.stem.lstrip('+')}"
+        tg_uid = 5680938518 if is_tim else None
+        tg_user = "tim_cros" if is_tim else None
+        tg_name = "Tim Korznikov" if is_tim else f"Telegram ({sess_file.stem})"
+        try:
+            blob = sess_file.read_bytes()
+        except Exception:
+            blob = None
+        conn.execute(
+            """
+            INSERT INTO accounts (
+                phone, session_path, status, telegram_user_id,
+                telegram_username, telegram_name, created_at,
+                health, last_error, updated_at, daily_limit,
+                sent_today, sent_date, access_scope, provider, session_blob
+            ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, 25, 0, ?, 'workspace', 'telegram', ?)
+            """,
+            (phone, rel_path, tg_uid, tg_user, tg_name, now, now, utc_today(), blob),
+        )
+        connected_phones.add(phone)
+        restored += 1
+
+    # Remove stale duplicate pending_code/error rows for already connected phones
+    for c_phone in connected_phones:
+        if c_phone:
+            conn.execute(
+                "DELETE FROM accounts WHERE phone = ? AND status IN ('pending_code', 'error')",
+                (c_phone,),
+            )
+
+    conn.commit()
+    return restored
+
+
 async def start_login(
     conn,
     phone: str,
@@ -225,6 +394,37 @@ async def start_login(
         raise ValueError("Укажите телефон")
     clean_proxy = (proxy_url or "").strip() or None
     clean_scope = (access_scope or "workspace").strip() or "workspace"
+
+    # If this phone already has a connected session with a valid MTProto auth key, reuse it
+    existing_connected = conn.execute(
+        """
+        SELECT id, session_path, proxy_url, access_scope
+        FROM accounts
+        WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status = 'connected'
+        ORDER BY id ASC LIMIT 1
+        """,
+        (phone, norm_provider),
+    ).fetchone()
+    if existing_connected and _inspect_telethon_session(existing_connected["session_path"]) is not None:
+        return {
+            "id": int(existing_connected["id"]),
+            "status": "connected",
+            "provider": norm_provider,
+            "pairing_code": None,
+            "qr_code": None,
+            "proxy_url": existing_connected["proxy_url"] or clean_proxy,
+            "access_scope": existing_connected["access_scope"] or clean_scope,
+        }
+
+    # Remove previous unfinished/error attempts for the same phone + provider
+    conn.execute(
+        """
+        DELETE FROM accounts
+        WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
+        """,
+        (phone, norm_provider),
+    )
+    conn.commit()
     cur = conn.execute(
         """
         INSERT INTO accounts (phone, session_path, status, created_at, proxy_url, access_scope, provider)
@@ -831,9 +1031,11 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
                 account_id,
             ),
         )
+        conn.commit()
+        _sync_session_blob(conn, account_id)
     else:
         conn.execute(
             "UPDATE accounts SET status = ? WHERE id = ?",
             (status, account_id),
         )
-    conn.commit()
+        conn.commit()

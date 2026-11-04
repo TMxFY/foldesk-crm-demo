@@ -68,7 +68,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             provider TEXT NOT NULL DEFAULT 'telegram',
             wa_jid TEXT,
             pairing_code TEXT,
-            qr_code TEXT
+            qr_code TEXT,
+            session_blob BLOB
         );
 
         CREATE TABLE IF NOT EXISTS leads (
@@ -356,6 +357,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "accounts", "wa_jid", "TEXT")
     _ensure_column(conn, "accounts", "pairing_code", "TEXT")
     _ensure_column(conn, "accounts", "qr_code", "TEXT")
+    _ensure_column(conn, "accounts", "session_blob", "BLOB")
     _ensure_column(conn, "dialogs", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
     _ensure_column(conn, "dialogs", "phone", "TEXT")
     _ensure_column(conn, "messages", "external_message_id", "TEXT")
