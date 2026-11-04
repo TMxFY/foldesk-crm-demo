@@ -180,14 +180,29 @@ def update_lead(conn, lead_id: int, **fields) -> dict:
     return as_dict(updated)
 
 
-def search_leads(conn, q: str = "", status: str | None = None) -> list:
+def search_leads(
+    conn, q: str = "", status: str | None = None, folder_id: int | None = None
+) -> list:
     if status is not None and status not in STATUSES:
         raise ValueError("Неизвестный статус")
+    if folder_id is not None and folder_id != "":
+        try:
+            folder_id = int(folder_id)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная папка") from None
+    else:
+        folder_id = None
     sql = "SELECT * FROM leads"
     params = []
+    clauses = []
     if status:
-        sql += " WHERE status = ?"
+        clauses.append("status = ?")
         params.append(status)
+    if folder_id is not None:
+        clauses.append("folder_id = ?")
+        params.append(folder_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY updated_at DESC, id DESC"
     rows = [as_dict(row) for row in conn.execute(sql, params)]
     needle = (q or "").strip()

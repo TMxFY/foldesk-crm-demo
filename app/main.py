@@ -23,6 +23,7 @@ from app.digest import apply_digest_callback, callback_data_from_update, send_mo
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.tasks import create_task, set_task_done
 from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
+from app.views import list_views, save_view
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -127,6 +128,12 @@ class PropertyDefIn(BaseModel):
 
 class PropertyValueIn(BaseModel):
     value: str | None = None
+
+
+class ViewIn(BaseModel):
+    name: str
+    status: str | None = None
+    folder_id: int | None = None
 
 
 def _gateway(request: Request):
@@ -422,12 +429,32 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
     @app.get("/api/leads")
-    def leads_search(request: Request, q: str = "", status: str = ""):
+    def leads_search(
+        request: Request,
+        q: str = "",
+        status: str = "",
+        folder_id: int | None = None,
+    ):
         return _call(
             search_leads,
             request.app.state.conn,
             q,
             status or None,
+            folder_id,
+        )
+
+    @app.get("/api/views")
+    def views_list(request: Request):
+        return _call(list_views, request.app.state.conn)
+
+    @app.post("/api/views")
+    def views_save(body: ViewIn, request: Request):
+        return _call(
+            save_view,
+            request.app.state.conn,
+            body.name,
+            status=body.status,
+            folder_id=body.folder_id,
         )
 
     @app.get("/api/leads/{lead_id}")

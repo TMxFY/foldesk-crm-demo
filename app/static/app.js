@@ -57,6 +57,7 @@ const state = {
   selectedLeadId: null,
   cards: {},
   folderLists: {},
+  views: [],
 };
 
 let modalSubmit = null;
@@ -374,6 +375,7 @@ async function loadFolderList() {
     const rows = await api(`/api/folders?account_id=${accountId}`);
     state.folderLists[accountId] = rows;
     renderFolderList(rows);
+    renderFolderFilter();
   } catch (error) {
     failRegion("#folders-view", "#folders-error", error);
   }
@@ -394,6 +396,7 @@ async function pullFolders() {
     });
     state.folderLists[accountId] = rows;
     renderFolderList(rows);
+    renderFolderFilter();
   } catch (error) {
     failRegion("#folders-view", "#folders-error", error);
   }
@@ -942,19 +945,119 @@ function paintCard(lead) {
   setView("#card-view", "filled");
 }
 
+function pipelineFilters() {
+  return {
+    status: document.querySelector("#stage-filter").value,
+    folderId: document.querySelector("#folder-filter").value,
+  };
+}
+
 function updateFilterNote() {
-  const stage = document.querySelector("#stage-filter").value;
-  const on = Boolean(stage || state.leadQuery);
+  const { status, folderId } = pipelineFilters();
+  const on = Boolean(status || folderId || state.leadQuery);
   document.querySelector("#filter-note").hidden = !on;
   document.querySelector("#board").dataset.filtered = on ? "true" : "false";
 }
 
+function renderFolderFilter() {
+  const select = document.querySelector("#folder-filter");
+  if (!select) return;
+  const previous = select.value;
+  select.replaceChildren(el("option", { value: "" }, ["Все"]));
+  const seen = new Set();
+  Object.values(state.folderLists).flat().forEach((folder) => {
+    if (!folder || seen.has(folder.id)) return;
+    seen.add(folder.id);
+    select.append(el("option", { value: String(folder.id) }, [folder.title]));
+  });
+  if (previous && ![...select.options].some((option) => option.value === previous)) {
+    select.append(el("option", { value: previous }, [`Папка ${previous}`]));
+  }
+  if (previous) select.value = previous;
+}
+
+async function loadPipelineFolders() {
+  const connected = state.accounts.filter((account) => account.status === "connected");
+  await Promise.all(connected.map(async (account) => {
+    try {
+      state.folderLists[String(account.id)] = await api(`/api/folders?account_id=${account.id}`);
+    } catch (_err) { /* воронка живёт и без папок этого аккаунта */ }
+  }));
+  renderFolderFilter();
+}
+
+function renderViews() {
+  const select = document.querySelector("#saved-view");
+  if (!select) return;
+  const previous = select.value;
+  select.replaceChildren(el("option", { value: "" }, ["Не выбран"]));
+  (state.views || []).forEach((view) => {
+    select.append(el("option", { value: String(view.id) }, [view.name]));
+  });
+  if (previous) select.value = previous;
+}
+
+async function loadViews() {
+  state.views = await api("/api/views");
+  renderViews();
+}
+
+function applyPipelineView(view) {
+  document.querySelector("#stage-filter").value = view.status || "";
+  const folder = document.querySelector("#folder-filter");
+  const folderId = view.folder_id == null ? "" : String(view.folder_id);
+  if (folderId && ![...folder.options].some((option) => option.value === folderId)) {
+    folder.append(el("option", { value: folderId }, [`Папка ${folderId}`]));
+  }
+  folder.value = folderId;
+  renderBoard();
+}
+
+async function savePipelineView() {
+  const field = document.querySelector("#view-name");
+  const name = field.value.trim();
+  if (!name) {
+    toast("Укажите имя вида", "error");
+    field.focus();
+    return;
+  }
+  const { status, folderId } = pipelineFilters();
+  const saved = await api("/api/views", {
+    method: "POST",
+    body: {
+      name,
+      status: status || null,
+      folder_id: folderId ? Number(folderId) : null,
+    },
+  });
+  await loadViews();
+  document.querySelector("#saved-view").value = String(saved.id);
+  toast("Вид сохранён", "ok");
+}
+
+async function resetPipelineView() {
+  document.querySelector("#stage-filter").value = "";
+  document.querySelector("#folder-filter").value = "";
+  document.querySelector("#saved-view").value = "";
+  document.querySelector("#view-name").value = "";
+  if (state.mode === "crm") {
+    const query = document.querySelector("#q");
+    if (query) query.value = "";
+  }
+  await loadLeads("");
+}
+
 function renderBoard() {
-  const stage = document.querySelector("#stage-filter").value;
+  const { status: stage, folderId } = pipelineFilters();
   const board = document.querySelector("#board");
   board.replaceChildren();
   STATUSES.forEach(([value, label]) => {
-    const cards = state.leads.filter((lead) => lead.status === value && (!stage || stage === value));
+    const cards = state.leads.filter((lead) => {
+      if (lead.status !== value) return false;
+      if (stage && stage !== value) return false;
+      if (folderId && String(lead.folder_id || "") !== folderId) return false;
+      return true;
+    });
     const items = cards.length
       ? cards.map((lead) => {
         const current = lead.id === state.selectedLeadId;
@@ -1522,7 +1625,33 @@ document.querySelector("#reminder-scopes").addEventListener("click", async (even
 });
 
 document.querySelector("#stage-filter").addEventListener("change", () => {
+  document.querySelector("#saved-view").value = "";
   renderBoard();
+});
+
+document.querySelector("#folder-filter").addEventListener("change", () => {
+  document.querySelector("#saved-view").value = "";
+  renderBoard();
+});
+
+document.querySelector("#save-view").addEventListener("click", () => {
+  savePipelineView().catch((error) => toast(error.message, "error"));
+});
+
+document.querySelector("#saved-view").addEventListener("change", (event) => {
+  const id = event.target.value;
+  if (!id) return;
+  const view = (state.views || []).find((item) => String(item.id) === id);
+  if (view) applyPipelineView(view);
+});
+
+document.querySelector("#reset-view").addEventListener("click", () => {
+  resetPipelineView().catch((error) => {
+    const node = document.querySelector("#board-error");
+    if (node) node.textContent = error.message;
+    setView("#board-view", "error");
+    toast(error.message, "error");
+  });
 });
 
 document.querySelector("#to-leads").addEventListener("click", async () => {
@@ -1696,6 +1825,7 @@ async function boot() {
   }
   try {
     await loadAccounts();
+    await loadPipelineFolders();
   } catch (error) {
     failRegion("#accounts-view", "#accounts-error", error);
   }
@@ -1714,6 +1844,11 @@ async function boot() {
     failRegion("#leads-view", "#leads-error", error);
     document.querySelector("#board-error").textContent = error.message;
     setView("#board-view", "error");
+  }
+  try {
+    await loadViews();
+  } catch (error) {
+    toast(error.message, "error");
   }
   try {
     await loadReminders();

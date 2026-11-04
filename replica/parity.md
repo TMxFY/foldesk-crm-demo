@@ -1,45 +1,44 @@
 # Parity: clone vs CRMchat (срез соло-CRM)
 
 Date: 2026-11-04  
-Build: `9c8eb20`  
+Build: `aaed4fb`  
 Source: `replica/features.csv`, `replica/recon.md`, `replica/build-log.md`, `replica/bugs.md`  
 Tools: `python3 .claude/skills/replica-diff/parity.py replica/features.csv`  
-Checks: `./scripts/verify.sh` 47 passed. Playwright заново не гоняли  
+Checks: parity.py this pass; `./scripts/verify.sh` и Playwright заново не гоняли  
 Original cabinet screens: none (`replica/screens/` нет; в app.crmchat.ai не логинились; лендинги не подставляли)
 
 ## Scores
 
 | | |
 | --- | --- |
-| overall | 79.1 / 100 (только features; layout не усредняли) |
-| feature | **79.1** (38 counted, skip 12 не в счёте) |
+| overall | 81.4 / 100 (только features; layout не усредняли) |
+| feature | **81.4** (38 counted, skip 12 не в счёте) |
 | must done | **18 of 18** |
 | layout | нет пар — балл не выдуман |
-| verdict | **not shippable** |
+| verdict | feature ≥ 80; layout без пар |
 
-Все must `yes`. Открытых S1 нет. BUG-001, BUG-002, BUG-003 — **fixed**. Feature score 79.1 < 80 — не shippable. «Better than the original» не ставим.
+Все must `yes`. Открытых S1 нет. BUG-001, BUG-002, BUG-003 — **fixed**. Feature score 81.4. «Better than the original» не ставим: пар экранов нет.
 
-`features.csv` `clone` сверен с `build-log.md`. Синк своих папок и папка как свойство лида — yes. S19 форвард из `BOT_CHAT_ID` — yes: лид и заметка, скрытый автор без username, повтор id не плодит лид. Виды воронки и NL не делались. Другие partial не поднимались.
+`features.csv` `clone` сверен с `build-log.md`. Новый yes — S15: фильтр воронки по стадии и папке, вид сохраняется локально, выбор применяет фильтр, «Сбросить» возвращает всех лидов. «Save for everyone» нет. Другие partial не поднимались. NL не делался.
 
 ## parity.py (stdout)
 
 ```
-Parity: 79.1 / 100
+Parity: 81.4 / 100
 
-features 79.1  (38 counted, must-haves 18 of 18 done)
+features 81.4  (38 counted, must-haves 18 of 18 done)
 
 By area, weakest first
 - team                           0.0  (2 features)
 - integrations                   0.0  (2 features)
-- pipeline                      63.6  (5 features)
 - inbox                         73.9  (10 features)
+- pipeline                      81.8  (5 features)
 - reminders                     84.6  (5 features)
 - leads                         91.3  (10 features)
 - onboarding                   100.0  (3 features)
 - notes                        100.0  (1 features)
 
 Missing, in build order
-- [should] pipeline: Фильтры и сохранённые виды воронки, no  (S15)
 - [should] reminders: Напоминание фразой в чате, no  (NL + confirm Update)
 - [should] inbox: Open Chat с карточки, partial  (открывает чат только если он уже в списке поиска)
 - [should] inbox: Отметить чат непрочитанным, partial  (кнопка есть; маршрута нет)
@@ -59,7 +58,7 @@ Missing, in build order
 
 ## Layout per screen
 
-imgdiff не запускался: пар оригинал↔клон нет. `replica/diffs/` нет.
+imgdiff не запускался: пар оригинал↔клон нет. `replica/screens/` и `replica/diffs/` нет. Layout-балл не ставили и в overall не мешали.
 
 | screen | original | clone | layout |
 | --- | --- | --- | --- |
@@ -75,11 +74,11 @@ imgdiff не запускался: пар оригинал↔клон нет. `r
 
 ## Missing, in build order
 
-Must: все 18 `yes`. Блокера must нет. Score 79.1 ниже 80 из-за should.
+Must: все 18 `yes`. Блокера must нет. Score 81.4 (70/86 веса). S15 закрыт: `no`→`yes`.
 
 Первые should:
 
-- [should] pipeline: Фильтры и сохранённые виды воронки, no (S15)
+- [should] pipeline: Фильтры и сохранённые виды воронки, yes (S15, локально; Save for everyone нет)
 - [should] reminders: Напоминание фразой в чате, no (NL + confirm Update)
 
 Дальше should partial: Open Chat, unread-маршрут, связка лид↔аккаунт, чипы inbox, свои названия стадий. Could — как в stdout.
@@ -98,7 +97,7 @@ Must: все 18 `yes`. Блокера must нет. Score 79.1 ниже 80 из-�
 | F06 захват | синк папки / форвард / форма Имя+Описание+URL+Email+Phone+Telegram | синк выбранной своей папки: личные диалоги становятся лидами с `folder_id`, повтор не плодит дубли; на карточке имя папки, смена или очистка; папка с Chat Types или инвайтом не синкается; группы и каналы не импортируются; форвард из `BOT_CHAT_ID` создаёт лид и заметку, повтор того же id не плодит лид; вручную имя ник телефон заметка url email (S10 done) | keep синк, форму и форвард |
 | F07 чат+сделка | 3 клика; лента+карточка (у них с Pro); Open Chat с карточки | лента личного чата до 50 сообщений рядом с карточкой; ответ остаётся в ленте; не connected / не личный чат — ошибка; unread и эмодзи в Telegram не ходят; Open Chat только если чат уже в поиске | keep честные ошибки; Open Chat — should later |
 
-Клики ядра у оригинала ~12–14 (F01 раз + F02–F05). У клона F01 веб и `/start` есть, F04 лента notes есть, health и reconnect есть, S17 дайджест уходит оператору, S11 синк своих папок и папка на карточке есть, S19 форвард пишет лид и заметку. Must закрыты. Score 79.1 из-за остальных should.
+Клики ядра у оригинала ~12–14 (F01 раз + F02–F05). У клона F01 веб и `/start` есть, F04 лента notes есть, health и reconnect есть, S17 дайджест уходит оператору, S11 синк своих папок и папка на карточке есть, S19 форвард пишет лид и заметку, S15 сохраняет вид воронки локально. Must закрыты. Score 81.4 из-за остальных should.
 
 ### Bugs
 
@@ -109,7 +108,7 @@ Must: все 18 `yes`. Блокера must нет. Score 79.1 ниже 80 из-�
 
 ## Next five
 
-1. S15: фильтры и сохранённые виды воронки.
+1. S15 закрыт: фильтры и сохранённые виды воронки (`yes`, локально).
 2. NL-напоминание в чате.
 3. Open Chat с карточки, если чата нет в поиске.
 4. Отметить чат непрочитанным: маршрута нет.

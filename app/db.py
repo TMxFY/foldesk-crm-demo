@@ -231,6 +231,20 @@ def init_db(conn: sqlite3.Connection) -> None:
             lead_id INTEGER,
             note_id INTEGER
         );
+
+        -- Один локальный оператор. Повтор того же имени обновляет строку, не плодит вторую.
+        CREATE TABLE IF NOT EXISTS saved_views (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT CHECK (
+                status IS NULL
+                OR status IN ('new', 'talking', 'waiting', 'won', 'lost')
+            ),
+            folder_id INTEGER,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS saved_views_name ON saved_views(name);
         """
     )
     _ensure_column(conn, "leads", "description", "TEXT")

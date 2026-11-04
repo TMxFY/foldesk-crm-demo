@@ -129,16 +129,33 @@
 
       <section id="s07" aria-labelledby="s07-title">
         <h2 id="s07-title">Воронка</h2>
-        <label class="inline" for="stage-filter">Стадия
-          <select id="stage-filter">
-            <option value="">Все</option>
-            <option value="new">Лид</option>
-            <option value="talking">Разговор</option>
-            <option value="waiting">Ждём</option>
-            <option value="won">Выигран</option>
-            <option value="lost">Проигран</option>
-          </select>
-        </label>
+        <div class="row view-bar">
+          <label class="inline" for="stage-filter">Стадия
+            <select id="stage-filter">
+              <option value="">Все</option>
+              <option value="new">Лид</option>
+              <option value="talking">Разговор</option>
+              <option value="waiting">Ждём</option>
+              <option value="won">Выигран</option>
+              <option value="lost">Проигран</option>
+            </select>
+          </label>
+          <label class="inline" for="folder-filter">Папка
+            <select id="folder-filter">
+              <option value="">Все</option>
+            </select>
+          </label>
+          <label class="inline" for="view-name">Имя вида
+            <input id="view-name" name="view-name" type="text" autocomplete="off" maxlength="80">
+          </label>
+          <button type="button" class="btn secondary sm" id="save-view">Сохранить вид</button>
+          <label class="inline" for="saved-view">Виды
+            <select id="saved-view">
+              <option value="">Не выбран</option>
+            </select>
+          </label>
+          <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
+        </div>
         <p id="filter-note" class="hint" hidden>Фильтр применён</p>
         <div id="board-view" data-state="loading">
           <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
