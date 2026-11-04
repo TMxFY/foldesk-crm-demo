@@ -1,7 +1,7 @@
 # Parity: clone vs CRMchat (срез соло-CRM)
 
 Date: 2026-11-04  
-Build: `aaed4fb`  
+Build: `df7c893`  
 Source: `replica/features.csv`, `replica/recon.md`, `replica/build-log.md`, `replica/bugs.md`  
 Tools: `python3 .claude/skills/replica-diff/parity.py replica/features.csv`  
 Checks: parity.py this pass; `./scripts/verify.sh` и Playwright заново не гоняли  
@@ -15,11 +15,11 @@ Original cabinet screens: none (`replica/screens/` нет; в app.crmchat.ai н�
 | feature | **81.4** (38 counted, skip 12 не в счёте) |
 | must done | **18 of 18** |
 | layout | нет пар — балл не выдуман |
-| verdict | feature ≥ 80; layout без пар |
+| verdict | **shippable** (скилл: must все yes, feature ≥ 80, открытых S1/S2 нет). Layout-балла нет. |
 
-Все must `yes`. Открытых S1 нет. BUG-001, BUG-002, BUG-003 — **fixed**. Feature score 81.4. «Better than the original» не ставим: пар экранов нет.
+Все must `yes`. Открытых S1 нет. BUG-001, BUG-002, BUG-003 — **fixed**. Feature score 81.4.
 
-`features.csv` `clone` сверен с `build-log.md`. Новый yes — S15: фильтр воронки по стадии и папке, вид сохраняется локально, выбор применяет фильтр, «Сбросить» возвращает всех лидов. «Save for everyone» нет. Другие partial не поднимались. NL не делался.
+`features.csv` `clone` сверен с `build-log.md`. Новый yes — S15: фильтр воронки по стадии и папке, вид сохраняется локально, выбор применяет фильтр, «Сбросить» возвращает всех лидов. «Save for everyone» нет; строку не откатывали. Другие partial не поднимались. NL не делался.
 
 ## parity.py (stdout)
 
@@ -74,14 +74,14 @@ imgdiff не запускался: пар оригинал↔клон нет. `r
 
 ## Missing, in build order
 
-Must: все 18 `yes`. Блокера must нет. Score 81.4 (70/86 веса). S15 закрыт: `no`→`yes`.
+Must: все 18 `yes`. Блокера must нет. Score 81.4 (70/86 веса). S15: `yes` (сохранение, применение, сброс; Save for everyone нет).
 
 Первые should:
 
-- [should] pipeline: Фильтры и сохранённые виды воронки, yes (S15, локально; Save for everyone нет)
 - [should] reminders: Напоминание фразой в чате, no (NL + confirm Update)
+- [should] inbox: Open Chat с карточки, partial (открывает чат только если он уже в списке поиска)
 
-Дальше should partial: Open Chat, unread-маршрут, связка лид↔аккаунт, чипы inbox, свои названия стадий. Could — как в stdout.
+Дальше should partial: unread-маршрут, связка лид↔аккаунт, чипы inbox, свои названия стадий. Could — как в stdout.
 
 ## Behaviour
 
@@ -108,8 +108,8 @@ Must: все 18 `yes`. Блокера must нет. Score 81.4 (70/86 веса). 
 
 ## Next five
 
-1. S15 закрыт: фильтры и сохранённые виды воронки (`yes`, локально).
-2. NL-напоминание в чате.
-3. Open Chat с карточки, если чата нет в поиске.
-4. Отметить чат непрочитанным: маршрута нет.
-5. Связка лид↔аккаунт с которого писали.
+1. NL-напоминание в чате.
+2. Open Chat с карточки, если чата нет в поиске.
+3. Отметить чат непрочитанным: маршрута нет.
+4. Связка лид↔аккаунт с которого писали.
+5. Чипы inbox: признака «ждёт ответа» / непрочитанных в поиске диалогов нет.

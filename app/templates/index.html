@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,153 +10,186 @@
 </head>
 <body>
   <a class="skip" href="#s04">К списку разговоров</a>
-  <header class="top">
-    <h1 class="brand">Foldesk</h1>
-    <nav class="nav" aria-label="Разделы">
-      <a href="#s04">Входящие</a>
-      <a href="#s05">Переписка</a>
-      <a href="#s06">У чата</a>
-      <a href="#s07">Воронка</a>
-      <a href="#s09">Карточка</a>
-      <a href="#digest">Напоминания</a>
-      <a href="#accounts">Аккаунт</a>
-      <a href="#s11">Папки</a>
-      <a href="#leads">Лиды</a>
-    </nav>
-    <button type="button" id="theme" class="btn ghost sm" aria-pressed="false">Тема</button>
-  </header>
-  <div class="shell">
-    <div class="list-col">
-      <section id="accounts" aria-labelledby="accounts-title">
-        <h2 id="accounts-title">Аккаунт</h2>
-        <form id="login-form">
-          <label for="phone">Телефон</label>
-          <input id="phone" name="phone" type="tel" autocomplete="tel" required placeholder="+79990000000">
-          <button type="submit" class="btn primary sm">Получить код</button>
-        </form>
-        <button type="button" id="bot-login" class="btn secondary sm">Войти через бота</button>
-        <p id="operator-msg" class="msg" role="status"></p>
-        <form id="code-form" hidden>
-          <label for="code">Код</label>
-          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
-          <button type="submit" class="btn primary sm">Подтвердить код</button>
-        </form>
-        <form id="password-form" hidden>
-          <label for="password">Пароль 2FA</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required>
-          <button type="submit" class="btn primary sm">Подтвердить пароль</button>
-        </form>
-        <p id="login-msg" class="msg" role="status"></p>
-        <div id="accounts-view" data-state="loading">
-          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
-          <p data-when="empty" class="hint">Сначала подключите Телеграм</p>
-          <p data-when="error" id="accounts-error" class="msg" role="alert"></p>
-          <ul data-when="filled" id="account-list"></ul>
+  <div class="app-frame">
+    <aside class="sidebar" aria-label="Боковая панель">
+      <div class="ws-header">
+        <span class="ws-logo" aria-hidden="true">F</span>
+        <div class="ws-meta">
+          <h1 class="brand">Foldesk</h1>
+          <span class="ws-sub">Telegram CRM</span>
         </div>
-      </section>
+        <svg class="ws-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/></svg>
+      </div>
 
-      <section id="s11" aria-labelledby="s11-title">
-        <h2 id="s11-title">Папки Telegram</h2>
-        <label for="folder-account">Для аккаунта
-          <select id="folder-account"></select>
-        </label>
-        <button type="button" id="folders-refresh" class="btn secondary sm">Обновить папки</button>
-        <div id="folders-view" data-state="empty">
-          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
-          <p data-when="empty" class="hint">Папок пока нет</p>
-          <p data-when="error" id="folders-error" class="msg" role="alert"></p>
-          <ul data-when="filled" id="folder-list"></ul>
+      <nav class="nav" aria-label="Разделы">
+        <div class="nav-group">
+          <span class="nav-caption">ЛИДЫ</span>
+          <a href="#s07" data-sheet-link="s07" data-sheet="pipeline" aria-current="page">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="4" height="15" rx="1"/></svg>
+            Воронка
+          </a>
+          <a href="#leads" data-sheet-link="leads" data-sheet="leads">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Лиды
+          </a>
+          <a href="#crm-properties" data-sheet-link="crm-properties" data-sheet="properties">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
+            Поля CRM
+          </a>
+          <a href="#s11" data-sheet-link="s11" data-sheet="folders">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            Папки
+          </a>
+          <a href="#s09" data-sheet-link="s09" class="nav-sublink">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M15 8h2"/><path d="M15 12h2"/><path d="M7 16h10"/></svg>
+            Карточка
+          </a>
         </div>
-      </section>
 
-      <section id="s04" aria-labelledby="s04-title">
-        <h2 id="s04-title">Входящие</h2>
-        <p id="inbox-live" class="hint" role="status" data-live="off">Список не обновляется</p>
-        <section id="search" aria-labelledby="search-title">
-          <h3 id="search-title">Поиск</h3>
-          <div class="switch" id="search-mode" role="group" aria-label="Где искать">
-            <button type="button" data-mode="crm" class="btn secondary sm" aria-pressed="true">В CRM</button>
-            <button type="button" data-mode="telegram" class="btn ghost sm" aria-pressed="false">В Telegram</button>
+        <div class="nav-group">
+          <span class="nav-caption">АУТРИЧ И ЧАТЫ</span>
+          <a href="#s04" data-sheet-link="inbox" data-sheet="inbox">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+            Входящие
+          </a>
+          <a href="#s05" data-sheet-link="inbox" class="nav-sublink">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></svg>
+            Переписка
+          </a>
+          <a href="#s06" data-sheet-link="inbox" class="nav-sublink">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg>
+            У чата
+          </a>
+          <a href="#outreach" data-sheet-link="outreach" data-sheet="outreach">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+            Рассылки
+          </a>
+          <a href="#accounts" data-sheet-link="accounts" data-sheet="accounts">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/></svg>
+            Аккаунт
+          </a>
+          <a href="#ai-bot" data-sheet-link="ai-bot" data-sheet="ai-bot">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>
+            AI Агент
+          </a>
+        </div>
+
+        <div class="nav-group">
+          <span class="nav-caption">ИНСТРУМЕНТЫ</span>
+          <a href="#tool-phones" data-sheet-link="tool-phones" data-sheet="tool-phones">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+            Телефоны в TG
+          </a>
+          <a href="#tool-parser" data-sheet-link="tool-parser" data-sheet="tool-parser">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/><path d="M11 8v6"/></svg>
+            Парсер групп
+          </a>
+        </div>
+
+        <div class="nav-group">
+          <span class="nav-caption">СИСТЕМА</span>
+          <a href="#digest" data-sheet-link="digest" data-sheet="digest">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+            Напоминания
+          </a>
+        </div>
+      </nav>
+
+      <div class="sidebar-plan-card" aria-label="Квоты воркспейса">
+        <div class="sidebar-plan-head">
+          <span class="sidebar-plan-title">Foldesk Pro</span>
+          <span class="sidebar-plan-badge">Active</span>
+        </div>
+        <div class="sidebar-quota-row">
+          <span>Лиды CRM</span>
+          <strong id="sidebar-quota-leads">0 / 5000</strong>
+        </div>
+        <div class="sidebar-quota-bar" aria-hidden="true"><span id="sidebar-quota-leads-fill" style="width: 4%"></span></div>
+        <div class="sidebar-quota-row">
+          <span>Telegram-сессии</span>
+          <strong id="sidebar-quota-accounts">0 / 10</strong>
+        </div>
+        <div class="sidebar-quota-bar" aria-hidden="true"><span id="sidebar-quota-accounts-fill" style="width: 0%"></span></div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button type="button" id="seed-demo" class="btn secondary sm">Демо-данные</button>
+        <button type="button" id="theme" class="btn ghost sm" aria-pressed="true">Тема</button>
+      </div>
+    </aside>
+
+    <main class="workspace" id="workspace-main" data-view-mode="{{ default_view_mode | default('all') }}" data-active-sheet="s07">
+      <div class="topbar">
+        <div class="topbar-left">
+          <span class="view-pill">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="4" height="15" rx="1"/></svg>
+            <span id="active-sheet-label">Воронка</span>
+          </span>
+          <div class="flow-steps" role="group" aria-label="Порядок работы">
+            <a href="#accounts" class="flow-step" data-sheet-link="accounts">1. Аккаунт и лимит</a>
+            <span class="flow-sep" aria-hidden="true">→</span>
+            <a href="#outreach" class="flow-step" data-sheet-link="outreach">2. CSV и цепочка</a>
+            <span class="flow-sep" aria-hidden="true">→</span>
+            <a href="#s04" class="flow-step" data-sheet-link="inbox">3. Диалоги</a>
+            <span class="flow-sep" aria-hidden="true">→</span>
+            <a href="#s07" class="flow-step" data-sheet-link="s07">4. Воронка</a>
           </div>
-          <form id="search-form" role="search">
-            <label class="tg-only" hidden>Аккаунт
-              <select id="tg-account"></select>
+          <p id="inbox-live" class="hint live-pill" role="status" data-live="off">Список не обновляется</p>
+        </div>
+
+        <div class="topbar-stats" id="workspace-stats" aria-label="Сводка">
+          <span class="stat-chip">Сделки: <strong id="stat-leads">0</strong></span>
+          <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
+          <span class="stat-chip">Рассылки: <strong id="stat-campaigns">0</strong></span>
+          <span class="stat-chip">Напоминания: <strong id="stat-reminders">0</strong></span>
+          <button type="button" id="toggle-view-mode" class="btn secondary sm">Все блоки</button>
+        </div>
+      </div>
+
+      <section id="s07" data-sheet="s07" class="surface-box pipeline-section" aria-labelledby="s07-title">
+        <div class="pipeline-header">
+          <div class="pipeline-title-row">
+            <h2 id="s07-title">Воронка</h2>
+            <p id="filter-note" class="hint filter-badge" hidden>Фильтр применён</p>
+          </div>
+          <div class="row view-bar">
+            <label class="inline" for="stage-filter">Стадия
+              <select id="stage-filter">
+                <option value="">Все</option>
+                <option value="new">Лид</option>
+                <option value="talking">Разговор</option>
+                <option value="waiting">Ждём</option>
+                <option value="won">Выигран</option>
+                <option value="lost">Проигран</option>
+              </select>
             </label>
-            <label for="q">Запрос</label>
-            <input id="q" name="q" type="search" placeholder="Имя или @" autocomplete="off">
-            <button type="submit" class="btn primary sm">Найти</button>
-          </form>
-          <div class="chips" role="group" aria-label="Фильтр">
-            <button type="button" class="chip" data-chip="waiting" aria-pressed="false">Ждёт ответа</button>
-            <button type="button" class="chip" data-chip="unread" aria-pressed="false">Непрочитанные</button>
-            <button type="button" class="chip" data-chip="groups" aria-pressed="false">Группы</button>
-            <button type="button" class="chip" data-chip="muted" aria-pressed="false">Без звука</button>
-          </div>
-          <p id="chip-note" class="hint" hidden>В ответе поиска нет этого признака, поэтому список может опустеть.</p>
-        </section>
-        <div id="inbox-view" data-state="empty">
-          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span><span class="sk"></span></div>
-          <p data-when="empty" class="hint">Разговоров на столе нет</p>
-          <p data-when="none" class="hint">Ничего не найдено</p>
-          <p data-when="error" id="inbox-error" class="msg" role="alert"></p>
-          <ul data-when="filled" id="dialog-results"></ul>
-        </div>
-      </section>
-    </div>
-
-    <main class="stage">
-      <section id="s05" aria-labelledby="s05-title">
-        <h2 id="s05-title">Переписка</h2>
-        <div id="thread-view" data-state="empty">
-          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk tall"></span></div>
-          <p data-when="empty" class="hint">Слева ещё не открыт разговор</p>
-          <div data-when="filled">
-            <div id="thread-head"></div>
-            <p id="thread-error" class="msg" role="alert" hidden></p>
-            <ol id="messages" class="messages"></ol>
-            <p id="thread-gap" class="hint">Сообщений пока нет</p>
-            <form id="reply-form">
-              <label for="reply-text">Ответ</label>
-              <textarea id="reply-text" name="text"></textarea>
-              <div class="row">
-                <button type="submit" class="btn primary sm">Отправить</button>
-                <button type="button" class="btn ghost sm" id="mark-unread">Непрочитанное</button>
+            <label class="inline" for="folder-filter">Папка
+              <select id="folder-filter">
+                <option value="">Все</option>
+              </select>
+            </label>
+            <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
+            <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Виды</button>
+            <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
+            <div id="views-popup-box" class="views-popup-box" data-popup-box="views">
+              <div class="popup-box-head sheet-only-flex">
+                <strong>Сохранённые виды</strong>
+                <button type="button" class="btn ghost sm popup-close-btn" data-close-popup aria-label="Закрыть">×</button>
               </div>
-            </form>
+              <div class="views-popup-fields">
+                <label class="inline" for="saved-view">Виды
+                  <select id="saved-view">
+                    <option value="">Не выбран</option>
+                  </select>
+                </label>
+                <label class="inline" for="view-name">Имя вида
+                  <input id="view-name" name="view-name" type="text" autocomplete="off" maxlength="80" placeholder="Название вида">
+                </label>
+                <button type="button" class="btn secondary sm" id="save-view">Сохранить вид</button>
+              </div>
+            </div>
           </div>
         </div>
-      </section>
-
-      <section id="s07" aria-labelledby="s07-title">
-        <h2 id="s07-title">Воронка</h2>
-        <div class="row view-bar">
-          <label class="inline" for="stage-filter">Стадия
-            <select id="stage-filter">
-              <option value="">Все</option>
-              <option value="new">Лид</option>
-              <option value="talking">Разговор</option>
-              <option value="waiting">Ждём</option>
-              <option value="won">Выигран</option>
-              <option value="lost">Проигран</option>
-            </select>
-          </label>
-          <label class="inline" for="folder-filter">Папка
-            <select id="folder-filter">
-              <option value="">Все</option>
-            </select>
-          </label>
-          <label class="inline" for="view-name">Имя вида
-            <input id="view-name" name="view-name" type="text" autocomplete="off" maxlength="80">
-          </label>
-          <button type="button" class="btn secondary sm" id="save-view">Сохранить вид</button>
-          <label class="inline" for="saved-view">Виды
-            <select id="saved-view">
-              <option value="">Не выбран</option>
-            </select>
-          </label>
-          <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
-        </div>
-        <p id="filter-note" class="hint" hidden>Фильтр применён</p>
         <div id="board-view" data-state="loading">
           <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
           <p data-when="error" id="board-error" class="msg" role="alert"></p>
@@ -164,21 +197,483 @@
         </div>
       </section>
 
-      <section id="leads" aria-labelledby="leads-title">
-        <h2 id="leads-title">Лиды</h2>
-        <form id="manual-lead" class="manual">
-          <label>Имя <input name="name" autocomplete="name"></label>
-          <label>Ник <input name="username" autocomplete="off"></label>
-          <label>Телефон <input name="phone" type="tel" autocomplete="tel"></label>
-          <label>Заметка <input name="note" autocomplete="off"></label>
-          <label>Ссылка <input name="url" type="url" autocomplete="off" inputmode="url"></label>
-          <label>Почта <input name="email" type="email" autocomplete="email"></label>
-          <button type="submit" class="btn primary sm">Завести карточку</button>
-        </form>
+      <div class="messenger-grid" data-sheet="inbox">
+        <section id="s04" class="surface-box pane-col" aria-labelledby="s04-title">
+          <div class="pane-head">
+            <h2 id="s04-title">Входящие</h2>
+            <span id="inbox-active-session-badge" class="badge b-new">Все сессии</span>
+          </div>
+
+          <div id="inbox-session-switcher" class="inbox-session-switcher" role="group" aria-label="Сессии Telegram">
+            <button type="button" class="chip session-pill" data-session-account="all" aria-pressed="true">Все сессии</button>
+          </div>
+
+          <section id="search" class="search-panel" aria-labelledby="search-title">
+            <div class="search-top">
+              <h3 id="search-title">Поиск</h3>
+              <div class="switch" id="search-mode" role="group" aria-label="Где искать">
+                <button type="button" data-mode="crm" class="btn secondary sm" aria-pressed="true">В CRM</button>
+                <button type="button" data-mode="telegram" class="btn ghost sm" aria-pressed="false">В Telegram</button>
+              </div>
+            </div>
+            <form id="search-form" role="search">
+              <label class="tg-only" hidden>Аккаунт
+                <select id="tg-account"></select>
+              </label>
+              <div class="search-row">
+                <label for="q">Запрос</label>
+                <div class="search-input-group">
+                  <input id="q" name="q" type="search" placeholder="Имя или @" autocomplete="off">
+                  <button type="submit" class="btn primary sm">Найти</button>
+                </div>
+              </div>
+            </form>
+            <div class="chips" role="group" aria-label="Фильтр">
+              <button type="button" class="chip" data-chip="waiting" aria-pressed="false">Ждёт ответа</button>
+              <button type="button" class="chip" data-chip="unread" aria-pressed="false">Непрочитанные</button>
+              <button type="button" class="chip" data-chip="groups" aria-pressed="false">Группы</button>
+              <button type="button" class="chip" data-chip="muted" aria-pressed="false">Без звука</button>
+            </div>
+            <p id="chip-note" class="hint" hidden>В ответе поиска нет этого признака, поэтому список может опустеть.</p>
+          </section>
+          <div id="inbox-view" data-state="empty">
+            <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span><span class="sk"></span></div>
+            <p data-when="empty" class="hint empty-state">Разговоров на столе нет</p>
+            <p data-when="none" class="hint empty-state">Ничего не найдено</p>
+            <p data-when="error" id="inbox-error" class="msg" role="alert"></p>
+            <ul data-when="filled" id="dialog-results" class="dialog-list"></ul>
+          </div>
+        </section>
+
+        <section id="s05" class="surface-box pane-col chat-pane" aria-labelledby="s05-title">
+          <div class="pane-head">
+            <h2 id="s05-title">Переписка</h2>
+          </div>
+          <div id="thread-view" data-state="empty">
+            <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk tall"></span></div>
+            <p data-when="empty" class="hint empty-state">Слева ещё не открыт разговор</p>
+            <div data-when="filled" class="thread-active">
+              <div id="thread-head" class="thread-head"></div>
+              <p id="thread-error" class="msg" role="alert" hidden></p>
+              <ol id="messages" class="messages"></ol>
+              <p id="thread-gap" class="hint empty-state">Сообщений пока нет</p>
+              <form id="reply-form" class="reply-form">
+                <label for="reply-text">Ответ</label>
+                <textarea id="reply-text" name="text" placeholder="Напишите сообщение..."></textarea>
+                <div class="row">
+                  <button type="submit" class="btn primary sm">Отправить</button>
+                  <button type="button" class="btn ghost sm" id="mark-unread">Непрочитанное</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <div class="inspector-col">
+          <section id="s06" class="surface-box" aria-labelledby="s06-title">
+            <div class="pane-head">
+              <h2 id="s06-title">Рядом с чатом</h2>
+            </div>
+            <div id="side-view" data-state="empty">
+              <p data-when="empty" class="hint empty-state">Выберите разговор</p>
+              <div data-when="nolead" class="stack">
+                <p>К этому чату лид ещё не заведён</p>
+                <button type="button" id="to-leads" class="btn primary sm">В лиды</button>
+              </div>
+              <div data-when="filled" id="side-card"></div>
+              <p data-when="error" id="side-error" class="msg" role="alert"></p>
+            </div>
+          </section>
+
+          <section id="s09" class="surface-box" data-popup-box="card" aria-labelledby="s09-title">
+            <div class="pane-head">
+              <h2 id="s09-title">Карточка</h2>
+              <button type="button" class="btn ghost sm popup-close-btn sheet-only-btn" id="close-card-popup" data-close-popup aria-label="Закрыть карточку">Закрыть ×</button>
+            </div>
+            <div id="card-view" data-state="empty">
+              <p data-when="empty" class="hint empty-state">Выберите лида в списке или на воронке</p>
+              <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
+              <div data-when="filled" id="lead-card"></div>
+              <p data-when="error" id="card-error" class="msg" role="alert"></p>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div class="ops-grid">
+        <section id="digest" data-sheet="digest" class="surface-box" aria-labelledby="digest-title">
+          <div class="pane-head">
+            <h2 id="digest-title">Напоминания</h2>
+            <button type="button" class="btn secondary sm" id="digest-send">Прислать сводку</button>
+          </div>
+          <div id="reminders" class="stack">
+            <p id="digest-send-status" class="hint" role="status" hidden></p>
+            <div class="switch" id="reminder-scopes" role="group" aria-label="Срок">
+              <button type="button" data-scope="open" class="btn secondary sm" aria-pressed="true">Открытые</button>
+              <button type="button" data-scope="overdue" class="btn ghost sm" aria-pressed="false">Просроченные</button>
+              <button type="button" data-scope="all" class="btn ghost sm" aria-pressed="false">Все</button>
+            </div>
+            <div id="digest-view" data-state="loading">
+              <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+              <p data-when="empty" class="hint empty-state">На сегодня ничего не стоит</p>
+              <div data-when="filled" id="reminder-list" class="stack"></div>
+              <p data-when="error" id="digest-error" class="msg" role="alert"></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="accounts" data-sheet="accounts" class="surface-box" aria-labelledby="accounts-title">
+          <div class="pane-head">
+            <h2 id="accounts-title">Аккаунт</h2>
+            <div class="row">
+              <button type="button" id="check-accounts-btn" class="btn secondary sm">Проверить связь</button>
+              <button type="button" id="open-login-popup" class="btn primary sm sheet-only-btn">+ Подключить номер</button>
+              <button type="button" id="open-session-import-popup" class="btn secondary sm">+ Session / JSON</button>
+              <button type="button" id="bot-login" class="btn secondary sm">Войти через бота</button>
+            </div>
+          </div>
+          <div id="account-auth-box" class="account-auth-box" data-popup-box="login">
+            <div class="popup-box-head sheet-only-flex">
+              <strong>Подключение Telegram-аккаунта</strong>
+              <button type="button" class="btn ghost sm popup-close-btn" data-close-popup aria-label="Закрыть">Закрыть ×</button>
+            </div>
+
+            <div class="auth-mode-tabs" role="tablist" aria-label="Способ подключения аккаунта">
+              <button type="button" class="auth-tab-btn" id="auth-tab-btn-phone" data-auth-tab="phone" role="tab" aria-selected="true">По номеру (Phone Number)</button>
+              <button type="button" class="auth-tab-btn" id="auth-tab-btn-session" data-auth-tab="session" role="tab" aria-selected="false">Session + JSON (ZIP)</button>
+            </div>
+
+            <div id="auth-pane-phone" class="auth-tab-pane">
+              <form id="login-form" class="compact-form">
+                <label for="phone">Телефон</label>
+                <div class="search-input-group">
+                  <input id="phone" name="phone" type="tel" autocomplete="tel" required placeholder="+79990000000">
+                  <button type="submit" class="btn primary sm">Получить код</button>
+                </div>
+                <div class="auth-meta-grid">
+                  <label for="account-proxy-select">Прокси (Proxy Location)
+                    <select id="account-proxy-select" name="proxy">
+                      <option value="auto">Auto (Workspace Proxy)</option>
+                      <option value="eu_residential">EU Residential</option>
+                      <option value="us_dedicated">US Dedicated</option>
+                      <option value="cis_mobile">CIS Mobile</option>
+                    </select>
+                  </label>
+                  <label for="account-access-select">Доступ (Access)
+                    <select id="account-access-select" name="access">
+                      <option value="workspace">Workspace (Общий)</option>
+                      <option value="personal">Personal (Личный)</option>
+                    </select>
+                  </label>
+                </div>
+              </form>
+              <p id="operator-msg" class="msg" role="status"></p>
+              <form id="code-form" class="compact-form" hidden>
+                <label for="code">Код</label>
+                <div class="search-input-group">
+                  <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+                  <button type="submit" class="btn primary sm">Подтвердить код</button>
+                </div>
+              </form>
+              <form id="password-form" class="compact-form" hidden>
+                <label for="password">Пароль 2FA</label>
+                <div class="search-input-group">
+                  <input id="password" name="password" type="password" autocomplete="current-password" required>
+                  <button type="submit" class="btn primary sm">Подтвердить пароль</button>
+                </div>
+              </form>
+            </div>
+
+            <div id="auth-pane-session" class="auth-tab-pane" hidden>
+              <div class="session-import-card stack">
+                <div class="session-dropzone">
+                  <label for="session-import-file" class="session-dropzone-label">
+                    <strong>Выберите ZIP-архив или файлы .session + .json</strong>
+                    <span class="hint">Поддерживаются пакеты Telethon / Pyrogram / TData JSON (до 5 МБ на аккаунт)</span>
+                  </label>
+                  <input id="session-import-file" type="file" accept=".zip,.session,.json" multiple>
+                </div>
+                <label for="session-import-text">Или вставьте JSON-профили / StringSession / список (phone, username, name)
+                  <textarea id="session-import-text" rows="3" placeholder='[{"phone":"+79995550101","username":"ivan_outreach","name":"Иван · Outreach","proxy":"EU Residential"}]'></textarea>
+                </label>
+                <div class="auth-meta-grid">
+                  <label for="session-proxy-select">Прокси для импорта
+                    <select id="session-proxy-select">
+                      <option value="auto">Auto (Workspace Proxy)</option>
+                      <option value="eu_residential">EU Residential</option>
+                      <option value="us_dedicated">US Dedicated</option>
+                      <option value="cis_mobile">CIS Mobile</option>
+                    </select>
+                  </label>
+                  <label for="session-access-select">Доступ
+                    <select id="session-access-select">
+                      <option value="workspace">Workspace (Общий)</option>
+                      <option value="personal">Personal (Личный)</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="row">
+                  <button type="button" id="fill-sample-session-btn" class="btn secondary sm">Пример пакета Session + JSON</button>
+                  <button type="button" id="import-session-btn" class="btn primary sm">Импортировать Session + JSON</button>
+                </div>
+              </div>
+            </div>
+
+            <p id="login-msg" class="msg" role="status"></p>
+          </div>
+          <div id="accounts-summary-bar" class="accounts-summary-bar hint" role="status">
+            Подключено: 0 · Не подключено: 0 · Суточный пул: 0 сообщ./сут
+          </div>
+          <div id="accounts-view" data-state="loading">
+            <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+            <p data-when="empty" class="hint empty-state">Сначала подключите Телеграм</p>
+            <p data-when="error" id="accounts-error" class="msg" role="alert"></p>
+            <ul data-when="filled" id="account-list" class="account-list"></ul>
+          </div>
+        </section>
+
+        <section id="s11" data-sheet="s11" class="surface-box" aria-labelledby="s11-title">
+          <div class="pane-head">
+            <h2 id="s11-title">Папки Telegram</h2>
+            <button type="button" id="folders-refresh" class="btn secondary sm">Обновить папки</button>
+          </div>
+          <label for="folder-account">Для аккаунта
+            <select id="folder-account"></select>
+          </label>
+          <div id="folders-view" data-state="empty">
+            <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
+            <p data-when="empty" class="hint empty-state">Папок пока нет</p>
+            <p data-when="error" id="folders-error" class="msg" role="alert"></p>
+            <ul data-when="filled" id="folder-list" class="account-list"></ul>
+          </div>
+        </section>
+      </div>
+
+      <section id="outreach" data-sheet="outreach" class="surface-box outreach-section" aria-labelledby="outreach-title">
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="outreach-title">Рассылки</h2>
+            <span id="schedule-summary-badge" class="badge b-new">Пн–Пт · 09:00–18:00 UTC</span>
+          </div>
+          <div class="row outreach-head-actions">
+            <button type="button" id="outreach-open-schedule-btn" class="btn secondary sm">Расписание</button>
+            <button type="button" id="outreach-open-from-leads-btn" class="btn secondary sm">+ Из лидов CRM</button>
+            <button type="button" id="open-builder-popup" class="btn primary sm sheet-only-btn">+ Создать цепочку</button>
+            <button type="button" id="open-csv-popup" class="btn secondary sm sheet-only-btn">Импорт CSV</button>
+          </div>
+        </div>
+
+        <div id="outreach-schedule-box" class="surface-subcard outreach-modal-box" data-popup-box="schedule" hidden>
+          <div class="subcard-head">
+            <h3>Расписание отправки (Sending Schedule)</h3>
+            <button type="button" class="btn ghost sm popup-close-btn" data-close-schedule aria-label="Закрыть">Закрыть ×</button>
+          </div>
+          <form id="schedule-form" class="stack">
+            <p class="hint">Укажите дни недели и рабочие часы, в которые разрешена отправка сообщений и фоллоуапов по кампаниям.</p>
+            <div id="schedule-days-list" class="schedule-days-list"></div>
+            <div class="outreach-form-row">
+              <label for="schedule-timezone">Часовой пояс (Timezone)
+                <select id="schedule-timezone">
+                  <option value="UTC">UTC</option>
+                  <option value="Europe/Moscow">Europe/Moscow (MSK)</option>
+                  <option value="Europe/Berlin">Europe/Berlin (CET)</option>
+                  <option value="Asia/Dubai">Asia/Dubai (GST)</option>
+                  <option value="America/New_York">America/New_York (EST)</option>
+                </select>
+              </label>
+              <div class="row">
+                <button type="submit" id="save-schedule-btn" class="btn primary sm">Сохранить расписание</button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <div id="outreach-from-leads-box" class="surface-subcard outreach-modal-box" data-popup-box="from-leads" hidden>
+          <div class="subcard-head">
+            <h3>Добавить получателей из Лидов CRM</h3>
+            <button type="button" class="btn ghost sm popup-close-btn" data-close-from-leads aria-label="Закрыть">Закрыть ×</button>
+          </div>
+          <div class="outreach-form-row">
+            <label for="from-leads-campaign-select">Целевая кампания
+              <select id="from-leads-campaign-select">
+                <option value="">Создать новую кампанию автоматически</option>
+              </select>
+            </label>
+            <label for="from-leads-stage-filter">Фильтр по стадии воронки
+              <select id="from-leads-stage-filter">
+                <option value="">Все стадии</option>
+                <option value="new">Лид</option>
+                <option value="talking">Разговор</option>
+                <option value="waiting">Ждём</option>
+                <option value="won">Выигран</option>
+              </select>
+            </label>
+          </div>
+          <div class="campaign-pool-head">
+            <span class="steps-caption">Выберите контакты CRM для постановки в очередь:</span>
+            <button type="button" id="from-leads-select-all" class="btn secondary sm">Выбрать все</button>
+          </div>
+          <div id="from-leads-checklist" class="from-leads-checklist"></div>
+          <div class="row">
+            <button type="button" id="add-from-leads-btn" class="btn primary sm">Добавить лидов в кампанию</button>
+          </div>
+        </div>
+
+        <div class="outreach-grid">
+          <div class="outreach-builder surface-subcard" id="outreach-builder-box" data-popup-box="builder">
+            <div class="subcard-head">
+              <h3>1. Цепочка сообщений</h3>
+              <button type="button" class="btn ghost sm popup-close-btn sheet-only-btn" data-close-popup aria-label="Закрыть">Закрыть ×</button>
+            </div>
+            <form id="campaign-form" class="stack">
+              <div class="outreach-form-row">
+                <label for="campaign-name">Название рассылки
+                  <input id="campaign-name" name="name" type="text" autocomplete="off" placeholder="Web3 Founders">
+                </label>
+                <label for="campaign-account">Отправитель
+                  <select id="campaign-account" name="account_id" aria-label="Отправитель">
+                    <option value="">Выберите аккаунт</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="campaign-pool-box">
+                <div class="campaign-pool-head">
+                  <span class="steps-caption">Пул аккаунтов рассылки (ротация):</span>
+                  <button type="button" id="select-all-campaign-accounts" class="btn secondary sm">Выбрать все подключённые</button>
+                </div>
+                <div id="campaign-accounts-pool" class="campaign-accounts-pool" role="group" aria-label="Пул аккаунтов рассылки"></div>
+                <p id="campaign-pool-summary" class="hint campaign-pool-summary">Пул: 0 аккаунтов · до 0 сообщ./сутки суммарно</p>
+              </div>
+
+              <div class="outreach-limit-row">
+                <label for="campaign-limit">Лимит в сутки
+                  <input id="campaign-limit" name="daily_limit" type="number" min="1" max="500" value="20">
+                </label>
+                <div class="limit-preset-group" role="group" aria-label="Быстрый выбор лимита кампании">
+                  <button type="button" class="chip campaign-limit-chip" data-campaign-limit="10" data-limit-preset="10" aria-pressed="false">10 / сут</button>
+                  <button type="button" class="chip campaign-limit-chip" data-campaign-limit="20" data-limit-preset="20" aria-pressed="true">20 / сут</button>
+                </div>
+              </div>
+
+              <div class="steps-toolbar">
+                <span class="steps-caption">Переменные:</span>
+                <div class="var-chips" role="group" aria-label="Переменные шаблона">
+                  <button type="button" class="chip var-chip" data-insert-var="{name}">+ {name}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{company}">+ {company}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{username}">+ {username}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{note}">+ {note}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{first_touch}">+ {first_touch}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{followup_1}">+ {followup_1}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{followup_2}">+ {followup_2}</button>
+                  <button type="button" class="chip var-chip" data-insert-var="{hook}">+ {hook}</button>
+                </div>
+              </div>
+
+              <div id="campaign-steps-list" class="campaign-steps-list"></div>
+
+              <div class="row">
+                <button type="button" id="add-campaign-step" class="btn secondary sm">+ Шаг</button>
+                <button type="submit" id="create-campaign-btn" class="btn primary sm">Создать цепочку рассылки</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="outreach-ops stack">
+            <div class="csv-upload-card surface-subcard" id="outreach-csv-box" data-popup-box="csv">
+              <div class="subcard-head">
+                <h3>2. Импорт CSV</h3>
+                <div class="row">
+                  <button type="button" id="fill-sample-csv" class="btn secondary sm">Пример таблицы CSV</button>
+                  <button type="button" class="btn ghost sm popup-close-btn sheet-only-btn" data-close-popup aria-label="Закрыть">Закрыть ×</button>
+                </div>
+              </div>
+              <div class="outreach-form-row">
+                <label for="csv-campaign-select">Рассылка
+                  <select id="csv-campaign-select">
+                    <option value="">Сначала создайте рассылку</option>
+                  </select>
+                </label>
+                <label for="csv-file">Файл CSV
+                  <input id="csv-file" type="file" accept=".csv,.txt">
+                </label>
+              </div>
+              <label for="csv-text">CSV: простой (username, name, phone, company, note) или таблица SoftUGC (Название, Сайт, Контакт, Первое касание, Фоллоуап 1, Фоллоуап 2)
+                <textarea id="csv-text" rows="3" placeholder="Column 1,Приоритет,Статус/Фит,Категория,Название,Сайт,Контакт,Их угол,Наш угол,Хук,Первое касание,Статус,Founder X,Founder PH,Founder LinkedIn,Рынок,Сегмент,Фоллоуап 1,Фоллоуап 2"></textarea>
+              </label>
+
+              <div id="csv-mapping-preview-box" class="csv-mapping-preview-box stack" hidden>
+                <div class="csv-mapping-card">
+                  <div class="subcard-head">
+                    <strong>Сопоставление колонок (Map fields to columns)</strong>
+                    <span id="csv-preview-count-badge" class="badge b-ok">0 строк</span>
+                  </div>
+                  <div class="csv-mapping-grid">
+                    <label for="csv-map-username">Контакт / Username
+                      <select id="csv-map-username" data-map-field="username"></select>
+                    </label>
+                    <label for="csv-map-company">Компания / Название
+                      <select id="csv-map-company" data-map-field="company"></select>
+                    </label>
+                    <label for="csv-map-step1">Первое касание (Шаг 1)
+                      <select id="csv-map-step1" data-map-field="step_1"></select>
+                    </label>
+                    <label for="csv-map-step2">Фоллоуап 1 (Шаг 2)
+                      <select id="csv-map-step2" data-map-field="step_2"></select>
+                    </label>
+                  </div>
+                </div>
+                <div class="csv-preview-wrap">
+                  <span class="steps-caption">ПРЕДПРОСМОТР ТАБЛИЦЫ (PREVIEW):</span>
+                  <div id="csv-preview-grid" class="csv-preview-grid"></div>
+                </div>
+              </div>
+
+              <p class="hint">Поддерживаются как простые таблицы (<code>username,name,company</code>), так и полные выгрузки SoftUGC с готовыми текстами шагов (<code>Название</code>, <code>Сайт</code>, <code>Контакт</code>, <code>Первое касание</code>, <code>Фоллоуап 1</code>, <code>Фоллоуап 2</code>).</p>
+              <div class="row">
+                <button type="button" id="import-csv-btn" class="btn primary sm">Загрузить CSV в рассылку</button>
+              </div>
+            </div>
+
+            <div class="surface-subcard stack outreach-queue-card">
+              <div class="subcard-head all-only-flex">
+                <h3>3. Очередь и запуск</h3>
+              </div>
+              <div id="campaigns-view" data-state="empty">
+                <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+                <p data-when="empty" class="hint empty-state">Нет активных рассылок</p>
+                <p data-when="error" id="campaigns-error" class="msg" role="alert"></p>
+                <div data-when="filled" id="campaign-list" class="campaign-list"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="leads" data-sheet="leads" class="surface-box" aria-labelledby="leads-title">
+        <div class="pane-head">
+          <h2 id="leads-title">Лиды</h2>
+          <button type="button" id="open-lead-popup" class="btn primary sm sheet-only-btn">+ Завести карточку</button>
+        </div>
+        <div id="manual-lead-box" class="manual-lead-box" data-popup-box="lead">
+          <div class="popup-box-head sheet-only-flex">
+            <strong>Новая карточка контакта</strong>
+            <button type="button" class="btn ghost sm popup-close-btn" data-close-popup aria-label="Закрыть">Закрыть ×</button>
+          </div>
+          <form id="manual-lead" class="manual">
+            <label>Имя <input name="name" autocomplete="name" placeholder="Имя контакта"></label>
+            <label>Ник <input name="username" autocomplete="off" placeholder="@username"></label>
+            <label>Телефон <input name="phone" type="tel" autocomplete="tel" placeholder="+7..."></label>
+            <label>Заметка <input name="note" autocomplete="off" placeholder="Контекст сделки"></label>
+            <label>Ссылка <input name="url" type="url" autocomplete="off" inputmode="url" placeholder="https://..."></label>
+            <label>Почта <input name="email" type="email" autocomplete="email" placeholder="ivan@company.ru"></label>
+            <button type="submit" class="btn primary sm">Завести карточку</button>
+          </form>
+        </div>
         <div id="leads-view" data-state="loading">
           <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
-          <p data-when="empty" class="hint">Карточек на столе нет</p>
-          <p data-when="none" class="hint">По запросу пусто</p>
+          <p data-when="empty" class="hint empty-state">Карточек на столе нет</p>
+          <p data-when="none" class="hint empty-state">По запросу пусто</p>
           <p data-when="error" id="leads-error" class="msg" role="alert"></p>
           <div data-when="filled" class="table-wrap">
             <table>
@@ -186,8 +681,8 @@
                 <tr>
                   <th>Имя</th>
                   <th>Username</th>
-                  <th>Telegram id</th>
-                  <th>Телефон</th>
+                  <th class="num">Telegram id</th>
+                  <th class="num">Телефон</th>
                   <th>Статус</th>
                   <th>Заметка</th>
                   <th>Следующий шаг</th>
@@ -199,53 +694,206 @@
           </div>
         </div>
       </section>
+
+      <section id="tool-phones" data-sheet="tool-phones" class="surface-box tool-section" aria-labelledby="tool-phones-title" hidden>
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="tool-phones-title">Телефоны в Telegram</h2>
+            <span class="badge b-ok">MTProto Contact Resolver</span>
+          </div>
+          <button type="button" id="tool-phones-sample-btn" class="btn secondary sm">Вставить пример номеров</button>
+        </div>
+        <div class="tool-card-layout">
+          <div class="surface-subcard stack">
+            <h3>Поиск Telegram-аккаунтов по номерам телефонов</h3>
+            <p class="hint">Вставьте телефонные номера в любом формате. Система нормализует их, проверит наличие Telegram-профиля и создаст готовые карточки для переписки или рассылки.</p>
+            <label for="tool-phones-input">Список номеров (по одному на строке)
+              <textarea id="tool-phones-input" rows="5" placeholder="+1 (202) 555-0100&#10;+44 20 7946 0958&#10;+7 (999) 123-45-67"></textarea>
+            </label>
+            <div class="outreach-form-row">
+              <label for="tool-phones-account">Сессия для проверки
+                <select id="tool-phones-account"></select>
+              </label>
+              <label for="tool-phones-campaign">Добавить в кампанию (опционально)
+                <select id="tool-phones-campaign">
+                  <option value="">Без добавления в кампанию</option>
+                </select>
+              </label>
+            </div>
+            <label class="row">
+              <input type="checkbox" id="tool-phones-create-leads" checked>
+              <span>Сразу создать карточки в Лидах CRM</span>
+            </label>
+            <div class="tool-info-callout">
+              <span>Номера нормализуются и дедуплицируются перед проверкой. Найденные контакты сразу доступны для открытия диалога в платформе.</span>
+            </div>
+            <div class="row">
+              <button type="button" id="tool-phones-submit-btn" class="btn primary sm">Найти аккаунты в Telegram</button>
+            </div>
+          </div>
+
+          <div class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>Результаты конвертации</h3>
+              <span id="tool-phones-count-badge" class="badge b-new">0 найдено</span>
+            </div>
+            <div id="tool-phones-results" class="tool-results-list">
+              <p class="hint empty-state">Запустите проверку номеров, чтобы увидеть найденные Telegram-профили.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tool-parser" data-sheet="tool-parser" class="surface-box tool-section" aria-labelledby="tool-parser-title" hidden>
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="tool-parser-title">Парсер групп Telegram</h2>
+            <span class="badge b-talk">Участники и активные авторы</span>
+          </div>
+          <div class="row">
+            <button type="button" class="chip parser-preset-chip" data-group-preset="https://t.me/saas_founders_hub">@saas_founders_hub</button>
+            <button type="button" class="chip parser-preset-chip" data-group-preset="https://t.me/web3_builders_cis">@web3_builders_cis</button>
+          </div>
+        </div>
+        <div class="tool-card-layout">
+          <div class="surface-subcard stack">
+            <h3>Сбор базы участников из чата или группы</h3>
+            <label for="tool-parser-link">Ссылка на группу или @username чата
+              <input id="tool-parser-link" type="text" autocomplete="off" placeholder="https://t.me/saas_founders_hub или @yc_founders">
+            </label>
+            <div class="outreach-form-row">
+              <label for="tool-parser-account">Рабочая сессия Telegram
+                <select id="tool-parser-account"></select>
+              </label>
+              <label for="tool-parser-campaign">Импортировать в кампанию (опционально)
+                <select id="tool-parser-campaign">
+                  <option value="">Без добавления в кампанию</option>
+                </select>
+              </label>
+            </div>
+            <label class="row">
+              <input type="checkbox" id="tool-parser-create-leads" checked>
+              <span>Добавить спарсенных участников в Лиды CRM</span>
+            </label>
+            <div class="tool-info-callout stack">
+              <span>1. Поддерживаются открытые группы и чаты с публичным списком участников или открытой историей сообщений.</span>
+              <span>2. Все найденные участники с @username сохраняются с био и источником группы для персонализации рассылки.</span>
+            </div>
+            <div class="row">
+              <button type="button" id="tool-parser-submit-btn" class="btn primary sm">Спарсить участников группы</button>
+            </div>
+          </div>
+
+          <div class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>Собранные участники</h3>
+              <span id="tool-parser-count-badge" class="badge b-new">0 участников</span>
+            </div>
+            <div id="tool-parser-results" class="tool-results-list">
+              <p class="hint empty-state">Укажите ссылку на Telegram-группу и нажмите «Спарсить участников группы».</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="crm-properties" data-sheet="crm-properties" class="surface-box tool-section" aria-labelledby="crm-properties-title" hidden>
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="crm-properties-title">Поля CRM: Лиды</h2>
+            <span class="badge b-new">Кастомные атрибуты карточек</span>
+          </div>
+        </div>
+        <div class="tool-card-layout">
+          <div class="surface-subcard stack">
+            <h3>Создать новое поле (New property)</h3>
+            <p class="hint">Кастомные поля доступны во всех карточках лидов, фильтрах воронки и переменных рассылки.</p>
+            <form id="crm-property-create-form" class="stack">
+              <label for="crm-prop-name">Название поля
+                <input id="crm-prop-name" type="text" autocomplete="off" placeholder="Например: MRR, Ссылка на Pitch Deck, Индустрия">
+              </label>
+              <label for="crm-prop-type">Тип поля
+                <select id="crm-prop-type">
+                  <option value="text">Text (Текст)</option>
+                  <option value="single_select">Single Select (Один вариант)</option>
+                  <option value="multi_select">Multi Select (Несколько вариантов)</option>
+                  <option value="amount">Amount (Сумма / Бюджет)</option>
+                  <option value="url">URL (Ссылка)</option>
+                  <option value="email">Email (Почта)</option>
+                  <option value="tel">Phone (Телефон)</option>
+                </select>
+              </label>
+              <div class="row">
+                <button type="submit" id="crm-prop-submit-btn" class="btn primary sm">+ Создать поле CRM</button>
+              </div>
+            </form>
+          </div>
+          <div class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>Активные поля воркспейса</h3>
+              <span id="crm-properties-count-badge" class="badge b-ok">0 полей</span>
+            </div>
+            <div id="crm-properties-list" class="tool-results-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="ai-bot" data-sheet="ai-bot" class="surface-box tool-section" aria-labelledby="ai-bot-title" hidden>
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="ai-bot-title">AI Агент · Квалификация и авто-ответы</h2>
+            <span class="badge b-talk">4-ступенчатый конвейер субагентов</span>
+          </div>
+        </div>
+        <div class="tool-card-layout">
+          <div class="surface-subcard stack">
+            <h3>Архитектура AI-агента Foldesk</h3>
+            <p class="hint">AI отвечает от лица подключённых Telegram-аккаунтов, определяет стадию сделки, квалифицирует лида и экономит часы ручной переписки.</p>
+            <div class="ai-pipeline-grid">
+              <div class="ai-stage-card">
+                <span class="badge b-new">Этап 1 · Classifier</span>
+                <strong>Классификатор контекста</strong>
+                <p class="hint">Определяет стадию диалога, интент собеседника, тональность и наличие возражений.</p>
+              </div>
+              <div class="ai-stage-card">
+                <span class="badge b-talk">Этап 2 · Strategist</span>
+                <strong>Стратег переговоров</strong>
+                <p class="hint">Выбирает оптимальный сценарий ответа: дожим на созвон, ответ на вопрос по цене или отправка кейса.</p>
+              </div>
+              <div class="ai-stage-card">
+                <span class="badge b-wait">Этап 3 · Generator</span>
+                <strong>Генератор вариантов</strong>
+                <p class="hint">Формирует 3 естественных варианта ответа в стиле живого основателя без шаблонных фраз.</p>
+              </div>
+              <div class="ai-stage-card">
+                <span class="badge b-ok">Этап 4 · Selector</span>
+                <strong>Селектор и критик</strong>
+                <p class="hint">Проверяет факты, выбирает лучший ответ и отправляет его в чат или сохраняет как черновик.</p>
+              </div>
+            </div>
+          </div>
+          <div class="surface-subcard stack">
+            <h3>Настройки автономности</h3>
+            <label class="row">
+              <input type="checkbox" id="ai-bot-copilot-toggle" checked>
+              <span>Режим Copilot (подсказывать ответ в окне переписки)</span>
+            </label>
+            <label class="row">
+              <input type="checkbox" id="ai-bot-auto-qualify" checked>
+              <span>Автоматически двигать карточку в «Разговор» при ответе лида</span>
+            </label>
+            <label for="ai-bot-goal">Цель квалификации (Target Action)
+              <input id="ai-bot-goal" type="text" value="Назначить 15-минутный демо-созвон в Google Meet или отправить 3 примера UGC-креативов">
+            </label>
+            <div class="row">
+              <button type="button" id="ai-bot-save-btn" class="btn primary sm">Сохранить конфигурацию AI</button>
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
-
-    <aside class="panel-col">
-      <section id="s06" aria-labelledby="s06-title">
-        <h2 id="s06-title">Рядом с чатом</h2>
-        <div id="side-view" data-state="empty">
-          <p data-when="empty" class="hint">Выберите разговор</p>
-          <div data-when="nolead" class="stack">
-            <p>К этому чату лид ещё не заведён</p>
-            <button type="button" id="to-leads" class="btn primary sm">В лиды</button>
-          </div>
-          <div data-when="filled" id="side-card"></div>
-          <p data-when="error" id="side-error" class="msg" role="alert"></p>
-        </div>
-      </section>
-
-      <section id="s09" aria-labelledby="s09-title">
-        <h2 id="s09-title">Карточка</h2>
-        <div id="card-view" data-state="empty">
-          <p data-when="empty" class="hint">Выберите лида в списке или на воронке</p>
-          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
-          <div data-when="filled" id="lead-card"></div>
-          <p data-when="error" id="card-error" class="msg" role="alert"></p>
-        </div>
-      </section>
-
-      <section id="digest" aria-labelledby="digest-title">
-        <h2 id="digest-title">Напоминания</h2>
-        <div id="reminders">
-          <button type="button" class="btn secondary sm" id="digest-send">Прислать сводку</button>
-          <p id="digest-send-status" class="hint" role="status" hidden></p>
-          <div class="switch" id="reminder-scopes" role="group" aria-label="Срок">
-            <button type="button" data-scope="open" class="btn secondary sm" aria-pressed="true">Открытые</button>
-            <button type="button" data-scope="overdue" class="btn ghost sm" aria-pressed="false">Просроченные</button>
-            <button type="button" data-scope="all" class="btn ghost sm" aria-pressed="false">Все</button>
-          </div>
-          <div id="digest-view" data-state="loading">
-            <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
-            <p data-when="empty" class="hint">На сегодня ничего не стоит</p>
-            <div data-when="filled" id="reminder-list"></div>
-            <p data-when="error" id="digest-error" class="msg" role="alert"></p>
-          </div>
-        </div>
-      </section>
-    </aside>
   </div>
 
+  <div id="sheet-popup-backdrop" class="sheet-popup-backdrop" hidden></div>
   <div id="toast" class="toast" hidden></div>
   <div id="modal" class="modal-root" hidden>
     <button type="button" class="overlay" id="modal-dismiss" aria-label="Закрыть"></button>

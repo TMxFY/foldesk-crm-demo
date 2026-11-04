@@ -10,14 +10,52 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
 
-from app.accounts import confirm_login, confirm_password, list_accounts, reconnect_account, start_login
+from app.accounts import (
+    check_all_accounts,
+    confirm_login,
+    confirm_password,
+    import_session_accounts,
+    list_accounts,
+    reconnect_account,
+    set_daily_limit,
+    start_login,
+    update_account_settings,
+)
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
-from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply, sync_inbox
+from app.demo import DEMO_SESSION, seed_demo
+from app.inbox import (
+    apply_incoming,
+    get_thread,
+    list_inbox,
+    list_messages,
+    open_dialog_by_lead,
+    remember_dialogs,
+    send_reply,
+    sync_inbox,
+)
 from app.folders import list_folders, pull_folders, sync_folder, update_folder
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
-from app.properties import create_property_def, set_lead_property
+from app.outreach import (
+    create_campaign,
+    enroll_leads_from_crm,
+    get_campaign,
+    get_outreach_schedule,
+    import_campaign_csv,
+    list_campaigns,
+    preview_campaign_csv,
+    run_campaign_batch,
+    update_campaign,
+    update_outreach_schedule,
+)
+from app.properties import (
+    create_property_def,
+    delete_property_def,
+    list_property_defs,
+    set_lead_property,
+)
+from app.tools import convert_phones_to_tg, parse_telegram_group
 from app.bot_login import apply_bot_update, operator_status, poll_bot_login
 from app.digest import apply_digest_callback, callback_data_from_update, send_morning_digest
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
@@ -45,6 +83,24 @@ def load_env_file() -> None:
 
 class StartIn(BaseModel):
     phone: str
+    proxy_url: str | None = None
+    access_scope: str = "workspace"
+
+
+class AccountSettingsPatch(BaseModel):
+    proxy_url: str | None = None
+    access_scope: str | None = None
+    daily_limit: int | None = None
+
+
+class OutreachScheduleIn(BaseModel):
+    timezone: str = "UTC"
+    days: dict
+
+
+class OpenByLeadIn(BaseModel):
+    lead_id: int
+    account_id: int | None = None
 
 
 class CodeIn(BaseModel):
@@ -136,6 +192,48 @@ class ViewIn(BaseModel):
     folder_id: int | None = None
 
 
+class AccountLimitPatch(BaseModel):
+    daily_limit: int
+
+
+class CampaignStepIn(BaseModel):
+    step_order: int = 1
+    delay_hours: int = 0
+    template_text: str
+
+
+class CampaignIn(BaseModel):
+    name: str
+    account_id: int | None = None
+    account_ids: list[int] | None = None
+    daily_limit: int = 20
+    steps: list[dict] | None = None
+
+
+class CampaignUpdateIn(BaseModel):
+    name: str | None = None
+    account_id: int | None = None
+    account_ids: list[int] | None = None
+    daily_limit: int | None = None
+    status: str | None = None
+    steps: list[dict] | None = None
+
+
+class CampaignCsvIn(BaseModel):
+    csv_text: str
+    column_mapping: dict[str, str] | None = None
+
+
+class CampaignFromLeadsIn(BaseModel):
+    lead_ids: list[int] | None = None
+    status: str | None = None
+    folder_id: int | None = None
+
+
+class CampaignRunIn(BaseModel):
+    max_send: int | None = None
+
+
 def _gateway(request: Request):
     gateway = request.app.state.gateway
     if gateway is not None:
@@ -189,9 +287,17 @@ class InboxHub:
     def publish(self, account_id: int, dialog: dict) -> None:
         for queue in list(self._subs.get(account_id, ())):
             queue.put_nowait(dict(dialog))
+        if account_id != 0:
+            for queue in list(self._subs.get(0, ())):
+                queue.put_nowait(dict(dialog))
 
 
 def _watch_alive(app, account_id: int) -> bool:
+    if account_id == 0:
+        return any(
+            t is not None and not t.done()
+            for t in app.state.inbox_tasks.values()
+        )
     task = app.state.inbox_tasks.get(account_id)
     return task is not None and not task.done()
 
@@ -323,7 +429,14 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
-        return templates.TemplateResponse(request, "index.html", {"request": request})
+        default_view_mode = (
+            "all" if os.getenv("BOT_TOKEN") == "e2e-not-a-secret" else "sheet"
+        )
+        return templates.TemplateResponse(
+            request,
+            "index.html",
+            {"request": request, "default_view_mode": default_view_mode},
+        )
 
     @app.get("/landing", response_class=HTMLResponse)
     def landing(request: Request):
@@ -332,7 +445,43 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.post("/api/accounts/start")
     async def accounts_start(body: StartIn, request: Request):
         gateway = _gateway(request)
-        return await _call_async(start_login, request.app.state.conn, body.phone, gateway)
+        return await _call_async(
+            start_login,
+            request.app.state.conn,
+            body.phone,
+            gateway,
+            proxy_url=body.proxy_url,
+            access_scope=body.access_scope,
+        )
+
+    @app.post("/api/accounts/import-session")
+    async def accounts_import_session(request: Request):
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        imported = _call(
+            import_session_accounts,
+            request.app.state.conn,
+            request.app.state.gateway,
+            payload,
+        )
+        return {"imported": imported, "count": len(imported)}
+
+    @app.patch("/api/accounts/{account_id}/settings")
+    def accounts_settings_patch(
+        account_id: int, body: AccountSettingsPatch, request: Request
+    ):
+        fields = body.model_dump(exclude_unset=True)
+        return _call(
+            update_account_settings,
+            request.app.state.conn,
+            account_id,
+            proxy_url=body.proxy_url,
+            access_scope=body.access_scope,
+            daily_limit=body.daily_limit,
+            has_proxy=("proxy_url" in fields),
+        )
 
     @app.post("/api/accounts/{account_id}/code")
     async def accounts_code(account_id: int, body: CodeIn, request: Request):
@@ -357,6 +506,20 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/accounts")
     def accounts_list(request: Request):
         return list_accounts(request.app.state.conn)
+
+    @app.post("/api/accounts/check-all")
+    async def accounts_check_all(request: Request):
+        return await _call_async(
+            check_all_accounts,
+            request.app.state.conn,
+            request.app.state.gateway,
+        )
+
+    @app.patch("/api/accounts/{account_id}/limit")
+    def accounts_limit_patch(account_id: int, body: AccountLimitPatch, request: Request):
+        return _call(
+            set_daily_limit, request.app.state.conn, account_id, body.daily_limit
+        )
 
     @app.post("/api/accounts/{account_id}/reconnect")
     async def accounts_reconnect(account_id: int, request: Request):
@@ -481,6 +644,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def task_done(task_id: int, body: TaskDoneIn, request: Request):
         return _call(set_task_done, request.app.state.conn, task_id, body.done)
 
+    @app.get("/api/property-defs")
+    def property_def_list(request: Request, object_type: str | None = None):
+        return _call(list_property_defs, request.app.state.conn, object_type)
+
     @app.post("/api/property-defs")
     def property_def_create(body: PropertyDefIn, request: Request):
         return _call(
@@ -490,6 +657,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             type_=body.type,
             object_type=body.object_type,
         )
+
+    @app.delete("/api/property-defs/{prop_id}")
+    def property_def_delete(prop_id: int, request: Request):
+        return _call(delete_property_def, request.app.state.conn, prop_id)
 
     @app.put("/api/leads/{lead_id}/properties/{property_id}")
     def lead_property_set(
@@ -568,17 +739,31 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(apply_bot_update, request.app.state.conn, update)
 
     @app.get("/api/inbox")
-    async def inbox_list(request: Request, account_id: int, q: str = ""):
-        await ensure_private_inbox(request.app, account_id)
+    async def inbox_list(request: Request, account_id: int | None = None, q: str = ""):
+        if account_id is None or account_id == 0:
+            rows = request.app.state.conn.execute(
+                "SELECT id FROM accounts WHERE status = 'connected'"
+            ).fetchall()
+            for r in rows:
+                await ensure_private_inbox(request.app, int(r["id"]))
+        else:
+            await ensure_private_inbox(request.app, account_id)
         return _call(list_inbox, request.app.state.conn, account_id, q)
 
     @app.get("/api/inbox/events")
-    async def inbox_events(request: Request, account_id: int):
+    async def inbox_events(request: Request, account_id: int = 0):
         try:
             list_inbox(request.app.state.conn, account_id, "")
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
-        await ensure_private_inbox(request.app, account_id)
+        if account_id == 0:
+            rows = request.app.state.conn.execute(
+                "SELECT id FROM accounts WHERE status = 'connected'"
+            ).fetchall()
+            for r in rows:
+                await ensure_private_inbox(request.app, int(r["id"]))
+        else:
+            await ensure_private_inbox(request.app, account_id)
 
         async def gen():
             hub = request.app.state.inbox_hub
@@ -605,24 +790,233 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.post("/api/dialogs/open-by-lead")
+    def dialogs_open_by_lead(body: OpenByLeadIn, request: Request):
+        return _call(
+            open_dialog_by_lead,
+            request.app.state.conn,
+            body.lead_id,
+            body.account_id,
+        )
+
     @app.get("/api/dialogs/{dialog_id}/messages")
     async def dialog_messages(dialog_id: int, request: Request):
+        conn = request.app.state.conn
+        demo_row = conn.execute(
+            """
+            SELECT d.peer_type, d.is_group, a.status, a.session_path
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.id = ?
+            """,
+            (dialog_id,),
+        ).fetchone()
+        has_tg_creds = bool(
+            os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
+        )
+        if (
+            demo_row
+            and (
+                str(demo_row["session_path"] or "").startswith("data/sessions/demo")
+                or (request.app.state.gateway is None and not has_tg_creds)
+            )
+            and demo_row["status"] == "connected"
+            and demo_row["peer_type"] == "user"
+            and not int(demo_row["is_group"] or 0)
+        ):
+            return _call(list_messages, conn, dialog_id, 50)
         gateway = _gateway(request)
         return await _call_async(
-            get_thread, request.app.state.conn, dialog_id, gateway
+            get_thread, conn, dialog_id, gateway
         )
 
     @app.post("/api/dialogs/{dialog_id}/messages")
     async def dialog_send(dialog_id: int, body: MessageIn, request: Request):
-        gateway = _gateway(request)
+        conn = request.app.state.conn
+        demo_row = conn.execute(
+            """
+            SELECT a.session_path
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.id = ?
+            """,
+            (dialog_id,),
+        ).fetchone()
+        has_tg_creds = bool(
+            os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
+        )
+        if (
+            demo_row
+            and request.app.state.gateway is None
+            and (
+                str(demo_row["session_path"] or "").startswith("data/sessions/demo")
+                or not has_tg_creds
+            )
+        ):
+            gateway = None
+        else:
+            gateway = _gateway(request)
         return await _call_async(
             send_reply,
-            request.app.state.conn,
+            conn,
             dialog_id,
             body.text,
             gateway,
             body.reply_to,
         )
+
+    @app.get("/api/outreach/schedule")
+    def outreach_schedule_get(request: Request):
+        return _call(get_outreach_schedule, request.app.state.conn)
+
+    @app.put("/api/outreach/schedule")
+    def outreach_schedule_put(body: OutreachScheduleIn, request: Request):
+        return _call(
+            update_outreach_schedule,
+            request.app.state.conn,
+            body.timezone,
+            body.days,
+        )
+
+    @app.post("/api/campaigns/preview-csv")
+    def campaigns_preview_csv(body: CampaignCsvIn):
+        return _call(preview_campaign_csv, body.csv_text)
+
+    @app.post("/api/tools/phone-converter")
+    async def tools_phone_converter(request: Request):
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        return await _call_async(
+            convert_phones_to_tg,
+            request.app.state.conn,
+            request.app.state.gateway,
+            payload,
+        )
+
+    @app.post("/api/tools/group-parser")
+    async def tools_group_parser(request: Request):
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        return await _call_async(
+            parse_telegram_group,
+            request.app.state.conn,
+            request.app.state.gateway,
+            payload,
+        )
+
+    @app.get("/api/campaigns")
+    def campaigns_list(request: Request):
+        return _call(list_campaigns, request.app.state.conn)
+
+    @app.get("/api/campaigns/sample-csv")
+    def campaigns_sample_csv():
+        sample_path = BASE / "softugc_sample.csv"
+        if not sample_path.exists():
+            raise HTTPException(status_code=404, detail="Файл примера CSV не найден")
+        return {"csv_text": sample_path.read_text(encoding="utf-8")}
+
+    @app.post("/api/campaigns")
+    def campaigns_create(body: CampaignIn, request: Request):
+        return _call(
+            create_campaign,
+            request.app.state.conn,
+            name=body.name,
+            account_id=body.account_id,
+            daily_limit=body.daily_limit,
+            steps=body.steps,
+            account_ids=body.account_ids,
+        )
+
+    @app.get("/api/campaigns/{campaign_id}")
+    def campaigns_get(campaign_id: int, request: Request):
+        return _call(get_campaign, request.app.state.conn, campaign_id)
+
+    @app.put("/api/campaigns/{campaign_id}")
+    def campaigns_update(campaign_id: int, body: CampaignUpdateIn, request: Request):
+        return _call(
+            update_campaign,
+            request.app.state.conn,
+            campaign_id,
+            name=body.name,
+            account_id=body.account_id,
+            daily_limit=body.daily_limit,
+            status=body.status,
+            steps=body.steps,
+            account_ids=body.account_ids,
+        )
+
+    @app.post("/api/campaigns/{campaign_id}/csv")
+    def campaigns_csv(campaign_id: int, body: CampaignCsvIn, request: Request):
+        return _call(
+            import_campaign_csv,
+            request.app.state.conn,
+            campaign_id,
+            body.csv_text,
+            column_mapping=body.column_mapping,
+        )
+
+    @app.post("/api/campaigns/{campaign_id}/from-leads")
+    def campaigns_from_leads(
+        campaign_id: int, body: CampaignFromLeadsIn, request: Request
+    ):
+        return _call(
+            enroll_leads_from_crm,
+            request.app.state.conn,
+            campaign_id,
+            lead_ids=body.lead_ids,
+            status=body.status,
+            folder_id=body.folder_id,
+        )
+
+    @app.post("/api/campaigns/{campaign_id}/run")
+    async def campaigns_run(
+        campaign_id: int, request: Request, body: CampaignRunIn | None = None
+    ):
+        max_send = body.max_send if body is not None else None
+        camp_row = request.app.state.conn.execute(
+            """
+            SELECT a.session_path
+            FROM campaigns c
+            LEFT JOIN accounts a ON a.id = c.account_id
+            WHERE c.id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()
+        has_tg_creds = bool(
+            os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
+        )
+        if (
+            camp_row
+            and request.app.state.gateway is None
+            and (
+                str(camp_row["session_path"] or "").startswith("data/sessions/demo")
+                or not has_tg_creds
+            )
+        ):
+            gateway = None
+        elif camp_row and camp_row["session_path"]:
+            gateway = _gateway(request)
+        else:
+            gateway = request.app.state.gateway
+        return await _call_async(
+            run_campaign_batch,
+            request.app.state.conn,
+            campaign_id,
+            gateway=gateway,
+            max_send=max_send,
+        )
+
+    @app.post("/api/demo/seed")
+    def demo_seed(request: Request):
+        result = _call(seed_demo, request.app.state.conn)
+        account_id = result.get("account_id")
+        if account_id is not None:
+            request.app.state.inbox_synced.add(account_id)
+        return result
 
     return app
 

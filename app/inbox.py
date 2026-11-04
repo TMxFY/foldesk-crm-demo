@@ -1,13 +1,15 @@
 import sqlite3
 
+from app.accounts import check_daily_limit, increment_daily_sent
 from app.db import as_dict, utc_now
 from app.telegram_gateway import GatewayError
 
 
 def _public(row) -> dict:
     data = as_dict(row)
-    return {
+    out = {
         "id": data["id"],
+        "dialog_id": data["id"],
         "account_id": data["account_id"],
         "telegram_user_id": data["peer_id"],
         "username": data["username"],
@@ -21,6 +23,13 @@ def _public(row) -> dict:
         "last_from_peer": data["last_from_peer"],
         "lead_id": data["lead_id"],
     }
+    if "account_phone" in data:
+        out["account_phone"] = data["account_phone"]
+    if "account_name" in data:
+        out["account_name"] = data["account_name"]
+    if "account_username" in data:
+        out["account_username"] = data["account_username"]
+    return out
 
 
 def remember_dialogs(conn, account_id: int, people: list) -> list:
@@ -207,19 +216,42 @@ def sync_inbox(conn, account_id: int, people: list) -> list:
     return saved
 
 
-def list_inbox(conn, account_id: int, q: str = "") -> list:
-    account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
-    if account is None:
-        raise LookupError("account")
-    rows = conn.execute(
-        """
-        SELECT * FROM dialogs
-        WHERE account_id = ? AND peer_type = 'user'
-        ORDER BY (last_message_at IS NULL), last_message_at DESC, updated_at DESC, id DESC
-        LIMIT 30
-        """,
-        (account_id,),
-    ).fetchall()
+def list_inbox(conn, account_id: int | None = None, q: str = "") -> list:
+    if account_id is None or int(account_id) == 0:
+        rows = conn.execute(
+            """
+            SELECT
+                d.*,
+                a.phone AS account_phone,
+                COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                a.telegram_username AS account_username
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.peer_type = 'user'
+            ORDER BY (d.last_message_at IS NULL), d.last_message_at DESC, d.updated_at DESC, d.id DESC
+            LIMIT 60
+            """
+        ).fetchall()
+    else:
+        acc_id = int(account_id)
+        account = conn.execute("SELECT id FROM accounts WHERE id = ?", (acc_id,)).fetchone()
+        if account is None:
+            raise LookupError("account")
+        rows = conn.execute(
+            """
+            SELECT
+                d.*,
+                a.phone AS account_phone,
+                COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                a.telegram_username AS account_username
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.account_id = ? AND d.peer_type = 'user'
+            ORDER BY (d.last_message_at IS NULL), d.last_message_at DESC, d.updated_at DESC, d.id DESC
+            LIMIT 30
+            """,
+            (acc_id,),
+        ).fetchall()
     found = [_public(row) for row in rows]
     needle = (q or "").strip()
     if needle.startswith("@"):
@@ -233,8 +265,167 @@ def list_inbox(conn, account_id: int, q: str = "") -> list:
             row.get("name") or "",
             row.get("username") or "",
             str(row.get("telegram_user_id") or ""),
+            row.get("account_name") or "",
+            row.get("account_phone") or "",
         )).casefold()
     ]
+
+
+def open_dialog_by_lead(conn, lead_id: int, account_id: int | None = None) -> dict:
+    lead_row = conn.execute("SELECT * FROM leads WHERE id = ?", (int(lead_id),)).fetchone()
+    if lead_row is None:
+        raise LookupError("lead")
+    lead = as_dict(lead_row)
+    lid = int(lead["id"])
+    now = utc_now()
+
+    explicit_acc_id = int(account_id) if (account_id is not None and int(account_id) > 0) else None
+    if explicit_acc_id is not None:
+        acc_check = conn.execute("SELECT * FROM accounts WHERE id = ?", (explicit_acc_id,)).fetchone()
+        if acc_check is None:
+            raise LookupError("account")
+
+    # 1. Try existing dialog on requested account (or any account if not specified)
+    existing_dlg = None
+    if explicit_acc_id is not None:
+        existing_dlg = conn.execute(
+            """
+            SELECT d.*, a.phone AS account_phone,
+                   COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                   a.telegram_username AS account_username
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.account_id = ?
+              AND d.peer_type = 'user'
+              AND (
+                  d.lead_id = ?
+                  OR (? IS NOT NULL AND d.peer_id = ?)
+                  OR (? IS NOT NULL AND d.username IS NOT NULL AND lower(d.username) = lower(?))
+              )
+            ORDER BY d.id LIMIT 1
+            """,
+            (
+                explicit_acc_id,
+                lid,
+                lead.get("telegram_user_id"),
+                lead.get("telegram_user_id"),
+                lead.get("username"),
+                lead.get("username"),
+            ),
+        ).fetchone()
+    else:
+        existing_dlg = conn.execute(
+            """
+            SELECT d.*, a.phone AS account_phone,
+                   COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                   a.telegram_username AS account_username
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.peer_type = 'user'
+              AND (
+                  d.id = ?
+                  OR d.lead_id = ?
+                  OR (? IS NOT NULL AND d.peer_id = ?)
+                  OR (? IS NOT NULL AND d.username IS NOT NULL AND lower(d.username) = lower(?))
+              )
+            ORDER BY (d.lead_id = ?) DESC, d.id LIMIT 1
+            """,
+            (
+                lead.get("dialog_id") or -1,
+                lid,
+                lead.get("telegram_user_id"),
+                lead.get("telegram_user_id"),
+                lead.get("username"),
+                lead.get("username"),
+                lid,
+            ),
+        ).fetchone()
+
+    if existing_dlg is not None:
+        dlg_id = int(existing_dlg["id"])
+        conn.execute("UPDATE dialogs SET lead_id = ? WHERE id = ?", (lid, dlg_id))
+        conn.execute("UPDATE leads SET dialog_id = ? WHERE id = ?", (dlg_id, lid))
+        conn.commit()
+        refreshed = conn.execute(
+            """
+            SELECT d.*, a.phone AS account_phone,
+                   COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                   a.telegram_username AS account_username
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.id = ?
+            """,
+            (dlg_id,),
+        ).fetchone()
+        return _public(refreshed)
+
+    # 2. Determine target account for creating a new dialog
+    target_acc_id = explicit_acc_id
+    if target_acc_id is None and lead.get("account_id"):
+        acc_row = conn.execute(
+            "SELECT id FROM accounts WHERE id = ? AND status = 'connected'",
+            (int(lead["account_id"]),),
+        ).fetchone()
+        if acc_row:
+            target_acc_id = int(acc_row["id"])
+    if target_acc_id is None:
+        acc_row = conn.execute(
+            "SELECT id FROM accounts WHERE status = 'connected' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if acc_row:
+            target_acc_id = int(acc_row["id"])
+    if target_acc_id is None:
+        acc_row = conn.execute("SELECT id FROM accounts ORDER BY id LIMIT 1").fetchone()
+        if acc_row:
+            target_acc_id = int(acc_row["id"])
+    if target_acc_id is None:
+        raise ValueError("Подключите хотя бы один Telegram-аккаунт для открытия чата")
+
+    peer_id = int(lead.get("telegram_user_id") or (900000 + lid))
+    username = (lead.get("username") or "").strip().lstrip("@") or None
+    title = (lead.get("name") or "").strip() or username or lead.get("phone") or f"Лид #{lid}"
+    preview = (lead.get("note") or lead.get("description") or "Контакт из CRM · готов к диалогу")[:120]
+
+    conn.execute(
+        """
+        INSERT INTO dialogs (
+            account_id, peer_type, peer_id, username, title,
+            is_group, unread_count, last_message_at, last_message_preview,
+            last_from_peer, muted, lead_id, created_at, updated_at
+        ) VALUES (?, 'user', ?, ?, ?, 0, 0, ?, ?, 0, 0, ?, ?, ?)
+        ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
+            username = COALESCE(excluded.username, dialogs.username),
+            title = CASE WHEN dialogs.title IS NULL OR dialogs.title = '' THEN excluded.title ELSE dialogs.title END,
+            lead_id = excluded.lead_id,
+            updated_at = excluded.updated_at
+        """,
+        (target_acc_id, peer_id, username, title, now, preview, lid, now, now),
+    )
+    created_row = conn.execute(
+        """
+        SELECT d.*, a.phone AS account_phone,
+               COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+               a.telegram_username AS account_username
+        FROM dialogs d
+        JOIN accounts a ON a.id = d.account_id
+        WHERE d.account_id = ? AND d.peer_type = 'user' AND d.peer_id = ?
+        """,
+        (target_acc_id, peer_id),
+    ).fetchone()
+    dlg_id = int(created_row["id"])
+    conn.execute(
+        """
+        UPDATE leads
+        SET dialog_id = ?,
+            account_id = COALESCE(account_id, ?),
+            telegram_user_id = COALESCE(telegram_user_id, ?),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (dlg_id, target_acc_id, peer_id, now, lid),
+    )
+    conn.commit()
+    return _public(created_row)
 
 
 def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
@@ -350,9 +541,21 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     account = as_dict(account)
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
-    sent = await gateway.send_message(
-        account["session_path"], dialog["peer_id"], body, reply_to
-    )
+    check_daily_limit(conn, account["id"])
+    if gateway is None:
+        next_row = conn.execute(
+            "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone()
+        sent = {
+            "telegram_message_id": int(next_row["next_id"]),
+            "text": body,
+            "sent_at": utc_now(),
+        }
+    else:
+        sent = await gateway.send_message(
+            account["session_path"], dialog["peer_id"], body, reply_to
+        )
     if not isinstance(sent, dict) or sent.get("telegram_message_id") is None:
         raise GatewayError("Ответ без номера сообщения")
     now = utc_now()
@@ -388,6 +591,7 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
         """,
         (sent_at, preview, now, dialog_id),
     )
+    increment_daily_sent(conn, account["id"])
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)

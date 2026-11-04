@@ -13,6 +13,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def utc_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def resolve_session(session_path: str) -> Path:
     path = Path(session_path)
     if not path.is_absolute():
@@ -55,7 +59,12 @@ def init_db(conn: sqlite3.Connection) -> None:
                 OR health IN ('active', 'offline', 'unauthorized', 'banned', 'frozen')
             ),
             last_error TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            daily_limit INTEGER NOT NULL DEFAULT 20,
+            sent_today INTEGER NOT NULL DEFAULT 0,
+            sent_date TEXT,
+            proxy_url TEXT,
+            access_scope TEXT NOT NULL DEFAULT 'workspace'
         );
 
         CREATE TABLE IF NOT EXISTS leads (
@@ -75,6 +84,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             description TEXT,
             email TEXT,
             url TEXT,
+            dialog_id INTEGER,
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         );
 
@@ -245,15 +255,101 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS saved_views_name ON saved_views(name);
+
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+            account_ids_json TEXT,
+            daily_limit INTEGER NOT NULL DEFAULT 20 CHECK (daily_limit >= 1 AND daily_limit <= 500),
+            status TEXT NOT NULL DEFAULT 'draft' CHECK (
+                status IN ('draft', 'running', 'paused', 'completed')
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS campaign_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+            step_order INTEGER NOT NULL CHECK (step_order >= 1),
+            delay_hours INTEGER NOT NULL DEFAULT 0 CHECK (delay_hours >= 0),
+            template_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (campaign_id, step_order)
+        );
+
+        CREATE TABLE IF NOT EXISTS campaign_recipients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+            lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+            assigned_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+            telegram_user_id INTEGER,
+            username TEXT,
+            name TEXT,
+            phone TEXT,
+            company TEXT,
+            note TEXT,
+            website TEXT,
+            category TEXT,
+            their_angle TEXT,
+            our_angle TEXT,
+            hook TEXT,
+            step1_text TEXT,
+            step2_text TEXT,
+            step3_text TEXT,
+            current_step INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                status IN ('pending', 'in_progress', 'completed', 'replied', 'failed')
+            ),
+            last_sent_at TEXT,
+            error_text TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS campaign_recipients_campaign ON campaign_recipients(campaign_id, status);
+
+        CREATE TABLE IF NOT EXISTS outreach_schedule (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            timezone TEXT NOT NULL DEFAULT 'UTC',
+            days_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
+    _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "leads", "description", "TEXT")
     _ensure_column(conn, "leads", "email", "TEXT")
     _ensure_column(conn, "leads", "url", "TEXT")
     _ensure_column(conn, "leads", "folder_id", "INTEGER REFERENCES folders(id) ON DELETE SET NULL")
+    _ensure_column(conn, "leads", "dialog_id", "INTEGER")
     _ensure_column(conn, "accounts", "health", "TEXT")
     _ensure_column(conn, "accounts", "last_error", "TEXT")
     _ensure_column(conn, "accounts", "updated_at", "TEXT")
+    _ensure_column(conn, "accounts", "daily_limit", "INTEGER NOT NULL DEFAULT 20")
+    _ensure_column(conn, "accounts", "sent_today", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "accounts", "sent_date", "TEXT")
+    _ensure_column(conn, "accounts", "proxy_url", "TEXT")
+    _ensure_column(conn, "accounts", "access_scope", "TEXT NOT NULL DEFAULT 'workspace'")
+    _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
+    _ensure_column(
+        conn,
+        "campaign_recipients",
+        "assigned_account_id",
+        "INTEGER REFERENCES accounts(id) ON DELETE SET NULL",
+    )
+    _ensure_column(conn, "campaign_recipients", "website", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "category", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "their_angle", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "our_angle", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "hook", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "step1_text", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "step2_text", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "step3_text", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")
     conn.commit()

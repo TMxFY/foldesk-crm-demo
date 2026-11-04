@@ -1,0 +1,507 @@
+{
+  "meta": {
+    "name": "crmchat-visual",
+    "description": "Визуальная design-dna публичного маркетингового сайта crmchat.ai для своего продукта. Не зеркало бандла. Цвета и шрифты сняты computed style 1440, не из скриншот-догадки.",
+    "source_references": "https://crmchat.ai/",
+    "created_at": "2026-11-04",
+    "evidence": "RECON/original-recon.json cssVariables + RECON/style-facts.json computed style. app.crmchat.ai не открывался."
+  },
+  "design_system": {
+    "color": {
+      "palette_type": "zinc neutrals + single blue accent",
+      "primary": {
+        "hex": "#127ef1",
+        "role": "CTA fill (Open in Web, Try for Free) and accent word inside h1. Computed rgb(18, 126, 241). CSS var --token-46aef220-58f8-449f-bd4e-f0721e62e798."
+      },
+      "secondary": {
+        "hex": "#09090b",
+        "role": "Primary ink on headings and dark button fill (Outreach Features). Computed rgb(9, 9, 11). CSS var --token-963ba7ff-1506-4ab8-a9bc-332b05614e66."
+      },
+      "accent": {
+        "hex": "#0099ff",
+        "role": "Inline text link only, distinct from CTA fill. Computed rgb(0, 153, 255) on an anchor. Not used as button background."
+      },
+      "neutral": {
+        "scale": "#09090b #18181b #27272a #3f3f46 #52525b #71717a #a1a1aa #d4d4d8 #e4e4e7 #f4f4f5 #fafafa #ffffff",
+        "usage": "CSS variables on the page (zinc-like). Measured in use: text #09090b, #3f3f46, #52525b, #71717a; inactive tab fill #d4d4d8; section #f4f4f5; body #fafafa; chips #ffffff."
+      },
+      "semantic": {
+        "success": "TODO: var #48d87d exists, role not proven on homepage",
+        "warning": "TODO: var #ffb66e exists, role not proven on homepage",
+        "error": "TODO: var #ff6969 exists, role not proven on homepage",
+        "info": "TODO: var #0d75ba exists, role not proven on homepage"
+      },
+      "surface": {
+        "background": "#fafafa",
+        "card": "#ffffff",
+        "elevated": "rgba(255, 255, 255, 0.7) and rgba(255, 255, 255, 0.5) measured on small pills; section band #f4f4f5"
+      },
+      "contrast_strategy": "dark-on-light dominant",
+      "cta_label": {
+        "hex": "#ffffff",
+        "role": "Label inside blue CTA. Computed on the inner text node, not on the <a> (the <a> itself reports default link blue)."
+      },
+      "muted_text": {
+        "hex": "#71717a",
+        "also": "#52525b",
+        "role": "Supporting copy. Hero lede rgb(113, 113, 122); some paragraphs rgb(82, 82, 91)."
+      }
+    },
+    "typography": {
+      "type_scale": {
+        "display": {
+          "size": "58px",
+          "weight": "600",
+          "line_height": "69.6px",
+          "tracking": "-1.16px",
+          "family": "Manrope",
+          "source": "h1"
+        },
+        "heading_1": {
+          "size": "46px",
+          "weight": "600",
+          "line_height": "55.2px",
+          "tracking": "-0.46px",
+          "family": "Manrope",
+          "source": "h2"
+        },
+        "heading_2": {
+          "size": "36px",
+          "weight": "600",
+          "line_height": "43.2px",
+          "tracking": "-0.72px",
+          "family": "Manrope",
+          "source": "h3"
+        },
+        "heading_3": {
+          "size": "30px",
+          "weight": "600",
+          "line_height": "42px",
+          "tracking": "-0.6px",
+          "family": "Manrope",
+          "source": "h4"
+        },
+        "body": {
+          "size": "16px",
+          "weight": "400",
+          "line_height": "27.2px",
+          "tracking": "0.16px",
+          "family": "Manrope",
+          "color": "#71717a"
+        },
+        "body_small": {
+          "size": "14px",
+          "weight": "500",
+          "line_height": "21px",
+          "tracking": "0.42px",
+          "family": "Inter Tight",
+          "color": "#09090b",
+          "note": "nav labels; 14/400 also used for supporting UI copy"
+        },
+        "caption": {
+          "size": "12px",
+          "weight": "400",
+          "line_height": "14.4px",
+          "tracking": "0.6px",
+          "family": "Inter Tight",
+          "color": "#71717a"
+        },
+        "overline": {
+          "size": "12px",
+          "weight": "600",
+          "line_height": "14.4px",
+          "tracking": "0.48px",
+          "family": "Inter Tight",
+          "color": "#ffffff",
+          "note": "small dark pill label"
+        }
+      },
+      "font_families": {
+        "heading": "Manrope",
+        "body": "Manrope",
+        "ui": "Inter Tight",
+        "mono": "TODO: mono family not present in document.fonts or computed samples"
+      },
+      "font_style_notes": "Scaffold guessed heading=Inter Tight from document.fonts (first 40 faces were Inter Tight) and body=sans-serif from section wrappers. Corrected from computed style: h1–h4 are Manrope 600; long paragraphs are Manrope 400; nav, captions, and button labels are Inter Tight. Placeholder family names (Manrope Placeholder, Inter Tight Placeholder) are Framer fallbacks, not separate brands."
+    },
+    "spacing": {
+      "base_unit": "",
+      "scale": "",
+      "content_density": "",
+      "section_rhythm": ""
+    },
+    "layout": {
+      "grid_system": "",
+      "max_content_width": "",
+      "columns": "",
+      "gutter": "",
+      "breakpoints": "",
+      "alignment_tendency": ""
+    },
+    "shape": {
+      "border_radius": {
+        "small": "8px",
+        "medium": "10px",
+        "large": "12px",
+        "pill": "50px and 100px"
+      },
+      "border_usage": "Measured on controls, not a full audit: inactive tab 8px, nav and header CTA 10px, hero CTA 12px, pills 50px/100px. Section borders not measured as a system.",
+      "divider_style": ""
+    },
+    "elevation": {
+      "shadow_style": "",
+      "levels": {
+        "low": "",
+        "medium": "",
+        "high": ""
+      },
+      "depth_cues": ""
+    },
+    "iconography": {
+      "style": "",
+      "stroke_weight": "",
+      "size_scale": "",
+      "preferred_set": ""
+    },
+    "motion": {
+      "easing": "",
+      "duration_scale": {
+        "micro": "",
+        "normal": "",
+        "macro": ""
+      },
+      "entrance_pattern": "",
+      "exit_pattern": "",
+      "philosophy": ""
+    },
+    "components": {
+      "button_style": "",
+      "input_style": "",
+      "card_style": "",
+      "navigation_pattern": "",
+      "modal_style": "",
+      "list_style": "",
+      "component_notes": ""
+    }
+  },
+  "design_style": {
+    "aesthetic": {
+      "mood": [],
+      "visual_metaphor": "",
+      "era_influence": "",
+      "genre": "",
+      "personality_traits": [],
+      "adjectives": []
+    },
+    "visual_language": {
+      "complexity": "",
+      "ornamentation": "",
+      "whitespace_usage": "",
+      "visual_weight_distribution": "",
+      "focal_strategy": "",
+      "contrast_level": "",
+      "texture_usage": ""
+    },
+    "composition": {
+      "hierarchy_method": "",
+      "balance_type": "",
+      "flow_direction": "",
+      "grouping_strategy": "",
+      "negative_space_role": ""
+    },
+    "imagery": {
+      "photo_treatment": "",
+      "illustration_style": "",
+      "graphic_elements": "",
+      "pattern_usage": "",
+      "image_shape": ""
+    },
+    "interaction_feel": {
+      "feedback_style": "",
+      "hover_behavior": "",
+      "transition_personality": "",
+      "loading_style": "",
+      "microinteraction_density": ""
+    },
+    "brand_voice_in_ui": {
+      "tone": "",
+      "formality": "",
+      "cta_style": "",
+      "empty_state_approach": "",
+      "error_tone": ""
+    }
+  },
+  "visual_effects": {
+    "overview": {
+      "effect_intensity": "",
+      "performance_tier": "",
+      "fallback_strategy": "",
+      "primary_technology": "Framer CSS/HTML. Homepage has one canvas (backing 2170x2170, css 1280x1280). 2D vs WebGL was not sampled; three/gsap/lenis are false. Scaffold label Canvas 2D was a heuristic and is not evidence."
+    },
+    "background_effects": {
+      "type": "",
+      "description": "",
+      "technology": "",
+      "params": {
+        "color_palette": "",
+        "speed": "",
+        "density": "",
+        "opacity": "",
+        "blend_mode": ""
+      }
+    },
+    "particle_systems": {
+      "enabled": false,
+      "type": "",
+      "description": "",
+      "technology": "",
+      "params": {
+        "count": "",
+        "shape": "",
+        "size_range": "",
+        "movement_pattern": "",
+        "color_behavior": "",
+        "interaction": "",
+        "spawn_area": ""
+      }
+    },
+    "3d_elements": {
+      "enabled": false,
+      "type": "",
+      "description": "",
+      "technology": "",
+      "params": {
+        "renderer": "",
+        "lighting": "",
+        "camera": "",
+        "materials": "",
+        "geometry": "",
+        "post_processing": [],
+        "interaction_model": ""
+      }
+    },
+    "shader_effects": {
+      "enabled": false,
+      "type": "",
+      "description": "",
+      "technology": "",
+      "params": {
+        "uniforms": "",
+        "vertex_manipulation": "",
+        "fragment_output": "",
+        "noise_type": "",
+        "distortion": ""
+      }
+    },
+    "scroll_effects": {
+      "parallax": {
+        "enabled": false,
+        "layers": "",
+        "depth_range": "",
+        "speed_curve": ""
+      },
+      "scroll_triggered_animations": {
+        "enabled": false,
+        "trigger_points": "",
+        "animation_type": "",
+        "scrub_behavior": ""
+      },
+      "scroll_morphing": {
+        "enabled": false,
+        "description": ""
+      }
+    },
+    "text_effects": {
+      "type": "",
+      "description": "",
+      "technology": "",
+      "params": {
+        "split_strategy": "",
+        "animation_per_unit": "",
+        "stagger": "",
+        "effect_style": ""
+      }
+    },
+    "cursor_effects": {
+      "enabled": false,
+      "type": "",
+      "description": "",
+      "params": {
+        "shape": "",
+        "size": "",
+        "blend_mode": "",
+        "trail": "",
+        "interaction_zone": ""
+      }
+    },
+    "image_effects": {
+      "type": "",
+      "description": "",
+      "technology": "",
+      "params": {
+        "filter_pipeline": "",
+        "hover_transform": "",
+        "reveal_animation": "",
+        "distortion_type": ""
+      }
+    },
+    "glassmorphism_neumorphism": {
+      "enabled": false,
+      "style": "",
+      "params": {
+        "blur_radius": "",
+        "transparency": "",
+        "border_treatment": "",
+        "shadow_type": "",
+        "light_source_angle": ""
+      }
+    },
+    "canvas_drawings": {
+      "enabled": true,
+      "type": "TODO",
+      "description": "One canvas element on https://crmchat.ai/ at 1440. Backing store 2170x2170, CSS box 1280x1280. Drawing type not inspected.",
+      "technology": "TODO: getContext not sampled",
+      "params": {
+        "draw_method": "",
+        "animation_loop": "",
+        "color_scheme": "",
+        "responsiveness": "",
+        "interaction": ""
+      }
+    },
+    "svg_animations": {
+      "enabled": false,
+      "type": "",
+      "description": "",
+      "params": {
+        "animation_method": "",
+        "path_morphing": "",
+        "stroke_animation": "",
+        "filter_effects": ""
+      }
+    },
+    "composite_notes": ""
+  },
+  "_recon_signals": {
+    "fonts": [
+      "Inter Tight",
+      "sans-serif"
+    ],
+    "color_candidates": [
+      "#09090b",
+      "#18181b",
+      "#27272a",
+      "#3f3f46",
+      "#52525b",
+      "#71717a",
+      "#a1a1aa",
+      "#d4d4d8",
+      "#e4e4e7",
+      "#f4f4f5",
+      "#fafafa",
+      "#fff",
+      "#fffffff2",
+      "#0d75ba",
+      "#40c5ff1a",
+      "#ffb66e",
+      "#48d87d",
+      "#ff6969",
+      "#8554ff",
+      "#beff4b",
+      "#fb923c",
+      "#67e8f9",
+      "#f472b6",
+      "#127ef1"
+    ],
+    "frameworks": {
+      "react": false,
+      "next": false,
+      "vue": false,
+      "nuxt": false,
+      "svelte": false,
+      "astro": false,
+      "three": false,
+      "gsap": false,
+      "lenis": false
+    },
+    "canvas_count": 1,
+    "css_color_vars": [
+      "--token-963ba7ff-1506-4ab8-a9bc-332b05614e66: #09090b",
+      "--token-a5bac2d3-d710-47e2-8bb9-ad946999897c: #18181b",
+      "--token-69d8c37b-c734-4666-b632-32d8f9c9fc52: #27272a",
+      "--token-44ba4d15-de95-4ba6-998e-92f0bf192c5f: #3f3f46",
+      "--token-4e3d4b62-b411-4488-b97a-8ff2a61d3177: #52525b",
+      "--token-05d3d3db-be9e-464a-9684-d4b46306a4c3: #71717a",
+      "--token-1ce3c98f-6fc8-41c4-9a88-0e9fdbf098f1: #a1a1aa",
+      "--token-9f531285-1e18-4a38-b208-f287be68e804: #d4d4d8",
+      "--token-408e9ffb-f435-48c7-a9ff-2c04fe742fc2: #e4e4e7",
+      "--token-4e9dcd95-1f27-443e-9665-b27316e88fe2: #f4f4f5",
+      "--token-bdd5c3bb-385d-4b4d-b487-5a1f9f5d346c: #fafafa",
+      "--token-3711503b-3d3b-4886-a85c-4293b65e43e7: #fff",
+      "--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6: #09090b",
+      "--token-cdaba0c3-7192-4155-be78-0e3fe010491c: #18181b",
+      "--token-b459e046-718c-4dbb-8c34-b5d5869d1e57: #27272a",
+      "--token-e4701bb6-83f6-41e5-b0c8-9b95b4510e3a: #3f3f46",
+      "--token-e6a1425f-5cc8-4e16-87a5-8615ab8b8fe1: #52525b",
+      "--token-fd54a91d-2c97-4609-acbc-244da5b6b983: #71717a",
+      "--token-60b32788-cdeb-41df-ba14-e212d5e544dd: #a1a1aa",
+      "--token-d1b70223-6c17-4c93-9dd4-7a1775f7f7c5: #d4d4d8",
+      "--token-31213cc7-db87-4df4-8209-e72c8adb68fb: #e4e4e7",
+      "--token-b0454cba-c19e-43a6-8075-f4b7a5ae4372: #f4f4f5",
+      "--token-bebb5c17-844d-419e-ab0e-ada0b43a4350: #fafafa",
+      "--token-2b0e18bf-9e9a-4016-bdfc-5769700a5529: #fff",
+      "--token-cd1e8e92-b91e-4022-84c2-a059ee7f7bad: #fff",
+      "--token-5cb9a68d-31cb-4baf-8414-1a3d9276de57: #fffffff2",
+      "--token-d4b915e8-652b-419f-be5a-3361d1e18040: #fff",
+      "--token-39f1e7bd-d6a2-4d0f-90ef-8d65a8c77a7c: #0d75ba",
+      "--token-5cf227e4-8d28-4f31-8df2-e94a44959be8: #40c5ff1a",
+      "--token-385cb8b2-959c-4157-9298-79e9c79de523: #ffb66e",
+      "--token-507185eb-89a3-4185-a6e0-ad13e3c47e1c: #48d87d",
+      "--token-a2b02a90-8343-4e93-bc27-1339e83d69f8: #ff6969",
+      "--token-d3c9b405-1976-40f4-a12c-b2b083e848e2: #8554ff",
+      "--token-2b39abb9-fea1-4307-9825-a3e2580c4c08: #beff4b",
+      "--token-859258dd-93b0-4f6d-8deb-ee5f517e9648: #fb923c",
+      "--token-1507f56b-76d2-4fd3-8c60-feec6812130b: #67e8f9",
+      "--token-1f938e72-b917-4440-a479-af25e05d6ef2: #f472b6",
+      "--token-46aef220-58f8-449f-bd4e-f0721e62e798: #127ef1",
+      "--token-48db76b1-b6f7-481c-9646-e2e74df040d6: #000",
+      "--token-58389c29-c015-4427-a57c-637e65cb6404: #e3e3e3",
+      "--token-e0da01bd-4e0f-4d83-9396-a2ca91f1ef19: #000",
+      "--token-3ab2d8b6-b506-4374-a6e8-5ad0c59c1eff: #666",
+      "--token-f12ecc83-59c9-4232-ac38-7d89a1a3b51f: #666",
+      "--token-0f37c8c4-f915-44f0-be09-b8afb177739f: #666",
+      "--token-14b60f22-b2ad-4fd1-a3db-62c621a81acc: #e3e3e3",
+      "--token-da7cc88f-3656-465f-953b-fa43f0c95c63: #a8a8b2",
+      "--token-44fe9c97-b3d8-4353-bdbe-abf17d09c622: #94949e",
+      "--token-da13adb3-c22e-4772-81bb-50149f3cd671: #fafafa",
+      "--token-122efaff-ca65-4f26-b4de-fe2826f750b7: #fff",
+      "--token-13261ac0-6588-48aa-ba0d-cdc2ec34b5f1: #fff",
+      "--token-caf759f3-1d62-45fc-ad82-7ff586953871: #fff",
+      "--token-5888ab63-e51f-4d96-b305-c183f89c39b8: #fff",
+      "--token-d84fa2f2-c4f1-46f2-a487-e244597a768b: #fff",
+      "--token-11487f8c-2406-4759-aea5-c846b36549d2: #f4f4f5",
+      "--framer-text-color: #000",
+      "--framer-text-color: #000",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--framer-link-text-color: #09f",
+      "--border-color: var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)",
+      "--framer-link-text-color: #09f",
+      "--border-color: var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)",
+      "--framer-link-text-color: #09f",
+      "--border-color: var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)",
+      "--border-color: var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)",
+      "--framer-link-text-color: #09f",
+      "--framer-text-color: var(--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6,#09090b)"
+    ]
+  },
+  "_scaffold_note": "best-effort 预填来自 recon。font_families/surface.background/visual_effects 已据真实信号填写；color 的 primary/secondary/accent 角色需人工从 _recon_signals.color_candidates 指派；所有 \"\" 字段需人工 Analyze 补全(见 references/design-dna.md)。确认无误后可删除 _recon_signals 与本说明。",
+  "_color_correction": "surface.background from scaffold was rgb(255,255,255) because the first painted section is the nav. Body computed background is rgb(250,250,250). Kept #fafafa as the page surface."
+}

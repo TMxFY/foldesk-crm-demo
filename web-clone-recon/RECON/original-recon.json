@@ -1,0 +1,4599 @@
+{
+  "label": "original",
+  "url": "https://crmchat.ai/",
+  "capturedAt": "2026-11-03T23:31:07.560Z",
+  "console": {
+    "errors": [
+      {
+        "type": "error",
+        "text": "Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID",
+        "viewport": 1440
+      },
+      {
+        "type": "error",
+        "text": "Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID",
+        "viewport": 768
+      },
+      {
+        "type": "error",
+        "text": "Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID",
+        "viewport": 390
+      }
+    ],
+    "warnings": [
+      {
+        "type": "warning",
+        "text": "Caught a recoverable error. The site is still functional, but might have some UI flickering or degraded page load performance. If you are the author of this website, update external components and check recently added custom code or code overrides to fix the following server/client mismatches:\n Error: Minified React error #421; visit https://reactjs.org/docs/error-decoder.html?invariant=421 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.\n    at is (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:8:9273)\n    at ts (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:8:7227)\n    at cp (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:8:68599)\n    at tc (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:8:37121)\n    at ec (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:8:37094)\n    at zs (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:8:32162)\n    at Et (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:1:10822)\n    at MessagePort.Ot (https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/react.Da4LRgXc.mjs:1:11177) null",
+        "viewport": 768
+      }
+    ],
+    "pageErrors": []
+  },
+  "captures": [
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "screenshot": "screenshots/original-1440.png",
+      "signals": {
+        "href": "https://crmchat.ai/",
+        "title": "crmchat - Leading Telegram CRM, Outreach and Automation Platform",
+        "lang": "en",
+        "bodyTextChars": 8326,
+        "scrollHeight": 9059,
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        },
+        "h1": [
+          "Telegram CRM, Outreach & Lead Research"
+        ],
+        "headings": [
+          {
+            "tag": "h1",
+            "text": "Telegram CRM, Outreach & Lead Research"
+          },
+          {
+            "tag": "h2",
+            "text": "All-in-one Sales Platform. Optimized for Telegram."
+          },
+          {
+            "tag": "h3",
+            "text": "Telegram Outreach withAutomated Sequences"
+          },
+          {
+            "tag": "h2",
+            "text": "You're in good company"
+          },
+          {
+            "tag": "h3",
+            "text": "A CRM Pipeline we're all used to. Now Telegram-Native."
+          },
+          {
+            "tag": "h2",
+            "text": "50K+"
+          },
+          {
+            "tag": "h2",
+            "text": "20%"
+          },
+          {
+            "tag": "h2",
+            "text": "50%"
+          },
+          {
+            "tag": "h2",
+            "text": "Trusted by Web3, iGaming, Agencies and Creators Worldwide"
+          },
+          {
+            "tag": "h2",
+            "text": "Grow your business on Telegram"
+          }
+        ],
+        "metaDescription": "Telegram-native CRM & Telegram Automation app for sales teams. Find new leads on Telegram, manage CRM deals & scale multi-account outreach. Trusted by 500+ Web3, iGaming, Tech, and LeadGen companies.",
+        "counts": {
+          "links": 72,
+          "images": 45,
+          "video": 0,
+          "canvas": 1,
+          "sections": 16,
+          "forms": 0,
+          "buttons": 2,
+          "inputs": 1,
+          "interactive": 106,
+          "scripts": 16,
+          "stylesheets": 0
+        },
+        "frameworks": {
+          "react": false,
+          "next": false,
+          "vue": false,
+          "nuxt": false,
+          "svelte": false,
+          "astro": false,
+          "three": false,
+          "gsap": false,
+          "lenis": false
+        },
+        "scripts": [
+          "https://mc.yandex.com/metrika/tag_phono.js",
+          "https://connect.facebook.net/signals/config/556089130134761?v=2.9.435&r=stable&domain=crmchat.ai&hme=4453c87d489b6902031c012cadd2731893cd69feb64fe8a61b339727247a7703&ex_m=118%2C242%2C171%2C27%2C82%2C83%2C162%2C78%2C77%2C11%2C181%2C102%2C20%2C153%2C141%2C46%2C85%2C90%2C149%2C176%2C183%2C8%2C4%2C5%2C7%2C6%2C3%2C103%2C115%2C32%2C17%2C31%2C18%2C33%2C34%2C35%2C37%2C55%2C163%2C87%2C126%2C22%2C24%2C51%2C47%2C49%2C48%2C95%2C104%2C108%2C124%2C160%2C164%2C53%2C125%2C29%2C26%2C133%2C79%2C43%2C166%2C165%2C167%2C157%2C155%2C30%2C42%2C66%2C123%2C178%2C80%2C21%2C128%2C93%2C76%2C23%2C97%2C98%2C130%2C96%2C151%2C150%2C154%2C109%2C177%2C180%2C41%2C56%2C127%2C54%2C161%2C72%2C185%2C110%2C184%2C211%2C263%2C84%2C283%2C282%2C281%2C14%2C25%2C28%2C40%2C62%2C117%2C68%2C10%2C73%2C111%2C112%2C113%2C119%2C144%2C38%2C36%2C146%2C147%2C148%2C143%2C142%2C172%2C86%2C175%2C173%2C174%2C57%2C69%2C67%2C137%2C19%2C179%2C52%2C333%2C334%2C335%2C332%2C349%2C371%2C256%2C238%2C70%2C239%2C237%2C374%2C365%2C59%2C257%2C121%2C145%2C92%2C135%2C61%2C134%2C140%2C139%2C65%2C74%2C168%2C88%2C89%2C129%2C44%2C39%2C60%2C63%2C114%2C182%2C1%2C138%2C16%2C136%2C12%2C2%2C64%2C105%2C15%2C75%2C71%2C132%2C101%2C100%2C187%2C188%2C106%2C107%2C9%2C116%2C186%2C58%2C158%2C99%2C91%2C81%2C131%2C120%2C169%2C50%2C159%2C0%2C94%2C152%2C156%2C170%2C45%2C122%2C13%2C189",
+          "https://connect.facebook.net/en_US/fbevents.js",
+          "https://eu-assets.i.posthog.com/static/array.js",
+          "https://www.googletagmanager.com/gtag/js?id=G-HV9PCSW0CW&cx=c&gtm=4e6b21",
+          "https://consent.cookiefirst.com/sites/crmchat.ai-2a647fc1-758d-40d4-bd2b-80d15a7fd617/consent.js",
+          "https://mc.yandex.ru/metrika/tag.js?id=110709752",
+          "https://sc.lfeeder.com/lftracker_v1_Xbp1oaElv1k4EdVj.js",
+          "https://www.googletagmanager.com/gtm.js?id=GTM-MFDQ7CM8",
+          "https://eu-assets.i.posthog.com/static/1.445.1/exception-autocapture.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/dead-clicks-autocapture.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/posthog-recorder.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/surveys.js",
+          "https://eu-assets.i.posthog.com/array/phc_dU9IzmCl2YhzLf5xVaRawLlWZAyR5OzW2dfCgOhkBiD/config.js",
+          "https://events.framer.com/script?v=2",
+          "https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/script_main.Cw2a0qfj.mjs"
+        ],
+        "stylesheets": [],
+        "sections": [
+          {
+            "tag": "nav",
+            "id": "",
+            "className": "framer-rruVO framer-wkp83w framer-v-wkp83w",
+            "text": "IndustriesProductHelp CenterCompanyPricingChangelogSelect LanguageEnglishRussian (Russia)Open in Web",
+            "rect": {
+              "x": 0,
+              "y": 0,
+              "width": 1440,
+              "height": 61
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(255, 255, 255)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-2lypg8",
+            "text": ".home-reading-illustration-root .home-reading-illustration-light, .home-reading-illustration-root .home-reading-illustration-dark { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: none; } .home-read",
+            "rect": {
+              "x": 0,
+              "y": 0,
+              "width": 1440,
+              "height": 900
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(255, 255, 255)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "The Open PlatformTON FoundationTributeSolana SuperteamSuperProtocolGlobal Blockchain ShowThe Open PlatformTON FoundationTributeSolana SuperteamSuperProtocolGlobal Blockchain ShowThe Open PlatformTON FoundationTributeSolana SuperteamSuperPro",
+            "rect": {
+              "x": 270,
+              "y": 798,
+              "width": 900,
+              "height": 60
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-wwBRL framer-sB2WQ framer-1gm795s framer-v-1gm795s",
+            "text": "NewsSmart Account Report & Message Rescheduling is Live!View Changelog",
+            "rect": {
+              "x": 0,
+              "y": 900,
+              "width": 1440,
+              "height": 51
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-34p1u6",
+            "text": "All-in-one Sales Platform. Optimized for Telegram.From lead research to deal closure — everything happens in a single dashboard.",
+            "rect": {
+              "x": 0,
+              "y": 951,
+              "width": 1440,
+              "height": 274
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-CjrQj framer-rDpB8 framer-RQTb1 framer-33DjT framer-sB2WQ framer-UeWlY framer-1iji9gm framer-v-1iji9gm",
+            "text": "OutreachCRMResearch ToolsTelegram Outreach withAutomated SequencesLaunch personalized outreach campaigns across multiple Telegram accounts. Create automated message sequences to reach thousands of prospects efficiently.Outreach FeaturesDon’",
+            "rect": {
+              "x": 0,
+              "y": 1225,
+              "width": 1440,
+              "height": 792
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "reviews",
+            "className": "framer-1uojeqq",
+            "text": "Rated 4.9 of 5You're in good companyWith 4 years in the CRM market,we're trusted by TON, Solana Superteam, and 300+ Web3 companies and GTM agencies.Explore Case StudiesRoman PotapenkoChief Strategy, SuperprotocolMy favorite feature is assig",
+            "rect": {
+              "x": 0,
+              "y": 2017,
+              "width": 1440,
+              "height": 859
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "Roman PotapenkoChief Strategy, SuperprotocolMy favorite feature is assigning tasks directly within our deals to team members and receiving a morning digest of what's been completed. Now, we run all our deal flow on Telegram without needing ",
+            "rect": {
+              "x": 120,
+              "y": 2375,
+              "width": 1200,
+              "height": 400
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "cards",
+            "className": "framer-180e8nv",
+            "text": "A CRM Pipeline we're all used to. Now Telegram-Native.Seamlessly use crmchat across all devices — as a Telegram mini app on mobile or a desktop-friendly web version. Manage your pipeline, track leads, and close deals from anywhere.Try for F",
+            "rect": {
+              "x": 0,
+              "y": 2875,
+              "width": 1440,
+              "height": 578
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "numbers",
+            "className": "framer-u8aqf0",
+            "text": "50K+Messages sent using crmchat per day.20%Avg. response rate for cold outreach.50%B2B Outreach Tasks Automated.",
+            "rect": {
+              "x": 0,
+              "y": 3453,
+              "width": 1440,
+              "height": 170
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "boxes",
+            "className": "framer-12bdnk5",
+            "text": "Trusted by Web3, iGaming, Agencies and Creators WorldwideFrom Web3 & SaaS companies to iGaming to content creators — discover how teams use crmchat to grow their business on Telegram.FastSecureWeb3 & SaaS CompaniesReach out to potential par",
+            "rect": {
+              "x": 0,
+              "y": 3624,
+              "width": 1440,
+              "height": 1205
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "",
+            "rect": {
+              "x": 220,
+              "y": 4639,
+              "width": 485,
+              "height": 80
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-EI22Y framer-RQTb1 framer-33DjT framer-1bsvqv0 framer-v-1bsvqv0",
+            "text": "Grow your business on TelegramCRM, Outreach & Lead Research. Get started with 1-week free trial.Try for Free",
+            "rect": {
+              "x": 0,
+              "y": 4829,
+              "width": 1440,
+              "height": 680
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "faq",
+            "className": "framer-kbs55j",
+            "text": "Step into the Future of Telegram Business DevelopmentCommon questions about our team, Telegram CRM, Outreach and Research.Can I trust you?CRMchat (formerly Hints) has 4 years of CRM market experience. We’re partners with HubSpot and Pipedri",
+            "rect": {
+              "x": 0,
+              "y": 5509,
+              "width": 1440,
+              "height": 1104
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "blog",
+            "className": "framer-cf7nc2",
+            "text": "crmchat BlogOur best content on growing your company, from outbound sales and CRM automation to AI lead generation.View BlogcrmYour Exchange Business Runs on Telegram. Your Spreadsheet Can't Keep UpAug 19, 2026Read morecrmYour Exchange's Cl",
+            "rect": {
+              "x": 0,
+              "y": 6613,
+              "width": 1440,
+              "height": 1276
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "footer",
+            "id": "",
+            "className": "framer-yZJcR framer-1qRHM framer-RJeGq framer-sB2WQ framer-teg9cx framer-v-teg9cx",
+            "text": "All-in-one Business Suite for Telegram-first Sales Teams.IndustriesWeb3 & CryptoiGamingContent CreatorsMedia BuyingGTM AgenciesTrading CoursesProductTelegram CRMTelegram OutreachTG Account WarmupTG Unified InboxProspect ResearchTelegram API",
+            "rect": {
+              "x": 0,
+              "y": 7889,
+              "width": 1440,
+              "height": 1170
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          }
+        ],
+        "cssVariables": [
+          [
+            "--token-963ba7ff-1506-4ab8-a9bc-332b05614e66",
+            "#09090b"
+          ],
+          [
+            "--token-a5bac2d3-d710-47e2-8bb9-ad946999897c",
+            "#18181b"
+          ],
+          [
+            "--token-69d8c37b-c734-4666-b632-32d8f9c9fc52",
+            "#27272a"
+          ],
+          [
+            "--token-44ba4d15-de95-4ba6-998e-92f0bf192c5f",
+            "#3f3f46"
+          ],
+          [
+            "--token-4e3d4b62-b411-4488-b97a-8ff2a61d3177",
+            "#52525b"
+          ],
+          [
+            "--token-05d3d3db-be9e-464a-9684-d4b46306a4c3",
+            "#71717a"
+          ],
+          [
+            "--token-1ce3c98f-6fc8-41c4-9a88-0e9fdbf098f1",
+            "#a1a1aa"
+          ],
+          [
+            "--token-9f531285-1e18-4a38-b208-f287be68e804",
+            "#d4d4d8"
+          ],
+          [
+            "--token-408e9ffb-f435-48c7-a9ff-2c04fe742fc2",
+            "#e4e4e7"
+          ],
+          [
+            "--token-4e9dcd95-1f27-443e-9665-b27316e88fe2",
+            "#f4f4f5"
+          ],
+          [
+            "--token-bdd5c3bb-385d-4b4d-b487-5a1f9f5d346c",
+            "#fafafa"
+          ],
+          [
+            "--token-3711503b-3d3b-4886-a85c-4293b65e43e7",
+            "#fff"
+          ],
+          [
+            "--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6",
+            "#09090b"
+          ],
+          [
+            "--token-cdaba0c3-7192-4155-be78-0e3fe010491c",
+            "#18181b"
+          ],
+          [
+            "--token-b459e046-718c-4dbb-8c34-b5d5869d1e57",
+            "#27272a"
+          ],
+          [
+            "--token-e4701bb6-83f6-41e5-b0c8-9b95b4510e3a",
+            "#3f3f46"
+          ],
+          [
+            "--token-e6a1425f-5cc8-4e16-87a5-8615ab8b8fe1",
+            "#52525b"
+          ],
+          [
+            "--token-fd54a91d-2c97-4609-acbc-244da5b6b983",
+            "#71717a"
+          ],
+          [
+            "--token-60b32788-cdeb-41df-ba14-e212d5e544dd",
+            "#a1a1aa"
+          ],
+          [
+            "--token-d1b70223-6c17-4c93-9dd4-7a1775f7f7c5",
+            "#d4d4d8"
+          ],
+          [
+            "--token-31213cc7-db87-4df4-8209-e72c8adb68fb",
+            "#e4e4e7"
+          ],
+          [
+            "--token-b0454cba-c19e-43a6-8075-f4b7a5ae4372",
+            "#f4f4f5"
+          ],
+          [
+            "--token-bebb5c17-844d-419e-ab0e-ada0b43a4350",
+            "#fafafa"
+          ],
+          [
+            "--token-2b0e18bf-9e9a-4016-bdfc-5769700a5529",
+            "#fff"
+          ],
+          [
+            "--token-cd1e8e92-b91e-4022-84c2-a059ee7f7bad",
+            "#fff"
+          ],
+          [
+            "--token-5cb9a68d-31cb-4baf-8414-1a3d9276de57",
+            "#fffffff2"
+          ],
+          [
+            "--token-d4b915e8-652b-419f-be5a-3361d1e18040",
+            "#fff"
+          ],
+          [
+            "--token-39f1e7bd-d6a2-4d0f-90ef-8d65a8c77a7c",
+            "#0d75ba"
+          ],
+          [
+            "--token-5cf227e4-8d28-4f31-8df2-e94a44959be8",
+            "#40c5ff1a"
+          ],
+          [
+            "--token-385cb8b2-959c-4157-9298-79e9c79de523",
+            "#ffb66e"
+          ],
+          [
+            "--token-507185eb-89a3-4185-a6e0-ad13e3c47e1c",
+            "#48d87d"
+          ],
+          [
+            "--token-a2b02a90-8343-4e93-bc27-1339e83d69f8",
+            "#ff6969"
+          ],
+          [
+            "--token-d3c9b405-1976-40f4-a12c-b2b083e848e2",
+            "#8554ff"
+          ],
+          [
+            "--token-2b39abb9-fea1-4307-9825-a3e2580c4c08",
+            "#beff4b"
+          ],
+          [
+            "--token-859258dd-93b0-4f6d-8deb-ee5f517e9648",
+            "#fb923c"
+          ],
+          [
+            "--token-1507f56b-76d2-4fd3-8c60-feec6812130b",
+            "#67e8f9"
+          ],
+          [
+            "--token-1f938e72-b917-4440-a479-af25e05d6ef2",
+            "#f472b6"
+          ],
+          [
+            "--token-46aef220-58f8-449f-bd4e-f0721e62e798",
+            "#127ef1"
+          ],
+          [
+            "--token-48db76b1-b6f7-481c-9646-e2e74df040d6",
+            "#000"
+          ],
+          [
+            "--token-58389c29-c015-4427-a57c-637e65cb6404",
+            "#e3e3e3"
+          ],
+          [
+            "--token-e0da01bd-4e0f-4d83-9396-a2ca91f1ef19",
+            "#000"
+          ],
+          [
+            "--token-3ab2d8b6-b506-4374-a6e8-5ad0c59c1eff",
+            "#666"
+          ],
+          [
+            "--token-f12ecc83-59c9-4232-ac38-7d89a1a3b51f",
+            "#666"
+          ],
+          [
+            "--token-0f37c8c4-f915-44f0-be09-b8afb177739f",
+            "#666"
+          ],
+          [
+            "--token-14b60f22-b2ad-4fd1-a3db-62c621a81acc",
+            "#e3e3e3"
+          ],
+          [
+            "--token-da7cc88f-3656-465f-953b-fa43f0c95c63",
+            "#a8a8b2"
+          ],
+          [
+            "--token-44fe9c97-b3d8-4353-bdbe-abf17d09c622",
+            "#94949e"
+          ],
+          [
+            "--token-da13adb3-c22e-4772-81bb-50149f3cd671",
+            "#fafafa"
+          ],
+          [
+            "--token-122efaff-ca65-4f26-b4de-fe2826f750b7",
+            "#fff"
+          ],
+          [
+            "--token-13261ac0-6588-48aa-ba0d-cdc2ec34b5f1",
+            "#fff"
+          ],
+          [
+            "--token-caf759f3-1d62-45fc-ad82-7ff586953871",
+            "#fff"
+          ],
+          [
+            "--token-5888ab63-e51f-4d96-b305-c183f89c39b8",
+            "#fff"
+          ],
+          [
+            "--token-d84fa2f2-c4f1-46f2-a487-e244597a768b",
+            "#fff"
+          ],
+          [
+            "--token-11487f8c-2406-4759-aea5-c846b36549d2",
+            "#f4f4f5"
+          ],
+          [
+            "--framer-will-change-override",
+            "none"
+          ],
+          [
+            "--framer-will-change-filter-override",
+            "none"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-text-decoration-style,solid) var(--framer-text-decoration,none) var(--framer-text-decoration-color,currentcolor) var(--framer-text-decoration-thickness,auto)"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-text-decoration-skip-ink)"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-text-decoration-offset)"
+          ],
+          [
+            "--font-family",
+            "var(--framer-font-family)"
+          ],
+          [
+            "--font-style",
+            "var(--framer-font-style)"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-font-weight)"
+          ],
+          [
+            "--text-color",
+            "var(--framer-text-color)"
+          ],
+          [
+            "--letter-spacing",
+            "var(--framer-letter-spacing)"
+          ],
+          [
+            "--font-size",
+            "var(--framer-font-size)"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-text-transform)"
+          ],
+          [
+            "--line-height",
+            "var(--framer-line-height)"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-font-family,var(--framer-font-family))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-font-style,var(--framer-font-style))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-font-weight,var(--framer-font-weight))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-text-color,var(--framer-text-color))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-font-size,var(--framer-font-size))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-text-transform,var(--framer-text-transform))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid)) var(--framer-link-text-decoration,var(--framer-text-decoration,none)) var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor)) var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset))"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-hover-font-family,var(--framer-link-font-family,var(--framer-font-family)))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-hover-font-style,var(--framer-link-font-style,var(--framer-font-style)))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-hover-font-weight,var(--framer-link-font-weight,var(--framer-font-weight)))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-hover-text-color,var(--framer-link-text-color,var(--framer-text-color)))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-hover-font-size,var(--framer-link-font-size,var(--framer-font-size)))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-hover-text-transform,var(--framer-link-text-transform,var(--framer-text-transform)))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-hover-text-decoration-style,var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid))) var(--framer-link-hover-text-decoration,var(--framer-link-text-decoration,var(--framer-text-decoration,none))) var(--framer-link-hover-text-decoration-color,var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor))) var(--framer-link-hover-text-decoration-thickness,var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto)))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-hover-text-decoration-skip-ink,var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink)))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-hover-text-decoration-offset,var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset)))"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-current-font-family,var(--framer-link-font-family,var(--framer-font-family)))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-current-font-style,var(--framer-link-font-style,var(--framer-font-style)))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-current-font-weight,var(--framer-link-font-weight,var(--framer-font-weight)))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-current-text-color,var(--framer-link-text-color,var(--framer-text-color)))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-current-font-size,var(--framer-link-font-size,var(--framer-font-size)))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-current-text-transform,var(--framer-link-text-transform,var(--framer-text-transform)))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-current-text-decoration-style,var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid))) var(--framer-link-current-text-decoration,var(--framer-link-text-decoration,var(--framer-text-decoration,none))) var(--framer-link-current-text-decoration-color,var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor))) var(--framer-link-current-text-decoration-thickness,var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto)))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-current-text-decoration-skip-ink,var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink)))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-current-text-decoration-offset,var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset)))"
+          ],
+          [
+            "--framer-font-family",
+            "Inter, Inter Placeholder, sans-serif"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "500"
+          ],
+          [
+            "--framer-text-color",
+            "#000"
+          ],
+          [
+            "--framer-font-size",
+            "16px"
+          ],
+          [
+            "--framer-letter-spacing",
+            "0"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-style",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-color",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-thickness",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-skip-ink",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-offset",
+            "none"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-text-alignment",
+            "start"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--framer-text-background-color",
+            "initial"
+          ],
+          [
+            "--framer-text-background-radius",
+            "initial"
+          ],
+          [
+            "--framer-text-background-corner-shape",
+            "initial"
+          ],
+          [
+            "--framer-text-background-padding",
+            "initial"
+          ],
+          [
+            "--list-style-type",
+            "decimal"
+          ],
+          [
+            "--framer-font-family",
+            "Inter, Inter Placeholder, sans-serif"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "500"
+          ],
+          [
+            "--framer-text-color",
+            "#000"
+          ],
+          [
+            "--framer-font-size",
+            "16px"
+          ],
+          [
+            "--framer-letter-spacing",
+            "0"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-text-alignment",
+            "start"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--font-variation-settings",
+            "normal"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-font-family",
+            "\"Manrope\", \"Manrope Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-family-bold",
+            "\"Manrope\", \"Manrope Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--framer-font-size",
+            "58px"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-style-bold",
+            "normal"
+          ],
+          [
+            "--framer-font-variation-axes",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "600"
+          ],
+          [
+            "--framer-font-weight-bold",
+            "700"
+          ],
+          [
+            "--framer-letter-spacing",
+            "-.02em"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "40px"
+          ],
+          [
+            "--framer-text-alignment",
+            "left"
+          ],
+          [
+            "--framer-text-color",
+            "var(--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6,#09090b)"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-text-stroke-color",
+            "initial"
+          ],
+          [
+            "--framer-text-stroke-width",
+            "initial"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-font-family",
+            "\"Inter Tight\", \"Inter Tight Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-family-bold",
+            "\"Inter\", \"Inter Placeholder\", sans-serif"
+          ]
+        ],
+        "fonts": [
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight"
+        ],
+        "images": [
+          {
+            "src": "https://framerusercontent.com/images/OPJDn7HftNNuzLN2Ge8Ckp0opqw.png?width=174&height=180",
+            "alt": "",
+            "width": 174,
+            "height": 180
+          },
+          {
+            "src": "https://framerusercontent.com/images/5XFp7vuYPkfemUB5wuzNmkgZbns.png?width=120&height=120",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/Mxr1V9A8jbdURRWdZd33J8HemYk.svg?width=800&height=800",
+            "alt": "",
+            "width": 1440,
+            "height": 1440
+          },
+          {
+            "src": "https://framerusercontent.com/images/UFq3FSAuxjOcLs2BLVsjnOmPgM.svg?width=800&height=800",
+            "alt": "",
+            "width": 1440,
+            "height": 1440
+          },
+          {
+            "src": "https://framerusercontent.com/images/bLooXswqeqysa3Jih1G9KsT0bDU.svg?width=440&height=300",
+            "alt": "CRMChat screenshot with Telegram Outreach Sequence",
+            "width": 440,
+            "height": 300
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/26vG1fOeQquLgHfO5TNSq9aRovc.jpg?width=893&height=591",
+            "alt": "CRMChat CRM pipeline view",
+            "width": 580,
+            "height": 383
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/xFHAfQRdBg5cQewdATP16sxt7ZY.png?scale-down-to=512&width=1536&height=1024",
+            "alt": "",
+            "width": 366,
+            "height": 244
+          },
+          {
+            "src": "https://framerusercontent.com/images/1WcPEPeQwFpmjSkmVKPfR2drpoE.png?scale-down-to=512&width=1536&height=1024",
+            "alt": "",
+            "width": 366,
+            "height": 244
+          },
+          {
+            "src": "https://framerusercontent.com/images/1GKGtPtbOWSthCd72kjLo0mkvQ8.png?scale-down-to=512&width=1536&height=1024",
+            "alt": "",
+            "width": 366,
+            "height": 244
+          },
+          {
+            "src": "https://framerusercontent.com/images/LSrU0ma9QpkTP2EBs18PEjhzTY.png?scale-down-to=512&width=1536&height=1024",
+            "alt": "",
+            "width": 366,
+            "height": 244
+          }
+        ],
+        "canvases": [
+          {
+            "width": 2170,
+            "height": 2170,
+            "cssWidth": 1301.2633056640625,
+            "cssHeight": 1301.263427734375
+          }
+        ]
+      }
+    },
+    {
+      "viewport": {
+        "width": 768,
+        "height": 900
+      },
+      "screenshot": "screenshots/original-768.png",
+      "signals": {
+        "href": "https://crmchat.ai/",
+        "title": "crmchat - Leading Telegram CRM, Outreach and Automation Platform",
+        "lang": "en",
+        "bodyTextChars": 7962,
+        "scrollHeight": 9647,
+        "viewport": {
+          "width": 768,
+          "height": 900
+        },
+        "h1": [
+          "Telegram CRM, Outreach & Lead Research"
+        ],
+        "headings": [
+          {
+            "tag": "h1",
+            "text": "Telegram CRM, Outreach & Lead Research"
+          },
+          {
+            "tag": "h2",
+            "text": "All-in-one Sales Platform. Optimized for Telegram."
+          },
+          {
+            "tag": "h3",
+            "text": "Telegram Outreach with Automated Sequences"
+          },
+          {
+            "tag": "h2",
+            "text": "You're in good company"
+          },
+          {
+            "tag": "h3",
+            "text": "A CRM Pipeline we're all used to. Now Telegram-Native."
+          },
+          {
+            "tag": "h2",
+            "text": "50K+"
+          },
+          {
+            "tag": "h2",
+            "text": "20%"
+          },
+          {
+            "tag": "h2",
+            "text": "50%"
+          },
+          {
+            "tag": "h2",
+            "text": "Trusted by Web3, iGaming, Agencies and Creators Worldwide"
+          },
+          {
+            "tag": "h2",
+            "text": "Grow your business on Telegram"
+          }
+        ],
+        "metaDescription": "Telegram-native CRM & Telegram Automation app for sales teams. Find new leads on Telegram, manage CRM deals & scale multi-account outreach. Trusted by 500+ Web3, iGaming, Tech, and LeadGen companies.",
+        "counts": {
+          "links": 62,
+          "images": 48,
+          "video": 0,
+          "canvas": 1,
+          "sections": 15,
+          "forms": 0,
+          "buttons": 2,
+          "inputs": 1,
+          "interactive": 93,
+          "scripts": 16,
+          "stylesheets": 0
+        },
+        "frameworks": {
+          "react": false,
+          "next": false,
+          "vue": false,
+          "nuxt": false,
+          "svelte": false,
+          "astro": false,
+          "three": false,
+          "gsap": false,
+          "lenis": false
+        },
+        "scripts": [
+          "https://mc.yandex.com/metrika/tag_phono.js",
+          "https://connect.facebook.net/signals/config/556089130134761?v=2.9.435&r=stable&domain=crmchat.ai&hme=4453c87d489b6902031c012cadd2731893cd69feb64fe8a61b339727247a7703&ex_m=118%2C242%2C171%2C27%2C82%2C83%2C162%2C78%2C77%2C11%2C181%2C102%2C20%2C153%2C141%2C46%2C85%2C90%2C149%2C176%2C183%2C8%2C4%2C5%2C7%2C6%2C3%2C103%2C115%2C32%2C17%2C31%2C18%2C33%2C34%2C35%2C37%2C55%2C163%2C87%2C126%2C22%2C24%2C51%2C47%2C49%2C48%2C95%2C104%2C108%2C124%2C160%2C164%2C53%2C125%2C29%2C26%2C133%2C79%2C43%2C166%2C165%2C167%2C157%2C155%2C30%2C42%2C66%2C123%2C178%2C80%2C21%2C128%2C93%2C76%2C23%2C97%2C98%2C130%2C96%2C151%2C150%2C154%2C109%2C177%2C180%2C41%2C56%2C127%2C54%2C161%2C72%2C185%2C110%2C184%2C211%2C263%2C84%2C283%2C282%2C281%2C14%2C25%2C28%2C40%2C62%2C117%2C68%2C10%2C73%2C111%2C112%2C113%2C119%2C144%2C38%2C36%2C146%2C147%2C148%2C143%2C142%2C172%2C86%2C175%2C173%2C174%2C57%2C69%2C67%2C137%2C19%2C179%2C52%2C333%2C334%2C335%2C332%2C349%2C371%2C256%2C238%2C70%2C239%2C237%2C374%2C365%2C59%2C257%2C121%2C145%2C92%2C135%2C61%2C134%2C140%2C139%2C65%2C74%2C168%2C88%2C89%2C129%2C44%2C39%2C60%2C63%2C114%2C182%2C1%2C138%2C16%2C136%2C12%2C2%2C64%2C105%2C15%2C75%2C71%2C132%2C101%2C100%2C187%2C188%2C106%2C107%2C9%2C116%2C186%2C58%2C158%2C99%2C91%2C81%2C131%2C120%2C169%2C50%2C159%2C0%2C94%2C152%2C156%2C170%2C45%2C122%2C13%2C189",
+          "https://connect.facebook.net/en_US/fbevents.js",
+          "https://eu-assets.i.posthog.com/static/array.js",
+          "https://www.googletagmanager.com/gtag/js?id=G-HV9PCSW0CW&cx=c&gtm=4e6b21h1",
+          "https://consent.cookiefirst.com/sites/crmchat.ai-2a647fc1-758d-40d4-bd2b-80d15a7fd617/consent.js",
+          "https://mc.yandex.ru/metrika/tag.js?id=110709752",
+          "https://sc.lfeeder.com/lftracker_v1_Xbp1oaElv1k4EdVj.js",
+          "https://www.googletagmanager.com/gtm.js?id=GTM-MFDQ7CM8",
+          "https://eu-assets.i.posthog.com/static/1.445.1/exception-autocapture.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/dead-clicks-autocapture.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/posthog-recorder.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/surveys.js",
+          "https://eu-assets.i.posthog.com/array/phc_dU9IzmCl2YhzLf5xVaRawLlWZAyR5OzW2dfCgOhkBiD/config.js",
+          "https://events.framer.com/script?v=2",
+          "https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/script_main.Cw2a0qfj.mjs"
+        ],
+        "stylesheets": [],
+        "sections": [
+          {
+            "tag": "nav",
+            "id": "",
+            "className": "framer-rruVO framer-wkp83w framer-v-4gxnd7",
+            "text": "Select LanguageEnglishRussian (Russia)",
+            "rect": {
+              "x": 0,
+              "y": 0,
+              "width": 768,
+              "height": 60
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(255, 255, 255)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-2lypg8",
+            "text": ".home-reading-illustration-root .home-reading-illustration-light, .home-reading-illustration-root .home-reading-illustration-dark { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: none; } .home-read",
+            "rect": {
+              "x": 0,
+              "y": 0,
+              "width": 768,
+              "height": 900
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(255, 255, 255)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "The Open PlatformTON FoundationTributeSolana SuperteamSuperProtocolGlobal Blockchain ShowThe Open PlatformTON FoundationTributeSolana SuperteamSuperProtocolGlobal Blockchain ShowThe Open PlatformTON FoundationTributeSolana SuperteamSuperPro",
+            "rect": {
+              "x": 35,
+              "y": 653,
+              "width": 698,
+              "height": 60
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-34p1u6",
+            "text": "All-in-one Sales Platform. Optimized for Telegram.From lead research to deal closure — everything happens in a single dashboard.",
+            "rect": {
+              "x": 0,
+              "y": 900,
+              "width": 768,
+              "height": 244
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-CjrQj framer-rDpB8 framer-RQTb1 framer-33DjT framer-sB2WQ framer-UeWlY framer-1iji9gm framer-v-18ixk9v",
+            "text": "OutreachCRMResearch ToolsTelegram Outreach with Automated SequencesLaunch personalized outreach campaigns across multiple Telegram accounts. Create automated message sequences to reach thousands of prospects efficiently.Outreach FeaturesDon",
+            "rect": {
+              "x": 0,
+              "y": 1144,
+              "width": 768,
+              "height": 1051
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "reviews",
+            "className": "framer-1uojeqq",
+            "text": "Rated 4.9 of 5You're in good companyWith 4 years in the CRM market,we're trusted by TON, Solana Superteam, and 300+ Web3 companies and GTM agencies.Explore Case StudiesRoman PotapenkoChief Strategy, SuperprotocolMy favorite feature is assig",
+            "rect": {
+              "x": 0,
+              "y": 2195,
+              "width": 768,
+              "height": 704
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "Roman PotapenkoChief Strategy, SuperprotocolMy favorite feature is assigning tasks directly within our deals to team members and receiving a morning digest of what's been completed. Now, we run all our deal flow on Telegram without needing ",
+            "rect": {
+              "x": 20,
+              "y": 2459,
+              "width": 733,
+              "height": 400
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "cards",
+            "className": "framer-180e8nv",
+            "text": "A CRM Pipeline we're all used to. Now Telegram-Native.Seamlessly use crmchat across all devices — as a Telegram mini app on mobile or a desktop-friendly web version. Manage your pipeline, track leads, and close deals from anywhere.Try for F",
+            "rect": {
+              "x": 0,
+              "y": 3261,
+              "width": 768,
+              "height": 786
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "numbers",
+            "className": "framer-u8aqf0",
+            "text": "50K+Messages sent using crmchat per day.20%Avg. response rate for cold outreach.50%B2B Outreach Tasks Automated.",
+            "rect": {
+              "x": 0,
+              "y": 2899,
+              "width": 768,
+              "height": 362
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "boxes",
+            "className": "framer-12bdnk5",
+            "text": "Trusted by Web3, iGaming, Agencies and Creators WorldwideFrom Web3 & SaaS companies to iGaming to content creators — discover how teams use crmchat to grow their business on Telegram.FastSecureWeb3 & SaaS CompaniesReach out to potential par",
+            "rect": {
+              "x": 0,
+              "y": 4047,
+              "width": 768,
+              "height": 1466
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "",
+            "rect": {
+              "x": 15,
+              "y": 4808,
+              "width": 738,
+              "height": 80
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-EI22Y framer-RQTb1 framer-33DjT framer-1bsvqv0 framer-v-1wwceon",
+            "text": "Grow your business on TelegramCRM, Outreach & Lead Research. Get started with 1-week free trial.Try for Free",
+            "rect": {
+              "x": 0,
+              "y": 5514,
+              "width": 768,
+              "height": 600
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "faq",
+            "className": "framer-kbs55j",
+            "text": "Step into the Future of Telegram Business DevelopmentCommon questions about our team, Telegram CRM, Outreach and Research.Can I trust you?CRMchat (formerly Hints) has 4 years of CRM market experience. We’re partners with HubSpot and Pipedri",
+            "rect": {
+              "x": 0,
+              "y": 6114,
+              "width": 768,
+              "height": 1072
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "blog",
+            "className": "framer-cf7nc2",
+            "text": "crmchat BlogOur best content on growing your company, from outbound sales and CRM automation to AI lead generation.View BlogcrmYour Exchange Business Runs on Telegram. Your Spreadsheet Can't Keep UpAug 19, 2026Read morecrmYour Exchange's Cl",
+            "rect": {
+              "x": 0,
+              "y": 7186,
+              "width": 768,
+              "height": 1121
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "footer",
+            "id": "",
+            "className": "framer-yZJcR framer-1qRHM framer-RJeGq framer-sB2WQ framer-teg9cx framer-v-1ms3200",
+            "text": "All-in-one Business Suite for Telegram-first Sales Teams.IndustriesWeb3 & CryptoiGamingContent CreatorsMedia BuyingGTM AgenciesTrading CoursesProductTelegram CRMTelegram OutreachTG Account WarmupTG Unified InboxProspect ResearchTelegram API",
+            "rect": {
+              "x": 0,
+              "y": 8306,
+              "width": 768,
+              "height": 1341
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          }
+        ],
+        "cssVariables": [
+          [
+            "--token-963ba7ff-1506-4ab8-a9bc-332b05614e66",
+            "#09090b"
+          ],
+          [
+            "--token-a5bac2d3-d710-47e2-8bb9-ad946999897c",
+            "#18181b"
+          ],
+          [
+            "--token-69d8c37b-c734-4666-b632-32d8f9c9fc52",
+            "#27272a"
+          ],
+          [
+            "--token-44ba4d15-de95-4ba6-998e-92f0bf192c5f",
+            "#3f3f46"
+          ],
+          [
+            "--token-4e3d4b62-b411-4488-b97a-8ff2a61d3177",
+            "#52525b"
+          ],
+          [
+            "--token-05d3d3db-be9e-464a-9684-d4b46306a4c3",
+            "#71717a"
+          ],
+          [
+            "--token-1ce3c98f-6fc8-41c4-9a88-0e9fdbf098f1",
+            "#a1a1aa"
+          ],
+          [
+            "--token-9f531285-1e18-4a38-b208-f287be68e804",
+            "#d4d4d8"
+          ],
+          [
+            "--token-408e9ffb-f435-48c7-a9ff-2c04fe742fc2",
+            "#e4e4e7"
+          ],
+          [
+            "--token-4e9dcd95-1f27-443e-9665-b27316e88fe2",
+            "#f4f4f5"
+          ],
+          [
+            "--token-bdd5c3bb-385d-4b4d-b487-5a1f9f5d346c",
+            "#fafafa"
+          ],
+          [
+            "--token-3711503b-3d3b-4886-a85c-4293b65e43e7",
+            "#fff"
+          ],
+          [
+            "--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6",
+            "#09090b"
+          ],
+          [
+            "--token-cdaba0c3-7192-4155-be78-0e3fe010491c",
+            "#18181b"
+          ],
+          [
+            "--token-b459e046-718c-4dbb-8c34-b5d5869d1e57",
+            "#27272a"
+          ],
+          [
+            "--token-e4701bb6-83f6-41e5-b0c8-9b95b4510e3a",
+            "#3f3f46"
+          ],
+          [
+            "--token-e6a1425f-5cc8-4e16-87a5-8615ab8b8fe1",
+            "#52525b"
+          ],
+          [
+            "--token-fd54a91d-2c97-4609-acbc-244da5b6b983",
+            "#71717a"
+          ],
+          [
+            "--token-60b32788-cdeb-41df-ba14-e212d5e544dd",
+            "#a1a1aa"
+          ],
+          [
+            "--token-d1b70223-6c17-4c93-9dd4-7a1775f7f7c5",
+            "#d4d4d8"
+          ],
+          [
+            "--token-31213cc7-db87-4df4-8209-e72c8adb68fb",
+            "#e4e4e7"
+          ],
+          [
+            "--token-b0454cba-c19e-43a6-8075-f4b7a5ae4372",
+            "#f4f4f5"
+          ],
+          [
+            "--token-bebb5c17-844d-419e-ab0e-ada0b43a4350",
+            "#fafafa"
+          ],
+          [
+            "--token-2b0e18bf-9e9a-4016-bdfc-5769700a5529",
+            "#fff"
+          ],
+          [
+            "--token-cd1e8e92-b91e-4022-84c2-a059ee7f7bad",
+            "#fff"
+          ],
+          [
+            "--token-5cb9a68d-31cb-4baf-8414-1a3d9276de57",
+            "#fffffff2"
+          ],
+          [
+            "--token-d4b915e8-652b-419f-be5a-3361d1e18040",
+            "#fff"
+          ],
+          [
+            "--token-39f1e7bd-d6a2-4d0f-90ef-8d65a8c77a7c",
+            "#0d75ba"
+          ],
+          [
+            "--token-5cf227e4-8d28-4f31-8df2-e94a44959be8",
+            "#40c5ff1a"
+          ],
+          [
+            "--token-385cb8b2-959c-4157-9298-79e9c79de523",
+            "#ffb66e"
+          ],
+          [
+            "--token-507185eb-89a3-4185-a6e0-ad13e3c47e1c",
+            "#48d87d"
+          ],
+          [
+            "--token-a2b02a90-8343-4e93-bc27-1339e83d69f8",
+            "#ff6969"
+          ],
+          [
+            "--token-d3c9b405-1976-40f4-a12c-b2b083e848e2",
+            "#8554ff"
+          ],
+          [
+            "--token-2b39abb9-fea1-4307-9825-a3e2580c4c08",
+            "#beff4b"
+          ],
+          [
+            "--token-859258dd-93b0-4f6d-8deb-ee5f517e9648",
+            "#fb923c"
+          ],
+          [
+            "--token-1507f56b-76d2-4fd3-8c60-feec6812130b",
+            "#67e8f9"
+          ],
+          [
+            "--token-1f938e72-b917-4440-a479-af25e05d6ef2",
+            "#f472b6"
+          ],
+          [
+            "--token-46aef220-58f8-449f-bd4e-f0721e62e798",
+            "#127ef1"
+          ],
+          [
+            "--token-48db76b1-b6f7-481c-9646-e2e74df040d6",
+            "#000"
+          ],
+          [
+            "--token-58389c29-c015-4427-a57c-637e65cb6404",
+            "#e3e3e3"
+          ],
+          [
+            "--token-e0da01bd-4e0f-4d83-9396-a2ca91f1ef19",
+            "#000"
+          ],
+          [
+            "--token-3ab2d8b6-b506-4374-a6e8-5ad0c59c1eff",
+            "#666"
+          ],
+          [
+            "--token-f12ecc83-59c9-4232-ac38-7d89a1a3b51f",
+            "#666"
+          ],
+          [
+            "--token-0f37c8c4-f915-44f0-be09-b8afb177739f",
+            "#666"
+          ],
+          [
+            "--token-14b60f22-b2ad-4fd1-a3db-62c621a81acc",
+            "#e3e3e3"
+          ],
+          [
+            "--token-da7cc88f-3656-465f-953b-fa43f0c95c63",
+            "#a8a8b2"
+          ],
+          [
+            "--token-44fe9c97-b3d8-4353-bdbe-abf17d09c622",
+            "#94949e"
+          ],
+          [
+            "--token-da13adb3-c22e-4772-81bb-50149f3cd671",
+            "#fafafa"
+          ],
+          [
+            "--token-122efaff-ca65-4f26-b4de-fe2826f750b7",
+            "#fff"
+          ],
+          [
+            "--token-13261ac0-6588-48aa-ba0d-cdc2ec34b5f1",
+            "#fff"
+          ],
+          [
+            "--token-caf759f3-1d62-45fc-ad82-7ff586953871",
+            "#fff"
+          ],
+          [
+            "--token-5888ab63-e51f-4d96-b305-c183f89c39b8",
+            "#fff"
+          ],
+          [
+            "--token-d84fa2f2-c4f1-46f2-a487-e244597a768b",
+            "#fff"
+          ],
+          [
+            "--token-11487f8c-2406-4759-aea5-c846b36549d2",
+            "#f4f4f5"
+          ],
+          [
+            "--framer-will-change-override",
+            "none"
+          ],
+          [
+            "--framer-will-change-filter-override",
+            "none"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-text-decoration-style,solid) var(--framer-text-decoration,none) var(--framer-text-decoration-color,currentcolor) var(--framer-text-decoration-thickness,auto)"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-text-decoration-skip-ink)"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-text-decoration-offset)"
+          ],
+          [
+            "--font-family",
+            "var(--framer-font-family)"
+          ],
+          [
+            "--font-style",
+            "var(--framer-font-style)"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-font-weight)"
+          ],
+          [
+            "--text-color",
+            "var(--framer-text-color)"
+          ],
+          [
+            "--letter-spacing",
+            "var(--framer-letter-spacing)"
+          ],
+          [
+            "--font-size",
+            "var(--framer-font-size)"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-text-transform)"
+          ],
+          [
+            "--line-height",
+            "var(--framer-line-height)"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-font-family,var(--framer-font-family))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-font-style,var(--framer-font-style))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-font-weight,var(--framer-font-weight))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-text-color,var(--framer-text-color))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-font-size,var(--framer-font-size))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-text-transform,var(--framer-text-transform))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid)) var(--framer-link-text-decoration,var(--framer-text-decoration,none)) var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor)) var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset))"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-hover-font-family,var(--framer-link-font-family,var(--framer-font-family)))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-hover-font-style,var(--framer-link-font-style,var(--framer-font-style)))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-hover-font-weight,var(--framer-link-font-weight,var(--framer-font-weight)))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-hover-text-color,var(--framer-link-text-color,var(--framer-text-color)))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-hover-font-size,var(--framer-link-font-size,var(--framer-font-size)))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-hover-text-transform,var(--framer-link-text-transform,var(--framer-text-transform)))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-hover-text-decoration-style,var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid))) var(--framer-link-hover-text-decoration,var(--framer-link-text-decoration,var(--framer-text-decoration,none))) var(--framer-link-hover-text-decoration-color,var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor))) var(--framer-link-hover-text-decoration-thickness,var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto)))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-hover-text-decoration-skip-ink,var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink)))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-hover-text-decoration-offset,var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset)))"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-current-font-family,var(--framer-link-font-family,var(--framer-font-family)))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-current-font-style,var(--framer-link-font-style,var(--framer-font-style)))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-current-font-weight,var(--framer-link-font-weight,var(--framer-font-weight)))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-current-text-color,var(--framer-link-text-color,var(--framer-text-color)))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-current-font-size,var(--framer-link-font-size,var(--framer-font-size)))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-current-text-transform,var(--framer-link-text-transform,var(--framer-text-transform)))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-current-text-decoration-style,var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid))) var(--framer-link-current-text-decoration,var(--framer-link-text-decoration,var(--framer-text-decoration,none))) var(--framer-link-current-text-decoration-color,var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor))) var(--framer-link-current-text-decoration-thickness,var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto)))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-current-text-decoration-skip-ink,var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink)))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-current-text-decoration-offset,var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset)))"
+          ],
+          [
+            "--framer-font-family",
+            "Inter, Inter Placeholder, sans-serif"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "500"
+          ],
+          [
+            "--framer-text-color",
+            "#000"
+          ],
+          [
+            "--framer-font-size",
+            "16px"
+          ],
+          [
+            "--framer-letter-spacing",
+            "0"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-style",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-color",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-thickness",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-skip-ink",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-offset",
+            "none"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-text-alignment",
+            "start"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--framer-text-background-color",
+            "initial"
+          ],
+          [
+            "--framer-text-background-radius",
+            "initial"
+          ],
+          [
+            "--framer-text-background-corner-shape",
+            "initial"
+          ],
+          [
+            "--framer-text-background-padding",
+            "initial"
+          ],
+          [
+            "--list-style-type",
+            "decimal"
+          ],
+          [
+            "--framer-font-family",
+            "Inter, Inter Placeholder, sans-serif"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "500"
+          ],
+          [
+            "--framer-text-color",
+            "#000"
+          ],
+          [
+            "--framer-font-size",
+            "16px"
+          ],
+          [
+            "--framer-letter-spacing",
+            "0"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-text-alignment",
+            "start"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--font-variation-settings",
+            "normal"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-font-family",
+            "\"Manrope\", \"Manrope Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-family-bold",
+            "\"Manrope\", \"Manrope Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--framer-font-size",
+            "58px"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-style-bold",
+            "normal"
+          ],
+          [
+            "--framer-font-variation-axes",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "600"
+          ],
+          [
+            "--framer-font-weight-bold",
+            "700"
+          ],
+          [
+            "--framer-letter-spacing",
+            "-.02em"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "40px"
+          ],
+          [
+            "--framer-text-alignment",
+            "left"
+          ],
+          [
+            "--framer-text-color",
+            "var(--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6,#09090b)"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-text-stroke-color",
+            "initial"
+          ],
+          [
+            "--framer-text-stroke-width",
+            "initial"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-font-family",
+            "\"Inter Tight\", \"Inter Tight Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-family-bold",
+            "\"Inter\", \"Inter Placeholder\", sans-serif"
+          ]
+        ],
+        "fonts": [
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight"
+        ],
+        "images": [
+          {
+            "src": "https://framerusercontent.com/images/OPJDn7HftNNuzLN2Ge8Ckp0opqw.png?width=174&height=180",
+            "alt": "",
+            "width": 174,
+            "height": 180
+          },
+          {
+            "src": "https://framerusercontent.com/images/5XFp7vuYPkfemUB5wuzNmkgZbns.png?width=120&height=120",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/Mxr1V9A8jbdURRWdZd33J8HemYk.svg?width=800&height=800",
+            "alt": "",
+            "width": 768,
+            "height": 768
+          },
+          {
+            "src": "https://framerusercontent.com/images/UFq3FSAuxjOcLs2BLVsjnOmPgM.svg?width=800&height=800",
+            "alt": "",
+            "width": 768,
+            "height": 768
+          },
+          {
+            "src": "https://framerusercontent.com/images/bLooXswqeqysa3Jih1G9KsT0bDU.svg?width=440&height=300",
+            "alt": "CRMChat screenshot with Telegram Outreach Sequence",
+            "width": 440,
+            "height": 300
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/26vG1fOeQquLgHfO5TNSq9aRovc.jpg?width=893&height=591",
+            "alt": "CRMChat CRM pipeline view",
+            "width": 728,
+            "height": 481
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/xFHAfQRdBg5cQewdATP16sxt7ZY.png?scale-down-to=1024&width=1536&height=1024",
+            "alt": "",
+            "width": 728,
+            "height": 485
+          },
+          {
+            "src": "https://framerusercontent.com/images/1WcPEPeQwFpmjSkmVKPfR2drpoE.png?scale-down-to=1024&width=1536&height=1024",
+            "alt": "",
+            "width": 728,
+            "height": 485
+          }
+        ],
+        "canvases": [
+          {
+            "width": 862,
+            "height": 862,
+            "cssWidth": 516.9073486328125,
+            "cssHeight": 516.907470703125
+          }
+        ]
+      }
+    },
+    {
+      "viewport": {
+        "width": 390,
+        "height": 900
+      },
+      "screenshot": "screenshots/original-390.png",
+      "signals": {
+        "href": "https://crmchat.ai/",
+        "title": "crmchat - Leading Telegram CRM, Outreach and Automation Platform",
+        "lang": "en",
+        "bodyTextChars": 6745,
+        "scrollHeight": 9908,
+        "viewport": {
+          "width": 390,
+          "height": 900
+        },
+        "h1": [
+          "Telegram CRM, Outreach & Lead Research"
+        ],
+        "headings": [
+          {
+            "tag": "h1",
+            "text": "Telegram CRM, Outreach & Lead Research"
+          },
+          {
+            "tag": "h2",
+            "text": "All-in-one Sales Platform. Optimized for Telegram."
+          },
+          {
+            "tag": "h3",
+            "text": "Telegram Outreach with Automated Sequences"
+          },
+          {
+            "tag": "h2",
+            "text": "You're in good company"
+          },
+          {
+            "tag": "h3",
+            "text": "A CRM Pipeline we're all used to. Now Telegram-Native."
+          },
+          {
+            "tag": "h2",
+            "text": "50K+"
+          },
+          {
+            "tag": "h2",
+            "text": "20%"
+          },
+          {
+            "tag": "h2",
+            "text": "50%"
+          },
+          {
+            "tag": "h2",
+            "text": "Trusted by Web3, iGaming, Agencies and Creators Worldwide"
+          },
+          {
+            "tag": "h2",
+            "text": "Grow your business on Telegram"
+          }
+        ],
+        "metaDescription": "Telegram-native CRM & Telegram Automation app for sales teams. Find new leads on Telegram, manage CRM deals & scale multi-account outreach. Trusted by 500+ Web3, iGaming, Tech, and LeadGen companies.",
+        "counts": {
+          "links": 60,
+          "images": 33,
+          "video": 0,
+          "canvas": 1,
+          "sections": 15,
+          "forms": 0,
+          "buttons": 2,
+          "inputs": 1,
+          "interactive": 91,
+          "scripts": 16,
+          "stylesheets": 0
+        },
+        "frameworks": {
+          "react": false,
+          "next": false,
+          "vue": false,
+          "nuxt": false,
+          "svelte": false,
+          "astro": false,
+          "three": false,
+          "gsap": false,
+          "lenis": false
+        },
+        "scripts": [
+          "https://mc.yandex.com/metrika/tag_phono.js",
+          "https://connect.facebook.net/signals/config/556089130134761?v=2.9.435&r=stable&domain=crmchat.ai&hme=4453c87d489b6902031c012cadd2731893cd69feb64fe8a61b339727247a7703&ex_m=118%2C242%2C171%2C27%2C82%2C83%2C162%2C78%2C77%2C11%2C181%2C102%2C20%2C153%2C141%2C46%2C85%2C90%2C149%2C176%2C183%2C8%2C4%2C5%2C7%2C6%2C3%2C103%2C115%2C32%2C17%2C31%2C18%2C33%2C34%2C35%2C37%2C55%2C163%2C87%2C126%2C22%2C24%2C51%2C47%2C49%2C48%2C95%2C104%2C108%2C124%2C160%2C164%2C53%2C125%2C29%2C26%2C133%2C79%2C43%2C166%2C165%2C167%2C157%2C155%2C30%2C42%2C66%2C123%2C178%2C80%2C21%2C128%2C93%2C76%2C23%2C97%2C98%2C130%2C96%2C151%2C150%2C154%2C109%2C177%2C180%2C41%2C56%2C127%2C54%2C161%2C72%2C185%2C110%2C184%2C211%2C263%2C84%2C283%2C282%2C281%2C14%2C25%2C28%2C40%2C62%2C117%2C68%2C10%2C73%2C111%2C112%2C113%2C119%2C144%2C38%2C36%2C146%2C147%2C148%2C143%2C142%2C172%2C86%2C175%2C173%2C174%2C57%2C69%2C67%2C137%2C19%2C179%2C52%2C333%2C334%2C335%2C332%2C349%2C371%2C256%2C238%2C70%2C239%2C237%2C374%2C365%2C59%2C257%2C121%2C145%2C92%2C135%2C61%2C134%2C140%2C139%2C65%2C74%2C168%2C88%2C89%2C129%2C44%2C39%2C60%2C63%2C114%2C182%2C1%2C138%2C16%2C136%2C12%2C2%2C64%2C105%2C15%2C75%2C71%2C132%2C101%2C100%2C187%2C188%2C106%2C107%2C9%2C116%2C186%2C58%2C158%2C99%2C91%2C81%2C131%2C120%2C169%2C50%2C159%2C0%2C94%2C152%2C156%2C170%2C45%2C122%2C13%2C189",
+          "https://connect.facebook.net/en_US/fbevents.js",
+          "https://eu-assets.i.posthog.com/static/array.js",
+          "https://www.googletagmanager.com/gtag/js?id=G-HV9PCSW0CW&cx=c&gtm=4e6b21",
+          "https://consent.cookiefirst.com/sites/crmchat.ai-2a647fc1-758d-40d4-bd2b-80d15a7fd617/consent.js",
+          "https://mc.yandex.ru/metrika/tag.js?id=110709752",
+          "https://sc.lfeeder.com/lftracker_v1_Xbp1oaElv1k4EdVj.js",
+          "https://www.googletagmanager.com/gtm.js?id=GTM-MFDQ7CM8",
+          "https://eu-assets.i.posthog.com/static/1.445.1/exception-autocapture.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/dead-clicks-autocapture.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/posthog-recorder.js",
+          "https://eu-assets.i.posthog.com/static/1.445.1/surveys.js",
+          "https://eu-assets.i.posthog.com/array/phc_dU9IzmCl2YhzLf5xVaRawLlWZAyR5OzW2dfCgOhkBiD/config.js",
+          "https://events.framer.com/script?v=2",
+          "https://framerusercontent.com/sites/5vTUXS7mqxt3tsIEr2W98T/script_main.Cw2a0qfj.mjs"
+        ],
+        "stylesheets": [],
+        "sections": [
+          {
+            "tag": "nav",
+            "id": "",
+            "className": "framer-rruVO framer-wkp83w framer-v-4gxnd7",
+            "text": "Select LanguageEnglishRussian (Russia)",
+            "rect": {
+              "x": 0,
+              "y": 0,
+              "width": 390,
+              "height": 60
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(255, 255, 255)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-2lypg8",
+            "text": ".home-reading-illustration-root .home-reading-illustration-light, .home-reading-illustration-root .home-reading-illustration-dark { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: none; } .home-read",
+            "rect": {
+              "x": 0,
+              "y": 0,
+              "width": 390,
+              "height": 900
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(255, 255, 255)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "The Open PlatformTON FoundationTributeSolana SuperteamSuperProtocolGlobal Blockchain ShowThe Open PlatformTON FoundationTributeSolana SuperteamSuperProtocolGlobal Blockchain ShowThe Open PlatformTON FoundationTributeSolana SuperteamSuperPro",
+            "rect": {
+              "x": 35,
+              "y": 672,
+              "width": 320,
+              "height": 60
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-34p1u6",
+            "text": "All-in-one Sales Platform. Optimized for Telegram.From lead research to deal closure — everything happens in a single dashboard.",
+            "rect": {
+              "x": 0,
+              "y": 900,
+              "width": 390,
+              "height": 244
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-CjrQj framer-rDpB8 framer-RQTb1 framer-33DjT framer-sB2WQ framer-UeWlY framer-1iji9gm framer-v-18ixk9v",
+            "text": "OutreachCRMResearch ToolsTelegram Outreach with Automated SequencesLaunch personalized outreach campaigns across multiple Telegram accounts. Create automated message sequences to reach thousands of prospects efficiently.Outreach FeaturesDon",
+            "rect": {
+              "x": 0,
+              "y": 1144,
+              "width": 390,
+              "height": 846
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(244, 244, 245)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "reviews",
+            "className": "framer-1uojeqq",
+            "text": "Rated 4.9 of 5You're in good companyWith 4 years in the CRM market,we're trusted by TON, Solana Superteam, and 300+ Web3 companies and GTM agencies.Explore Case StudiesRoman PotapenkoChief Strategy, SuperprotocolMy favorite feature is assig",
+            "rect": {
+              "x": 0,
+              "y": 1990,
+              "width": 390,
+              "height": 731
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "Roman PotapenkoChief Strategy, SuperprotocolMy favorite feature is assigning tasks directly within our deals to team members and receiving a morning digest of what's been completed. Now, we run all our deal flow on Telegram without needing ",
+            "rect": {
+              "x": 20,
+              "y": 2281,
+              "width": 355,
+              "height": 400
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "cards",
+            "className": "framer-180e8nv",
+            "text": "A CRM Pipeline we're all used to. Now Telegram-Native.Seamlessly use crmchat across all devices — as a Telegram mini app on mobile or a desktop-friendly web version. Manage your pipeline, track leads, and close deals from anywhere.Try for F",
+            "rect": {
+              "x": 0,
+              "y": 3084,
+              "width": 390,
+              "height": 813
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "numbers",
+            "className": "framer-u8aqf0",
+            "text": "50K+Messages sent using crmchat per day.20%Avg. response rate for cold outreach.50%B2B Outreach Tasks Automated.",
+            "rect": {
+              "x": 0,
+              "y": 2721,
+              "width": 390,
+              "height": 362
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "boxes",
+            "className": "framer-12bdnk5",
+            "text": "Trusted by Web3, iGaming, Agencies and Creators WorldwideFrom Web3 & SaaS companies to iGaming to content creators — discover how teams use crmchat to grow their business on Telegram.FastSecureWeb3 & SaaS CompaniesReach out to potential par",
+            "rect": {
+              "x": 0,
+              "y": 3897,
+              "width": 390,
+              "height": 1500
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "",
+            "text": "",
+            "rect": {
+              "x": 15,
+              "y": 4691,
+              "width": 360,
+              "height": 80
+            },
+            "style": {
+              "display": "flex",
+              "position": "static",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "",
+            "className": "framer-EI22Y framer-RQTb1 framer-33DjT framer-1bsvqv0 framer-v-1wwceon",
+            "text": "Grow your business on TelegramCRM, Outreach & Lead Research. Get started with 1-week free trial.Try for Free",
+            "rect": {
+              "x": 0,
+              "y": 5397,
+              "width": 390,
+              "height": 600
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgba(0, 0, 0, 0)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "faq",
+            "className": "framer-kbs55j",
+            "text": "Step into the Future of Telegram Business DevelopmentCommon questions about our team, Telegram CRM, Outreach and Research.Can I trust you?CRMchat (formerly Hints) has 4 years of CRM market experience. We’re partners with HubSpot and Pipedri",
+            "rect": {
+              "x": 0,
+              "y": 5997,
+              "width": 390,
+              "height": 1341
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "section",
+            "id": "blog",
+            "className": "framer-cf7nc2",
+            "text": "crmchat BlogOur best content on growing your company, from outbound sales and CRM automation to AI lead generation.View BlogcrmYour Exchange Business Runs on Telegram. Your Spreadsheet Can't Keep UpAug 19, 2026Read morecrmYour Exchange's Cl",
+            "rect": {
+              "x": 0,
+              "y": 7338,
+              "width": 390,
+              "height": 1229
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          },
+          {
+            "tag": "footer",
+            "id": "",
+            "className": "framer-yZJcR framer-1qRHM framer-RJeGq framer-sB2WQ framer-teg9cx framer-v-1ms3200",
+            "text": "All-in-one Business Suite for Telegram-first Sales Teams.IndustriesWeb3 & CryptoiGamingContent CreatorsMedia BuyingGTM AgenciesTrading CoursesProductTelegram CRMTelegram OutreachTG Account WarmupTG Unified InboxProspect ResearchTelegram API",
+            "rect": {
+              "x": 0,
+              "y": 8567,
+              "width": 390,
+              "height": 1341
+            },
+            "style": {
+              "display": "flex",
+              "position": "relative",
+              "backgroundColor": "rgb(250, 250, 250)",
+              "color": "rgb(0, 0, 0)",
+              "fontFamily": "sans-serif",
+              "fontSize": "12px"
+            }
+          }
+        ],
+        "cssVariables": [
+          [
+            "--token-963ba7ff-1506-4ab8-a9bc-332b05614e66",
+            "#09090b"
+          ],
+          [
+            "--token-a5bac2d3-d710-47e2-8bb9-ad946999897c",
+            "#18181b"
+          ],
+          [
+            "--token-69d8c37b-c734-4666-b632-32d8f9c9fc52",
+            "#27272a"
+          ],
+          [
+            "--token-44ba4d15-de95-4ba6-998e-92f0bf192c5f",
+            "#3f3f46"
+          ],
+          [
+            "--token-4e3d4b62-b411-4488-b97a-8ff2a61d3177",
+            "#52525b"
+          ],
+          [
+            "--token-05d3d3db-be9e-464a-9684-d4b46306a4c3",
+            "#71717a"
+          ],
+          [
+            "--token-1ce3c98f-6fc8-41c4-9a88-0e9fdbf098f1",
+            "#a1a1aa"
+          ],
+          [
+            "--token-9f531285-1e18-4a38-b208-f287be68e804",
+            "#d4d4d8"
+          ],
+          [
+            "--token-408e9ffb-f435-48c7-a9ff-2c04fe742fc2",
+            "#e4e4e7"
+          ],
+          [
+            "--token-4e9dcd95-1f27-443e-9665-b27316e88fe2",
+            "#f4f4f5"
+          ],
+          [
+            "--token-bdd5c3bb-385d-4b4d-b487-5a1f9f5d346c",
+            "#fafafa"
+          ],
+          [
+            "--token-3711503b-3d3b-4886-a85c-4293b65e43e7",
+            "#fff"
+          ],
+          [
+            "--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6",
+            "#09090b"
+          ],
+          [
+            "--token-cdaba0c3-7192-4155-be78-0e3fe010491c",
+            "#18181b"
+          ],
+          [
+            "--token-b459e046-718c-4dbb-8c34-b5d5869d1e57",
+            "#27272a"
+          ],
+          [
+            "--token-e4701bb6-83f6-41e5-b0c8-9b95b4510e3a",
+            "#3f3f46"
+          ],
+          [
+            "--token-e6a1425f-5cc8-4e16-87a5-8615ab8b8fe1",
+            "#52525b"
+          ],
+          [
+            "--token-fd54a91d-2c97-4609-acbc-244da5b6b983",
+            "#71717a"
+          ],
+          [
+            "--token-60b32788-cdeb-41df-ba14-e212d5e544dd",
+            "#a1a1aa"
+          ],
+          [
+            "--token-d1b70223-6c17-4c93-9dd4-7a1775f7f7c5",
+            "#d4d4d8"
+          ],
+          [
+            "--token-31213cc7-db87-4df4-8209-e72c8adb68fb",
+            "#e4e4e7"
+          ],
+          [
+            "--token-b0454cba-c19e-43a6-8075-f4b7a5ae4372",
+            "#f4f4f5"
+          ],
+          [
+            "--token-bebb5c17-844d-419e-ab0e-ada0b43a4350",
+            "#fafafa"
+          ],
+          [
+            "--token-2b0e18bf-9e9a-4016-bdfc-5769700a5529",
+            "#fff"
+          ],
+          [
+            "--token-cd1e8e92-b91e-4022-84c2-a059ee7f7bad",
+            "#fff"
+          ],
+          [
+            "--token-5cb9a68d-31cb-4baf-8414-1a3d9276de57",
+            "#fffffff2"
+          ],
+          [
+            "--token-d4b915e8-652b-419f-be5a-3361d1e18040",
+            "#fff"
+          ],
+          [
+            "--token-39f1e7bd-d6a2-4d0f-90ef-8d65a8c77a7c",
+            "#0d75ba"
+          ],
+          [
+            "--token-5cf227e4-8d28-4f31-8df2-e94a44959be8",
+            "#40c5ff1a"
+          ],
+          [
+            "--token-385cb8b2-959c-4157-9298-79e9c79de523",
+            "#ffb66e"
+          ],
+          [
+            "--token-507185eb-89a3-4185-a6e0-ad13e3c47e1c",
+            "#48d87d"
+          ],
+          [
+            "--token-a2b02a90-8343-4e93-bc27-1339e83d69f8",
+            "#ff6969"
+          ],
+          [
+            "--token-d3c9b405-1976-40f4-a12c-b2b083e848e2",
+            "#8554ff"
+          ],
+          [
+            "--token-2b39abb9-fea1-4307-9825-a3e2580c4c08",
+            "#beff4b"
+          ],
+          [
+            "--token-859258dd-93b0-4f6d-8deb-ee5f517e9648",
+            "#fb923c"
+          ],
+          [
+            "--token-1507f56b-76d2-4fd3-8c60-feec6812130b",
+            "#67e8f9"
+          ],
+          [
+            "--token-1f938e72-b917-4440-a479-af25e05d6ef2",
+            "#f472b6"
+          ],
+          [
+            "--token-46aef220-58f8-449f-bd4e-f0721e62e798",
+            "#127ef1"
+          ],
+          [
+            "--token-48db76b1-b6f7-481c-9646-e2e74df040d6",
+            "#000"
+          ],
+          [
+            "--token-58389c29-c015-4427-a57c-637e65cb6404",
+            "#e3e3e3"
+          ],
+          [
+            "--token-e0da01bd-4e0f-4d83-9396-a2ca91f1ef19",
+            "#000"
+          ],
+          [
+            "--token-3ab2d8b6-b506-4374-a6e8-5ad0c59c1eff",
+            "#666"
+          ],
+          [
+            "--token-f12ecc83-59c9-4232-ac38-7d89a1a3b51f",
+            "#666"
+          ],
+          [
+            "--token-0f37c8c4-f915-44f0-be09-b8afb177739f",
+            "#666"
+          ],
+          [
+            "--token-14b60f22-b2ad-4fd1-a3db-62c621a81acc",
+            "#e3e3e3"
+          ],
+          [
+            "--token-da7cc88f-3656-465f-953b-fa43f0c95c63",
+            "#a8a8b2"
+          ],
+          [
+            "--token-44fe9c97-b3d8-4353-bdbe-abf17d09c622",
+            "#94949e"
+          ],
+          [
+            "--token-da13adb3-c22e-4772-81bb-50149f3cd671",
+            "#fafafa"
+          ],
+          [
+            "--token-122efaff-ca65-4f26-b4de-fe2826f750b7",
+            "#fff"
+          ],
+          [
+            "--token-13261ac0-6588-48aa-ba0d-cdc2ec34b5f1",
+            "#fff"
+          ],
+          [
+            "--token-caf759f3-1d62-45fc-ad82-7ff586953871",
+            "#fff"
+          ],
+          [
+            "--token-5888ab63-e51f-4d96-b305-c183f89c39b8",
+            "#fff"
+          ],
+          [
+            "--token-d84fa2f2-c4f1-46f2-a487-e244597a768b",
+            "#fff"
+          ],
+          [
+            "--token-11487f8c-2406-4759-aea5-c846b36549d2",
+            "#f4f4f5"
+          ],
+          [
+            "--framer-will-change-override",
+            "none"
+          ],
+          [
+            "--framer-will-change-filter-override",
+            "none"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-text-decoration-style,solid) var(--framer-text-decoration,none) var(--framer-text-decoration-color,currentcolor) var(--framer-text-decoration-thickness,auto)"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-text-decoration-skip-ink)"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-text-decoration-offset)"
+          ],
+          [
+            "--font-family",
+            "var(--framer-font-family)"
+          ],
+          [
+            "--font-style",
+            "var(--framer-font-style)"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-font-weight)"
+          ],
+          [
+            "--text-color",
+            "var(--framer-text-color)"
+          ],
+          [
+            "--letter-spacing",
+            "var(--framer-letter-spacing)"
+          ],
+          [
+            "--font-size",
+            "var(--framer-font-size)"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-text-transform)"
+          ],
+          [
+            "--line-height",
+            "var(--framer-line-height)"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-font-family,var(--framer-font-family))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-font-style,var(--framer-font-style))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-font-weight,var(--framer-font-weight))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-text-color,var(--framer-text-color))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-font-size,var(--framer-font-size))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-text-transform,var(--framer-text-transform))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid)) var(--framer-link-text-decoration,var(--framer-text-decoration,none)) var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor)) var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset))"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-hover-font-family,var(--framer-link-font-family,var(--framer-font-family)))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-hover-font-style,var(--framer-link-font-style,var(--framer-font-style)))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-hover-font-weight,var(--framer-link-font-weight,var(--framer-font-weight)))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-hover-text-color,var(--framer-link-text-color,var(--framer-text-color)))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-hover-font-size,var(--framer-link-font-size,var(--framer-font-size)))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-hover-text-transform,var(--framer-link-text-transform,var(--framer-text-transform)))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-hover-text-decoration-style,var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid))) var(--framer-link-hover-text-decoration,var(--framer-link-text-decoration,var(--framer-text-decoration,none))) var(--framer-link-hover-text-decoration-color,var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor))) var(--framer-link-hover-text-decoration-thickness,var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto)))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-hover-text-decoration-skip-ink,var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink)))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-hover-text-decoration-offset,var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset)))"
+          ],
+          [
+            "--font-family",
+            "var(--framer-link-current-font-family,var(--framer-link-font-family,var(--framer-font-family)))"
+          ],
+          [
+            "--font-style",
+            "var(--framer-link-current-font-style,var(--framer-link-font-style,var(--framer-font-style)))"
+          ],
+          [
+            "--font-weight",
+            "var(--framer-link-current-font-weight,var(--framer-link-font-weight,var(--framer-font-weight)))"
+          ],
+          [
+            "--text-color",
+            "var(--framer-link-current-text-color,var(--framer-link-text-color,var(--framer-text-color)))"
+          ],
+          [
+            "--font-size",
+            "var(--framer-link-current-font-size,var(--framer-link-font-size,var(--framer-font-size)))"
+          ],
+          [
+            "--text-transform",
+            "var(--framer-link-current-text-transform,var(--framer-link-text-transform,var(--framer-text-transform)))"
+          ],
+          [
+            "--text-decoration",
+            "var(--framer-link-current-text-decoration-style,var(--framer-link-text-decoration-style,var(--framer-text-decoration-style,solid))) var(--framer-link-current-text-decoration,var(--framer-link-text-decoration,var(--framer-text-decoration,none))) var(--framer-link-current-text-decoration-color,var(--framer-link-text-decoration-color,var(--framer-text-decoration-color,currentcolor))) var(--framer-link-current-text-decoration-thickness,var(--framer-link-text-decoration-thickness,var(--framer-text-decoration-thickness,auto)))"
+          ],
+          [
+            "--text-decoration-skip-ink",
+            "var(--framer-link-current-text-decoration-skip-ink,var(--framer-link-text-decoration-skip-ink,var(--framer-text-decoration-skip-ink)))"
+          ],
+          [
+            "--text-underline-offset",
+            "var(--framer-link-current-text-decoration-offset,var(--framer-link-text-decoration-offset,var(--framer-text-decoration-offset)))"
+          ],
+          [
+            "--framer-font-family",
+            "Inter, Inter Placeholder, sans-serif"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "500"
+          ],
+          [
+            "--framer-text-color",
+            "#000"
+          ],
+          [
+            "--framer-font-size",
+            "16px"
+          ],
+          [
+            "--framer-letter-spacing",
+            "0"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-style",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-color",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-thickness",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-skip-ink",
+            "none"
+          ],
+          [
+            "--framer-text-decoration-offset",
+            "none"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-text-alignment",
+            "start"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--framer-text-background-color",
+            "initial"
+          ],
+          [
+            "--framer-text-background-radius",
+            "initial"
+          ],
+          [
+            "--framer-text-background-corner-shape",
+            "initial"
+          ],
+          [
+            "--framer-text-background-padding",
+            "initial"
+          ],
+          [
+            "--list-style-type",
+            "decimal"
+          ],
+          [
+            "--framer-font-family",
+            "Inter, Inter Placeholder, sans-serif"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "500"
+          ],
+          [
+            "--framer-text-color",
+            "#000"
+          ],
+          [
+            "--framer-font-size",
+            "16px"
+          ],
+          [
+            "--framer-letter-spacing",
+            "0"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-text-alignment",
+            "start"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--font-variation-settings",
+            "normal"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "0px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--border-bottom-width",
+            "1px"
+          ],
+          [
+            "--border-color",
+            "var(--token-31213cc7-db87-4df4-8209-e72c8adb68fb,#e4e4e7)"
+          ],
+          [
+            "--border-left-width",
+            "1px"
+          ],
+          [
+            "--border-right-width",
+            "1px"
+          ],
+          [
+            "--border-style",
+            "solid"
+          ],
+          [
+            "--border-top-width",
+            "1px"
+          ],
+          [
+            "--framer-link-text-color",
+            "#09f"
+          ],
+          [
+            "--framer-link-text-decoration",
+            "underline"
+          ],
+          [
+            "--framer-font-family",
+            "\"Manrope\", \"Manrope Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-family-bold",
+            "\"Manrope\", \"Manrope Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-open-type-features",
+            "normal"
+          ],
+          [
+            "--framer-font-size",
+            "58px"
+          ],
+          [
+            "--framer-font-style",
+            "normal"
+          ],
+          [
+            "--framer-font-style-bold",
+            "normal"
+          ],
+          [
+            "--framer-font-variation-axes",
+            "normal"
+          ],
+          [
+            "--framer-font-weight",
+            "600"
+          ],
+          [
+            "--framer-font-weight-bold",
+            "700"
+          ],
+          [
+            "--framer-letter-spacing",
+            "-.02em"
+          ],
+          [
+            "--framer-line-height",
+            "1.2em"
+          ],
+          [
+            "--framer-paragraph-spacing",
+            "40px"
+          ],
+          [
+            "--framer-text-alignment",
+            "left"
+          ],
+          [
+            "--framer-text-color",
+            "var(--token-de5448c6-98bb-4403-96cd-7fe86bf2daa6,#09090b)"
+          ],
+          [
+            "--framer-text-decoration",
+            "none"
+          ],
+          [
+            "--framer-text-stroke-color",
+            "initial"
+          ],
+          [
+            "--framer-text-stroke-width",
+            "initial"
+          ],
+          [
+            "--framer-text-transform",
+            "none"
+          ],
+          [
+            "--framer-font-family",
+            "\"Inter Tight\", \"Inter Tight Placeholder\", sans-serif"
+          ],
+          [
+            "--framer-font-family-bold",
+            "\"Inter\", \"Inter Placeholder\", sans-serif"
+          ]
+        ],
+        "fonts": [
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight",
+          "Inter Tight"
+        ],
+        "images": [
+          {
+            "src": "https://framerusercontent.com/images/OPJDn7HftNNuzLN2Ge8Ckp0opqw.png?width=174&height=180",
+            "alt": "",
+            "width": 174,
+            "height": 180
+          },
+          {
+            "src": "https://framerusercontent.com/images/5XFp7vuYPkfemUB5wuzNmkgZbns.png?width=120&height=120",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/Mxr1V9A8jbdURRWdZd33J8HemYk.svg?scale-down-to=512&width=800&height=800",
+            "alt": "",
+            "width": 609,
+            "height": 609
+          },
+          {
+            "src": "https://framerusercontent.com/images/UFq3FSAuxjOcLs2BLVsjnOmPgM.svg?scale-down-to=512&width=800&height=800",
+            "alt": "",
+            "width": 609,
+            "height": 609
+          },
+          {
+            "src": "https://framerusercontent.com/images/bLooXswqeqysa3Jih1G9KsT0bDU.svg?width=440&height=300",
+            "alt": "CRMChat screenshot with Telegram Outreach Sequence",
+            "width": 440,
+            "height": 300
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/6dU5nKR4pHj5Mk8gx83iePyiHJ0.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/7IZfjnmPOZXUXJ0QSmSu3Hi94.jpg?width=500&height=500",
+            "alt": "",
+            "width": 500,
+            "height": 500
+          },
+          {
+            "src": "https://framerusercontent.com/images/I2CswDaPB1sB9ylEuraWlQ4RE.png?width=360&height=360",
+            "alt": "",
+            "width": 360,
+            "height": 360
+          },
+          {
+            "src": "https://framerusercontent.com/images/pWBz4jQSsDYuwbZ90RWQaqwScw.jpg?width=512&height=512",
+            "alt": "",
+            "width": 512,
+            "height": 512
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/26vG1fOeQquLgHfO5TNSq9aRovc.jpg?scale-down-to=512&width=893&height=591",
+            "alt": "CRMChat CRM pipeline view",
+            "width": 350,
+            "height": 231
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/JswQhxj7oiC7x6SA04bAzrvGCng.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/Nz3r9V8duDxWSE30EIl4NMnWBA.svg?scale-down-to=512&width=1024&height=1024",
+            "alt": "",
+            "width": 120,
+            "height": 120
+          },
+          {
+            "src": "https://framerusercontent.com/images/whFczzU39rZfjfDixol7Gb1e0vw.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/e4Gp7KAjXuapmPPYIiwormHAWfk.svg?width=150&height=38",
+            "alt": "",
+            "width": 150,
+            "height": 38
+          },
+          {
+            "src": "https://framerusercontent.com/images/Qa5IQ11cfqcitjEaeR9qZgHd9Y.jpg?scale-down-to=512&width=640&height=640",
+            "alt": "",
+            "width": 59,
+            "height": 59
+          },
+          {
+            "src": "https://framerusercontent.com/images/xFHAfQRdBg5cQewdATP16sxt7ZY.png?scale-down-to=512&width=1536&height=1024",
+            "alt": "",
+            "width": 350,
+            "height": 233
+          },
+          {
+            "src": "https://framerusercontent.com/images/1WcPEPeQwFpmjSkmVKPfR2drpoE.png?scale-down-to=512&width=1536&height=1024",
+            "alt": "",
+            "width": 350,
+            "height": 233
+          }
+        ],
+        "canvases": [
+          {
+            "width": 862,
+            "height": 862,
+            "cssWidth": 516.9074096679688,
+            "cssHeight": 516.907470703125
+          }
+        ]
+      }
+    }
+  ]
+}

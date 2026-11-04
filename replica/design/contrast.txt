@@ -1,0 +1,56 @@
+  AAA   19.06:1  text                     on bg                   
+  AAA   19.90:1  text                     on surface              
+  AAA   18.10:1  text                     on sunken               
+  AAA   13.46:1  text                     on fill-muted           
+  AAA    7.76:1  text                     on fill-muted-hover     
+  AAA    7.41:1  text-muted               on bg                   
+  AAA    7.73:1  text-muted               on surface              
+  AAA    7.03:1  text-muted               on sunken               
+  AAA   10.44:1  on-accent                on accent               
+  AAA   14.89:1  on-accent                on accent-hover         
+  AAA   10.01:1  accent                   on bg                   
+  AAA   10.44:1  accent                   on surface              
+  AAA    9.50:1  accent                   on sunken               
+  AA     6.30:1  danger                   on bg                   
+  AA     6.57:1  danger                   on surface              
+  AA     5.59:1  danger                   on danger-soft          
+  AA     6.71:1  success                  on bg                   
+  AA     6.28:1  success                  on success-soft         
+  AA     6.51:1  warning                  on bg                   
+  AA     6.16:1  warning                  on warning-soft         
+  AA     6.57:1  on-danger                on danger               
+  AAA    7.00:1  on-success               on success              
+  AA     6.79:1  on-warning               on warning              
+  PASS   4.63:1  border-input             on bg                   ui
+  PASS   4.83:1  border-input             on surface              ui
+  PASS  10.01:1  accent                   on bg                   ui
+  PASS  10.44:1  accent                   on surface              ui
+  AAA   16.14:1  dark-text                on dark-bg              
+  AAA   13.25:1  dark-text                on dark-surface         
+  AAA   17.68:1  dark-text                on dark-sunken          
+  AAA    9.50:1  dark-text                on dark-fill-muted      
+  AAA    7.03:1  dark-text                on dark-fill-muted-hover 
+  AA     6.92:1  dark-text-muted          on dark-bg              
+  AA     5.68:1  dark-text-muted          on dark-surface         
+  AAA    7.58:1  dark-text-muted          on dark-sunken          
+  AAA   11.99:1  dark-on-accent           on dark-accent          
+  AAA   13.96:1  dark-on-accent           on dark-accent-hover    
+  AAA   12.01:1  dark-accent              on dark-bg              
+  AAA    9.85:1  dark-accent              on dark-surface         
+  AAA   13.15:1  dark-accent              on dark-sunken          
+  AA     6.37:1  dark-danger              on dark-bg              
+  AA     5.23:1  dark-danger              on dark-surface         
+  AA     5.78:1  dark-danger              on dark-danger-soft     
+  AAA   12.64:1  dark-success             on dark-bg              
+  AAA   11.03:1  dark-success             on dark-success-soft    
+  AAA   10.52:1  dark-warning             on dark-bg              
+  AAA    8.43:1  dark-warning             on dark-warning-soft    
+  AA     6.36:1  dark-on-danger           on dark-danger          
+  AAA   12.62:1  dark-on-success          on dark-success         
+  AAA   10.51:1  dark-on-warning          on dark-warning         
+  PASS   6.92:1  dark-border-input        on dark-bg              ui
+  PASS   5.68:1  dark-border-input        on dark-surface         ui
+  PASS  12.01:1  dark-accent              on dark-bg              ui
+  PASS   9.85:1  dark-accent              on dark-surface         ui
+
+  54 pairs, 0 failing AA

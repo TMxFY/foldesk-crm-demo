@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Примитивы кабинета</title>
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: var(--text-base);
+      line-height: var(--leading-base);
+      font-weight: 400;
+    }
+    header, main { max-width: 960px; margin: 0 auto; padding: var(--space-5); }
+    header { display: flex; justify-content: space-between; gap: var(--space-4); align-items: center; }
+    h1 { font-size: var(--text-xl); line-height: var(--leading-xl); font-weight: 600; margin: 0; }
+    h2 { font-size: var(--text-lg); line-height: var(--leading-lg); font-weight: 600; margin: 0 0 var(--space-3); }
+    p.note { color: var(--text-muted); font-size: var(--text-sm); line-height: var(--leading-sm); margin: var(--space-2) 0 0; }
+    section {
+      background: var(--surface);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-card);
+      padding: var(--space-4);
+      margin-bottom: var(--space-4);
+    }
+    .row { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+    .stack { display: grid; gap: var(--space-3); }
+    button, input, textarea { font: inherit; }
+    .btn {
+      border: 1px solid transparent;
+      border-radius: var(--radius-md);
+      padding: 0 var(--space-4);
+      height: 40px;
+      font-size: var(--text-sm);
+      line-height: var(--leading-sm);
+      font-weight: 600;
+      cursor: pointer;
+      transition: background var(--motion-fast) var(--ease);
+    }
+    .btn.sm { height: 32px; padding: 0 var(--space-3); }
+    .btn.lg { height: 48px; padding: 0 var(--space-5); border-radius: var(--radius-lg); }
+    .btn.icon { width: 24px; height: 24px; padding: 0; border-radius: var(--radius-sm); }
+    .btn.primary { background: var(--accent); color: var(--on-accent); }
+    .btn.primary:hover { background: var(--accent-hover); }
+    .btn.secondary { background: var(--fill-muted); color: var(--text); border-radius: var(--radius-sm); }
+    .btn.secondary:hover { background: var(--fill-muted-hover); }
+    .btn.ghost { background: transparent; color: var(--text); }
+    .btn.ghost:hover { background: var(--sunken); }
+    .btn.danger { background: var(--danger); color: var(--on-danger); }
+    .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: 0.48; cursor: not-allowed; }
+    .btn.loading { cursor: progress; }
+    .spinner {
+      width: 12px; height: 12px; margin-right: 8px;
+      display: inline-block; vertical-align: -1px;
+      border: 2px solid currentColor; border-right-color: transparent;
+      border-radius: var(--radius-pill);
+    }
+    label { display: block; font-size: var(--text-xs); line-height: var(--leading-xs); font-weight: 500; color: var(--text-muted); margin-bottom: var(--space-1); }
+    input[type="text"], input[type="date"], input[type="time"], textarea, .field input {
+      width: 100%;
+      height: 40px;
+      padding: 0 var(--space-3);
+      border: 1px solid var(--border-input);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+      color: var(--text);
+    }
+    textarea { height: 96px; padding: var(--space-2) var(--space-3); resize: vertical; }
+    input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    input:disabled { background: var(--sunken); color: var(--text-muted); }
+    .invalid input { border-color: var(--danger); }
+    .err { color: var(--danger); font-size: var(--text-sm); line-height: var(--leading-sm); margin: var(--space-1) 0 0; }
+    .lead {
+      width: 100%;
+      text-align: left;
+      display: grid;
+      grid-template-columns: 40px 1fr auto;
+      gap: var(--space-3);
+      align-items: center;
+      padding: var(--space-3);
+      border: 0;
+      border-radius: var(--radius-md);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .lead:hover, .lead[aria-current="true"] { background: var(--sunken); }
+    .lead:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .avatar {
+      width: 40px; height: 40px; border-radius: var(--radius-pill);
+      background: var(--fill-muted); color: var(--text);
+      display: grid; place-items: center; font-size: var(--text-sm); font-weight: 600;
+    }
+    .name { font-size: var(--text-sm); line-height: var(--leading-sm); font-weight: 600; }
+    .preview { font-size: var(--text-sm); line-height: var(--leading-sm); font-weight: 400; color: var(--text-muted); }
+    .meta { font-size: var(--text-xs); line-height: var(--leading-xs); color: var(--text-muted); text-align: right; }
+    .count {
+      display: inline-grid; place-items: center; min-width: 20px; height: 20px;
+      padding: 0 6px; border-radius: var(--radius-pill);
+      background: var(--accent); color: var(--on-accent);
+      font-size: var(--text-xs); line-height: var(--leading-xs); font-weight: 600;
+    }
+    .badge {
+      display: inline-flex; align-items: center; height: 24px; padding: 0 var(--space-2);
+      border-radius: var(--radius-pill);
+      font-size: var(--text-xs); line-height: var(--leading-xs); font-weight: 600;
+    }
+    .b-new { background: var(--sunken); color: var(--text); }
+    .b-talk { background: var(--surface); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .b-offer { background: var(--warning-soft); color: var(--warning); }
+    .b-deal { background: var(--fill-muted); color: var(--text); }
+    .b-won { background: var(--success-soft); color: var(--success); }
+    .b-ok { background: var(--success-soft); color: var(--success); }
+    .b-off { background: var(--sunken); color: var(--text-muted); }
+    .b-login { background: var(--warning-soft); color: var(--warning); }
+    .b-bad { background: var(--danger-soft); color: var(--danger); }
+    .reminder {
+      display: grid; gap: var(--space-2);
+      padding: var(--space-3);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    .reminder.due { border-color: var(--warning); }
+    .reminder.overdue { border-color: var(--danger); }
+    .reminder h3 { margin: 0; font-size: var(--text-sm); line-height: var(--leading-sm); font-weight: 600; }
+    .when { font-size: var(--text-xs); line-height: var(--leading-xs); color: var(--text-muted); }
+    .overdue .when { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Примитивы кабинета</h1>
+      <p class="note">Изолированная проверка. Маршрута в приложении нет. Чужие знаки и тексты не используются.</p>
+    </div>
+    <button class="btn secondary sm" type="button" id="theme">Тема</button>
+  </header>
+  <main>
+    <section>
+      <h2>Кнопка</h2>
+      <div class="row">
+        <button class="btn primary" type="button">Открыть чат</button>
+        <button class="btn secondary" type="button">Отложить</button>
+        <button class="btn ghost" type="button">Закрыть</button>
+        <button class="btn danger" type="button">Удалить</button>
+        <button class="btn primary sm" type="button">К лиду</button>
+        <button class="btn primary lg" type="button">Сохранить лид</button>
+        <button class="btn primary" type="button" disabled>Нельзя</button>
+        <button class="btn primary loading" type="button" aria-busy="true"><span class="spinner" aria-hidden="true"></span>Сохраняю</button>
+      </div>
+    </section>
+    <section>
+      <h2>Поле</h2>
+      <div class="stack">
+        <div>
+          <label for="name">Имя</label>
+          <input id="name" type="text" placeholder="Как обращаться">
+        </div>
+        <div class="invalid">
+          <label for="name-bad">Имя</label>
+          <input id="name-bad" type="text" value="" aria-invalid="true" aria-describedby="name-err">
+          <p class="err" id="name-err">Без имени лид не сохранить</p>
+        </div>
+        <div>
+          <label for="name-off">Имя</label>
+          <input id="name-off" type="text" value="Только просмотр" disabled>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Строка лида</h2>
+      <div class="stack">
+        <button class="lead" type="button" aria-current="true">
+          <span class="avatar" aria-hidden="true">МК</span>
+          <span>
+            <span class="name">Марина Котова</span><br>
+            <span class="preview">Можно созвон завтра утром?</span>
+          </span>
+          <span class="meta">14:20<br><span class="count">2</span></span>
+        </button>
+        <button class="lead" type="button">
+          <span class="avatar" aria-hidden="true">ИЛ</span>
+          <span>
+            <span class="name">Илья Левин</span><br>
+            <span class="preview">Счёт отправил, жду оплату</span>
+          </span>
+          <span class="meta">вчера</span>
+        </button>
+      </div>
+    </section>
+    <section>
+      <h2>Бейдж статуса</h2>
+      <div class="row">
+        <span class="badge b-new">Новый</span>
+        <span class="badge b-talk">Переписка</span>
+        <span class="badge b-offer">Оффер</span>
+        <span class="badge b-deal">Согласование</span>
+        <span class="badge b-won">Сделка</span>
+        <span class="badge b-ok">На связи</span>
+        <span class="badge b-off">Нет сети</span>
+        <span class="badge b-login">Нужен вход</span>
+        <span class="badge b-bad">Блок</span>
+        <span class="badge b-bad">Заморожен</span>
+      </div>
+    </section>
+    <section>
+      <h2>Напоминание</h2>
+      <div class="stack">
+        <article class="reminder due">
+          <h3>Перезвонить по счёту</h3>
+          <p class="when">Сегодня, 16:30</p>
+          <div class="row">
+            <button class="btn secondary sm" type="button">Сделано</button>
+            <button class="btn ghost sm" type="button">Отложить</button>
+            <button class="btn primary sm" type="button">К лиду</button>
+          </div>
+        </article>
+        <article class="reminder overdue">
+          <h3>Уточнить адрес доставки</h3>
+          <p class="when">Просрочено, вчера 11:00</p>
+          <div class="row">
+            <button class="btn secondary sm" type="button">Сделано</button>
+            <button class="btn ghost sm" type="button">Отложить</button>
+            <button class="btn primary sm" type="button">К лиду</button>
+          </div>
+        </article>
+        <article class="reminder">
+          <h3>Черновик условий</h3>
+          <span class="badge b-won">Сделано</span>
+        </article>
+      </div>
+    </section>
+  </main>
+  <script>
+    document.getElementById("theme").addEventListener("click", function () {
+      var root = document.documentElement;
+      root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+    });
+  </script>
+</body>
+</html>

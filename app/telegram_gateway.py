@@ -186,6 +186,14 @@ def _history_limit(limit) -> int:
 class TelethonGateway(TelegramGateway):
     def __init__(self):
         self._clients = {}
+        self._locks = {}
+
+    def _session_lock(self, session_path: str) -> asyncio.Lock:
+        lock = self._locks.get(session_path)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[session_path] = lock
+        return lock
 
     def _credentials(self):
         api_id = os.getenv("TG_API_ID", "").strip()
@@ -216,117 +224,123 @@ class TelethonGateway(TelegramGateway):
             await client.disconnect()
 
     async def request_code(self, phone: str, session_path: str) -> str:
-        client, _owned = await self._open(session_path)
-        try:
-            sent = await client.send_code_request(phone)
-            return sent.phone_code_hash
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось отправить код") from exc
-        finally:
-            await self._close(session_path)
+        async with self._session_lock(session_path):
+            client, _owned = await self._open(session_path)
+            try:
+                sent = await client.send_code_request(phone)
+                return sent.phone_code_hash
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось отправить код") from exc
+            finally:
+                await self._close(session_path)
 
     async def confirm_code(
         self, phone: str, code: str, phone_code_hash: str, session_path: str
     ) -> dict:
         from telethon import errors
 
-        client, _owned = await self._open(session_path)
-        try:
-            user = await client.sign_in(
-                phone=phone, code=code, phone_code_hash=phone_code_hash
-            )
-        except errors.SessionPasswordNeededError:
-            return {"status": "pending_password"}
-        except errors.PhoneCodeInvalidError as exc:
-            raise GatewayError("Неверный код") from exc
-        except errors.PhoneCodeExpiredError as exc:
-            raise GatewayError("Код истёк, запросите новый") from exc
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось подтвердить код") from exc
-        profile = {
-            "status": "connected",
-            "telegram_user_id": user.id,
-            "telegram_username": getattr(user, "username", None),
-            "telegram_name": _person_name(user),
-        }
-        await self._close(session_path)
-        return profile
+        async with self._session_lock(session_path):
+            client, _owned = await self._open(session_path)
+            try:
+                user = await client.sign_in(
+                    phone=phone, code=code, phone_code_hash=phone_code_hash
+                )
+            except errors.SessionPasswordNeededError:
+                return {"status": "pending_password"}
+            except errors.PhoneCodeInvalidError as exc:
+                raise GatewayError("Неверный код") from exc
+            except errors.PhoneCodeExpiredError as exc:
+                raise GatewayError("Код истёк, запросите новый") from exc
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось подтвердить код") from exc
+            profile = {
+                "status": "connected",
+                "telegram_user_id": user.id,
+                "telegram_username": getattr(user, "username", None),
+                "telegram_name": _person_name(user),
+            }
+            await self._close(session_path)
+            return profile
 
     async def confirm_password(self, password: str, session_path: str) -> dict:
         from telethon import errors
 
-        try:
-            client, _owned = await self._open(session_path)
-            user = await client.sign_in(password=password)
-        except errors.PasswordHashInvalidError as exc:
-            raise GatewayError("Неверный пароль") from exc
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось подтвердить пароль") from exc
-        profile = {
-            "status": "connected",
-            "telegram_user_id": user.id,
-            "telegram_username": getattr(user, "username", None),
-            "telegram_name": _person_name(user),
-        }
-        await self._close(session_path)
-        return profile
+        async with self._session_lock(session_path):
+            try:
+                client, _owned = await self._open(session_path)
+                user = await client.sign_in(password=password)
+            except errors.PasswordHashInvalidError as exc:
+                raise GatewayError("Неверный пароль") from exc
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось подтвердить пароль") from exc
+            profile = {
+                "status": "connected",
+                "telegram_user_id": user.id,
+                "telegram_username": getattr(user, "username", None),
+                "telegram_name": _person_name(user),
+            }
+            await self._close(session_path)
+            return profile
 
     async def session_health(self, session_path: str) -> dict:
-        try:
-            client, owned = await self._open(session_path)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            return _classify_session_error(exc)
-        try:
-            if not await client.is_user_authorized():
-                return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
-            me = await client.get_me()
-            if me is None:
-                return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
-            return {"health": "active", "last_error": None}
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            return _classify_session_error(exc)
-        finally:
-            if owned:
-                try:
-                    await self._close(session_path)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
+        async with self._session_lock(session_path):
+            try:
+                client, owned = await self._open(session_path)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return _classify_session_error(exc)
+            try:
+                if not await client.is_user_authorized():
+                    return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+                me = await client.get_me()
+                if me is None:
+                    return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+                return {"health": "active", "last_error": None}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return _classify_session_error(exc)
+            finally:
+                if owned:
+                    try:
+                        await self._close(session_path)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
 
     async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
-        client, owned = await self._open(session_path)
-        try:
-            return await self._search(client, query, limit)
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось прочитать диалоги") from exc
-        finally:
-            if owned:
-                await self._close(session_path)
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                return await self._search(client, query, limit)
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось прочитать диалоги") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
 
     async def load_inbox(self, session_path: str, limit: int = 30) -> list:
-        client, owned = await self._open(session_path)
-        try:
-            return await self._load_private(client, limit)
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось прочитать входящие") from exc
-        finally:
-            if owned:
-                await self._close(session_path)
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                return await self._load_private(client, limit)
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось прочитать входящие") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
 
     async def _load_private(self, client, limit: int) -> list:
         from telethon.tl.types import User
@@ -393,39 +407,45 @@ class TelethonGateway(TelegramGateway):
                 break
         return found
 
-    async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
+    async def send_message(self, session_path: str, peer_id, text: str, reply_to=None) -> dict:
         body = (text or "").strip()
         if not body:
             raise GatewayError("Напишите сообщение")
-        client, owned = await self._open(session_path)
-        try:
-            kwargs = {"reply_to": int(reply_to)} if reply_to else {}
-            msg = await client.send_message(int(peer_id), body, **kwargs)
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось отправить") from exc
-        finally:
-            if owned:
-                await self._close(session_path)
-        return {
-            "telegram_message_id": int(msg.id),
-            "text": getattr(msg, "message", None) or body,
-            "sent_at": _stamp(getattr(msg, "date", None)),
-            "direction": "out",
-        }
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                kwargs = {"reply_to": int(reply_to)} if reply_to else {}
+                if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit():
+                    target = int(peer_id)
+                else:
+                    target = str(peer_id).strip()
+                msg = await client.send_message(target, body, **kwargs)
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось отправить") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
+            return {
+                "telegram_message_id": int(msg.id),
+                "text": getattr(msg, "message", None) or body,
+                "sent_at": _stamp(getattr(msg, "date", None)),
+                "direction": "out",
+            }
 
     async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
-        client, owned = await self._open(session_path)
-        try:
-            return await self._history(client, peer_id, limit)
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
-        finally:
-            if owned:
-                await self._close(session_path)
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                return await self._history(client, peer_id, limit)
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
 
     async def _history(self, client, peer_id: int, limit: int) -> list:
         # get_messages is newest-first. A channel or chat id is not a personal dialog.
@@ -539,29 +559,31 @@ class TelethonGateway(TelegramGateway):
         ]
 
     async def list_folders(self, session_path: str) -> list:
-        client, owned = await self._open(session_path)
-        try:
-            items = await self._dialog_filters(client)
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось прочитать папки") from exc
-        finally:
-            if owned:
-                await self._close(session_path)
-        return [_folder_row(item) for item in items]
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                items = await self._dialog_filters(client)
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось прочитать папки") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
+            return [_folder_row(item) for item in items]
 
     async def folder_peers(self, session_path: str, telegram_folder_id: int) -> list:
-        client, owned = await self._open(session_path)
-        try:
-            return await self._explicit_users(client, int(telegram_folder_id))
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(str(exc) or "Не удалось прочитать папку") from exc
-        finally:
-            if owned:
-                await self._close(session_path)
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                return await self._explicit_users(client, int(telegram_folder_id))
+            except GatewayError:
+                raise
+            except Exception as exc:
+                raise GatewayError(str(exc) or "Не удалось прочитать папку") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
 
     async def _dialog_filters(self, client) -> list:
         from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -618,6 +640,69 @@ class TelethonGateway(TelegramGateway):
                 }
             )
         return people
+
+    async def resolve_phones(self, session_path: str, phones: list[str]) -> list[dict]:
+        from telethon.tl.functions.contacts import DeleteContactsRequest, ImportContactsRequest
+        from telethon.tl.types import InputPhoneContact
+
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                contacts = [
+                    InputPhoneContact(client_id=idx, phone=p, first_name=f"Contact{idx}", last_name="")
+                    for idx, p in enumerate(phones, start=1)
+                ]
+                res = await client(ImportContactsRequest(contacts))
+                users = getattr(res, "users", None) or []
+                out = []
+                for u in users:
+                    phone_val = getattr(u, "phone", None)
+                    norm_p = f"+{phone_val.lstrip('+')}" if phone_val else None
+                    out.append(
+                        {
+                            "phone": norm_p,
+                            "found": True,
+                            "telegram_user_id": int(u.id),
+                            "username": getattr(u, "username", None),
+                            "name": _person_name(u) or getattr(u, "username", None) or (norm_p or ""),
+                        }
+                    )
+                if users:
+                    try:
+                        await client(DeleteContactsRequest(id=users))
+                    except Exception:
+                        pass
+                return out
+            finally:
+                if owned:
+                    await self._close(session_path)
+
+    async def get_participants(self, session_path: str, group_link: str, limit: int = 50) -> list[dict]:
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                entity = await client.get_entity(group_link)
+                group_title = getattr(entity, "title", None) or str(group_link)
+                users = await client.get_participants(entity, limit=min(int(limit or 50), 200))
+                out = []
+                for u in users or []:
+                    if getattr(u, "bot", False):
+                        continue
+                    out.append(
+                        {
+                            "telegram_user_id": int(u.id),
+                            "username": getattr(u, "username", None),
+                            "name": _person_name(u) or getattr(u, "username", None) or f"User #{u.id}",
+                            "bio": "",
+                            "role": "member",
+                            "is_premium": bool(getattr(u, "premium", False)),
+                            "group_title": group_title,
+                        }
+                    )
+                return out
+            finally:
+                if owned:
+                    await self._close(session_path)
 
 
 def _folder_row(item) -> dict:
@@ -820,18 +905,22 @@ class FakeGateway(TelegramGateway):
                 break
         return matched
 
-    async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
+    async def send_message(self, session_path: str, peer_id, text: str, reply_to=None) -> dict:
         body = (text or "").strip()
         if not body:
             raise GatewayError("Напишите сообщение")
+        if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit():
+            peer_key = int(peer_id)
+        else:
+            peer_key = str(peer_id).strip()
         self._message_seq += 1
         used = {
             int(row.get("telegram_message_id") or 0)
-            for row in self.history.get(int(peer_id), [])
+            for row in self.history.get(peer_key, [])
         }
         while self._message_seq in used:
             self._message_seq += 1
-        self.sent.append({"peer_id": int(peer_id), "text": body, "reply_to": reply_to})
+        self.sent.append({"peer_id": peer_key, "text": body, "reply_to": reply_to, "session_path": session_path})
         record = {
             "telegram_message_id": self._message_seq,
             "text": body,
@@ -839,7 +928,7 @@ class FakeGateway(TelegramGateway):
             "direction": "out",
             "reply_to_telegram_message_id": int(reply_to) if reply_to else None,
         }
-        self.history.setdefault(int(peer_id), []).append(dict(record))
+        self.history.setdefault(peer_key, []).append(dict(record))
         return record
 
     async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:

@@ -1,0 +1,603 @@
+{
+  "label": "original",
+  "url": "https://crmchat.ai",
+  "capturedAt": "2026-11-03T23:33:19.203Z",
+  "maxPages": 8,
+  "maxDepth": 1,
+  "allowSubdomains": false,
+  "routes": [
+    {
+      "url": "https://crmchat.ai",
+      "from": "",
+      "depth": 0,
+      "status": 200,
+      "title": "crmchat - Leading Telegram CRM, Outreach and Automation Platform",
+      "lang": "en",
+      "metaDescription": "Telegram-native CRM & Telegram Automation app for sales teams. Find new leads on Telegram, manage CRM deals & scale multi-account outreach. Trusted by 500+ Web3, iGaming, Tech, and LeadGen companies.",
+      "h1": [
+        "Telegram CRM, Outreach & Lead Research"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "Telegram CRM, Outreach & Lead Research"
+        },
+        {
+          "tag": "h2",
+          "text": "All-in-one Sales Platform. Optimized for Telegram."
+        },
+        {
+          "tag": "h3",
+          "text": "Telegram Outreach withAutomated Sequences"
+        },
+        {
+          "tag": "h2",
+          "text": "You're in good company"
+        },
+        {
+          "tag": "h3",
+          "text": "A CRM Pipeline we're all used to. Now Telegram-Native."
+        },
+        {
+          "tag": "h2",
+          "text": "50K+"
+        },
+        {
+          "tag": "h2",
+          "text": "20%"
+        },
+        {
+          "tag": "h2",
+          "text": "50%"
+        },
+        {
+          "tag": "h2",
+          "text": "Trusted by Web3, iGaming, Agencies and Creators Worldwide"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        }
+      ],
+      "counts": {
+        "links": 72,
+        "images": 45,
+        "canvas": 1,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 72,
+      "screenshot": "screenshots/crmchat.ai-90c5698b.png",
+      "consoleErrors": [
+        "Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID"
+      ]
+    },
+    {
+      "url": "https://crmchat.ai/pricing",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "Compare crmchat Plans & Features | crmchat.ai",
+      "lang": "en",
+      "metaDescription": "Flexible Telegram CRM, Outreach, and Lead Research pricing from free to enterprise. Access native pipeline management, multi-account outreach, and lead research tools. Start free, scale as you grow.",
+      "h1": [
+        "\"A complete game-changer for our business, 10/10 recommend.\"",
+        "Pricing Plans"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "\"A complete game-changer for our business, 10/10 recommend.\""
+        },
+        {
+          "tag": "h1",
+          "text": "Pricing Plans"
+        },
+        {
+          "tag": "h2",
+          "text": "“crmchat has transformed our Telegram B2B outreach workflow”"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        },
+        {
+          "tag": "h3",
+          "text": "Frequently Asked Questions"
+        }
+      ],
+      "counts": {
+        "links": 44,
+        "images": 3,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 44,
+      "screenshot": "screenshots/crmchat.ai-pricing-881bfa38.png",
+      "consoleErrors": []
+    },
+    {
+      "url": "https://crmchat.ai/changelog",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "crmchat Changelog - Leading Telegram CRM & Outreach App",
+      "lang": "en",
+      "metaDescription": "Telegram-native CRM & Telegram Automation app for sales teams. Find new leads on Telegram, manage CRM deals & scale multi-account outreach. Trusted by 500+ Web3, iGaming, Tech, and LeadGen companies.",
+      "h1": [
+        "Changelog"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "Changelog"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: September 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: August 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: July 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: June 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: May 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: April 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: March 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: February 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🚀 crmchat Monthly Update: January 2026"
+        },
+        {
+          "tag": "h2",
+          "text": "🎄 crmchat Monthly Update: December 2025"
+        },
+        {
+          "tag": "h2",
+          "text": "📢 crmchat News: November 2025"
+        },
+        {
+          "tag": "h2",
+          "text": "📢 crmchat News: October 2025"
+        },
+        {
+          "tag": "h2",
+          "text": "📢 crmchat News: September 2025"
+        },
+        {
+          "tag": "h2",
+          "text": "Introducing Multiple Pipelines!"
+        },
+        {
+          "tag": "h2",
+          "text": "📢 crmchat News: August 2025"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        }
+      ],
+      "counts": {
+        "links": 69,
+        "images": 4,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 69,
+      "screenshot": "screenshots/crmchat.ai-changelog-d4f44d7d.png",
+      "consoleErrors": []
+    },
+    {
+      "url": "https://crmchat.ai/telegram-outreach",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "Telegram Outreach Automation - Multi-Account Scaling | crmchat",
+      "lang": "en",
+      "metaDescription": "Automate Telegram outreach with personalized sequences across unlimited accounts. Scale your messaging while maintaining compliance and maximizing response rates. Bulk message multiple group chats at once.",
+      "h1": [
+        "Telegram Outreach & Automation Platform"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "Telegram Outreach & Automation Platform"
+        },
+        {
+          "tag": "h2",
+          "text": "4x"
+        },
+        {
+          "tag": "h2",
+          "text": "60%"
+        },
+        {
+          "tag": "h2",
+          "text": "10K+"
+        },
+        {
+          "tag": "h2",
+          "text": "Your growth engine on Telegram"
+        },
+        {
+          "tag": "h2",
+          "text": "Smart account switching"
+        },
+        {
+          "tag": "h2",
+          "text": "Bulk Messages to Telegram Group Chats"
+        },
+        {
+          "tag": "h2",
+          "text": "Connect AI-Agents to your Outreach Accounts"
+        },
+        {
+          "tag": "h2",
+          "text": "Scalable Without Compromise"
+        },
+        {
+          "tag": "h2",
+          "text": "“crmchat has transformed our Telegram B2B outreach workflow”"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        },
+        {
+          "tag": "h3",
+          "text": "Explore the blog"
+        }
+      ],
+      "counts": {
+        "links": 62,
+        "images": 27,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 62,
+      "screenshot": "screenshots/crmchat.ai-telegram-outreach-5b33035d.png",
+      "consoleErrors": []
+    },
+    {
+      "url": "https://crmchat.ai/telegram-outreach-setup",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "Done-For-You Telegram Outreach Setup | crmchat VIP Service",
+      "lang": "en",
+      "metaDescription": "Let our Telegram strategists set up your complete outreach campaign. From account configuration to message sequences and compliance - we handle everything. Get expert setup in 3 days.",
+      "h1": [
+        "Telegram Outreach, done for you. Live in 3 days."
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "Telegram Outreach, done for you. Live in 3 days."
+        },
+        {
+          "tag": "h2",
+          "text": "We handle lead research, account setup, and campaign launch."
+        },
+        {
+          "tag": "h2",
+          "text": "Hands-OffExpert Setup"
+        },
+        {
+          "tag": "h2",
+          "text": "Maximum ReachMinimal Cost"
+        },
+        {
+          "tag": "h2",
+          "text": "All inside crmchat Software Suite"
+        },
+        {
+          "tag": "h2",
+          "text": "$1.79"
+        },
+        {
+          "tag": "h2",
+          "text": "$1"
+        },
+        {
+          "tag": "h2",
+          "text": "Custom"
+        },
+        {
+          "tag": "h2",
+          "text": "No Contract.‍‍‍No Long Commitment."
+        },
+        {
+          "tag": "h2",
+          "text": "White-glove serviceevery step of the way"
+        },
+        {
+          "tag": "h3",
+          "text": "Ready to Setup Your Telegram Outreach?"
+        },
+        {
+          "tag": "h3",
+          "text": "See why hundreds of agencies, marketers, and entrepreneurs love crmchat"
+        }
+      ],
+      "counts": {
+        "links": 56,
+        "images": 37,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 56,
+      "screenshot": "screenshots/crmchat.ai-telegram-outreach-setup-0bc459f8.png",
+      "consoleErrors": []
+    },
+    {
+      "url": "https://crmchat.ai/case-studies",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "Case Studies - Winning Stories from Customers Who Love crmchat",
+      "lang": "en",
+      "metaDescription": "Real stories from Web3 teams, marketing agencies, and SaaS companies using crmchat. Discover proven strategies for Telegram outreach and pipeline management.",
+      "h1": [
+        "Case Studies"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "Case Studies"
+        },
+        {
+          "tag": "h2",
+          "text": "How LeadsFlow generated 500+ meetings for 6 customers with Telegram outreach"
+        },
+        {
+          "tag": "h2",
+          "text": "How LeadBridge Generated 90 SQL Leads Across 3 Complex B2B Campaigns"
+        },
+        {
+          "tag": "h2",
+          "text": "How FINPR Generated 500% ROI and Closed 3 Deals at Token 2049"
+        },
+        {
+          "tag": "h2",
+          "text": "How crmchat Found My 62 Best Prospects in 2,300 Telegram Contacts"
+        },
+        {
+          "tag": "h2",
+          "text": "All Case Studies"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        }
+      ],
+      "counts": {
+        "links": 65,
+        "images": 15,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 65,
+      "screenshot": "screenshots/crmchat.ai-case-studies-083b0ddf.png",
+      "consoleErrors": []
+    },
+    {
+      "url": "https://crmchat.ai/case-studies/crmchat-meta-growth-experiment",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "How crmchat Used crmchat for B2B Sales: Meta Growth Experiment - crmchat",
+      "lang": "en",
+      "metaDescription": "Our Head of Growth shares how we used our own Telegram automation platform to acquire Web3 customers by teaching them our exact workflow",
+      "h1": [
+        "How crmchat Used crmchat for B2B Sales: Meta Growth Experiment"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "How crmchat Used crmchat for B2B Sales: Meta Growth Experiment"
+        },
+        {
+          "tag": "h2",
+          "text": "The Strategy: Transparency as Growth"
+        },
+        {
+          "tag": "h2",
+          "text": "The Clay + crmchat Workflow"
+        },
+        {
+          "tag": "h3",
+          "text": "Step 1: Prospect Research in Clay"
+        },
+        {
+          "tag": "h3",
+          "text": "Step 2: Decision-Maker Identification"
+        },
+        {
+          "tag": "h2",
+          "text": "The Four-Message Sequence"
+        },
+        {
+          "tag": "h3",
+          "text": "Message 1: Direct Introduction"
+        },
+        {
+          "tag": "h3",
+          "text": "Message 2: Industry Context (3 days later)"
+        },
+        {
+          "tag": "h3",
+          "text": "Message 3: Workflow Reveal (5 days later)"
+        },
+        {
+          "tag": "h3",
+          "text": "Message 4: Final Follow-up (7 days later)"
+        },
+        {
+          "tag": "h2",
+          "text": "The Results"
+        },
+        {
+          "tag": "h2",
+          "text": "Why This Approach Worked"
+        },
+        {
+          "tag": "h2",
+          "text": "Key Takeaways"
+        },
+        {
+          "tag": "h2",
+          "text": "The Template for Replication"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        }
+      ],
+      "counts": {
+        "links": 48,
+        "images": 18,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 48,
+      "screenshot": "screenshots/crmchat.ai-case-studies-crmchat-meta-growth-experiment-2677ccbb.png",
+      "consoleErrors": []
+    },
+    {
+      "url": "https://crmchat.ai/case-studies/lead-sniper-crmchat",
+      "from": "https://crmchat.ai",
+      "depth": 1,
+      "status": 200,
+      "title": "How Lead Sniper handled B2B Outreach to decision-makers in $1M+ revenue companies - crmchat",
+      "lang": "en",
+      "metaDescription": "A leading B2B marketing agency eliminated manual messaging bottlenecks and automated outreach across multiple client campaigns using crmchat",
+      "h1": [
+        "How Lead Sniper handled B2B Outreach to decision-makers in $1M+ revenue companies",
+        "Lead Sniper, a specialized B2B outreach agency"
+      ],
+      "headings": [
+        {
+          "tag": "h1",
+          "text": "How Lead Sniper handled B2B Outreach to decision-makers in $1M+ revenue companies"
+        },
+        {
+          "tag": "h1",
+          "text": "Lead Sniper, a specialized B2B outreach agency"
+        },
+        {
+          "tag": "h2",
+          "text": "Key Results:"
+        },
+        {
+          "tag": "h2",
+          "text": "The Challenge: Fragmented Tools and Unreliable Systems"
+        },
+        {
+          "tag": "h2",
+          "text": "The Search: Evaluating Multiple Solutions"
+        },
+        {
+          "tag": "h2",
+          "text": "Implementation: Complete Process Integration"
+        },
+        {
+          "tag": "h3",
+          "text": "Primary Use Case: End-to-End Campaign Management"
+        },
+        {
+          "tag": "h3",
+          "text": "Multiple Account Management"
+        },
+        {
+          "tag": "h3",
+          "text": "Unified Analytics and Lead Management"
+        },
+        {
+          "tag": "h2",
+          "text": "The Results: Integrated Workflow Success"
+        },
+        {
+          "tag": "h3",
+          "text": "Elimination of Tool Fragmentation"
+        },
+        {
+          "tag": "h3",
+          "text": "Enhanced Reliability and Features"
+        },
+        {
+          "tag": "h3",
+          "text": "Scalable Campaign Management"
+        },
+        {
+          "tag": "h2",
+          "text": "Industry Focus: High-Value B2B Prospects"
+        },
+        {
+          "tag": "h3",
+          "text": "Target Audience Profile"
+        },
+        {
+          "tag": "h2",
+          "text": "Technical Implementation"
+        },
+        {
+          "tag": "h3",
+          "text": "Campaign Structure"
+        },
+        {
+          "tag": "h3",
+          "text": "Platform Integration Benefits"
+        },
+        {
+          "tag": "h2",
+          "text": "Key Success Factors"
+        },
+        {
+          "tag": "h2",
+          "text": "Looking Forward"
+        },
+        {
+          "tag": "h2",
+          "text": "Grow your business on Telegram"
+        }
+      ],
+      "counts": {
+        "links": 48,
+        "images": 5,
+        "canvas": 0,
+        "forms": 0,
+        "buttons": 2
+      },
+      "linkCount": 48,
+      "screenshot": "screenshots/crmchat.ai-case-studies-lead-sniper-crmchat-287f56a5.png",
+      "consoleErrors": []
+    }
+  ],
+  "skipped": []
+}

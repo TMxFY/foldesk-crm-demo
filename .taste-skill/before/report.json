@@ -1,0 +1,1314 @@
+{
+ "url": "http://127.0.0.1:8000",
+ "at": "2026-11-04T10:40:47.813Z",
+ "allow": [],
+ "viewports": [
+  {
+   "width": 1440,
+   "height": 900,
+   "load": "load",
+   "screens": 1,
+   "filled": [
+    0.72
+   ],
+   "motion": {
+    "elements": 0,
+    "css": 0,
+    "transitions": 0,
+    "scripted": 0,
+    "videos": 0,
+    "playingVideos": 0
+   },
+   "metrics": {
+    "viewport": {
+     "w": 1440,
+     "h": 900
+    },
+    "page": {
+     "height": 900,
+     "screens": 1,
+     "words": 220,
+     "img": 0,
+     "video": 0,
+     "canvas": 0,
+     "svg": 12,
+     "sections": 19,
+     "horizontalOverflow": 0,
+     "overflowCulprits": [],
+     "uiFragments": 0,
+     "uiAbuse": false,
+     "realPictures": 0,
+     "videoCount": 0,
+     "uiPictures": 0,
+     "pictureSamples": [],
+     "blendText": 0,
+     "sideScrollers": 0,
+     "brokenImages": [],
+     "emoji": [],
+     "videosNoPoster": 0
+    },
+    "hero": {
+     "text": "Foldesk",
+     "words": 1,
+     "chars": 7,
+     "lines": 1,
+     "size": 14,
+     "vw": 1,
+     "font": "Manrope",
+     "weight": 600,
+     "tracking": 0,
+     "leading": 1.43,
+     "top": 21,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "h1": {
+     "text": "Foldesk",
+     "words": 1,
+     "lines": 1,
+     "size": 14,
+     "font": "Manrope"
+    },
+    "headings": [],
+    "headingSummary": {
+     "count": 0,
+     "maxLines": 0,
+     "over2Lines": 0,
+     "statements": 0,
+     "centered": 0,
+     "medianWords": null,
+     "mixedFontHeadings": 0
+    },
+    "type": {
+     "families": [
+      {
+       "family": "Manrope",
+       "share": 1,
+       "mono": false
+      }
+     ],
+     "familyCount": 1,
+     "sizes": [
+      12,
+      14,
+      16
+     ],
+     "sizeCount": 3,
+     "notLoaded": [],
+     "body": null,
+     "measureChars": null,
+     "max": {
+      "size": 16,
+      "vw": 1.1,
+      "font": "Manrope",
+      "text": "К списку разговоров"
+     },
+     "monoShare": 0,
+     "monoProseShare": 0,
+     "monoFamilies": [],
+     "monoSamples": [],
+     "microLabels": 0,
+     "microLabelShare": 0,
+     "microSamples": [],
+     "upperShare": 0.01,
+     "centerShare": 0.04,
+     "smallText": 26
+    },
+    "eyebrows": [],
+    "numbered": [],
+    "color": {
+     "bodyBg": "#f6f3ee",
+     "bodyBgHsl": {
+      "h": 37,
+      "s": 0.31,
+      "l": 0.95
+     },
+     "dark": false,
+     "sectionBgs": [
+      {
+       "color": "#f6f3ee",
+       "top": 0,
+       "hsl": {
+        "h": 37,
+        "s": 0.31,
+        "l": 0.95
+       }
+      },
+      {
+       "color": "#fffdfb",
+       "top": 126,
+       "hsl": {
+        "h": 30,
+        "s": 1,
+        "l": 0.99
+       }
+      }
+     ],
+     "textColors": [
+      {
+       "color": "#5e534a",
+       "share": 0.46
+      },
+      {
+       "color": "#1c1612",
+       "share": 0.45
+      },
+      {
+       "color": "#ffffff",
+       "share": 0.09
+      }
+     ],
+     "button": {
+      "bg": "#e6ddd0",
+      "hsl": {
+       "h": 35,
+       "s": 0.31,
+       "l": 0.86
+      },
+      "fg": "#1c1612"
+     },
+     "lowContrast": []
+    },
+    "buttons": {
+     "count": 6,
+     "inHero": 6,
+     "radius": 8,
+     "height": 32,
+     "withShadow": 0,
+     "withGradient": 0,
+     "mono": 0,
+     "upper": 0,
+     "heroLabels": [
+      "К списку разговоров",
+      "Воронка",
+      "Демо-данные",
+      "По листам",
+      "Сохранить вид"
+     ]
+    },
+    "surfaces": {
+     "shadowStatic": 11,
+     "shadowOverlay": 0,
+     "shadowSamples": [
+      "div.topbar → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "a.flow-step → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "section#s07.surface-box.pipeline-section → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "a.card → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px"
+     ],
+     "gradients": 0,
+     "scrims": 0,
+     "gradientSamples": [],
+     "gradientText": 0,
+     "hairlines": 2,
+     "hairlineSamples": [
+      "aside.sidebar 224px",
+      "div.pipeline-header 1150px"
+     ],
+     "outlinedBoxes": 15,
+     "dashed": 0,
+     "blurred": 0,
+     "roundedBoxes": 15,
+     "boxRadius": 10,
+     "squareMedia": 0,
+     "roundedMedia": 0,
+     "mediaRadius": 0,
+     "textShadow": 0,
+     "cardRows": [
+      {
+       "count": 5,
+       "iconTopped": false,
+       "rounded": true,
+       "top": 216
+      }
+     ]
+    },
+    "heroMedia": [],
+    "nav": {
+     "links": 1,
+     "fixed": true,
+     "height": 900,
+     "floatingPill": false,
+     "blur": false
+    },
+    "fontsLoaded": []
+   },
+   "layout": {
+    "viewport": {
+     "w": 1440,
+     "h": 900
+    },
+    "pageH": 900,
+    "margins": {
+     "left": 20,
+     "right": 34
+    },
+    "sections": [],
+    "gaps": [],
+    "h1s": [
+     {
+      "text": "Foldesk",
+      "size": 14,
+      "top": 21,
+      "firstScreen": true
+     }
+    ],
+    "edgeText": [
+     {
+      "text": "Максим Орлов · RetailBox",
+      "side": "right",
+      "px": 4
+     }
+    ],
+    "edges": [
+     {
+      "x": 61,
+      "n": 1
+     },
+     {
+      "x": 257,
+      "n": 1
+     },
+     {
+      "x": 286,
+      "n": 1
+     },
+     {
+      "x": 518,
+      "n": 1
+     },
+     {
+      "x": 751,
+      "n": 1
+     },
+     {
+      "x": 983,
+      "n": 1
+     },
+     {
+      "x": 1216,
+      "n": 1
+     }
+    ],
+    "leftBlocks": 7,
+    "bodySize": 12,
+    "stage": false,
+    "explains": false,
+    "slivers": [],
+    "voidShare": 0.33,
+    "voidBox": {
+     "x": 240,
+     "y": 540,
+     "w": 1200,
+     "h": 360
+    }
+   },
+   "app": {
+    "viewport": {
+     "w": 1440,
+     "h": 900
+    },
+    "dark": false,
+    "ground": "#f6f3ee",
+    "sidebar": {
+     "w": 224,
+     "tag": "aside",
+     "links": 12,
+     "share": 0.16
+    },
+    "topbar": null,
+    "canvas": {
+     "left": 41,
+     "right": 33
+    },
+    "hero": {
+     "text": "Foldesk",
+     "words": 1,
+     "chars": 7,
+     "lines": 1,
+     "size": 14,
+     "vw": 1,
+     "font": "Manrope",
+     "weight": 600,
+     "tracking": 0,
+     "leading": 1.43,
+     "top": 21,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "charts": 0,
+    "layout": {
+     "panels": 3,
+     "firstScreen": 3,
+     "ragged": [],
+     "voids": []
+    },
+    "tiles": 0,
+    "panels": {
+     "count": 16,
+     "radii": [
+      [
+       10,
+       8
+      ],
+      [
+       12,
+       7
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "heavyBorders": 0,
+     "borderSamples": [],
+     "heavyShadows": 0,
+     "softShadows": 10,
+     "shadowSamples": [],
+     "glass": 0
+    },
+    "chips": {
+     "count": 0,
+     "hues": 0,
+     "samples": []
+    },
+    "numbers": {
+     "cells": 16,
+     "leftAligned": 16,
+     "figures": 8,
+     "tabularShare": 1,
+     "kpiMax": 12
+    },
+    "rows": null,
+    "chartHues": 0,
+    "placeholders": [],
+    "type": {
+     "under13": 0.67,
+     "tiny": 0,
+     "tinySamples": [],
+     "sizes": [
+      12,
+      14,
+      16
+     ]
+    },
+    "title": {
+     "text": "Foldesk",
+     "size": 14,
+     "top": 21
+    },
+    "colourShare": 0.004
+   },
+   "consoleErrors": []
+  },
+  {
+   "width": 768,
+   "height": 1024,
+   "load": "load",
+   "screens": 1,
+   "filled": [
+    0.86
+   ],
+   "motion": {
+    "elements": 1,
+    "css": 0,
+    "transitions": 1,
+    "scripted": 0,
+    "videos": 0,
+    "playingVideos": 0
+   },
+   "metrics": {
+    "viewport": {
+     "w": 768,
+     "h": 1024
+    },
+    "page": {
+     "height": 1024,
+     "screens": 1,
+     "words": 220,
+     "img": 0,
+     "video": 0,
+     "canvas": 0,
+     "svg": 12,
+     "sections": 19,
+     "horizontalOverflow": 333,
+     "overflowCulprits": [
+      "select#saved-view (+6px)",
+      "input#view-name (+114px)",
+      "button#save-view.btn.secondary (+240px)"
+     ],
+     "uiFragments": 0,
+     "uiAbuse": false,
+     "realPictures": 0,
+     "videoCount": 0,
+     "uiPictures": 0,
+     "pictureSamples": [],
+     "blendText": 0,
+     "sideScrollers": 0,
+     "brokenImages": [],
+     "emoji": [],
+     "videosNoPoster": 0
+    },
+    "hero": {
+     "text": "Foldesk",
+     "words": 1,
+     "chars": 7,
+     "lines": 1,
+     "size": 14,
+     "vw": 1.8,
+     "font": "Manrope",
+     "weight": 600,
+     "tracking": 0,
+     "leading": 1.43,
+     "top": 21,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "h1": {
+     "text": "Foldesk",
+     "words": 1,
+     "lines": 1,
+     "size": 14,
+     "font": "Manrope"
+    },
+    "headings": [],
+    "headingSummary": {
+     "count": 0,
+     "maxLines": 0,
+     "over2Lines": 0,
+     "statements": 0,
+     "centered": 0,
+     "medianWords": null,
+     "mixedFontHeadings": 0
+    },
+    "type": {
+     "families": [
+      {
+       "family": "Manrope",
+       "share": 1,
+       "mono": false
+      }
+     ],
+     "familyCount": 1,
+     "sizes": [
+      12,
+      14,
+      16
+     ],
+     "sizeCount": 3,
+     "notLoaded": [],
+     "body": null,
+     "measureChars": null,
+     "max": {
+      "size": 16,
+      "vw": 2.1,
+      "font": "Manrope",
+      "text": "К списку разговоров"
+     },
+     "monoShare": 0,
+     "monoProseShare": 0,
+     "monoFamilies": [],
+     "monoSamples": [],
+     "microLabels": 0,
+     "microLabelShare": 0,
+     "microSamples": [],
+     "upperShare": 0.01,
+     "centerShare": 0.04,
+     "smallText": 26
+    },
+    "eyebrows": [],
+    "numbered": [],
+    "color": {
+     "bodyBg": "#f6f3ee",
+     "bodyBgHsl": {
+      "h": 37,
+      "s": 0.31,
+      "l": 0.95
+     },
+     "dark": false,
+     "sectionBgs": [
+      {
+       "color": "#f6f3ee",
+       "top": 341,
+       "hsl": {
+        "h": 37,
+        "s": 0.31,
+        "l": 0.95
+       }
+      },
+      {
+       "color": "#fffdfb",
+       "top": 499,
+       "hsl": {
+        "h": 30,
+        "s": 1,
+        "l": 0.99
+       }
+      }
+     ],
+     "textColors": [
+      {
+       "color": "#5e534a",
+       "share": 0.46
+      },
+      {
+       "color": "#1c1612",
+       "share": 0.45
+      },
+      {
+       "color": "#ffffff",
+       "share": 0.09
+      }
+     ],
+     "button": {
+      "bg": "#e6ddd0",
+      "hsl": {
+       "h": 35,
+       "s": 0.31,
+       "l": 0.86
+      },
+      "fg": "#1c1612"
+     },
+     "lowContrast": []
+    },
+    "buttons": {
+     "count": 6,
+     "inHero": 6,
+     "radius": 8,
+     "height": 32,
+     "withShadow": 0,
+     "withGradient": 0,
+     "mono": 0,
+     "upper": 0,
+     "heroLabels": [
+      "К списку разговоров",
+      "Воронка",
+      "Демо-данные",
+      "По листам",
+      "Сохранить вид"
+     ]
+    },
+    "surfaces": {
+     "shadowStatic": 11,
+     "shadowOverlay": 0,
+     "shadowSamples": [
+      "div.topbar → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "a.flow-step → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "section#s07.surface-box.pipeline-section → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "a.card → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px"
+     ],
+     "gradients": 0,
+     "scrims": 0,
+     "gradientSamples": [],
+     "gradientText": 0,
+     "hairlines": 3,
+     "hairlineSamples": [
+      "aside.sidebar 768px",
+      "div.sidebar-footer 744px",
+      "div.pipeline-header 1068px"
+     ],
+     "outlinedBoxes": 15,
+     "dashed": 0,
+     "blurred": 0,
+     "roundedBoxes": 15,
+     "boxRadius": 10,
+     "squareMedia": 0,
+     "roundedMedia": 0,
+     "mediaRadius": 0,
+     "textShadow": 0,
+     "cardRows": [
+      {
+       "count": 5,
+       "iconTopped": false,
+       "rounded": true,
+       "top": 589
+      }
+     ]
+    },
+    "heroMedia": [],
+    "nav": {
+     "links": 7,
+     "fixed": false,
+     "height": 124,
+     "floatingPill": false,
+     "blur": false
+    },
+    "fontsLoaded": []
+   },
+   "layout": {
+    "viewport": {
+     "w": 768,
+     "h": 1024
+    },
+    "pageH": 1024,
+    "margins": {
+     "left": 20,
+     "right": 25
+    },
+    "sections": [
+     {
+      "sel": "aside.sidebar",
+      "tag": "aside",
+      "top": 0,
+      "height": 280,
+      "words": 19,
+      "media": 0,
+      "middle": 8,
+      "heading": {
+       "text": "Foldesk",
+       "size": 14,
+       "tag": "h1"
+      },
+      "left": 12,
+      "right": 12,
+      "textLeft": 20,
+      "textRight": 25,
+      "fullBleed": false,
+      "footer": false,
+      "hero": true,
+      "continues": false,
+      "pinned": false
+     },
+     {
+      "sel": "main#workspace-main.workspace",
+      "tag": "main",
+      "top": 341,
+      "height": 623,
+      "words": 163,
+      "media": 0,
+      "middle": 261,
+      "heading": {
+       "text": "Воронка",
+       "size": 16,
+       "tag": "h2"
+      },
+      "left": 33,
+      "right": 0,
+      "textLeft": 33,
+      "textRight": -378,
+      "fullBleed": false,
+      "footer": true,
+      "hero": true,
+      "continues": false,
+      "pinned": false
+     }
+    ],
+    "gaps": [],
+    "h1s": [
+     {
+      "text": "Foldesk",
+      "size": 14,
+      "top": 21,
+      "firstScreen": true
+     }
+    ],
+    "edgeText": [
+     {
+      "text": "Сегодня · Ждём оплату инвойса #408",
+      "side": "right",
+      "px": 8
+     }
+    ],
+    "edges": [
+     {
+      "x": 61,
+      "n": 2
+     },
+     {
+      "x": 33,
+      "n": 1
+     },
+     {
+      "x": 278,
+      "n": 1
+     },
+     {
+      "x": 494,
+      "n": 1
+     },
+     {
+      "x": 710,
+      "n": 1
+     },
+     {
+      "x": 926,
+      "n": 1
+     }
+    ],
+    "leftBlocks": 7,
+    "bodySize": 12,
+    "stage": false,
+    "explains": false,
+    "slivers": [],
+    "voidShare": 0,
+    "voidBox": null
+   },
+   "app": {
+    "viewport": {
+     "w": 768,
+     "h": 1024
+    },
+    "dark": false,
+    "ground": "#f6f3ee",
+    "sidebar": null,
+    "topbar": null,
+    "canvas": {
+     "left": 20,
+     "right": -345
+    },
+    "hero": {
+     "text": "Foldesk",
+     "words": 1,
+     "chars": 7,
+     "lines": 1,
+     "size": 14,
+     "vw": 1.8,
+     "font": "Manrope",
+     "weight": 600,
+     "tracking": 0,
+     "leading": 1.43,
+     "top": 21,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "charts": 0,
+    "layout": {
+     "panels": 2,
+     "firstScreen": 2,
+     "ragged": [],
+     "voids": []
+    },
+    "tiles": 0,
+    "panels": {
+     "count": 15,
+     "radii": [
+      [
+       10,
+       8
+      ],
+      [
+       12,
+       7
+      ]
+     ],
+     "heavyBorders": 0,
+     "borderSamples": [],
+     "heavyShadows": 0,
+     "softShadows": 10,
+     "shadowSamples": [],
+     "glass": 0
+    },
+    "chips": {
+     "count": 0,
+     "hues": 0,
+     "samples": []
+    },
+    "numbers": {
+     "cells": 16,
+     "leftAligned": 16,
+     "figures": 8,
+     "tabularShare": 1,
+     "kpiMax": 12
+    },
+    "rows": null,
+    "chartHues": 0,
+    "placeholders": [],
+    "type": {
+     "under13": 0.67,
+     "tiny": 0,
+     "tinySamples": [],
+     "sizes": [
+      12,
+      14,
+      16
+     ]
+    },
+    "title": {
+     "text": "Foldesk",
+     "size": 14,
+     "top": 21
+    },
+    "colourShare": 0.008
+   },
+   "consoleErrors": []
+  },
+  {
+   "width": 390,
+   "height": 844,
+   "load": "load",
+   "screens": 3,
+   "filled": [
+    0.3,
+    0.3,
+    0.3
+   ],
+   "motion": {
+    "elements": 0,
+    "css": 0,
+    "transitions": 0,
+    "scripted": 0,
+    "videos": 0,
+    "playingVideos": 0
+   },
+   "metrics": {
+    "viewport": {
+     "w": 1101,
+     "h": 2383
+    },
+    "page": {
+     "height": 2383,
+     "screens": 1,
+     "words": 220,
+     "img": 0,
+     "video": 0,
+     "canvas": 0,
+     "svg": 12,
+     "sections": 19,
+     "horizontalOverflow": 0,
+     "overflowCulprits": [],
+     "uiFragments": 0,
+     "uiAbuse": false,
+     "realPictures": 0,
+     "videoCount": 0,
+     "uiPictures": 0,
+     "pictureSamples": [],
+     "blendText": 0,
+     "sideScrollers": 0,
+     "brokenImages": [],
+     "emoji": [],
+     "videosNoPoster": 0
+    },
+    "hero": {
+     "text": "Foldesk",
+     "words": 1,
+     "chars": 7,
+     "lines": 1,
+     "size": 14,
+     "vw": 1.3,
+     "font": "Manrope",
+     "weight": 600,
+     "tracking": 0,
+     "leading": 1.43,
+     "top": 21,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "h1": {
+     "text": "Foldesk",
+     "words": 1,
+     "lines": 1,
+     "size": 14,
+     "font": "Manrope"
+    },
+    "headings": [],
+    "headingSummary": {
+     "count": 0,
+     "maxLines": 0,
+     "over2Lines": 0,
+     "statements": 0,
+     "centered": 0,
+     "medianWords": null,
+     "mixedFontHeadings": 0
+    },
+    "type": {
+     "families": [
+      {
+       "family": "Manrope",
+       "share": 1,
+       "mono": false
+      }
+     ],
+     "familyCount": 1,
+     "sizes": [
+      12,
+      14,
+      16
+     ],
+     "sizeCount": 3,
+     "notLoaded": [],
+     "body": null,
+     "measureChars": null,
+     "max": {
+      "size": 16,
+      "vw": 1.5,
+      "font": "Manrope",
+      "text": "К списку разговоров"
+     },
+     "monoShare": 0,
+     "monoProseShare": 0,
+     "monoFamilies": [],
+     "monoSamples": [],
+     "microLabels": 0,
+     "microLabelShare": 0,
+     "microSamples": [],
+     "upperShare": 0.01,
+     "centerShare": 0.04,
+     "smallText": 26
+    },
+    "eyebrows": [],
+    "numbered": [],
+    "color": {
+     "bodyBg": "#f6f3ee",
+     "bodyBgHsl": {
+      "h": 37,
+      "s": 0.31,
+      "l": 0.95
+     },
+     "dark": false,
+     "sectionBgs": [],
+     "textColors": [
+      {
+       "color": "#5e534a",
+       "share": 0.46
+      },
+      {
+       "color": "#1c1612",
+       "share": 0.45
+      },
+      {
+       "color": "#ffffff",
+       "share": 0.09
+      }
+     ],
+     "button": {
+      "bg": "#e6ddd0",
+      "hsl": {
+       "h": 35,
+       "s": 0.31,
+       "l": 0.86
+      },
+      "fg": "#1c1612"
+     },
+     "lowContrast": []
+    },
+    "buttons": {
+     "count": 6,
+     "inHero": 6,
+     "radius": 8,
+     "height": 32,
+     "withShadow": 0,
+     "withGradient": 0,
+     "mono": 0,
+     "upper": 0,
+     "heroLabels": [
+      "К списку разговоров",
+      "Воронка",
+      "Демо-данные",
+      "По листам",
+      "Сохранить вид"
+     ]
+    },
+    "surfaces": {
+     "shadowStatic": 11,
+     "shadowOverlay": 0,
+     "shadowSamples": [
+      "div.topbar → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "a.flow-step → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "section#s07.surface-box.pipeline-section → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px",
+      "a.card → rgba(9, 9, 11, 0.06) 0px 1px 2px 0px"
+     ],
+     "gradients": 0,
+     "scrims": 0,
+     "gradientSamples": [],
+     "gradientText": 0,
+     "hairlines": 3,
+     "hairlineSamples": [
+      "aside.sidebar 390px",
+      "div.sidebar-footer 366px",
+      "div.pipeline-header 1068px"
+     ],
+     "outlinedBoxes": 15,
+     "dashed": 0,
+     "blurred": 0,
+     "roundedBoxes": 15,
+     "boxRadius": 10,
+     "squareMedia": 0,
+     "roundedMedia": 0,
+     "mediaRadius": 0,
+     "textShadow": 0,
+     "cardRows": [
+      {
+       "count": 5,
+       "iconTopped": false,
+       "rounded": true,
+       "top": 746
+      }
+     ]
+    },
+    "heroMedia": [],
+    "nav": {
+     "links": 4,
+     "fixed": false,
+     "height": 244,
+     "floatingPill": false,
+     "blur": false
+    },
+    "fontsLoaded": []
+   },
+   "layout": {
+    "viewport": {
+     "w": 1101,
+     "h": 2383
+    },
+    "pageH": 2383,
+    "margins": {
+     "left": 20,
+     "right": 33
+    },
+    "sections": [],
+    "gaps": [],
+    "h1s": [
+     {
+      "text": "Foldesk",
+      "size": 14,
+      "top": 21,
+      "firstScreen": true
+     }
+    ],
+    "edgeText": [
+     {
+      "text": "Сбросить",
+      "side": "right",
+      "px": 13
+     }
+    ],
+    "edges": [
+     {
+      "x": 61,
+      "n": 2
+     },
+     {
+      "x": 33,
+      "n": 1
+     },
+     {
+      "x": 278,
+      "n": 1
+     },
+     {
+      "x": 494,
+      "n": 1
+     },
+     {
+      "x": 710,
+      "n": 1
+     },
+     {
+      "x": 926,
+      "n": 1
+     }
+    ],
+    "leftBlocks": 7,
+    "bodySize": 12,
+    "stage": false,
+    "explains": false,
+    "slivers": [],
+    "voidShare": 0.53,
+    "voidBox": {
+     "x": 0,
+     "y": 1112,
+     "w": 1101,
+     "h": 1271
+    }
+   },
+   "app": {
+    "viewport": {
+     "w": 1101,
+     "h": 2383
+    },
+    "dark": false,
+    "ground": "#f6f3ee",
+    "sidebar": null,
+    "topbar": null,
+    "canvas": {
+     "left": 20,
+     "right": -12
+    },
+    "hero": {
+     "text": "Foldesk",
+     "words": 1,
+     "chars": 7,
+     "lines": 1,
+     "size": 14,
+     "vw": 1.3,
+     "font": "Manrope",
+     "weight": 600,
+     "tracking": 0,
+     "leading": 1.43,
+     "top": 21,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "charts": 0,
+    "layout": {
+     "panels": 3,
+     "firstScreen": 3,
+     "ragged": [],
+     "voids": []
+    },
+    "tiles": 0,
+    "panels": {
+     "count": 16,
+     "radii": [
+      [
+       10,
+       8
+      ],
+      [
+       12,
+       7
+      ],
+      [
+       0,
+       1
+      ]
+     ],
+     "heavyBorders": 0,
+     "borderSamples": [],
+     "heavyShadows": 0,
+     "softShadows": 10,
+     "shadowSamples": [],
+     "glass": 0
+    },
+    "chips": {
+     "count": 0,
+     "hues": 0,
+     "samples": []
+    },
+    "numbers": {
+     "cells": 16,
+     "leftAligned": 16,
+     "figures": 8,
+     "tabularShare": 1,
+     "kpiMax": 12
+    },
+    "rows": null,
+    "chartHues": 0,
+    "placeholders": [],
+    "type": {
+     "under13": 0.67,
+     "tiny": 0,
+     "tinySamples": [],
+     "sizes": [
+      12,
+      14,
+      16
+     ]
+    },
+    "title": {
+     "text": "Foldesk",
+     "size": 14,
+     "top": 21
+    },
+    "colourShare": 0.002
+   },
+   "consoleErrors": []
+  }
+ ],
+ "findings": [
+  {
+   "level": "WARN",
+   "id": "palette-cream",
+   "width": 1440,
+   "message": "Yellow-cream background (page background #f6f3ee, section #f6f3ee, section #fffdfb).",
+   "fix": "Use the drawn palette. If you want warmth, take a low-chroma stone or bone, not a yellow cream.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  },
+  {
+   "level": "WARN",
+   "id": "hero-void",
+   "width": 1440,
+   "message": "33% of the first screen is one empty block (1200×360px at 240,540).",
+   "fix": "Place the void on purpose or fill it: move the picture, the film or one fact into it, grow the headline to meet it, or shrink the screen to its content. A void reads as placed only when something closes it on the far side and it is the screen's one rest."
+  },
+  {
+   "level": "FAIL",
+   "id": "edge-text",
+   "width": 1440,
+   "message": "1 text block(s) sit within 16px of the screen edge: \"Максим Орлов · RetailBox\" (4px from the right)",
+   "fix": "Keep text inside the page margin (16–32px or more). Only display type deliberately bled past the edge may touch it.",
+   "alsoAt": [
+    768
+   ]
+  },
+  {
+   "level": "WARN",
+   "id": "numeric-align",
+   "width": 1440,
+   "message": "16 of 16 numeric table cells are left-aligned.",
+   "fix": "Right-align numbers, amounts and percentages (and their column headers) so the digits line up.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  },
+  {
+   "level": "WARN",
+   "id": "tiny-text",
+   "width": 1440,
+   "message": "67% of the text is under 13px.",
+   "fix": "Data and labels read at 13–14px; keep 11–12px for sublines and axis ticks.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  },
+  {
+   "level": "FAIL",
+   "id": "overflow",
+   "width": 768,
+   "message": "Page scrolls sideways by 333px at 768px. Widest offenders: select#saved-view (+6px), input#view-name (+114px), button#save-view.btn.secondary (+240px).",
+   "fix": "Constrain the element that is wider than the viewport (max-width: 100%, or overflow: clip on its section)."
+  },
+  {
+   "level": "WARN",
+   "id": "edge-text",
+   "width": 390,
+   "message": "1 text block(s) sit 12–15px from the phone's edge: \"Сбросить\" (13px)",
+   "fix": "The page margin is 16–20px on a phone; the header and the corner labels sit on it too."
+  }
+ ],
+ "images": [
+  {
+   "viewport": "desktop",
+   "width": 1440,
+   "fold": "/Users/timofei/dev/Python/new era/crmtg/.taste-skill/before/desktop-fold.jpg",
+   "pages": [
+    "/Users/timofei/dev/Python/new era/crmtg/.taste-skill/before/desktop-page-01.jpg"
+   ],
+   "film": []
+  },
+  {
+   "viewport": "tablet",
+   "width": 768,
+   "fold": "/Users/timofei/dev/Python/new era/crmtg/.taste-skill/before/tablet-fold.jpg",
+   "pages": [
+    "/Users/timofei/dev/Python/new era/crmtg/.taste-skill/before/tablet-page-01.jpg"
+   ],
+   "film": []
+  },
+  {
+   "viewport": "mobile",
+   "width": 390,
+   "fold": "/Users/timofei/dev/Python/new era/crmtg/.taste-skill/before/mobile-fold.jpg",
+   "pages": [
+    "/Users/timofei/dev/Python/new era/crmtg/.taste-skill/before/mobile-page-01.jpg"
+   ],
+   "film": []
+  }
+ ]
+}

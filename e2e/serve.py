@@ -104,11 +104,17 @@ def build():
         conn.execute("DELETE FROM tasks")
         conn.execute("DELETE FROM reminders")
         conn.execute("DELETE FROM property_values")
+        conn.execute("DELETE FROM campaign_recipients")
+        conn.execute("DELETE FROM campaign_steps")
+        conn.execute("DELETE FROM campaigns")
+        conn.execute("DELETE FROM folders")
+        conn.execute("DELETE FROM saved_views")
         conn.execute("DELETE FROM leads")
         conn.execute("DELETE FROM property_defs")
         conn.execute("DELETE FROM accounts")
         conn.commit()
         gateway._pending.clear()
+        gateway.sent.clear()
         gateway.needs_password = False
         gateway.health = None
         gateway._message_seq = 0

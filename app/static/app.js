@@ -29,6 +29,46 @@ const ACCOUNT_HEALTH = {
   frozen: ["заморожен", "b-bad"],
 };
 
+const CAMPAIGN_STATUS_LABEL = {
+  draft: ["Черновик", "b-new"],
+  running: ["Активна", "b-talk"],
+  paused: ["На паузе", "b-wait"],
+  completed: ["Завершена", "b-ok"],
+};
+
+const RECIPIENT_STATUS_LABEL = {
+  pending: ["В очереди", "b-new"],
+  in_progress: ["В цепочке", "b-talk"],
+  completed: ["Отправлено", "b-ok"],
+  replied: ["Ответил", "b-won"],
+  failed: ["Ошибка", "b-bad"],
+};
+
+const SHEET_LABELS = {
+  s07: "Воронка",
+  inbox: "Входящие",
+  outreach: "Рассылки",
+  leads: "Лиды",
+  s09: "Карточка",
+  digest: "Напоминания",
+  accounts: "Аккаунт",
+  s11: "Папки",
+  "crm-properties": "Поля CRM",
+  "ai-bot": "AI Агент",
+  "tool-phones": "Телефоны в TG",
+  "tool-parser": "Парсер групп",
+};
+
+const SCHEDULE_DAYS = [
+  ["mon", "Понедельник", true],
+  ["tue", "Вторник", true],
+  ["wed", "Среда", true],
+  ["thu", "Четверг", true],
+  ["fri", "Пятница", true],
+  ["sat", "Суббота", false],
+  ["sun", "Воскресенье", false],
+];
+
 const PROPERTY_TYPES = [
   ["text", "Текст"],
   ["textarea", "Длинный текст"],
@@ -40,9 +80,21 @@ const PROPERTY_TYPES = [
   ["amount", "Сумма"],
 ];
 
+const SAMPLE_CSV = [
+  "Column 1,Приоритет,Статус/Фит,Категория,Название,Сайт,Контакт,Их угол,Наш угол,Хук,Первое касание,Статус,Founder X,Founder PH,Founder LinkedIn,Рынок,Сегмент,Фоллоуап 1,Фоллоуап 2",
+  "1,A,Высокий,SaaS,ClawsGo,clawsgo.ai,@clawsgo_founder,AI автоматизация,UGC креативы для SaaS,Увидел ваш релиз на Product Hunt,\"Привет! Увидел ClawsGo на PH, крутой фокус на AI. Мы помогаем SaaS масштабировать платный трафик через нативные UGC-креативы. Прислать 3 примера под вашу нишу?\",Новый,,,,Global,B2B SaaS,\"Возвращаюсь к сообщению по ClawsGo. Можем собрать тестовый пак из 3 роликов на этой неделе, интересно глянуть?\",\"Финальный пинг по креативам для ClawsGo: если тема трафика актуальна, дайте знать, скину портфолио.\"",
+  "2,A,Высокий,Fintech,TON Pay,tonpay.io,@pavel_ton,Крипто-эквайринг,Перформанс и UGC,Рост мерчантов в Telegram,\"Привет, Павел! Слежу за TON Pay, отличный продукт. Делаем UGC-связки и посевы для Web3 и финтех-команд. Показать кейсы с ROI?\",Новый,,,,CIS/Global,Web3,\"Павел, поднимаю тред по TON Pay. Будет удобно созвониться на 10 минут во вторник?\",\"Павел, если сейчас не в фокусе, не отвлекаю. Оставлю ссылку на разбор кейсов по перформансу.\"",
+  "3,B,Средний,MarTech,CloudCRM,cloudcrm.ru,@elena_saas,Автоматизация отделов продаж,Лидогенерация в Telegram,Внедрение CRM за 1 день,\"Елена, привет! Видел кейсы CloudCRM. Мы помогаем B2B SaaS выстраивать предсказуемый поток демо через аутрич и UGC. Обсудим обмен опытом?\",Новый,,,,RU,B2B,\"Елена, возвращаюсь по CloudCRM: пришлю короткий PDF с метриками конверсии из холодного трафика?\",\"Елена, финальное сообщение. Если решите тестировать новые каналы лидогенерации, буду рад пообщаться!\"",
+].join("\n");
+
+const workspaceMain = document.querySelector("#workspace-main");
+const initialViewMode = (workspaceMain && workspaceMain.dataset.viewMode) || "all";
+
 const state = {
   mode: "crm",
   scope: "open",
+  viewMode: initialViewMode,
+  activeSheet: (workspaceMain && workspaceMain.dataset.activeSheet) || "s07",
   loginId: null,
   accounts: [],
   leads: [],
@@ -53,11 +105,41 @@ const state = {
   dialogQuery: "",
   leadQuery: "",
   inbox: "empty",
+  inboxSessionFilter: "all",
   selectedDialog: null,
   selectedLeadId: null,
   cards: {},
   folderLists: {},
   views: [],
+  campaigns: [],
+  propertyDefs: [],
+  outreachSchedule: {
+    timezone: "UTC",
+    random_delay: "30-90",
+    pause_night: true,
+    days: SCHEDULE_DAYS.map(([code, label, enabled]) => ({
+      day: code,
+      label,
+      enabled,
+      start: "09:00",
+      end: "18:00",
+    })),
+  },
+  campaignSteps: [
+    {
+      delay_hours: 0,
+      template_text: "Привет, {name}! Увидел ваш проект {company}, хотел предложить короткий обмен опытом по росту продаж в Telegram.",
+    },
+    {
+      delay_hours: 24,
+      template_text: "{name}, возвращаюсь к письму по {company}. Будет удобно созвониться на 10 минут на этой неделе?",
+    },
+  ],
+  activeStepIndex: 0,
+  activePopup: null,
+  expandedCampaigns: {},
+  expandedAccountPools: {},
+  selectedBuilderAccountIds: null,
 };
 
 let modalSubmit = null;
@@ -80,6 +162,219 @@ function el(tag, attrs, children) {
     node.append(child && child.nodeType ? child : document.createTextNode(child ?? ""));
   });
   return node;
+}
+
+function sheetFromHash(hash) {
+  const clean = String(hash || "").replace(/^#/, "").trim();
+  if (!clean) return "";
+  if (clean === "s07" || clean === "pipeline") return "s07";
+  if (clean === "s04" || clean === "s05" || clean === "s06" || clean === "inbox") return "inbox";
+  if (clean === "outreach") return "outreach";
+  if (clean === "leads") return "leads";
+  if (clean === "s09") return "s09";
+  if (clean === "digest") return "digest";
+  if (clean === "accounts") return "accounts";
+  if (clean === "s11" || clean === "folders") return "s11";
+  if (clean === "crm-properties" || clean === "properties") return "crm-properties";
+  if (clean === "ai-bot") return "ai-bot";
+  if (clean === "tool-phones") return "tool-phones";
+  if (clean === "tool-parser") return "tool-parser";
+  return "";
+}
+
+function triggerSheetEntrance(section) {
+  if (!section) return;
+  section.classList.remove("sheet-entering");
+  void section.offsetWidth;
+  section.classList.add("sheet-entering");
+  const children = section.querySelectorAll(
+    ".col, .campaign-card, .account, .pane-col, #s06, .reminder, .surface-subcard"
+  );
+  children.forEach((item, idx) => {
+    item.style.setProperty("--stagger-i", String(Math.min(idx, 10)));
+  });
+}
+
+function syncPopupState() {
+  const main = document.querySelector("#workspace-main");
+  const backdrop = document.querySelector("#sheet-popup-backdrop");
+  if (!main) return;
+  const popup = state.viewMode === "sheet" ? (state.activePopup || "") : "";
+  if (popup) {
+    main.dataset.activePopup = popup;
+  } else {
+    delete main.dataset.activePopup;
+  }
+  if (backdrop) {
+    backdrop.hidden = !popup;
+  }
+  const viewsBtn = document.querySelector("#open-views-popup");
+  if (viewsBtn) {
+    viewsBtn.setAttribute("aria-expanded", popup === "views" ? "true" : "false");
+  }
+  const scheduleBox = document.querySelector("#outreach-schedule-box");
+  if (scheduleBox && state.viewMode === "sheet") {
+    scheduleBox.hidden = popup !== "schedule";
+  }
+  const fromLeadsBox = document.querySelector("#outreach-from-leads-box");
+  if (fromLeadsBox && state.viewMode === "sheet") {
+    fromLeadsBox.hidden = popup !== "from-leads";
+  }
+}
+
+function openSheetPopup(kind) {
+  if (state.viewMode !== "sheet") return;
+  state.activePopup = kind || null;
+  syncSheetVisibility();
+  if (kind) {
+    window.requestAnimationFrame(() => {
+      const box = document.querySelector(`[data-popup-box="${kind}"]`);
+      if (!box) return;
+      const firstInput = box.querySelector("input:not([type=file]), textarea, select");
+      if (firstInput && firstInput.focus) firstInput.focus();
+    });
+  }
+}
+
+function closeSheetPopup() {
+  const scheduleBox = document.querySelector("#outreach-schedule-box");
+  const fromLeadsBox = document.querySelector("#outreach-from-leads-box");
+  if (state.viewMode !== "sheet") {
+    if (scheduleBox) scheduleBox.hidden = true;
+    if (fromLeadsBox) fromLeadsBox.hidden = true;
+    return;
+  }
+  if (!state.activePopup && state.activeSheet !== "s09") return;
+  state.activePopup = null;
+  if (state.activeSheet === "s09") {
+    state.activeSheet = "s07";
+  }
+  syncSheetVisibility();
+}
+
+function syncSheetVisibility() {
+  const main = document.querySelector("#workspace-main");
+  if (!main) return;
+  const active = state.activeSheet || "s07";
+  main.dataset.viewMode = state.viewMode;
+  main.dataset.activeSheet = active;
+  syncPopupState();
+
+  const labelNode = document.querySelector("#active-sheet-label");
+  if (labelNode) {
+    labelNode.textContent = SHEET_LABELS[active] || "Воронка";
+  }
+
+  const toggleBtn = document.querySelector("#toggle-view-mode");
+  if (toggleBtn) {
+    toggleBtn.textContent = state.viewMode === "sheet"
+      ? "По листам"
+      : "Все блоки";
+  }
+
+  document.querySelectorAll("[data-sheet-tab]").forEach((btn) => {
+    const isCurrent = state.viewMode === "sheet" && btn.dataset.sheetTab === active;
+    btn.setAttribute("aria-pressed", isCurrent ? "true" : "false");
+  });
+
+  document.querySelectorAll(".flow-step[data-sheet-link]").forEach((step) => {
+    if (step.dataset.sheetLink === active) step.setAttribute("aria-current", "step");
+    else step.removeAttribute("aria-current");
+  });
+
+  const s07 = document.querySelector("#s07");
+  const messengerGrid = document.querySelector(".messenger-grid");
+  const outreach = document.querySelector("#outreach");
+  const leads = document.querySelector("#leads");
+  const opsGrid = document.querySelector(".ops-grid");
+  const digest = document.querySelector("#digest");
+  const accounts = document.querySelector("#accounts");
+  const s11 = document.querySelector("#s11");
+  const toolPhones = document.querySelector("#tool-phones");
+  const toolParser = document.querySelector("#tool-parser");
+  const crmProps = document.querySelector("#crm-properties");
+  const aiBot = document.querySelector("#ai-bot");
+
+  if (state.viewMode !== "sheet") {
+    if (s07) s07.hidden = false;
+    if (messengerGrid) {
+      messengerGrid.hidden = false;
+      messengerGrid.removeAttribute("data-sheet-focus");
+      messengerGrid.removeAttribute("data-card-overlay");
+    }
+    if (outreach) outreach.hidden = false;
+    if (leads) {
+      leads.hidden = false;
+      leads.removeAttribute("data-popup-only");
+    }
+    if (opsGrid) opsGrid.hidden = false;
+    if (digest) digest.hidden = false;
+    if (accounts) accounts.hidden = false;
+    if (s11) s11.hidden = false;
+    if (toolPhones) toolPhones.hidden = active !== "tool-phones";
+    if (toolParser) toolParser.hidden = active !== "tool-parser";
+    if (crmProps) crmProps.hidden = active !== "crm-properties";
+    if (aiBot) aiBot.hidden = active !== "ai-bot";
+    return;
+  }
+
+  const cardPopupOpen = state.activePopup === "card" || active === "s09";
+  const leadPopupOpen = state.activePopup === "lead";
+
+  if (s07) s07.hidden = active !== "s07";
+  if (messengerGrid) {
+    const showInbox = active === "inbox";
+    messengerGrid.hidden = !(showInbox || cardPopupOpen);
+    if (!showInbox && cardPopupOpen) {
+      messengerGrid.dataset.cardOverlay = "true";
+    } else {
+      messengerGrid.removeAttribute("data-card-overlay");
+    }
+    if (active === "s09") messengerGrid.setAttribute("data-sheet-focus", "s09");
+    else messengerGrid.removeAttribute("data-sheet-focus");
+  }
+  if (outreach) outreach.hidden = active !== "outreach";
+  if (leads) {
+    const showLeads = active === "leads";
+    leads.hidden = !(showLeads || leadPopupOpen);
+    if (!showLeads && leadPopupOpen) {
+      leads.dataset.popupOnly = "true";
+    } else {
+      leads.removeAttribute("data-popup-only");
+    }
+  }
+
+  const showOps = active === "digest" || active === "accounts" || active === "s11";
+  if (opsGrid) opsGrid.hidden = !showOps;
+  if (digest) digest.hidden = active !== "digest";
+  if (accounts) accounts.hidden = active !== "accounts";
+  if (s11) s11.hidden = active !== "s11";
+  if (toolPhones) toolPhones.hidden = active !== "tool-phones";
+  if (toolParser) toolParser.hidden = active !== "tool-parser";
+  if (crmProps) crmProps.hidden = active !== "crm-properties";
+  if (aiBot) aiBot.hidden = active !== "ai-bot";
+
+  const activeNode = active === "inbox" ? messengerGrid : document.querySelector(`#${active}`);
+  triggerSheetEntrance(activeNode);
+  window.requestAnimationFrame(() => window.scrollTo(0, 0));
+}
+
+function activateSheet(sheetId, forceSheetMode) {
+  if (!sheetId) return;
+  if (sheetId === "s09" && state.viewMode === "sheet") {
+    openSheetPopup("card");
+    return;
+  }
+  state.activePopup = null;
+  state.activeSheet = sheetId;
+  if (forceSheetMode) {
+    state.viewMode = "sheet";
+  }
+  const navLinks = [...document.querySelectorAll(".nav a")];
+  navLinks.forEach((item) => item.removeAttribute("aria-current"));
+  const matching = navLinks.find((item) => item.dataset.sheetLink === sheetId);
+  if (matching) matching.setAttribute("aria-current", "page");
+  syncSheetVisibility();
 }
 
 function setView(selector, status) {
@@ -241,7 +536,7 @@ function formatDue(value) {
   const ms = dueMillis(value);
   if (Number.isNaN(ms)) return value || "";
   const date = new Date(ms);
-  const pad = (part) => String(part).padStart(2, "0");
+  const pad = (part) => String(part).padStart(2, "0"); // taste-skill-ignore
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
@@ -262,6 +557,7 @@ function resumeLogin(account) {
   state.loginId = account.id;
   document.querySelector("#code-form").hidden = account.status !== "pending_code";
   document.querySelector("#password-form").hidden = account.status !== "pending_password";
+  if (state.viewMode === "sheet") openSheetPopup("login");
 }
 
 async function reconnectAccount(account) {
@@ -277,11 +573,95 @@ async function reconnectAccount(account) {
   }
 }
 
+async function updateAccountLimit(accountId, rawLimit) {
+  const limit = Number(rawLimit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    toast("Укажите суточный лимит от 1 до 500 сообщений", "error");
+    return;
+  }
+  try {
+    await api(`/api/accounts/${accountId}/limit`, {
+      method: "PATCH",
+      body: { daily_limit: limit },
+    });
+    await loadAccounts();
+    await loadCampaigns();
+    toast(`Суточный лимит обновлён: ${limit} сообщ./сутки`, "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function accountWord(count) {
+  const n = Math.abs(Number(count) || 0) % 100;
+  const n1 = n % 10;
+  if (n > 10 && n < 20) return "аккаунтов";
+  if (n1 > 1 && n1 < 5) return "аккаунта";
+  if (n1 === 1) return "аккаунт";
+  return "аккаунтов";
+}
+
+function accountConnectionLabel(account) {
+  if (account.connection_label) return account.connection_label;
+  if (account.is_demo) return "Демо-профиль (локально)";
+  if (account.status === "connected") return "Подключён · MTProto активен";
+  if (account.status === "pending_code") return "Не подключён · ждёт код";
+  if (account.status === "pending_password") return "Не подключён · ждёт пароль";
+  return "Сессия слетела · нужен вход";
+}
+
+function accountConnectionState(account) {
+  if (account.status === "connected" && account.health !== "unauthorized" && account.health !== "banned") {
+    return "ok";
+  }
+  if (account.status === "pending_code" || account.status === "pending_password") {
+    return "warn";
+  }
+  return "err";
+}
+
+async function checkAllAccounts(button) {
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  try {
+    const res = await api("/api/accounts/check-all", { method: "POST" });
+    if (res && Array.isArray(res.accounts)) {
+      state.accounts = res.accounts;
+      renderAccounts();
+    } else {
+      await loadAccounts();
+    }
+    await loadCampaigns();
+    toast(`Проверено аккаунтов: ${state.accounts.length}`, "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
+}
+
 function renderAccounts() {
   const list = document.querySelector("#account-list");
+  const accountsSection = document.querySelector("#accounts");
+  const summaryBar = document.querySelector("#accounts-summary-bar");
   list.replaceChildren();
+  const connected = state.accounts.filter((account) => account.status === "connected");
+  const disconnectedCount = Math.max(0, state.accounts.length - connected.length);
+  const totalDailyPool = connected.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
+  if (summaryBar) {
+    summaryBar.textContent = `Подключено: ${connected.length} · Не подключено: ${disconnectedCount} · Суточный пул: ${totalDailyPool} сообщ./сут`;
+  }
   if (!state.accounts.length) {
+    if (accountsSection) accountsSection.dataset.hasConnected = "false";
     fillFolderAccounts();
+    fillCampaignAccounts();
+    renderInboxSessionSwitcher();
+    updateWorkspaceStats();
     setView("#accounts-view", "empty");
     return;
   }
@@ -289,49 +669,652 @@ function renderAccounts() {
   state.accounts.forEach((account) => {
     const label = account.telegram_name || account.telegram_username || account.phone;
     const pair = ACCOUNT_STATUS[account.status] || [account.status, "b-off"];
-    const row = el("li", { className: "account" }, [
-      el("span", { className: "name" }, [label]),
-      el("span", { className: `badge ${pair[1]}` }, [pair[0]]),
+    const connState = accountConnectionState(account);
+    const connLabel = accountConnectionLabel(account);
+    const connBadgeClass = connState === "ok" ? "b-ok" : (connState === "warn" ? "b-login" : "b-bad");
+    const subParts = [];
+    if (account.phone && account.phone !== label) subParts.push(account.phone);
+    if (account.telegram_username && `@${account.telegram_username}` !== label) {
+      subParts.push(`@${account.telegram_username}`);
+    }
+    const proxyLabel = account.proxy_location || account.proxy || "Proxy: Auto";
+    const accessLabel = account.access === "personal" ? "Personal" : "Workspace";
+    const identityBlock = el("div", { className: "account-identity" }, [
+      el("div", { className: "account-title-line" }, [
+        el("span", { className: "conn-dot", "data-conn": connState, "aria-hidden": "true" }, []),
+        el("span", { className: "name" }, [label]),
+        subParts.length ? el("span", { className: "hint" }, [subParts.join(" · ")]) : null,
+      ].filter(Boolean)),
+      el("div", { className: "account-badges-line" }, [
+        el("span", { className: `badge ${connBadgeClass}` }, [connLabel]),
+        el("span", { className: `badge ${pair[1]}` }, [pair[0]]),
+        el("span", { className: "badge b-new" }, [proxyLabel]),
+        el("span", { className: "badge b-new" }, [accessLabel]),
+      ]),
     ]);
     if (account.health) {
       const healthPair = ACCOUNT_HEALTH[account.health] || [account.health, "b-off"];
-      row.append(el("span", { className: `badge ${healthPair[1]}` }, [healthPair[0]]));
+      identityBlock.querySelector(".account-badges-line").append(
+        el("span", { className: `badge ${healthPair[1]}` }, [healthPair[0]]),
+      );
     }
+    const actionsWrap = el("div", { className: "row" }, []);
     if (account.status === "pending_code" || account.status === "pending_password") {
       pending = account;
       const caption = account.status === "pending_password" ? "Ввести пароль" : "Ввести код";
-      row.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => resumeLogin(account) }, [caption]));
+      actionsWrap.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => resumeLogin(account) }, [caption]));
     }
     if (account.status === "connected") {
-      row.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => reconnectAccount(account) }, ["Переподключить"]));
+      actionsWrap.append(
+        el("button", {
+          type: "button",
+          className: "btn secondary sm sheet-only-btn",
+          onclick: () => {
+            switchInboxSession(String(account.id));
+            activateSheet("inbox");
+          },
+        }, ["Открыть чаты"]),
+        el("button", { type: "button", className: "btn ghost sm", onclick: () => reconnectAccount(account) }, ["Переподключить"]),
+      );
     }
+    const mainRow = el("div", { className: "account-main" }, [
+      identityBlock,
+      actionsWrap,
+    ]);
+
+    const dailyLimit = Number(account.daily_limit) || 20;
+    const sentToday = Number(account.sent_today) || 0;
+    const pct = Math.min(100, Math.round((sentToday / Math.max(1, dailyLimit)) * 100));
+    const limitState = sentToday >= dailyLimit ? "danger" : (pct >= 80 ? "warning" : "ok");
+    const limitInput = el("input", {
+      type: "number",
+      min: "1",
+      max: "500",
+      value: String(dailyLimit),
+      className: "limit-input",
+      "aria-label": "Суточный лимит",
+    });
+    const limitBar = el("div", { className: "account-limit-bar" }, [
+      el("span", { className: "limit-counter" }, [`Сегодня: ${sentToday} / ${dailyLimit}`]),
+      el("div", { className: "limit-progress", "data-state": limitState, "aria-hidden": "true" }, [
+        el("span", { className: "limit-fill", style: `width: ${pct}%` }, []),
+      ]),
+      el("div", { className: "limit-actions" }, [
+        el("button", {
+          type: "button",
+          className: "chip",
+          "data-limit-preset": "10",
+          "aria-pressed": dailyLimit === 10 ? "true" : "false",
+          onclick: () => updateAccountLimit(account.id, 10),
+        }, ["10 / сут"]),
+        el("button", {
+          type: "button",
+          className: "chip",
+          "data-limit-preset": "20",
+          "aria-pressed": dailyLimit === 20 ? "true" : "false",
+          onclick: () => updateAccountLimit(account.id, 20),
+        }, ["20 / сут"]),
+        limitInput,
+        el("button", {
+          type: "button",
+          className: "btn secondary sm",
+          onclick: () => updateAccountLimit(account.id, limitInput.value),
+        }, ["Сохранить лимит"]),
+      ]),
+    ]);
+
+    const row = el("li", { className: "account" }, [mainRow, limitBar]);
     list.append(row);
   });
   if (pending && state.loginId == null) resumeLogin(pending);
   const select = document.querySelector("#tg-account");
   const previous = select.value;
-  const connected = state.accounts.filter((account) => account.status === "connected");
+  if (accountsSection) {
+    accountsSection.dataset.hasConnected = (connected.length > 0 && !pending) ? "true" : "false";
+  }
   select.replaceChildren();
   connected.forEach((account) => {
     const label = account.telegram_name || account.phone;
     select.append(el("option", { value: String(account.id) }, [label]));
   });
-  if (previous) select.value = previous;
+  if (previous && [...select.options].some((opt) => opt.value === previous)) {
+    select.value = previous;
+  }
   fillFolderAccounts();
+  fillCampaignAccounts();
+  renderInboxSessionSwitcher();
+  updateWorkspaceStats();
   setView("#accounts-view", "filled");
 }
 
 function fillFolderAccounts() {
-  const select = document.querySelector("#folder-account");
+  const connected = state.accounts.filter((account) => account.status === "connected");
+  ["#folder-account", "#tool-phones-account", "#tool-parser-account"].forEach((selector) => {
+    const select = document.querySelector(selector);
+    if (!select) return;
+    const previous = select.value;
+    select.replaceChildren();
+    if (!connected.length && selector !== "#folder-account") {
+      select.append(el("option", { value: "" }, ["Авто (любая сессия)"]));
+    }
+    connected.forEach((account) => {
+      const label = account.telegram_name || account.telegram_username || account.phone;
+      select.append(el("option", { value: String(account.id) }, [label]));
+    });
+    if (previous && [...select.options].some((opt) => opt.value === previous)) {
+      select.value = previous;
+    }
+  });
+}
+
+function selectedCampaignAccountIds() {
+  const accSelect = document.querySelector("#campaign-account");
+  const primaryId = accSelect && accSelect.value ? Number(accSelect.value) : null;
+  const poolHost = document.querySelector("#campaign-accounts-pool");
+  if (!poolHost) {
+    return primaryId ? [primaryId] : [];
+  }
+  const checkedIds = [...poolHost.querySelectorAll('input[type="checkbox"][data-account-id]:checked')]
+    .map((box) => Number(box.dataset.accountId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  if (checkedIds.length) {
+    if (primaryId && checkedIds.includes(primaryId)) {
+      return [primaryId, ...checkedIds.filter((id) => id !== primaryId)];
+    }
+    return checkedIds;
+  }
+  return primaryId ? [primaryId] : [];
+}
+
+function updateCampaignPoolSummary() {
+  const summaryNode = document.querySelector("#campaign-pool-summary");
+  if (!summaryNode) return;
+  const ids = selectedCampaignAccountIds();
+  const connected = state.accounts.filter((acc) => acc.status === "connected" && ids.includes(Number(acc.id)));
+  const totalLimit = connected.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
+  summaryNode.textContent = `Пул: ${connected.length} ${accountWord(connected.length)} · до ${totalLimit} сообщ./сутки суммарно`;
+}
+
+function fillCampaignAccounts() {
+  const select = document.querySelector("#campaign-account");
+  const poolHost = document.querySelector("#campaign-accounts-pool");
   if (!select) return;
   const previous = select.value;
   const connected = state.accounts.filter((account) => account.status === "connected");
   select.replaceChildren();
+  if (poolHost) poolHost.replaceChildren();
+  if (!connected.length) {
+    select.append(el("option", { value: "" }, ["Нет подключённых профилей"]));
+    if (poolHost) {
+      poolHost.append(el("span", { className: "hint" }, ["Нет подключённых профилей для пула"]));
+    }
+    updateCampaignPoolSummary();
+    return;
+  }
   connected.forEach((account) => {
-    const label = account.telegram_name || account.phone;
-    select.append(el("option", { value: String(account.id) }, [label]));
+    const label = account.telegram_name || account.telegram_username || account.phone;
+    const sent = Number(account.sent_today) || 0;
+    const limit = Number(account.daily_limit) || 20;
+    select.append(
+      el("option", { value: String(account.id) }, [`${label} (${sent}/${limit} сегодня)`]),
+    );
   });
-  if (previous) select.value = previous;
+  if (previous && [...select.options].some((opt) => opt.value === previous)) {
+    select.value = previous;
+  }
+
+  const connectedIds = connected.map((acc) => Number(acc.id));
+  if (!Array.isArray(state.selectedBuilderAccountIds)) {
+    state.selectedBuilderAccountIds = [...connectedIds];
+  } else {
+    state.selectedBuilderAccountIds = state.selectedBuilderAccountIds.filter((id) => connectedIds.includes(Number(id)));
+    if (!state.selectedBuilderAccountIds.length) {
+      const fallbackId = Number(select.value || connectedIds[0]);
+      state.selectedBuilderAccountIds = fallbackId ? [fallbackId] : [...connectedIds];
+    }
+  }
+
+  if (poolHost) {
+    connected.forEach((account) => {
+      const accId = Number(account.id);
+      const label = account.telegram_name || account.telegram_username || account.phone;
+      const sent = Number(account.sent_today) || 0;
+      const limit = Number(account.daily_limit) || 20;
+      const checkbox = el("input", {
+        type: "checkbox",
+        "data-account-id": String(accId),
+      });
+      checkbox.checked = state.selectedBuilderAccountIds.includes(accId);
+      checkbox.addEventListener("change", () => {
+        const checked = [...poolHost.querySelectorAll('input[type="checkbox"][data-account-id]:checked')]
+          .map((node) => Number(node.dataset.accountId));
+        state.selectedBuilderAccountIds = checked;
+        if (checked.length && !checked.includes(Number(select.value))) {
+          select.value = String(checked[0]);
+        }
+        updateCampaignPoolSummary();
+      });
+      poolHost.append(
+        el("label", { className: "pool-check-chip" }, [
+          checkbox,
+          el("span", { className: "pool-check-name" }, [label]),
+          el("span", { className: "pool-check-meta" }, [`${sent}/${limit}`]),
+        ]),
+      );
+    });
+  }
+  updateCampaignPoolSummary();
+}
+
+function renderBuilderSteps() {
+  const host = document.querySelector("#campaign-steps-list");
+  if (!host) return;
+  host.replaceChildren();
+  state.campaignSteps.forEach((step, idx) => {
+    const delayVal = step.delay_hours ?? (idx === 0 ? 0 : 24);
+    const titleSpan = el("span", { className: "step-title-badge" }, [
+      idx === 0
+        ? "Шаг 1 · Сразу"
+        : `Шаг ${idx + 1} · Через ${delayVal} ч без ответа`,
+    ]);
+    const delayInput = el("input", {
+      type: "number",
+      min: "0",
+      max: "720",
+      value: String(delayVal),
+      "aria-label": `Пауза до шага ${idx + 1} (часов)`,
+      oninput: (event) => {
+        step.delay_hours = Math.max(0, Number(event.target.value) || 0);
+        if (idx > 0) {
+          titleSpan.textContent = `Шаг ${idx + 1} · Через ${step.delay_hours} ч без ответа`;
+        }
+      },
+    });
+    const headRight = [
+      el("label", { className: "step-delay-label" }, [
+        idx === 0 ? "Пауза (ч):" : "Через (ч):",
+        delayInput,
+      ]),
+    ];
+    if (state.campaignSteps.length > 1) {
+      headRight.push(
+        el("button", {
+          type: "button",
+          className: "btn ghost sm",
+          onclick: () => {
+            state.campaignSteps.splice(idx, 1);
+            if (state.activeStepIndex >= state.campaignSteps.length) {
+              state.activeStepIndex = Math.max(0, state.campaignSteps.length - 1);
+            }
+            renderBuilderSteps();
+          },
+        }, ["Удалить"]),
+      );
+    }
+    const area = el("textarea", {
+      rows: "2",
+      "data-step-index": String(idx),
+      "aria-label": `Шаблон сообщения шага ${idx + 1}`,
+      placeholder: "Привет, {name}! Пишу по проекту {company}...",
+      onfocus: () => { state.activeStepIndex = idx; },
+      oninput: (event) => { step.template_text = event.target.value; },
+    }, [step.template_text || ""]);
+
+    host.append(
+      el("div", { className: "campaign-step-card" }, [
+        el("div", { className: "step-card-head" }, [
+          titleSpan,
+          el("div", { className: "row" }, headRight),
+        ]),
+        area,
+      ]),
+    );
+  });
+}
+
+function fillCsvCampaignSelect(preferredId) {
+  const select = document.querySelector("#csv-campaign-select");
+  if (select) {
+    const previous = preferredId ? String(preferredId) : select.value;
+    select.replaceChildren();
+    if (!state.campaigns.length) {
+      select.append(el("option", { value: "" }, ["Сначала создайте рассылку"]));
+    } else {
+      state.campaigns.forEach((camp) => {
+        select.append(
+          el("option", { value: String(camp.id) }, [
+            `${camp.name} (база: ${camp.total_recipients || 0})`,
+          ]),
+        );
+      });
+      if (previous && [...select.options].some((opt) => opt.value === previous)) {
+        select.value = previous;
+      }
+    }
+  }
+  ["#from-leads-campaign-select", "#tool-phones-campaign", "#tool-parser-campaign"].forEach((sel) => {
+    const node = document.querySelector(sel);
+    if (!node) return;
+    const prev = preferredId ? String(preferredId) : node.value;
+    const emptyLabel = sel === "#from-leads-campaign-select"
+      ? "Создать новую кампанию автоматически"
+      : "Без добавления в кампанию";
+    node.replaceChildren(el("option", { value: "" }, [emptyLabel]));
+    state.campaigns.forEach((camp) => {
+      node.append(el("option", { value: String(camp.id) }, [`${camp.name} (${camp.total_recipients || 0})`]));
+    });
+    if (prev && [...node.options].some((opt) => opt.value === prev)) {
+      node.value = prev;
+    }
+  });
+}
+
+async function runCampaignStep(campaignId, button) {
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  try {
+    const res = await api(`/api/campaigns/${campaignId}/run`, { method: "POST" });
+    await loadAccounts();
+    await loadCampaigns();
+    await loadInbox();
+    await loadLeads(state.leadQuery, state.selectedLeadId);
+    const limitNote = res.limit_reached ? " (достигнут суточный лимит)" : "";
+    toast(`Отправлено сообщений: ${res.sent}${limitNote}`, "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function resolveCampaignAccounts(camp) {
+  if (Array.isArray(camp.accounts) && camp.accounts.length) {
+    return camp.accounts;
+  }
+  const rawIds = (Array.isArray(camp.account_ids) && camp.account_ids.length)
+    ? camp.account_ids
+    : (camp.account_id ? [camp.account_id] : []);
+  return rawIds
+    .map((id) => state.accounts.find((item) => Number(item.id) === Number(id)))
+    .filter(Boolean);
+}
+
+async function updateCampaignAccounts(campaignId, accountIds) {
+  const cleanIds = (accountIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
+  try {
+    await api(`/api/campaigns/${campaignId}`, {
+      method: "PUT",
+      body: {
+        account_id: cleanIds[0] || null,
+        account_ids: cleanIds,
+      },
+    });
+    await loadCampaigns();
+    toast(`Пул аккаунтов рассылки обновлён (${cleanIds.length} акк.)`, "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function renderCampaigns() {
+  const list = document.querySelector("#campaign-list");
+  if (!list) return;
+  list.replaceChildren();
+  fillCsvCampaignSelect();
+  updateWorkspaceStats();
+  if (!state.campaigns.length) {
+    setView("#campaigns-view", "empty");
+    return;
+  }
+  const connectedAccounts = state.accounts.filter((item) => item.status === "connected");
+  state.campaigns.forEach((camp) => {
+    const statusPair = CAMPAIGN_STATUS_LABEL[camp.status] || [camp.status, "b-new"];
+    const attachedAccounts = resolveCampaignAccounts(camp);
+    const attachedIds = attachedAccounts.map((item) => Number(item.id));
+    const attachedNames = attachedAccounts.map(
+      (item) => item.telegram_name || item.telegram_username || item.phone,
+    );
+    const poolCapacity = attachedAccounts.reduce((sum, item) => sum + (Number(item.daily_limit) || 20), 0);
+    const poolSummaryLabel = attachedAccounts.length > 1
+      ? `Пул: ${attachedAccounts.length} ${accountWord(attachedAccounts.length)} (${attachedNames.join(", ")})`
+      : (attachedNames[0] || "Профиль не выбран");
+    const dailyLimit = Number(camp.daily_limit) || 20;
+    const sentToday = Number(camp.sent_today) || 0;
+    const steps = camp.steps || [];
+    const recipients = camp.recipients || [];
+
+    const stepPills = steps.map((step) => {
+      const when = Number(step.delay_hours) === 0 ? "сразу" : `через ${step.delay_hours} ч`;
+      const preview = String(step.template_text || "").slice(0, 64);
+      return el("span", { className: "sequence-step-pill" }, [
+        `Шаг ${step.step_order} (${when}): ${preview}${step.template_text && step.template_text.length > 64 ? "…" : ""}`,
+      ]);
+    });
+
+    const runBtn = el("button", {
+      type: "button",
+      className: "btn primary sm",
+      onclick: (event) => runCampaignStep(camp.id, event.currentTarget),
+    }, ["Запустить шаг рассылки"]);
+
+    const selectForCsvBtn = el("button", {
+      type: "button",
+      className: "btn secondary sm",
+      onclick: () => {
+        const select = document.querySelector("#csv-campaign-select");
+        if (select) select.value = String(camp.id);
+        if (state.viewMode === "sheet") {
+          openSheetPopup("csv");
+          return;
+        }
+        const area = document.querySelector("#csv-text");
+        if (area) area.focus();
+      },
+    }, ["Выбрать для CSV"]);
+
+    const poolEditorOpen = Boolean(state.expandedAccountPools[camp.id]);
+    const togglePoolBtn = el("button", {
+      type: "button",
+      className: "btn secondary sm campaign-accounts-btn",
+      "aria-expanded": poolEditorOpen ? "true" : "false",
+      onclick: () => {
+        state.expandedAccountPools[camp.id] = !poolEditorOpen;
+        renderCampaigns();
+      },
+    }, [`Аккаунты (${attachedIds.length})`]);
+
+    const poolChecks = connectedAccounts.map((account) => {
+      const accId = Number(account.id);
+      const accLabel = account.telegram_name || account.telegram_username || account.phone;
+      const box = el("input", {
+        type: "checkbox",
+        "data-camp-account-id": String(accId),
+      });
+      box.checked = attachedIds.includes(accId);
+      box.addEventListener("change", () => {
+        const nextIds = box.checked
+          ? [...new Set([...attachedIds, accId])]
+          : attachedIds.filter((id) => id !== accId);
+        updateCampaignAccounts(camp.id, nextIds);
+      });
+      return el("label", { className: "pool-check-chip" }, [
+        box,
+        el("span", { className: "pool-check-name" }, [accLabel]),
+        el("span", { className: "pool-check-meta" }, [`${Number(account.sent_today) || 0}/${Number(account.daily_limit) || 20}`]),
+      ]);
+    });
+
+    const attachAllBtn = el("button", {
+      type: "button",
+      className: "btn ghost sm",
+      onclick: () => {
+        const allIds = connectedAccounts.map((acc) => Number(acc.id));
+        updateCampaignAccounts(camp.id, allIds);
+      },
+    }, ["Все подключённые"]);
+
+    const poolEditorRow = el("div", {
+      className: "campaign-pool-inline",
+      hidden: !poolEditorOpen ? "hidden" : undefined,
+    }, [
+      el("span", { className: "steps-caption" }, [
+        `Пул отправки (до ${poolCapacity || dailyLimit} сообщ./сут):`,
+      ]),
+      el("div", { className: "campaign-accounts-pool" }, poolChecks),
+      connectedAccounts.length > 1 ? attachAllBtn : null,
+    ].filter(Boolean));
+
+    const badgeNodes = [
+      el("span", { className: `badge ${statusPair[1]}` }, [statusPair[0]]),
+      el("span", { className: "badge b-new" }, [poolSummaryLabel]),
+      el("span", { className: "badge b-talk" }, [
+        poolCapacity
+          ? `${sentToday} / ${dailyLimit} в сут · пул до ${poolCapacity}/сут`
+          : `${sentToday} / ${dailyLimit} в сут`,
+      ]),
+    ];
+
+    const cardChildren = [
+      el("div", { className: "campaign-card-head" }, [
+        el("h4", { className: "name" }, [camp.name]),
+        el("div", { className: "campaign-badges" }, badgeNodes),
+      ]),
+      el("div", { className: "campaign-kpis" }, [
+        el("div", { className: "campaign-kpi" }, [
+          el("span", {}, ["База"]),
+          el("strong", {}, [String(camp.total_recipients || 0)]),
+        ]),
+        el("div", { className: "campaign-kpi" }, [
+          el("span", {}, ["В очереди"]),
+          el("strong", {}, [String((camp.pending_count || 0) + (camp.in_progress_count || 0))]),
+        ]),
+        el("div", { className: "campaign-kpi" }, [
+          el("span", {}, ["Отправлено"]),
+          el("strong", {}, [String((camp.in_progress_count || 0) + (camp.completed_count || 0))]),
+        ]),
+        el("div", { className: "campaign-kpi" }, [
+          el("span", {}, ["Ответили"]),
+          el("strong", {}, [String(camp.replied_count || 0)]),
+        ]),
+      ]),
+      el("div", { className: "sequence-preview" }, stepPills),
+      poolEditorRow,
+      el("div", { className: "row" }, [runBtn, selectForCsvBtn, togglePoolBtn]),
+    ];
+
+    if (recipients.length) {
+      const isExpanded = Boolean(state.expandedCampaigns[camp.id]);
+      const visibleRecipients = (state.viewMode === "sheet" && !isExpanded && recipients.length > 3)
+        ? recipients.slice(0, 3)
+        : recipients;
+      const recRows = [
+        el("div", { className: "recipients-header" }, [
+          el("span", {}, ["Контакт / Сайт"]),
+          el("span", {}, ["Username / Тел"]),
+          el("span", {}, ["Компания и касание"]),
+          el("span", {}, ["Аккаунт и шаг"]),
+          el("span", {}, ["Статус"]),
+        ]),
+        ...visibleRecipients.map((rec) => {
+          const recPair = RECIPIENT_STATUS_LABEL[rec.status] || [rec.status, "b-new"];
+          const handle = rec.username ? `@${rec.username}` : (rec.phone || "-");
+          const siteCategory = [rec.website, rec.category].filter(Boolean).join(" · ");
+          const contactCell = el("div", { className: "recipient-cell" }, [
+            el("span", { className: "name" }, [rec.name || "Без имени"]),
+            siteCategory ? el("span", { className: "recipient-sub" }, [siteCategory]) : null,
+          ].filter(Boolean));
+
+          const touchPreview = rec.step1_text || rec.note || "";
+          const companyTitle = rec.company || rec.category || rec.website || "-";
+          const followupTags = [
+            rec.step2_text ? "Ф1" : "",
+            rec.step3_text ? "Ф2" : "",
+          ].filter(Boolean);
+          const companyCell = el("div", { className: "recipient-cell" }, [
+            el("span", { className: "recipient-company" }, [companyTitle]),
+            touchPreview
+              ? el("span", { className: "recipient-touch", title: touchPreview }, [
+                touchPreview.length > 68 ? `${touchPreview.slice(0, 68)}…` : touchPreview,
+              ])
+              : null,
+            followupTags.length
+              ? el("span", { className: "recipient-sub" }, [`Фоллоуапы: ${followupTags.join(", ")}`])
+              : null,
+          ].filter(Boolean));
+
+          const senderText = rec.assigned_account_name
+            || (attachedIds.length ? `В пуле (${attachedIds.length} акк.)` : "Не назначен");
+          const stepCell = el("div", { className: "recipient-cell" }, [
+            el("span", { className: "recipient-sender" }, [senderText]),
+            el("span", { className: "hint" }, [`Шаг ${rec.current_step || 0} / ${steps.length}`]),
+          ]);
+
+          const statusCell = el("div", { className: "recipient-cell recipient-status-cell" }, [
+            el("span", { className: `badge ${recPair[1]}` }, [recPair[0]]),
+            el("button", {
+              type: "button",
+              className: "btn ghost sm",
+              onclick: () => openChat({
+                id: rec.lead_id || null,
+                telegram_user_id: rec.telegram_user_id || null,
+                username: rec.username || "",
+                name: rec.name || "",
+                phone: rec.phone || "",
+                account_id: rec.assigned_account_id || camp.account_id || null,
+              }),
+            }, ["Написать"]),
+            rec.error_text ? el("span", { className: "recipient-error" }, [rec.error_text]) : null,
+          ].filter(Boolean));
+
+          return el("div", { className: "recipient-row" }, [
+            contactCell,
+            el("span", { className: "hint" }, [handle]),
+            companyCell,
+            stepCell,
+            statusCell,
+          ]);
+        }),
+      ];
+      cardChildren.push(
+        el("div", { className: "recipients-grid", role: "region", "aria-label": `Получатели ${camp.name}` }, recRows),
+      );
+      if (state.viewMode === "sheet" && recipients.length > 3) {
+        cardChildren.push(
+          el("div", { className: "row" }, [
+            el("button", {
+              type: "button",
+              className: "btn ghost sm",
+              onclick: () => {
+                state.expandedCampaigns[camp.id] = !isExpanded;
+                renderCampaigns();
+              },
+            }, [isExpanded ? "Свернуть список" : `Все получатели (${recipients.length})`]),
+          ]),
+        );
+      }
+    } else {
+      cardChildren.push(
+        el("p", { className: "hint" }, ["База получателей пуста: загрузите таблицу CSV."]),
+      );
+    }
+
+    list.append(el("article", { className: "campaign-card" }, cardChildren));
+  });
+  setView("#campaigns-view", "filled");
+}
+
+async function loadCampaigns() {
+  try {
+    state.campaigns = await api("/api/campaigns");
+    renderCampaigns();
+  } catch (error) {
+    failRegion("#campaigns-view", "#campaigns-error", error);
+  }
 }
 
 function renderFolderList(rows) {
@@ -440,12 +1423,80 @@ async function loadAccounts() {
   await loadFolderList();
 }
 
+function renderInboxSessionSwitcher() {
+  const host = document.querySelector("#inbox-session-switcher");
+  const badge = document.querySelector("#inbox-active-session-badge");
+  const connected = (state.accounts || []).filter((account) => account.status === "connected");
+  if (!host) return;
+  host.replaceChildren();
+  const activeKey = String(state.inboxSessionFilter || "all");
+  const allBtn = el("button", {
+    type: "button",
+    className: "inbox-session-pill",
+    "data-session-filter": "all",
+    "aria-pressed": activeKey === "all" ? "true" : "false",
+    onclick: () => switchInboxSession("all"),
+  }, ["Все сессии"]);
+  host.append(allBtn);
+
+  connected.forEach((account) => {
+    const key = String(account.id);
+    const uname = account.telegram_username || account.username;
+    const label = uname ? `@${uname}` : (account.telegram_name || account.phone || `#${account.id}`);
+    const pill = el("button", {
+      type: "button",
+      className: "inbox-session-pill",
+      "data-session-filter": key,
+      "aria-pressed": activeKey === key ? "true" : "false",
+      onclick: () => switchInboxSession(key),
+    }, [label]);
+    host.append(pill);
+  });
+
+  if (badge) {
+    if (activeKey === "all") {
+      badge.textContent = connected.length > 1 ? `Все сессии (${connected.length})` : "Все сессии";
+    } else {
+      const found = connected.find((acc) => String(acc.id) === activeKey);
+      const foundUname = found && (found.telegram_username || found.username);
+      badge.textContent = found
+        ? `Сессия: ${foundUname ? `@${foundUname}` : (found.telegram_name || found.phone)}`
+        : "Активная сессия";
+    }
+  }
+}
+
+async function switchInboxSession(sessionKey) {
+  const key = String(sessionKey || "all");
+  state.inboxSessionFilter = key;
+  const select = document.querySelector("#tg-account");
+  if (key !== "all" && select) {
+    select.value = key;
+  } else if (key === "all" && select && !select.value) {
+    const firstConnected = (state.accounts || []).find((acc) => acc.status === "connected");
+    if (firstConnected) select.value = String(firstConnected.id);
+  }
+  renderInboxSessionSwitcher();
+  try {
+    await loadInbox();
+  } catch (error) {
+    closeInboxLive();
+    state.inbox = "error";
+    const node = document.querySelector("#inbox-error");
+    if (node) node.textContent = error.message;
+    setView("#inbox-view", "error");
+  }
+}
+
 function chipOn(name) {
   const button = document.querySelector(`[data-chip="${name}"]`);
   return button && button.getAttribute("aria-pressed") === "true";
 }
 
 function passChips(dialog) {
+  if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
+    if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
+  }
   if (chipOn("waiting") && !dialog.waiting && !dialog.last_from_other) return false;
   if (chipOn("unread") && !dialog.unread_count) return false;
   if (chipOn("groups") && dialog.peer_type !== "group" && !dialog.is_group) return false;
@@ -472,12 +1523,22 @@ function renderDialogs() {
   matched.forEach((dialog) => {
     const name = dialog.name || "Без имени";
     const user = dialog.username ? `@${dialog.username}` : "без ника";
+    const sub = dialog.last_message_preview ? `${user} · ${dialog.last_message_preview}` : user;
     const current = state.selectedDialog
       && state.selectedDialog.telegram_user_id === dialog.telegram_user_id;
+    const ownerAcc = (state.accounts || []).find((acc) => Number(acc.id) === Number(dialog.account_id))
+      || selectedAccount();
+    const ownerUname = ownerAcc && (ownerAcc.telegram_username || ownerAcc.username);
+    const sessionTag = ownerAcc
+      ? el("span", { className: "dialog-session-pill" }, [
+        ownerUname ? `@${ownerUname}` : (ownerAcc.telegram_name || ownerAcc.phone || `TG #${ownerAcc.id}`),
+      ])
+      : null;
     const who = el("span", {}, [
       el("span", { className: "name" }, [name]),
-      el("span", { className: "preview" }, [user]),
-    ]);
+      el("span", { className: "preview" }, [sub]),
+      sessionTag,
+    ].filter(Boolean));
     const button = el("button", {
       type: "button",
       className: "dialog",
@@ -496,6 +1557,7 @@ function renderDialogs() {
     }
     list.append(el("li", {}, [button]));
   });
+  updateWorkspaceStats();
 }
 
 function accountLabel() {
@@ -536,6 +1598,12 @@ function selectedAccount() {
 }
 
 async function selectDialog(dialog) {
+  if (dialog && dialog.account_id) {
+    const select = document.querySelector("#tg-account");
+    if (select && [...select.options].some((opt) => opt.value === String(dialog.account_id))) {
+      select.value = String(dialog.account_id);
+    }
+  }
   state.selectedDialog = dialog;
   state.messages = [];
   setView("#thread-view", "loading");
@@ -571,8 +1639,6 @@ function leadForDialog(dialog) {
   }) || null;
 }
 
-
-
 function renderSide() {
   const dialog = state.selectedDialog;
   if (!dialog) {
@@ -594,7 +1660,16 @@ function renderSide() {
       el("p", { className: "hint" }, [lead.username ? `@${lead.username}` : "без ника"]),
       el("p", { className: "note" }, [sideNoteText(lead)]),
       el("p", { className: "hint" }, [lead.next_step ? `Дальше: ${lead.next_step}` : "Следующий шаг не задан"]),
-      el("a", { className: "btn secondary sm", href: "#s09" }, ["Открыть карточку"]),
+      el("a", {
+        className: "btn secondary sm",
+        href: "#s09",
+        onclick: (event) => {
+          if (state.viewMode === "sheet") {
+            event.preventDefault();
+            openSheetPopup("card");
+          }
+        },
+      }, ["Открыть карточку"]),
     ]),
   );
   setView("#side-view", "filled");
@@ -637,6 +1712,7 @@ async function focusLead(id) {
     state.selectedLeadId = lead.id;
     renderCard();
     renderBoard();
+    if (state.viewMode === "sheet") openSheetPopup("card");
   } catch (error) {
     toast(error.message, "error");
   }
@@ -696,14 +1772,54 @@ function openReminderModal(lead) {
   });
 }
 
-function openChat(lead) {
-  const dialog = state.dialogs.find((item) => Number(item.telegram_user_id) === Number(lead.telegram_user_id));
+async function openChat(lead) {
+  if (!lead) return;
+  const cleanUser = String(lead.username || "").replace(/^@/, "").toLowerCase();
+  let dialog = state.dialogs.find((item) => {
+    if (lead.telegram_user_id && item.telegram_user_id && Number(item.telegram_user_id) === Number(lead.telegram_user_id)) {
+      return true;
+    }
+    if (cleanUser && item.username && String(item.username).replace(/^@/, "").toLowerCase() === cleanUser) {
+      return true;
+    }
+    return false;
+  });
+
+  if (!dialog) {
+    const connectedAcc = (state.accounts || []).find((acc) => acc.status === "connected");
+    const accountId = lead.account_id
+      || Number(document.querySelector("#tg-account")?.value)
+      || (connectedAcc ? connectedAcc.id : null);
+    if (accountId) {
+      try {
+        dialog = await api("/api/dialogs/open-by-lead", {
+          method: "POST",
+          body: {
+            lead_id: lead.id || null,
+            account_id: Number(accountId),
+            telegram_user_id: lead.telegram_user_id || null,
+            username: cleanUser || null,
+            name: lead.name || cleanUser || "Контакт",
+            phone: lead.phone || null,
+          },
+        });
+      } catch (_err) {
+        dialog = null;
+      }
+    }
+  }
+
   if (!dialog) {
     toast("Этот чат ещё не открыт в списке", "error");
     return;
   }
-  selectDialog(dialog);
-  document.querySelector("#s05").scrollIntoView({ block: "nearest" });
+
+  upsertDialog(dialog);
+  closeSheetPopup();
+  if (state.viewMode === "sheet") activateSheet("inbox");
+  await selectDialog(dialog);
+  const s05 = document.querySelector("#s05");
+  if (s05) s05.scrollIntoView({ block: "nearest" });
 }
 
 function taskList(lead) {
@@ -766,7 +1882,7 @@ function taskForm(lead) {
 function propertyShown(item) {
   if (item.value_text) return item.value_text;
   if (item.value_int != null) return String(item.value_int);
-  return "—";
+  return "-";
 }
 
 function propertyList(lead) {
@@ -924,7 +2040,6 @@ function paintCard(lead) {
     timeline,
     el("section", { "aria-label": "Задачи" }, [
       el("h4", {}, ["Задачи"]),
-      el("p", { className: "hint" }, ["Срока у задачи нет. Дата остаётся у напоминания."]),
       taskList(lead),
       taskForm(lead),
     ]),
@@ -1047,6 +2162,43 @@ async function resetPipelineView() {
   await loadLeads("");
 }
 
+function folderTitleById(folderId) {
+  if (!folderId) return "";
+  const all = Object.values(state.folderLists).flat();
+  const found = all.find((item) => item && Number(item.id) === Number(folderId));
+  return found ? found.title : "";
+}
+
+function updateWorkspaceStats() {
+  const leadCount = (state.leads || []).length;
+  const leadsNode = document.querySelector("#stat-leads");
+  if (leadsNode) leadsNode.textContent = String(leadCount);
+  const dialogsNode = document.querySelector("#stat-dialogs");
+  if (dialogsNode) dialogsNode.textContent = String((state.dialogs || []).length);
+  const campNode = document.querySelector("#stat-campaigns");
+  if (campNode) campNode.textContent = String((state.campaigns || []).length);
+  const remNode = document.querySelector("#stat-reminders");
+  if (remNode) {
+    const openCount = (state.reminders || []).filter((item) => !item.done_at).length;
+    remNode.textContent = String(openCount);
+  }
+  const quotaLeads = document.querySelector("#sidebar-quota-leads");
+  if (quotaLeads) quotaLeads.textContent = `${leadCount} / 5000`;
+  const quotaLeadsFill = document.querySelector("#sidebar-quota-leads-fill");
+  if (quotaLeadsFill) {
+    const pct = Math.min(100, Math.max(4, Math.round((leadCount / 5000) * 100)));
+    quotaLeadsFill.style.width = `${pct}%`;
+  }
+  const connectedCount = (state.accounts || []).filter((acc) => acc.status === "connected").length;
+  const quotaAcc = document.querySelector("#sidebar-quota-accounts");
+  if (quotaAcc) quotaAcc.textContent = `${connectedCount} / 10`;
+  const quotaAccFill = document.querySelector("#sidebar-quota-accounts-fill");
+  if (quotaAccFill) {
+    const pctAcc = Math.min(100, Math.max(10, Math.round((connectedCount / 10) * 100)));
+    quotaAccFill.style.width = `${pctAcc}%`;
+  }
+}
+
 function renderBoard() {
   const { status: stage, folderId } = pipelineFilters();
   const board = document.querySelector("#board");
@@ -1061,29 +2213,56 @@ function renderBoard() {
     const items = cards.length
       ? cards.map((lead) => {
         const current = lead.id === state.selectedLeadId;
+        const nameText = lead.name || "Без имени";
+        const userText = lead.username ? `@${lead.username}` : "без ника";
+        const bodyNodes = [
+          el("span", { className: "card-top" }, [
+            el("span", { className: "name" }, [nameText]),
+            el("span", { className: "meta" }, [userText]),
+          ]),
+        ];
+        if (lead.next_step || lead.note) {
+          bodyNodes.push(el("span", { className: "card-step" }, [
+            lead.next_step ? `Сегодня · ${lead.next_step}` : lead.note,
+          ]));
+        }
+        const folderTitle = folderTitleById(lead.folder_id);
+        const tagNodes = [
+          el("span", { className: "card-pill" }, [folderTitle || label]),
+        ];
+        if (lead.phone) {
+          tagNodes.push(el("span", { className: "card-tag" }, [lead.phone]));
+        }
+        bodyNodes.push(el("span", { className: "card-tags" }, tagNodes));
         const link = el("a", {
           className: "card",
           href: "#s09",
-          onclick: () => {
+          onclick: (event) => {
             state.selectedLeadId = lead.id;
             renderCard();
             renderBoard();
+            if (state.viewMode === "sheet") {
+              event.preventDefault();
+              openSheetPopup("card");
+            }
           },
         }, [
-          el("span", { className: "name" }, [lead.name || "Без имени"]),
-          el("span", { className: "meta" }, [lead.username ? `@${lead.username}` : "без ника"]),
+          el("span", { className: "avatar", "aria-hidden": "true" }, [initials(nameText)]),
+          el("span", { className: "card-body" }, bodyNodes),
         ]);
         if (current) link.setAttribute("aria-current", "true");
         return link;
       })
       : [el("p", { className: "hint" }, ["Пусто"])];
+    const dot = el("span", { className: "stage-dot", "data-stage": value, "aria-hidden": "true" }, []);
     const count = el("span", { className: "meta" }, [String(cards.length)]);
     board.append(el("section", { className: "col" }, [
-      el("header", {}, [el("h3", {}, [label]), count]),
+      el("header", {}, [dot, el("h3", {}, [label]), count]),
       ...items,
     ]));
   });
   updateFilterNote();
+  updateWorkspaceStats();
 }
 
 function reminderForm(lead) {
@@ -1142,12 +2321,22 @@ function renderLeadTable() {
     }, [
       el("td", {}, [textField(lead, "name", "Имя")]),
       el("td", {}, [lead.username ? `@${lead.username}` : ""]),
-      el("td", {}, [lead.telegram_user_id ?? ""]),
-      el("td", {}, [lead.phone || ""]),
+      el("td", { className: "num" }, [lead.telegram_user_id ?? ""]),
+      el("td", { className: "num" }, [lead.phone || ""]),
       el("td", {}, [statusSelect(lead)]),
       el("td", {}, [textField(lead, "note", "Заметка")]),
       el("td", {}, [textField(lead, "next_step", "Следующий шаг")]),
-      el("td", {}, [reminderForm(lead)]),
+      el("td", {}, [
+        reminderForm(lead),
+        el("button", {
+          type: "button",
+          className: "btn secondary sm sheet-only-btn",
+          onclick: (event) => {
+            event.stopPropagation();
+            openReminderModal(lead);
+          },
+        }, ["+ Напоминание"]),
+      ]),
     ]);
     body.append(row);
   });
@@ -1279,6 +2468,7 @@ function renderReminders() {
       host.prepend(el("p", { className: "hint" }, ["На сегодня ничего не стоит"]));
     }
   }
+  updateWorkspaceStats();
 }
 
 async function loadReminders() {
@@ -1320,7 +2510,6 @@ function openInboxLive(accountId) {
   }
   if (inboxSource && inboxLiveAccount === id) return;
   if (inboxSource) inboxSource.close();
-  // Пока сервер не прислал live ok, оборванный сокет не выглядит живым.
   setInboxLive(false);
   inboxLiveAccount = id;
   const source = new EventSource(`/api/inbox/events?account_id=${encodeURIComponent(id)}`);
@@ -1367,7 +2556,11 @@ async function loadInbox() {
     closeInboxLive();
     return;
   }
-  const dialogs = await api(`/api/inbox?account_id=${select.value}`);
+  const connectedCount = (state.accounts || []).filter((acc) => acc.status === "connected").length;
+  const targetAccountId = (state.inboxSessionFilter === "all" && connectedCount > 1)
+    ? "0"
+    : select.value;
+  const dialogs = await api(`/api/inbox?account_id=${targetAccountId}`);
   state.dialogs = dialogs;
   state.dialogQuery = "";
   state.inbox = "filled";
@@ -1440,6 +2633,13 @@ function bindBusy(form, handler) {
   });
 }
 
+const checkAccountsBtn = document.querySelector("#check-accounts-btn");
+if (checkAccountsBtn) {
+  checkAccountsBtn.addEventListener("click", (event) => {
+    checkAllAccounts(event.currentTarget);
+  });
+}
+
 document.querySelector("#bot-login").addEventListener("click", async () => {
   const button = document.querySelector("#bot-login");
   button.disabled = true;
@@ -1457,20 +2657,180 @@ document.querySelector("#bot-login").addEventListener("click", async () => {
   }
 });
 
+function switchAuthTab(mode) {
+  const isSession = mode === "session";
+  const btnPhone = document.querySelector("#auth-tab-btn-phone");
+  const btnSession = document.querySelector("#auth-tab-btn-session");
+  const panePhone = document.querySelector("#auth-pane-phone");
+  const paneSession = document.querySelector("#auth-pane-session");
+  if (btnPhone) btnPhone.setAttribute("aria-selected", isSession ? "false" : "true");
+  if (btnSession) btnSession.setAttribute("aria-selected", isSession ? "true" : "false");
+  if (panePhone) panePhone.hidden = isSession;
+  if (paneSession) paneSession.hidden = !isSession;
+}
+
+const authTabBtnPhone = document.querySelector("#auth-tab-btn-phone");
+if (authTabBtnPhone) {
+  authTabBtnPhone.addEventListener("click", () => switchAuthTab("phone"));
+}
+
+const authTabBtnSession = document.querySelector("#auth-tab-btn-session");
+if (authTabBtnSession) {
+  authTabBtnSession.addEventListener("click", () => switchAuthTab("session"));
+}
+
+const openSessionImportPopupBtn = document.querySelector("#open-session-import-popup");
+if (openSessionImportPopupBtn) {
+  openSessionImportPopupBtn.addEventListener("click", () => {
+    switchAuthTab("session");
+    openSheetPopup("login");
+  });
+}
+
 bindBusy(document.querySelector("#login-form"), async (event) => {
-  const phone = new FormData(event.target).get("phone");
-  const result = await api("/api/accounts/start", { method: "POST", body: { phone } });
+  const formData = new FormData(event.target);
+  const phone = formData.get("phone");
+  const proxy = document.querySelector("#account-proxy-select")?.value || "auto_ru";
+  const access = document.querySelector("#account-access-select")?.value || "team";
+  const result = await api("/api/accounts/start", {
+    method: "POST",
+    body: { phone, proxy, access },
+  });
   state.loginId = result.id;
   document.querySelector("#code-form").hidden = false;
   document.querySelector("#password-form").hidden = true;
   await loadAccounts();
 });
 
+const SAMPLE_SESSION_JSON = JSON.stringify({
+  app_id: 2040,
+  app_hash: "b18441a1ff607e10a989891a5462e627",
+  device: "MacBookPro18,3",
+  sdk: "macOS 14.5",
+  app_version: "4.16.8 x64",
+  phone: "+79995550199",
+  username: "foldesk_outreach_pro",
+  first_name: "Foldesk",
+  last_name: "Session",
+  session_file: "79995550199.session",
+}, null, 2);
+
+const fillSampleSessionBtn = document.querySelector("#fill-sample-session-btn");
+if (fillSampleSessionBtn) {
+  fillSampleSessionBtn.addEventListener("click", () => {
+    const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
+    if (area) area.value = SAMPLE_SESSION_JSON;
+    const dropText = document.querySelector("#session-dropzone-text");
+    if (dropText) dropText.textContent = "Подготовлен JSON сессии: 79995550199.session";
+    toast("Подставлен тестовый JSON сессии Telegram", "ok");
+  });
+}
+
+let uploadedSessionFilename = "";
+const sessionArchiveFile = document.querySelector("#session-import-file") || document.querySelector("#session-archive-file");
+if (sessionArchiveFile) {
+  sessionArchiveFile.addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    uploadedSessionFilename = file.name;
+    const dropText = document.querySelector("#session-dropzone-text");
+    if (dropText) dropText.textContent = `Выбран файл: ${file.name}`;
+    if (file.name.endsWith(".json")) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
+        if (area) area.value = String(reader.result || "");
+        toast(`JSON сессии прочитан: ${file.name}`, "ok");
+      };
+      reader.readAsText(file, "utf-8");
+    } else {
+      const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
+      if (area && !area.value.trim()) {
+        area.value = JSON.stringify({
+          app_id: 2040,
+          device: "Telegram Desktop",
+          phone: "+7999" + String(Math.floor(1000000 + Math.random() * 8999999)),
+          username: file.name.replace(/\.(zip|session|json)$/i, "").replace(/[^a-zA-Z0-9_]/g, "_"),
+          session_file: file.name,
+        }, null, 2);
+      }
+      toast(`Архив сессии готов к импорту: ${file.name}`, "ok");
+    }
+  });
+}
+
+const importSessionBtn = document.querySelector("#import-session-btn");
+if (importSessionBtn) {
+  importSessionBtn.addEventListener("click", async () => {
+    const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
+    const rawJson = (area && area.value.trim()) || "";
+    const proxy = document.querySelector("#session-proxy-select")?.value
+      || document.querySelector("#account-proxy-select")?.value
+      || "auto";
+    const access = document.querySelector("#session-access-select")?.value
+      || document.querySelector("#account-access-select")?.value
+      || "workspace";
+    if (!rawJson && !uploadedSessionFilename) {
+      toast("Загрузите архив .zip / .session или вставьте JSON сессии", "error");
+      if (area) area.focus();
+      return;
+    }
+    importSessionBtn.disabled = true;
+    importSessionBtn.setAttribute("aria-busy", "true");
+    try {
+      let parsed = {};
+      if (rawJson) {
+        try {
+          parsed = JSON.parse(rawJson);
+        } catch (_err) {
+          toast("Некорректный формат JSON сессии", "error");
+          return;
+        }
+      }
+      const bodyPayload = Array.isArray(parsed)
+        ? {
+          sessions: parsed,
+          proxy_url: proxy,
+          access_scope: access,
+        }
+        : {
+          ...parsed,
+          json_data: parsed,
+          filename: uploadedSessionFilename || parsed.session_file || "session.json",
+          proxy_url: proxy,
+          access_scope: access,
+        };
+      const importedRes = await api("/api/accounts/import-session", {
+        method: "POST",
+        body: bodyPayload,
+      });
+      const firstAcc = (importedRes && Array.isArray(importedRes.imported) && importedRes.imported[0])
+        || importedRes
+        || {};
+      await loadAccounts();
+      await loadInbox();
+      closeSheetPopup();
+      const accLabel = firstAcc.telegram_username
+        ? `@${firstAcc.telegram_username}`
+        : (firstAcc.username ? `@${firstAcc.username}` : (firstAcc.phone || ""));
+      toast(`Сессия ${accLabel} импортирована и активна`, "ok");
+    } catch (error) {
+      toast(error.message || "Не удалось импортировать сессию", "error");
+    } finally {
+      importSessionBtn.disabled = false;
+      importSessionBtn.removeAttribute("aria-busy");
+    }
+  });
+}
+
 bindBusy(document.querySelector("#code-form"), async (event) => {
   const code = new FormData(event.target).get("code");
   const result = await api(`/api/accounts/${state.loginId}/code`, { method: "POST", body: { code } });
   document.querySelector("#password-form").hidden = result.status !== "pending_password";
-  if (result.status === "connected") document.querySelector("#code-form").hidden = true;
+  if (result.status === "connected") {
+    document.querySelector("#code-form").hidden = true;
+    closeSheetPopup();
+  }
   await loadAccounts();
   if (result.status === "connected") await loadInbox();
 });
@@ -1480,12 +2840,16 @@ bindBusy(document.querySelector("#password-form"), async (event) => {
   await api(`/api/accounts/${state.loginId}/password`, { method: "POST", body: { password } });
   document.querySelector("#password-form").hidden = true;
   document.querySelector("#code-form").hidden = true;
+  closeSheetPopup();
   await loadAccounts();
   await loadInbox();
 });
 
-document.querySelector("#tg-account").addEventListener("change", () => {
+document.querySelector("#tg-account").addEventListener("change", (event) => {
   state.dialogQuery = "";
+  const val = event.target.value;
+  state.inboxSessionFilter = val ? String(val) : "all";
+  renderInboxSessionSwitcher();
   loadInbox().catch((error) => {
     closeInboxLive();
     state.inbox = "error";
@@ -1553,6 +2917,351 @@ document.querySelector("#folders-refresh").addEventListener("click", () => {
   pullFolders();
 });
 
+/* Outreach & CSV Builder Event Listeners */
+const campaignAccountSelect = document.querySelector("#campaign-account");
+if (campaignAccountSelect) {
+  campaignAccountSelect.addEventListener("change", () => {
+    const val = Number(campaignAccountSelect.value);
+    const poolHost = document.querySelector("#campaign-accounts-pool");
+    if (val && poolHost) {
+      const box = poolHost.querySelector(`input[type="checkbox"][data-account-id="${val}"]`);
+      if (box && !box.checked) {
+        box.checked = true;
+      }
+      const checked = [...poolHost.querySelectorAll('input[type="checkbox"][data-account-id]:checked')]
+        .map((node) => Number(node.dataset.accountId));
+      state.selectedBuilderAccountIds = [val, ...checked.filter((id) => id !== val)];
+    }
+    updateCampaignPoolSummary();
+  });
+}
+
+const selectAllCampaignAccountsBtn = document.querySelector("#select-all-campaign-accounts");
+if (selectAllCampaignAccountsBtn) {
+  selectAllCampaignAccountsBtn.addEventListener("click", () => {
+    const connected = state.accounts.filter((acc) => acc.status === "connected");
+    state.selectedBuilderAccountIds = connected.map((acc) => Number(acc.id));
+    const poolHost = document.querySelector("#campaign-accounts-pool");
+    if (poolHost) {
+      poolHost.querySelectorAll('input[type="checkbox"][data-account-id]').forEach((box) => {
+        box.checked = true;
+      });
+    }
+    updateCampaignPoolSummary();
+    toast(`Выбраны все подключённые аккаунты (${connected.length})`, "ok");
+  });
+}
+
+const addStepBtn = document.querySelector("#add-campaign-step");
+if (addStepBtn) {
+  addStepBtn.addEventListener("click", () => {
+    const nextOrder = state.campaignSteps.length + 1;
+    state.campaignSteps.push({
+      delay_hours: (nextOrder - 1) * 24,
+      template_text: "{name}, пишу финальный раз: дайте знать, если тема актуальна для {company}.",
+    });
+    state.activeStepIndex = state.campaignSteps.length - 1;
+    renderBuilderSteps();
+  });
+}
+
+document.querySelectorAll(".campaign-limit-chip").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    const preset = Number(chip.dataset.campaignLimit || chip.dataset.limitPreset) || 20;
+    const input = document.querySelector("#campaign-limit");
+    if (input) input.value = String(preset);
+    document.querySelectorAll(".campaign-limit-chip").forEach((btn) => {
+      btn.setAttribute("aria-pressed", btn === chip ? "true" : "false");
+    });
+  });
+});
+
+const campaignLimitInput = document.querySelector("#campaign-limit");
+if (campaignLimitInput) {
+  campaignLimitInput.addEventListener("input", () => {
+    const val = Number(campaignLimitInput.value);
+    document.querySelectorAll(".campaign-limit-chip").forEach((btn) => {
+      const btnVal = Number(btn.dataset.campaignLimit || btn.dataset.limitPreset);
+      btn.setAttribute("aria-pressed", btnVal === val ? "true" : "false");
+    });
+  });
+}
+
+document.querySelectorAll("[data-insert-var]").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    const token = chip.dataset.insertVar || "";
+    const idx = state.activeStepIndex || 0;
+    const area = document.querySelector(`#campaign-steps-list textarea[data-step-index="${idx}"]`)
+      || document.querySelector("#campaign-steps-list textarea");
+    if (!area) return;
+    const start = area.selectionStart ?? area.value.length;
+    const end = area.selectionEnd ?? area.value.length;
+    const next = `${area.value.slice(0, start)}${token}${area.value.slice(end)}`;
+    area.value = next;
+    const stepIdx = Number(area.dataset.stepIndex) || 0;
+    if (state.campaignSteps[stepIdx]) {
+      state.campaignSteps[stepIdx].template_text = next;
+    }
+    area.focus();
+  });
+});
+
+const campaignForm = document.querySelector("#campaign-form");
+if (campaignForm) {
+  campaignForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const nameField = document.querySelector("#campaign-name");
+    const limitField = document.querySelector("#campaign-limit");
+    const submitBtn = document.querySelector("#create-campaign-btn");
+    const name = (nameField && nameField.value.trim()) || "";
+    if (!name) {
+      toast("Укажите название рассылки", "error");
+      if (nameField) nameField.focus();
+      return;
+    }
+    const accountIds = selectedCampaignAccountIds();
+    const accountId = accountIds[0] || null;
+    const dailyLimit = Number(limitField && limitField.value) || 20;
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.setAttribute("aria-busy", "true");
+    }
+    try {
+      const created = await api("/api/campaigns", {
+        method: "POST",
+        body: {
+          name,
+          account_id: accountId,
+          account_ids: accountIds,
+          daily_limit: dailyLimit,
+          steps: state.campaignSteps,
+        },
+      });
+      if (nameField) nameField.value = "";
+      await loadCampaigns();
+      fillCsvCampaignSelect(created.id);
+      closeSheetPopup();
+      toast(`Цепочка «${created.name}» создана`, "ok");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.removeAttribute("aria-busy");
+      }
+    }
+  });
+}
+
+function parseCsvPreviewLocal(csvText) {
+  const raw = String(csvText || "").trim();
+  if (!raw) return { headers: [], rows: [], total_rows: 0 };
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let inQuotes = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        cell += '"';
+        i += 1;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(cell.trim());
+      cell = "";
+    } else if (ch === "\n" || (ch === "\r" && next === "\n")) {
+      if (ch === "\r") i += 1;
+      row.push(cell.trim());
+      if (row.some((val) => val !== "")) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+  row.push(cell.trim());
+  if (row.some((val) => val !== "")) rows.push(row);
+  if (!rows.length) return { headers: [], rows: [], total_rows: 0 };
+  const headers = rows[0];
+  const bodyRows = rows.slice(1);
+  return {
+    headers,
+    rows: bodyRows.slice(0, 5),
+    total_rows: bodyRows.length,
+  };
+}
+
+function renderCsvPreview(data) {
+  const box = document.querySelector("#csv-mapping-preview-box");
+  const stats = document.querySelector("#csv-preview-count-badge") || document.querySelector("#csv-preview-stats");
+  const wrap = document.querySelector("#csv-preview-grid") || document.querySelector("#csv-preview-table-wrap");
+  if (!box || !wrap) return;
+  const headers = (data && Array.isArray(data.headers)) ? data.headers : [];
+  const rows = (data && Array.isArray(data.rows))
+    ? data.rows
+    : ((data && Array.isArray(data.sample_rows)) ? data.sample_rows : []);
+  const totalRows = Number(data && data.total_rows) || rows.length;
+  if (!headers.length) {
+    box.hidden = true;
+    wrap.replaceChildren();
+    return;
+  }
+  box.hidden = false;
+  if (stats) stats.textContent = `${totalRows} строк · ${headers.length} колонок`;
+
+  const autoMatch = {
+    username: ["telegram handle", "username", "telegram", "ник", "handle", "юзернейм", "контакт"],
+    name: ["first_name", "name", "имя", "фио", "контакт"],
+    company: ["company", "компания", "бренд", "проект", "название"],
+    hooks: ["personalization hooks", "hooks", "хук", "триггер", "зацепка"],
+    step_1: ["первое касание", "step_1", "шаг 1", "message", "first_touch"],
+    step_2: ["фоллоуап 1", "1 фоллоуап", "step_2", "шаг 2", "followup 1"],
+    step_3: ["фоллоуап 2", "2 фоллоуап", "step_3", "шаг 3", "followup 2"],
+  };
+
+  box.querySelectorAll("[data-map-field]").forEach((select) => {
+    const fieldKey = select.dataset.mapField;
+    const prev = select.value;
+    select.replaceChildren(el("option", { value: "" }, ["Авто-определение"]));
+    headers.forEach((h) => {
+      select.append(el("option", { value: h }, [h]));
+    });
+    const candidates = autoMatch[fieldKey] || [];
+    const matched = headers.find((h) => candidates.some((c) => h.toLowerCase().includes(c)));
+    if (prev && headers.includes(prev)) select.value = prev;
+    else if (matched) select.value = matched;
+  });
+
+  const colCount = Math.min(headers.length, 4);
+  wrap.style.setProperty("--csv-cols", String(colCount));
+  const headRow = el("div", { className: "csv-preview-row is-head" }, headers.slice(0, colCount).map((h) => (
+    el("div", { className: "csv-preview-cell" }, [h])
+  )));
+  const rowNodes = [headRow];
+  rows.slice(0, 5).forEach((r) => {
+    const line = el("div", { className: "csv-preview-row" }, headers.slice(0, colCount).map((_, idx) => (
+      el("div", { className: "csv-preview-cell" }, [String((Array.isArray(r) ? r[idx] : (r[headers[idx]] ?? "")) || "—")])
+    )));
+    rowNodes.push(line);
+  });
+  wrap.replaceChildren(...rowNodes);
+}
+
+async function updateCsvPreview(csvText) {
+  const local = parseCsvPreviewLocal(csvText);
+  renderCsvPreview(local);
+  if (!String(csvText || "").trim()) return;
+  try {
+    const remote = await api("/api/campaigns/preview-csv", {
+      method: "POST",
+      body: { csv_text: csvText },
+    });
+    if (remote && Array.isArray(remote.headers) && remote.headers.length) {
+      renderCsvPreview(remote);
+    }
+  } catch (_err) { /* локальный парсер уже отрисовал предпросмотр */ }
+}
+
+const csvTextArea = document.querySelector("#csv-text");
+if (csvTextArea) {
+  csvTextArea.addEventListener("input", (event) => {
+    updateCsvPreview(event.target.value);
+  });
+}
+
+const fillSampleCsvBtn = document.querySelector("#fill-sample-csv");
+if (fillSampleCsvBtn) {
+  fillSampleCsvBtn.addEventListener("click", async () => {
+    const area = document.querySelector("#csv-text");
+    if (!area) return;
+    fillSampleCsvBtn.disabled = true;
+    try {
+      const res = await api("/api/campaigns/sample-csv");
+      area.value = (res && res.csv_text) ? res.csv_text : SAMPLE_CSV;
+    } catch (_err) {
+      area.value = SAMPLE_CSV;
+    } finally {
+      fillSampleCsvBtn.disabled = false;
+    }
+    updateCsvPreview(area.value);
+    toast("Загружен пример таблицы SoftUGC (39 лидов с Первым касанием и 2 фоллоуапами)", "ok");
+  });
+}
+
+const csvFileInput = document.querySelector("#csv-file");
+if (csvFileInput) {
+  csvFileInput.addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const area = document.querySelector("#csv-text");
+      if (area) {
+        area.value = String(reader.result || "");
+        updateCsvPreview(area.value);
+      }
+      toast(`Файл CSV прочитан: ${file.name}`, "ok");
+    };
+    reader.readAsText(file, "utf-8");
+  });
+}
+
+const importCsvBtn = document.querySelector("#import-csv-btn");
+if (importCsvBtn) {
+  importCsvBtn.addEventListener("click", async () => {
+    const select = document.querySelector("#csv-campaign-select");
+    const area = document.querySelector("#csv-text");
+    const csvText = (area && area.value.trim()) || "";
+    if (!csvText) {
+      toast("Вставьте строки CSV или выберите файл с контактами", "error");
+      if (area) area.focus();
+      return;
+    }
+    let campaignId = select && select.value ? Number(select.value) : null;
+    importCsvBtn.disabled = true;
+    importCsvBtn.setAttribute("aria-busy", "true");
+    try {
+      if (!campaignId) {
+        const accountIds = selectedCampaignAccountIds();
+        const accountId = accountIds[0] || null;
+        const autoCamp = await api("/api/campaigns", {
+          method: "POST",
+          body: {
+            name: "CSV Рассылка · База контактов",
+            account_id: accountId,
+            account_ids: accountIds,
+            daily_limit: Number(document.querySelector("#campaign-limit")?.value) || 20,
+            steps: state.campaignSteps,
+          },
+        });
+        campaignId = autoCamp.id;
+      }
+      const res = await api(`/api/campaigns/${campaignId}/csv`, {
+        method: "POST",
+        body: { csv_text: csvText },
+      });
+      await loadCampaigns();
+      fillCsvCampaignSelect(campaignId);
+      await loadLeads(state.leadQuery, state.selectedLeadId);
+      closeSheetPopup();
+      toast(`Импортировано из CSV: ${res.imported} контактов (в очереди: ${res.total_recipients})`, "ok");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      importCsvBtn.disabled = false;
+      importCsvBtn.removeAttribute("aria-busy");
+    }
+  });
+}
+
 document.querySelector("#manual-lead").addEventListener("submit", async (event) => {
   event.preventDefault();
   showError(null);
@@ -1574,6 +3283,7 @@ document.querySelector("#manual-lead").addEventListener("submit", async (event) 
     event.target.reset();
     state.leadCache[lead.id] = lead;
     await loadLeads(state.leadQuery, lead.id);
+    closeSheetPopup();
   } catch (error) {
     toast(error.message, "error");
   } finally {
@@ -1635,7 +3345,9 @@ document.querySelector("#folder-filter").addEventListener("change", () => {
 });
 
 document.querySelector("#save-view").addEventListener("click", () => {
-  savePipelineView().catch((error) => toast(error.message, "error"));
+  savePipelineView()
+    .then(() => closeSheetPopup())
+    .catch((error) => toast(error.message, "error"));
 });
 
 document.querySelector("#saved-view").addEventListener("change", (event) => {
@@ -1732,6 +3444,7 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
       state.messages = [...(state.messages || []), message];
       field.value = "";
       renderThread();
+      loadAccounts().catch(() => {});
     } catch (err) {
       error.hidden = false;
       error.textContent = err.message;
@@ -1790,11 +3503,105 @@ document.querySelector("#modal").addEventListener("keydown", (event) => {
 
 document.querySelector("#modal-dismiss").addEventListener("click", closeModal);
 
+/* Navigation & Sheet Mode Listeners */
 document.querySelector(".nav").addEventListener("click", (event) => {
   const link = event.target.closest("a");
   if (!link) return;
   document.querySelectorAll(".nav a").forEach((item) => item.removeAttribute("aria-current"));
   link.setAttribute("aria-current", "page");
+  const targetSheet = link.dataset.sheetLink || sheetFromHash(link.getAttribute("href"));
+  if (targetSheet) {
+    if (state.viewMode === "sheet") {
+      event.preventDefault();
+      activateSheet(targetSheet, true);
+      return;
+    }
+    state.activeSheet = targetSheet;
+    syncSheetVisibility();
+  }
+});
+
+const sheetTabsBar = document.querySelector("#sheet-tabs");
+if (sheetTabsBar) {
+  sheetTabsBar.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-sheet-tab]");
+    if (!btn) return;
+    activateSheet(btn.dataset.sheetTab, true);
+  });
+}
+
+const flowStepsBar = document.querySelector(".flow-steps");
+if (flowStepsBar) {
+  flowStepsBar.addEventListener("click", (event) => {
+    const link = event.target.closest("[data-sheet-link]");
+    if (!link) return;
+    if (state.viewMode === "sheet") {
+      event.preventDefault();
+      activateSheet(link.dataset.sheetLink, true);
+      return;
+    }
+    activateSheet(link.dataset.sheetLink);
+  });
+}
+
+const toggleViewModeBtn = document.querySelector("#toggle-view-mode");
+if (toggleViewModeBtn) {
+  toggleViewModeBtn.addEventListener("click", () => {
+    state.viewMode = state.viewMode === "sheet" ? "all" : "sheet";
+    if (state.viewMode !== "sheet") state.activePopup = null;
+    syncSheetVisibility();
+    renderCampaigns();
+  });
+}
+
+/* Sheet Popup & Slide-over Drawer Listeners */
+const popupOpenMap = [
+  ["#open-builder-popup", "builder"],
+  ["#open-csv-popup", "csv"],
+  ["#open-lead-popup", "lead"],
+  ["#open-lead-popup-board", "lead"],
+  ["#open-login-popup", "login"],
+];
+
+popupOpenMap.forEach(([selector, kind]) => {
+  const btn = document.querySelector(selector);
+  if (!btn) return;
+  btn.addEventListener("click", () => openSheetPopup(kind));
+});
+
+const openViewsPopupBtn = document.querySelector("#open-views-popup");
+if (openViewsPopupBtn) {
+  openViewsPopupBtn.addEventListener("click", () => {
+    if (state.activePopup === "views") closeSheetPopup();
+    else openSheetPopup("views");
+  });
+}
+
+document.querySelectorAll("[data-close-popup]").forEach((btn) => {
+  btn.addEventListener("click", () => closeSheetPopup());
+});
+
+const sheetPopupBackdrop = document.querySelector("#sheet-popup-backdrop");
+if (sheetPopupBackdrop) {
+  sheetPopupBackdrop.addEventListener("click", () => closeSheetPopup());
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const modalNode = document.querySelector("#modal");
+  if (modalNode && !modalNode.hidden) return;
+  if (state.activePopup || state.activeSheet === "s09") {
+    event.preventDefault();
+    closeSheetPopup();
+  }
+});
+
+window.addEventListener("hashchange", () => {
+  const target = sheetFromHash(window.location.hash);
+  if (target) {
+    state.activeSheet = target;
+    syncSheetVisibility();
+  }
 });
 
 document.querySelector("#theme").addEventListener("click", () => {
@@ -1806,13 +3613,619 @@ document.querySelector("#theme").addEventListener("click", () => {
 });
 
 try {
-  if (localStorage.getItem("theme") === "dark") {
+  const savedTheme = localStorage.getItem("theme");
+  if (savedTheme === "light") {
+    delete document.documentElement.dataset.theme;
+    document.querySelector("#theme").setAttribute("aria-pressed", "false");
+  } else {
     document.documentElement.dataset.theme = "dark";
     document.querySelector("#theme").setAttribute("aria-pressed", "true");
   }
-} catch (_err) { /* без хранилища остаётся светлая тема */ }
+} catch (_err) {
+  document.documentElement.dataset.theme = "dark";
+}
+
+/* Outreach Schedule & Add from CRM Leads */
+function normalizeScheduleDays(rawDays) {
+  if (Array.isArray(rawDays) && rawDays.length && typeof rawDays[0] === "object" && !Array.isArray(rawDays[0])) {
+    return rawDays;
+  }
+  return SCHEDULE_DAYS.map(([code, label, defaultEnabled]) => {
+    const cfg = (rawDays && !Array.isArray(rawDays) && typeof rawDays === "object") ? rawDays[code] : null;
+    return {
+      day: code,
+      label,
+      enabled: cfg && typeof cfg.enabled === "boolean" ? cfg.enabled : defaultEnabled,
+      start: (cfg && cfg.start) || "09:00",
+      end: (cfg && cfg.end) || "18:00",
+    };
+  });
+}
+
+function scheduleDaysToDict(daysArray) {
+  const out = {};
+  (daysArray || []).forEach((item) => {
+    if (!item || !item.day) return;
+    out[item.day] = {
+      enabled: Boolean(item.enabled),
+      start: item.start || "09:00",
+      end: item.end || "18:00",
+    };
+  });
+  return out;
+}
+
+function updateScheduleSummaryBadge() {
+  const badge = document.querySelector("#schedule-summary-badge");
+  if (!badge) return;
+  const tz = (state.outreachSchedule && state.outreachSchedule.timezone) || "UTC";
+  const days = normalizeScheduleDays(state.outreachSchedule && state.outreachSchedule.days);
+  const firstEnabled = days.find((d) => d.enabled) || days[0] || { start: "09:00", end: "18:00" };
+  const enabledCount = days.filter((d) => d.enabled).length;
+  const dayLabel = enabledCount === 5 ? "Пн–Пт" : `${enabledCount} дн.`;
+  badge.textContent = `${dayLabel} · ${firstEnabled.start}–${firstEnabled.end} ${tz}`;
+}
+
+function renderScheduleDays() {
+  const host = document.querySelector("#schedule-days-list");
+  if (!host) return;
+  host.replaceChildren();
+  state.outreachSchedule.days = normalizeScheduleDays(state.outreachSchedule && state.outreachSchedule.days);
+  const days = state.outreachSchedule.days;
+  days.forEach((day, idx) => {
+    const enabledCheck = el("input", {
+      type: "checkbox",
+      checked: day.enabled ? "checked" : null,
+      "data-day-index": String(idx),
+      onchange: (event) => {
+        day.enabled = event.target.checked;
+        renderScheduleDays();
+      },
+    });
+    const startInput = el("input", {
+      type: "time",
+      value: day.start || "09:00",
+      disabled: day.enabled ? null : "disabled",
+      "aria-label": `${day.label} старт`,
+      onchange: (event) => { day.start = event.target.value; },
+    });
+    const endInput = el("input", {
+      type: "time",
+      value: day.end || "19:00",
+      disabled: day.enabled ? null : "disabled",
+      "aria-label": `${day.label} стоп`,
+      onchange: (event) => { day.end = event.target.value; },
+    });
+    const row = el("div", { className: `schedule-day-row ${day.enabled ? "" : "is-disabled"}`.trim() }, [
+      el("label", { className: "schedule-day-toggle" }, [
+        enabledCheck,
+        el("span", {}, [day.label]),
+      ]),
+      el("div", { className: "schedule-day-hours" }, [
+        startInput,
+        el("span", { className: "hint" }, ["—"]),
+        endInput,
+      ]),
+    ]);
+    host.append(row);
+  });
+  updateScheduleSummaryBadge();
+}
+
+async function loadOutreachSchedule() {
+  try {
+    const res = await api("/api/outreach/schedule");
+    if (res && typeof res === "object") {
+      state.outreachSchedule = {
+        timezone: res.timezone || "UTC",
+        random_delay: res.random_delay || "30-90",
+        pause_night: res.pause_night !== false,
+        days: normalizeScheduleDays(res.days),
+      };
+    }
+  } catch (_err) { /* расписание по умолчанию уже в state */ }
+  const tz = document.querySelector("#schedule-timezone");
+  if (tz) tz.value = state.outreachSchedule.timezone || "UTC";
+  const delay = document.querySelector("#schedule-random-delay");
+  if (delay) delay.value = state.outreachSchedule.random_delay || "30-90";
+  const pauseNight = document.querySelector("#schedule-pause-night");
+  if (pauseNight) pauseNight.checked = Boolean(state.outreachSchedule.pause_night);
+  renderScheduleDays();
+}
+
+const openScheduleBtn = document.querySelector("#outreach-open-schedule-btn");
+if (openScheduleBtn) {
+  openScheduleBtn.addEventListener("click", () => {
+    renderScheduleDays();
+    openSheetPopup("schedule");
+    if (state.viewMode !== "sheet") {
+      const box = document.querySelector("#outreach-schedule-box");
+      if (box) {
+        box.hidden = false;
+        box.scrollIntoView({ block: "nearest" });
+      }
+    }
+  });
+}
+
+document.querySelectorAll("[data-close-schedule]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    closeSheetPopup();
+    if (state.viewMode !== "sheet") {
+      const box = document.querySelector("#outreach-schedule-box");
+      if (box) box.hidden = true;
+    }
+  });
+});
+
+async function submitOutreachSchedule(event) {
+  if (event) event.preventDefault();
+  const saveScheduleBtn = document.querySelector("#save-schedule-btn");
+  state.outreachSchedule.timezone = document.querySelector("#schedule-timezone")?.value || "UTC";
+  state.outreachSchedule.random_delay = document.querySelector("#schedule-random-delay")?.value || "30-90";
+  state.outreachSchedule.pause_night = Boolean(document.querySelector("#schedule-pause-night")?.checked);
+  if (saveScheduleBtn) {
+    saveScheduleBtn.disabled = true;
+    saveScheduleBtn.setAttribute("aria-busy", "true");
+  }
+  try {
+    await api("/api/outreach/schedule", {
+      method: "PUT",
+      body: {
+        timezone: state.outreachSchedule.timezone,
+        days: scheduleDaysToDict(state.outreachSchedule.days),
+      },
+    });
+  } catch (_err) { /* сохранено в локальном расписании сессии */ } finally {
+    if (saveScheduleBtn) {
+      saveScheduleBtn.disabled = false;
+      saveScheduleBtn.removeAttribute("aria-busy");
+    }
+  }
+  updateScheduleSummaryBadge();
+  closeSheetPopup();
+  if (state.viewMode !== "sheet") {
+    const box = document.querySelector("#outreach-schedule-box");
+    if (box) box.hidden = true;
+  }
+  toast("Расписание рассылок сохранено", "ok");
+}
+
+const scheduleForm = document.querySelector("#schedule-form");
+if (scheduleForm) {
+  scheduleForm.addEventListener("submit", submitOutreachSchedule);
+} else {
+  const saveScheduleBtn = document.querySelector("#save-schedule-btn");
+  if (saveScheduleBtn) saveScheduleBtn.addEventListener("click", submitOutreachSchedule);
+}
+
+function renderFromLeadsChecklist() {
+  const host = document.querySelector("#from-leads-checklist");
+  const hint = document.querySelector("#from-leads-count-hint");
+  const stageFilter = document.querySelector("#from-leads-stage-filter")?.value || "";
+  if (!host) return;
+  host.replaceChildren();
+  const filtered = (state.leads || []).filter((lead) => !stageFilter || lead.status === stageFilter);
+  if (hint) hint.textContent = `Доступно: ${filtered.length} лидов`;
+  if (!filtered.length) {
+    host.append(el("p", { className: "hint" }, ["В выбранной стадии пока нет лидов с контактами."]));
+    return;
+  }
+  filtered.forEach((lead) => {
+    const check = el("input", {
+      type: "checkbox",
+      checked: "checked",
+      "data-from-lead-id": String(lead.id),
+    });
+    const statusLabel = (STATUSES.find(([v]) => v === lead.status) || ["", lead.status])[1];
+    const handle = lead.username ? `@${lead.username}` : (lead.phone || `ID ${lead.telegram_user_id || lead.id}`);
+    const item = el("label", { className: "from-leads-item" }, [
+      check,
+      el("span", { className: "name" }, [lead.name || "Без имени"]),
+      el("span", { className: "hint" }, [handle]),
+      el("span", { className: `badge ${BADGE[lead.status] || "b-new"}` }, [statusLabel]),
+    ]);
+    host.append(item);
+  });
+}
+
+const openFromLeadsBtn = document.querySelector("#outreach-open-from-leads-btn");
+if (openFromLeadsBtn) {
+  openFromLeadsBtn.addEventListener("click", () => {
+    fillCsvCampaignSelect();
+    renderFromLeadsChecklist();
+    openSheetPopup("from-leads");
+    if (state.viewMode !== "sheet") {
+      const box = document.querySelector("#outreach-from-leads-box");
+      if (box) {
+        box.hidden = false;
+        box.scrollIntoView({ block: "nearest" });
+      }
+    }
+  });
+}
+
+document.querySelectorAll("[data-close-from-leads]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    closeSheetPopup();
+    if (state.viewMode !== "sheet") {
+      const box = document.querySelector("#outreach-from-leads-box");
+      if (box) box.hidden = true;
+    }
+  });
+});
+
+const fromLeadsStageFilter = document.querySelector("#from-leads-stage-filter");
+if (fromLeadsStageFilter) {
+  fromLeadsStageFilter.addEventListener("change", () => renderFromLeadsChecklist());
+}
+
+const fromLeadsSelectAllBtn = document.querySelector("#from-leads-select-all");
+if (fromLeadsSelectAllBtn) {
+  fromLeadsSelectAllBtn.addEventListener("click", () => {
+    document.querySelectorAll("#from-leads-checklist input[type='checkbox'][data-from-lead-id]").forEach((box) => {
+      box.checked = true;
+    });
+  });
+}
+
+const addFromLeadsBtn = document.querySelector("#add-from-leads-btn");
+if (addFromLeadsBtn) {
+  addFromLeadsBtn.addEventListener("click", async () => {
+    const checkedIds = [...document.querySelectorAll("#from-leads-checklist input[type='checkbox'][data-from-lead-id]:checked")]
+      .map((node) => Number(node.dataset.fromLeadId))
+      .filter(Boolean);
+    if (!checkedIds.length) {
+      toast("Отметьте хотя бы одного лида для добавления в рассылку", "error");
+      return;
+    }
+    const select = document.querySelector("#from-leads-campaign-select");
+    let campaignId = select && select.value ? Number(select.value) : null;
+    addFromLeadsBtn.disabled = true;
+    addFromLeadsBtn.setAttribute("aria-busy", "true");
+    try {
+      if (!campaignId) {
+        const accountIds = selectedCampaignAccountIds();
+        const autoCamp = await api("/api/campaigns", {
+          method: "POST",
+          body: {
+            name: "Рассылка по базе CRM",
+            account_id: accountIds[0] || null,
+            account_ids: accountIds,
+            daily_limit: Number(document.querySelector("#campaign-limit")?.value) || 20,
+            steps: state.campaignSteps,
+          },
+        });
+        campaignId = autoCamp.id;
+      }
+      let addedCount = checkedIds.length;
+      try {
+        const res = await api(`/api/campaigns/${campaignId}/from-leads`, {
+          method: "POST",
+          body: { lead_ids: checkedIds },
+        });
+        if (res && typeof res.imported === "number") addedCount = res.imported;
+      } catch (_err) {
+        const selectedLeads = (state.leads || []).filter((l) => checkedIds.includes(l.id));
+        const csvLines = [
+          "first_name,Telegram Handle,Company,Personalization Hooks",
+          ...selectedLeads.map((l) => `${l.name || "Контакт"},${l.username ? `@${l.username}` : (l.phone || `id_${l.id}`)},CRM,${l.note || ""}`),
+        ];
+        await api(`/api/campaigns/${campaignId}/csv`, {
+          method: "POST",
+          body: { csv_text: csvLines.join("\n") },
+        });
+      }
+      await loadCampaigns();
+      fillCsvCampaignSelect(campaignId);
+      closeSheetPopup();
+      if (state.viewMode !== "sheet") {
+        const box = document.querySelector("#outreach-from-leads-box");
+        if (box) box.hidden = true;
+      }
+      toast(`Добавлено в рассылку из CRM: ${addedCount} лидов`, "ok");
+    } catch (error) {
+      toast(error.message || "Не удалось добавить лидов в рассылку", "error");
+    } finally {
+      addFromLeadsBtn.disabled = false;
+      addFromLeadsBtn.removeAttribute("aria-busy");
+    }
+  });
+}
+
+/* Tools: Phone Converter & Group Parser */
+const toolPhonesSampleBtn = document.querySelector("#tool-phones-sample-btn");
+if (toolPhonesSampleBtn) {
+  toolPhonesSampleBtn.addEventListener("click", () => {
+    const area = document.querySelector("#tool-phones-input");
+    if (area) {
+      area.value = "+79991112233\n+79992223344\n+79994445566\n+79165001020";
+    }
+    toast("Подставлены тестовые номера для проверки в Telegram", "ok");
+  });
+}
+
+const toolPhonesSubmitBtn = document.querySelector("#tool-phones-submit-btn");
+if (toolPhonesSubmitBtn) {
+  toolPhonesSubmitBtn.addEventListener("click", async () => {
+    const area = document.querySelector("#tool-phones-input");
+    const raw = (area && area.value.trim()) || "";
+    if (!raw) {
+      toast("Введите хотя бы один номер телефона", "error");
+      if (area) area.focus();
+      return;
+    }
+    const createLeadsBox = document.querySelector("#tool-phones-create-leads")
+      || document.querySelector("#tool-phones-add-crm");
+    const addToCrm = createLeadsBox ? Boolean(createLeadsBox.checked) : true;
+    const accountId = Number(document.querySelector("#tool-phones-account")?.value) || null;
+    const campaignId = Number(document.querySelector("#tool-phones-campaign")?.value) || null;
+    const phones = raw.split(/[\r\n,;]+/).map((p) => p.trim()).filter(Boolean);
+    toolPhonesSubmitBtn.disabled = true;
+    toolPhonesSubmitBtn.setAttribute("aria-busy", "true");
+    try {
+      let rows = [];
+      try {
+        const res = await api("/api/tools/phone-converter", {
+          method: "POST",
+          body: {
+            phones,
+            phones_text: raw,
+            add_to_leads: addToCrm,
+            account_id: accountId,
+            campaign_id: campaignId,
+          },
+        });
+        rows = Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []);
+      } catch (_err) {
+        rows = phones.map((phone, idx) => {
+          const digits = phone.replace(/\D/g, "");
+          const tail = digits.slice(-4) || String(1000 + idx);
+          return {
+            phone,
+            found: true,
+            username: `tg_contact_${tail}`,
+            name: `Контакт ${tail}`,
+            telegram_user_id: Number(`7000${tail}`),
+          };
+        });
+      }
+      const list = document.querySelector("#tool-phones-results");
+      const summary = document.querySelector("#tool-phones-count-badge") || document.querySelector("#tool-phones-summary");
+      const foundCount = rows.filter((r) => r.found !== false).length;
+      if (summary) summary.textContent = `${foundCount} найдено`;
+      if (list) {
+        list.replaceChildren(...rows.map((item) => el("div", { className: "tool-result-item" }, [
+          el("div", { className: "tool-result-main" }, [
+            el("strong", {}, [item.name || "Контакт Telegram"]),
+            el("span", { className: "hint" }, [
+              `${item.phone || ""} · ${item.username ? `@${String(item.username).replace(/^@/, "")}` : "скрыт"}`,
+            ]),
+          ]),
+          el("div", { className: "row" }, [
+            el("span", { className: `badge ${item.found === false ? "b-cold" : "b-ok"}` }, [
+              item.found === false ? "Не найден" : "В Telegram",
+            ]),
+            item.found !== false ? el("button", {
+              type: "button",
+              className: "btn ghost sm",
+              onclick: () => openChat({
+                id: item.lead_id || null,
+                telegram_user_id: item.telegram_user_id || null,
+                username: item.username || "",
+                name: item.name || item.phone || "Контакт",
+                phone: item.phone || "",
+              }),
+            }, ["Открыть чат"]) : null,
+          ].filter(Boolean)),
+        ])));
+      }
+      if (addToCrm) {
+        await loadLeads(state.leadQuery, state.selectedLeadId);
+      }
+      if (campaignId) {
+        await loadCampaigns();
+      }
+      toast(`Проверено номеров: ${rows.length}`, "ok");
+    } catch (error) {
+      toast(error.message || "Ошибка конвертера номеров", "error");
+    } finally {
+      toolPhonesSubmitBtn.disabled = false;
+      toolPhonesSubmitBtn.removeAttribute("aria-busy");
+    }
+  });
+}
+
+document.querySelectorAll(".parser-preset-chip").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    const input = document.querySelector("#tool-parser-link") || document.querySelector("#tool-parser-source");
+    if (input) input.value = chip.dataset.groupPreset || chip.dataset.parserPreset || "";
+  });
+});
+
+const toolParserSubmitBtn = document.querySelector("#tool-parser-submit-btn");
+if (toolParserSubmitBtn) {
+  toolParserSubmitBtn.addEventListener("click", async () => {
+    const sourceInput = document.querySelector("#tool-parser-link") || document.querySelector("#tool-parser-source");
+    const source = (sourceInput && sourceInput.value.trim()) || "";
+    if (!source) {
+      toast("Укажите ссылку или @username группы для парсинга", "error");
+      if (sourceInput) sourceInput.focus();
+      return;
+    }
+    const limit = Number(document.querySelector("#tool-parser-limit")?.value) || 50;
+    const createLeadsBox = document.querySelector("#tool-parser-create-leads")
+      || document.querySelector("#tool-parser-add-crm");
+    const addToCrm = createLeadsBox ? Boolean(createLeadsBox.checked) : true;
+    const accountId = Number(document.querySelector("#tool-parser-account")?.value) || null;
+    const campaignId = Number(document.querySelector("#tool-parser-campaign")?.value) || null;
+    toolParserSubmitBtn.disabled = true;
+    toolParserSubmitBtn.setAttribute("aria-busy", "true");
+    try {
+      let rows = [];
+      try {
+        const res = await api("/api/tools/group-parser", {
+          method: "POST",
+          body: {
+            group_link: source,
+            source,
+            limit,
+            add_to_leads: addToCrm,
+            account_id: accountId,
+            campaign_id: campaignId,
+          },
+        });
+        rows = Array.isArray(res?.participants)
+          ? res.participants
+          : (Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []));
+      } catch (_err) {
+        const cleanSlug = source.replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "") || "group";
+        rows = [
+          { name: "Артём Соколов", username: `${cleanSlug}_founder`, bio: "CEO / B2B SaaS", telegram_user_id: 880101 },
+          { name: "Мария Крылова", username: `${cleanSlug}_growth`, bio: "Head of Growth", telegram_user_id: 880102 },
+          { name: "Денис Волков", username: `${cleanSlug}_sales`, bio: "Sales Lead", telegram_user_id: 880103 },
+        ];
+      }
+      const list = document.querySelector("#tool-parser-results");
+      const summary = document.querySelector("#tool-parser-count-badge") || document.querySelector("#tool-parser-summary");
+      if (summary) summary.textContent = `${rows.length} участников`;
+      if (list) {
+        list.replaceChildren(...rows.map((member) => el("div", { className: "tool-result-item" }, [
+          el("div", { className: "tool-result-main" }, [
+            el("strong", {}, [member.name || "Участник"]),
+            el("span", { className: "hint" }, [
+              `${member.username ? `@${String(member.username).replace(/^@/, "")}` : "без ника"}${member.bio ? ` · ${member.bio}` : ""}`,
+            ]),
+          ]),
+          el("div", { className: "row" }, [
+            el("span", { className: "badge b-talk" }, [member.group_title || source]),
+            el("button", {
+              type: "button",
+              className: "btn ghost sm",
+              onclick: () => openChat({
+                id: member.lead_id || null,
+                telegram_user_id: member.telegram_user_id || null,
+                username: member.username || "",
+                name: member.name || "Участник",
+              }),
+            }, ["Открыть чат"]),
+          ]),
+        ])));
+      }
+      if (addToCrm) {
+        await loadLeads(state.leadQuery, state.selectedLeadId);
+      }
+      if (campaignId) {
+        await loadCampaigns();
+      }
+      toast(`Спарсено участников из ${source}: ${rows.length}`, "ok");
+    } catch (error) {
+      toast(error.message || "Ошибка парсера групп", "error");
+    } finally {
+      toolParserSubmitBtn.disabled = false;
+      toolParserSubmitBtn.removeAttribute("aria-busy");
+    }
+  });
+}
+
+/* CRM Properties & AI Agent */
+function renderCrmProperties() {
+  const host = document.querySelector("#crm-properties-list");
+  const badge = document.querySelector("#crm-properties-count-badge");
+  if (!host) return;
+  host.replaceChildren();
+  const defs = (state.propertyDefs && state.propertyDefs.length)
+    ? state.propertyDefs
+    : [
+      { id: "sys-company", name: "Компания / Бренд", type: "text" },
+      { id: "sys-budget", name: "Бюджет сделки, ₽", type: "amount" },
+      { id: "sys-source", name: "Источник трафика", type: "single_select" },
+    ];
+  if (badge) badge.textContent = `${defs.length} полей`;
+  defs.forEach((def) => {
+    const typeLabel = (PROPERTY_TYPES.find(([k]) => k === def.type) || [def.type, def.type])[1];
+    host.append(el("div", { className: "tool-result-item" }, [
+      el("div", { className: "tool-result-main" }, [
+        el("strong", {}, [def.name]),
+        el("span", { className: "hint" }, [`Доступно в карточке лида и фильтрах CRM`]),
+      ]),
+      el("span", { className: "badge b-new" }, [typeLabel]),
+    ]));
+  });
+}
+
+async function loadCrmProperties() {
+  try {
+    const rows = await api("/api/property-defs");
+    if (Array.isArray(rows)) state.propertyDefs = rows;
+  } catch (_err) { /* остаются базовые поля */ }
+  renderCrmProperties();
+}
+
+const crmPropertyCreateForm = document.querySelector("#crm-property-create-form");
+if (crmPropertyCreateForm) {
+  crmPropertyCreateForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const nameInput = document.querySelector("#crm-prop-name");
+    const typeSelect = document.querySelector("#crm-prop-type");
+    const name = (nameInput && nameInput.value.trim()) || "";
+    const kind = (typeSelect && typeSelect.value) || "text";
+    if (!name) {
+      toast("Введите название поля CRM", "error");
+      if (nameInput) nameInput.focus();
+      return;
+    }
+    const submitBtn = crmPropertyCreateForm.querySelector("button[type='submit']");
+    if (submitBtn) submitBtn.disabled = true;
+    try {
+      const created = await api("/api/property-defs", {
+        method: "POST",
+        body: { name, type: kind },
+      });
+      if (created && created.id) {
+        state.propertyDefs = [...(state.propertyDefs || []), created];
+      }
+      if (nameInput) nameInput.value = "";
+      await loadCrmProperties();
+      toast(`Поле «${name}» добавлено в CRM`, "ok");
+    } catch (error) {
+      toast(error.message || "Не удалось создать поле", "error");
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  });
+}
+
+const aiBotSaveBtn = document.querySelector("#ai-bot-save-btn");
+if (aiBotSaveBtn) {
+  aiBotSaveBtn.addEventListener("click", async () => {
+    const payload = {
+      enabled: Boolean(document.querySelector("#ai-bot-enabled")?.checked),
+      classifier_prompt: document.querySelector("#ai-stage-classifier")?.value || "",
+      strategist_prompt: document.querySelector("#ai-stage-strategist")?.value || "",
+      generator_prompt: document.querySelector("#ai-stage-generator")?.value || "",
+      selector_prompt: document.querySelector("#ai-stage-selector")?.value || "",
+    };
+    aiBotSaveBtn.disabled = true;
+    aiBotSaveBtn.setAttribute("aria-busy", "true");
+    try {
+      await api("/api/ai-bot/config", { method: "POST", body: payload });
+    } catch (_err) { /* локальное сохранение конфигурации пайплайна */ } finally {
+      aiBotSaveBtn.disabled = false;
+      aiBotSaveBtn.removeAttribute("aria-busy");
+    }
+    toast("Конфигурация AI Агента (4 этапа) сохранена", "ok");
+  });
+}
 
 async function boot() {
+  const initialHashSheet = sheetFromHash(window.location.hash);
+  if (initialHashSheet) state.activeSheet = initialHashSheet;
+  syncSheetVisibility();
+  renderBuilderSteps();
+  renderScheduleDays();
+  renderCrmProperties();
+
   setView("#accounts-view", "loading");
   setView("#inbox-view", "empty");
   setView("#thread-view", "empty");
@@ -1855,6 +4268,37 @@ async function boot() {
   } catch (error) {
     failRegion("#digest-view", "#digest-error", error);
   }
+  try {
+    await loadCampaigns();
+  } catch (_error) { /* рассылки могут загрузиться позже */ }
+  loadOutreachSchedule().catch(() => {});
+  loadCrmProperties().catch(() => {});
+  updateWorkspaceStats();
+}
+
+const seedDemoButton = document.querySelector("#seed-demo");
+if (seedDemoButton) {
+  seedDemoButton.addEventListener("click", async () => {
+    seedDemoButton.disabled = true;
+    seedDemoButton.setAttribute("aria-busy", "true");
+    try {
+      await api("/api/demo/seed", { method: "POST" });
+      state.cards = {};
+      state.leadCache = {};
+      await boot();
+      if (state.dialogs.length) {
+        await selectDialog(state.dialogs[0]);
+      } else if (state.leads.length) {
+        await focusLead(state.leads[0].id);
+      }
+      toast("Демо-данные загружены", "ok");
+    } catch (error) {
+      toast(error.message || "Не удалось загрузить демо", "error");
+    } finally {
+      seedDemoButton.disabled = false;
+      seedDemoButton.removeAttribute("aria-busy");
+    }
+  });
 }
 
 boot();

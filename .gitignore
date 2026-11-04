@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+.env
+*.session
+*.session-journal
+.DS_Store
+node_modules/
+e2e/.tmp/
+e2e/test-results/
+e2e/playwright-report/
+test-results/
+playwright-report/

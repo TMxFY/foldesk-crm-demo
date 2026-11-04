@@ -82,6 +82,35 @@ def create_property_def(conn, *, name: str, type_: str, object_type: str = "lead
     return as_dict(row)
 
 
+def list_property_defs(conn, object_type: str | None = None) -> list[dict]:
+    if object_type and str(object_type).strip():
+        clean_obj = str(object_type).strip()
+        if clean_obj not in OBJECTS:
+            raise ValueError("Неизвестный объект поля")
+        rows = conn.execute(
+            "SELECT * FROM property_defs WHERE object_type = ? ORDER BY position, id",
+            (clean_obj,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM property_defs ORDER BY object_type, position, id"
+        ).fetchall()
+    return [as_dict(row) for row in rows]
+
+
+def delete_property_def(conn, prop_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM property_defs WHERE id = ?",
+        (int(prop_id),),
+    ).fetchone()
+    if row is None:
+        raise LookupError("property")
+    conn.execute("DELETE FROM property_values WHERE property_id = ?", (int(prop_id),))
+    conn.execute("DELETE FROM property_defs WHERE id = ?", (int(prop_id),))
+    conn.commit()
+    return {"deleted": True, "id": int(prop_id)}
+
+
 def list_lead_properties(conn, lead_id: int) -> list:
     rows = conn.execute(
         """
