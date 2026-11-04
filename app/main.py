@@ -453,13 +453,6 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     if conn is None:
         conn = connect()
     init_db(conn)
-    if os.getenv("DEMO_AUTOSEED", "").strip().lower() in ("1", "true", "yes"):
-        existing_acc = conn.execute("SELECT COUNT(*) AS cnt FROM accounts").fetchone()
-        if not existing_acc or int(existing_acc["cnt"] or 0) == 0:
-            try:
-                seed_demo(conn)
-            except Exception:
-                pass
     app.state.conn = conn
     app.state.gateway = gateway
     app.state.wa_gateway = WhatsAppGateway()

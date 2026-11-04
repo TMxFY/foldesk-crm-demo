@@ -6,7 +6,5 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/accounts
     envVars:
-      - key: DEMO_AUTOSEED
-        value: "0"
       - key: PORT
         value: "8000"
