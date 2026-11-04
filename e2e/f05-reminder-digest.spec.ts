@@ -121,21 +121,22 @@ test('F05-E5 open the lead from the digest while CRM search hides the row', asyn
   await expect(page.getByRole('cell', { name: '@ivan_p' })).toHaveCount(0);
 });
 
-test('F05-H3 a dated task on the card is a reminder', async ({ page }) => {
+test('F05-H3 a card task has no due date', async ({ page }) => {
   const card = page.getByRole('region', { name: 'Карточка' });
+  await expect(card.getByLabel('Дата задачи')).toHaveCount(0);
+  await expect(card.getByLabel('Время задачи')).toHaveCount(0);
   await card.getByLabel('Текст задачи').fill('написать');
-  await card.getByLabel('Дата задачи').fill('2026-12-20');
-  await card.getByLabel('Время задачи').fill('15:00');
   await card.getByRole('button', { name: 'Поставить задачу' }).click();
-  await expect(card.getByText('написать')).toBeVisible();
-  await expect(card.getByText('15:00')).toBeVisible();
-  const open = await (await page.request.get('/api/reminders?scope=open')).json();
-  expect(open.filter((row: { text: string }) => row.text === 'написать')).toHaveLength(1);
-  await card.getByRole('button', { name: 'Задача сделана: написать' }).click();
-  await expect(card.getByRole('button', { name: 'Задача сделана: написать' })).toHaveCount(0);
-  const all = await (await page.request.get('/api/reminders?scope=all')).json();
-  const task = all.find((row: { text: string }) => row.text === 'написать');
-  expect(task.done_at).toBeTruthy();
+  await expect(card.getByRole('checkbox', { name: 'написать' })).toBeVisible();
+  const lead = (await (await page.request.get('/api/leads')).json())[0];
+  let body = await (await page.request.get(`/api/leads/${lead.id}/card`)).json();
+  const open = body.tasks.find((row: { title: string }) => row.title === 'написать');
+  expect(open.done_at).toBeNull();
+  expect(open.due_at).toBeUndefined();
+  expect(await (await page.request.get('/api/reminders?scope=all')).json()).toEqual([]);
+  await card.getByRole('checkbox', { name: 'написать' }).check();
+  body = await (await page.request.get(`/api/leads/${lead.id}/card`)).json();
+  expect(body.tasks.find((row: { title: string }) => row.title === 'написать').done_at).toBeTruthy();
 });
 
 test('F05-N1 missing lead cannot take a reminder', async ({ page }) => {

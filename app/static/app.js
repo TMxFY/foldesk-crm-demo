@@ -21,6 +21,17 @@ const ACCOUNT_STATUS = {
   error: ["ошибка входа", "b-bad"],
 };
 
+const PROPERTY_TYPES = [
+  ["text", "Текст"],
+  ["textarea", "Длинный текст"],
+  ["single_select", "Один вариант"],
+  ["multi_select", "Несколько вариантов"],
+  ["url", "Ссылка"],
+  ["email", "Почта"],
+  ["tel", "Телефон"],
+  ["amount", "Сумма"],
+];
+
 const state = {
   mode: "crm",
   scope: "open",
@@ -36,6 +47,7 @@ const state = {
   inbox: "empty",
   selectedDialog: null,
   selectedLeadId: null,
+  cards: {},
 };
 
 let modalSubmit = null;
@@ -43,6 +55,7 @@ let modalReturn = null;
 let toastTimer = 0;
 let inboxSource = null;
 let inboxLiveAccount = "";
+let cardToken = 0;
 
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -165,6 +178,7 @@ function textField(lead, field, label) {
 async function patchLead(id, body) {
   try {
     const updated = await api(`/api/leads/${id}`, { method: "PATCH", body });
+    delete state.cards[id];
     state.leadCache[updated.id] = updated;
     await loadLeads(state.leadQuery, updated.id);
   } catch (error) {
@@ -413,7 +427,7 @@ function renderSide() {
       el("h3", { className: "name" }, [lead.name || "Без имени"]),
       el("span", { className: `badge ${badge}` }, [label]),
       el("p", { className: "hint" }, [lead.username ? `@${lead.username}` : "без ника"]),
-      el("p", { className: "note" }, [lead.note || "Заметок пока нет"]),
+      el("p", { className: "note" }, [sideNoteText(lead)]),
       el("p", { className: "hint" }, [lead.next_step ? `Дальше: ${lead.next_step}` : "Следующий шаг не задан"]),
       el("a", { className: "btn secondary sm", href: "#s09" }, ["Открыть карточку"]),
     ]),
@@ -435,10 +449,26 @@ function safeHref(url) {
   return /^https?:\/\//i.test(text) ? text : "";
 }
 
+function sideNoteText(lead) {
+  const card = state.cards[lead.id];
+  if (card && card.notes && card.notes.length) return card.notes[card.notes.length - 1].body;
+  return lead.note || "Заметок пока нет";
+}
+
+function refreshSideNote(leadId) {
+  const dialog = state.selectedDialog;
+  if (!dialog) return;
+  const lead = leadForDialog(dialog);
+  if (!lead || lead.id !== leadId) return;
+  const note = document.querySelector("#side-card .note");
+  if (note) note.textContent = sideNoteText(lead);
+}
+
 async function focusLead(id) {
   try {
-    const lead = await api(`/api/leads/${id}`);
-    state.leadCache[lead.id] = lead;
+    const lead = await api(`/api/leads/${id}/card`);
+    state.cards[lead.id] = lead;
+    state.leadCache[lead.id] = { ...(state.leadCache[lead.id] || {}), ...lead };
     state.selectedLeadId = lead.id;
     renderCard();
     renderBoard();
@@ -449,7 +479,6 @@ async function focusLead(id) {
 
 function openNoteModal(lead) {
   const area = el("textarea", { id: "note-body", name: "body" });
-  area.value = lead.note || "";
   const err = el("p", { id: "note-err", className: "err", hidden: "hidden" }, ["Напишите текст"]);
   openModal("Заметка", [
     el("label", { for: "note-body" }, ["Текст"]),
@@ -463,7 +492,9 @@ function openNoteModal(lead) {
       err.hidden = false;
       return false;
     }
-    await patchLead(lead.id, { note: body });
+    await api(`/api/leads/${lead.id}/notes`, { method: "POST", body: { body } });
+    delete state.cards[lead.id];
+    await renderCard();
     toast("Заметка записана", "ok");
     return true;
   });
@@ -510,9 +541,29 @@ function openChat(lead) {
   document.querySelector("#s05").scrollIntoView({ block: "nearest" });
 }
 
+function taskList(lead) {
+  const tasks = lead.tasks || [];
+  if (!tasks.length) return el("p", { className: "hint" }, ["Задач пока нет"]);
+  return el("ul", { className: "stack" }, tasks.map((item) => {
+    const box = el("input", { type: "checkbox" });
+    box.checked = Boolean(item.done_at);
+    box.addEventListener("change", async () => {
+      box.disabled = true;
+      try {
+        await api(`/api/tasks/${item.id}/done`, { method: "POST", body: { done: box.checked } });
+        delete state.cards[lead.id];
+        await renderCard();
+      } catch (error) {
+        box.checked = !box.checked;
+        box.disabled = false;
+        toast(error.message, "error");
+      }
+    });
+    return el("li", {}, [el("label", { className: "row" }, [box, item.title])]);
+  }));
+}
+
 function taskForm(lead) {
-  const date = el("input", { type: "date", "aria-label": "Дата задачи" });
-  const time = el("input", { type: "time", "aria-label": "Время задачи" });
   const text = el("input", { type: "text", "aria-label": "Текст задачи" });
   let saving = false;
   return el("form", {
@@ -520,56 +571,135 @@ function taskForm(lead) {
     onsubmit: async (event) => {
       event.preventDefault();
       if (saving) return;
-      const due = fromDateAndTime(date.value, time.value);
-      const body = text.value.trim();
-      if (!due || !body) {
-        toast("Укажите дату, время и текст задачи", "error");
+      const title = text.value.trim();
+      if (!title) {
+        toast("Напишите задачу", "error");
         return;
       }
       const button = event.target.querySelector("button[type=submit]");
       saving = true;
       button.disabled = true;
       try {
-        await api("/api/reminders", {
-          method: "POST",
-          body: { lead_id: lead.id, due_at: due, text: body },
-        });
-        date.value = "";
-        time.value = "";
+        await api(`/api/leads/${lead.id}/tasks`, { method: "POST", body: { title } });
         text.value = "";
-        await loadReminders();
+        delete state.cards[lead.id];
+        await renderCard();
         toast("Задача поставлена", "ok");
       } catch (error) {
         toast(error.message, "error");
       } finally {
         saving = false;
-        button.disabled = false;
+        if (button.isConnected) button.disabled = false;
       }
     },
   }, [
     el("label", {}, ["Текст задачи", text]),
-    el("label", {}, ["Дата задачи", date]),
-    el("label", {}, ["Время задачи", time]),
     el("button", { type: "submit", className: "btn secondary sm" }, ["Поставить задачу"]),
   ]);
 }
 
-function renderCard() {
-  const lead = selectedLead();
-  if (!lead) {
+function propertyShown(item) {
+  if (item.value_text) return item.value_text;
+  if (item.value_int != null) return String(item.value_int);
+  return "—";
+}
+
+function propertyList(lead) {
+  const rows = lead.properties || [];
+  if (!rows.length) return el("p", { className: "hint" }, ["Своих полей пока нет"]);
+  return el("ul", { className: "stack" }, rows.map((item) => (
+    el("li", {}, [`${item.name} (${item.type}): ${propertyShown(item)}`])
+  )));
+}
+
+function propertyForm(lead) {
+  const name = el("input", { type: "text", "aria-label": "Имя поля" });
+  const type = el("select", { "aria-label": "Тип поля" });
+  type.append(el("option", { value: "" }, ["Тип"]));
+  PROPERTY_TYPES.forEach(([value, label]) => {
+    type.append(el("option", { value }, [label]));
+  });
+  const value = el("input", { type: "text", "aria-label": "Значение поля" });
+  let saving = false;
+  return el("form", {
+    className: "stack",
+    onsubmit: async (event) => {
+      event.preventDefault();
+      if (saving) return;
+      const label = name.value.trim();
+      const kind = type.value;
+      const text = value.value.trim();
+      if (!label || !kind || !text) {
+        toast("Укажите имя, тип и значение", "error");
+        return;
+      }
+      const button = event.target.querySelector("button[type=submit]");
+      saving = true;
+      button.disabled = true;
+      try {
+        const def = await api("/api/property-defs", {
+          method: "POST",
+          body: { name: label, type: kind },
+        });
+        await api(`/api/leads/${lead.id}/properties/${def.id}`, {
+          method: "PUT",
+          body: { value: text },
+        });
+        name.value = "";
+        type.value = "";
+        value.value = "";
+        delete state.cards[lead.id];
+        await renderCard();
+        toast("Поле записано", "ok");
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        saving = false;
+        if (button.isConnected) button.disabled = false;
+      }
+    },
+  }, [
+    el("label", {}, ["Имя поля", name]),
+    el("label", {}, ["Тип поля", type]),
+    el("label", {}, ["Значение поля", value]),
+    el("button", { type: "submit", className: "btn secondary sm" }, ["Добавить поле"]),
+  ]);
+}
+
+async function renderCard() {
+  const id = state.selectedLeadId;
+  if (id == null) {
     setView("#card-view", "empty");
     return;
   }
-  const notes = [];
-  if (lead.note) {
-    notes.push(el("li", {}, [
-      el("span", { className: "dot", "aria-hidden": "true" }, []),
-      el("div", { className: "note" }, [
-        el("p", {}, [lead.note]),
-        el("p", { className: "meta" }, ["Заметка"]),
-      ]),
-    ]));
+  const token = ++cardToken;
+  let lead = state.cards[id];
+  if (!lead) {
+    setView("#card-view", "loading");
+    try {
+      lead = await api(`/api/leads/${id}/card`);
+    } catch (error) {
+      if (token !== cardToken) return;
+      failRegion("#card-view", "#card-error", error);
+      return;
+    }
+    if (token !== cardToken) return;
+    state.cards[id] = lead;
   }
+  paintCard(lead);
+  refreshSideNote(id);
+}
+
+function paintCard(lead) {
+  const notes = (lead.notes || []).map((item) => el("li", {}, [
+    el("span", { className: "dot", "aria-hidden": "true" }, []),
+    el("div", { className: "note" }, [
+      el("p", {}, [item.body]),
+      el("p", { className: "meta" }, [
+        el("time", { datetime: item.created_at || "" }, [formatDue(item.created_at) || "Заметка"]),
+      ]),
+    ]),
+  ]));
   state.reminders.filter((item) => item.lead_id === lead.id).forEach((item) => {
     const body = [
       el("p", {}, [item.text]),
@@ -579,7 +709,7 @@ function renderCard() {
       body.push(el("button", {
         type: "button",
         className: "btn ghost sm",
-        "aria-label": `Задача сделана: ${item.text}`,
+        "aria-label": `Сделано: ${item.text}`,
         onclick: async () => {
           try {
             await api(`/api/reminders/${item.id}/done`, { method: "POST" });
@@ -615,9 +745,15 @@ function renderCard() {
     el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
     timeline,
     el("section", { "aria-label": "Задачи" }, [
-      el("h4", {}, ["Задача"]),
-      el("p", { className: "hint" }, ["Срок пишется в напоминание"]),
+      el("h4", {}, ["Задачи"]),
+      el("p", { className: "hint" }, ["Срока у задачи нет. Дата остаётся у напоминания."]),
+      taskList(lead),
       taskForm(lead),
+    ]),
+    el("section", { "aria-label": "Свои поля" }, [
+      el("h4", {}, ["Свои поля"]),
+      propertyList(lead),
+      propertyForm(lead),
     ]),
     el("div", { className: "row" }, [
       el("button", { type: "button", className: "btn secondary sm", onclick: () => openNoteModal(lead) }, ["Заметка"]),

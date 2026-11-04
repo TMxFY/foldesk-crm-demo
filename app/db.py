@@ -127,6 +127,78 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE (dialog_id, telegram_message_id),
             FOREIGN KEY (dialog_id) REFERENCES dialogs(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+            body TEXT NOT NULL CHECK (length(trim(body)) > 0),
+            source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'forwarded')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS notes_lead_created ON notes(lead_id, created_at);
+
+        -- Checkbox only. Dated follow-ups stay in reminders; tasks has no due_at.
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+            title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+            done_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS tasks_lead_done ON tasks(lead_id, done_at);
+
+        CREATE TABLE IF NOT EXISTS property_defs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_type TEXT NOT NULL CHECK (object_type IN ('lead', 'account')),
+            key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL CHECK (
+                type IN (
+                    'text', 'textarea', 'single_select', 'multi_select',
+                    'url', 'email', 'tel', 'amount'
+                )
+            ),
+            options_json TEXT NOT NULL DEFAULT '[]',
+            required INTEGER NOT NULL DEFAULT 0 CHECK (required IN (0, 1)),
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (object_type, key)
+        );
+
+        CREATE INDEX IF NOT EXISTS property_defs_object ON property_defs(object_type, position);
+
+        CREATE TABLE IF NOT EXISTS property_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id INTEGER NOT NULL REFERENCES property_defs(id) ON DELETE CASCADE,
+            lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+            account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+            value_text TEXT,
+            value_int INTEGER,
+            currency TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (lead_id IS NOT NULL AND account_id IS NULL)
+                OR (lead_id IS NULL AND account_id IS NOT NULL)
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS property_values_property ON property_values(property_id);
+        CREATE INDEX IF NOT EXISTS property_values_lead ON property_values(lead_id);
+        CREATE INDEX IF NOT EXISTS property_values_account ON property_values(account_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS property_values_one_lead
+            ON property_values(property_id, lead_id)
+            WHERE lead_id IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS property_values_one_account
+            ON property_values(property_id, account_id)
+            WHERE account_id IS NOT NULL;
         """
     )
     _ensure_column(conn, "leads", "description", "TEXT")

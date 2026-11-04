@@ -1,6 +1,9 @@
 import sqlite3
 
 from app.db import STATUSES, as_dict, utc_now
+from app.notes import notes_for_card
+from app.properties import list_lead_properties
+from app.tasks import list_tasks
 
 
 def _clean_username(username):
@@ -98,6 +101,15 @@ def get_lead(conn, lead_id: int) -> dict:
     if row is None:
         raise LookupError("lead")
     return as_dict(row)
+
+
+def lead_card(conn, lead_id: int) -> dict:
+    lead = get_lead(conn, lead_id)
+    card = dict(lead)
+    card["notes"] = notes_for_card(conn, lead)
+    card["tasks"] = list_tasks(conn, lead_id)
+    card["properties"] = list_lead_properties(conn, lead_id)
+    return card
 
 
 def update_lead(conn, lead_id: int, **fields) -> dict:

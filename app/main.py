@@ -8,14 +8,17 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.accounts import confirm_login, confirm_password, list_accounts, start_login
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
 from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply
-from app.leads import add_lead_from_dialog, create_lead, get_lead, search_leads, update_lead
+from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
+from app.notes import add_note
+from app.properties import create_property_def, set_lead_property
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
+from app.tasks import create_task, set_task_done
 from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
 
 BASE = Path(__file__).resolve().parent
@@ -85,6 +88,29 @@ class PostponeIn(BaseModel):
 class MessageIn(BaseModel):
     text: str
     reply_to: int | None = None
+
+
+class NoteIn(BaseModel):
+    body: str
+
+
+class TaskIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
+
+
+class TaskDoneIn(BaseModel):
+    done: bool = True
+
+
+class PropertyDefIn(BaseModel):
+    name: str
+    type: str
+    object_type: str = "lead"
+
+
+class PropertyValueIn(BaseModel):
+    value: str | None = None
 
 
 def _gateway(request: Request):
@@ -327,6 +353,44 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/leads/{lead_id}")
     def leads_get(lead_id: int, request: Request):
         return _call(get_lead, request.app.state.conn, lead_id)
+
+    @app.get("/api/leads/{lead_id}/card")
+    def leads_card(lead_id: int, request: Request):
+        return _call(lead_card, request.app.state.conn, lead_id)
+
+    @app.post("/api/leads/{lead_id}/notes")
+    def lead_note_create(lead_id: int, body: NoteIn, request: Request):
+        return _call(add_note, request.app.state.conn, lead_id, body.body)
+
+    @app.post("/api/leads/{lead_id}/tasks")
+    def lead_task_create(lead_id: int, body: TaskIn, request: Request):
+        return _call(create_task, request.app.state.conn, lead_id, body.title)
+
+    @app.post("/api/tasks/{task_id}/done")
+    def task_done(task_id: int, body: TaskDoneIn, request: Request):
+        return _call(set_task_done, request.app.state.conn, task_id, body.done)
+
+    @app.post("/api/property-defs")
+    def property_def_create(body: PropertyDefIn, request: Request):
+        return _call(
+            create_property_def,
+            request.app.state.conn,
+            name=body.name,
+            type_=body.type,
+            object_type=body.object_type,
+        )
+
+    @app.put("/api/leads/{lead_id}/properties/{property_id}")
+    def lead_property_set(
+        lead_id: int, property_id: int, body: PropertyValueIn, request: Request
+    ):
+        return _call(
+            set_lead_property,
+            request.app.state.conn,
+            lead_id,
+            property_id,
+            body.value,
+        )
 
     @app.patch("/api/leads/{lead_id}")
     def leads_patch(lead_id: int, body: LeadPatch, request: Request):

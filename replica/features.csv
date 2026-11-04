@@ -10,8 +10,8 @@ feature,area,priority,original,clone,notes
 Воронка со стадиями,pipeline,must,yes,yes,S07 пять статусов; без перетаскивания
 Сменить статус на карточке,pipeline,must,yes,yes,Status = custom property
 Найти лида в списке,leads,must,yes,yes,S08 F02
-Карточка: профиль свойства заметки задачи,leads,must,yes,partial,S09 задача со сроком = напоминание; своих полей нет
-Заметка на карточке,notes,must,yes,yes,F04 поле leads.note; отдельной ленты notes нет
+Карточка: профиль свойства заметки задачи,leads,must,yes,yes,S09 notes tasks property_values; срок только у reminders
+Заметка на карточке,notes,must,yes,yes,лента notes со временем; leads.note не затирается и виден если ленты нет
 Напоминание с датой и временем,reminders,must,yes,yes,F05 S13
 Дайджест задач на день в боте,reminders,must,yes,partial,S17 панель на странице; бота нет
 Уведомление в срок: готово / отложить / открыть лида,reminders,must,yes,yes,S18 сделано отложить и к лиду пишутся
@@ -19,14 +19,14 @@ feature,area,priority,original,clone,notes
 Проверка дублей,leads,must,yes,yes,ошибка API в тосте; слияния нет
 Синк своих папок Telegram в CRM,leads,should,yes,no,S11 F06; ошибка Chat Types
 Форвард сообщения боту = лид + заметка,leads,should,yes,no,S19
-Кастомные поля и свои названия стадий,pipeline,should,yes,no,S14 типы из API docs
+Кастомные поля и свои названия стадий,pipeline,should,yes,partial,определение и значение на лиде пишутся; свои названия стадий нет
 Фильтры и сохранённые виды воронки,pipeline,should,yes,no,S15
 Фильтр «ждёт ответа»,inbox,should,yes,partial,чип есть; признака в поиске диалогов нет
 Фильтр непрочитанных,inbox,should,yes,partial,чип есть; признака в поиске диалогов нет
 Связка лид↔аккаунт с которого писали,inbox,should,yes,partial,account_id пишется при «В лиды»
 Отметить чат непрочитанным,inbox,should,yes,partial,кнопка есть; маршрута нет
 Напоминание фразой в чате,reminders,should,yes,no,NL + confirm Update
-Чекбокс задачи на карточке,reminders,should,yes,no,S09
+Чекбокс задачи на карточке,reminders,should,yes,yes,tasks.title и done_at; колонки due_at нет
 Папка Telegram как свойство лида,leads,should,yes,no,changelog 2.4.5
 Open Chat с карточки,inbox,should,yes,partial,открывает чат только если он уже в списке поиска
 Несколько воркспейсов,team,could,yes,no,соло не must
