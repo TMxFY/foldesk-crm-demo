@@ -11,7 +11,12 @@ import zipfile
 
 from app.db import as_dict, resolve_session, utc_now, utc_today
 from app.telegram_gateway import SESSION_HEALTH, GatewayError
-from app.whatsapp_gateway import WhatsAppGateway, generate_pairing_code, generate_qr_svg
+from app.whatsapp_gateway import (
+    WhatsAppGateway,
+    _inspect_whatsmeow_db,
+    generate_pairing_code,
+    generate_qr_svg,
+)
 
 
 def _inspect_telethon_session(session_path: str) -> tuple[int, bytes] | None:
@@ -249,7 +254,10 @@ def _sync_session_blob(conn, account_id: int) -> None:
         if not row or not row[0]:
             return
         session_path = str(row[0]).strip()
-        if _inspect_telethon_session(session_path) is None:
+        if (
+            _inspect_telethon_session(session_path) is None
+            and _inspect_whatsmeow_db(session_path) is None
+        ):
             return
         abs_p = resolve_session(session_path)
         blob = abs_p.read_bytes()
@@ -303,7 +311,10 @@ def restore_disk_sessions(conn) -> int:
                 restored += 1
             except Exception:
                 pass
-        if _inspect_telethon_session(session_path) is not None:
+        if (
+            _inspect_telethon_session(session_path) is not None
+            or _inspect_whatsmeow_db(session_path) is not None
+        ):
             try:
                 current_bytes = abs_p.read_bytes()
                 if not blob or bytes(blob) != current_bytes:
@@ -457,6 +468,11 @@ async def start_login(
             phone_code_hash = await gateway.request_code(
                 phone, session_path, auth_mode=norm_mode
             )
+            p_info = (gateway._pending or {}).get(session_path) or {}
+            if p_info.get("pairing_code"):
+                pairing_code = p_info["pairing_code"]
+            if p_info.get("qr_code"):
+                qr_code = p_info["qr_code"]
         else:
             phone_code_hash = await gateway.request_code(phone, session_path)
     except Exception as exc:

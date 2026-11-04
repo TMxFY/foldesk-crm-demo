@@ -907,6 +907,7 @@ function renderAccounts() {
           type: "button",
           className: "btn secondary sm",
           onclick: async () => {
+            state.inboxChatMode = "crm";
             await switchInboxSession(String(account.id));
             activateSheet("inbox");
             const s04 = document.querySelector("#s04");
@@ -1859,8 +1860,12 @@ async function switchInboxSession(sessionKey) {
   const key = String(sessionKey || "all");
   state.inboxSessionFilter = key;
   const select = document.querySelector("#tg-account");
-  if (key !== "all" && select) {
-    select.value = key;
+  if (key !== "all") {
+    const chosenAcc = (state.accounts || []).find((acc) => String(acc.id) === key);
+    if (chosenAcc && normalizeProvider(chosenAcc.provider) === "whatsapp") {
+      state.inboxChatMode = "crm";
+    }
+    if (select) select.value = key;
   } else if (key === "all" && select && !select.value) {
     const firstConnected = (state.accounts || []).find((acc) => acc.status === "connected");
     if (firstConnected) select.value = String(firstConnected.id);
@@ -3255,6 +3260,50 @@ const DEFAULT_WA_QR_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
 
 let waCurrentAccountId = null;
 let waCurrentPairingCode = "";
+let waPollTimer = null;
+
+function stopWaPoll() {
+  if (waPollTimer) {
+    window.clearInterval(waPollTimer);
+    waPollTimer = null;
+  }
+}
+
+function startWaPoll(accountId) {
+  stopWaPoll();
+  if (!accountId) return;
+  waPollTimer = window.setInterval(async () => {
+    try {
+      const accounts = await api("/api/accounts");
+      if (Array.isArray(accounts)) {
+        state.accounts = accounts;
+        const found = accounts.find((a) => Number(a.id) === Number(accountId));
+        if (!found) {
+          stopWaPoll();
+          return;
+        }
+        if (found.qr_code) {
+          const qrImage = document.querySelector("#wa-qr-image");
+          if (qrImage && qrImage.src !== found.qr_code) qrImage.src = found.qr_code;
+        }
+        if (found.pairing_code) {
+          waCurrentPairingCode = found.pairing_code;
+          const codeDisplay = document.querySelector("#wa-pairing-code-display");
+          if (codeDisplay) codeDisplay.textContent = found.pairing_code;
+        }
+        if (found.status === "connected") {
+          stopWaPoll();
+          const pairingBox = document.querySelector("#wa-pairing-box");
+          if (pairingBox) pairingBox.hidden = true;
+          renderAccounts();
+          await loadInbox();
+          closeSheetPopup();
+          toast("Аккаунт WhatsApp подключён", "ok");
+        }
+      }
+    } catch (_err) { /* фоновый опрос статуса QR */ }
+  }, 3000);
+}
 
 function generateWaPairingCode(phone) {
   const digits = String(phone || "").replace(/\D/g, "");
@@ -3294,6 +3343,16 @@ async function startWhatsappLogin(mode) {
     });
     waCurrentAccountId = res.id;
     state.loginId = res.id;
+    if (res.status === "connected") {
+      stopWaPoll();
+      const pairingBox = document.querySelector("#wa-pairing-box");
+      if (pairingBox) pairingBox.hidden = true;
+      await loadAccounts();
+      await loadInbox();
+      closeSheetPopup();
+      toast("Аккаунт WhatsApp подключён", "ok");
+      return;
+    }
     waCurrentPairingCode = res.pairing_code || generateWaPairingCode(phone);
     const pairingBox = document.querySelector("#wa-pairing-box");
     const codePanel = document.querySelector("#wa-code-panel");
@@ -3306,6 +3365,7 @@ async function startWhatsappLogin(mode) {
     if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode;
     if (qrImage) qrImage.src = res.qr_code || res.qr_svg || res.qr_url || DEFAULT_WA_QR_SVG;
     await loadAccounts();
+    startWaPoll(res.id);
   } catch (error) {
     showError(error);
   } finally {
