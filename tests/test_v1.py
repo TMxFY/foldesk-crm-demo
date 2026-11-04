@@ -1,4 +1,6 @@
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -92,7 +94,9 @@ def test_api_search_status_reminder_and_page(client):
     for anchor in ("s04", "s05", "s06", "s07", "s09", "digest"):
         assert f'id="{anchor}"' in page.text
     assert "/design/tokens.css" in page.text
-    assert "crmchat.ai" not in page.text
+    brand = json.loads((Path(__file__).resolve().parents[1] / "replica" / "brand.json").read_text(encoding="utf-8"))
+    for host in brand["domains"]:
+        assert host not in page.text
     css = client.get("/static/app.css")
     assert css.status_code == 200
     for token in ("var(--bg)", "var(--text)", "var(--accent)", "var(--space-4)"):

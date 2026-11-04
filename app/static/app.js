@@ -122,7 +122,7 @@ function showError(error) {
 }
 
 function failRegion(view, box, error) {
-  const message = error && error.message ? error.message : "Ошибка запроса";
+  const message = error && error.message ? error.message : "Запрос не дошёл";
   const node = document.querySelector(box);
   if (node) node.textContent = message;
   setView(view, "error");
@@ -143,7 +143,7 @@ async function api(path, options) {
   }
   if (!res.ok) {
     const detail = data && data.detail;
-    throw new Error(typeof detail === "string" ? detail : "Ошибка запроса");
+    throw new Error(typeof detail === "string" ? detail : "Запрос не дошёл");
   }
   return data;
 }
@@ -691,7 +691,7 @@ function openReminderModal(lead) {
       body: { lead_id: lead.id, due_at: due, text: body },
     });
     await loadReminders();
-    toast("Напоминание поставлено", "ok");
+    toast("Напоминание на столе", "ok");
     return true;
   });
 }
@@ -1113,7 +1113,7 @@ function reminderForm(lead) {
         time.value = "";
         text.value = "";
         await loadReminders();
-        toast("Напоминание поставлено", "ok");
+        toast("Напоминание на столе", "ok");
       } catch (error) {
         toast(error.message, "error");
       } finally {

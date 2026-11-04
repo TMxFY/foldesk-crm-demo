@@ -17,3 +17,4 @@
 - 2026-11-04 — S11 синк своих папок: `pull_folders`, `sync_folder`, папка на карточке. Личные диалоги, без групп и каналов. `./scripts/verify.sh`: 41 passed. `feature_list.json` не закрыт.
 - 2026-11-04 — S19 форвард боту: `apply_forward_update` создаёт лид и заметку `notes`. Чужой чат и пустой токен не пишут. `./scripts/verify.sh`: 47 passed. `feature_list.json` не закрыт.
 - 2026-11-04 — S15 виды воронки: `save_view` / `list_views`, фильтр стадии и папки, сброс. Пустое имя не пишется, то же имя обновляет строку. `./scripts/verify.sh`: 48 passed. `feature_list.json` не закрыт.
+- 2026-11-04 — replica-brand: имя Foldesk, палитра хвоя/бумага в ролях `tokens.json`. Строки в `index.html` и в `failRegion`, `api`, `openReminderModal`, `reminderForm`. contrast.py: 54 пары, 0 AA, код 0. sweep: хвосты только в `web-clone-recon/`, не в коде приложения. `./scripts/verify.sh`: 48 passed. Фича не закрыта.

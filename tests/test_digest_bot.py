@@ -208,5 +208,5 @@ def test_done_marks_reminder_and_lead_does_not_message(client, conn, monkeypatch
 def test_page_has_digest_button(client):
     page = client.get("/")
     assert page.status_code == 200
-    assert "Прислать дайджест" in page.text
+    assert "Прислать сводку" in page.text
     assert "sendDigest" in client.get("/static/app.js").text

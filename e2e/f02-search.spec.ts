@@ -59,7 +59,7 @@ test('F02-E1 no CRM match hides other leads', async ({ page }) => {
   await page.getByRole('button', { name: 'Найти' }).click();
   await expect(page.getByRole('cell', { name: '@maria' })).toHaveCount(0);
   await expect(page.getByRole('region', { name: 'Воронка' }).getByText('Фильтр применён')).toBeVisible();
-  await expect(page.getByText('Лидов пока нет')).toBeHidden();
+  await expect(page.getByText('Карточек на столе нет')).toBeHidden();
   await expect(page.getByText('По запросу пусто')).toBeVisible();
   await page.getByLabel('Запрос').fill('');
   await page.getByRole('button', { name: 'Найти' }).click();

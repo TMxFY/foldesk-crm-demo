@@ -14,7 +14,7 @@ test.afterEach(() => {
 
 test('F17 digest button succeeds only after accepted send', async ({ page }) => {
   const digest = page.getByRole('region', { name: 'Напоминания' });
-  const button = digest.getByRole('button', { name: 'Прислать дайджест' });
+  const button = digest.getByRole('button', { name: 'Прислать сводку' });
   const status = page.locator('#digest-send-status');
 
   await page.request.post('/api/test/digest-transport', { data: { mode: 'fail' } });

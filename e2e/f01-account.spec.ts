@@ -6,7 +6,7 @@ test.beforeEach(async ({ page }) => {
   watch(page);
   await reset(page);
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Кабинет' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Foldesk' })).toBeVisible();
 });
 
 test.afterEach(() => {
@@ -15,7 +15,7 @@ test.afterEach(() => {
 
 test('F01-H1 connect shows the account as online', async ({ page }, info) => {
   const accounts = page.getByRole('region', { name: 'Аккаунт' });
-  await expect(accounts.getByText('Аккаунт ещё не подключён')).toBeVisible();
+  await expect(accounts.getByText('Сначала подключите Телеграм')).toBeVisible();
   noteAxe(info, await scan(page, 'S03 empty'));
   await connect(page);
   await expect(accounts.getByText('на связи')).toBeVisible();

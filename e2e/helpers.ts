@@ -73,7 +73,7 @@ export async function addLead(page: Page, name: string, username = '') {
   const leads = page.getByRole('region', { name: 'Лиды' });
   await leads.getByLabel('Имя').first().fill(name);
   if (username) await leads.getByLabel('Ник').fill(username);
-  await leads.getByRole('button', { name: 'Добавить лид' }).click();
+  await leads.getByRole('button', { name: 'Завести карточку' }).click();
   await expect(page.getByRole('table').getByLabel('Имя').first()).toHaveValue(name);
 }
 

@@ -41,7 +41,7 @@ test('F03-H3 manual lead keeps note link and email', async ({ page }) => {
   await form.getByLabel('Заметка').fill('созвон в пятницу');
   await form.getByLabel('Ссылка').fill('https://example.com/anna');
   await form.getByLabel('Почта').fill('anna@example.com');
-  await form.getByRole('button', { name: 'Добавить лид' }).click();
+  await form.getByRole('button', { name: 'Завести карточку' }).click();
   const card = page.getByRole('region', { name: 'Карточка' });
   await expect(card.getByRole('heading', { name: 'Анна' })).toBeVisible();
   await expect(card.getByText('созвон в пятницу')).toBeVisible();
@@ -57,29 +57,29 @@ test('F03-H3 manual lead keeps note link and email', async ({ page }) => {
 });
 
 test('F03-E1 blank manual submit creates nothing', async ({ page }) => {
-  await page.getByRole('region', { name: 'Лиды' }).getByRole('button', { name: 'Добавить лид' }).click();
+  await page.getByRole('region', { name: 'Лиды' }).getByRole('button', { name: 'Завести карточку' }).click();
   await expect(page.getByRole('alert').filter({ hasText: 'Укажите имя' })).toBeVisible();
   expect(await (await page.request.get('/api/leads')).json()).toEqual([]);
-  await expect(page.getByText('Лидов пока нет')).toBeVisible();
+  await expect(page.getByText('Карточек на столе нет')).toBeVisible();
 });
 
 test('F03-E2 whitespace and a very long name', async ({ page }) => {
   const leads = page.getByRole('region', { name: 'Лиды' });
   await leads.getByLabel('Имя').fill('   ');
-  await leads.getByRole('button', { name: 'Добавить лид' }).click();
+  await leads.getByRole('button', { name: 'Завести карточку' }).click();
   await expect(page.getByRole('alert').filter({ hasText: 'Укажите имя' })).toBeVisible();
   expect(await (await page.request.get('/api/leads')).json()).toEqual([]);
 
   const longName = `Иван ${'А'.repeat(500)}`;
   await leads.getByLabel('Имя').fill(longName);
-  await leads.getByRole('button', { name: 'Добавить лид' }).click();
+  await leads.getByRole('button', { name: 'Завести карточку' }).click();
   await expect(page.getByRole('table').getByLabel('Имя')).toHaveValue(longName);
 });
 
 test('F03-E3 double click adds one manual lead', async ({ page }) => {
   const leads = page.getByRole('region', { name: 'Лиды' });
   await leads.getByLabel('Имя').fill('Двойной');
-  await leads.getByRole('button', { name: 'Добавить лид' }).dblclick();
+  await leads.getByRole('button', { name: 'Завести карточку' }).dblclick();
   await expect(page.getByRole('table').getByLabel('Имя')).toHaveValue('Двойной');
   const rows = await (await page.request.get('/api/leads')).json();
   expect(rows.filter((row: { name: string }) => row.name === 'Двойной')).toHaveLength(1);

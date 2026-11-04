@@ -1,0 +1,7 @@
+{
+  "name": "Foldesk",
+  "avoid": ["CRM Chat", "CRMChat", "Hintsflow"],
+  "domains": ["crmchat.ai", "app.crmchat.ai", "developers.crmchat.ai"],
+  "colors": ["#127ef1", "#0099ff"],
+  "note": "Screening list for sweep.py. Not a trademark clearance."
+}
