@@ -1,4 +1,6 @@
+import asyncio
 import os
+import threading
 from abc import ABC, abstractmethod
 
 from datetime import timezone
@@ -36,6 +38,10 @@ class TelegramGateway(ABC):
         """Last personal-dialog messages, oldest first. Not groups or channels."""
         raise GatewayError("История не подключена")
 
+    async def watch_private(self, session_path: str, on_message) -> None:
+        """Listen until cancelled. Deliver incoming private messages to on_message."""
+        raise GatewayError("Живые входящие не подключены")
+
 
 def _session_name(session_path: str) -> str:
     # Telethon appends .session itself. The stored path already has the suffix.
@@ -58,6 +64,30 @@ def _stamp(sent) -> str:
     if sent.tzinfo is None:
         sent = sent.replace(tzinfo=timezone.utc)
     return sent.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def listening_event(gateway, session_path: str) -> asyncio.Event:
+    events = getattr(gateway, "_listening", None)
+    if events is None:
+        events = {}
+        gateway._listening = events
+    event = events.get(session_path)
+    if event is None:
+        event = asyncio.Event()
+        events[session_path] = event
+    return event
+
+
+def _private_incoming(message) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("is_group"):
+        return False
+    if (message.get("peer_type") or "user") != "user":
+        return False
+    if (message.get("direction") or "in") != "in":
+        return False
+    return message.get("telegram_user_id") is not None
 
 
 def _history_limit(limit) -> int:
@@ -274,6 +304,63 @@ class TelethonGateway(TelegramGateway):
         rows.reverse()
         return rows[-cap:]
 
+    async def _private_payload(self, event):
+        # Groups and channels are not the inbox. Outgoing is stored by send_reply.
+        if not getattr(event, "is_private", False):
+            return None
+        if getattr(event, "is_group", False) or getattr(event, "is_channel", False):
+            return None
+        getter = getattr(event, "get_sender", None)
+        if getter is None:
+            return None
+        sender = await getter()
+        from telethon.tl.types import User
+
+        if not isinstance(sender, User):
+            return None
+        message = getattr(event, "message", None)
+        if message is None or getattr(message, "id", None) is None:
+            return None
+        if getattr(message, "out", False):
+            return None
+        text = getattr(message, "message", None)
+        return {
+            "telegram_user_id": int(sender.id),
+            "username": getattr(sender, "username", None),
+            "name": _person_name(sender),
+            "telegram_message_id": int(message.id),
+            "text": text,
+            "sent_at": _stamp(getattr(message, "date", None)),
+            "direction": "in",
+            "peer_type": "user",
+        }
+
+    async def watch_private(self, session_path: str, on_message) -> None:
+        from telethon import events
+
+        client, _owned = await self._open(session_path)
+        self._loop = asyncio.get_running_loop()
+
+        async def handler(event):
+            payload = await self._private_payload(event)
+            if payload is None:
+                return
+            await on_message(payload)
+
+        client.add_event_handler(handler, events.NewMessage(incoming=True))
+        try:
+            # Difference only: a long outage can miss updates Telegram already dropped.
+            try:
+                await client.catch_up()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            listening_event(self, session_path).set()
+            await client.run_until_disconnected()
+        finally:
+            client.remove_event_handler(handler)
+
     async def _resolve_username(self, client, query: str) -> list:
         from telethon.tl.types import User
 
@@ -304,6 +391,45 @@ class FakeGateway(TelegramGateway):
         self._pending = {}
         self.sent = []
         self._message_seq = 0
+        self._lock = threading.Lock()
+        self._listeners = {}
+        self._backlog = {}
+        self._loop = None
+
+    def push_private(self, session_path: str, message: dict) -> None:
+        """Queue one incoming private message. Groups and channels are ignored."""
+        if not _private_incoming(message):
+            return
+        item = dict(message)
+        with self._lock:
+            listener = self._listeners.get(session_path)
+            loop = self._loop
+            if listener is None or loop is None:
+                self._backlog.setdefault(session_path, []).append(item)
+                return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            loop.create_task(listener(item))
+            return
+        asyncio.run_coroutine_threadsafe(listener(item), loop).result(timeout=5)
+
+    async def watch_private(self, session_path: str, on_message) -> None:
+        self._loop = asyncio.get_running_loop()
+        with self._lock:
+            self._listeners[session_path] = on_message
+            batch = self._backlog.pop(session_path, [])
+        try:
+            for item in batch:
+                await on_message(dict(item))
+            listening_event(self, session_path).set()
+            await asyncio.Future()
+        finally:
+            with self._lock:
+                if self._listeners.get(session_path) is on_message:
+                    self._listeners.pop(session_path, None)
 
     async def request_code(self, phone: str, session_path: str) -> str:
         phone_code_hash = "hash-" + phone

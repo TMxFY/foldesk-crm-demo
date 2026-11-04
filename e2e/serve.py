@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.db import connect, init_db
-from app.main import create_app
+from app.main import create_app, stop_inbox_watches
 from app.telegram_gateway import FakeGateway
 
 DIALOGS = [
@@ -62,7 +62,11 @@ def build():
     app = create_app(conn=conn, gateway=gateway)
 
     @app.post("/api/test/reset")
-    def reset():
+    async def reset():
+        await stop_inbox_watches(app)
+        with gateway._lock:
+            gateway._listeners.clear()
+            gateway._backlog.clear()
         conn.execute("DELETE FROM messages")
         conn.execute("DELETE FROM dialogs")
         conn.execute("DELETE FROM reminders")

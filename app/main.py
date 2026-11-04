@@ -1,8 +1,11 @@
+import asyncio
+import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -10,10 +13,10 @@ from pydantic import BaseModel
 from app.accounts import confirm_login, confirm_password, list_accounts, start_login
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
-from app.inbox import get_thread, list_inbox, remember_dialogs, send_reply
+from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply
 from app.leads import add_lead_from_dialog, create_lead, get_lead, search_leads, update_lead
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
-from app.telegram_gateway import GatewayError, TelethonGateway
+from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -117,14 +120,119 @@ async def _call_async(func, *args, **kwargs):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class InboxHub:
+    def __init__(self):
+        self._subs = {}
+
+    def subscribe(self, account_id: int) -> asyncio.Queue:
+        queue = asyncio.Queue()
+        self._subs.setdefault(account_id, set()).add(queue)
+        return queue
+
+    def unsubscribe(self, account_id: int, queue) -> None:
+        subs = self._subs.get(account_id)
+        if not subs:
+            return
+        subs.discard(queue)
+        if not subs:
+            self._subs.pop(account_id, None)
+
+    def publish(self, account_id: int, dialog: dict) -> None:
+        for queue in list(self._subs.get(account_id, ())):
+            queue.put_nowait(dict(dialog))
+
+
+def _watch_alive(app, account_id: int) -> bool:
+    task = app.state.inbox_tasks.get(account_id)
+    return task is not None and not task.done()
+
+
+def _sse(event: str, data) -> str:
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+async def start_account_watch(app, account_id: int) -> None:
+    gateway = app.state.gateway
+    if gateway is None:
+        return
+    existing = app.state.inbox_tasks.get(account_id)
+    if existing is not None and not existing.done():
+        return
+    try:
+        account = load_account(app.state.conn, account_id)
+    except LookupError:
+        return
+    if account["status"] != "connected":
+        return
+    session_path = account["session_path"]
+    ready = listening_event(gateway, session_path)
+    ready.clear()
+
+    async def on_message(message):
+        try:
+            dialog = apply_incoming(app.state.conn, account_id, message)
+        except ValueError:
+            return
+        app.state.inbox_hub.publish(account_id, dialog)
+
+    async def runner():
+        try:
+            await gateway.watch_private(session_path, on_message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+
+    task = asyncio.create_task(runner())
+    app.state.inbox_tasks[account_id] = task
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        return
+
+
+async def start_connected_watches(app) -> None:
+    if app.state.gateway is None:
+        return
+    rows = app.state.conn.execute(
+        "SELECT id FROM accounts WHERE status = 'connected'"
+    ).fetchall()
+    for row in rows:
+        await start_account_watch(app, row["id"])
+
+
+async def stop_inbox_watches(app) -> None:
+    tasks = list(app.state.inbox_tasks.values())
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    app.state.inbox_tasks.clear()
+
+
 def create_app(conn=None, gateway=None) -> FastAPI:
     load_env_file()
-    app = FastAPI(title="CRM Telegram")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await start_connected_watches(app)
+        try:
+            yield
+        finally:
+            await stop_inbox_watches(app)
+
+    app = FastAPI(title="CRM Telegram", lifespan=lifespan)
     if conn is None:
         conn = connect()
     init_db(conn)
     app.state.conn = conn
     app.state.gateway = gateway
+    app.state.inbox_hub = InboxHub()
+    app.state.inbox_tasks = {}
     app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 
     @app.get("/design/tokens.css")
@@ -143,16 +251,22 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.post("/api/accounts/{account_id}/code")
     async def accounts_code(account_id: int, body: CodeIn, request: Request):
         gateway = _gateway(request)
-        return await _call_async(
+        result = await _call_async(
             confirm_login, request.app.state.conn, account_id, body.code, gateway
         )
+        if result.get("status") == "connected":
+            await start_account_watch(request.app, account_id)
+        return result
 
     @app.post("/api/accounts/{account_id}/password")
     async def accounts_password(account_id: int, body: PasswordIn, request: Request):
         gateway = _gateway(request)
-        return await _call_async(
+        result = await _call_async(
             confirm_password, request.app.state.conn, account_id, body.password, gateway
         )
+        if result.get("status") == "connected":
+            await start_account_watch(request.app, account_id)
+        return result
 
     @app.get("/api/accounts")
     def accounts_list(request: Request):
@@ -246,6 +360,38 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/inbox")
     def inbox_list(request: Request, account_id: int, q: str = ""):
         return _call(list_inbox, request.app.state.conn, account_id, q)
+
+    @app.get("/api/inbox/events")
+    async def inbox_events(request: Request, account_id: int):
+        try:
+            list_inbox(request.app.state.conn, account_id, "")
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Не найдено") from exc
+
+        async def gen():
+            hub = request.app.state.inbox_hub
+            queue = hub.subscribe(account_id)
+            try:
+                yield _sse("live", {"ok": _watch_alive(request.app, account_id)})
+                yield _sse("snapshot", list_inbox(request.app.state.conn, account_id, ""))
+                while True:
+                    try:
+                        dialog = await asyncio.wait_for(queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        if await request.is_disconnected():
+                            break
+                        yield _sse("live", {"ok": _watch_alive(request.app, account_id)})
+                        yield ": ping\n\n"
+                        continue
+                    yield _sse("dialog", dialog)
+            finally:
+                hub.unsubscribe(account_id, queue)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/dialogs/{dialog_id}/messages")
     async def dialog_messages(dialog_id: int, request: Request):

@@ -41,6 +41,8 @@ const state = {
 let modalSubmit = null;
 let modalReturn = null;
 let toastTimer = 0;
+let inboxSource = null;
+let inboxLiveAccount = "";
 
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -872,6 +874,75 @@ async function loadReminders() {
   renderCard();
 }
 
+function setInboxLive(on) {
+  const node = document.querySelector("#inbox-live");
+  if (!node) return;
+  node.dataset.live = on ? "on" : "off";
+  node.textContent = on ? "Список обновляется сам" : "Список не обновляется";
+}
+
+function closeInboxLive() {
+  if (inboxSource) {
+    inboxSource.close();
+    inboxSource = null;
+  }
+  inboxLiveAccount = "";
+  setInboxLive(false);
+}
+
+function upsertDialog(dialog) {
+  const idx = state.dialogs.findIndex((row) => row.id === dialog.id);
+  if (idx >= 0) state.dialogs[idx] = dialog;
+  else state.dialogs.unshift(dialog);
+  if (state.inbox !== "filled") state.inbox = "filled";
+  renderDialogs();
+}
+
+function openInboxLive(accountId) {
+  const id = String(accountId || "");
+  if (!id) {
+    closeInboxLive();
+    return;
+  }
+  if (inboxSource && inboxLiveAccount === id) return;
+  if (inboxSource) inboxSource.close();
+  // Пока сервер не прислал live ok, оборванный сокет не выглядит живым.
+  setInboxLive(false);
+  inboxLiveAccount = id;
+  const source = new EventSource(`/api/inbox/events?account_id=${encodeURIComponent(id)}`);
+  inboxSource = source;
+  source.addEventListener("error", () => {
+    if (inboxSource !== source) return;
+    setInboxLive(false);
+  });
+  source.addEventListener("live", (event) => {
+    if (inboxSource !== source) return;
+    let ok = false;
+    try {
+      ok = JSON.parse(event.data).ok === true;
+    } catch (_err) {
+      ok = false;
+    }
+    setInboxLive(ok);
+  });
+  source.addEventListener("snapshot", (event) => {
+    if (inboxSource !== source || state.dialogQuery) return;
+    try {
+      const rows = JSON.parse(event.data);
+      if (!Array.isArray(rows)) return;
+      state.dialogs = rows;
+      state.inbox = rows.length ? "filled" : "empty";
+      renderDialogs();
+    } catch (_err) { /* битый кадр не затирает список */ }
+  });
+  source.addEventListener("dialog", (event) => {
+    if (inboxSource !== source) return;
+    try {
+      upsertDialog(JSON.parse(event.data));
+    } catch (_err) { /* ждём следующий кадр */ }
+  });
+}
+
 async function loadInbox() {
   const select = document.querySelector("#tg-account");
   if (!select.value) {
@@ -879,6 +950,7 @@ async function loadInbox() {
     state.inbox = "empty";
     state.dialogQuery = "";
     renderDialogs();
+    closeInboxLive();
     return;
   }
   const dialogs = await api(`/api/inbox?account_id=${select.value}`);
@@ -886,6 +958,7 @@ async function loadInbox() {
   state.dialogQuery = "";
   state.inbox = "filled";
   renderDialogs();
+  openInboxLive(select.value);
 }
 
 async function searchTelegram(query) {
@@ -968,6 +1041,7 @@ bindBusy(document.querySelector("#code-form"), async (event) => {
   document.querySelector("#password-form").hidden = result.status !== "pending_password";
   if (result.status === "connected") document.querySelector("#code-form").hidden = true;
   await loadAccounts();
+  if (result.status === "connected") await loadInbox();
 });
 
 bindBusy(document.querySelector("#password-form"), async (event) => {
@@ -976,6 +1050,18 @@ bindBusy(document.querySelector("#password-form"), async (event) => {
   document.querySelector("#password-form").hidden = true;
   document.querySelector("#code-form").hidden = true;
   await loadAccounts();
+  await loadInbox();
+});
+
+document.querySelector("#tg-account").addEventListener("change", () => {
+  state.dialogQuery = "";
+  loadInbox().catch((error) => {
+    closeInboxLive();
+    state.inbox = "error";
+    const node = document.querySelector("#inbox-error");
+    if (node) node.textContent = error.message;
+    setView("#inbox-view", "error");
+  });
 });
 
 document.querySelector("#search-mode").addEventListener("click", (event) => {
@@ -1244,6 +1330,7 @@ async function boot() {
   try {
     await loadInbox();
   } catch (error) {
+    closeInboxLive();
     state.inbox = "error";
     const node = document.querySelector("#inbox-error");
     if (node) node.textContent = error.message;

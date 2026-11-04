@@ -60,6 +60,76 @@ def remember_dialogs(conn, account_id: int, people: list) -> list:
     return saved
 
 
+def apply_incoming(conn, account_id: int, message: dict) -> dict:
+    if not isinstance(message, dict) or message.get("is_group"):
+        raise ValueError("Это не личный диалог")
+    if (message.get("peer_type") or "user") != "user":
+        raise ValueError("Это не личный диалог")
+    if (message.get("direction") or "in") != "in":
+        raise ValueError("Нужно входящее")
+    peer_id = message.get("telegram_user_id")
+    if peer_id is None:
+        raise ValueError("Это не личный диалог")
+    account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if account is None:
+        raise LookupError("account")
+    now = utc_now()
+    title = (message.get("name") or "").strip()
+    username = message.get("username")
+    if username is not None:
+        username = str(username).strip().lstrip("@") or None
+    text = message.get("text")
+    preview = "" if text is None else str(text)[:120]
+    sent_at = str(message.get("sent_at") or now)
+    conn.execute(
+        """
+        INSERT INTO dialogs (
+            account_id, peer_type, peer_id, username, title,
+            is_group, unread_count, last_message_at, last_message_preview,
+            last_from_peer, muted, created_at, updated_at
+        ) VALUES (?, 'user', ?, ?, ?, 0, 1, ?, ?, 1, 0, ?, ?)
+        ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
+            username = COALESCE(excluded.username, dialogs.username),
+            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
+            unread_count = dialogs.unread_count + 1,
+            last_message_at = excluded.last_message_at,
+            last_message_preview = excluded.last_message_preview,
+            last_from_peer = 1,
+            updated_at = excluded.updated_at
+        """,
+        (account_id, int(peer_id), username, title, sent_at, preview, now, now),
+    )
+    row = conn.execute(
+        """
+        SELECT * FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        """,
+        (account_id, int(peer_id)),
+    ).fetchone()
+    mid = message.get("telegram_message_id")
+    if mid is not None:
+        body = None if text is None else str(text)
+        try:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    dialog_id, telegram_message_id, direction, text, sent_at,
+                    reply_to_telegram_message_id, created_at, updated_at
+                ) VALUES (?, ?, 'in', ?, ?, NULL, ?, ?)
+                ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+                    text = excluded.text,
+                    sent_at = excluded.sent_at,
+                    updated_at = excluded.updated_at
+                """,
+                (row["id"], int(mid), body, sent_at, now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise ValueError("Не удалось записать входящее") from exc
+    conn.commit()
+    return _public(row)
+
+
 def list_inbox(conn, account_id: int, q: str = "") -> list:
     account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
     if account is None:

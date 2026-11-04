@@ -2,7 +2,7 @@ feature,area,priority,original,clone,notes
 Вход через веб или Telegram-бота,onboarding,must,yes,partial,S01; локальная страница без бота и без Google/Apple
 Подключить свой аккаунт Telegram (телефон и код),onboarding,must,yes,yes,F01 S02; не Session+JSON
 Статусы аккаунта и переподключение,onboarding,must,yes,partial,бейдж входа есть; health и reconnect ещё нет
-Список входящих с подключённого аккаунта,inbox,must,yes,partial,S04 кэш SQLite после поиска; сокета нет
+Список входящих с подключённого аккаунта,inbox,must,yes,partial,S04 SSE без «Найти»; офлайн только catch_up разницы Telegram
 Поиск чата по имени или @username,inbox,must,yes,yes,F02
 Открыть переписку и ответить,inbox,must,yes,yes,S05 до 50 личных сообщений и ответ в ту же ленту
 Карточка лида рядом с чатом,inbox,must,yes,yes,S06 карточка у ленты личного чата
