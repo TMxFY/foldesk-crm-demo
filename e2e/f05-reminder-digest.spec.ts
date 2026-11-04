@@ -64,7 +64,7 @@ test('F05-E1 empty reminder does not save', async ({ page }) => {
   expect(await (await page.request.get('/api/reminders')).json()).toEqual([]);
 });
 
-test('F05-E2 postpone tells the truth and keeps the due time', async ({ page }) => {
+test('F05-E2 postpone saves the new due time', async ({ page }) => {
   const lead = (await (await page.request.get('/api/leads')).json())[0];
   const created = await page.request.post('/api/reminders', {
     data: { lead_id: lead.id, due_at: '2000-01-01T00:00:00', text: 'позвонить' },
@@ -78,9 +78,11 @@ test('F05-E2 postpone tells the truth and keeps the due time', async ({ page }) 
   await item.getByLabel('Дата').fill('2026-12-02');
   await item.getByLabel('Время').fill('10:00');
   await item.getByRole('button', { name: 'Сохранить срок' }).click();
-  await expect(page.getByRole('alert').filter({ hasText: 'не принимает новый срок' })).toBeVisible();
-  const after = (await (await page.request.get('/api/reminders?scope=all')).json())[0].due_at;
-  expect(after).toBe(before);
+  await expect(digest.getByRole('article').filter({ hasText: 'позвонить' }).getByText('10:00')).toBeVisible();
+  const after = (await (await page.request.get('/api/reminders?scope=all')).json())[0];
+  expect(after.due_at).not.toBe(before);
+  expect(after.done_at).toBeNull();
+  expect(after.text).toBe('позвонить');
 });
 
 test('F05-E3 double click creates one reminder', async ({ page }) => {
@@ -99,6 +101,41 @@ test('F05-E4 mobile digest and keyboard focus on the reminder dialog', async ({ 
   await expect(page.getByRole('heading', { name: 'Напоминания' })).toBeVisible();
   await page.getByRole('region', { name: 'Карточка' }).getByRole('button', { name: 'Напоминание' }).click();
   await expect(page.getByRole('dialog', { name: 'Напоминание' }).getByLabel('Дата')).toBeFocused();
+});
+
+test('F05-E5 open the lead from the digest while CRM search hides the row', async ({ page }) => {
+  const lead = (await (await page.request.get('/api/leads')).json())[0];
+  const created = await page.request.post('/api/reminders', {
+    data: { lead_id: lead.id, due_at: '2000-01-01T00:00:00', text: 'позвонить' },
+  });
+  expect(created.ok()).toBeTruthy();
+  await page.reload();
+  await page.getByLabel('Запрос').fill('нет-такого');
+  await page.getByRole('button', { name: 'Найти' }).click();
+  const card = page.getByRole('region', { name: 'Карточка' });
+  await expect(card.getByText('Выберите лида в списке или на воронке')).toBeVisible();
+  await expect(page.getByRole('cell', { name: '@ivan_p' })).toHaveCount(0);
+  const digest = page.getByRole('region', { name: 'Напоминания' });
+  await digest.getByRole('link', { name: /К лиду: позвонить/ }).click();
+  await expect(card.getByRole('heading', { name: 'Иван Петров' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: '@ivan_p' })).toHaveCount(0);
+});
+
+test('F05-H3 a dated task on the card is a reminder', async ({ page }) => {
+  const card = page.getByRole('region', { name: 'Карточка' });
+  await card.getByLabel('Текст задачи').fill('написать');
+  await card.getByLabel('Дата задачи').fill('2026-12-20');
+  await card.getByLabel('Время задачи').fill('15:00');
+  await card.getByRole('button', { name: 'Поставить задачу' }).click();
+  await expect(card.getByText('написать')).toBeVisible();
+  await expect(card.getByText('15:00')).toBeVisible();
+  const open = await (await page.request.get('/api/reminders?scope=open')).json();
+  expect(open.filter((row: { text: string }) => row.text === 'написать')).toHaveLength(1);
+  await card.getByRole('button', { name: 'Задача сделана: написать' }).click();
+  await expect(card.getByRole('button', { name: 'Задача сделана: написать' })).toHaveCount(0);
+  const all = await (await page.request.get('/api/reminders?scope=all')).json();
+  const task = all.find((row: { text: string }) => row.text === 'написать');
+  expect(task.done_at).toBeTruthy();
 });
 
 test('F05-N1 missing lead cannot take a reminder', async ({ page }) => {

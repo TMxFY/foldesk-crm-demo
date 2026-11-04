@@ -12,6 +12,12 @@ def _clean_username(username):
     return value or None
 
 
+def _blank(value):
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
 def _find_dialog_lead(conn, account_id, telegram_user_id):
     row = conn.execute(
         """
@@ -34,14 +40,20 @@ def create_lead(
     status="new",
     note=None,
     next_step=None,
+    description=None,
+    email=None,
+    url=None,
 ) -> dict:
     if status not in STATUSES:
         raise ValueError("Неизвестный статус")
     username = _clean_username(username)
     name = (name or "").strip() or None
     phone = (phone or "").strip() or None
-    note = None if note is None else str(note)
+    note = _blank(note)
     next_step = None if next_step is None else str(next_step)
+    description = _blank(description)
+    email = _blank(email)
+    url = _blank(url)
     if not any((name, username, phone, telegram_user_id)):
         raise ValueError("Укажите имя, username, телефон или telegram id")
     now = utc_now()
@@ -50,8 +62,9 @@ def create_lead(
             """
             INSERT INTO leads (
                 account_id, telegram_user_id, username, name, phone,
-                status, note, next_step, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, note, next_step, created_at, updated_at,
+                description, email, url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account_id,
@@ -64,6 +77,9 @@ def create_lead(
                 next_step,
                 now,
                 now,
+                description,
+                email,
+                url,
             ),
         )
         conn.commit()
@@ -77,8 +93,15 @@ def create_lead(
     return as_dict(row)
 
 
+def get_lead(conn, lead_id: int) -> dict:
+    row = conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    if row is None:
+        raise LookupError("lead")
+    return as_dict(row)
+
+
 def update_lead(conn, lead_id: int, **fields) -> dict:
-    allowed = {"status", "note", "next_step", "name"}
+    allowed = {"status", "note", "next_step", "name", "description", "email", "url"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError("Нельзя менять: " + ", ".join(sorted(unknown)))
@@ -91,6 +114,9 @@ def update_lead(conn, lead_id: int, **fields) -> dict:
         raise ValueError("Неизвестный статус")
     if "name" in fields and fields["name"] is not None:
         fields["name"] = str(fields["name"]).strip() or None
+    for key in ("description", "email", "url"):
+        if key in fields and fields[key] is not None:
+            fields[key] = str(fields[key]).strip() or None
     assignments = ", ".join(f"{key} = ?" for key in fields)
     values = list(fields.values())
     values.append(utc_now())
@@ -128,6 +154,8 @@ def search_leads(conn, q: str = "", status: str | None = None) -> list:
                 lead.get("username") or "",
                 lead.get("phone") or "",
                 str(lead.get("telegram_user_id") or ""),
+                lead.get("email") or "",
+                lead.get("url") or "",
             )
         )
         return folded in blob.casefold()

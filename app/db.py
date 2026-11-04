@@ -29,6 +29,12 @@ def connect(db_path=None) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
+    have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if name not in have:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -60,6 +66,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             next_step TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            description TEXT,
+            email TEXT,
+            url TEXT,
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         );
 
@@ -81,8 +90,48 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             FOREIGN KEY (lead_id) REFERENCES leads(id)
         );
+
+        CREATE TABLE IF NOT EXISTS dialogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            peer_type TEXT NOT NULL DEFAULT 'user' CHECK (
+                peer_type IN ('user', 'chat', 'channel')
+            ),
+            peer_id INTEGER NOT NULL,
+            username TEXT,
+            title TEXT,
+            is_group INTEGER NOT NULL DEFAULT 0 CHECK (is_group IN (0, 1)),
+            unread_count INTEGER NOT NULL DEFAULT 0 CHECK (unread_count >= 0),
+            last_message_at TEXT,
+            last_message_preview TEXT,
+            last_from_peer INTEGER NOT NULL DEFAULT 0 CHECK (last_from_peer IN (0, 1)),
+            muted INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+            lead_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (account_id, peer_type, peer_id),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+            FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL,
+            telegram_message_id INTEGER NOT NULL,
+            direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+            text TEXT,
+            sent_at TEXT NOT NULL,
+            reply_to_telegram_message_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (dialog_id, telegram_message_id),
+            FOREIGN KEY (dialog_id) REFERENCES dialogs(id) ON DELETE CASCADE
+        );
         """
     )
+    _ensure_column(conn, "leads", "description", "TEXT")
+    _ensure_column(conn, "leads", "email", "TEXT")
+    _ensure_column(conn, "leads", "url", "TEXT")
     conn.commit()
 
 

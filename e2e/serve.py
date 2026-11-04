@@ -47,6 +47,8 @@ def build():
 
     @app.post("/api/test/reset")
     def reset():
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM dialogs")
         conn.execute("DELETE FROM reminders")
         conn.execute("DELETE FROM leads")
         conn.execute("DELETE FROM accounts")

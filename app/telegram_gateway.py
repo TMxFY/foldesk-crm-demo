@@ -1,7 +1,9 @@
 import os
 from abc import ABC, abstractmethod
 
-from app.db import resolve_session
+from datetime import timezone
+
+from app.db import resolve_session, utc_now
 
 
 class GatewayError(Exception):
@@ -26,6 +28,9 @@ class TelegramGateway(ABC):
     @abstractmethod
     async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
         """User dialogs only. A query starting with @ resolves that username."""
+
+    async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
+        raise GatewayError("Отправка не подключена")
 
 
 def _session_name(session_path: str) -> str:
@@ -176,6 +181,35 @@ class TelethonGateway(TelegramGateway):
                 break
         return found
 
+    async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
+        body = (text or "").strip()
+        if not body:
+            raise GatewayError("Напишите сообщение")
+        client, owned = await self._open(session_path)
+        try:
+            kwargs = {"reply_to": int(reply_to)} if reply_to else {}
+            msg = await client.send_message(int(peer_id), body, **kwargs)
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось отправить") from exc
+        finally:
+            if owned:
+                await self._close(session_path)
+        sent = getattr(msg, "date", None)
+        if sent is None:
+            sent_at = utc_now()
+        else:
+            if sent.tzinfo is None:
+                sent = sent.replace(tzinfo=timezone.utc)
+            sent_at = sent.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        return {
+            "telegram_message_id": int(msg.id),
+            "text": getattr(msg, "message", None) or body,
+            "sent_at": sent_at,
+            "direction": "out",
+        }
+
     async def _resolve_username(self, client, query: str) -> list:
         from telethon.tl.types import User
 
@@ -201,6 +235,8 @@ class FakeGateway(TelegramGateway):
         self.needs_password = needs_password
         self.dialogs = [dict(item) for item in (dialogs or [])]
         self._pending = {}
+        self.sent = []
+        self._message_seq = 0
 
     async def request_code(self, phone: str, session_path: str) -> str:
         phone_code_hash = "hash-" + phone
@@ -273,3 +309,16 @@ class FakeGateway(TelegramGateway):
             if len(matched) >= limit:
                 break
         return matched
+
+    async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
+        body = (text or "").strip()
+        if not body:
+            raise GatewayError("Напишите сообщение")
+        self._message_seq += 1
+        self.sent.append({"peer_id": int(peer_id), "text": body, "reply_to": reply_to})
+        return {
+            "telegram_message_id": self._message_seq,
+            "text": body,
+            "sent_at": utc_now(),
+            "direction": "out",
+        }

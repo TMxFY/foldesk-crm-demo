@@ -27,8 +27,10 @@ const state = {
   loginId: null,
   accounts: [],
   leads: [],
+  leadCache: {},
   reminders: [],
   dialogs: [],
+  messages: [],
   dialogQuery: "",
   leadQuery: "",
   inbox: "empty",
@@ -160,11 +162,12 @@ function textField(lead, field, label) {
 
 async function patchLead(id, body) {
   try {
-    await api(`/api/leads/${id}`, { method: "PATCH", body });
-    await loadLeads(state.leadQuery);
+    const updated = await api(`/api/leads/${id}`, { method: "PATCH", body });
+    state.leadCache[updated.id] = updated;
+    await loadLeads(state.leadQuery, updated.id);
   } catch (error) {
     toast(error.message, "error");
-    await loadLeads(state.leadQuery);
+    await loadLeads(state.leadQuery, id);
   }
 }
 
@@ -336,7 +339,43 @@ function renderThread() {
     el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
     el("p", { className: "hint" }, [dialog.username ? `@${dialog.username}` : "без ника"]),
   );
-  document.querySelector("#messages").replaceChildren();
+  const items = state.messages || [];
+  document.querySelector("#messages").replaceChildren(...items.map((message) => (
+    el("li", { className: message.direction === "out" ? "out" : "in" }, [
+      message.text || "Вложение",
+    ])
+  )));
+  const gap = document.querySelector("#thread-gap");
+  if (gap) gap.hidden = items.length > 0;
+}
+
+function selectedAccount() {
+  const id = Number(document.querySelector("#tg-account").value);
+  return state.accounts.find((account) => account.id === id) || null;
+}
+
+async function selectDialog(dialog) {
+  state.selectedDialog = dialog;
+  state.messages = [];
+  setView("#thread-view", "loading");
+  renderDialogs();
+  const reply = document.querySelector("#reply-text");
+  if (reply) reply.value = "";
+  let loadError = "";
+  if (dialog.id) {
+    try {
+      state.messages = await api(`/api/dialogs/${dialog.id}/messages`);
+    } catch (error) {
+      loadError = error.message;
+    }
+  }
+  renderThread();
+  if (loadError) {
+    const error = document.querySelector("#thread-error");
+    error.hidden = false;
+    error.textContent = loadError;
+  }
+  renderSide();
 }
 
 function leadForDialog(dialog) {
@@ -349,13 +388,7 @@ function leadForDialog(dialog) {
   }) || null;
 }
 
-function selectDialog(dialog) {
-  state.selectedDialog = dialog;
-  setView("#thread-view", "loading");
-  renderDialogs();
-  renderThread();
-  renderSide();
-}
+
 
 function renderSide() {
   const dialog = state.selectedDialog;
@@ -387,7 +420,27 @@ function renderSide() {
 }
 
 function selectedLead() {
-  return state.leads.find((lead) => lead.id === state.selectedLeadId) || null;
+  if (state.selectedLeadId == null) return null;
+  const inList = state.leads.find((lead) => lead.id === state.selectedLeadId);
+  if (inList) return inList;
+  return state.leadCache[state.selectedLeadId] || null;
+}
+
+function safeHref(url) {
+  const text = String(url || "").trim();
+  return /^https?:\/\//i.test(text) ? text : "";
+}
+
+async function focusLead(id) {
+  try {
+    const lead = await api(`/api/leads/${id}`);
+    state.leadCache[lead.id] = lead;
+    state.selectedLeadId = lead.id;
+    renderCard();
+    renderBoard();
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 function openNoteModal(lead) {
@@ -453,6 +506,50 @@ function openChat(lead) {
   document.querySelector("#s05").scrollIntoView({ block: "nearest" });
 }
 
+function taskForm(lead) {
+  const date = el("input", { type: "date", "aria-label": "Дата задачи" });
+  const time = el("input", { type: "time", "aria-label": "Время задачи" });
+  const text = el("input", { type: "text", "aria-label": "Текст задачи" });
+  let saving = false;
+  return el("form", {
+    className: "stack",
+    onsubmit: async (event) => {
+      event.preventDefault();
+      if (saving) return;
+      const due = fromDateAndTime(date.value, time.value);
+      const body = text.value.trim();
+      if (!due || !body) {
+        toast("Укажите дату, время и текст задачи", "error");
+        return;
+      }
+      const button = event.target.querySelector("button[type=submit]");
+      saving = true;
+      button.disabled = true;
+      try {
+        await api("/api/reminders", {
+          method: "POST",
+          body: { lead_id: lead.id, due_at: due, text: body },
+        });
+        date.value = "";
+        time.value = "";
+        text.value = "";
+        await loadReminders();
+        toast("Задача поставлена", "ok");
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        saving = false;
+        button.disabled = false;
+      }
+    },
+  }, [
+    el("label", {}, ["Текст задачи", text]),
+    el("label", {}, ["Дата задачи", date]),
+    el("label", {}, ["Время задачи", time]),
+    el("button", { type: "submit", className: "btn secondary sm" }, ["Поставить задачу"]),
+  ]);
+}
+
 function renderCard() {
   const lead = selectedLead();
   if (!lead) {
@@ -470,35 +567,62 @@ function renderCard() {
     ]));
   }
   state.reminders.filter((item) => item.lead_id === lead.id).forEach((item) => {
+    const body = [
+      el("p", {}, [item.text]),
+      el("p", { className: "meta" }, [el("time", { datetime: item.due_at || "" }, [formatDue(item.due_at)])]),
+    ];
+    if (!item.done_at) {
+      body.push(el("button", {
+        type: "button",
+        className: "btn ghost sm",
+        "aria-label": `Задача сделана: ${item.text}`,
+        onclick: async () => {
+          try {
+            await api(`/api/reminders/${item.id}/done`, { method: "POST" });
+            await loadReminders();
+          } catch (error) {
+            toast(error.message, "error");
+          }
+        },
+      }, ["Сделано"]));
+    }
     notes.push(el("li", {}, [
       el("span", { className: "dot", "aria-hidden": "true" }, []),
-      el("div", {}, [
-        el("p", {}, [item.text]),
-        el("p", { className: "meta" }, [el("time", { datetime: item.due_at || "" }, [formatDue(item.due_at)])]),
-      ]),
+      el("div", {}, body),
     ]));
   });
   const timeline = notes.length
     ? el("ol", { className: "timeline" }, notes)
     : el("p", { className: "hint" }, ["Заметок пока нет"]);
-  document.querySelector("#lead-card").replaceChildren(
-    el("div", { className: "panel", "aria-labelledby": "card-name" }, [
-      el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
-      el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
-      el("label", {}, ["Статус", statusSelect(lead)]),
-      el("p", { className: "hint" }, [
-        lead.username ? `@${lead.username}` : "без ника",
-        lead.phone ? ` · ${lead.phone}` : "",
-        lead.telegram_user_id ? ` · ${lead.telegram_user_id}` : "",
-      ]),
-      el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
-      timeline,
-      el("div", { className: "row" }, [
-        el("button", { type: "button", className: "btn secondary sm", onclick: () => openNoteModal(lead) }, ["Заметка"]),
-        el("button", { type: "button", className: "btn secondary sm", onclick: () => openReminderModal(lead) }, ["Напоминание"]),
-        el("button", { type: "button", className: "btn ghost sm", onclick: () => openChat(lead) }, ["Открыть чат"]),
-      ]),
+  const href = safeHref(lead.url);
+  const profile = [
+    el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
+    el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
+    el("label", {}, ["Статус", statusSelect(lead)]),
+    el("p", { className: "hint" }, [
+      lead.username ? `@${lead.username}` : "без ника",
+      lead.phone ? ` · ${lead.phone}` : "",
+      lead.telegram_user_id ? ` · ${lead.telegram_user_id}` : "",
     ]),
+  ];
+  if (lead.email) profile.push(el("p", {}, [lead.email]));
+  if (href) profile.push(el("a", { href, rel: "noreferrer" }, ["Ссылка"]));
+  profile.push(
+    el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
+    timeline,
+    el("section", { "aria-label": "Задачи" }, [
+      el("h4", {}, ["Задача"]),
+      el("p", { className: "hint" }, ["Срок пишется в напоминание"]),
+      taskForm(lead),
+    ]),
+    el("div", { className: "row" }, [
+      el("button", { type: "button", className: "btn secondary sm", onclick: () => openNoteModal(lead) }, ["Заметка"]),
+      el("button", { type: "button", className: "btn secondary sm", onclick: () => openReminderModal(lead) }, ["Напоминание"]),
+      el("button", { type: "button", className: "btn ghost sm", onclick: () => openChat(lead) }, ["Открыть чат"]),
+    ]),
+  );
+  document.querySelector("#lead-card").replaceChildren(
+    el("div", { className: "panel", "aria-labelledby": "card-name" }, profile),
   );
   setView("#card-view", "filled");
 }
@@ -611,7 +735,7 @@ function renderLeadTable() {
   });
 }
 
-async function loadLeads(query) {
+async function loadLeads(query, keepId) {
   state.leadQuery = query || "";
   setView("#leads-view", "loading");
   setView("#board-view", "loading");
@@ -619,14 +743,18 @@ async function loadLeads(query) {
   if (state.leadQuery) params.set("q", state.leadQuery);
   const leads = await api(`/api/leads?${params.toString()}`);
   state.leads = leads;
-  if (state.selectedLeadId && !leads.some((lead) => lead.id === state.selectedLeadId)) {
+  leads.forEach((lead) => { state.leadCache[lead.id] = lead; });
+  if (keepId != null && state.leadCache[keepId]) {
+    state.selectedLeadId = keepId;
+  } else if (state.selectedLeadId && !leads.some((lead) => lead.id === state.selectedLeadId)) {
     state.selectedLeadId = null;
   }
   renderLeadTable();
   renderBoard();
   renderCard();
   renderSide();
-  setView("#leads-view", leads.length ? "filled" : "empty");
+  const leadMode = leads.length ? "filled" : (state.leadQuery ? "none" : "empty");
+  setView("#leads-view", leadMode);
   setView("#board-view", leads.length ? "filled" : "empty");
 }
 
@@ -647,14 +775,31 @@ function reminderCard(reminder) {
   const postpone = el("form", { hidden: "hidden", className: "stack" }, [
     el("label", {}, ["Дата", el("input", { type: "date", name: "date", required: "required" })]),
     el("label", {}, ["Время", el("input", { type: "time", name: "time", required: "required" })]),
-    el("p", { className: "err", hidden: "hidden" }, ["Сервер пока не принимает новый срок."]),
+    el("p", { className: "err", hidden: "hidden" }, [""]),
     el("button", { type: "submit", className: "btn ghost sm" }, ["Сохранить срок"]),
   ]);
-  postpone.addEventListener("submit", (event) => {
+  postpone.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const data = new FormData(postpone);
+    const due = fromDateAndTime(data.get("date"), data.get("time"));
     const err = postpone.querySelector(".err");
-    err.hidden = false;
-    toast("Сервер пока не принимает новый срок.", "error");
+    const button = postpone.querySelector("button[type=submit]");
+    if (!due) {
+      err.textContent = "Укажите дату и время";
+      err.hidden = false;
+      return;
+    }
+    button.disabled = true;
+    try {
+      await api(`/api/reminders/${reminder.id}/postpone`, { method: "POST", body: { due_at: due } });
+      await loadReminders();
+      toast("Срок обновлён", "ok");
+    } catch (error) {
+      err.textContent = error.message;
+      err.hidden = false;
+      toast(error.message, "error");
+      button.disabled = false;
+    }
   });
   item.append(el("div", { className: "row" }, [
     el("button", {
@@ -680,11 +825,7 @@ function reminderCard(reminder) {
       className: "btn primary sm",
       href: "#s09",
       "aria-label": `К лиду: ${reminder.text}`,
-      onclick: () => {
-        state.selectedLeadId = reminder.lead_id;
-        renderCard();
-        renderBoard();
-      },
+      onclick: () => { focusLead(reminder.lead_id); },
     }, ["К лиду"]),
   ]));
   item.append(postpone);
@@ -727,6 +868,22 @@ async function loadReminders() {
   state.reminders = await api(`/api/reminders?scope=${state.scope}`);
   renderReminders();
   renderCard();
+}
+
+async function loadInbox() {
+  const select = document.querySelector("#tg-account");
+  if (!select.value) {
+    state.dialogs = [];
+    state.inbox = "empty";
+    state.dialogQuery = "";
+    renderDialogs();
+    return;
+  }
+  const dialogs = await api(`/api/inbox?account_id=${select.value}`);
+  state.dialogs = dialogs;
+  state.dialogQuery = "";
+  state.inbox = "filled";
+  renderDialogs();
 }
 
 async function searchTelegram(query) {
@@ -882,11 +1039,14 @@ document.querySelector("#manual-lead").addEventListener("submit", async (event) 
         name: form.get("name"),
         username: form.get("username"),
         phone: form.get("phone"),
+        note: form.get("note"),
+        url: form.get("url"),
+        email: form.get("email"),
       },
     });
     event.target.reset();
-    state.selectedLeadId = lead.id;
-    await loadLeads(state.leadQuery);
+    state.leadCache[lead.id] = lead;
+    await loadLeads(state.leadQuery, lead.id);
   } catch (error) {
     toast(error.message, "error");
   } finally {
@@ -930,8 +1090,8 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
         name: dialog.name,
       },
     });
-    state.selectedLeadId = lead.id;
-    await loadLeads(state.leadQuery);
+    state.leadCache[lead.id] = lead;
+    await loadLeads(state.leadQuery, lead.id);
     toast("Записан в лиды", "ok");
   } catch (error) {
     document.querySelector("#side-error").textContent = error.message;
@@ -942,13 +1102,62 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
   }
 });
 
-document.querySelector("#reply-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const error = document.querySelector("#thread-error");
-  error.hidden = false;
-  error.textContent = "Отправка в чат ещё не подключена.";
-  toast(error.textContent, "error");
-});
+{
+  let sending = false;
+  document.querySelector("#reply-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const error = document.querySelector("#thread-error");
+    const dialog = state.selectedDialog;
+    const field = document.querySelector("#reply-text");
+    const text = field.value.trim();
+    error.hidden = true;
+    error.textContent = "";
+    if (!dialog) {
+      error.hidden = false;
+      error.textContent = "Выберите разговор";
+      return;
+    }
+    const account = selectedAccount();
+    if (!account || account.status !== "connected") {
+      error.hidden = false;
+      error.textContent = "Аккаунт не подключён";
+      toast(error.textContent, "error");
+      return;
+    }
+    if (!text) {
+      error.hidden = false;
+      error.textContent = "Напишите сообщение";
+      toast(error.textContent, "error");
+      return;
+    }
+    if (!dialog.id) {
+      error.hidden = false;
+      error.textContent = "Чат ещё не в кэше";
+      toast(error.textContent, "error");
+      return;
+    }
+    if (sending) return;
+    sending = true;
+    const button = event.target.querySelector("button[type=submit]");
+    button.disabled = true;
+    try {
+      const message = await api(`/api/dialogs/${dialog.id}/messages`, {
+        method: "POST",
+        body: { text },
+      });
+      state.messages = [...(state.messages || []), message];
+      field.value = "";
+      renderThread();
+    } catch (err) {
+      error.hidden = false;
+      error.textContent = err.message;
+      toast(err.message, "error");
+    } finally {
+      sending = false;
+      button.disabled = false;
+    }
+  });
+}
 
 document.querySelector("#mark-unread").addEventListener("click", () => {
   const error = document.querySelector("#thread-error");
@@ -1029,6 +1238,14 @@ async function boot() {
     await loadAccounts();
   } catch (error) {
     failRegion("#accounts-view", "#accounts-error", error);
+  }
+  try {
+    await loadInbox();
+  } catch (error) {
+    state.inbox = "error";
+    const node = document.querySelector("#inbox-error");
+    if (node) node.textContent = error.message;
+    setView("#inbox-view", "error");
   }
   try {
     await loadLeads("");

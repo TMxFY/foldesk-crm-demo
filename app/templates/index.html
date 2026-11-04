@@ -96,7 +96,7 @@
             <div id="thread-head"></div>
             <p id="thread-error" class="msg" role="alert" hidden></p>
             <ol id="messages" class="messages"></ol>
-            <p class="hint">В кэше нет сообщений</p>
+            <p id="thread-gap" class="hint">В кэше нет сообщений</p>
             <form id="reply-form">
               <label for="reply-text">Ответ</label>
               <textarea id="reply-text" name="text"></textarea>
@@ -135,11 +135,15 @@
           <label>Имя <input name="name" autocomplete="name"></label>
           <label>Ник <input name="username" autocomplete="off"></label>
           <label>Телефон <input name="phone" type="tel" autocomplete="tel"></label>
+          <label>Заметка <input name="note" autocomplete="off"></label>
+          <label>Ссылка <input name="url" type="url" autocomplete="off" inputmode="url"></label>
+          <label>Почта <input name="email" type="email" autocomplete="email"></label>
           <button type="submit" class="btn primary sm">Добавить лид</button>
         </form>
         <div id="leads-view" data-state="loading">
           <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
           <p data-when="empty" class="hint">Лидов пока нет</p>
+          <p data-when="none" class="hint">По запросу пусто</p>
           <p data-when="error" id="leads-error" class="msg" role="alert"></p>
           <div data-when="filled" class="table-wrap">
             <table>

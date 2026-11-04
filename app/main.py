@@ -10,8 +10,9 @@ from pydantic import BaseModel
 from app.accounts import confirm_login, confirm_password, list_accounts, start_login
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
-from app.leads import add_lead_from_dialog, create_lead, search_leads, update_lead
-from app.reminders import complete_reminder, create_reminder, list_reminders
+from app.inbox import list_inbox, list_messages, remember_dialogs, send_reply
+from app.leads import add_lead_from_dialog, create_lead, get_lead, search_leads, update_lead
+from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.telegram_gateway import GatewayError, TelethonGateway
 
 BASE = Path(__file__).resolve().parent
@@ -53,6 +54,9 @@ class LeadIn(BaseModel):
     status: str = "new"
     note: str | None = None
     next_step: str | None = None
+    description: str | None = None
+    email: str | None = None
+    url: str | None = None
 
 
 class LeadPatch(BaseModel):
@@ -60,12 +64,24 @@ class LeadPatch(BaseModel):
     note: str | None = None
     next_step: str | None = None
     name: str | None = None
+    description: str | None = None
+    email: str | None = None
+    url: str | None = None
 
 
 class ReminderIn(BaseModel):
     lead_id: int
     due_at: str
     text: str
+
+
+class PostponeIn(BaseModel):
+    due_at: str
+
+
+class MessageIn(BaseModel):
+    text: str
+    reply_to: int | None = None
 
 
 def _gateway(request: Request):
@@ -155,7 +171,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             found = await gateway.search_dialogs(account["session_path"], q, limit=30)
         except GatewayError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return found[:30]
+        return remember_dialogs(request.app.state.conn, account_id, found[:30])
 
     @app.post("/api/leads")
     def leads_create(body: LeadIn, request: Request):
@@ -180,6 +196,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             status=body.status,
             note=body.note,
             next_step=body.next_step,
+            description=body.description,
+            email=body.email,
+            url=body.url,
         )
 
     @app.get("/api/leads")
@@ -190,6 +209,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             q,
             status or None,
         )
+
+    @app.get("/api/leads/{lead_id}")
+    def leads_get(lead_id: int, request: Request):
+        return _call(get_lead, request.app.state.conn, lead_id)
 
     @app.patch("/api/leads/{lead_id}")
     def leads_patch(lead_id: int, body: LeadPatch, request: Request):
@@ -213,6 +236,32 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.post("/api/reminders/{reminder_id}/done")
     def reminders_done(reminder_id: int, request: Request):
         return _call(complete_reminder, request.app.state.conn, reminder_id)
+
+    @app.post("/api/reminders/{reminder_id}/postpone")
+    def reminders_postpone(reminder_id: int, body: PostponeIn, request: Request):
+        return _call(
+            postpone_reminder, request.app.state.conn, reminder_id, body.due_at
+        )
+
+    @app.get("/api/inbox")
+    def inbox_list(request: Request, account_id: int, q: str = ""):
+        return _call(list_inbox, request.app.state.conn, account_id, q)
+
+    @app.get("/api/dialogs/{dialog_id}/messages")
+    def dialog_messages(dialog_id: int, request: Request):
+        return _call(list_messages, request.app.state.conn, dialog_id)
+
+    @app.post("/api/dialogs/{dialog_id}/messages")
+    async def dialog_send(dialog_id: int, body: MessageIn, request: Request):
+        gateway = _gateway(request)
+        return await _call_async(
+            send_reply,
+            request.app.state.conn,
+            dialog_id,
+            body.text,
+            gateway,
+            body.reply_to,
+        )
 
     return app
 

@@ -73,6 +73,24 @@ def list_reminders(conn, scope: str = "open", now: str | None = None) -> list:
     return overdue
 
 
+def postpone_reminder(conn, reminder_id: int, due_at: str) -> dict:
+    row = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+    if row is None:
+        raise LookupError("reminder")
+    if row["done_at"] is not None:
+        raise ValueError("Напоминание уже закрыто")
+    due = normalize_due(due_at)
+    conn.execute(
+        "UPDATE reminders SET due_at = ? WHERE id = ?",
+        (due, reminder_id),
+    )
+    conn.commit()
+    updated = conn.execute(
+        "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+    ).fetchone()
+    return as_dict(updated)
+
+
 def complete_reminder(conn, reminder_id: int) -> dict:
     row = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
     if row is None:
