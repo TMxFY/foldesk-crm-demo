@@ -13,7 +13,7 @@ feature,area,priority,original,clone,notes
 Карточка: профиль свойства заметки задачи,leads,must,yes,yes,S09 notes tasks property_values; срок только у reminders
 Заметка на карточке,notes,must,yes,yes,лента notes со временем; leads.note не затирается и виден если ленты нет
 Напоминание с датой и временем,reminders,must,yes,yes,F05 S13
-Дайджест задач на день в боте,reminders,must,yes,partial,S17 панель на странице; бота нет
+Дайджест задач на день в боте,reminders,must,yes,yes,S17 одно sendMessage в BOT_CHAT_ID; пустой день честно; Сделано и К лиду
 Уведомление в срок: готово / отложить / открыть лида,reminders,must,yes,yes,S18 сделано отложить и к лиду пишутся
 Добавить лида вручную,leads,must,yes,yes,имя ник телефон заметка ссылка почта
 Проверка дублей,leads,must,yes,yes,ошибка API в тосте; слияния нет

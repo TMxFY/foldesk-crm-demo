@@ -1306,6 +1306,37 @@ document.querySelector("#manual-lead").addEventListener("submit", async (event) 
   }
 });
 
+async function sendDigest() {
+  const button = document.querySelector("#digest-send");
+  const status = document.querySelector("#digest-send-status");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  if (status) {
+    status.textContent = "";
+    status.hidden = true;
+  }
+  try {
+    await api("/api/digest/send", { method: "POST" });
+    if (status) {
+      status.hidden = false;
+      status.textContent = "Дайджест отправлен";
+    }
+    toast("Дайджест отправлен", "ok");
+  } catch (error) {
+    if (status) {
+      status.hidden = false;
+      status.textContent = error.message;
+    }
+    toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.querySelector("#digest-send").addEventListener("click", () => {
+  sendDigest();
+});
+
 document.querySelector("#reminder-scopes").addEventListener("click", async (event) => {
   const button = event.target.closest("button");
   if (!button) return;

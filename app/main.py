@@ -17,6 +17,7 @@ from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, 
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
 from app.properties import create_property_def, set_lead_property
+from app.digest import apply_digest_callback, callback_data_from_update, send_morning_digest
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.tasks import create_task, set_task_done
 from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
@@ -83,6 +84,10 @@ class ReminderIn(BaseModel):
 
 class PostponeIn(BaseModel):
     due_at: str
+
+
+class DigestCallbackIn(BaseModel):
+    data: str
 
 
 class MessageIn(BaseModel):
@@ -460,6 +465,24 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(
             postpone_reminder, request.app.state.conn, reminder_id, body.due_at
         )
+
+    @app.post("/api/digest/send")
+    def digest_send(request: Request):
+        opener = getattr(request.app.state, "digest_opener", None)
+        return _call(send_morning_digest, request.app.state.conn, opener=opener)
+
+    @app.post("/api/digest/callback")
+    def digest_callback(body: DigestCallbackIn, request: Request):
+        return _call(apply_digest_callback, request.app.state.conn, body.data)
+
+    @app.post("/api/digest/webhook")
+    async def digest_webhook(request: Request):
+        try:
+            update = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Неизвестное действие") from exc
+        data = _call(callback_data_from_update, update)
+        return _call(apply_digest_callback, request.app.state.conn, data)
 
     @app.get("/api/inbox")
     async def inbox_list(request: Request, account_id: int, q: str = ""):

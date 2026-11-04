@@ -53,13 +53,44 @@ class E2EGateway(FakeGateway):
         return await super().request_code(phone, session_path)
 
 
+class DigestBox:
+    def __init__(self):
+        self.mode = "ok"
+
+    def __call__(self, req, timeout=None):
+        class Resp:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+
+            def read(self_inner):
+                return self_inner._body
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+        if self.mode == "fail":
+            return Resp(403, b'{"ok": false}')
+        return Resp(200, b'{"ok": true, "result": {"message_id": 1}}')
+
+
+digest_box = DigestBox()
+
+
 def build():
     if DB_PATH.exists():
         DB_PATH.unlink()
     conn = connect(DB_PATH)
     init_db(conn)
     gateway = E2EGateway()
+    # Fake operator bot. Real BOT_TOKEN from the parent shell must not be used.
+    os.environ["BOT_TOKEN"] = "e2e-not-a-secret"
+    os.environ["BOT_CHAT_ID"] = "900001"
     app = create_app(conn=conn, gateway=gateway)
+    app.state.digest_opener = digest_box
 
     @app.post("/api/test/reset")
     async def reset():
@@ -82,7 +113,16 @@ def build():
         gateway.health = None
         gateway._message_seq = 0
         seed_history(gateway)
+        digest_box.mode = "ok"
         return {"ok": True}
+
+    @app.post("/api/test/digest-transport")
+    async def digest_transport(body: dict):
+        mode = body.get("mode")
+        if mode not in ("ok", "fail"):
+            return {"ok": False}
+        digest_box.mode = mode
+        return {"mode": mode}
 
     @app.post("/api/test/session-health")
     async def session_health(body: dict):
