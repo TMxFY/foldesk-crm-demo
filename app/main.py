@@ -236,6 +236,7 @@ class CampaignFromLeadsIn(BaseModel):
 
 class CampaignRunIn(BaseModel):
     max_send: int | None = None
+    respect_delays: bool = False
 
 
 def _gateway(request: Request):
@@ -1041,6 +1042,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         campaign_id: int, request: Request, body: CampaignRunIn | None = None
     ):
         max_send = body.max_send if body is not None else None
+        respect_delays = bool(body.respect_delays) if body is not None else False
         camp_row = request.app.state.conn.execute(
             """
             SELECT a.session_path, a.provider
@@ -1053,6 +1055,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         has_tg_creds = bool(
             os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
         )
+        wa_gateway = _gateway_for_provider(request, "whatsapp")
         if (
             camp_row
             and request.app.state.gateway is None
@@ -1060,7 +1063,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         ):
             gateway = None
         elif camp_row and str(camp_row["provider"] or "").strip().lower() == "whatsapp":
-            gateway = _gateway_for_provider(request, "whatsapp")
+            gateway = (
+                request.app.state.gateway
+                if request.app.state.gateway is not None
+                else (_gateway(request) if has_tg_creds else None)
+            )
         elif (
             camp_row
             and request.app.state.gateway is None
@@ -1077,6 +1084,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             campaign_id,
             gateway=gateway,
             max_send=max_send,
+            respect_delays=respect_delays,
+            wa_gateway=wa_gateway,
         )
 
     @app.post("/api/demo/seed")

@@ -138,6 +138,23 @@ def update_account_settings(
     return _public(_load(conn, account_id))
 
 
+def delete_account(conn, account_id: int) -> dict:
+    current = _load(conn, account_id)
+    session_path = str(current.get("session_path") or "").strip()
+    conn.execute("UPDATE leads SET account_id = NULL WHERE account_id = ?", (account_id,))
+    conn.execute("UPDATE campaigns SET account_id = NULL WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+    conn.commit()
+    if session_path and not session_path.startswith("data/sessions/demo"):
+        try:
+            abs_p = resolve_session(session_path)
+            if abs_p.exists() and abs_p.is_file():
+                abs_p.unlink()
+        except Exception:
+            pass
+    return {"deleted": True, "id": int(account_id)}
+
+
 def check_daily_limit(conn, account_id: int) -> tuple[int, int]:
     row = _load(conn, account_id)
     today = utc_today()
@@ -234,6 +251,8 @@ async def start_login(
         qr_code = generate_qr_svg(session_path, phone)
 
     try:
+        if gateway is not None and hasattr(gateway, "set_proxy"):
+            gateway.set_proxy(session_path, clean_proxy)
         if norm_provider == "whatsapp" and isinstance(gateway, WhatsAppGateway):
             phone_code_hash = await gateway.request_code(
                 phone, session_path, auth_mode=norm_mode
@@ -498,15 +517,76 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 sess_bytes = _decode_b64(str(entry["session_base64"]))
             except Exception:
                 sess_bytes = None
-        if not sess_bytes and entry.get("session_string"):
-            sess_bytes = str(entry["session_string"]).encode("utf-8")
-        if not sess_bytes:
-            if provider == "whatsapp":
-                sess_bytes = f"SQLite format 3\x00whatsapp:{phone}".encode("utf-8")
-            else:
-                sess_bytes = f"SQLite format 3\x00{phone}:{tg_id}".encode("utf-8")
 
-        abs_session_path.write_bytes(sess_bytes)
+        wrote_session = False
+        if sess_bytes:
+            abs_session_path.write_bytes(sess_bytes)
+            wrote_session = True
+        else:
+            raw_session_str = (
+                entry.get("session_string")
+                or jdata.get("session_string")
+                or entry.get("string_session")
+                or jdata.get("string_session")
+            )
+            if raw_session_str and str(raw_session_str).strip():
+                s_val = str(raw_session_str).strip()
+                converted = False
+                if provider == "telegram":
+                    try:
+                        from telethon.sessions import SQLiteSession, StringSession
+
+                        str_sess = StringSession(s_val)
+                        if getattr(str_sess, "auth_key", None):
+                            if abs_session_path.exists():
+                                abs_session_path.unlink()
+                            sql_sess = SQLiteSession(str(abs_session_path.with_suffix("")))
+                            sql_sess.set_dc(
+                                str_sess.dc_id,
+                                str_sess.server_address,
+                                str_sess.port,
+                            )
+                            sql_sess.auth_key = str_sess.auth_key
+                            sql_sess.save()
+                            sql_sess.close()
+                            converted = True
+                            wrote_session = True
+                    except Exception:
+                        converted = False
+                if not converted:
+                    if not (abs_session_path.exists() and abs_session_path.stat().st_size > 100):
+                        abs_session_path.write_bytes(s_val.encode("utf-8"))
+                        wrote_session = True
+
+        if not wrote_session:
+            if not (abs_session_path.exists() and abs_session_path.stat().st_size > 100):
+                if provider == "whatsapp":
+                    stub_bytes = f"SQLite format 3\x00whatsapp:{phone}".encode("utf-8")
+                else:
+                    stub_bytes = f"SQLite format 3\x00{phone}:{tg_id}".encode("utf-8")
+                abs_session_path.write_bytes(stub_bytes)
+
+        app_id_val = (
+            entry.get("app_id")
+            or entry.get("api_id")
+            or jdata.get("app_id")
+            or jdata.get("api_id")
+            or payload.get("app_id")
+            or payload.get("api_id")
+        )
+        app_hash_val = (
+            entry.get("app_hash")
+            or entry.get("api_hash")
+            or jdata.get("app_hash")
+            or jdata.get("api_hash")
+            or payload.get("app_hash")
+            or payload.get("api_hash")
+        )
+        if gateway is not None:
+            if hasattr(gateway, "set_proxy"):
+                gateway.set_proxy(session_path, proxy_url)
+            if hasattr(gateway, "set_app_credentials") and app_id_val and app_hash_val:
+                gateway.set_app_credentials(session_path, app_id_val, app_hash_val)
 
         existing = conn.execute(
             "SELECT id FROM accounts WHERE phone = ? AND provider = ? ORDER BY id LIMIT 1",

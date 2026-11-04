@@ -364,3 +364,135 @@ def test_softugc_sample_csv_import_and_personalized_steps(tmp_path):
         msgs = client.get(f"/api/dialogs/{yori_dialog['id']}/messages").json()
         assert len(msgs) == 1
         assert "Getting your research AI tool seen" in msgs[0]["text"]
+
+
+def test_auto_stop_on_reply_prevents_followup_and_moves_lead_to_talking(tmp_path):
+    from app.inbox import apply_incoming
+
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    account_id, _ = _seed_connected_account(conn, daily_limit=20)
+    app = create_app(conn=conn, gateway=None)
+
+    with TestClient(app) as client:
+        create_resp = client.post(
+            "/api/campaigns",
+            json={
+                "name": "Авто-стоп при ответе",
+                "account_id": account_id,
+                "daily_limit": 20,
+                "steps": [
+                    {
+                        "step_order": 1,
+                        "delay_hours": 0,
+                        "template_text": "Привет, {name}! Первый шаг.",
+                    },
+                    {
+                        "step_order": 2,
+                        "delay_hours": 24,
+                        "template_text": "{name}, второй шаг (фоллоу-ап 1).",
+                    },
+                    {
+                        "step_order": 3,
+                        "delay_hours": 48,
+                        "template_text": "{name}, третий шаг (фоллоу-ап 2).",
+                    },
+                ],
+            },
+        )
+        assert create_resp.status_code == 200
+        camp_id = create_resp.json()["id"]
+
+        csv_payload = (
+            "username,name,phone,company\n"
+            "@alex_reply,Алексей Ответов,+79995550011,ReplyTech\n"
+            "@boris_operator,Борис Операторов,+79995550022,OpCorp\n"
+            "@victor_silent,ВикторМолчанов,+79995550033,SilentCo\n"
+        )
+        imp = client.post(f"/api/campaigns/{camp_id}/csv", json={"csv_text": csv_payload})
+        assert imp.status_code == 200
+        assert imp.json()["imported"] == 3
+
+        # 1) Отправка шага 1 -> все лиды переходят в 'waiting' и получают расчёт фоллоу-апа
+        run1 = client.post(f"/api/campaigns/{camp_id}/run", json={})
+        assert run1.status_code == 200
+        assert run1.json()["sent"] == 3
+
+        leads_after_step1 = {l["username"]: l for l in client.get("/api/leads").json()}
+        assert leads_after_step1["alex_reply"]["status"] == "waiting"
+        assert "Отправлен шаг 1/3" in (leads_after_step1["alex_reply"]["next_step"] or "")
+        assert leads_after_step1["alex_reply"]["campaign_status"] == "in_progress"
+        assert leads_after_step1["alex_reply"]["campaign_step"] == 1
+        assert leads_after_step1["alex_reply"]["next_followup_at"] is not None
+        assert leads_after_step1["alex_reply"]["account_name"] == "Сейлз Аккаунт"
+
+        camp_after_step1 = client.get(f"/api/campaigns/{camp_id}").json()
+        recs_step1 = {r["username"]: r for r in camp_after_step1["recipients"]}
+        assert recs_step1["alex_reply"]["next_step_order"] == 2
+        assert recs_step1["alex_reply"]["next_delay_hours"] == 24
+        assert recs_step1["alex_reply"]["next_followup_at"] is not None
+        assert recs_step1["alex_reply"]["followup_due"] is False
+        assert "Первый шаг" in (recs_step1["alex_reply"]["last_sent_text"] or "")
+
+        # 2a) Клиент alex_reply присылает входящее через apply_incoming
+        alex_tg_id = recs_step1["alex_reply"]["telegram_user_id"]
+        apply_incoming(
+            conn,
+            account_id,
+            {
+                "telegram_user_id": alex_tg_id,
+                "username": "alex_reply",
+                "name": "Алексей Ответов",
+                "telegram_message_id": 5001,
+                "direction": "in",
+                "text": "Привет! Да, интересно, давайте созвонимся.",
+            },
+        )
+
+        # Мгновенно проверяем: получатель стал 'replied', а лид перешёл в 'talking'
+        alex_lead = client.get(f"/api/leads/{leads_after_step1['alex_reply']['id']}").json()
+        assert alex_lead["status"] == "talking"
+        assert "Клиент ответил" in (alex_lead["next_step"] or "")
+        assert alex_lead["campaign_status"] == "replied"
+        assert alex_lead["last_from_peer"] == 1
+
+        # 2b) Клиент boris_operator ответил, а оператор уже ответил ему вручную (last_from_peer стал 0)
+        boris_tg_id = recs_step1["boris_operator"]["telegram_user_id"]
+        boris_dlg = apply_incoming(
+            conn,
+            account_id,
+            {
+                "telegram_user_id": boris_tg_id,
+                "username": "boris_operator",
+                "name": "Борис Операторов",
+                "telegram_message_id": 5002,
+                "direction": "in",
+                "text": "Сколько стоит?",
+            },
+        )
+        manual_reply = client.post(
+            f"/api/dialogs/{boris_dlg['id']}/messages",
+            json={"text": "Отправил презентацию и прайс!"},
+        )
+        assert manual_reply.status_code == 200
+
+        # 2c) Проверка respect_delays=True: для victor_silent 24 часа ещё не прошли
+        run_delayed = client.post(
+            f"/api/campaigns/{camp_id}/run", json={"respect_delays": True}
+        )
+        assert run_delayed.status_code == 200
+        assert run_delayed.json()["sent"] == 0
+
+        # 3) Запуск шага 2 (принудительно без ожидания таймера) -> отправляется ТОЛЬКО victor_silent!
+        run2 = client.post(f"/api/campaigns/{camp_id}/run", json={})
+        assert run2.status_code == 200
+        run2_data = run2.json()
+        assert run2_data["sent"] == 1
+
+        recs_step2 = {r["username"]: r for r in run2_data["campaign"]["recipients"]}
+        assert recs_step2["alex_reply"]["status"] == "replied"
+        assert recs_step2["alex_reply"]["current_step"] == 1
+        assert recs_step2["boris_operator"]["status"] == "replied"
+        assert recs_step2["boris_operator"]["current_step"] == 1
+        assert recs_step2["victor_silent"]["status"] == "in_progress"
+        assert recs_step2["victor_silent"]["current_step"] == 2

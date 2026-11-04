@@ -40,7 +40,7 @@ const RECIPIENT_STATUS_LABEL = {
   pending: ["В очереди", "b-new"],
   in_progress: ["В цепочке", "b-talk"],
   completed: ["Отправлено", "b-ok"],
-  replied: ["Ответил", "b-won"],
+  replied: ["Ответил · Авто-стоп", "b-won"],
   failed: ["Ошибка", "b-bad"],
 };
 
@@ -100,6 +100,8 @@ const state = {
   leads: [],
   leadCache: {},
   reminders: [],
+  allOpenReminders: [],
+  allOpenRemindersLoaded: false,
   dialogs: [],
   messages: [],
   dialogQuery: "",
@@ -557,6 +559,148 @@ function formatDue(value) {
   const date = new Date(ms);
   const pad = (part) => String(part).padStart(2, "0"); // taste-skill-ignore
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatShortTime(value) {
+  const ms = dueMillis(value);
+  if (Number.isNaN(ms)) return value || "";
+  const date = new Date(ms);
+  const pad = (part) => String(part).padStart(2, "0"); // taste-skill-ignore
+  return `${pad(date.getDate())}.${pad(date.getMonth() + 1)} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function isSameDialog(a, b) {
+  if (!a || !b) return false;
+  if (a.id != null && b.id != null) return Number(a.id) === Number(b.id);
+  if (a.telegram_user_id != null && b.telegram_user_id != null) {
+    if (Number(a.telegram_user_id) !== Number(b.telegram_user_id)) return false;
+    if (a.account_id && b.account_id) return Number(a.account_id) === Number(b.account_id);
+    return true;
+  }
+  return false;
+}
+
+function allRemindersForLead(leadId) {
+  const merged = new Map();
+  (state.allOpenReminders || []).forEach((item) => {
+    if (item && Number(item.lead_id) === Number(leadId)) merged.set(item.id, item);
+  });
+  (state.reminders || []).forEach((item) => {
+    if (item && Number(item.lead_id) === Number(leadId)) merged.set(item.id, item);
+  });
+  return [...merged.values()];
+}
+
+function resolveLeadTracking(lead) {
+  if (!lead) return {};
+  const acc = lead.account_id
+    ? (state.accounts || []).find((a) => Number(a.id) === Number(lead.account_id))
+    : null;
+  const cleanUser = String(lead.username || "").replace(/^@/, "").toLowerCase();
+  const dlg = (state.dialogs || []).find((d) => {
+    if (lead.telegram_user_id && d.telegram_user_id && Number(d.telegram_user_id) === Number(lead.telegram_user_id)) return true;
+    if (cleanUser && d.username && String(d.username).replace(/^@/, "").toLowerCase() === cleanUser) return true;
+    return false;
+  });
+  let recMatch = null;
+  for (const camp of (state.campaigns || [])) {
+    for (const r of (camp.recipients || [])) {
+      if ((lead.id && r.lead_id && Number(r.lead_id) === Number(lead.id))
+        || (cleanUser && r.username && String(r.username).replace(/^@/, "").toLowerCase() === cleanUser)) {
+        recMatch = r;
+        break;
+      }
+    }
+    if (recMatch) break;
+  }
+  const accountName = lead.account_name
+    || (recMatch && recMatch.assigned_account_name)
+    || (acc && (acc.telegram_name || (acc.telegram_username ? `@${acc.telegram_username}` : acc.phone)))
+    || "";
+  const accountPhone = lead.account_phone || (acc && acc.phone) || "";
+  const campaignStatus = lead.campaign_status || (recMatch && recMatch.status) || "";
+  const lastFromPeer = lead.last_from_peer != null
+    ? Number(lead.last_from_peer)
+    : (dlg && dlg.last_from_peer != null ? Number(dlg.last_from_peer) : null);
+  const campaignStep = lead.campaign_step != null
+    ? Number(lead.campaign_step)
+    : (recMatch && recMatch.current_step != null ? Number(recMatch.current_step) : 0);
+  const lastSentAt = lead.last_sent_at || (recMatch && recMatch.last_sent_at) || "";
+  const lastMessageAt = lead.last_message_at || (dlg && dlg.last_message_at) || lastSentAt || "";
+  const nextFollowupAt = lead.next_followup_at || (recMatch && recMatch.next_followup_at) || "";
+  const isReplied = campaignStatus === "replied" || lastFromPeer === 1;
+  const openReminders = allRemindersForLead(lead.id).filter((rem) => !rem.done_at);
+  const hasDueReminder = openReminders.some((rem) => {
+    const b = bucket(rem);
+    return b === "overdue" || b === "today";
+  });
+  const followupDueMs = dueMillis(nextFollowupAt);
+  const isFollowupDue = Boolean(lead.followup_due)
+    || hasDueReminder
+    || (!isReplied && !Number.isNaN(followupDueMs) && followupDueMs <= Date.now());
+  const isWaitingReply = !isReplied && (
+    campaignStatus === "in_progress"
+    || campaignStatus === "completed"
+    || (lastFromPeer === 0 && Boolean(lastMessageAt))
+    || lead.status === "waiting"
+  );
+  return {
+    accountName,
+    accountPhone,
+    campaignStatus,
+    lastFromPeer,
+    campaignStep,
+    lastSentAt,
+    lastMessageAt,
+    nextFollowupAt,
+    isReplied,
+    isWaitingReply,
+    isFollowupDue,
+    openReminders,
+  };
+}
+
+function matchFollowupFilter(lead, followup) {
+  if (!followup) return true;
+  const tr = resolveLeadTracking(lead);
+  if (followup === "replied") return tr.isReplied;
+  if (followup === "waiting_reply") return tr.isWaitingReply;
+  if (followup === "due_followup") return tr.isFollowupDue;
+  return true;
+}
+
+function leadTrackingBox(lead) {
+  const tr = resolveLeadTracking(lead);
+  const senderLabel = tr.accountName || tr.accountPhone || "Не назначен";
+  const lastTouchRaw = tr.lastSentAt || tr.lastMessageAt;
+  const lastTouchLabel = lastTouchRaw ? formatDue(lastTouchRaw) : "Нет касаний";
+  let chainBadge = el("span", { className: "badge b-off" }, ["Вне цепочки"]);
+  if (tr.isReplied) {
+    chainBadge = el("span", { className: "badge b-won" }, ["Ответил — агент остановлен"]);
+  } else if (tr.campaignStatus === "in_progress") {
+    const fupText = tr.nextFollowupAt ? ` · След. фоллоу-ап: ${formatShortTime(tr.nextFollowupAt)}` : "";
+    chainBadge = el("span", { className: "badge b-talk" }, [`Шаг ${tr.campaignStep || 1}${fupText}`]);
+  } else if (tr.campaignStatus === "completed") {
+    chainBadge = el("span", { className: "badge b-ok" }, [`Шаг ${tr.campaignStep || 1} (завершён)`]);
+  } else if (tr.campaignStatus === "pending") {
+    chainBadge = el("span", { className: "badge b-new" }, ["В очереди рассылки"]);
+  } else if (tr.lastFromPeer === 0 && lastTouchRaw) {
+    chainBadge = el("span", { className: "badge b-wait" }, ["Ждём ответа клиента"]);
+  }
+  return el("div", { className: "lead-tracking-box" }, [
+    el("div", { className: "lead-tracking-row" }, [
+      el("span", { className: "hint" }, ["Аккаунт отправителя:"]),
+      el("strong", {}, [senderLabel]),
+    ]),
+    el("div", { className: "lead-tracking-row" }, [
+      el("span", { className: "hint" }, ["Последнее касание:"]),
+      el("span", {}, [lastTouchLabel]),
+    ]),
+    el("div", { className: "lead-tracking-row" }, [
+      el("span", { className: "hint" }, ["Статус цепочки:"]),
+      chainBadge,
+    ]),
+  ]);
 }
 
 function bucket(reminder) {
@@ -1058,9 +1202,11 @@ async function runCampaignStep(campaignId, button) {
   }
   try {
     const res = await api(`/api/campaigns/${campaignId}/run`, { method: "POST" });
+    state.cards = {};
     await loadAccounts();
     await loadCampaigns();
     await loadInbox();
+    await loadReminders();
     await loadLeads(state.leadQuery, state.selectedLeadId);
     const limitNote = res.limit_reached ? " (достигнут суточный лимит)" : "";
     toast(`Отправлено сообщений: ${res.sent}${limitNote}`, "ok");
@@ -1303,7 +1449,13 @@ function renderCampaigns() {
           const stepCell = el("div", { className: "recipient-cell" }, [
             el("span", { className: "recipient-sender" }, [senderText]),
             el("span", { className: "hint" }, [`Шаг ${rec.current_step || 0} / ${steps.length}`]),
-          ]);
+            rec.last_sent_at
+              ? el("span", { className: "recipient-sub" }, [`Посл.: ${formatShortTime(rec.last_sent_at)}`])
+              : null,
+            (rec.status === "in_progress" && rec.next_followup_at)
+              ? el("span", { className: "recipient-sub recipient-followup-due" }, [`След. фоллоу-ап: ${formatShortTime(rec.next_followup_at)}`])
+              : null,
+          ].filter(Boolean));
 
           const statusCell = el("div", { className: "recipient-cell recipient-status-cell" }, [
             el("span", { className: `badge ${recPair[1]}` }, [recPair[0]]),
@@ -1363,6 +1515,12 @@ async function loadCampaigns() {
   try {
     state.campaigns = await api("/api/campaigns");
     renderCampaigns();
+    renderBoard();
+    renderLeadTable();
+    if (state.selectedLeadId != null && state.cards[state.selectedLeadId]) {
+      paintCard(state.cards[state.selectedLeadId]);
+    }
+    renderSide();
   } catch (error) {
     failRegion("#campaigns-view", "#campaigns-error", error);
   }
@@ -1551,7 +1709,8 @@ function passChips(dialog) {
   if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
     if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
   }
-  if (chipOn("waiting") && !dialog.waiting && !dialog.last_from_other) return false;
+  if (chipOn("waiting") && !(Number(dialog.last_from_peer || 0) === 1 || Boolean(dialog.waiting) || Boolean(dialog.last_from_other))) return false;
+  if (chipOn("our_turn") && !(Number(dialog.last_from_peer || 0) === 0 && Boolean(dialog.last_message_at))) return false;
   if (chipOn("unread") && !dialog.unread_count) return false;
   if (chipOn("groups") && dialog.peer_type !== "group" && !dialog.is_group) return false;
   if (chipOn("muted") && !dialog.muted) return false;
@@ -1583,21 +1742,30 @@ function renderDialogs() {
       ? `@${dialog.username}`
       : (provider === "whatsapp" && dialog.phone ? dialog.phone : "без ника");
     const sub = dialog.last_message_preview ? `${user} · ${dialog.last_message_preview}` : user;
-    const current = state.selectedDialog
-      && state.selectedDialog.telegram_user_id === dialog.telegram_user_id;
+    const current = isSameDialog(state.selectedDialog, dialog);
     const ownerUname = ownerAcc && (ownerAcc.telegram_username || ownerAcc.username);
     const sessionTag = ownerAcc
       ? el("span", { className: "dialog-session-pill" }, [
         ownerUname ? `@${ownerUname}` : (ownerAcc.telegram_name || ownerAcc.phone || `#${ownerAcc.id}`),
       ])
       : null;
+    let statusBadge = null;
+    if (Number(dialog.last_from_peer) === 1) {
+      statusBadge = el("span", { className: "badge b-ok dialog-turn-badge" }, ["Клиент ответил"]);
+    } else if (Number(dialog.last_from_peer) === 0 && dialog.last_message_at) {
+      const shortTime = formatShortTime(dialog.last_message_at);
+      statusBadge = el("span", { className: "badge b-off dialog-turn-badge" }, [
+        shortTime ? `Вы писали · ${shortTime}` : "Вы писали",
+      ]);
+    }
+    const metaTags = [sessionTag, statusBadge].filter(Boolean);
     const who = el("span", {}, [
       el("span", { className: "dialog-name-row" }, [
         channelBadgeEl(provider),
         el("span", { className: "name" }, [name]),
       ]),
       el("span", { className: "preview" }, [sub]),
-      sessionTag,
+      metaTags.length ? el("span", { className: "dialog-meta-row" }, metaTags) : null,
     ].filter(Boolean));
     const button = el("button", {
       type: "button",
@@ -1735,6 +1903,7 @@ function renderSide() {
         el("span", { className: `badge ${badge}` }, [label]),
       ]),
       el("p", { className: "hint" }, [handleParts.join(" · ")]),
+      leadTrackingBox(lead),
       el("p", { className: "note" }, [sideNoteText(lead)]),
       el("p", { className: "hint" }, [lead.next_step ? `Дальше: ${lead.next_step}` : "Следующий шаг не задан"]),
       el("a", {
@@ -1852,7 +2021,13 @@ function openReminderModal(lead) {
 async function openChat(lead) {
   if (!lead) return;
   const cleanUser = String(lead.username || "").replace(/^@/, "").toLowerCase();
-  let dialog = state.dialogs.find((item) => {
+  const matchesLead = (item, strictAccount) => {
+    if (strictAccount && lead.account_id && item.account_id && Number(item.account_id) !== Number(lead.account_id)) {
+      return false;
+    }
+    if (lead.id && item.lead_id && Number(item.lead_id) === Number(lead.id)) {
+      return true;
+    }
     if (lead.telegram_user_id && item.telegram_user_id && Number(item.telegram_user_id) === Number(lead.telegram_user_id)) {
       return true;
     }
@@ -1860,7 +2035,9 @@ async function openChat(lead) {
       return true;
     }
     return false;
-  });
+  };
+  let dialog = state.dialogs.find((item) => matchesLead(item, true))
+    || state.dialogs.find((item) => matchesLead(item, false));
 
   if (!dialog) {
     const connectedAcc = (state.accounts || []).find((acc) => acc.status === "connected");
@@ -2067,7 +2244,7 @@ function paintCard(lead) {
       ]),
     ]),
   ]));
-  state.reminders.filter((item) => item.lead_id === lead.id).forEach((item) => {
+  allRemindersForLead(lead.id).forEach((item) => {
     const body = [
       el("p", {}, [item.text]),
       el("p", { className: "meta" }, [el("time", { datetime: item.due_at || "" }, [formatDue(item.due_at)])]),
@@ -2102,6 +2279,7 @@ function paintCard(lead) {
       channelBadgeEl(provider),
       el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
     ]),
+    leadTrackingBox(lead),
     el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
     el("label", {}, ["Телефон", textField(lead, "phone", "Телефон")]),
     el("label", {}, ["Статус", statusSelect(lead)]),
@@ -2144,16 +2322,18 @@ function paintCard(lead) {
 
 function pipelineFilters() {
   const channelNode = document.querySelector("#channel-filter");
+  const followupNode = document.querySelector("#followup-filter");
   return {
     status: document.querySelector("#stage-filter").value,
     folderId: document.querySelector("#folder-filter").value,
     channel: channelNode ? channelNode.value : "",
+    followup: followupNode ? followupNode.value : "",
   };
 }
 
 function updateFilterNote() {
-  const { status, folderId, channel } = pipelineFilters();
-  const on = Boolean(status || folderId || channel || state.leadQuery);
+  const { status, folderId, channel, followup } = pipelineFilters();
+  const on = Boolean(status || folderId || channel || followup || state.leadQuery);
   document.querySelector("#filter-note").hidden = !on;
   document.querySelector("#board").dataset.filtered = on ? "true" : "false";
 }
@@ -2239,6 +2419,8 @@ async function resetPipelineView() {
   document.querySelector("#folder-filter").value = "";
   const channelNode = document.querySelector("#channel-filter");
   if (channelNode) channelNode.value = "";
+  const followupNode = document.querySelector("#followup-filter");
+  if (followupNode) followupNode.value = "";
   document.querySelector("#saved-view").value = "";
   document.querySelector("#view-name").value = "";
   if (state.mode === "crm") {
@@ -2265,7 +2447,8 @@ function updateWorkspaceStats() {
   if (campNode) campNode.textContent = String((state.campaigns || []).length);
   const remNode = document.querySelector("#stat-reminders");
   if (remNode) {
-    const openCount = (state.reminders || []).filter((item) => !item.done_at).length;
+    const remSource = state.allOpenRemindersLoaded ? (state.allOpenReminders || []) : (state.reminders || []);
+    const openCount = remSource.filter((item) => !item.done_at).length;
     remNode.textContent = String(openCount);
   }
   const quotaLeads = document.querySelector("#sidebar-quota-leads");
@@ -2286,7 +2469,7 @@ function updateWorkspaceStats() {
 }
 
 function renderBoard() {
-  const { status: stage, folderId, channel } = pipelineFilters();
+  const { status: stage, folderId, channel, followup } = pipelineFilters();
   const board = document.querySelector("#board");
   board.replaceChildren();
   STATUSES.forEach(([value, label]) => {
@@ -2295,6 +2478,7 @@ function renderBoard() {
       if (stage && stage !== value) return false;
       if (folderId && String(lead.folder_id || "") !== folderId) return false;
       if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
+      if (!matchFollowupFilter(lead, followup)) return false;
       return true;
     });
     const items = cards.length
@@ -2305,6 +2489,7 @@ function renderBoard() {
         const userText = lead.username
           ? `@${lead.username}`
           : (provider === "whatsapp" && lead.phone ? lead.phone : "без ника");
+        const tr = resolveLeadTracking(lead);
         const bodyNodes = [
           el("span", { className: "card-top" }, [
             el("span", { className: "name" }, [nameText]),
@@ -2321,6 +2506,19 @@ function renderBoard() {
           channelBadgeEl(provider),
           el("span", { className: "card-pill" }, [folderTitle || label]),
         ];
+        if (tr.accountName || tr.accountPhone) {
+          tagNodes.push(el("span", { className: "card-tag card-account-tag" }, [
+            `Акк: ${tr.accountName || tr.accountPhone}`,
+          ]));
+        }
+        if (tr.isReplied) {
+          tagNodes.push(el("span", { className: "card-pill card-pill-replied" }, ["Ответил · Авто-стоп"]));
+        } else if (tr.campaignStatus === "in_progress") {
+          const nextFupText = tr.nextFollowupAt ? ` · фоллоу-ап ${formatShortTime(tr.nextFollowupAt)}` : "";
+          tagNodes.push(el("span", { className: "card-tag card-followup-tag" }, [
+            `Шаг ${tr.campaignStep || 1}${nextFupText}`,
+          ]));
+        }
         if (lead.phone) {
           tagNodes.push(el("span", { className: "card-tag" }, [lead.phone]));
         }
@@ -2402,9 +2600,10 @@ function reminderForm(lead) {
 function renderLeadTable() {
   const body = document.querySelector("#lead-rows");
   body.replaceChildren();
-  const { channel } = pipelineFilters();
+  const { channel, followup } = pipelineFilters();
   const filteredLeads = state.leads.filter((lead) => {
     if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
+    if (!matchFollowupFilter(lead, followup)) return false;
     return true;
   });
   filteredLeads.forEach((lead) => {
@@ -2412,6 +2611,29 @@ function renderLeadTable() {
     const contactText = lead.username
       ? `@${lead.username}`
       : (provider === "whatsapp" && lead.phone ? lead.phone : "");
+    const tr = resolveLeadTracking(lead);
+    const trackingPills = [];
+    if (tr.accountName || tr.accountPhone) {
+      trackingPills.push(el("span", { className: "hint" }, [`Акк: ${tr.accountName || tr.accountPhone}`]));
+    }
+    const lastTouchRaw = tr.lastSentAt || tr.lastMessageAt;
+    if (lastTouchRaw) {
+      trackingPills.push(el("span", { className: "hint" }, [`Касание: ${formatShortTime(lastTouchRaw)}`]));
+    }
+    if (tr.isReplied) {
+      trackingPills.push(el("span", { className: "badge b-won" }, ["Ответил — агент остановлен"]));
+    } else if (tr.campaignStatus === "in_progress") {
+      trackingPills.push(el("span", { className: "badge b-talk" }, [
+        `Шаг ${tr.campaignStep || 1}${tr.nextFollowupAt ? ` · фоллоу-ап ${formatShortTime(tr.nextFollowupAt)}` : ""}`,
+      ]));
+    } else if (tr.campaignStatus === "completed") {
+      trackingPills.push(el("span", { className: "badge b-ok" }, [`Шаг ${tr.campaignStep || 1}`]));
+    }
+    const openRemNodes = tr.openReminders.map((rem) => (
+      el("div", { className: "lead-open-reminder badge b-wait" }, [
+        `${formatDue(rem.due_at)} · ${rem.text}`,
+      ])
+    ));
     const row = el("tr", {
       onclick: () => {
         state.selectedLeadId = lead.id;
@@ -2428,10 +2650,14 @@ function renderLeadTable() {
       el("td", {}, [contactText]),
       el("td", { className: "num" }, [lead.telegram_user_id ?? ""]),
       el("td", { className: "num" }, [lead.phone || ""]),
-      el("td", {}, [statusSelect(lead)]),
+      el("td", {}, [
+        statusSelect(lead),
+        trackingPills.length ? el("div", { className: "lead-tracking-meta" }, trackingPills) : null,
+      ].filter(Boolean)),
       el("td", {}, [textField(lead, "note", "Заметка")]),
       el("td", {}, [textField(lead, "next_step", "Следующий шаг")]),
       el("td", {}, [
+        ...openRemNodes,
         reminderForm(lead),
         el("button", {
           type: "button",
@@ -2578,8 +2804,23 @@ function renderReminders() {
 
 async function loadReminders() {
   setView("#digest-view", "loading");
-  state.reminders = await api(`/api/reminders?scope=${state.scope}`);
+  const scoped = await api(`/api/reminders?scope=${state.scope}`);
+  state.reminders = scoped;
+  if (state.scope === "open" || state.scope === "all") {
+    state.allOpenReminders = scoped.filter((item) => !item.done_at);
+    state.allOpenRemindersLoaded = true;
+  } else {
+    try {
+      const openRows = await api("/api/reminders?scope=open");
+      if (Array.isArray(openRows)) {
+        state.allOpenReminders = openRows.filter((item) => !item.done_at);
+        state.allOpenRemindersLoaded = true;
+      }
+    } catch (_err) { /* оставляем сохранённый список открытых напоминаний */ }
+  }
   renderReminders();
+  renderLeadTable();
+  renderBoard();
   renderCard();
 }
 
@@ -2600,10 +2841,13 @@ function closeInboxLive() {
 }
 
 function upsertDialog(dialog) {
-  const idx = state.dialogs.findIndex((row) => row.id === dialog.id);
-  if (idx >= 0) state.dialogs[idx] = dialog;
+  const idx = state.dialogs.findIndex((row) => isSameDialog(row, dialog));
+  if (idx >= 0) state.dialogs[idx] = { ...state.dialogs[idx], ...dialog };
   else state.dialogs.unshift(dialog);
-  if (state.inbox !== "filled") state.inbox = "filled";
+  if (state.inbox !== "filled") {
+    state.inbox = "filled";
+    setView("#inbox-view", "filled");
+  }
   renderDialogs();
 }
 
@@ -3359,10 +3603,16 @@ function renderCsvPreview(data) {
     name: ["first_name", "name", "имя", "фио", "контакт"],
     company: ["company", "компания", "бренд", "проект", "название"],
     hooks: ["personalization hooks", "hooks", "хук", "триггер", "зацепка"],
-    step_1: ["первое касание", "step_1", "шаг 1", "message", "first_touch"],
-    step_2: ["фоллоуап 1", "1 фоллоуап", "step_2", "шаг 2", "followup 1"],
-    step_3: ["фоллоуап 2", "2 фоллоуап", "step_3", "шаг 3", "followup 2"],
+    step_1: ["первое касание", "step_1", "step1_text", "шаг 1", "message", "first_touch"],
+    step_2: ["фоллоуап 1", "1 фоллоуап", "step_2", "step2_text", "шаг 2", "followup 1"],
+    step_3: ["фоллоуап 2", "2 фоллоуап", "step_3", "step3_text", "шаг 3", "followup 2"],
+    step1_text: ["первое касание", "step_1", "step1_text", "шаг 1", "message", "first_touch"],
+    step2_text: ["фоллоуап 1", "1 фоллоуап", "step_2", "step2_text", "шаг 2", "followup 1"],
+    step3_text: ["фоллоуап 2", "2 фоллоуап", "step_3", "step3_text", "шаг 3", "followup 2"],
   };
+  const remoteMapping = (data && data.detected_mapping && typeof data.detected_mapping === "object")
+    ? data.detected_mapping
+    : {};
 
   box.querySelectorAll("[data-map-field]").forEach((select) => {
     const fieldKey = select.dataset.mapField;
@@ -3372,7 +3622,10 @@ function renderCsvPreview(data) {
       select.append(el("option", { value: h }, [h]));
     });
     const candidates = autoMatch[fieldKey] || [];
-    const matched = headers.find((h) => candidates.some((c) => h.toLowerCase().includes(c)));
+    const remoteCandidate = remoteMapping[fieldKey];
+    const matched = (remoteCandidate && headers.includes(remoteCandidate))
+      ? remoteCandidate
+      : headers.find((h) => candidates.some((c) => h.toLowerCase().includes(c)));
     if (prev && headers.includes(prev)) select.value = prev;
     else if (matched) select.value = matched;
   });
@@ -3481,9 +3734,25 @@ if (importCsvBtn) {
         });
         campaignId = autoCamp.id;
       }
+      const columnMapping = {};
+      const mapAlias = {
+        step_1: "step1_text",
+        step_2: "step2_text",
+        step_3: "step3_text",
+      };
+      document.querySelectorAll("#csv-mapping-preview-box [data-map-field]").forEach((sel) => {
+        const rawKey = sel.dataset.mapField || "";
+        const normKey = mapAlias[rawKey] || rawKey;
+        if (normKey && sel.value) {
+          columnMapping[normKey] = sel.value;
+        }
+      });
       const res = await api(`/api/campaigns/${campaignId}/csv`, {
         method: "POST",
-        body: { csv_text: csvText },
+        body: {
+          csv_text: csvText,
+          column_mapping: Object.keys(columnMapping).length ? columnMapping : undefined,
+        },
       });
       await loadCampaigns();
       fillCsvCampaignSelect(campaignId);
@@ -3593,6 +3862,15 @@ if (channelFilterSelect) {
   });
 }
 
+const followupFilterSelect = document.querySelector("#followup-filter");
+if (followupFilterSelect) {
+  followupFilterSelect.addEventListener("change", () => {
+    document.querySelector("#saved-view").value = "";
+    renderBoard();
+    renderLeadTable();
+  });
+}
+
 document.querySelector("#save-view").addEventListener("click", () => {
   savePipelineView()
     .then(() => closeSheetPopup())
@@ -3691,9 +3969,16 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
         body: { text },
       });
       state.messages = [...(state.messages || []), message];
+      dialog.last_message_preview = text;
+      dialog.last_from_peer = 0;
+      dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
+      dialog.unread_count = 0;
+      upsertDialog(dialog);
       field.value = "";
       renderThread();
+      renderDialogs();
       loadAccounts().catch(() => {});
+      loadCampaigns().catch(() => {});
     } catch (err) {
       error.hidden = false;
       error.textContent = err.message;

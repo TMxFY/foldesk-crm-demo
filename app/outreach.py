@@ -1,4 +1,5 @@
 import csv
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import re
@@ -8,6 +9,7 @@ from app.accounts import _load as load_account
 from app.accounts import _public as public_account
 from app.accounts import increment_daily_sent
 from app.db import as_dict, utc_now, utc_today
+from app.inbox import _cache_messages, stop_outreach_on_reply
 
 CAMPAIGN_STATUSES = ("draft", "running", "paused", "completed")
 RECIPIENT_STATUSES = ("pending", "in_progress", "completed", "replied", "failed")
@@ -222,13 +224,107 @@ def render_template(template_text: str, recipient: dict) -> str:
     return "\n".join(lines).strip()
 
 
-def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None) -> int:
-    if not account_id:
-        return 0
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _add_hours_iso(iso_str: str | None, hours: int) -> str | None:
+    dt = _parse_iso_dt(iso_str)
+    if dt is None:
+        return None
+    target = dt + timedelta(hours=max(0, int(hours or 0)))
+    return target.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> list[dict]:
+    acc_ids = set()
+    if account_id:
+        acc_ids.add(int(account_id))
+    if rec.get("assigned_account_id"):
+        acc_ids.add(int(rec["assigned_account_id"]))
+
+    match_clauses = []
+    match_params = []
+    if rec.get("telegram_user_id"):
+        match_clauses.append("peer_id = ?")
+        match_params.append(int(rec["telegram_user_id"]))
+    if rec.get("lead_id"):
+        match_clauses.append("lead_id = ?")
+        match_params.append(int(rec["lead_id"]))
+    if rec.get("username"):
+        clean_u = _clean_handle(rec["username"])
+        if clean_u:
+            match_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+            match_params.append(clean_u)
+    if rec.get("phone"):
+        phone_str = str(rec["phone"]).strip()
+        phone_digits = re.sub(r"\D", "", phone_str)
+        peer_cand = int(phone_digits[-12:]) if phone_digits and len(phone_digits) >= 7 else -1
+        match_clauses.append("(phone = ? OR peer_id = ?)")
+        match_params.extend([phone_str, peer_cand])
+
+    if not match_clauses:
+        return []
+
+    sql = f"SELECT * FROM dialogs WHERE peer_type = 'user' AND ({' OR '.join(match_clauses)})"
+    params = list(match_params)
+    if acc_ids:
+        ph = ",".join("?" for _ in acc_ids)
+        sql += f" AND account_id IN ({ph})"
+        params.extend(sorted(acc_ids))
+    rows = conn.execute(sql, params).fetchall()
+    return [as_dict(r) for r in rows]
+
+
+def _dialog_has_client_reply(conn, dialog: dict, rec: dict) -> bool:
+    if int(dialog.get("last_from_peer") or 0) == 1:
+        return True
+    dlg_id = int(dialog["id"])
+    last_sent_at = rec.get("last_sent_at")
+    current_step = int(rec.get("current_step") or 0)
+    if last_sent_at:
+        in_row = conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE dialog_id = ? AND direction = 'in' AND sent_at >= ?
+            LIMIT 1
+            """,
+            (dlg_id, str(last_sent_at)),
+        ).fetchone()
+        if in_row is not None:
+            return True
+    if current_step >= 1:
+        any_in = conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE dialog_id = ? AND direction = 'in'
+            LIMIT 1
+            """,
+            (dlg_id,),
+        ).fetchone()
+        if any_in is not None:
+            return True
+    return False
+
+
+def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None) -> int:
     rows = conn.execute(
         """
         SELECT * FROM campaign_recipients
-        WHERE campaign_id = ? AND status IN ('in_progress', 'completed')
+        WHERE campaign_id = ? AND status IN ('pending', 'in_progress', 'completed')
         """,
         (campaign_id,),
     ).fetchall()
@@ -236,34 +332,12 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None) -> in
     now = utc_now()
     for row in rows:
         rec = as_dict(row)
-        dialog = None
-        if rec.get("telegram_user_id"):
-            dialog = conn.execute(
-                """
-                SELECT last_from_peer, last_message_at FROM dialogs
-                WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
-                """,
-                (account_id, int(rec["telegram_user_id"])),
-            ).fetchone()
-        if dialog is None and rec.get("lead_id"):
-            dialog = conn.execute(
-                """
-                SELECT last_from_peer, last_message_at FROM dialogs
-                WHERE account_id = ? AND lead_id = ?
-                """,
-                (account_id, int(rec["lead_id"])),
-            ).fetchone()
-        if dialog is None and rec.get("phone"):
-            phone_digits = re.sub(r"\D", "", str(rec["phone"]))
-            peer_cand = int(phone_digits[-12:]) if phone_digits and len(phone_digits) >= 7 else -1
-            dialog = conn.execute(
-                """
-                SELECT last_from_peer, last_message_at FROM dialogs
-                WHERE account_id = ? AND peer_type = 'user' AND (phone = ? OR peer_id = ?)
-                """,
-                (account_id, rec["phone"], peer_cand),
-            ).fetchone()
-        if dialog and int(dialog["last_from_peer"] or 0) == 1:
+        dialogs = _find_recipient_dialogs(conn, rec, account_id=account_id)
+        if not dialogs and account_id is not None:
+            # Also check across any account if assigned_account_id or dialog exists elsewhere
+            dialogs = _find_recipient_dialogs(conn, rec, account_id=None)
+        has_reply = any(_dialog_has_client_reply(conn, d, rec) for d in dialogs)
+        if has_reply:
             conn.execute(
                 """
                 UPDATE campaign_recipients
@@ -271,6 +345,14 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None) -> in
                 WHERE id = ?
                 """,
                 (now, rec["id"]),
+            )
+            stop_outreach_on_reply(
+                conn,
+                account_id=rec.get("assigned_account_id") or account_id,
+                peer_id=rec.get("telegram_user_id"),
+                username=rec.get("username"),
+                phone=rec.get("phone"),
+                lead_id=rec.get("lead_id"),
             )
             replied_now += 1
     if replied_now:
@@ -284,8 +366,11 @@ def get_campaign(conn, campaign_id: int) -> dict:
         raise LookupError("campaign")
     camp = as_dict(row)
     account_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
-    for aid in account_ids:
-        _sync_campaign_replies(conn, campaign_id, aid)
+    if account_ids:
+        for aid in account_ids:
+            _sync_campaign_replies(conn, campaign_id, aid)
+    else:
+        _sync_campaign_replies(conn, campaign_id, None)
 
     accounts_list = []
     acc_name_map = {}
@@ -312,6 +397,7 @@ def get_campaign(conn, campaign_id: int) -> dict:
         "SELECT * FROM campaign_recipients WHERE campaign_id = ? ORDER BY id",
         (campaign_id,),
     ).fetchall()
+    now_iso = utc_now()
     recipients = []
     for r in rec_rows:
         rd = as_dict(r)
@@ -332,6 +418,61 @@ def get_campaign(conn, campaign_id: int) -> dict:
             rd["assigned_account_name"] = acc_name_map.get(assigned_id_int)
         else:
             rd["assigned_account_name"] = None
+
+        cur_step = int(rd.get("current_step") or 0)
+        status = rd.get("status")
+        last_sent_at = rd.get("last_sent_at")
+        if status in ("pending", "in_progress") and cur_step < len(steps):
+            rd["next_step_order"] = cur_step + 1
+            next_delay = int(steps[cur_step].get("delay_hours") or 0)
+            rd["next_delay_hours"] = next_delay
+        else:
+            rd["next_step_order"] = None
+            rd["next_delay_hours"] = None
+
+        if status == "in_progress" and last_sent_at and cur_step < len(steps):
+            next_delay = int(steps[cur_step].get("delay_hours") or 0)
+            if next_delay > 0:
+                rd["next_followup_at"] = _add_hours_iso(last_sent_at, next_delay)
+            else:
+                rd["next_followup_at"] = last_sent_at
+        else:
+            rd["next_followup_at"] = None
+
+        if status == "pending":
+            rd["followup_due"] = True
+        elif status == "in_progress" and rd.get("next_followup_at"):
+            rd["followup_due"] = str(rd["next_followup_at"]) <= now_iso
+        else:
+            rd["followup_due"] = False
+
+        # Compute last_sent_text from messages or rendered step
+        last_sent_text = None
+        dlgs = _find_recipient_dialogs(conn, rd, account_id=assigned_id)
+        if dlgs:
+            msg_row = conn.execute(
+                """
+                SELECT text FROM messages
+                WHERE dialog_id = ? AND direction = 'out'
+                ORDER BY sent_at DESC, id DESC
+                LIMIT 1
+                """,
+                (dlgs[0]["id"],),
+            ).fetchone()
+            if msg_row and msg_row["text"]:
+                last_sent_text = msg_row["text"]
+        if last_sent_text is None and cur_step >= 1 and cur_step - 1 < len(steps):
+            prev_idx = cur_step - 1
+            if prev_idx == 0 and (rd.get("step1_text") or "").strip():
+                last_sent_text = render_template(rd["step1_text"], rd)
+            elif prev_idx == 1 and (rd.get("step2_text") or "").strip():
+                last_sent_text = render_template(rd["step2_text"], rd)
+            elif prev_idx == 2 and (rd.get("step3_text") or "").strip():
+                last_sent_text = render_template(rd["step3_text"], rd)
+            else:
+                last_sent_text = render_template(steps[prev_idx]["template_text"], rd)
+        rd["last_sent_text"] = last_sent_text
+
         recipients.append(rd)
 
     today = utc_today()
@@ -1183,6 +1324,8 @@ async def run_campaign_batch(
     campaign_id: int,
     gateway=None,
     max_send: int | None = None,
+    respect_delays: bool = False,
+    wa_gateway=None,
 ) -> dict:
     camp = get_campaign(conn, campaign_id)
     account_ids = camp.get("account_ids") or []
@@ -1259,6 +1402,15 @@ async def run_campaign_batch(
         if step_idx >= len(steps):
             continue
 
+        step = steps[step_idx]
+        now = utc_now()
+        if respect_delays and step_idx >= 1 and rec.get("last_sent_at"):
+            delay_hours = int(step.get("delay_hours") or 0)
+            if delay_hours > 0:
+                due_iso = _add_hours_iso(rec["last_sent_at"], delay_hours)
+                if due_iso and due_iso > now:
+                    continue
+
         available = [
             st for st in connected_states if st["sent_today"] < st["daily_limit"]
         ]
@@ -1282,9 +1434,9 @@ async def run_campaign_batch(
         account_raw = chosen_state["raw"]
         acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
         session_path = str(account_raw.get("session_path") or "")
-        use_gateway = gateway is not None and not session_path.startswith("data/sessions/demo")
+        active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
+        use_gateway = active_gw is not None and not session_path.startswith("data/sessions/demo")
 
-        step = steps[step_idx]
         if step_idx == 0 and (rec.get("step1_text") or "").strip():
             rendered_text = render_template(rec["step1_text"], rec)
         elif step_idx == 1 and (rec.get("step2_text") or "").strip():
@@ -1294,32 +1446,14 @@ async def run_campaign_batch(
         else:
             rendered_text = render_template(step["template_text"], rec)
 
-        now = utc_now()
         try:
             if acc_provider == "whatsapp":
                 dialog = _ensure_recipient_dialog(
                     conn, chosen_account_id, rec, now, provider="whatsapp"
                 )
-                phone_digits = re.sub(
-                    r"\D", "", str(rec.get("phone") or dialog.get("phone") or "")
-                )
-                peer_target = phone_digits or rec.get("telegram_user_id") or dialog["peer_id"]
-                if use_gateway:
-                    sent = await gateway.send_message(
-                        session_path, peer_target, rendered_text
-                    )
-                    tg_mid = int(sent["telegram_message_id"])
-                    sent_at = str(sent.get("sent_at") or now)
-                else:
-                    next_row = conn.execute(
-                        "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
-                        (dialog["id"],),
-                    ).fetchone()
-                    tg_mid = int(next_row["next_id"])
-                    sent_at = now
             else:
                 if use_gateway and rec.get("username") and (not rec.get("telegram_user_id") or int(rec["telegram_user_id"]) >= 900000):
-                    found = await gateway.search_dialogs(session_path, f"@{rec['username']}", limit=1)
+                    found = await active_gw.search_dialogs(session_path, f"@{rec['username']}", limit=1)
                     if found and found[0].get("telegram_user_id"):
                         real_tg_id = int(found[0]["telegram_user_id"])
                         rec["telegram_user_id"] = real_tg_id
@@ -1340,13 +1474,64 @@ async def run_campaign_batch(
                     conn, chosen_account_id, rec, now, provider="telegram"
                 )
 
+            # Before sending follow-up (step_idx >= 1), check live and cached messages for reply
+            if step_idx >= 1 and dialog:
+                if use_gateway and hasattr(active_gw, "fetch_messages"):
+                    try:
+                        fetched_msgs = await active_gw.fetch_messages(
+                            session_path, dialog["peer_id"], 5
+                        )
+                        if isinstance(fetched_msgs, list) and fetched_msgs:
+                            _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                    except Exception:
+                        pass
+                refreshed_dlg_row = conn.execute(
+                    "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
+                ).fetchone()
+                if refreshed_dlg_row is not None:
+                    dialog = as_dict(refreshed_dlg_row)
+                if _dialog_has_client_reply(conn, dialog, rec):
+                    conn.execute(
+                        "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
+                        (now, rec["id"]),
+                    )
+                    stop_outreach_on_reply(
+                        conn,
+                        account_id=chosen_account_id,
+                        peer_id=dialog.get("peer_id") or rec.get("telegram_user_id"),
+                        username=dialog.get("username") or rec.get("username"),
+                        phone=dialog.get("phone") or rec.get("phone"),
+                        lead_id=dialog.get("lead_id") or rec.get("lead_id"),
+                    )
+                    conn.commit()
+                    continue
+
+            if acc_provider == "whatsapp":
+                phone_digits = re.sub(
+                    r"\D", "", str(rec.get("phone") or dialog.get("phone") or "")
+                )
+                peer_target = phone_digits or rec.get("telegram_user_id") or dialog["peer_id"]
+                if use_gateway:
+                    sent = await active_gw.send_message(
+                        session_path, peer_target, rendered_text
+                    )
+                    tg_mid = int(sent["telegram_message_id"])
+                    sent_at = str(sent.get("sent_at") or now)
+                else:
+                    next_row = conn.execute(
+                        "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+                        (dialog["id"],),
+                    ).fetchone()
+                    tg_mid = int(next_row["next_id"])
+                    sent_at = now
+            else:
                 if use_gateway:
                     peer_target = (
                         f"@{rec['username']}"
                         if (int(dialog["peer_id"]) >= 900000 and rec.get("username"))
                         else dialog["peer_id"]
                     )
-                    sent = await gateway.send_message(
+                    sent = await active_gw.send_message(
                         session_path, peer_target, rendered_text, None
                     )
                     tg_mid = int(sent["telegram_message_id"])
@@ -1401,6 +1586,37 @@ async def run_campaign_batch(
             """,
             (next_step, next_status, chosen_account_id, sent_at, now, rec["id"]),
         )
+        if rec.get("lead_id"):
+            if next_step < len(steps):
+                next_delay_h = int(steps[next_step].get("delay_hours") or 0)
+                lead_next_step = f"Отправлен шаг {next_step}/{len(steps)} · след. фоллоу-ап через {next_delay_h}ч"
+            else:
+                lead_next_step = f"Отправлены все {len(steps)} шага рассылки"
+            try:
+                conn.execute(
+                    """
+                    UPDATE leads
+                    SET account_id = ?,
+                        dialog_id = COALESCE(dialog_id, ?),
+                        status = CASE WHEN status = 'new' THEN 'waiting' ELSE status END,
+                        next_step = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (chosen_account_id, dialog["id"], lead_next_step, now, int(rec["lead_id"])),
+                )
+            except sqlite3.IntegrityError:
+                conn.execute(
+                    """
+                    UPDATE leads
+                    SET dialog_id = COALESCE(dialog_id, ?),
+                        status = CASE WHEN status = 'new' THEN 'waiting' ELSE status END,
+                        next_step = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (dialog["id"], lead_next_step, now, int(rec["lead_id"])),
+                )
         sent_count += 1
 
     remaining_row = conn.execute(

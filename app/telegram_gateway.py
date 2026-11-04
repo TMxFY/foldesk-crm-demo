@@ -1,11 +1,13 @@
 import asyncio
 import os
+import sqlite3
 import threading
 from abc import ABC, abstractmethod
+from urllib.parse import unquote, urlparse
 
 from datetime import timezone
 
-from app.db import resolve_session, utc_now
+from app.db import DEFAULT_DB, resolve_session, utc_now
 
 
 class GatewayError(Exception):
@@ -183,10 +185,87 @@ def _history_limit(limit) -> int:
     return min(cap, 50)
 
 
+def _parse_proxy_for_telethon(proxy_url: str | None) -> tuple | None:
+    if not proxy_url:
+        return None
+    raw = str(proxy_url).strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = f"socks5://{raw}"
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "socks5").lower()
+    host = parsed.hostname
+    port = parsed.port
+    if not host or not port:
+        return None
+    # PySocks constants: SOCKS4 = 1, SOCKS5 = 2, HTTP = 3
+    if scheme.startswith("http"):
+        proxy_type = 3
+    elif scheme == "socks4":
+        proxy_type = 1
+    else:
+        proxy_type = 2
+    try:
+        import socks  # type: ignore
+
+        if scheme.startswith("http"):
+            proxy_type = getattr(socks, "HTTP", 3)
+        elif scheme == "socks4":
+            proxy_type = getattr(socks, "SOCKS4", 1)
+        else:
+            proxy_type = getattr(socks, "SOCKS5", 2)
+    except Exception:
+        pass
+    user = unquote(parsed.username) if parsed.username else None
+    pwd = unquote(parsed.password) if parsed.password else None
+    return (proxy_type, host, int(port), True, user, pwd)
+
+
 class TelethonGateway(TelegramGateway):
     def __init__(self):
         self._clients = {}
         self._locks = {}
+        self._proxies = {}
+        self._app_credentials = {}
+
+    def set_proxy(self, session_path: str, proxy_url: str | None) -> None:
+        if not session_path:
+            return
+        clean = (proxy_url or "").strip() or None
+        if clean:
+            self._proxies[session_path] = clean
+        else:
+            self._proxies.pop(session_path, None)
+
+    def set_app_credentials(
+        self, session_path: str, app_id: int | str | None, app_hash: str | None
+    ) -> None:
+        if not session_path or not app_id or not app_hash:
+            return
+        try:
+            self._app_credentials[session_path] = (int(app_id), str(app_hash).strip())
+        except (TypeError, ValueError):
+            pass
+
+    def _resolve_proxy(self, session_path: str) -> str | None:
+        if session_path in self._proxies:
+            return self._proxies[session_path]
+        try:
+            if DEFAULT_DB.exists():
+                with sqlite3.connect(DEFAULT_DB) as conn:
+                    row = conn.execute(
+                        "SELECT proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
+                        (session_path,),
+                    ).fetchone()
+                    if row and row[0]:
+                        proxy_val = str(row[0]).strip()
+                        if proxy_val:
+                            self._proxies[session_path] = proxy_val
+                            return proxy_val
+        except Exception:
+            pass
+        return None
 
     def _session_lock(self, session_path: str) -> asyncio.Lock:
         lock = self._locks.get(session_path)
@@ -195,7 +274,9 @@ class TelethonGateway(TelegramGateway):
             self._locks[session_path] = lock
         return lock
 
-    def _credentials(self):
+    def _credentials(self, session_path: str | None = None):
+        if session_path and session_path in self._app_credentials:
+            return self._app_credentials[session_path]
         api_id = os.getenv("TG_API_ID", "").strip()
         api_hash = os.getenv("TG_API_HASH", "").strip()
         if not api_id or not api_hash:
@@ -212,8 +293,10 @@ class TelethonGateway(TelegramGateway):
             return client, False
         from telethon import TelegramClient
 
-        api_id, api_hash = self._credentials()
-        client = TelegramClient(_session_name(session_path), api_id, api_hash)
+        api_id, api_hash = self._credentials(session_path)
+        proxy_tuple = _parse_proxy_for_telethon(self._resolve_proxy(session_path))
+        kwargs = {"proxy": proxy_tuple} if proxy_tuple else {}
+        client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
         await client.connect()
         self._clients[session_path] = client
         return client, True
@@ -242,11 +325,17 @@ class TelethonGateway(TelegramGateway):
         from telethon import errors
 
         async with self._session_lock(session_path):
-            client, _owned = await self._open(session_path)
+            client, owned = await self._open(session_path)
             try:
                 user = await client.sign_in(
                     phone=phone, code=code, phone_code_hash=phone_code_hash
                 )
+                return {
+                    "status": "connected",
+                    "telegram_user_id": user.id,
+                    "telegram_username": getattr(user, "username", None),
+                    "telegram_name": _person_name(user),
+                }
             except errors.SessionPasswordNeededError:
                 return {"status": "pending_password"}
             except errors.PhoneCodeInvalidError as exc:
@@ -257,36 +346,33 @@ class TelethonGateway(TelegramGateway):
                 raise
             except Exception as exc:
                 raise GatewayError(str(exc) or "Не удалось подтвердить код") from exc
-            profile = {
-                "status": "connected",
-                "telegram_user_id": user.id,
-                "telegram_username": getattr(user, "username", None),
-                "telegram_name": _person_name(user),
-            }
-            await self._close(session_path)
-            return profile
+            finally:
+                if owned:
+                    await self._close(session_path)
 
     async def confirm_password(self, password: str, session_path: str) -> dict:
         from telethon import errors
 
         async with self._session_lock(session_path):
+            owned = False
             try:
-                client, _owned = await self._open(session_path)
+                client, owned = await self._open(session_path)
                 user = await client.sign_in(password=password)
+                return {
+                    "status": "connected",
+                    "telegram_user_id": user.id,
+                    "telegram_username": getattr(user, "username", None),
+                    "telegram_name": _person_name(user),
+                }
             except errors.PasswordHashInvalidError as exc:
                 raise GatewayError("Неверный пароль") from exc
             except GatewayError:
                 raise
             except Exception as exc:
                 raise GatewayError(str(exc) or "Не удалось подтвердить пароль") from exc
-            profile = {
-                "status": "connected",
-                "telegram_user_id": user.id,
-                "telegram_username": getattr(user, "username", None),
-                "telegram_name": _person_name(user),
-            }
-            await self._close(session_path)
-            return profile
+            finally:
+                if owned:
+                    await self._close(session_path)
 
     async def session_health(self, session_path: str) -> dict:
         async with self._session_lock(session_path):
@@ -518,28 +604,36 @@ class TelethonGateway(TelegramGateway):
     async def watch_private(self, session_path: str, on_message) -> None:
         from telethon import events
 
-        client, _owned = await self._open(session_path)
-        self._loop = asyncio.get_running_loop()
+        async with self._session_lock(session_path):
+            client, _owned = await self._open(session_path)
+            self._loop = asyncio.get_running_loop()
 
-        async def handler(event):
-            payload = await self._private_payload(event)
-            if payload is None:
-                return
-            await on_message(payload)
+            async def handler(event):
+                payload = await self._private_payload(event)
+                if payload is None:
+                    return
+                await on_message(payload)
 
-        client.add_event_handler(handler, events.NewMessage(incoming=True))
-        try:
-            # Difference only: a long outage can miss updates Telegram already dropped.
+            client.add_event_handler(handler, events.NewMessage(incoming=True))
             try:
-                await client.catch_up()
-            except asyncio.CancelledError:
-                raise
+                # Difference only: a long outage can miss updates Telegram already dropped.
+                try:
+                    await client.catch_up()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                listening_event(self, session_path).set()
             except Exception:
-                pass
-            listening_event(self, session_path).set()
+                client.remove_event_handler(handler)
+                self._clients.pop(session_path, None)
+                raise
+
+        try:
             await client.run_until_disconnected()
         finally:
             client.remove_event_handler(handler)
+            self._clients.pop(session_path, None)
 
     async def _resolve_username(self, client, query: str) -> list:
         from telethon.tl.types import User

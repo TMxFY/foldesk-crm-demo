@@ -828,6 +828,17 @@ section {
   overflow-wrap: anywhere;
 }
 
+.card-pill.card-pill-replied {
+  background: var(--success-soft);
+  color: var(--success);
+  border: var(--line) solid var(--success);
+}
+
+.card-tag.card-followup-tag {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
 .card-tag {
   display: inline-flex;
   align-items: center;
@@ -1973,6 +1984,51 @@ td input, td select { min-width: 110px; height: var(--size-sm); }
   line-height: var(--leading-xs);
   font-variant-numeric: tabular-nums;
   width: fit-content;
+}
+
+.dialog-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: 2px;
+}
+
+.lead-tracking-box {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  border: var(--line) solid var(--border);
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.lead-tracking-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.lead-tracking-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.lead-open-reminder {
+  margin-bottom: var(--space-1);
+}
+
+.recipient-followup-due {
+  color: var(--warning);
+  font-weight: 500;
 }
 
 /* Account Auth Tabs & Session + JSON Import */

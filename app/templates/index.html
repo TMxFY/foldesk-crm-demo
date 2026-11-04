@@ -175,6 +175,14 @@
                 <option value="whatsapp">Только WhatsApp</option>
               </select>
             </label>
+            <label class="inline" for="followup-filter">Касание
+              <select id="followup-filter" aria-label="Статус касания">
+                <option value="">Все по касаниям</option>
+                <option value="replied">Ответили (Авто-стоп)</option>
+                <option value="waiting_reply">Ждём ответа клиента</option>
+                <option value="due_followup">Пора фоллоу-апить</option>
+              </select>
+            </label>
             <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
             <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Виды</button>
             <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
@@ -237,6 +245,7 @@
             </form>
             <div class="chips" role="group" aria-label="Фильтр">
               <button type="button" class="chip" data-chip="waiting" aria-pressed="false">Ждёт ответа</button>
+              <button type="button" class="chip" data-chip="our_turn" aria-pressed="false">Ждём ответа от лида</button>
               <button type="button" class="chip" data-chip="unread" aria-pressed="false">Непрочитанные</button>
               <button type="button" class="chip" data-chip="groups" aria-pressed="false">Группы</button>
               <button type="button" class="chip" data-chip="muted" aria-pressed="false">Без звука</button>
@@ -667,10 +676,13 @@
                       <select id="csv-map-company" data-map-field="company"></select>
                     </label>
                     <label for="csv-map-step1">Первое касание (Шаг 1)
-                      <select id="csv-map-step1" data-map-field="step_1"></select>
+                      <select id="csv-map-step1" data-map-field="step1_text"></select>
                     </label>
                     <label for="csv-map-step2">Фоллоуап 1 (Шаг 2)
-                      <select id="csv-map-step2" data-map-field="step_2"></select>
+                      <select id="csv-map-step2" data-map-field="step2_text"></select>
+                    </label>
+                    <label for="csv-map-step3">Фоллоуап 2 (Шаг 3)
+                      <select id="csv-map-step3" data-map-field="step3_text"></select>
                     </label>
                   </div>
                 </div>

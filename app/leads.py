@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import re
 import sqlite3
 
@@ -9,11 +10,176 @@ from app.tasks import list_tasks
 PROVIDERS = ("telegram", "whatsapp")
 
 
-def _public(row) -> dict | None:
+def _add_hours_iso(iso_str: str | None, hours: int | None) -> str | None:
+    if not iso_str:
+        return None
+    s = str(iso_str).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+    target = dt + timedelta(hours=max(0, int(hours or 0)))
+    return target.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _enrich_lead(conn, data: dict | None) -> dict | None:
+    if data is None:
+        return None
+    data["provider"] = data.get("provider") or "telegram"
+    lid = data.get("id")
+    acc_id = data.get("account_id")
+    tg_id = data.get("telegram_user_id")
+    username = data.get("username")
+    phone = data.get("phone")
+    dialog_id = data.get("dialog_id")
+
+    # 1. Campaign recipient info
+    rec_clauses = []
+    rec_params = []
+    if lid is not None:
+        rec_clauses.append("cr.lead_id = ?")
+        rec_params.append(int(lid))
+    if tg_id is not None:
+        rec_clauses.append("cr.telegram_user_id = ?")
+        rec_params.append(int(tg_id))
+    if username:
+        rec_clauses.append("(cr.username IS NOT NULL AND lower(cr.username) = lower(?))")
+        rec_params.append(str(username))
+    if phone:
+        rec_clauses.append("(cr.phone IS NOT NULL AND cr.phone = ?)")
+        rec_params.append(str(phone))
+
+    rec_row = None
+    if rec_clauses:
+        rec_row = conn.execute(
+            f"""
+            SELECT cr.*,
+                   (
+                       SELECT cs.delay_hours
+                       FROM campaign_steps cs
+                       WHERE cs.campaign_id = cr.campaign_id
+                         AND cs.step_order = cr.current_step + 1
+                       LIMIT 1
+                   ) AS next_delay_hours
+            FROM campaign_recipients cr
+            WHERE {' OR '.join(rec_clauses)}
+            ORDER BY (cr.lead_id = ?) DESC, cr.updated_at DESC, cr.id DESC
+            LIMIT 1
+            """,
+            [*rec_params, int(lid) if lid is not None else -1],
+        ).fetchone()
+
+    if rec_row is not None:
+        rec = as_dict(rec_row)
+        data["campaign_status"] = rec.get("status")
+        data["campaign_step"] = rec.get("current_step")
+        data["last_sent_at"] = rec.get("last_sent_at")
+        if rec.get("assigned_account_id") and not acc_id:
+            acc_id = rec["assigned_account_id"]
+        if (
+            rec.get("status") == "in_progress"
+            and rec.get("last_sent_at")
+            and rec.get("next_delay_hours") is not None
+        ):
+            delay_h = int(rec["next_delay_hours"] or 0)
+            if delay_h > 0:
+                data["next_followup_at"] = _add_hours_iso(rec["last_sent_at"], delay_h)
+            else:
+                data["next_followup_at"] = rec["last_sent_at"]
+        else:
+            data["next_followup_at"] = None
+    else:
+        data["campaign_status"] = None
+        data["campaign_step"] = None
+        data["last_sent_at"] = None
+        data["next_followup_at"] = None
+
+    # 2. Dialog info
+    dlg_clauses = []
+    dlg_params = []
+    if dialog_id is not None:
+        dlg_clauses.append("d.id = ?")
+        dlg_params.append(int(dialog_id))
+    if lid is not None:
+        dlg_clauses.append("d.lead_id = ?")
+        dlg_params.append(int(lid))
+    if tg_id is not None:
+        dlg_clauses.append("d.peer_id = ?")
+        dlg_params.append(int(tg_id))
+    if username:
+        dlg_clauses.append("(d.username IS NOT NULL AND lower(d.username) = lower(?))")
+        dlg_params.append(str(username))
+    if phone:
+        dlg_clauses.append("(d.phone IS NOT NULL AND d.phone = ?)")
+        dlg_params.append(str(phone))
+
+    dlg_row = None
+    if dlg_clauses:
+        dlg_row = conn.execute(
+            f"""
+            SELECT d.id, d.account_id, d.last_message_at, d.last_message_preview, d.last_from_peer
+            FROM dialogs d
+            WHERE d.peer_type = 'user' AND ({' OR '.join(dlg_clauses)})
+            ORDER BY (d.id = ?) DESC, (d.lead_id = ?) DESC, d.last_message_at DESC, d.id DESC
+            LIMIT 1
+            """,
+            [
+                *dlg_params,
+                int(dialog_id) if dialog_id is not None else -1,
+                int(lid) if lid is not None else -1,
+            ],
+        ).fetchone()
+
+    if dlg_row is not None:
+        dlg = as_dict(dlg_row)
+        data["last_message_at"] = dlg.get("last_message_at")
+        data["last_message_preview"] = dlg.get("last_message_preview")
+        data["last_from_peer"] = dlg.get("last_from_peer")
+        if dlg.get("account_id") and not acc_id:
+            acc_id = dlg["account_id"]
+    else:
+        data["last_message_at"] = None
+        data["last_message_preview"] = None
+        data["last_from_peer"] = None
+
+    # 3. Account info
+    if acc_id is not None:
+        acc_row = conn.execute(
+            "SELECT phone, telegram_name, telegram_username FROM accounts WHERE id = ?",
+            (int(acc_id),),
+        ).fetchone()
+        if acc_row is not None:
+            acc = as_dict(acc_row)
+            data["account_phone"] = acc.get("phone")
+            data["account_name"] = (
+                acc.get("telegram_name")
+                or acc.get("telegram_username")
+                or acc.get("phone")
+            )
+        else:
+            data["account_phone"] = None
+            data["account_name"] = None
+    else:
+        data["account_phone"] = None
+        data["account_name"] = None
+
+    return data
+
+
+def _public(row, conn=None) -> dict | None:
     data = as_dict(row)
     if data is None:
         return None
     data["provider"] = data.get("provider") or "telegram"
+    if conn is not None:
+        return _enrich_lead(conn, data)
     return data
 
 
@@ -75,7 +241,7 @@ def _find_dialog_lead(conn, account_id, telegram_user_id=None, phone=None, provi
             (account_id, telegram_user_id),
         ).fetchone()
         if row is not None:
-            return _public(row)
+            return _public(row, conn)
     if phone and (provider == "whatsapp" or telegram_user_id is None):
         row = conn.execute(
             """
@@ -86,7 +252,7 @@ def _find_dialog_lead(conn, account_id, telegram_user_id=None, phone=None, provi
             (account_id, phone),
         ).fetchone()
         if row is not None:
-            return _public(row)
+            return _public(row, conn)
     return None
 
 
@@ -170,14 +336,14 @@ def create_lead(
             raise ValueError("Лид с таким telegram id уже есть") from exc
         raise ValueError("Некорректные данные лида") from exc
     row = conn.execute("SELECT * FROM leads WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return _public(row)
+    return _public(row, conn)
 
 
 def get_lead(conn, lead_id: int) -> dict:
     row = conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
     if row is None:
         raise LookupError("lead")
-    return _public(row)
+    return _public(row, conn)
 
 
 def _folder_title(conn, folder_id):
@@ -235,7 +401,7 @@ def update_lead(conn, lead_id: int, **fields) -> dict:
     if row is None:
         raise LookupError("lead")
     if not fields:
-        return _public(row)
+        return _public(row, conn)
     if "status" in fields and fields["status"] not in STATUSES:
         raise ValueError("Неизвестный статус")
     if "provider" in fields and fields["provider"] is not None:
@@ -257,7 +423,7 @@ def update_lead(conn, lead_id: int, **fields) -> dict:
     )
     conn.commit()
     updated = conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
-    return _public(updated)
+    return _public(updated, conn)
 
 
 def search_leads(
@@ -296,7 +462,7 @@ def search_leads(
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY updated_at DESC, id DESC"
-    rows = [_public(row) for row in conn.execute(sql, params)]
+    rows = [_public(row, conn) for row in conn.execute(sql, params)]
     needle = (q or "").strip()
     if needle.startswith("@"):
         needle = needle[1:]

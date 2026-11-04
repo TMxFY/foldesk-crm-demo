@@ -66,6 +66,114 @@ def _public(row) -> dict:
     return out
 
 
+def stop_outreach_on_reply(
+    conn,
+    account_id: int | None = None,
+    peer_id: int | None = None,
+    username: str | None = None,
+    phone: str | None = None,
+    lead_id: int | None = None,
+) -> int:
+    now = utc_now()
+    clean_user = str(username).strip().lstrip("@") if username else None
+    clean_phone = str(phone).strip() if phone else None
+    phone_digits = re.sub(r"\D", "", clean_phone or "")
+    phone_peer_id = int(phone_digits[-12:]) if (phone_digits and len(phone_digits) >= 7) else None
+    clean_peer_id = int(peer_id) if peer_id is not None else phone_peer_id
+    clean_lead_id = int(lead_id) if lead_id is not None else None
+
+    if not any((clean_lead_id, clean_peer_id, clean_user, clean_phone)):
+        return 0
+
+    # Find matching leads first so we can also match campaign_recipients by lead_id
+    lead_clauses = []
+    lead_params = []
+    if clean_lead_id is not None:
+        lead_clauses.append("id = ?")
+        lead_params.append(clean_lead_id)
+    if clean_peer_id is not None:
+        lead_clauses.append("telegram_user_id = ?")
+        lead_params.append(clean_peer_id)
+    if clean_user:
+        lead_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+        lead_params.append(clean_user)
+    if clean_phone:
+        lead_clauses.append("(phone IS NOT NULL AND phone = ?)")
+        lead_params.append(clean_phone)
+
+    matched_lead_ids = set()
+    if clean_lead_id is not None:
+        matched_lead_ids.add(clean_lead_id)
+
+    if lead_clauses:
+        lead_rows = conn.execute(
+            f"SELECT id, status FROM leads WHERE {' OR '.join(lead_clauses)}",
+            lead_params,
+        ).fetchall()
+        for lr in lead_rows:
+            lid = int(lr["id"])
+            matched_lead_ids.add(lid)
+
+    # Also find matching campaign_recipients
+    rec_clauses = []
+    rec_params = []
+    if matched_lead_ids:
+        ph = ",".join("?" for _ in matched_lead_ids)
+        rec_clauses.append(f"lead_id IN ({ph})")
+        rec_params.extend(sorted(matched_lead_ids))
+    if clean_peer_id is not None:
+        rec_clauses.append("telegram_user_id = ?")
+        rec_params.append(clean_peer_id)
+    if clean_user:
+        rec_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+        rec_params.append(clean_user)
+    if clean_phone:
+        rec_clauses.append("(phone IS NOT NULL AND phone = ?)")
+        rec_params.append(clean_phone)
+
+    stopped_count = 0
+    if rec_clauses:
+        rec_rows = conn.execute(
+            f"""
+            SELECT id, lead_id, status FROM campaign_recipients
+            WHERE status IN ('pending', 'in_progress', 'completed')
+              AND ({' OR '.join(rec_clauses)})
+            """,
+            rec_params,
+        ).fetchall()
+        for rr in rec_rows:
+            if rr["lead_id"]:
+                matched_lead_ids.add(int(rr["lead_id"]))
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET status = 'replied', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, int(rr["id"])),
+            )
+            stopped_count += 1
+
+    if matched_lead_ids:
+        ph = ",".join("?" for _ in matched_lead_ids)
+        conn.execute(
+            f"""
+            UPDATE leads
+            SET status = CASE WHEN status IN ('new', 'waiting') THEN 'talking' ELSE status END,
+                next_step = CASE
+                    WHEN status IN ('new', 'waiting')
+                    THEN 'Клиент ответил — цепочка остановлена, ответьте вручную'
+                    ELSE COALESCE(next_step, 'Клиент ответил — цепочка остановлена, ответьте вручную')
+                END,
+                updated_at = ?
+            WHERE id IN ({ph})
+            """,
+            [now, *sorted(matched_lead_ids)],
+        )
+
+    return stopped_count
+
+
 def remember_dialogs(conn, account_id: int, people: list) -> list:
     acc_provider = _account_provider(conn, account_id)
     now = utc_now()
@@ -84,21 +192,52 @@ def remember_dialogs(conn, account_id: int, people: list) -> list:
             username = str(username).strip().lstrip("@") or None
         provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
         phone = _extract_dialog_phone(person, int(peer_id), provider)
+        unread = person.get("unread_count") if "unread_count" in person else None
+        if unread is not None:
+            unread = max(0, int(unread))
+        preview = person.get("last_message_preview")
+        if preview is not None:
+            preview = str(preview)[:120]
+        sent_at = person.get("last_message_at")
+        if sent_at is not None:
+            sent_at = str(sent_at)
+        last_from = person.get("last_from_peer") if "last_from_peer" in person else None
+        if last_from is not None:
+            last_from = 1 if last_from else 0
         conn.execute(
             """
             INSERT INTO dialogs (
                 account_id, peer_type, peer_id, username, title, phone, provider,
-                is_group, unread_count, last_from_peer, muted,
-                created_at, updated_at
-            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
+                is_group, unread_count, last_message_at, last_message_preview,
+                last_from_peer, muted, created_at, updated_at
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
             ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
-                username = excluded.username,
-                title = excluded.title,
+                username = COALESCE(excluded.username, dialogs.username),
+                title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
                 phone = COALESCE(excluded.phone, dialogs.phone),
                 provider = COALESCE(excluded.provider, dialogs.provider),
+                unread_count = COALESCE(?, dialogs.unread_count),
+                last_message_at = COALESCE(excluded.last_message_at, dialogs.last_message_at),
+                last_message_preview = COALESCE(excluded.last_message_preview, dialogs.last_message_preview),
+                last_from_peer = COALESCE(?, dialogs.last_from_peer),
                 updated_at = excluded.updated_at
             """,
-            (account_id, int(peer_id), username, title, phone, provider, now, now),
+            (
+                account_id,
+                int(peer_id),
+                username,
+                title,
+                phone,
+                provider,
+                0 if unread is None else unread,
+                sent_at,
+                preview,
+                0 if last_from is None else last_from,
+                now,
+                now,
+                unread,
+                last_from,
+            ),
         )
         row = conn.execute(
             """
@@ -107,6 +246,15 @@ def remember_dialogs(conn, account_id: int, people: list) -> list:
             """,
             (account_id, int(peer_id)),
         ).fetchone()
+        if row and int(row["last_from_peer"] or 0) == 1:
+            stop_outreach_on_reply(
+                conn,
+                account_id=account_id,
+                peer_id=int(row["peer_id"]),
+                username=row["username"],
+                phone=row["phone"],
+                lead_id=row["lead_id"],
+            )
         saved.append(_public(row))
     conn.commit()
     return saved
@@ -184,6 +332,14 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
         except sqlite3.IntegrityError as exc:
             conn.rollback()
             raise ValueError("Не удалось записать входящее") from exc
+    stop_outreach_on_reply(
+        conn,
+        account_id=account_id,
+        peer_id=int(row["peer_id"]),
+        username=row["username"],
+        phone=row["phone"],
+        lead_id=row["lead_id"],
+    )
     conn.commit()
     return _public(row)
 
@@ -265,6 +421,15 @@ def sync_inbox(conn, account_id: int, people: list) -> list:
                 """,
                 (account_id, int(peer_id)),
             ).fetchone()
+            if row and int(row["last_from_peer"] or 0) == 1:
+                stop_outreach_on_reply(
+                    conn,
+                    account_id=account_id,
+                    peer_id=int(row["peer_id"]),
+                    username=row["username"],
+                    phone=row["phone"],
+                    lead_id=row["lead_id"],
+                )
             saved.append(_public(row))
         conn.commit()
     except (sqlite3.IntegrityError, TypeError, ValueError) as exc:
@@ -622,6 +787,35 @@ def _cache_messages(conn, dialog_id: int, items: list) -> None:
                 """,
                 (dialog_id, message_id, direction, text, sent_at, reply_to, now, now),
             )
+        if normalized:
+            latest = max(normalized, key=lambda m: (m[3], m[0]))
+            _, last_dir, last_text, last_sent_at, _ = latest
+            last_preview = "" if last_text is None else str(last_text)[:120]
+            if last_dir == "in":
+                conn.execute(
+                    """
+                    UPDATE dialogs
+                    SET last_from_peer = 1,
+                        last_message_at = COALESCE(?, last_message_at),
+                        last_message_preview = CASE WHEN ? != '' THEN ? ELSE last_message_preview END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (last_sent_at, last_preview, last_preview, now, dialog_id),
+                )
+            if any(m[1] == "in" for m in normalized):
+                dlg_row = conn.execute(
+                    "SELECT * FROM dialogs WHERE id = ?", (dialog_id,)
+                ).fetchone()
+                if dlg_row is not None:
+                    stop_outreach_on_reply(
+                        conn,
+                        account_id=int(dlg_row["account_id"]),
+                        peer_id=int(dlg_row["peer_id"]),
+                        username=dlg_row["username"],
+                        phone=dlg_row["phone"],
+                        lead_id=dlg_row["lead_id"],
+                    )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
