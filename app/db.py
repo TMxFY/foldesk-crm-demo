@@ -49,7 +49,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             telegram_user_id INTEGER,
             telegram_username TEXT,
             telegram_name TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            health TEXT CHECK (
+                health IS NULL
+                OR health IN ('active', 'offline', 'unauthorized', 'banned', 'frozen')
+            ),
+            last_error TEXT,
+            updated_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS leads (
@@ -204,6 +210,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "leads", "description", "TEXT")
     _ensure_column(conn, "leads", "email", "TEXT")
     _ensure_column(conn, "leads", "url", "TEXT")
+    _ensure_column(conn, "accounts", "health", "TEXT")
+    _ensure_column(conn, "accounts", "last_error", "TEXT")
+    _ensure_column(conn, "accounts", "updated_at", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.commit()
 
 

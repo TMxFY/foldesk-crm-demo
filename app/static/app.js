@@ -21,6 +21,14 @@ const ACCOUNT_STATUS = {
   error: ["ошибка входа", "b-bad"],
 };
 
+const ACCOUNT_HEALTH = {
+  active: ["активен", "b-ok"],
+  offline: ["офлайн", "b-off"],
+  unauthorized: ["не авторизован", "b-bad"],
+  banned: ["заблокирован", "b-bad"],
+  frozen: ["заморожен", "b-bad"],
+};
+
 const PROPERTY_TYPES = [
   ["text", "Текст"],
   ["textarea", "Длинный текст"],
@@ -235,6 +243,19 @@ function resumeLogin(account) {
   document.querySelector("#password-form").hidden = account.status !== "pending_password";
 }
 
+async function reconnectAccount(account) {
+  showError(null);
+  try {
+    const result = await api(`/api/accounts/${account.id}/reconnect`, { method: "POST" });
+    await loadAccounts();
+    if (!result || result.health !== "active") {
+      showError(new Error((result && result.last_error) || "Сессия не активна"));
+    }
+  } catch (error) {
+    showError(error);
+  }
+}
+
 function renderAccounts() {
   const list = document.querySelector("#account-list");
   list.replaceChildren();
@@ -250,10 +271,17 @@ function renderAccounts() {
       el("span", { className: "name" }, [label]),
       el("span", { className: `badge ${pair[1]}` }, [pair[0]]),
     ]);
+    if (account.health) {
+      const healthPair = ACCOUNT_HEALTH[account.health] || [account.health, "b-off"];
+      row.append(el("span", { className: `badge ${healthPair[1]}` }, [healthPair[0]]));
+    }
     if (account.status === "pending_code" || account.status === "pending_password") {
       pending = account;
       const caption = account.status === "pending_password" ? "Ввести пароль" : "Ввести код";
       row.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => resumeLogin(account) }, [caption]));
+    }
+    if (account.status === "connected") {
+      row.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => reconnectAccount(account) }, ["Переподключить"]));
     }
     list.append(row);
   });

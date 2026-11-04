@@ -11,3 +11,4 @@
 - 2026-11-04 — replica-build S04: живые входящие, SSE `/api/inbox/events`. `./scripts/verify.sh`: 20 passed. partial: сокет есть, полный офлайн-догон нет. Фича не закрыта.
 - 2026-11-04 — replica-build S09: заметки, задачи без due_at, свои поля. `./scripts/verify.sh`: 22 passed. Свои названия стадий нет. Фича не закрыта.
 - 2026-11-04 — S04: список личных диалогов без ручного поиска и без нового сообщения. `./scripts/verify.sh`: 23 passed. Фича не закрыта.
+- 2026-11-04 — account health: вход и `POST /api/accounts/{id}/reconnect` пишут `health` и `last_error`. Кнопка «Переподключить» при unauthorized не рисует «активен». `./scripts/verify.sh`: 25 passed. Playwright F01-H1/H3/H4 passed. `feature_list.json` не закрыт.

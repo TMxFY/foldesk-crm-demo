@@ -1,5 +1,5 @@
 from app.db import as_dict, resolve_session, utc_now
-from app.telegram_gateway import GatewayError
+from app.telegram_gateway import SESSION_HEALTH, GatewayError
 
 PUBLIC_FIELDS = (
     "id",
@@ -9,6 +9,8 @@ PUBLIC_FIELDS = (
     "telegram_username",
     "telegram_name",
     "created_at",
+    "health",
+    "last_error",
 )
 
 
@@ -90,8 +92,7 @@ async def confirm_login(conn, account_id: int, code: str, gateway) -> dict:
     except Exception as exc:
         _mark_error(conn, account_id)
         raise GatewayError(str(exc) or "Не удалось подтвердить код") from exc
-    _apply_result(conn, account_id, result)
-    return {"status": result["status"]}
+    return await _finish_login(conn, account_id, result, gateway)
 
 
 async def confirm_password(conn, account_id: int, password: str, gateway) -> dict:
@@ -113,8 +114,78 @@ async def confirm_password(conn, account_id: int, password: str, gateway) -> dic
     except Exception as exc:
         _mark_error(conn, account_id)
         raise GatewayError(str(exc) or "Не удалось подтвердить пароль") from exc
+    return await _finish_login(conn, account_id, result, gateway)
+
+
+def _clip_error(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:500]
+
+
+def _write_health(conn, account_id: int, health: str, last_error) -> None:
+    # health is the live session. accounts.status stays the login step.
+    if health not in SESSION_HEALTH:
+        raise ValueError("Неизвестный статус сессии")
+    conn.execute(
+        """
+        UPDATE accounts
+        SET health = ?, last_error = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (health, _clip_error(last_error), utc_now(), account_id),
+    )
+    conn.commit()
+
+
+async def _probe_health(gateway, session_path: str) -> dict:
+    try:
+        probe = await gateway.session_health(session_path)
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        return {"health": "offline", "last_error": _clip_error(exc) or "Нет связи"}
+    except Exception as exc:
+        return {
+            "health": "offline",
+            "last_error": _clip_error(exc) or "Не удалось проверить сессию",
+        }
+    if not isinstance(probe, dict) or probe.get("health") not in SESSION_HEALTH:
+        return {
+            "health": "offline",
+            "last_error": _clip_error(probe.get("last_error") if isinstance(probe, dict) else None)
+            or "Не удалось проверить сессию",
+        }
+    health = probe["health"]
+    if health == "active":
+        return {"health": "active", "last_error": None}
+    return {
+        "health": health,
+        "last_error": _clip_error(probe.get("last_error")) or "Сессия не активна",
+    }
+
+
+async def _finish_login(conn, account_id: int, result: dict, gateway) -> dict:
     _apply_result(conn, account_id, result)
+    if result.get("status") == "connected":
+        account = _load(conn, account_id)
+        probe = await _probe_health(gateway, account["session_path"])
+        _write_health(conn, account_id, probe["health"], probe["last_error"])
     return {"status": result["status"]}
+
+
+async def reconnect_account(conn, account_id: int, gateway) -> dict:
+    account = _load(conn, account_id)
+    if account["status"] != "connected":
+        raise ValueError("Аккаунт не подключён")
+    probe = await _probe_health(gateway, account["session_path"])
+    _write_health(conn, account_id, probe["health"], probe["last_error"])
+    return {
+        "status": account["status"],
+        "health": probe["health"],
+        "last_error": probe["last_error"],
+    }
 
 
 def _apply_result(conn, account_id: int, result: dict) -> None:

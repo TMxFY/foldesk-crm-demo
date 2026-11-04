@@ -46,6 +46,42 @@ class TelegramGateway(ABC):
         """Private dialogs already on the account. Not search, not groups or channels."""
         raise GatewayError("Список входящих не подключён")
 
+    async def session_health(self, session_path: str) -> dict:
+        """Probe a saved session. Return health and last_error. Do not log in again."""
+        raise GatewayError("Проверка сессии не подключена")
+
+
+SESSION_HEALTH = ("active", "offline", "unauthorized", "banned", "frozen")
+
+
+def _clip_error(exc) -> str:
+    text = str(exc).strip() or exc.__class__.__name__
+    return text[:500]
+
+
+def _classify_session_error(exc: Exception) -> dict:
+    text = _clip_error(exc)
+    blob = f"{exc.__class__.__name__} {text}".casefold()
+    if "frozen" in blob:
+        return {"health": "frozen", "last_error": text}
+    try:
+        from telethon import errors
+    except Exception:
+        errors = None
+    if errors is not None and isinstance(
+        exc, (errors.UserDeactivatedBanError, errors.PhoneNumberBannedError)
+    ):
+        return {"health": "banned", "last_error": text}
+    if errors is not None and isinstance(
+        exc, (errors.UnauthorizedError, errors.AuthKeyError, errors.UserDeactivatedError)
+    ):
+        return {"health": "unauthorized", "last_error": text}
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return {"health": "offline", "last_error": text or "Нет связи"}
+    if errors is not None and isinstance(exc, errors.TimedOutError):
+        return {"health": "offline", "last_error": text or "Нет связи"}
+    return {"health": "offline", "last_error": text or "Не удалось проверить сессию"}
+
 
 def _session_name(session_path: str) -> str:
     # Telethon appends .session itself. The stored path already has the suffix.
@@ -207,6 +243,33 @@ class TelethonGateway(TelegramGateway):
         }
         await self._close(session_path)
         return profile
+
+    async def session_health(self, session_path: str) -> dict:
+        try:
+            client, owned = await self._open(session_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return _classify_session_error(exc)
+        try:
+            if not await client.is_user_authorized():
+                return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+            me = await client.get_me()
+            if me is None:
+                return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+            return {"health": "active", "last_error": None}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return _classify_session_error(exc)
+        finally:
+            if owned:
+                try:
+                    await self._close(session_path)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
 
     async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
         client, owned = await self._open(session_path)
@@ -444,10 +507,19 @@ class TelethonGateway(TelegramGateway):
 
 
 class FakeGateway(TelegramGateway):
-    def __init__(self, code="12345", password="secret", needs_password=False, dialogs=None, history=None):
+    def __init__(
+        self,
+        code="12345",
+        password="secret",
+        needs_password=False,
+        dialogs=None,
+        history=None,
+        health=None,
+    ):
         self.code = code
         self.password = password
         self.needs_password = needs_password
+        self.health = health
         self.dialogs = [dict(item) for item in (dialogs or [])]
         self.history = {}
         for peer, rows in (history or {}).items():
@@ -494,6 +566,23 @@ class FakeGateway(TelegramGateway):
             with self._lock:
                 if self._listeners.get(session_path) is on_message:
                     self._listeners.pop(session_path, None)
+
+    async def session_health(self, session_path: str) -> dict:
+        forced = self.health
+        if forced in SESSION_HEALTH:
+            if forced == "active":
+                return {"health": "active", "last_error": None}
+            text = {
+                "offline": "Нет связи",
+                "unauthorized": "Сессия недействительна",
+                "banned": "Аккаунт заблокирован",
+                "frozen": "Аккаунт заморожен",
+            }[forced]
+            return {"health": forced, "last_error": text}
+        pending = self._pending.get(session_path) or {}
+        if pending.get("state") == "connected":
+            return {"health": "active", "last_error": None}
+        return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
 
     async def request_code(self, phone: str, session_path: str) -> str:
         phone_code_hash = "hash-" + phone

@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
 
-from app.accounts import confirm_login, confirm_password, list_accounts, start_login
+from app.accounts import confirm_login, confirm_password, list_accounts, reconnect_account, start_login
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
 from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply, sync_inbox
@@ -330,6 +330,13 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/accounts")
     def accounts_list(request: Request):
         return list_accounts(request.app.state.conn)
+
+    @app.post("/api/accounts/{account_id}/reconnect")
+    async def accounts_reconnect(account_id: int, request: Request):
+        gateway = _gateway(request)
+        return await _call_async(
+            reconnect_account, request.app.state.conn, account_id, gateway
+        )
 
     @app.get("/api/accounts/{account_id}/dialogs")
     async def account_dialogs(account_id: int, request: Request, q: str = ""):

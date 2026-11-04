@@ -79,9 +79,16 @@ def build():
         conn.commit()
         gateway._pending.clear()
         gateway.needs_password = False
+        gateway.health = None
         gateway._message_seq = 0
         seed_history(gateway)
         return {"ok": True}
+
+    @app.post("/api/test/session-health")
+    async def session_health(body: dict):
+        health = body.get("health")
+        gateway.health = health or None
+        return {"health": gateway.health}
 
     return app
 
