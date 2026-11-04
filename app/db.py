@@ -205,6 +205,13 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS property_values_one_account
             ON property_values(property_id, account_id)
             WHERE account_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS operator_session (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            logged_in INTEGER NOT NULL DEFAULT 0 CHECK (logged_in IN (0, 1)),
+            chat_id TEXT,
+            logged_in_at TEXT
+        );
         """
     )
     _ensure_column(conn, "leads", "description", "TEXT")

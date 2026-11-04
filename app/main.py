@@ -17,6 +17,7 @@ from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, 
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
 from app.properties import create_property_def, set_lead_property
+from app.bot_login import apply_start_update, operator_status, poll_bot_login
 from app.digest import apply_digest_callback, callback_data_from_update, send_morning_digest
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.tasks import create_task, set_task_done
@@ -483,6 +484,23 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Неизвестное действие") from exc
         data = _call(callback_data_from_update, update)
         return _call(apply_digest_callback, request.app.state.conn, data)
+
+    @app.get("/api/operator")
+    def operator_get(request: Request):
+        return operator_status(request.app.state.conn)
+
+    @app.post("/api/operator/bot-login")
+    def operator_bot_login(request: Request):
+        opener = getattr(request.app.state, "bot_opener", None)
+        return _call(poll_bot_login, request.app.state.conn, opener)
+
+    @app.post("/api/operator/update")
+    async def operator_update(request: Request):
+        try:
+            update = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Не апдейт") from exc
+        return _call(apply_start_update, request.app.state.conn, update)
 
     @app.get("/api/inbox")
     async def inbox_list(request: Request, account_id: int, q: str = ""):

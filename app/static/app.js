@@ -298,6 +298,19 @@ function renderAccounts() {
   setView("#accounts-view", "filled");
 }
 
+function showOperator(text, kind) {
+  const box = document.querySelector("#operator-msg");
+  if (!box) return;
+  box.textContent = text || "";
+  box.setAttribute("role", kind === "alert" ? "alert" : "status");
+}
+
+async function loadOperator() {
+  const status = await api("/api/operator");
+  if (status && status.logged_in) showOperator("Вы вошли через бота", "status");
+  else showOperator("", "status");
+}
+
 async function loadAccounts() {
   state.accounts = await api("/api/accounts");
   renderAccounts();
@@ -1190,6 +1203,23 @@ function bindBusy(form, handler) {
   });
 }
 
+document.querySelector("#bot-login").addEventListener("click", async () => {
+  const button = document.querySelector("#bot-login");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  showOperator("", "status");
+  try {
+    const status = await api("/api/operator/bot-login", { method: "POST" });
+    if (status && status.logged_in) showOperator("Вы вошли через бота", "status");
+    else showOperator("Бот ещё не получил /start", "alert");
+  } catch (error) {
+    showOperator(error.message || "Нет BOT_TOKEN", "alert");
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
+});
+
 bindBusy(document.querySelector("#login-form"), async (event) => {
   const phone = new FormData(event.target).get("phone");
   const result = await api("/api/accounts/start", { method: "POST", body: { phone } });
@@ -1517,6 +1547,11 @@ async function boot() {
   setView("#thread-view", "empty");
   setView("#side-view", "empty");
   setView("#card-view", "empty");
+  try {
+    await loadOperator();
+  } catch (error) {
+    showOperator(error.message || "Нет BOT_TOKEN", "alert");
+  }
   try {
     await loadAccounts();
   } catch (error) {
