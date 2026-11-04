@@ -22,7 +22,7 @@ from app.accounts import (
     update_account_settings,
 )
 from app.accounts import _load as load_account
-from app.db import ROOT, connect, init_db
+from app.db import ROOT, connect, init_db, utc_now
 from app.demo import DEMO_SESSION, seed_demo
 from app.inbox import (
     apply_incoming,
@@ -32,6 +32,7 @@ from app.inbox import (
     open_dialog_by_lead,
     remember_dialogs,
     send_reply,
+    start_direct_dialog,
     sync_inbox,
 )
 from app.folders import list_folders, pull_folders, sync_folder, update_folder
@@ -71,6 +72,8 @@ KEYS_DETAIL = "Нужны ключи TG_API_ID и TG_API_HASH с https://my.tele
 
 
 def load_env_file() -> None:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
     path = ROOT / ".env"
     if not path.exists():
         return
@@ -104,6 +107,21 @@ class OutreachScheduleIn(BaseModel):
 class OpenByLeadIn(BaseModel):
     lead_id: int
     account_id: int | None = None
+
+
+class StartDirectDialogIn(BaseModel):
+    handle: str
+    account_id: int | None = None
+    name: str | None = None
+
+
+class InboxSyncIn(BaseModel):
+    account_id: int | None = None
+
+
+class TgCredentialsIn(BaseModel):
+    api_id: str | int
+    api_hash: str
 
 
 class CodeIn(BaseModel):
@@ -239,12 +257,52 @@ class CampaignRunIn(BaseModel):
     respect_delays: bool = False
 
 
+def _resolve_tg_creds(conn=None) -> tuple[str, str]:
+    api_id = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
+        if conn is not None:
+            try:
+                rows = dict(
+                    conn.execute(
+                        "SELECT key, value FROM kv_settings WHERE key IN ('tg_api_id', 'tg_api_hash')"
+                    ).fetchall()
+                )
+                api_id = api_id or str(rows.get("tg_api_id") or "").strip()
+                api_hash = api_hash or str(rows.get("tg_api_hash") or "").strip()
+            except Exception:
+                pass
+        if not api_id or not api_hash:
+            api_id = "2040"
+            api_hash = "b18441a1ff607e10a989891a5462e627"
+    return api_id, api_hash
+
+
+def _resolve_app_gateway(app, provider: str = "telegram"):
+    norm = str(provider or "telegram").strip().lower()
+    if norm == "whatsapp":
+        wa_gw = getattr(app.state, "wa_gateway", None)
+        if wa_gw is None:
+            wa_gw = WhatsAppGateway()
+            app.state.wa_gateway = wa_gw
+        return wa_gw
+    if app.state.gateway is not None:
+        return app.state.gateway
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    api_id, api_hash = _resolve_tg_creds(getattr(app.state, "conn", None))
+    if not api_id or not api_hash:
+        return None
+    gateway = TelethonGateway()
+    app.state.gateway = gateway
+    return gateway
+
+
 def _gateway(request: Request):
     gateway = request.app.state.gateway
     if gateway is not None:
         return gateway
-    api_id = os.getenv("TG_API_ID", "").strip()
-    api_hash = os.getenv("TG_API_HASH", "").strip()
+    api_id, api_hash = _resolve_tg_creds(getattr(request.app.state, "conn", None))
     if not api_id or not api_hash:
         raise HTTPException(status_code=400, detail=KEYS_DETAIL)
     gateway = TelethonGateway()
@@ -349,11 +407,7 @@ async def ensure_private_inbox(app, account_id: int) -> None:
             synced.add(account_id)
             return
         provider = str(account.get("provider") or "telegram").strip().lower()
-        gateway = (
-            getattr(app.state, "wa_gateway", None)
-            if provider == "whatsapp"
-            else app.state.gateway
-        )
+        gateway = _resolve_app_gateway(app, provider)
         if gateway is None:
             return
         try:
@@ -377,11 +431,7 @@ async def start_account_watch(app, account_id: int) -> None:
     if account["status"] != "connected":
         return
     provider = str(account.get("provider") or "telegram").strip().lower()
-    gateway = (
-        getattr(app.state, "wa_gateway", None)
-        if provider == "whatsapp"
-        else app.state.gateway
-    )
+    gateway = _resolve_app_gateway(app, provider)
     if gateway is None:
         return
     await ensure_private_inbox(app, account_id)
@@ -421,7 +471,7 @@ async def start_connected_watches(app) -> None:
     ).fetchall()
     for row in rows:
         provider = str(row["provider"] or "telegram").strip().lower()
-        if provider != "whatsapp" and app.state.gateway is None:
+        if provider != "whatsapp" and _resolve_app_gateway(app, "telegram") is None:
             continue
         await start_account_watch(app, row["id"])
 
@@ -502,13 +552,16 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
         provider = str((payload if isinstance(payload, dict) else {}).get("provider") or "telegram").strip().lower()
-        gw = request.app.state.wa_gateway if provider == "whatsapp" else request.app.state.gateway
+        gw = _resolve_app_gateway(request.app, provider)
         imported = _call(
             import_session_accounts,
             request.app.state.conn,
             gw,
             payload,
         )
+        for acc in imported:
+            if isinstance(acc, dict) and acc.get("id") and acc.get("status") == "connected":
+                await start_account_watch(request.app, int(acc["id"]))
         return {"imported": imported, "count": len(imported)}
 
     @app.patch("/api/accounts/{account_id}/settings")
@@ -568,9 +621,13 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.post("/api/accounts/{account_id}/reconnect")
     async def accounts_reconnect(account_id: int, request: Request):
         gateway = _gateway_for_account(request, account_id)
-        return await _call_async(
+        result = await _call_async(
             reconnect_account, request.app.state.conn, account_id, gateway
         )
+        if isinstance(result, dict) and result.get("status") == "connected":
+            request.app.state.inbox_synced.discard(account_id)
+            await start_account_watch(request.app, account_id)
+        return result
 
     @app.get("/api/folders")
     def folders_list(request: Request, account_id: int):
@@ -847,6 +904,74 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             body.lead_id,
             body.account_id,
         )
+
+    @app.post("/api/dialogs/start-direct")
+    async def dialogs_start_direct(body: StartDirectDialogIn, request: Request):
+        conn = request.app.state.conn
+        gateway = None
+        if body.account_id:
+            try:
+                acc = load_account(conn, body.account_id)
+                prov = str(acc.get("provider") or "telegram").strip().lower()
+                if not str(acc.get("session_path") or "").startswith("data/sessions/demo"):
+                    gateway = _resolve_app_gateway(request.app, prov)
+            except Exception:
+                gateway = None
+        else:
+            gateway = _resolve_app_gateway(request.app, "telegram")
+        return await _call_async(
+            start_direct_dialog,
+            conn,
+            body.handle,
+            body.account_id,
+            body.name,
+            gateway=gateway,
+        )
+
+    @app.post("/api/inbox/sync")
+    async def inbox_sync_now(request: Request, body: InboxSyncIn | None = None):
+        conn = request.app.state.conn
+        target_id = body.account_id if body is not None else None
+        if target_id is None or int(target_id) == 0:
+            rows = conn.execute(
+                "SELECT id FROM accounts WHERE status = 'connected'"
+            ).fetchall()
+            for r in rows:
+                aid = int(r["id"])
+                request.app.state.inbox_synced.discard(aid)
+                await start_account_watch(request.app, aid)
+            return {"synced": len(rows), "dialogs": list_inbox(conn, 0, "")}
+        aid = int(target_id)
+        request.app.state.inbox_synced.discard(aid)
+        await start_account_watch(request.app, aid)
+        return {"synced": 1, "dialogs": list_inbox(conn, aid, "")}
+
+    @app.post("/api/settings/tg-credentials")
+    def settings_set_tg_credentials(body: TgCredentialsIn, request: Request):
+        api_id = str(body.api_id or "").strip()
+        api_hash = str(body.api_hash or "").strip()
+        if not api_id.isdigit() or not api_hash:
+            raise HTTPException(status_code=400, detail="Укажите числовой api_id и строку api_hash")
+        now = utc_now()
+        conn = request.app.state.conn
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at) VALUES ('tg_api_id', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (api_id, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at) VALUES ('tg_api_hash', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (api_hash, now),
+        )
+        conn.commit()
+        os.environ["TG_API_ID"] = api_id
+        os.environ["TG_API_HASH"] = api_hash
+        return {"ok": True, "api_id": int(api_id)}
 
     @app.get("/api/dialogs/{dialog_id}/messages")
     async def dialog_messages(dialog_id: int, request: Request):

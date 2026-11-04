@@ -496,3 +496,80 @@ def test_auto_stop_on_reply_prevents_followup_and_moves_lead_to_talking(tmp_path
         assert recs_step2["boris_operator"]["current_step"] == 1
         assert recs_step2["victor_silent"]["status"] == "in_progress"
         assert recs_step2["victor_silent"]["current_step"] == 2
+
+
+def test_dynamic_csv_column_variables_and_direct_chat_open(tmp_path):
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    account_id, _ = _seed_connected_account(conn, daily_limit=20)
+    app = create_app(conn=conn, gateway=None)
+
+    with TestClient(app) as client:
+        # 1. Создание рассылки с кастомными переменными из названий столбцов CSV
+        camp_res = client.post(
+            "/api/campaigns",
+            json={
+                "name": "Кастомные столбцы CSV",
+                "account_id": account_id,
+                "daily_limit": 20,
+                "steps": [
+                    {
+                        "step_order": 1,
+                        "delay_hours": 0,
+                        "template_text": (
+                            "Привет, {Имя Фаундера}! Вижу вы развиваете {Название} в городе {Город} "
+                            "(ниша: {Ниша}, угол: {Их угол}). Сайт {Сайт} отличный!"
+                        ),
+                    }
+                ],
+            },
+        )
+        assert camp_res.status_code == 200
+        camp_id = camp_res.json()["id"]
+
+        csv_text = (
+            "Контакт,Имя Фаундера,Название,Сайт,Город,Ниша,Их угол\n"
+            "@dmitry_ai,Дмитрий,NeuroFlow,neuroflow.io,Москва,B2B AI,Автоматизация саппорта\n"
+        )
+        imp_res = client.post(
+            f"/api/campaigns/{camp_id}/csv",
+            json={"csv_text": csv_text},
+        )
+        assert imp_res.status_code == 200
+        imp_data = imp_res.json()
+        assert imp_data["imported"] == 1
+        assert "Город" in imp_data["campaign"]["csv_headers"]
+        assert "Ниша" in imp_data["campaign"]["csv_headers"]
+        assert "Их угол" in imp_data["campaign"]["csv_headers"]
+
+        run_res = client.post(f"/api/campaigns/{camp_id}/run", json={})
+        assert run_res.status_code == 200
+        assert run_res.json()["sent"] == 1
+
+        inbox = client.get(f"/api/inbox?account_id={account_id}").json()
+        dmitry_dlg = next(d for d in inbox if d["username"] == "dmitry_ai")
+        dmitry_msgs = client.get(f"/api/dialogs/{dmitry_dlg['id']}/messages").json()
+        assert len(dmitry_msgs) == 1
+        assert (
+            dmitry_msgs[0]["text"]
+            == "Привет, Дмитрий! Вижу вы развиваете NeuroFlow в городе Москва (ниша: B2B AI, угол: Автоматизация саппорта). Сайт neuroflow.io отличный!"
+        )
+
+        # 2. Открытие прямого Telegram Web чата по @username через /api/dialogs/start-direct
+        direct_res = client.post(
+            "/api/dialogs/start-direct",
+            json={"handle": "@new_tg_web_lead", "account_id": account_id},
+        )
+        assert direct_res.status_code == 200
+        direct_data = direct_res.json()
+        assert direct_data["dialog"]["username"] == "new_tg_web_lead"
+        assert direct_data["lead"]["username"] == "new_tg_web_lead"
+        assert direct_data["lead"]["status"] == "talking"
+
+        msg_res = client.post(
+            f"/api/dialogs/{direct_data['dialog']['id']}/messages",
+            json={"text": "Привет напрямую из Telegram Web сессии в CRM!"},
+        )
+        assert msg_res.status_code == 200
+        assert msg_res.json()["text"] == "Привет напрямую из Telegram Web сессии в CRM!"
+

@@ -130,3 +130,34 @@ test('F21-H4 Multi-session Inbox switcher and direct message sending across sess
   await thread.getByRole('button', { name: 'Отправить' }).click();
   await expect(thread.locator('#messages')).toContainText('Привет! Отправляю ответ прямо из мульти-сессионного окна Foldesk.');
 });
+
+test('F21-H5 Telegram Web quick chat bar and dynamic CSV column variables', async ({ page }) => {
+  await page.locator('#seed-demo').click();
+  await expect(page.locator('#board .card').first()).toBeVisible();
+
+  // 1. Dynamic CSV column variables appear in builder chips
+  await page.locator('#csv-text').fill(
+    'Контакт,Имя Фаундера,Город,Ниша,Их угол\n@founder_msk,Алексей,Москва,FinTech,AI скоринг\n',
+  );
+  await expect(page.locator('#builder-var-chips [data-insert-var="{Город}"]')).toBeVisible();
+  await expect(page.locator('#builder-var-chips [data-insert-var="{Ниша}"]')).toBeVisible();
+  await expect(page.locator('#builder-var-chips [data-insert-var="{Их угол}"]')).toBeVisible();
+
+  const step1Area = page.locator('#campaign-steps-list textarea').first();
+  await step1Area.fill('Привет, {Имя Фаундера} из ');
+  await page.locator('#builder-var-chips [data-insert-var="{Город}"]').click();
+  await expect(step1Area).toHaveValue('Привет, {Имя Фаундера} из {Город}');
+
+  // 2. Telegram Web quick-start chat bar in #s04 opens chat & creates CRM lead
+  await page.locator('#tg-web-handle').fill('@tg_web_founder');
+  await page.locator('#tg-web-open-btn').click();
+
+  const thread = page.locator('#s05');
+  await expect(thread.locator('#thread-head')).toContainText('@tg_web_founder');
+  await expect(page.locator('#s06')).toContainText('@tg_web_founder');
+
+  await thread.locator('#reply-text').fill('Пишу напрямую через Telegram Web сессию!');
+  await thread.locator('#reply-text').press('Enter');
+  await expect(thread.locator('#messages')).toContainText('Пишу напрямую через Telegram Web сессию!');
+});
+

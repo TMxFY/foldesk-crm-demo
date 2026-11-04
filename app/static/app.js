@@ -142,6 +142,7 @@ const state = {
   expandedCampaigns: {},
   expandedAccountPools: {},
   selectedBuilderAccountIds: null,
+  csvHeaders: [],
 };
 
 let modalSubmit = null;
@@ -784,7 +785,7 @@ function accountConnectionLabel(account) {
   if (account.connection_label) return account.connection_label;
   if (account.is_demo) return "Демо-профиль (локально)";
   const isWa = normalizeProvider(account.provider) === "whatsapp";
-  if (account.status === "connected") return isWa ? "Подключён · WhatsApp Web активен" : "Подключён · MTProto активен";
+  if (account.status === "connected") return isWa ? "Подключён · WhatsApp Web активен" : "Подключён · MTProto онлайн";
   if (account.status === "pending_code") return "Не подключён · ждёт код";
   if (account.status === "pending_password") return "Не подключён · ждёт пароль";
   return "Сессия слетела · нужен вход";
@@ -889,10 +890,16 @@ function renderAccounts() {
       actionsWrap.append(
         el("button", {
           type: "button",
-          className: "btn secondary sm sheet-only-btn",
-          onclick: () => {
-            switchInboxSession(String(account.id));
+          className: "btn secondary sm",
+          onclick: async () => {
+            await switchInboxSession(String(account.id));
             activateSheet("inbox");
+            const s04 = document.querySelector("#s04");
+            if (s04 && state.viewMode !== "sheet") s04.scrollIntoView({ block: "nearest" });
+            const matched = state.dialogs.filter(passChips);
+            if (matched.length && !state.selectedDialog) {
+              selectDialog(matched[0]).catch(() => {});
+            }
           },
         }, ["Открыть чаты"]),
         el("button", { type: "button", className: "btn ghost sm", onclick: () => reconnectAccount(account) }, ["Переподключить"]),
@@ -1514,6 +1521,12 @@ function renderCampaigns() {
 async function loadCampaigns() {
   try {
     state.campaigns = await api("/api/campaigns");
+    if (!state.csvHeaders.length) {
+      const withHeaders = (state.campaigns || []).find((c) => Array.isArray(c.csv_headers) && c.csv_headers.length);
+      if (withHeaders) {
+        renderCsvVarChips(withHeaders.csv_headers);
+      }
+    }
     renderCampaigns();
     renderBoard();
     renderLeadTable();
@@ -1794,6 +1807,14 @@ function accountLabel() {
   return option ? option.text : "аккаунт";
 }
 
+function formatBubbleTime(raw) {
+  if (!raw) return "";
+  const ms = Date.parse(raw);
+  if (Number.isNaN(ms)) return "";
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
 function renderThread() {
   const dialog = state.selectedDialog;
   const error = document.querySelector("#thread-error");
@@ -1820,11 +1841,17 @@ function renderThread() {
     el("p", { className: "hint" }, [contactHint]),
   );
   const items = state.messages || [];
-  document.querySelector("#messages").replaceChildren(...items.map((message) => (
-    el("li", { className: message.direction === "out" ? "out" : "in" }, [
+  const msgList = document.querySelector("#messages");
+  msgList.replaceChildren(...items.map((message) => {
+    const t = formatBubbleTime(message.sent_at);
+    return el("li", {
+      className: message.direction === "out" ? "out" : "in",
+      "data-time": t || undefined,
+    }, [
       message.text || "Вложение",
-    ])
-  )));
+    ]);
+  }));
+  msgList.scrollTop = msgList.scrollHeight;
   const gap = document.querySelector("#thread-gap");
   if (gap) gap.hidden = items.length > 0;
 }
@@ -1867,12 +1894,20 @@ async function selectDialog(dialog) {
 }
 
 function leadForDialog(dialog) {
-  if (!dialog || dialog.telegram_user_id == null) return null;
-  const accountId = Number(document.querySelector("#tg-account").value);
+  if (!dialog) return null;
+  const accountId = Number(document.querySelector("#tg-account")?.value || dialog.account_id || 0);
+  const cleanUser = String(dialog.username || "").replace(/^@/, "").toLowerCase();
   return state.leads.find((lead) => {
-    if (Number(lead.telegram_user_id) !== Number(dialog.telegram_user_id)) return false;
-    if (lead.account_id && accountId && Number(lead.account_id) !== accountId) return false;
-    return true;
+    if (dialog.lead_id && Number(lead.id) === Number(dialog.lead_id)) return true;
+    if (dialog.telegram_user_id != null && lead.telegram_user_id != null
+        && Number(lead.telegram_user_id) === Number(dialog.telegram_user_id)) {
+      if (lead.account_id && accountId && Number(lead.account_id) !== accountId) return false;
+      return true;
+    }
+    if (cleanUser && lead.username && String(lead.username).replace(/^@/, "").toLowerCase() === cleanUser) {
+      return true;
+    }
+    return false;
   }) || null;
 }
 
@@ -2890,7 +2925,18 @@ function openInboxLive(accountId) {
   source.addEventListener("dialog", (event) => {
     if (inboxSource !== source) return;
     try {
-      upsertDialog(JSON.parse(event.data));
+      const incoming = JSON.parse(event.data);
+      upsertDialog(incoming);
+      if (state.selectedDialog && isSameDialog(state.selectedDialog, incoming) && incoming.id) {
+        api(`/api/dialogs/${incoming.id}/messages`).then((msgs) => {
+          if (state.selectedDialog && isSameDialog(state.selectedDialog, incoming)) {
+            state.messages = msgs;
+            renderThread();
+          }
+        }).catch(() => {});
+      }
+      loadLeads(state.leadQuery, state.selectedLeadId).catch(() => {});
+      loadCampaigns().catch(() => {});
     } catch (_err) { /* ждём следующий кадр */ }
   });
 }
@@ -3468,8 +3514,35 @@ if (campaignLimitInput) {
   });
 }
 
-document.querySelectorAll("[data-insert-var]").forEach((chip) => {
-  chip.addEventListener("click", () => {
+function renderCsvVarChips(headers) {
+  const host = document.querySelector("#builder-var-chips") || document.querySelector(".var-chips");
+  if (!host) return;
+  const cleanHeaders = [...new Set((headers || []).map((h) => String(h || "").trim()).filter(Boolean))];
+  state.csvHeaders = cleanHeaders;
+  host.querySelectorAll("[data-csv-var='true']").forEach((node) => node.remove());
+  const defaultTokens = new Set(
+    [...host.querySelectorAll("[data-default-var='true']")]
+      .map((btn) => String(btn.dataset.insertVar || "").replace(/^\{|\}$/g, "").toLowerCase()),
+  );
+  cleanHeaders.forEach((colName) => {
+    if (defaultTokens.has(colName.toLowerCase())) return;
+    const token = `{${colName}}`;
+    const btn = el("button", {
+      type: "button",
+      className: "chip var-chip var-chip-csv",
+      "data-csv-var": "true",
+      "data-insert-var": token,
+      title: `Подставить столбец «${colName}» из CSV`,
+    }, [`+ ${token}`]);
+    host.append(btn);
+  });
+}
+
+const builderVarChips = document.querySelector("#builder-var-chips") || document.querySelector(".var-chips");
+if (builderVarChips) {
+  builderVarChips.addEventListener("click", (event) => {
+    const chip = event.target.closest("[data-insert-var]");
+    if (!chip) return;
     const token = chip.dataset.insertVar || "";
     const idx = state.activeStepIndex || 0;
     const area = document.querySelector(`#campaign-steps-list textarea[data-step-index="${idx}"]`)
@@ -3485,7 +3558,7 @@ document.querySelectorAll("[data-insert-var]").forEach((chip) => {
     }
     area.focus();
   });
-});
+}
 
 const campaignForm = document.querySelector("#campaign-form");
 if (campaignForm) {
@@ -3595,6 +3668,7 @@ function renderCsvPreview(data) {
     wrap.replaceChildren();
     return;
   }
+  renderCsvVarChips(headers);
   box.hidden = false;
   if (stats) stats.textContent = `${totalRows} строк · ${headers.length} колонок`;
 
@@ -3686,6 +3760,17 @@ if (fillSampleCsvBtn) {
   });
 }
 
+const csvCampaignSelect = document.querySelector("#csv-campaign-select");
+if (csvCampaignSelect) {
+  csvCampaignSelect.addEventListener("change", () => {
+    const campId = Number(csvCampaignSelect.value);
+    const camp = (state.campaigns || []).find((c) => Number(c.id) === campId);
+    if (camp && Array.isArray(camp.csv_headers) && camp.csv_headers.length) {
+      renderCsvVarChips(camp.csv_headers);
+    }
+  });
+}
+
 const csvFileInput = document.querySelector("#csv-file");
 if (csvFileInput) {
   csvFileInput.addEventListener("change", (event) => {
@@ -3693,12 +3778,22 @@ if (csvFileInput) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
+      const rawText = String(reader.result || "");
       const area = document.querySelector("#csv-text");
       if (area) {
-        area.value = String(reader.result || "");
+        area.value = rawText;
         updateCsvPreview(area.value);
+      } else {
+        const local = parseCsvPreviewLocal(rawText);
+        if (local.headers.length) renderCsvVarChips(local.headers);
       }
-      toast(`Файл CSV прочитан: ${file.name}`, "ok");
+      const cols = state.csvHeaders.slice(0, 6).map((h) => `{${h}}`).join(", ");
+      toast(
+        cols
+          ? `Файл CSV прочитан (${file.name}) · переменные столбцов: ${cols}`
+          : `Файл CSV прочитан: ${file.name}`,
+        "ok",
+      );
     };
     reader.readAsText(file, "utf-8");
   });
@@ -3926,6 +4021,99 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
 });
 
 {
+  const tgWebNewChatForm = document.querySelector("#tg-web-new-chat-form");
+  if (tgWebNewChatForm) {
+    tgWebNewChatForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = document.querySelector("#tg-web-handle");
+      const rawHandle = (input && input.value.trim()) || "";
+      if (!rawHandle) {
+        toast("Введите @username или +телефон для открытия чата", "error");
+        if (input) input.focus();
+        return;
+      }
+      const btn = document.querySelector("#tg-web-open-btn");
+      const select = document.querySelector("#tg-account");
+      const accountId = (state.inboxSessionFilter && state.inboxSessionFilter !== "all")
+        ? Number(state.inboxSessionFilter)
+        : (select && select.value ? Number(select.value) : null);
+      if (btn) {
+        btn.disabled = true;
+        btn.setAttribute("aria-busy", "true");
+      }
+      try {
+        const res = await api("/api/dialogs/start-direct", {
+          method: "POST",
+          body: {
+            handle: rawHandle,
+            account_id: accountId || null,
+          },
+        });
+        if (res && res.lead) {
+          state.leadCache[res.lead.id] = res.lead;
+          const existingIdx = state.leads.findIndex((l) => Number(l.id) === Number(res.lead.id));
+          if (existingIdx >= 0) state.leads[existingIdx] = res.lead;
+          else state.leads.unshift(res.lead);
+          renderLeadTable();
+          renderBoard();
+        }
+        if (res && res.dialog) {
+          upsertDialog(res.dialog);
+          await selectDialog(res.dialog);
+          if (input) input.value = "";
+          const replyBox = document.querySelector("#reply-text");
+          if (replyBox) replyBox.focus();
+          toast(`Открыт чат с ${res.dialog.name || rawHandle}`, "ok");
+        }
+      } catch (err) {
+        const node = document.querySelector("#inbox-error");
+        if (node) node.textContent = err.message;
+        toast(err.message || "Не удалось открыть чат", "error");
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.removeAttribute("aria-busy");
+        }
+      }
+    });
+  }
+
+  const tgWebSyncBtn = document.querySelector("#tg-web-sync-btn");
+  if (tgWebSyncBtn) {
+    tgWebSyncBtn.addEventListener("click", async () => {
+      const select = document.querySelector("#tg-account");
+      const accountId = (state.inboxSessionFilter && state.inboxSessionFilter !== "all")
+        ? Number(state.inboxSessionFilter)
+        : (select && select.value ? Number(select.value) : null);
+      tgWebSyncBtn.disabled = true;
+      tgWebSyncBtn.setAttribute("aria-busy", "true");
+      try {
+        await api("/api/inbox/sync", {
+          method: "POST",
+          body: { account_id: accountId || null },
+        });
+        await loadInbox();
+        toast("Список диалогов Telegram синхронизирован", "ok");
+      } catch (err) {
+        toast(err.message || "Не удалось синхронизировать чаты", "error");
+      } finally {
+        tgWebSyncBtn.disabled = false;
+        tgWebSyncBtn.removeAttribute("aria-busy");
+      }
+    });
+  }
+
+  const replyTextField = document.querySelector("#reply-text");
+  if (replyTextField) {
+    replyTextField.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        const form = document.querySelector("#reply-form");
+        if (form) form.requestSubmit();
+      }
+    });
+  }
+
   let sending = false;
   document.querySelector("#reply-form").addEventListener("submit", async (event) => {
     event.preventDefault();

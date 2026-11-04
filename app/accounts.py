@@ -75,7 +75,7 @@ def _public(row: dict) -> dict:
         elif is_demo:
             connection_label = "Демо-профиль (локально)"
         elif session_exists and health == "active":
-            connection_label = "Подключён · MTProto активен"
+            connection_label = "Подключён · MTProto онлайн"
         else:
             connection_label = "Подключён · сессия сохранена"
 

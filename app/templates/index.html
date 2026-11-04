@@ -216,12 +216,20 @@
         <section id="s04" class="surface-box pane-col" aria-labelledby="s04-title">
           <div class="pane-head">
             <h2 id="s04-title">Входящие</h2>
-            <span id="inbox-active-session-badge" class="badge b-new">Все сессии</span>
+            <div class="row">
+              <span id="inbox-active-session-badge" class="badge b-new">Все сессии</span>
+              <button type="button" id="tg-web-sync-btn" class="btn ghost sm" title="Синхронизировать чаты из Telegram">Обновить</button>
+            </div>
           </div>
 
           <div id="inbox-session-switcher" class="inbox-session-switcher" role="group" aria-label="Сессии Telegram">
             <button type="button" class="chip session-pill" data-session-account="all" aria-pressed="true">Все сессии</button>
           </div>
+
+          <form id="tg-web-new-chat-form" class="tg-web-new-chat-bar" aria-label="Написать новому контакту в Telegram">
+            <input id="tg-web-handle" name="handle" type="text" autocomplete="off" placeholder="Написать в Telegram: @username или +телефон..." aria-label="Ник или телефон для нового чата">
+            <button type="submit" id="tg-web-open-btn" class="btn primary sm">Начать чат</button>
+          </form>
 
           <section id="search" class="search-panel" aria-labelledby="search-title">
             <div class="search-top">
@@ -617,16 +625,19 @@
               </div>
 
               <div class="steps-toolbar">
-                <span class="steps-caption">Переменные:</span>
-                <div class="var-chips" role="group" aria-label="Переменные шаблона">
-                  <button type="button" class="chip var-chip" data-insert-var="{name}">+ {name}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{company}">+ {company}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{username}">+ {username}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{note}">+ {note}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{first_touch}">+ {first_touch}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{followup_1}">+ {followup_1}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{followup_2}">+ {followup_2}</button>
-                  <button type="button" class="chip var-chip" data-insert-var="{hook}">+ {hook}</button>
+                <div class="steps-toolbar-head">
+                  <span class="steps-caption">Переменные (подтягиваются из столбцов CSV):</span>
+                  <label for="csv-file" class="chip var-chip-upload" id="load-csv-vars-btn">Подтянуть столбцы из CSV</label>
+                </div>
+                <div id="builder-var-chips" class="var-chips" role="group" aria-label="Переменные шаблона">
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{name}">+ {name}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{company}">+ {company}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{username}">+ {username}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{note}">+ {note}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{first_touch}">+ {first_touch}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{followup_1}">+ {followup_1}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{followup_2}">+ {followup_2}</button>
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{hook}">+ {hook}</button>
                 </div>
               </div>
 

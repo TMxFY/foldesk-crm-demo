@@ -858,7 +858,34 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
     cap = 50 if limit is None else max(1, min(int(limit), 50))
-    fetched = await gateway.fetch_messages(account["session_path"], dialog["peer_id"], cap)
+    peer_id = int(dialog["peer_id"])
+    if peer_id >= 900000 and dialog.get("username") and hasattr(gateway, "search_dialogs"):
+        try:
+            found = await gateway.search_dialogs(
+                account["session_path"], f"@{dialog['username']}", limit=1
+            )
+            if isinstance(found, list) and found and found[0].get("telegram_user_id"):
+                real_id = int(found[0]["telegram_user_id"])
+                if real_id != peer_id:
+                    try:
+                        conn.execute(
+                            "UPDATE dialogs SET peer_id = ?, updated_at = ? WHERE id = ?",
+                            (real_id, utc_now(), dialog_id),
+                        )
+                        if dialog.get("lead_id"):
+                            conn.execute(
+                                "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                                (real_id, utc_now(), int(dialog["lead_id"])),
+                            )
+                        conn.commit()
+                        peer_id = real_id
+                    except sqlite3.IntegrityError:
+                        conn.rollback()
+        except Exception:
+            pass
+    if peer_id >= 900000:
+        return list_messages(conn, dialog_id, cap)
+    fetched = await gateway.fetch_messages(account["session_path"], peer_id, cap)
     if not isinstance(fetched, list):
         raise GatewayError("История без списка")
     _cache_messages(conn, dialog_id, fetched[-cap:])
@@ -893,8 +920,35 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
             "sent_at": utc_now(),
         }
     else:
+        peer_target = int(dialog["peer_id"])
+        if peer_target >= 900000 and dialog.get("username"):
+            if hasattr(gateway, "search_dialogs"):
+                try:
+                    found = await gateway.search_dialogs(
+                        account["session_path"], f"@{dialog['username']}", limit=1
+                    )
+                    if isinstance(found, list) and found and found[0].get("telegram_user_id"):
+                        real_id = int(found[0]["telegram_user_id"])
+                        peer_target = real_id
+                        try:
+                            conn.execute(
+                                "UPDATE dialogs SET peer_id = ?, updated_at = ? WHERE id = ?",
+                                (real_id, utc_now(), dialog_id),
+                            )
+                            if dialog.get("lead_id"):
+                                conn.execute(
+                                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                                    (real_id, utc_now(), int(dialog["lead_id"])),
+                                )
+                            conn.commit()
+                        except sqlite3.IntegrityError:
+                            conn.rollback()
+                except Exception:
+                    pass
+            if isinstance(peer_target, int) and peer_target >= 900000:
+                peer_target = f"@{dialog['username']}"
         sent = await gateway.send_message(
-            account["session_path"], dialog["peer_id"], body, reply_to
+            account["session_path"], peer_target, body, reply_to
         )
     if not isinstance(sent, dict) or sent.get("telegram_message_id") is None:
         raise GatewayError("Ответ без номера сообщения")
@@ -935,3 +989,134 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)
+
+
+async def start_direct_dialog(
+    conn,
+    handle: str,
+    account_id: int | None = None,
+    name: str | None = None,
+    gateway=None,
+) -> dict:
+    raw = (handle or "").strip()
+    if not raw:
+        raise ValueError("Введите @username или номер телефона")
+    clean_raw = re.sub(r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/", "@", raw, flags=re.IGNORECASE).strip()
+
+    target_acc = None
+    if account_id is not None and int(account_id) > 0:
+        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
+        if row is not None:
+            target_acc = as_dict(row)
+    if target_acc is None:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE status = 'connected' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            target_acc = as_dict(row)
+    if target_acc is None:
+        row = conn.execute("SELECT * FROM accounts ORDER BY id LIMIT 1").fetchone()
+        if row is not None:
+            target_acc = as_dict(row)
+    if target_acc is None:
+        raise ValueError("Подключите хотя бы один аккаунт Telegram или WhatsApp")
+
+    acc_id = int(target_acc["id"])
+    provider = str(target_acc.get("provider") or "telegram").strip().lower()
+    if provider not in ("telegram", "whatsapp"):
+        provider = "telegram"
+
+    phone = None
+    username = None
+    resolved_tg_id = None
+    resolved_name = (name or "").strip() or None
+
+    digits = re.sub(r"\D", "", clean_raw)
+    if clean_raw.startswith("+") or (digits and len(digits) >= 7 and not re.search(r"[A-Za-zА-Яа-я]", clean_raw)):
+        phone = f"+{digits}"
+    else:
+        username = clean_raw.lstrip("@").split("/")[0].split("?")[0].strip() or None
+
+    session_path = str(target_acc.get("session_path") or "")
+    if (
+        gateway is not None
+        and target_acc.get("status") == "connected"
+        and not session_path.startswith("data/sessions/demo")
+        and hasattr(gateway, "search_dialogs")
+    ):
+        search_q = f"@{username}" if username else (phone or clean_raw)
+        try:
+            found = await gateway.search_dialogs(session_path, search_q, limit=1)
+            if isinstance(found, list) and found:
+                first = found[0]
+                if first.get("telegram_user_id"):
+                    resolved_tg_id = int(first["telegram_user_id"])
+                if first.get("username"):
+                    username = str(first["username"]).strip().lstrip("@")
+                if first.get("name") and not resolved_name:
+                    resolved_name = str(first["name"]).strip()
+        except Exception:
+            pass
+
+    now = utc_now()
+    lead_row = None
+    if resolved_tg_id is not None:
+        lead_row = conn.execute(
+            "SELECT * FROM leads WHERE telegram_user_id = ? ORDER BY id LIMIT 1",
+            (resolved_tg_id,),
+        ).fetchone()
+    if lead_row is None and username:
+        lead_row = conn.execute(
+            "SELECT * FROM leads WHERE lower(username) = lower(?) ORDER BY id LIMIT 1",
+            (username,),
+        ).fetchone()
+    if lead_row is None and phone:
+        lead_row = conn.execute(
+            "SELECT * FROM leads WHERE phone = ? ORDER BY id LIMIT 1",
+            (phone,),
+        ).fetchone()
+
+    if lead_row is not None:
+        lead_id = int(lead_row["id"])
+        if resolved_tg_id is not None and not lead_row["telegram_user_id"]:
+            try:
+                conn.execute(
+                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                    (resolved_tg_id, now, lead_id),
+                )
+            except sqlite3.IntegrityError:
+                pass
+    else:
+        display_name = resolved_name or (f"@{username}" if username else phone) or clean_raw
+        cur = conn.execute(
+            """
+            INSERT INTO leads (
+                account_id, telegram_user_id, username, name, phone,
+                status, note, next_step, created_at, updated_at, provider
+            ) VALUES (?, ?, ?, ?, ?, 'talking', ?, ?, ?, ?, ?)
+            """,
+            (
+                acc_id,
+                resolved_tg_id,
+                username,
+                display_name,
+                phone,
+                "Открыт прямой чат в Telegram Web",
+                "Написать сообщение в чате",
+                now,
+                now,
+                provider,
+            ),
+        )
+        lead_id = int(cur.lastrowid)
+        if resolved_tg_id is None:
+            resolved_tg_id = int(digits[-12:]) if (provider == "whatsapp" and digits and len(digits) >= 7) else (900000 + lead_id)
+            conn.execute(
+                "UPDATE leads SET telegram_user_id = ? WHERE id = ?",
+                (resolved_tg_id, lead_id),
+            )
+        conn.commit()
+
+    dialog = open_dialog_by_lead(conn, lead_id, acc_id)
+    updated_lead = as_dict(conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone())
+    return {"dialog": dialog, "lead": updated_lead}

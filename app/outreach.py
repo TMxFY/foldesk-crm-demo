@@ -174,6 +174,21 @@ def _clean_step1_text(raw: str | None) -> tuple[str | None, str | None]:
     return (text or None), None
 
 
+def _extract_extra_fields(recipient: dict) -> dict[str, str]:
+    raw_extra = recipient.get("extra_fields")
+    if isinstance(raw_extra, dict):
+        return {str(k): str(v or "") for k, v in raw_extra.items() if str(k).strip()}
+    raw_json = recipient.get("extra_json")
+    if raw_json and isinstance(raw_json, str):
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, dict):
+                return {str(k): str(v or "") for k, v in parsed.items() if str(k).strip()}
+        except Exception:
+            pass
+    return {}
+
+
 def render_template(template_text: str, recipient: dict) -> str:
     text = str(template_text or "")
     name_val = (
@@ -195,6 +210,16 @@ def render_template(template_text: str, recipient: dict) -> str:
     step2_val = (recipient.get("step2_text") or "").strip()
     step3_val = (recipient.get("step3_text") or "").strip()
 
+    extra_fields = _extract_extra_fields(recipient)
+    lookup_by_norm: dict[str, str] = {}
+    for col_key, col_val in extra_fields.items():
+        clean_k = col_key.strip().lstrip("\ufeff")
+        if not clean_k:
+            continue
+        val_str = str(col_val or "").strip()
+        lookup_by_norm[clean_k.lower()] = val_str
+        lookup_by_norm[re.sub(r"[\s_\-]+", "_", clean_k.lower())] = val_str
+
     replacements = {
         "{name}": name_val,
         "{username}": username_val,
@@ -213,8 +238,33 @@ def render_template(template_text: str, recipient: dict) -> str:
         "{step2_text}": step2_val,
         "{step3_text}": step3_val,
     }
+    for col_key, col_val in extra_fields.items():
+        token = f"{{{col_key}}}"
+        if token not in replacements:
+            replacements[token] = str(col_val or "").strip()
+
     for token, value in replacements.items():
         text = text.replace(token, value)
+
+    def _replace_dynamic_token(match: re.Match) -> str:
+        raw_token = match.group(1)
+        clean_token = raw_token.strip().lstrip("\ufeff")
+        if not clean_token:
+            return match.group(0)
+        low = clean_token.lower()
+        if low in lookup_by_norm:
+            return lookup_by_norm[low]
+        norm_underscore = re.sub(r"[\s_\-]+", "_", low)
+        if norm_underscore in lookup_by_norm:
+            return lookup_by_norm[norm_underscore]
+        alias_field = HEADER_ALIASES.get(low)
+        if alias_field and f"{{{alias_field}}}" in replacements:
+            return replacements[f"{{{alias_field}}}"]
+        if clean_token in recipient and recipient[clean_token] is not None:
+            return str(recipient[clean_token]).strip()
+        return match.group(0)
+
+    text = re.sub(r"\{([^{}]+)\}", _replace_dynamic_token, text)
 
     lines = []
     for line in text.splitlines():
@@ -399,8 +449,28 @@ def get_campaign(conn, campaign_id: int) -> dict:
     ).fetchall()
     now_iso = utc_now()
     recipients = []
+    seen_csv_headers: list[str] = []
+    seen_csv_headers_set: set[str] = set()
+    try:
+        stored_headers = json.loads(camp.get("csv_headers_json") or "[]")
+        if isinstance(stored_headers, list):
+            for h in stored_headers:
+                hs = str(h or "").strip()
+                if hs and hs not in seen_csv_headers_set:
+                    seen_csv_headers_set.add(hs)
+                    seen_csv_headers.append(hs)
+    except Exception:
+        pass
+
     for r in rec_rows:
         rd = as_dict(r)
+        extra_fields = _extract_extra_fields(rd)
+        rd["extra_fields"] = extra_fields
+        for hk in extra_fields.keys():
+            hks = str(hk or "").strip()
+            if hks and hks not in seen_csv_headers_set:
+                seen_csv_headers_set.add(hks)
+                seen_csv_headers.append(hks)
         assigned_id = rd.get("assigned_account_id")
         if assigned_id is not None:
             assigned_id_int = int(assigned_id)
@@ -491,6 +561,7 @@ def get_campaign(conn, campaign_id: int) -> dict:
     camp["accounts"] = accounts_list
     camp["steps"] = steps
     camp["recipients"] = recipients
+    camp["csv_headers"] = seen_csv_headers
     camp["total_recipients"] = len(recipients)
     camp["pending_count"] = pending_count
     camp["in_progress_count"] = in_progress_count
@@ -776,6 +847,17 @@ def _build_col_map(
     return col_map
 
 
+def _looks_like_data_cell(val: str) -> bool:
+    v = (val or "").strip()
+    if not v:
+        return False
+    if v.startswith("@") or "t.me/" in v.lower():
+        return True
+    if re.fullmatch(r"\+?\d[\d\s\-()]{6,18}", v):
+        return True
+    return False
+
+
 def preview_campaign_csv(csv_text: str) -> dict:
     raw = (csv_text or "").strip()
     if not raw:
@@ -788,7 +870,9 @@ def preview_campaign_csv(csv_text: str) -> dict:
 
     first_clean = [c.strip().lstrip("\ufeff") for c in rows[0]]
     first_lower = [c.lower() for c in first_clean]
-    is_header = any(col in HEADER_ALIASES for col in first_lower)
+    is_header = any(col in HEADER_ALIASES for col in first_lower) or (
+        len(rows) >= 2 and not any(_looks_like_data_cell(c) for c in first_clean)
+    )
 
     if is_header:
         headers = first_clean
@@ -831,21 +915,45 @@ def _parse_csv_rows(csv_text: str, column_mapping: dict | None = None) -> list[d
     if not rows:
         raise ValueError("В таблице CSV нет строк с контактами")
 
-    first_lower = [c.lower().strip().lstrip("\ufeff") for c in rows[0]]
+    first_clean = [c.strip().lstrip("\ufeff") for c in rows[0]]
+    first_lower = [c.lower() for c in first_clean]
     has_explicit_mapping = bool(isinstance(column_mapping, dict) and column_mapping)
-    is_header = any(col in HEADER_ALIASES for col in first_lower) or has_explicit_mapping
+    is_header = (
+        any(col in HEADER_ALIASES for col in first_lower)
+        or has_explicit_mapping
+        or (len(rows) >= 2 and not any(_looks_like_data_cell(c) for c in first_clean))
+    )
 
     parsed = []
     if is_header:
+        headers = first_clean
         col_map = _build_col_map(rows[0], column_mapping=column_mapping)
         data_rows = rows[1:]
         for r in data_rows:
-            item = {}
-            for idx, val in enumerate(r):
+            item: dict = {}
+            extra_fields: dict[str, str] = {}
+            for idx, h_name in enumerate(headers):
+                val = r[idx] if idx < len(r) else ""
+                if h_name:
+                    extra_fields[h_name] = val
                 field = col_map.get(idx)
                 if field and val:
                     item[field] = val
-            if item:
+            if not any(item.get(k) for k in ("username", "name", "phone", "company")):
+                # Fallback auto-detection when CSV uses custom column names
+                for idx, val in enumerate(r):
+                    v = (val or "").strip()
+                    if not v:
+                        continue
+                    if (v.startswith("@") or "t.me/" in v.lower()) and not item.get("username"):
+                        item["username"] = v
+                    elif re.fullmatch(r"\+?\d[\d\s\-()]{6,18}", v) and not item.get("phone"):
+                        item["phone"] = v
+                    elif not item.get("name") and idx <= 2:
+                        item["name"] = v
+            if item or any(extra_fields.values()):
+                item["extra_fields"] = extra_fields
+                item["_headers"] = headers
                 parsed.append(item)
     else:
         for r in rows:
@@ -1008,7 +1116,10 @@ def import_campaign_csv(
     now = utc_now()
     imported = 0
     has_step3 = False
+    detected_headers: list[str] = []
     for item in contacts:
+        if not detected_headers and item.get("_headers"):
+            detected_headers = [str(h) for h in item["_headers"] if str(h).strip()]
         username = _clean_handle(item.get("username"))
         company = _clean_company_title(item.get("company"))
         explicit_name = (item.get("name") or "").strip() or None
@@ -1040,6 +1151,12 @@ def import_campaign_csv(
         if lead_id in seen_leads:
             continue
 
+        extra_fields = item.get("extra_fields")
+        extra_json = (
+            json.dumps(extra_fields, ensure_ascii=False)
+            if isinstance(extra_fields, dict) and extra_fields
+            else None
+        )
         rec_status = "failed" if error_reason else "pending"
         conn.execute(
             """
@@ -1047,8 +1164,8 @@ def import_campaign_csv(
                 campaign_id, lead_id, telegram_user_id, username, name,
                 phone, company, note, website, category, their_angle,
                 our_angle, hook, step1_text, step2_text, step3_text,
-                current_step, status, last_sent_at, error_text, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?)
+                extra_json, current_step, status, last_sent_at, error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?)
             """,
             (
                 campaign_id,
@@ -1067,6 +1184,7 @@ def import_campaign_csv(
                 step1_text,
                 step2_text,
                 step3_text,
+                extra_json,
                 rec_status,
                 error_reason,
                 now,
@@ -1103,7 +1221,13 @@ def import_campaign_csv(
                 (campaign_id, now),
             )
 
-    conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
+    if detected_headers:
+        conn.execute(
+            "UPDATE campaigns SET csv_headers_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(detected_headers, ensure_ascii=False), now, campaign_id),
+        )
+    else:
+        conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
     conn.commit()
     updated_campaign = get_campaign(conn, campaign_id)
     return {

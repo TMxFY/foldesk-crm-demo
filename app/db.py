@@ -269,6 +269,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
             account_ids_json TEXT,
+            csv_headers_json TEXT,
             daily_limit INTEGER NOT NULL DEFAULT 20 CHECK (daily_limit >= 1 AND daily_limit <= 500),
             status TEXT NOT NULL DEFAULT 'draft' CHECK (
                 status IN ('draft', 'running', 'paused', 'completed')
@@ -306,6 +307,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             step1_text TEXT,
             step2_text TEXT,
             step3_text TEXT,
+            extra_json TEXT,
             current_step INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'pending' CHECK (
                 status IN ('pending', 'in_progress', 'completed', 'replied', 'failed')
@@ -322,6 +324,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY CHECK (id = 1),
             timezone TEXT NOT NULL DEFAULT 'UTC',
             days_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS kv_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         """
@@ -352,6 +360,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "dialogs", "phone", "TEXT")
     _ensure_column(conn, "messages", "external_message_id", "TEXT")
     _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
+    _ensure_column(conn, "campaigns", "csv_headers_json", "TEXT")
     _ensure_column(
         conn,
         "campaign_recipients",
@@ -366,6 +375,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "campaign_recipients", "step1_text", "TEXT")
     _ensure_column(conn, "campaign_recipients", "step2_text", "TEXT")
     _ensure_column(conn, "campaign_recipients", "step3_text", "TEXT")
+    _ensure_column(conn, "campaign_recipients", "extra_json", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")
     conn.commit()
