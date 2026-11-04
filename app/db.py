@@ -224,6 +224,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL,
             UNIQUE (account_id, telegram_folder_id)
         );
+
+        -- getUpdates без offset отдаёт тот же update_id снова. Одна строка — одна заметка.
+        CREATE TABLE IF NOT EXISTS bot_seen_updates (
+            update_id INTEGER PRIMARY KEY,
+            lead_id INTEGER,
+            note_id INTEGER
+        );
         """
     )
     _ensure_column(conn, "leads", "description", "TEXT")

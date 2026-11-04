@@ -18,7 +18,7 @@ from app.folders import list_folders, pull_folders, sync_folder, update_folder
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
 from app.properties import create_property_def, set_lead_property
-from app.bot_login import apply_start_update, operator_status, poll_bot_login
+from app.bot_login import apply_bot_update, operator_status, poll_bot_login
 from app.digest import apply_digest_callback, callback_data_from_update, send_morning_digest
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.tasks import create_task, set_task_done
@@ -534,7 +534,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             update = await request.json()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Не апдейт") from exc
-        return _call(apply_start_update, request.app.state.conn, update)
+        return _call(apply_bot_update, request.app.state.conn, update)
 
     @app.get("/api/inbox")
     async def inbox_list(request: Request, account_id: int, q: str = ""):
