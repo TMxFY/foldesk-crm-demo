@@ -80,6 +80,54 @@ def test_offline_private_appears_without_search(tmp_path):
         assert rows[0]["last_from_peer"] == 1
 
 
+def test_connected_inbox_without_search_or_event(tmp_path):
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    gateway = FakeGateway(
+        code="11111",
+        dialogs=[
+            {"telegram_user_id": 77, "username": "newcomer", "name": "Новый"},
+            {
+                "telegram_user_id": 88,
+                "username": "room",
+                "name": "Группа",
+                "is_group": True,
+                "peer_type": "chat",
+            },
+            {
+                "telegram_user_id": 99,
+                "username": "news",
+                "name": "Канал",
+                "peer_type": "channel",
+            },
+        ],
+    )
+    loads = {"n": 0}
+    original = gateway.load_inbox
+
+    async def counted(session_path, limit=30):
+        loads["n"] += 1
+        return await original(session_path, limit)
+
+    async def boom(*_args, **_kwargs):
+        raise AssertionError("поиск не нужен")
+
+    gateway.load_inbox = counted
+    gateway.search_dialogs = boom
+    app = create_app(conn=conn, gateway=gateway)
+    with TestClient(app) as client:
+        account_id = _connect(client)
+        listed = client.get("/api/inbox", params={"account_id": account_id})
+        assert listed.status_code == 200
+        rows = listed.json()
+        assert [row["username"] for row in rows] == ["newcomer"]
+        assert rows[0]["name"] == "Новый"
+        assert rows[0]["unread_count"] == 0
+        again = client.get("/api/inbox", params={"account_id": account_id})
+        assert [row["username"] for row in again.json()] == ["newcomer"]
+        assert loads["n"] == 1
+
+
 def test_live_private_appears_without_search(tmp_path):
     conn = connect(tmp_path / "crm.db")
     init_db(conn)

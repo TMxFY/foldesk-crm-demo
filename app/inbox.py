@@ -130,6 +130,83 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
     return _public(row)
 
 
+def sync_inbox(conn, account_id: int, people: list) -> list:
+    account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if account is None:
+        raise LookupError("account")
+    now = utc_now()
+    saved = []
+    try:
+        for person in people or []:
+            if not isinstance(person, dict) or person.get("is_group"):
+                continue
+            if (person.get("peer_type") or "user") != "user":
+                continue
+            peer_id = person.get("telegram_user_id")
+            if peer_id is None:
+                continue
+            title = (person.get("name") or "").strip()
+            username = person.get("username")
+            if username is not None:
+                username = str(username).strip().lstrip("@") or None
+            unread = person.get("unread_count") if "unread_count" in person else None
+            if unread is not None:
+                unread = max(0, int(unread))
+            preview = person.get("last_message_preview")
+            if preview is not None:
+                preview = str(preview)[:120]
+            sent_at = person.get("last_message_at")
+            if sent_at is not None:
+                sent_at = str(sent_at)
+            last_from = person.get("last_from_peer") if "last_from_peer" in person else None
+            if last_from is not None:
+                last_from = 1 if last_from else 0
+            conn.execute(
+                """
+                INSERT INTO dialogs (
+                    account_id, peer_type, peer_id, username, title,
+                    is_group, unread_count, last_message_at, last_message_preview,
+                    last_from_peer, muted, created_at, updated_at
+                ) VALUES (?, 'user', ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, dialogs.username),
+                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
+                    unread_count = COALESCE(?, dialogs.unread_count),
+                    last_message_at = COALESCE(excluded.last_message_at, dialogs.last_message_at),
+                    last_message_preview = COALESCE(excluded.last_message_preview, dialogs.last_message_preview),
+                    last_from_peer = COALESCE(?, dialogs.last_from_peer),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_id,
+                    int(peer_id),
+                    username,
+                    title,
+                    0 if unread is None else unread,
+                    sent_at,
+                    preview,
+                    0 if last_from is None else last_from,
+                    now,
+                    now,
+                    unread,
+                    last_from,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM dialogs
+                WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+                """,
+                (account_id, int(peer_id)),
+            ).fetchone()
+            saved.append(_public(row))
+        conn.commit()
+    except (sqlite3.IntegrityError, TypeError, ValueError) as exc:
+        conn.rollback()
+        raise ValueError("Не удалось записать входящие") from exc
+    return saved
+
+
 def list_inbox(conn, account_id: int, q: str = "") -> list:
     account = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
     if account is None:

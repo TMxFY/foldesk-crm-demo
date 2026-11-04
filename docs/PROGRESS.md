@@ -10,3 +10,4 @@
 - 2026-11-04 — replica-build: лента личного диалога в S05 рядом с S06. `./scripts/verify.sh`: 16 passed. Playwright 46 passed. Фича не закрыта.
 - 2026-11-04 — replica-build S04: живые входящие, SSE `/api/inbox/events`. `./scripts/verify.sh`: 20 passed. partial: сокет есть, полный офлайн-догон нет. Фича не закрыта.
 - 2026-11-04 — replica-build S09: заметки, задачи без due_at, свои поля. `./scripts/verify.sh`: 22 passed. Свои названия стадий нет. Фича не закрыта.
+- 2026-11-04 — S04: список личных диалогов без ручного поиска и без нового сообщения. `./scripts/verify.sh`: 23 passed. Фича не закрыта.

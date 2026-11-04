@@ -42,6 +42,10 @@ class TelegramGateway(ABC):
         """Listen until cancelled. Deliver incoming private messages to on_message."""
         raise GatewayError("Живые входящие не подключены")
 
+    async def load_inbox(self, session_path: str, limit: int = 30) -> list:
+        """Private dialogs already on the account. Not search, not groups or channels."""
+        raise GatewayError("Список входящих не подключён")
+
 
 def _session_name(session_path: str) -> str:
     # Telethon appends .session itself. The stored path already has the suffix.
@@ -88,6 +92,16 @@ def _private_incoming(message) -> bool:
     if (message.get("direction") or "in") != "in":
         return False
     return message.get("telegram_user_id") is not None
+
+
+def _inbox_limit(limit) -> int:
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = 30
+    if cap < 1:
+        cap = 1
+    return min(cap, 30)
 
 
 def _history_limit(limit) -> int:
@@ -205,6 +219,56 @@ class TelethonGateway(TelegramGateway):
         finally:
             if owned:
                 await self._close(session_path)
+
+    async def load_inbox(self, session_path: str, limit: int = 30) -> list:
+        client, owned = await self._open(session_path)
+        try:
+            return await self._load_private(client, limit)
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(str(exc) or "Не удалось прочитать входящие") from exc
+        finally:
+            if owned:
+                await self._close(session_path)
+
+    async def _load_private(self, client, limit: int) -> list:
+        from telethon.tl.types import User
+
+        cap = _inbox_limit(limit)
+        found = []
+        async for dialog in client.iter_dialogs():
+            if not getattr(dialog, "is_user", False):
+                continue
+            if getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False):
+                continue
+            entity = getattr(dialog, "entity", None)
+            if not isinstance(entity, User):
+                continue
+            message = getattr(dialog, "message", None)
+            preview = None
+            sent_at = None
+            last_from = None
+            if message is not None:
+                text = getattr(message, "message", None)
+                preview = "" if text is None else str(text)[:120]
+                sent_at = _stamp(getattr(message, "date", None))
+                last_from = 0 if getattr(message, "out", False) else 1
+            found.append(
+                {
+                    "telegram_user_id": int(entity.id),
+                    "username": getattr(entity, "username", None),
+                    "name": dialog.name or _person_name(entity),
+                    "peer_type": "user",
+                    "unread_count": int(getattr(dialog, "unread_count", 0) or 0),
+                    "last_message_preview": preview,
+                    "last_message_at": sent_at,
+                    "last_from_peer": last_from,
+                }
+            )
+            if len(found) >= cap:
+                break
+        return found
 
     async def _search(self, client, query: str, limit: int) -> list:
         q = (query or "").strip()
@@ -475,6 +539,36 @@ class FakeGateway(TelegramGateway):
             "telegram_username": "operator",
             "telegram_name": "Оператор",
         }
+
+    async def load_inbox(self, session_path: str, limit: int = 30) -> list:
+        cap = _inbox_limit(limit)
+        found = []
+        for item in self.dialogs:
+            if not isinstance(item, dict) or item.get("is_group"):
+                continue
+            if (item.get("peer_type") or "user") != "user":
+                continue
+            peer_id = item.get("telegram_user_id")
+            if peer_id is None:
+                continue
+            row = {
+                "telegram_user_id": int(peer_id),
+                "username": item.get("username"),
+                "name": item.get("name") or "",
+                "peer_type": "user",
+            }
+            if "unread_count" in item and item.get("unread_count") is not None:
+                row["unread_count"] = max(0, int(item["unread_count"]))
+            if item.get("last_message_preview") is not None:
+                row["last_message_preview"] = str(item["last_message_preview"])[:120]
+            if item.get("last_message_at") is not None:
+                row["last_message_at"] = str(item["last_message_at"])
+            if "last_from_peer" in item and item.get("last_from_peer") is not None:
+                row["last_from_peer"] = 1 if item.get("last_from_peer") else 0
+            found.append(row)
+            if len(found) >= cap:
+                break
+        return found
 
     async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
         q = (query or "").strip()

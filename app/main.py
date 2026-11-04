@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict
 from app.accounts import confirm_login, confirm_password, list_accounts, start_login
 from app.accounts import _load as load_account
 from app.db import ROOT, connect, init_db
-from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply
+from app.inbox import apply_incoming, get_thread, list_inbox, remember_dialogs, send_reply, sync_inbox
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
 from app.properties import create_property_def, set_lead_property
@@ -178,18 +178,49 @@ def _sse(event: str, data) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+async def ensure_private_inbox(app, account_id: int) -> None:
+    # One successful pull per process. A later page open reads SQLite.
+    synced = app.state.inbox_synced
+    if account_id in synced:
+        return
+    async with app.state.inbox_sync_lock:
+        if account_id in synced:
+            return
+        gateway = app.state.gateway
+        if gateway is None:
+            return
+        try:
+            account = load_account(app.state.conn, account_id)
+        except LookupError:
+            return
+        if account["status"] != "connected":
+            return
+        try:
+            people = await gateway.load_inbox(account["session_path"], limit=30)
+        except Exception:
+            return
+        if not isinstance(people, list):
+            return
+        try:
+            sync_inbox(app.state.conn, account_id, people[:30])
+        except (LookupError, ValueError):
+            return
+        synced.add(account_id)
+
+
 async def start_account_watch(app, account_id: int) -> None:
     gateway = app.state.gateway
     if gateway is None:
-        return
-    existing = app.state.inbox_tasks.get(account_id)
-    if existing is not None and not existing.done():
         return
     try:
         account = load_account(app.state.conn, account_id)
     except LookupError:
         return
     if account["status"] != "connected":
+        return
+    await ensure_private_inbox(app, account_id)
+    existing = app.state.inbox_tasks.get(account_id)
+    if existing is not None and not existing.done():
         return
     session_path = account["session_path"]
     ready = listening_event(gateway, session_path)
@@ -259,6 +290,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     app.state.gateway = gateway
     app.state.inbox_hub = InboxHub()
     app.state.inbox_tasks = {}
+    app.state.inbox_synced = set()
+    app.state.inbox_sync_lock = asyncio.Lock()
     app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 
     @app.get("/design/tokens.css")
@@ -422,7 +455,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
     @app.get("/api/inbox")
-    def inbox_list(request: Request, account_id: int, q: str = ""):
+    async def inbox_list(request: Request, account_id: int, q: str = ""):
+        await ensure_private_inbox(request.app, account_id)
         return _call(list_inbox, request.app.state.conn, account_id, q)
 
     @app.get("/api/inbox/events")
@@ -431,6 +465,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             list_inbox(request.app.state.conn, account_id, "")
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
+        await ensure_private_inbox(request.app, account_id)
 
         async def gen():
             hub = request.app.state.inbox_hub
