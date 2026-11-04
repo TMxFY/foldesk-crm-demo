@@ -548,15 +548,20 @@ function reminderForm(lead) {
   const date = el("input", { type: "date", "aria-label": "Дата" });
   const time = el("input", { type: "time", "aria-label": "Время" });
   const text = el("input", { type: "text", "aria-label": "Текст напоминания" });
+  let saving = false;
   return el("form", {
     className: "reminder-form",
     onsubmit: async (event) => {
       event.preventDefault();
+      if (saving) return;
       const due = fromDateAndTime(date.value, time.value);
       if (!due || !text.value.trim()) {
         toast("Укажите дату, время и текст", "error");
         return;
       }
+      const button = event.target.querySelector("button[type=submit]");
+      saving = true;
+      button.disabled = true;
       try {
         await api("/api/reminders", {
           method: "POST",
@@ -569,6 +574,9 @@ function reminderForm(lead) {
         toast("Напоминание поставлено", "ok");
       } catch (error) {
         toast(error.message, "error");
+      } finally {
+        saving = false;
+        button.disabled = false;
       }
     },
   }, [
