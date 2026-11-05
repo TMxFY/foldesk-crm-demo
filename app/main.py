@@ -1963,7 +1963,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         password: str = ""
         host: str = "gate.nodemaven.com"
         port: int = 1080
-        ttl: int = 86400
+        ttl: str | int = "24h"
         filter: str = "medium"
         default_country: str = "us"
 
@@ -2021,7 +2021,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 "configured": False,
                 "host": "gate.nodemaven.com",
                 "port": 1080,
-                "ttl": 86400,
+                "ttl": "24h",
                 "filter": "medium",
                 "default_country": "us",
                 "user_masked": None,
@@ -2045,11 +2045,13 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def nodemaven_config_save(body: NodeMavenConfigIn, request: Request):
         conn = request.app.state.conn
         now = utc_now()
+        from app.telegram_gateway import _normalize_nodemaven_ttl
+
         pairs = {
             "nodemaven_user": body.user.strip(),
             "nodemaven_host": (body.host or "gate.nodemaven.com").strip(),
             "nodemaven_port": str(int(body.port or 1080)),
-            "nodemaven_ttl": str(max(60, int(body.ttl or 86400))),
+            "nodemaven_ttl": _normalize_nodemaven_ttl(body.ttl),
             "nodemaven_filter": (body.filter or "medium").strip().lower(),
             "nodemaven_default_country": (body.default_country or "us").strip().lower(),
         }

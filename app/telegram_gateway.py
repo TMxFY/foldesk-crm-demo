@@ -249,6 +249,20 @@ def infer_proxy_country(
     return fallback
 
 
+def _normalize_nodemaven_ttl(ttl_val: str | int | None) -> str:
+    raw = str(ttl_val or "").strip().lower()
+    if not raw or raw == "86400":
+        return "24h"
+    if raw.isdigit():
+        secs = int(raw)
+        if secs >= 3600:
+            return f"{max(1, min(24, secs // 3600))}h"
+        return f"{max(1, secs // 60)}m"
+    if re.fullmatch(r"\d+[smhd]", raw):
+        return raw
+    return "24h"
+
+
 _NODEMAVEN_API_CACHE: dict[str, tuple[str, str]] = {}
 
 
@@ -266,13 +280,17 @@ def fetch_nodemaven_api_credentials(api_key: str) -> tuple[str, str] | None:
             resp = client.get("https://api.nodemaven.com/api/v2/base/sub-users/", headers=headers)
             if resp.status_code == 200:
                 payload = resp.json()
-                items = (
-                    payload.get("results")
-                    if isinstance(payload, dict) and "results" in payload
-                    else (payload if isinstance(payload, list) else [])
-                )
-                for item in items or ():
-                    if isinstance(item, dict):
+                items = []
+                if isinstance(payload, dict):
+                    items = payload.get("payload") or payload.get("results") or []
+                elif isinstance(payload, list):
+                    items = payload
+                if isinstance(items, list):
+                    sorted_items = sorted(
+                        (i for i in items if isinstance(i, dict)),
+                        key=lambda x: 0 if x.get("is_default_user") else 1,
+                    )
+                    for item in sorted_items:
                         u = str(item.get("proxy_username") or item.get("username") or "").strip()
                         p = str(item.get("proxy_password") or item.get("password") or "").strip()
                         if u and p:
@@ -384,10 +402,7 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
         port_int = int(port or 1080)
     except (TypeError, ValueError):
         port_int = 1080
-    try:
-        ttl_int = max(60, int(ttl or 86400))
-    except (TypeError, ValueError):
-        ttl_int = 86400
+    ttl_str = _normalize_nodemaven_ttl(ttl)
 
     return {
         "api_key": api_key or None,
@@ -395,7 +410,7 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
         "password": password,
         "host": host or "gate.nodemaven.com",
         "port": port_int,
-        "ttl": ttl_int,
+        "ttl": ttl_str,
         "filter": (flt or "medium").strip().lower(),
         "default_country": (default_country or "us").strip().lower() or "us",
     }
@@ -430,7 +445,7 @@ def build_nodemaven_proxy_url(
     if "-country-" in base_user:
         base_user = re.sub(r"-country-[a-zA-Z]{2}", "", base_user)
     if "-ttl-" in base_user:
-        base_user = re.sub(r"-ttl-\d+", "", base_user)
+        base_user = re.sub(r"-ttl-[a-zA-Z0-9]+", "", base_user)
     if "-filter-" in base_user:
         base_user = re.sub(r"-filter-[a-zA-Z0-9_]+", "", base_user)
     base_user = base_user.strip("-")
