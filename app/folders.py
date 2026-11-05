@@ -162,8 +162,16 @@ async def sync_folder(conn, folder_id: int, gateway) -> dict:
     }
 
 
-async def sync_all_folders(conn, account_id: int, gateway) -> dict:
-    folders = await pull_folders(conn, account_id, gateway)
+async def sync_all_folders(
+    conn, account_id: int, gateway, folder_ids: list[int] | None = None
+) -> dict:
+    if folder_ids:
+        target_ids = {int(fid) for fid in folder_ids}
+        folders = [
+            f for f in list_folders(conn, account_id) if int(f["id"]) in target_ids
+        ]
+    else:
+        folders = await pull_folders(conn, account_id, gateway)
     synced_folders = 0
     total_added = 0
     total_leads = 0

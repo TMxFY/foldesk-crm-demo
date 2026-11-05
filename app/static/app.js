@@ -1743,17 +1743,36 @@ async function loadCampaigns() {
   }
 }
 
+function updateSelectedFoldersBtn() {
+  const btn = document.querySelector("#folders-sync-selected");
+  if (!btn) return;
+  const checked = document.querySelectorAll("#folder-list .folder-select-cb:checked");
+  const cnt = checked.length;
+  btn.disabled = cnt === 0;
+  btn.textContent = cnt > 0 ? `Синхронизировать выбранные (${cnt})` : "Синхронизировать выбранные";
+}
+
 function renderFolderList(rows) {
   const list = document.querySelector("#folder-list");
   if (!list) return;
   list.replaceChildren();
+  updateSelectedFoldersBtn();
   if (!rows || !rows.length) {
     setView("#folders-view", "empty");
     return;
   }
   rows.forEach((folder) => {
     const leadsCount = Number(folder.leads_count) || 0;
+    const cb = !folder.blocked_reason
+      ? el("input", {
+          type: "checkbox",
+          className: "folder-select-cb",
+          "data-folder-id": String(folder.id),
+          onchange: () => updateSelectedFoldersBtn(),
+        })
+      : null;
     const headRow = el("div", { className: "row" }, [
+      cb,
       el("span", { className: "name" }, [folder.title]),
       leadsCount > 0
         ? el("span", { className: "badge b-ok" }, [`${leadsCount} лидов`])
@@ -1839,7 +1858,7 @@ async function pullFolders() {
   }
 }
 
-async function syncAllFolders() {
+async function syncAllFolders(folderIds = null) {
   const select = document.querySelector("#folder-account");
   const accountId = select && select.value;
   if (!accountId) {
@@ -1847,12 +1866,18 @@ async function syncAllFolders() {
     return;
   }
   const btn = document.querySelector("#folders-sync-all");
+  const selBtn = document.querySelector("#folders-sync-selected");
   if (btn) btn.disabled = true;
+  if (selBtn) selBtn.disabled = true;
   setView("#folders-view", "loading");
   try {
+    const payload = { account_id: Number(accountId) };
+    if (Array.isArray(folderIds) && folderIds.length) {
+      payload.folder_ids = folderIds.map(Number);
+    }
     const res = await api("/api/folders/sync-all", {
       method: "POST",
-      body: { account_id: Number(accountId) },
+      body: payload,
     });
     const rows = Array.isArray(res?.folders) ? res.folders : [];
     state.folderLists[accountId] = rows;
@@ -1865,6 +1890,7 @@ async function syncAllFolders() {
     toast(error.message || "Ошибка синхронизации папок", "error");
   } finally {
     if (btn) btn.disabled = false;
+    updateSelectedFoldersBtn();
   }
 }
 
@@ -4447,6 +4473,18 @@ const foldersSyncAllBtn = document.querySelector("#folders-sync-all");
 if (foldersSyncAllBtn) {
   foldersSyncAllBtn.addEventListener("click", () => {
     syncAllFolders();
+  });
+}
+
+const foldersSyncSelectedBtn = document.querySelector("#folders-sync-selected");
+if (foldersSyncSelectedBtn) {
+  foldersSyncSelectedBtn.addEventListener("click", () => {
+    const ids = Array.from(document.querySelectorAll("#folder-list .folder-select-cb:checked"))
+      .map((cb) => Number(cb.getAttribute("data-folder-id")))
+      .filter((n) => n > 0);
+    if (ids.length) {
+      syncAllFolders(ids);
+    }
   });
 }
 

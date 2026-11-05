@@ -779,11 +779,19 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             sync_folder, request.app.state.conn, folder_id, gateway
         )
 
+    class FolderSyncBatchIn(BaseModel):
+        account_id: int
+        folder_ids: list[int] | None = None
+
     @app.post("/api/folders/sync-all")
-    async def folders_sync_all(body: FolderPullIn, request: Request):
+    async def folders_sync_all(body: FolderSyncBatchIn, request: Request):
         gateway = _gateway(request)
         return await _call_async(
-            sync_all_folders, request.app.state.conn, body.account_id, gateway
+            sync_all_folders,
+            request.app.state.conn,
+            body.account_id,
+            gateway,
+            body.folder_ids,
         )
 
     @app.get("/api/accounts/{account_id}/dialogs")
