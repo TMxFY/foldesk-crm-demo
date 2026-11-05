@@ -55,6 +55,10 @@ def extract_all_telethon_web_sessions(conn) -> list[dict]:
     seen_users: set[int] = set()
     for raw in rows:
         acc = as_dict(raw)
+        if str(acc.get("status") or "") != "connected":
+            continue
+        if str(acc.get("health") or "") in ("unauthorized", "offline", "banned", "frozen"):
+            continue
         session_path = str(acc.get("session_path") or "").strip()
         if not session_path or session_path.startswith("data/sessions/demo"):
             continue
@@ -180,7 +184,21 @@ def build_session_init_js(
     session_info: dict | None, all_sessions: list[dict] | None = None
 ) -> str:
     if not session_info:
-        return "// No active Telegram session in CRM\n"
+        return """(function() {
+  try {
+    if (localStorage.getItem("foldesk_tg_session_sig")) {
+      localStorage.removeItem("foldesk_tg_session_sig");
+      localStorage.removeItem("user_auth");
+      localStorage.removeItem("account1");
+      localStorage.removeItem("tt-global-state");
+      for (var i = 1; i <= 5; i++) {
+        localStorage.removeItem("dc" + i + "_auth_key");
+        localStorage.removeItem("dc" + i + "_hash");
+      }
+    }
+  } catch (e) {}
+})();
+"""
     sessions_list = all_sessions if all_sessions else [session_info]
     dc_id = int(session_info["dc_id"])
     auth_key_hex = str(session_info["auth_key_hex"])
@@ -204,62 +222,58 @@ def build_session_init_js(
     )
     return f"""(function() {{
   try {{
-    var allSessions = {sessions_json};
-    for (var k = 0; k < allSessions.length; k++) {{
-      var s = allSessions[k];
-      var slotKey = "account" + s.slot;
-      var existingRaw = localStorage.getItem(slotKey);
-      var slotObj = {{}};
-      if (existingRaw) {{
-        try {{
-          var parsed = JSON.parse(existingRaw);
-          if (parsed && typeof parsed === "object" && String(parsed.userId) === String(s.user_id)) {{
-            slotObj = parsed;
-          }}
-        }} catch (_) {{}}
-      }}
-      slotObj.userId = String(s.user_id);
-      slotObj.dcId = Number(s.dc_id);
-      slotObj["dc" + s.dc_id + "_auth_key"] = s.auth_key_hex;
-      if (s.first_name) slotObj.firstName = s.first_name;
-      if (s.last_name) slotObj.lastName = s.last_name;
-      if (s.phone) slotObj.phone = s.phone;
-      localStorage.setItem(slotKey, JSON.stringify(slotObj));
-    }}
-
     var dc = {dc_id};
     var authKey = "{auth_key_hex}";
     var userId = "{user_id}";
     var accId = "{acc_id}";
+    var sig = accId + ":" + dc + ":" + userId + ":" + authKey.slice(0, 24);
+    var prevSig = localStorage.getItem("foldesk_tg_session_sig");
+    var failedSig = localStorage.getItem("foldesk_tg_failed_sig");
+    var existingKey = localStorage.getItem("dc" + dc + "_auth_key");
+    var existingUser = localStorage.getItem("user_auth");
+
+    if (prevSig === sig && (!existingKey || !existingUser)) {{
+      localStorage.setItem("foldesk_tg_failed_sig", sig);
+      localStorage.removeItem("account1");
+      localStorage.removeItem("tt-global-state");
+      for (var d = 1; d <= 5; d++) {{
+        localStorage.removeItem("dc" + d + "_auth_key");
+      }}
+      return;
+    }}
+    if (failedSig === sig) {{
+      return;
+    }}
+
+    var allSessions = {sessions_json};
     var urlParams = new URLSearchParams(window.location.search || "");
     var slotParam = Number(urlParams.get("account") || "1");
-    if (!slotParam || slotParam === 1) {{
-      var sig = accId + ":" + dc + ":" + userId + ":" + authKey.slice(0, 24);
-      var prevSig = localStorage.getItem("foldesk_tg_session_sig");
-      var existingKey = localStorage.getItem("dc" + dc + "_auth_key");
-      var existingUser = localStorage.getItem("user_auth");
-      if (prevSig !== sig || !existingKey || !existingUser) {{
-        localStorage.setItem("dc", String(dc));
-        localStorage.setItem("dc" + dc + "_auth_key", JSON.stringify(authKey));
-        localStorage.setItem("user_auth", JSON.stringify({{
-          dcID: dc,
-          id: String(userId),
-          date: Math.floor(Date.now() / 1000)
-        }}));
-        var activeSlot1 = {{
-          userId: String(userId),
-          dcId: Number(dc)
+    if ((!slotParam || slotParam === 1) && prevSig !== sig) {{
+      for (var k = 0; k < allSessions.length; k++) {{
+        var s = allSessions[k];
+        var slotKey = "account" + s.slot;
+        var slotObj = {{
+          userId: String(s.user_id),
+          dcId: Number(s.dc_id)
         }};
-        activeSlot1["dc" + dc + "_auth_key"] = authKey;
-        localStorage.setItem("account1", JSON.stringify(activeSlot1));
-        for (var i = 1; i <= 5; i++) {{
-          localStorage.setItem("dc" + i + "_hash", JSON.stringify(""));
-        }}
-        if (prevSig && prevSig !== sig) {{
-          localStorage.removeItem("tt-global-state");
-        }}
-        localStorage.setItem("foldesk_tg_session_sig", sig);
+        slotObj["dc" + s.dc_id + "_auth_key"] = s.auth_key_hex;
+        if (s.first_name) slotObj.firstName = s.first_name;
+        if (s.last_name) slotObj.lastName = s.last_name;
+        if (s.phone) slotObj.phone = s.phone;
+        localStorage.setItem(slotKey, JSON.stringify(slotObj));
       }}
+      localStorage.setItem("dc", String(dc));
+      localStorage.setItem("dc" + dc + "_auth_key", JSON.stringify(authKey));
+      localStorage.setItem("user_auth", JSON.stringify({{
+        dcID: dc,
+        id: String(userId),
+        date: Math.floor(Date.now() / 1000)
+      }}));
+      for (var i = 1; i <= 5; i++) {{
+        localStorage.setItem("dc" + i + "_hash", JSON.stringify(""));
+      }}
+      localStorage.removeItem("tt-global-state");
+      localStorage.setItem("foldesk_tg_session_sig", sig);
     }}
   }} catch (e) {{
     console.error("Foldesk TG Web session init error:", e);

@@ -108,9 +108,17 @@ def _classify_session_error(exc: Exception) -> dict:
     ):
         return {"health": "banned", "last_error": text}
     if errors is not None and isinstance(
-        exc, (errors.UnauthorizedError, errors.AuthKeyError, errors.UserDeactivatedError)
+        exc,
+        (
+            errors.UnauthorizedError,
+            errors.AuthKeyError,
+            errors.UserDeactivatedError,
+            getattr(errors, "ConnectionLayerInvalidError", errors.UnauthorizedError),
+        ),
     ):
         return {"health": "unauthorized", "last_error": text}
+    if "auth_key_unregistered" in blob or "connectionlayerinvaliderror" in blob or "invokeWithLayer" in text:
+        return {"health": "unauthorized", "last_error": "Сессия сброшена Telegram — войдите заново"}
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
         return {"health": "offline", "last_error": text or "Нет связи"}
     if errors is not None and isinstance(exc, errors.TimedOutError):
