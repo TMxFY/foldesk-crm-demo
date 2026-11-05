@@ -249,7 +249,71 @@ def infer_proxy_country(
     return fallback
 
 
+_NODEMAVEN_API_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def fetch_nodemaven_api_credentials(api_key: str) -> tuple[str, str] | None:
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    if key in _NODEMAVEN_API_CACHE:
+        return _NODEMAVEN_API_CACHE[key]
+    try:
+        import httpx
+
+        headers = {"Authorization": f"x-api-key {key}", "Accept": "application/json"}
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get("https://api.nodemaven.com/api/v2/base/sub-users/", headers=headers)
+            if resp.status_code == 200:
+                payload = resp.json()
+                items = (
+                    payload.get("results")
+                    if isinstance(payload, dict) and "results" in payload
+                    else (payload if isinstance(payload, list) else [])
+                )
+                for item in items or ():
+                    if isinstance(item, dict):
+                        u = str(item.get("proxy_username") or item.get("username") or "").strip()
+                        p = str(item.get("proxy_password") or item.get("password") or "").strip()
+                        if u and p:
+                            _NODEMAVEN_API_CACHE[key] = (u, p)
+                            return (u, p)
+            # Also check /account/ in case proxy credentials are returned on main account
+            acc_resp = client.get("https://api.nodemaven.com/api/v2/base/account/", headers=headers)
+            if acc_resp.status_code == 200:
+                acc_data = acc_resp.json()
+                if isinstance(acc_data, dict):
+                    u = str(acc_data.get("proxy_username") or acc_data.get("username") or "").strip()
+                    p = str(acc_data.get("proxy_password") or acc_data.get("password") or "").strip()
+                    if u and p:
+                        _NODEMAVEN_API_CACHE[key] = (u, p)
+                        return (u, p)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_nodemaven_balance(api_key: str) -> dict | None:
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    try:
+        import httpx
+
+        headers = {"Authorization": f"x-api-key {key}", "Accept": "application/json"}
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get("https://api.nodemaven.com/api/v2/base/account/balance/", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return None
+
+
 def resolve_nodemaven_config(conn=None) -> dict | None:
+    api_key = os.getenv("NODEMAVEN_API_KEY", "").strip()
     user = os.getenv("NODEMAVEN_USER", "").strip()
     password = os.getenv("NODEMAVEN_PASS", "").strip() or os.getenv("NODEMAVEN_PASSWORD", "").strip()
     host = os.getenv("NODEMAVEN_HOST", "").strip()
@@ -259,20 +323,21 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
     default_country = os.getenv("NODEMAVEN_DEFAULT_COUNTRY", "").strip()
 
     def _read_kv(c) -> None:
-        nonlocal user, password, host, port, ttl, flt, default_country
+        nonlocal api_key, user, password, host, port, ttl, flt, default_country
         try:
             rows = dict(
                 c.execute(
                     """
                     SELECT key, value FROM kv_settings
                     WHERE key IN (
-                        'nodemaven_user', 'nodemaven_pass', 'nodemaven_host',
-                        'nodemaven_port', 'nodemaven_ttl', 'nodemaven_filter',
-                        'nodemaven_default_country'
+                        'nodemaven_api_key', 'nodemaven_user', 'nodemaven_pass',
+                        'nodemaven_host', 'nodemaven_port', 'nodemaven_ttl',
+                        'nodemaven_filter', 'nodemaven_default_country'
                     )
                     """
                 ).fetchall()
             )
+            api_key = api_key or str(rows.get("nodemaven_api_key") or "").strip()
             user = user or str(rows.get("nodemaven_user") or "").strip()
             password = password or str(rows.get("nodemaven_pass") or "").strip()
             host = host or str(rows.get("nodemaven_host") or "").strip()
@@ -292,6 +357,26 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
         except Exception:
             pass
 
+    if (not user or not password) and api_key:
+        fetched = fetch_nodemaven_api_credentials(api_key)
+        if fetched:
+            user, password = fetched
+            if conn is not None:
+                try:
+                    now = utc_now()
+                    for k, v in (("nodemaven_user", user), ("nodemaven_pass", password)):
+                        conn.execute(
+                            """
+                            INSERT INTO kv_settings (key, value, updated_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                            """,
+                            (k, v, now),
+                        )
+                    conn.commit()
+                except Exception:
+                    pass
+
     if not user or not password:
         return None
 
@@ -305,6 +390,7 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
         ttl_int = 86400
 
     return {
+        "api_key": api_key or None,
         "user": user,
         "password": password,
         "host": host or "gate.nodemaven.com",

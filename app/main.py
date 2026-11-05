@@ -1958,6 +1958,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return {"ok": True, "config": cfg}
 
     class NodeMavenConfigIn(BaseModel):
+        api_key: str = ""
         user: str = ""
         password: str = ""
         host: str = "gate.nodemaven.com"
@@ -2054,6 +2055,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         }
         if body.password.strip():
             pairs["nodemaven_pass"] = body.password.strip()
+        if body.api_key.strip():
+            pairs["nodemaven_api_key"] = body.api_key.strip()
         for k, v in pairs.items():
             conn.execute(
                 """
