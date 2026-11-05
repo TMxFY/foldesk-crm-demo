@@ -24,13 +24,24 @@ from app.accounts import (
 )
 from app.accounts import _load as load_account
 from app.tg_web_proxy import register_tg_web_routes
-from app.db import ROOT, connect, init_db, utc_now
+from app.db import (
+    ROOT,
+    connect,
+    create_pipeline_stage,
+    init_db,
+    list_pipeline_stages,
+    update_pipeline_stage,
+    utc_now,
+)
 from app.demo import DEMO_SESSION, seed_demo
 from app.inbox import (
     apply_incoming,
+    get_inbox_counts,
     get_thread,
     list_inbox,
     list_messages,
+    mark_dialog_read,
+    mark_dialog_unread,
     open_dialog_by_lead,
     remember_dialogs,
     send_reply,
@@ -43,12 +54,15 @@ from app.notes import add_note
 from app.outreach import (
     create_campaign,
     enroll_leads_from_crm,
+    get_autopilot_status,
     get_campaign,
     get_outreach_schedule,
     import_campaign_csv,
     list_campaigns,
     preview_campaign_csv,
+    run_autopilot_tick,
     run_campaign_batch,
+    set_autopilot_enabled,
     update_campaign,
     update_outreach_schedule,
 )
@@ -65,7 +79,9 @@ from app.reminders import complete_reminder, create_reminder, list_reminders, po
 from app.tasks import create_task, set_task_done
 from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
 from app.views import list_views, save_view
+from app.snippets import create_snippet, delete_snippet, list_snippets
 from app.whatsapp_gateway import WhatsAppGateway
+from app.analytics import get_analytics_summary
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -104,6 +120,19 @@ class AccountSettingsPatch(BaseModel):
 class OutreachScheduleIn(BaseModel):
     timezone: str = "UTC"
     days: dict
+    autopilot_enabled: bool | None = None
+
+
+class OutreachAutopilotIn(BaseModel):
+    enabled: bool
+    activate_drafts: bool = False
+
+
+class OutreachAutopilotTickIn(BaseModel):
+    max_send_per_campaign: int = 1
+    respect_delays: bool = True
+    force: bool = False
+
 
 
 class OpenByLeadIn(BaseModel):
@@ -147,6 +176,8 @@ class LeadIn(BaseModel):
     email: str | None = None
     url: str | None = None
     provider: str | None = None
+    amount: int | float | str | None = 0
+    currency: str | None = "USD"
 
 
 class LeadPatch(BaseModel):
@@ -154,10 +185,27 @@ class LeadPatch(BaseModel):
     note: str | None = None
     next_step: str | None = None
     name: str | None = None
+    phone: str | None = None
     description: str | None = None
     email: str | None = None
     url: str | None = None
     folder_id: int | None = None
+    provider: str | None = None
+    amount: int | float | str | None = None
+    currency: str | None = None
+
+
+class PipelineStageIn(BaseModel):
+    key: str | None = None
+    label: str
+    position: int | None = None
+    color: str | None = None
+
+
+class PipelineStagePatch(BaseModel):
+    label: str | None = None
+    position: int | None = None
+    color: str | None = None
 
 
 class FolderPullIn(BaseModel):
@@ -231,6 +279,7 @@ class CampaignIn(BaseModel):
     account_id: int | None = None
     account_ids: list[int] | None = None
     daily_limit: int = 20
+    status: str | None = None
     steps: list[dict] | None = None
 
 
@@ -432,6 +481,10 @@ async def start_account_watch(app, account_id: int) -> None:
         return
     if account["status"] != "connected":
         return
+    if str(account.get("session_path") or "").startswith("data/sessions/demo") and isinstance(
+        getattr(app.state, "gateway", None), (type(None), TelethonGateway)
+    ):
+        return
     provider = str(account.get("provider") or "telegram").strip().lower()
     gateway = _resolve_app_gateway(app, provider)
     if gateway is None:
@@ -496,15 +549,51 @@ async def stop_inbox_watches(app) -> None:
             pass
 
 
+async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            await run_autopilot_tick(
+                app.state.conn,
+                gateway=getattr(app.state, "gateway", None),
+                wa_gateway=getattr(app.state, "wa_gateway", None),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+
+async def start_autopilot_loop(app: FastAPI) -> None:
+    existing = getattr(app.state, "autopilot_task", None)
+    if existing is not None and not existing.done():
+        return
+    interval = float(getattr(app.state, "autopilot_interval", 30.0) or 30.0)
+    app.state.autopilot_task = asyncio.create_task(autopilot_loop(app, interval))
+
+
+async def stop_autopilot_loop(app: FastAPI) -> None:
+    task = getattr(app.state, "autopilot_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        app.state.autopilot_task = None
+
+
 def create_app(conn=None, gateway=None) -> FastAPI:
     load_env_file()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await start_connected_watches(app)
+        await start_autopilot_loop(app)
         try:
             yield
         finally:
+            await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
 
     app = FastAPI(title="CRM Telegram", lifespan=lifespan)
@@ -695,6 +784,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 body.name,
                 phone=body.phone,
                 provider=body.provider,
+                amount=body.amount,
+                currency=body.currency,
             )
         return _call(
             create_lead,
@@ -711,6 +802,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             email=body.email,
             url=body.url,
             provider=body.provider,
+            amount=body.amount,
+            currency=body.currency,
         )
 
     @app.get("/api/leads")
@@ -730,6 +823,81 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             provider=provider or None,
         )
 
+    class LeadBulkIn(BaseModel):
+        lead_ids: list[int]
+        action: str
+        status: str | None = None
+        folder_id: int | str | None = None
+        amount: int | float | str | None = None
+        currency: str | None = None
+        campaign_id: int | None = None
+        value: str | int | float | None = None
+
+    class LeadMergeIn(BaseModel):
+        source_lead_id: int
+        target_lead_id: int
+
+    @app.post("/api/leads/bulk")
+    def leads_bulk(body: LeadBulkIn, request: Request):
+        from app.leads import bulk_leads_action
+
+        return _call(
+            bulk_leads_action,
+            request.app.state.conn,
+            body.lead_ids,
+            body.action,
+            status=body.status,
+            folder_id=body.folder_id,
+            amount=body.amount,
+            currency=body.currency,
+            campaign_id=body.campaign_id,
+            value=body.value,
+        )
+
+    @app.get("/api/leads/duplicates")
+    def leads_duplicates(request: Request):
+        from app.leads import find_duplicate_leads
+
+        return _call(find_duplicate_leads, request.app.state.conn)
+
+    @app.post("/api/leads/merge")
+    def leads_merge(body: LeadMergeIn, request: Request):
+        from app.leads import merge_leads
+
+        return _call(
+            merge_leads,
+            request.app.state.conn,
+            body.source_lead_id,
+            body.target_lead_id,
+        )
+
+    @app.get("/api/leads/export.csv")
+    def leads_export_csv(
+        request: Request,
+        q: str = "",
+        status: str = "",
+        folder_id: int | None = None,
+        provider: str = "",
+    ):
+        from fastapi.responses import Response
+        from app.leads import export_leads_csv
+
+        csv_text = _call(
+            export_leads_csv,
+            request.app.state.conn,
+            q=q,
+            status=status or None,
+            folder_id=folder_id,
+            provider=provider or None,
+        )
+        return Response(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="leads_export.csv"'
+            },
+        )
+
     @app.get("/api/views")
     def views_list(request: Request):
         return _call(list_views, request.app.state.conn)
@@ -744,6 +912,29 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             folder_id=body.folder_id,
         )
 
+    class SnippetIn(BaseModel):
+        shortcut: str
+        title: str
+        body: str
+
+    @app.get("/api/snippets")
+    def snippets_list(request: Request):
+        return _call(list_snippets, request.app.state.conn)
+
+    @app.post("/api/snippets")
+    def snippets_create(body: SnippetIn, request: Request):
+        return _call(
+            create_snippet,
+            request.app.state.conn,
+            body.shortcut,
+            body.title,
+            body.body,
+        )
+
+    @app.delete("/api/snippets/{snippet_id}")
+    def snippets_delete(snippet_id: int, request: Request):
+        return _call(delete_snippet, request.app.state.conn, snippet_id)
+
     @app.get("/api/leads/{lead_id}")
     def leads_get(lead_id: int, request: Request):
         return _call(get_lead, request.app.state.conn, lead_id)
@@ -751,6 +942,13 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/leads/{lead_id}/card")
     def leads_card(lead_id: int, request: Request):
         return _call(lead_card, request.app.state.conn, lead_id)
+
+    @app.get("/api/leads/{lead_id}/events")
+    def leads_events_list(lead_id: int, request: Request, limit: int = 200):
+        from app.events import list_lead_events
+
+        _call(get_lead, request.app.state.conn, lead_id)
+        return _call(list_lead_events, request.app.state.conn, lead_id, limit=limit)
 
     @app.post("/api/leads/{lead_id}/notes")
     def lead_note_create(lead_id: int, body: NoteIn, request: Request):
@@ -799,6 +997,34 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         fields = body.model_dump(exclude_unset=True)
         return _call(update_lead, request.app.state.conn, lead_id, **fields)
 
+    @app.get("/api/pipeline/stages")
+    def pipeline_stages_list(request: Request):
+        return _call(list_pipeline_stages, request.app.state.conn)
+
+    @app.post("/api/pipeline/stages")
+    def pipeline_stages_create(body: PipelineStageIn, request: Request):
+        return _call(
+            create_pipeline_stage,
+            request.app.state.conn,
+            key=body.key,
+            label=body.label,
+            position=body.position,
+            color=body.color,
+        )
+
+    @app.patch("/api/pipeline/stages/{stage_key}")
+    def pipeline_stages_patch(
+        stage_key: str, body: PipelineStagePatch, request: Request
+    ):
+        return _call(
+            update_pipeline_stage,
+            request.app.state.conn,
+            stage_key,
+            label=body.label,
+            position=body.position,
+            color=body.color,
+        )
+
     @app.post("/api/reminders")
     def reminders_create(body: ReminderIn, request: Request):
         return _call(
@@ -821,6 +1047,21 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def reminders_postpone(reminder_id: int, body: PostponeIn, request: Request):
         return _call(
             postpone_reminder, request.app.state.conn, reminder_id, body.due_at
+        )
+
+    @app.get("/api/focus/today")
+    def focus_today(
+        request: Request,
+        stale_days: int = 3,
+        now: str | None = None,
+    ):
+        from app.events import get_today_focus
+
+        return _call(
+            get_today_focus,
+            request.app.state.conn,
+            now=now,
+            stale_days=stale_days,
         )
 
     @app.post("/api/digest/send")
@@ -859,7 +1100,15 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(apply_bot_update, request.app.state.conn, update)
 
     @app.get("/api/inbox")
-    async def inbox_list(request: Request, account_id: int | None = None, q: str = ""):
+    async def inbox_list(
+        request: Request,
+        account_id: int | None = None,
+        q: str = "",
+        chip: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        with_counts: bool = False,
+    ):
         if account_id is None or account_id == 0:
             rows = request.app.state.conn.execute(
                 "SELECT id FROM accounts WHERE status = 'connected'"
@@ -868,7 +1117,44 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 await ensure_private_inbox(request.app, int(r["id"]))
         else:
             await ensure_private_inbox(request.app, account_id)
-        return _call(list_inbox, request.app.state.conn, account_id, q)
+        return _call(
+            list_inbox,
+            request.app.state.conn,
+            account_id,
+            q,
+            chip,
+            provider,
+            status,
+            with_counts,
+        )
+
+    @app.get("/api/inbox/counts")
+    async def inbox_counts_get(
+        request: Request,
+        account_id: int | None = None,
+        q: str = "",
+        provider: str | None = None,
+        status: str | None = None,
+    ):
+        counts = _call(
+            get_inbox_counts,
+            request.app.state.conn,
+            account_id,
+            q,
+            provider,
+            status,
+        )
+        return {"counts": counts, **counts}
+
+    @app.post("/api/inbox/dialogs/{dialog_id}/unread")
+    @app.post("/api/dialogs/{dialog_id}/unread")
+    def inbox_dialog_mark_unread(dialog_id: int, request: Request):
+        return _call(mark_dialog_unread, request.app.state.conn, dialog_id)
+
+    @app.post("/api/inbox/dialogs/{dialog_id}/read")
+    @app.post("/api/dialogs/{dialog_id}/read")
+    def inbox_dialog_mark_read(dialog_id: int, request: Request):
+        return _call(mark_dialog_read, request.app.state.conn, dialog_id)
 
     @app.get("/api/inbox/events")
     async def inbox_events(request: Request, account_id: int = 0):
@@ -1073,6 +1359,39 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             request.app.state.conn,
             body.timezone,
             body.days,
+            autopilot_enabled=body.autopilot_enabled,
+        )
+
+    @app.get("/api/outreach/autopilot")
+    def outreach_autopilot_get(request: Request):
+        return _call(get_autopilot_status, request.app.state.conn)
+
+    @app.post("/api/outreach/autopilot")
+    @app.put("/api/outreach/autopilot")
+    @app.patch("/api/outreach/autopilot")
+    def outreach_autopilot_set(body: OutreachAutopilotIn, request: Request):
+        return _call(
+            set_autopilot_enabled,
+            request.app.state.conn,
+            body.enabled,
+            activate_drafts=body.activate_drafts,
+        )
+
+    @app.post("/api/outreach/autopilot/tick")
+    async def outreach_autopilot_tick(
+        request: Request, body: OutreachAutopilotTickIn | None = None
+    ):
+        max_send = body.max_send_per_campaign if body is not None else 1
+        respect_delays = body.respect_delays if body is not None else True
+        force = body.force if body is not None else False
+        return await _call_async(
+            run_autopilot_tick,
+            request.app.state.conn,
+            gateway=getattr(request.app.state, "gateway", None),
+            wa_gateway=getattr(request.app.state, "wa_gateway", None),
+            max_send_per_campaign=max_send,
+            respect_delays=respect_delays,
+            force=force,
         )
 
     @app.post("/api/campaigns/preview-csv")
@@ -1126,6 +1445,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             daily_limit=body.daily_limit,
             steps=body.steps,
             account_ids=body.account_ids,
+            status=body.status,
         )
 
     @app.get("/api/campaigns/{campaign_id}")
@@ -1219,6 +1539,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             respect_delays=respect_delays,
             wa_gateway=wa_gateway,
         )
+
+    @app.get("/api/analytics/summary")
+    def analytics_summary(request: Request):
+        return _call(get_analytics_summary, request.app.state.conn)
 
     @app.post("/api/demo/seed")
     def demo_seed(request: Request):

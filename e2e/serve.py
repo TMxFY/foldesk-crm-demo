@@ -34,7 +34,10 @@ def seed_history(gateway) -> None:
 
 TMP = Path(__file__).resolve().parent / ".tmp"
 TMP.mkdir(exist_ok=True)
-DB_PATH = TMP / "crm.db"
+DB_PATH = Path(
+    os.environ.get("E2E_DB_PATH")
+    or (TMP / f"crm_{os.environ.get('PORT', 'default')}.db")
+)
 
 
 class E2EGateway(FakeGateway):
@@ -103,16 +106,26 @@ def build():
         conn.execute("DELETE FROM notes")
         conn.execute("DELETE FROM tasks")
         conn.execute("DELETE FROM reminders")
+        conn.execute("DELETE FROM lead_events")
         conn.execute("DELETE FROM property_values")
         conn.execute("DELETE FROM campaign_recipients")
         conn.execute("DELETE FROM campaign_steps")
         conn.execute("DELETE FROM campaigns")
         conn.execute("DELETE FROM folders")
         conn.execute("DELETE FROM saved_views")
+        conn.execute("DELETE FROM snippets")
+        conn.execute("DELETE FROM kv_settings WHERE key = 'snippets_user_modified'")
         conn.execute("DELETE FROM leads")
         conn.execute("DELETE FROM property_defs")
         conn.execute("DELETE FROM accounts")
+        conn.execute("DELETE FROM pipeline_stages")
         conn.commit()
+        from app.db import _ensure_default_pipeline_stages
+        from app.snippets import seed_default_snippets
+
+        _ensure_default_pipeline_stages(conn)
+        conn.commit()
+        seed_default_snippets(conn)
         gateway._pending.clear()
         gateway.sent.clear()
         gateway.needs_password = False

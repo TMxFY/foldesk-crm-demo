@@ -1,18 +1,32 @@
+import asyncio
 import csv
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import random
 import re
 import sqlite3
+from zoneinfo import ZoneInfo
 
 from app.accounts import _load as load_account
 from app.accounts import _public as public_account
 from app.accounts import increment_daily_sent
 from app.db import as_dict, utc_now, utc_today
-from app.inbox import _cache_messages, stop_outreach_on_reply
+from app.inbox import _cache_messages, _record_lead_event_safe, stop_outreach_on_reply
 
 CAMPAIGN_STATUSES = ("draft", "running", "paused", "completed")
 RECIPIENT_STATUSES = ("pending", "in_progress", "completed", "replied", "failed")
+
+WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+WEEKDAY_RU = {
+    "mon": "Пн",
+    "tue": "Вт",
+    "wed": "Ср",
+    "thu": "Чт",
+    "fri": "Пт",
+    "sat": "Сб",
+    "sun": "Вс",
+}
 
 DEFAULT_SCHEDULE_DAYS = {
     "mon": {"enabled": True, "start": "09:00", "end": "18:00"},
@@ -175,21 +189,44 @@ def _clean_step1_text(raw: str | None) -> tuple[str | None, str | None]:
 
 
 def _extract_extra_fields(recipient: dict) -> dict[str, str]:
-    raw_extra = recipient.get("extra_fields")
-    if isinstance(raw_extra, dict):
-        return {str(k): str(v or "") for k, v in raw_extra.items() if str(k).strip()}
-    raw_json = recipient.get("extra_json")
-    if raw_json and isinstance(raw_json, str):
-        try:
-            parsed = json.loads(raw_json)
-            if isinstance(parsed, dict):
-                return {str(k): str(v or "") for k, v in parsed.items() if str(k).strip()}
-        except Exception:
-            pass
+    for dict_key in ("extra_fields", "custom_vars"):
+        raw_extra = recipient.get(dict_key)
+        if isinstance(raw_extra, dict):
+            return {str(k): str(v or "") for k, v in raw_extra.items() if str(k).strip()}
+    for json_key in ("extra_json", "custom_vars_json"):
+        raw_json = recipient.get(json_key)
+        if raw_json and isinstance(raw_json, str):
+            try:
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, dict):
+                    return {str(k): str(v or "") for k, v in parsed.items() if str(k).strip()}
+            except Exception:
+                pass
     return {}
 
 
-def render_template(template_text: str, recipient: dict) -> str:
+_SPINTAX_INNER_RE = re.compile(r"\{([^{}]*\|[^{}]*)\}")
+
+
+def expand_spintax(text: str, rng: random.Random | None = None) -> str:
+    """Раскрывает конструкции Spintax вида {Привет|Добрый день|Здравствуйте}, включая вложенные."""
+    out = str(text or "")
+    chooser = rng.choice if rng is not None else random.choice
+    for _ in range(50):
+        if not _SPINTAX_INNER_RE.search(out):
+            break
+        out = _SPINTAX_INNER_RE.sub(
+            lambda m: chooser([opt.strip() for opt in m.group(1).split("|")]),
+            out,
+        )
+    return out
+
+
+def render_template(
+    template_text: str,
+    recipient: dict,
+    rng: random.Random | None = None,
+) -> str:
     text = str(template_text or "")
     name_val = (
         (recipient.get("name") or "").strip()
@@ -249,7 +286,7 @@ def render_template(template_text: str, recipient: dict) -> str:
     def _replace_dynamic_token(match: re.Match) -> str:
         raw_token = match.group(1)
         clean_token = raw_token.strip().lstrip("\ufeff")
-        if not clean_token:
+        if not clean_token or "|" in clean_token:
             return match.group(0)
         low = clean_token.lower()
         if low in lookup_by_norm:
@@ -264,7 +301,8 @@ def render_template(template_text: str, recipient: dict) -> str:
             return str(recipient[clean_token]).strip()
         return match.group(0)
 
-    text = re.sub(r"\{([^{}]+)\}", _replace_dynamic_token, text)
+    text = re.sub(r"\{([^{}|]+)\}", _replace_dynamic_token, text)
+    text = expand_spintax(text, rng=rng)
 
     lines = []
     for line in text.splitlines():
@@ -272,6 +310,7 @@ def render_template(template_text: str, recipient: dict) -> str:
         cleaned = re.sub(r"\s+([,!?.:;])", r"\1", cleaned)
         lines.append(cleaned)
     return "\n".join(lines).strip()
+
 
 
 def _parse_iso_dt(value: str | None) -> datetime | None:
@@ -615,12 +654,16 @@ def create_campaign(
     daily_limit: int = 20,
     steps: list | None = None,
     account_ids: list[int] | None = None,
+    status: str | None = None,
 ) -> dict:
     clean_name = (name or "").strip()
     if not clean_name:
         raise ValueError("Укажите название рассылки")
     if isinstance(daily_limit, bool) or not isinstance(daily_limit, int) or not (1 <= int(daily_limit) <= 500):
         raise ValueError("Лимит должен быть от 1 до 500 сообщений в сутки")
+    initial_status = (status or "draft").strip()
+    if initial_status not in CAMPAIGN_STATUSES:
+        raise ValueError("Неизвестный статус рассылки")
     resolved_ids = _parse_account_ids(account_id, account_ids)
     for aid in resolved_ids:
         acc = conn.execute("SELECT id FROM accounts WHERE id = ?", (aid,)).fetchone()
@@ -633,9 +676,9 @@ def create_campaign(
     cur = conn.execute(
         """
         INSERT INTO campaigns (name, account_id, account_ids_json, daily_limit, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'draft', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (clean_name, primary_account_id, account_ids_json, int(daily_limit), now, now),
+        (clean_name, primary_account_id, account_ids_json, int(daily_limit), initial_status, now, now),
     )
     campaign_id = cur.lastrowid
     for step in norm_steps:
@@ -725,7 +768,140 @@ def update_campaign(
     return get_campaign(conn, campaign_id)
 
 
-def get_outreach_schedule(conn) -> dict:
+def _parse_hhmm(raw: str | None, default_minutes: int = 540) -> int:
+    s = str(raw or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if not m:
+        return default_minutes
+    hh = min(23, max(0, int(m.group(1))))
+    mm = min(59, max(0, int(m.group(2))))
+    return hh * 60 + mm
+
+
+def _get_kv(conn, key: str, default: str | None = None) -> str | None:
+    try:
+        row = conn.execute("SELECT value FROM kv_settings WHERE key = ?", (key,)).fetchone()
+        if row is not None:
+            return str(row["value"])
+    except Exception:
+        pass
+    return default
+
+
+def _set_kv(conn, key: str, value: str) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO kv_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, str(value), now),
+    )
+
+
+def is_autopilot_enabled(conn) -> bool:
+    val = _get_kv(conn, "outreach_autopilot_enabled", "1")
+    return str(val).strip().lower() not in ("0", "false", "off", "no")
+
+
+def evaluate_schedule_window(
+    schedule: dict,
+    now_dt: datetime | None = None,
+    autopilot_enabled: bool = True,
+    now: datetime | None = None,
+) -> dict:
+    effective_now = now_dt if now_dt is not None else now
+    tz_name = str(schedule.get("timezone") or "UTC").strip() or "UTC"
+    try:
+        tz_obj = ZoneInfo(tz_name)
+    except Exception:
+        tz_obj = timezone.utc
+
+    if effective_now is None:
+        now_utc = datetime.now(timezone.utc)
+    elif effective_now.tzinfo is None:
+        now_utc = effective_now.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = effective_now.astimezone(timezone.utc)
+
+    local_dt = now_utc.astimezone(tz_obj)
+    day_key = WEEKDAY_KEYS[local_dt.weekday()]
+    days = schedule.get("days") if isinstance(schedule.get("days"), dict) else DEFAULT_SCHEDULE_DAYS
+    today_cfg = days.get(day_key) if isinstance(days.get(day_key), dict) else DEFAULT_SCHEDULE_DAYS[day_key]
+
+    enabled_today = bool(today_cfg.get("enabled", False))
+    start_str = str(today_cfg.get("start") or "09:00").strip()
+    end_str = str(today_cfg.get("end") or "18:00").strip()
+    start_min = _parse_hhmm(start_str, 9 * 60)
+    end_min = _parse_hhmm(end_str, 18 * 60)
+    cur_min = local_dt.hour * 60 + local_dt.minute
+
+    within_window = False
+    if not enabled_today:
+        reason = "day_disabled"
+    else:
+        if start_min < end_min:
+            within_window = start_min <= cur_min < end_min
+        else:
+            within_window = cur_min >= start_min or cur_min <= end_min
+        reason = "within_window" if within_window else "outside_hours"
+
+    next_run_at: str | None = None
+    if not autopilot_enabled:
+        next_run_label = "Автопилот выключен"
+    elif within_window:
+        next_dt = now_utc + timedelta(seconds=30)
+        next_run_at = next_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        next_run_label = (
+            f"Активен · окно {WEEKDAY_RU.get(day_key, day_key)} {start_str}–{end_str} {tz_name} · след. проверка через 30 сек"
+        )
+    else:
+        found_label = None
+        for offset in range(0, 8):
+            cand_local = local_dt + timedelta(days=offset)
+            cand_key = WEEKDAY_KEYS[cand_local.weekday()]
+            cand_cfg = days.get(cand_key) if isinstance(days.get(cand_key), dict) else DEFAULT_SCHEDULE_DAYS[cand_key]
+            if not bool(cand_cfg.get("enabled", False)):
+                continue
+            cand_start = str(cand_cfg.get("start") or "09:00").strip()
+            cand_start_min = _parse_hhmm(cand_start, 9 * 60)
+            if offset == 0 and cur_min >= cand_start_min:
+                continue
+            sh, sm = divmod(cand_start_min, 60)
+            target_local = cand_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+            next_run_at = target_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            found_label = f"Ожидание окна · след. запуск: {WEEKDAY_RU.get(cand_key, cand_key)} {cand_start} ({tz_name})"
+            break
+        next_run_label = found_label or "Нет активных дней в расписании"
+
+    return {
+        "within_window": within_window,
+        "reason": reason,
+        "current_day": day_key,
+        "local_time": local_dt.strftime("%H:%M"),
+        "timezone": tz_name,
+        "window_start": start_str,
+        "window_end": end_str,
+        "next_run_at": next_run_at,
+        "next_run_label": next_run_label,
+    }
+
+
+def is_within_outreach_schedule(
+    schedule_or_conn,
+    now_dt: datetime | None = None,
+    now: datetime | None = None,
+) -> bool:
+    effective_now = now_dt if now_dt is not None else now
+    if isinstance(schedule_or_conn, sqlite3.Connection):
+        sched = get_outreach_schedule(schedule_or_conn, now_dt=effective_now)
+    else:
+        sched = schedule_or_conn
+    return bool(evaluate_schedule_window(sched, now_dt=effective_now)["within_window"])
+
+
+def get_outreach_schedule(conn, now_dt: datetime | None = None) -> dict:
     row = conn.execute("SELECT * FROM outreach_schedule WHERE id = 1").fetchone()
     if row is None:
         now = utc_now()
@@ -738,32 +914,53 @@ def get_outreach_schedule(conn) -> dict:
             (json.dumps(days_copy), now),
         )
         conn.commit()
-        return {"timezone": "UTC", "days": days_copy, "updated_at": now}
-    d = as_dict(row)
-    try:
-        parsed_days = json.loads(d.get("days_json") or "{}")
-    except Exception:
-        parsed_days = {}
-    days_out = {}
-    for day_key, default_cfg in DEFAULT_SCHEDULE_DAYS.items():
-        raw_day = parsed_days.get(day_key) if isinstance(parsed_days, dict) else None
-        if isinstance(raw_day, dict):
-            days_out[day_key] = {
-                "enabled": bool(raw_day.get("enabled", default_cfg["enabled"])),
-                "start": str(raw_day.get("start") or default_cfg["start"]).strip(),
-                "end": str(raw_day.get("end") or default_cfg["end"]).strip(),
-            }
-        else:
-            days_out[day_key] = dict(default_cfg)
+        tz_val = "UTC"
+        days_out = days_copy
+        updated_at = now
+    else:
+        d = as_dict(row)
+        try:
+            parsed_days = json.loads(d.get("days_json") or "{}")
+        except Exception:
+            parsed_days = {}
+        days_out = {}
+        for day_key, default_cfg in DEFAULT_SCHEDULE_DAYS.items():
+            raw_day = parsed_days.get(day_key) if isinstance(parsed_days, dict) else None
+            if isinstance(raw_day, dict):
+                days_out[day_key] = {
+                    "enabled": bool(raw_day.get("enabled", default_cfg["enabled"])),
+                    "start": str(raw_day.get("start") or default_cfg["start"]).strip(),
+                    "end": str(raw_day.get("end") or default_cfg["end"]).strip(),
+                }
+            else:
+                days_out[day_key] = dict(default_cfg)
+        tz_val = d.get("timezone") or "UTC"
+        updated_at = d.get("updated_at") or utc_now()
+
+    enabled = is_autopilot_enabled(conn)
+    base_sched = {"timezone": tz_val, "days": days_out}
+    win = evaluate_schedule_window(base_sched, now_dt=now_dt, autopilot_enabled=enabled)
+    last_tick = _get_kv(conn, "outreach_autopilot_last_tick", None)
     return {
-        "timezone": d.get("timezone") or "UTC",
+        "timezone": tz_val,
         "days": days_out,
-        "updated_at": d.get("updated_at") or utc_now(),
+        "updated_at": updated_at,
+        "autopilot_enabled": enabled,
+        "within_window": win["within_window"],
+        "next_run_at": win["next_run_at"],
+        "next_run_label": win["next_run_label"],
+        "last_tick_at": last_tick,
     }
 
 
-def update_outreach_schedule(conn, timezone: str, days: dict) -> dict:
-    clean_tz = (timezone or "UTC").strip() or "UTC"
+def update_outreach_schedule(
+    conn,
+    timezone: str = "UTC",
+    days: dict | None = None,
+    autopilot_enabled: bool | None = None,
+    timezone_name: str | None = None,
+) -> dict:
+    clean_tz = (timezone_name or timezone or "UTC").strip() or "UTC"
     if not isinstance(days, dict):
         raise ValueError("Некорректный формат дней расписания")
     current = get_outreach_schedule(conn)["days"]
@@ -791,8 +988,56 @@ def update_outreach_schedule(conn, timezone: str, days: dict) -> dict:
         """,
         (clean_tz, json.dumps(merged), now),
     )
+    if autopilot_enabled is not None:
+        _set_kv(conn, "outreach_autopilot_enabled", "1" if autopilot_enabled else "0")
     conn.commit()
     return get_outreach_schedule(conn)
+
+
+def get_autopilot_status(conn, now_dt: datetime | None = None) -> dict:
+    sched = get_outreach_schedule(conn, now_dt=now_dt)
+    running_rows = conn.execute(
+        "SELECT id, name, daily_limit FROM campaigns WHERE status = 'running' ORDER BY id"
+    ).fetchall()
+    return {
+        "enabled": sched["autopilot_enabled"],
+        "autopilot_enabled": sched["autopilot_enabled"],
+        "within_window": sched["within_window"],
+        "timezone": sched["timezone"],
+        "next_run_at": sched["next_run_at"],
+        "next_run_label": sched["next_run_label"],
+        "last_tick_at": sched["last_tick_at"],
+        "running_campaigns_count": len(running_rows),
+        "running_campaign_ids": [int(r["id"]) for r in running_rows],
+        "schedule": sched,
+    }
+
+
+def set_autopilot_enabled(
+    conn,
+    enabled: bool,
+    activate_drafts: bool = False,
+    now_dt: datetime | None = None,
+) -> dict:
+    _set_kv(conn, "outreach_autopilot_enabled", "1" if enabled else "0")
+    if enabled and activate_drafts:
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET status = 'running', updated_at = ?
+            WHERE status IN ('draft', 'paused')
+              AND EXISTS (
+                  SELECT 1 FROM campaign_recipients r
+                  WHERE r.campaign_id = campaigns.id
+                    AND r.status IN ('pending', 'in_progress')
+              )
+            """,
+            (now,),
+        )
+    conn.commit()
+    return get_autopilot_status(conn, now_dt=now_dt)
+
 
 
 def _detect_delimiter(sample: str) -> str:
@@ -1450,6 +1695,7 @@ async def run_campaign_batch(
     max_send: int | None = None,
     respect_delays: bool = False,
     wa_gateway=None,
+    jitter_range: tuple[float, float] | None = None,
 ) -> dict:
     camp = get_campaign(conn, campaign_id)
     account_ids = camp.get("account_ids") or []
@@ -1516,6 +1762,7 @@ async def run_campaign_batch(
 
     sent_count = 0
     sent_by_account: dict[str, int] = {}
+    jitter_delays_ms: list[int] = []
     state_by_id = {st["id"]: st for st in connected_states}
 
     for row in eligible_rows:
@@ -1540,6 +1787,14 @@ async def run_campaign_batch(
         ]
         if not available:
             break
+
+        if jitter_range is not None and len(jitter_range) == 2:
+            j_min = max(0.0, float(jitter_range[0]))
+            j_max = max(j_min, float(jitter_range[1]))
+            j_sec = random.uniform(j_min, j_max)
+            jitter_delays_ms.append(int(round(j_sec * 1000)))
+            if j_sec > 0:
+                await asyncio.sleep(j_sec)
 
         assigned_id = rec.get("assigned_account_id")
         if (
@@ -1741,6 +1996,21 @@ async def run_campaign_batch(
                     """,
                     (dialog["id"], lead_next_step, now, int(rec["lead_id"])),
                 )
+            _record_lead_event_safe(
+                conn,
+                lead_id=int(rec["lead_id"]),
+                event_type="outreach_sent",
+                title=f"Отправлен шаг {next_step}/{len(steps)} кампании «{camp['name']}»",
+                meta={
+                    "campaign_id": campaign_id,
+                    "campaign_name": camp["name"],
+                    "step": next_step,
+                    "total_steps": len(steps),
+                    "account_id": chosen_account_id,
+                    "preview": rendered_text[:120],
+                },
+                now=now,
+            )
         sent_count += 1
 
     remaining_row = conn.execute(
@@ -1766,8 +2036,133 @@ async def run_campaign_batch(
     return {
         "sent": sent_count,
         "sent_by_account": sent_by_account,
+        "jitter_delays_ms": jitter_delays_ms,
         "limit_reached": sent_count > 0 and sent_count == effective_quota,
         "remaining": remaining_active,
         "campaign": updated_campaign,
         "account": updated_account,
     }
+
+
+async def run_autopilot_tick(
+    conn,
+    gateway=None,
+    wa_gateway=None,
+    now_dt: datetime | None = None,
+    max_send_per_campaign: int = 1,
+    respect_delays: bool = True,
+    jitter_range: tuple[float, float] | None = (0.01, 0.05),
+    force: bool = False,
+    now: datetime | None = None,
+    max_per_campaign: int | None = None,
+) -> dict:
+    effective_now = now_dt if now_dt is not None else now
+    effective_max = int(max_per_campaign) if max_per_campaign is not None else int(max_send_per_campaign)
+    tick_iso = (
+        effective_now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if isinstance(effective_now, datetime) and effective_now.tzinfo is not None
+        else (
+            effective_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if isinstance(effective_now, datetime)
+            else utc_now()
+        )
+    )
+    _set_kv(conn, "outreach_autopilot_last_tick", tick_iso)
+    conn.commit()
+
+    sched = get_outreach_schedule(conn, now_dt=effective_now)
+    enabled = bool(sched["autopilot_enabled"])
+    within_window = bool(sched["within_window"])
+
+    if not enabled and not force:
+        return {
+            "ok": True,
+            "ran": False,
+            "enabled": False,
+            "within_schedule": within_window,
+            "reason": "autopilot_disabled",
+            "campaigns_checked": 0,
+            "sent": 0,
+            "results": [],
+            "campaigns": [],
+            "status": get_autopilot_status(conn, now_dt=effective_now),
+        }
+
+    if not within_window and not force:
+        return {
+            "ok": True,
+            "ran": False,
+            "enabled": enabled,
+            "within_schedule": False,
+            "reason": "outside_schedule",
+            "campaigns_checked": 0,
+            "sent": 0,
+            "results": [],
+            "campaigns": [],
+            "status": get_autopilot_status(conn, now_dt=effective_now),
+        }
+
+    running_rows = conn.execute(
+        "SELECT id, name FROM campaigns WHERE status = 'running' ORDER BY id"
+    ).fetchall()
+
+    total_sent = 0
+    results = []
+    for crow in running_rows:
+        cid = int(crow["id"])
+        try:
+            batch_res = await run_campaign_batch(
+                conn,
+                cid,
+                gateway=gateway,
+                max_send=effective_max,
+                respect_delays=respect_delays,
+                wa_gateway=wa_gateway,
+                jitter_range=jitter_range,
+            )
+            sent_now = int(batch_res.get("sent") or 0)
+            total_sent += sent_now
+            results.append(
+                {
+                    "campaign_id": cid,
+                    "campaign_name": crow["name"],
+                    "sent": sent_now,
+                    "sent_by_account": batch_res.get("sent_by_account") or {},
+                    "jitter_delays_ms": batch_res.get("jitter_delays_ms") or [],
+                    "remaining": batch_res.get("remaining"),
+                    "limit_reached": batch_res.get("limit_reached", False),
+                }
+            )
+        except ValueError as exc:
+            results.append(
+                {
+                    "campaign_id": cid,
+                    "campaign_name": crow["name"],
+                    "sent": 0,
+                    "limit_reached": "лимит" in str(exc).lower(),
+                    "skipped_reason": str(exc),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "campaign_id": cid,
+                    "campaign_name": crow["name"],
+                    "sent": 0,
+                    "skipped_reason": str(exc),
+                }
+            )
+
+    return {
+        "ok": True,
+        "ran": True,
+        "enabled": enabled,
+        "within_schedule": within_window,
+        "reason": "completed",
+        "campaigns_checked": len(running_rows),
+        "sent": total_sent,
+        "results": results,
+        "campaigns": results,
+        "status": get_autopilot_status(conn, now_dt=effective_now),
+    }
+

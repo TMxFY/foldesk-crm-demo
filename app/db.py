@@ -1,3 +1,4 @@
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,6 +7,13 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
 
 STATUSES = ("new", "talking", "waiting", "won", "lost")
+DEFAULT_PIPELINE_STAGES = (
+    ("new", "Лид", 1, "#94a3b8"),
+    ("talking", "Разговор", 2, "#38bdf8"),
+    ("waiting", "Ждём", 3, "#fbbf24"),
+    ("won", "Выигран", 4, "#34d399"),
+    ("lost", "Проигран", 5, "#f87171"),
+)
 ACCOUNT_STATUSES = ("pending_code", "pending_password", "connected", "error")
 
 
@@ -79,9 +87,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             username TEXT,
             name TEXT,
             phone TEXT,
-            status TEXT NOT NULL DEFAULT 'new' CHECK (
-                status IN ('new', 'talking', 'waiting', 'won', 'lost')
-            ),
+            status TEXT NOT NULL DEFAULT 'new',
             note TEXT,
             next_step TEXT,
             created_at TEXT NOT NULL,
@@ -91,6 +97,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             url TEXT,
             dialog_id INTEGER,
             provider TEXT NOT NULL DEFAULT 'telegram',
+            amount INTEGER NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'USD',
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         );
 
@@ -255,10 +263,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS saved_views (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            status TEXT CHECK (
-                status IS NULL
-                OR status IN ('new', 'talking', 'waiting', 'won', 'lost')
-            ),
+            status TEXT,
             folder_id INTEGER,
             created_at TEXT NOT NULL
         );
@@ -333,6 +338,32 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS snippets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shortcut TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pipeline_stages (
+            key TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            color TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS lead_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            meta_json TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS lead_events_lead_created ON lead_events(lead_id, created_at);
         """
     )
     _migrate(conn)
@@ -345,6 +376,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "leads", "folder_id", "INTEGER REFERENCES folders(id) ON DELETE SET NULL")
     _ensure_column(conn, "leads", "dialog_id", "INTEGER")
     _ensure_column(conn, "leads", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
+    _ensure_column(conn, "leads", "amount", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "leads", "currency", "TEXT NOT NULL DEFAULT 'USD'")
     _ensure_column(conn, "accounts", "health", "TEXT")
     _ensure_column(conn, "accounts", "last_error", "TEXT")
     _ensure_column(conn, "accounts", "updated_at", "TEXT")
@@ -378,12 +411,163 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "campaign_recipients", "step2_text", "TEXT")
     _ensure_column(conn, "campaign_recipients", "step3_text", "TEXT")
     _ensure_column(conn, "campaign_recipients", "extra_json", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_stages (
+            key TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            color TEXT
+        )
+        """
+    )
+    _ensure_default_pipeline_stages(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")
+    snippets_count = conn.execute("SELECT COUNT(*) FROM snippets").fetchone()[0]
+    if snippets_count == 0:
+        user_mod = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'snippets_user_modified'"
+        ).fetchone()
+        if user_mod is None:
+            from app.snippets import seed_default_snippets
+
+            seed_default_snippets(conn)
     conn.commit()
+
+
+def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
+    for key, label, position, color in DEFAULT_PIPELINE_STAGES:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO pipeline_stages (key, label, position, color)
+            VALUES (?, ?, ?, ?)
+            """,
+            (key, label, position, color),
+        )
 
 
 def as_dict(row):
     if row is None:
         return None
     return {key: row[key] for key in row.keys()}
+
+
+def valid_statuses(conn: sqlite3.Connection | None = None) -> set[str]:
+    allowed = set(STATUSES)
+    if conn is not None:
+        try:
+            rows = conn.execute("SELECT key FROM pipeline_stages").fetchall()
+            allowed.update(str(r[0]) for r in rows if r[0])
+        except Exception:
+            pass
+    return allowed
+
+
+def list_pipeline_stages(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT key, label, position, color FROM pipeline_stages ORDER BY position ASC, rowid ASC"
+    ).fetchall()
+    return [as_dict(row) for row in rows]
+
+
+def update_pipeline_stage(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    label: str | None = None,
+    position: int | None = None,
+    color: str | None = None,
+) -> dict:
+    clean_key = str(key or "").strip()
+    if not clean_key:
+        raise LookupError("stage")
+    existing = conn.execute(
+        "SELECT key, label, position, color FROM pipeline_stages WHERE key = ?",
+        (clean_key,),
+    ).fetchone()
+    if existing is None:
+        raise LookupError("stage")
+    updates = {}
+    if label is not None:
+        clean_label = str(label).strip()
+        if not clean_label:
+            raise ValueError("Укажите название стадии")
+        updates["label"] = clean_label
+    if position is not None:
+        try:
+            updates["position"] = int(position)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная позиция стадии") from None
+    if color is not None:
+        updates["color"] = str(color).strip() or None
+    if updates:
+        assignments = ", ".join(f"{col} = ?" for col in updates)
+        conn.execute(
+            f"UPDATE pipeline_stages SET {assignments} WHERE key = ?",
+            [*updates.values(), clean_key],
+        )
+        conn.commit()
+    row = conn.execute(
+        "SELECT key, label, position, color FROM pipeline_stages WHERE key = ?",
+        (clean_key,),
+    ).fetchone()
+    return as_dict(row)
+
+
+def create_pipeline_stage(
+    conn: sqlite3.Connection,
+    *,
+    key: str | None = None,
+    label: str = "",
+    position: int | None = None,
+    color: str | None = None,
+) -> dict:
+    clean_label = str(label or "").strip()
+    if not clean_label:
+        raise ValueError("Укажите название стадии")
+    explicit_key = key is not None and str(key).strip() != ""
+    if explicit_key:
+        clean_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(key).strip().lower()).strip("_")
+        if not clean_key:
+            raise ValueError("Некорректный ключ стадии")
+        dup = conn.execute(
+            "SELECT 1 FROM pipeline_stages WHERE key = ?", (clean_key,)
+        ).fetchone()
+        if dup is not None:
+            raise ValueError("Стадия с таким ключом уже существует")
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "_", clean_label.lower()).strip("_")
+        base_key = slug or "stage"
+        clean_key = base_key
+        idx = 1
+        while (
+            conn.execute(
+                "SELECT 1 FROM pipeline_stages WHERE key = ?", (clean_key,)
+            ).fetchone()
+            is not None
+        ):
+            idx += 1
+            clean_key = f"{base_key}_{idx}"
+    if position is None:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM pipeline_stages"
+        ).fetchone()[0]
+        clean_pos = int(max_pos) + 1
+    else:
+        try:
+            clean_pos = int(position)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная позиция стадии") from None
+    clean_color = (str(color).strip() if color is not None else "") or "#6366f1"
+    conn.execute(
+        "INSERT INTO pipeline_stages (key, label, position, color) VALUES (?, ?, ?, ?)",
+        (clean_key, clean_label, clean_pos, clean_color),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT key, label, position, color FROM pipeline_stages WHERE key = ?",
+        (clean_key,),
+    ).fetchone()
+    return as_dict(row)
+

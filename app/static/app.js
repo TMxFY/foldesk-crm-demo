@@ -57,6 +57,7 @@ const SHEET_LABELS = {
   "ai-bot": "AI Агент",
   "tool-phones": "Телефоны в TG",
   "tool-parser": "Парсер групп",
+  analytics: "Аналитика",
 };
 
 const SCHEDULE_DAYS = [
@@ -113,8 +114,11 @@ const state = {
   cards: {},
   folderLists: {},
   views: [],
+  snippets: [],
+  lastCopiedSnippet: "",
   campaigns: [],
   propertyDefs: [],
+  analytics: null,
   outreachSchedule: {
     timezone: "UTC",
     random_delay: "30-90",
@@ -182,6 +186,7 @@ function sheetFromHash(hash) {
   if (clean === "ai-bot") return "ai-bot";
   if (clean === "tool-phones") return "tool-phones";
   if (clean === "tool-parser") return "tool-parser";
+  if (clean === "analytics") return "analytics";
   return "";
 }
 
@@ -297,6 +302,7 @@ function syncSheetVisibility() {
   const toolParser = document.querySelector("#tool-parser");
   const crmProps = document.querySelector("#crm-properties");
   const aiBot = document.querySelector("#ai-bot");
+  const analyticsSec = document.querySelector("#analytics");
 
   if (state.viewMode !== "sheet") {
     if (s07) s07.hidden = false;
@@ -314,6 +320,7 @@ function syncSheetVisibility() {
     if (digest) digest.hidden = false;
     if (accounts) accounts.hidden = false;
     if (s11) s11.hidden = false;
+    if (analyticsSec) analyticsSec.hidden = false;
     if (toolPhones) toolPhones.hidden = active !== "tool-phones";
     if (toolParser) toolParser.hidden = active !== "tool-parser";
     if (crmProps) crmProps.hidden = active !== "crm-properties";
@@ -356,6 +363,12 @@ function syncSheetVisibility() {
   if (toolParser) toolParser.hidden = active !== "tool-parser";
   if (crmProps) crmProps.hidden = active !== "crm-properties";
   if (aiBot) aiBot.hidden = active !== "ai-bot";
+  if (analyticsSec) analyticsSec.hidden = active !== "analytics";
+
+  if (active === "s07" || active === "leads") {
+    state.bulkHostTarget = active;
+  }
+  if (typeof syncBulkHostContainer === "function") syncBulkHostContainer();
 
   const activeNode = active === "inbox" ? messengerGrid : document.querySelector(`#${active}`);
   triggerSheetEntrance(activeNode);
@@ -511,6 +524,144 @@ function folderField(lead) {
     select.append(option);
   });
   return select;
+}
+
+function leadAmount(lead) {
+  if (!lead) return 0;
+  const num = Number(lead.amount);
+  return Number.isFinite(num) && num > 0 ? Math.round(num) : 0;
+}
+
+function formatMoney(amount, currency = "USD") {
+  const num = Math.max(0, Math.round(Number(amount) || 0));
+  const cur = String(currency || "USD").toUpperCase();
+  const sym = cur === "EUR" ? "€" : (cur === "RUB" ? "₽" : "$");
+  return `${sym}${num.toLocaleString("en-US")}`;
+}
+
+function amountField(lead, label = "Бюджет ($)") {
+  return el("input", {
+    type: "number",
+    min: "0",
+    step: "1",
+    name: "amount",
+    className: "lead-amount-input",
+    value: String(leadAmount(lead)),
+    "aria-label": label,
+    onchange: (event) => {
+      const raw = event.target.value;
+      const num = Math.max(0, Math.round(Number(raw) || 0));
+      lead.amount = num;
+      if (state.leadCache[lead.id]) state.leadCache[lead.id].amount = num;
+      if (state.cards[lead.id]) state.cards[lead.id].amount = num;
+      const inList = state.leads.find((item) => Number(item.id) === Number(lead.id));
+      if (inList) inList.amount = num;
+      const sideBadge = document.querySelector("#side-card .side-amount-badge");
+      const dialogLead = state.selectedDialog ? leadForDialog(state.selectedDialog) : null;
+      if (sideBadge && dialogLead && Number(dialogLead.id) === Number(lead.id)) {
+        sideBadge.setAttribute("data-side-amount", String(num));
+        sideBadge.textContent = formatMoney(num, lead.currency);
+      }
+      renderBoard();
+      patchLead(lead.id, { amount: num });
+    },
+  });
+}
+
+function syncStageSelectOptions() {
+  const stageFilter = document.querySelector("#stage-filter");
+  if (stageFilter) {
+    const prev = stageFilter.value;
+    stageFilter.replaceChildren(el("option", { value: "" }, ["Все"]));
+    STATUSES.forEach(([key, label]) => {
+      stageFilter.append(el("option", { value: key }, [label]));
+    });
+    if (prev && [...stageFilter.options].some((opt) => opt.value === prev)) {
+      stageFilter.value = prev;
+    }
+  }
+  const fromLeadsStage = document.querySelector("#from-leads-stage-filter");
+  if (fromLeadsStage) {
+    const prev = fromLeadsStage.value;
+    fromLeadsStage.replaceChildren(el("option", { value: "" }, ["Все стадии"]));
+    STATUSES.forEach(([key, label]) => {
+      fromLeadsStage.append(el("option", { value: key }, [label]));
+    });
+    if (prev && [...fromLeadsStage.options].some((opt) => opt.value === prev)) {
+      fromLeadsStage.value = prev;
+    }
+  }
+  const bulkStatus = document.querySelector("#bulk-status-select");
+  if (bulkStatus) {
+    const prev = bulkStatus.value;
+    bulkStatus.replaceChildren();
+    STATUSES.forEach(([key, label]) => {
+      bulkStatus.append(el("option", { value: key }, [label]));
+    });
+    if (prev && [...bulkStatus.options].some((opt) => opt.value === prev)) {
+      bulkStatus.value = prev;
+    }
+  }
+}
+
+async function loadPipelineStages() {
+  try {
+    const stages = await api("/api/pipeline/stages");
+    if (Array.isArray(stages) && stages.length) {
+      state.pipelineStages = stages;
+      STATUSES.splice(
+        0,
+        STATUSES.length,
+        ...stages.map((s) => [String(s.key), String(s.label)])
+      );
+      stages.forEach((s) => {
+        if (!BADGE[s.key]) BADGE[s.key] = "b-new";
+      });
+      syncStageSelectOptions();
+      renderBoard();
+      renderLeadTable();
+      if (state.selectedLeadId != null && state.cards[state.selectedLeadId]) {
+        paintCard(state.cards[state.selectedLeadId]);
+      }
+      renderSide();
+    }
+  } catch (_err) {
+    /* fallback to default STATUSES */
+  }
+}
+
+async function promptRenameStage(stageKey, currentLabel) {
+  const nextLabel = window.prompt("Новое название стадии воронки:", currentLabel || "");
+  if (nextLabel == null) return;
+  const cleaned = String(nextLabel).trim();
+  if (!cleaned || cleaned === currentLabel) return;
+  try {
+    await api(`/api/pipeline/stages/${encodeURIComponent(stageKey)}`, {
+      method: "PATCH",
+      body: { label: cleaned },
+    });
+    await loadPipelineStages();
+    toast("Стадия переименована", "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось переименовать стадию", "error");
+  }
+}
+
+async function promptCreateStage() {
+  const rawLabel = window.prompt("Название новой стадии воронки:");
+  if (rawLabel == null) return;
+  const cleaned = String(rawLabel).trim();
+  if (!cleaned) return;
+  try {
+    await api("/api/pipeline/stages", {
+      method: "POST",
+      body: { label: cleaned },
+    });
+    await loadPipelineStages();
+    toast(`Стадия «${cleaned}» добавлена`, "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось добавить стадию", "error");
+  }
 }
 
 function textField(lead, field, label) {
@@ -1399,6 +1550,36 @@ function renderCampaigns() {
       ]),
     ];
 
+    const isRunning = camp.status === "running";
+    const statusToggleBtn = el("button", {
+      type: "button",
+      className: `btn ${isRunning ? "ghost" : "secondary"} sm campaign-status-toggle-btn`,
+      "data-campaign-id": String(camp.id),
+      "data-campaign-status": camp.status || "draft",
+      onclick: async (event) => {
+        const btn = event.currentTarget;
+        const nextStatus = camp.status === "running" ? "paused" : "running";
+        if (btn) btn.disabled = true;
+        try {
+          await api(`/api/campaigns/${camp.id}`, {
+            method: "PUT",
+            body: { status: nextStatus },
+          });
+          await loadCampaigns();
+          toast(
+            nextStatus === "running"
+              ? `Кампания «${camp.name}» переведена в активный автопилот`
+              : `Кампания «${camp.name}» поставлена на паузу`,
+            "ok",
+          );
+        } catch (error) {
+          toast(error.message, "error");
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+      },
+    }, [isRunning ? "Пауза" : "В автопилот"]);
+
     const cardChildren = [
       el("div", { className: "campaign-card-head" }, [
         el("h4", { className: "name" }, [camp.name]),
@@ -1424,7 +1605,7 @@ function renderCampaigns() {
       ]),
       el("div", { className: "sequence-preview" }, stepPills),
       poolEditorRow,
-      el("div", { className: "row" }, [runBtn, selectForCsvBtn, togglePoolBtn]),
+      el("div", { className: "row" }, [runBtn, statusToggleBtn, selectForCsvBtn, togglePoolBtn]),
     ];
 
     if (recipients.length) {
@@ -1859,6 +2040,7 @@ function syncTelegramWebAPanel(connected) {
 async function switchInboxSession(sessionKey) {
   const key = String(sessionKey || "all");
   state.inboxSessionFilter = key;
+  state.pinnedDialogId = null;
   const select = document.querySelector("#tg-account");
   if (key !== "all") {
     const chosenAcc = (state.accounts || []).find((acc) => String(acc.id) === key);
@@ -1866,13 +2048,35 @@ async function switchInboxSession(sessionKey) {
       state.inboxChatMode = "crm";
     }
     if (select) select.value = key;
-  } else if (key === "all" && select && !select.value) {
-    const firstConnected = (state.accounts || []).find((acc) => acc.status === "connected");
-    if (firstConnected) select.value = String(firstConnected.id);
+  } else if (key === "all" && select) {
+    const currentAcc = (state.accounts || []).find((acc) => String(acc.id) === String(select.value));
+    if (!select.value || (currentAcc && normalizeProvider(currentAcc.provider) !== "telegram")) {
+      const firstTg = (state.accounts || []).find(
+        (acc) => acc.status === "connected" && normalizeProvider(acc.provider) === "telegram"
+      ) || (state.accounts || []).find((acc) => acc.status === "connected");
+      if (firstTg) select.value = String(firstTg.id);
+    }
+  }
+  if (
+    key !== "all"
+    && state.selectedDialog
+    && state.selectedDialog.account_id != null
+    && String(state.selectedDialog.account_id) !== key
+  ) {
+    state.selectedDialog = null;
   }
   renderInboxSessionSwitcher();
   try {
     await loadInbox();
+    if (key !== "all" && !state.selectedDialog) {
+      const nextDialog = (state.dialogs || []).find((d) => String(d.account_id) === key) || null;
+      if (nextDialog) {
+        await selectDialog(nextDialog, { markRead: false });
+      } else {
+        renderThread();
+        renderSide();
+      }
+    }
   } catch (error) {
     closeInboxLive();
     state.inbox = "error";
@@ -1882,24 +2086,84 @@ async function switchInboxSession(sessionKey) {
   }
 }
 
+const INBOX_CHIP_LABELS = {
+  waiting: "Ждёт ответа",
+  our_turn: "Ждём ответа от лида",
+  unread: "Непрочитанные",
+  groups: "Группы",
+  muted: "Без звука",
+};
+
 function chipOn(name) {
   const button = document.querySelector(`[data-chip="${name}"]`);
   return button && button.getAttribute("aria-pressed") === "true";
+}
+
+function activeInboxChips() {
+  return [...document.querySelectorAll("#s04 [data-chip]")]
+    .filter((btn) => btn.getAttribute("aria-pressed") === "true")
+    .map((btn) => btn.dataset.chip)
+    .filter(Boolean);
+}
+
+function computeLocalInboxCounts(dialogs) {
+  const pool = (Array.isArray(dialogs) ? dialogs : []).filter((dialog) => {
+    if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
+      if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
+    }
+    return true;
+  });
+  return {
+    waiting: pool.filter((d) => Number(d.last_from_peer || 0) === 1 || Boolean(d.waiting) || Boolean(d.last_from_other)).length,
+    our_turn: pool.filter((d) => Number(d.last_from_peer || 0) === 0).length,
+    unread: pool.filter((d) => Number(d.unread_count || 0) > 0).length,
+    groups: pool.filter((d) => d.peer_type === "group" || d.peer_type === "chat" || Boolean(d.is_group)).length,
+    muted: pool.filter((d) => Boolean(d.muted)).length,
+  };
+}
+
+function renderInboxChipCounts(explicitCounts = null) {
+  const basePool = Array.isArray(state.allDialogs) && state.allDialogs.length
+    ? state.allDialogs
+    : state.dialogs;
+  const counts = explicitCounts || state.inboxCounts || computeLocalInboxCounts(basePool);
+  Object.entries(INBOX_CHIP_LABELS).forEach(([key, label]) => {
+    const button = document.querySelector(`#s04 [data-chip="${key}"]`);
+    if (!button) return;
+    const val = Number(counts && counts[key] != null ? counts[key] : 0) || 0;
+    button.dataset.count = String(val);
+    button.replaceChildren(
+      `${label} (`,
+      el("span", { className: "chip-count", "data-chip-count": key }, [String(val)]),
+      ")",
+    );
+  });
 }
 
 function passChips(dialog) {
   if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
     if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
   }
+  if (
+    state.pinnedDialogId != null
+    && dialog
+    && dialog.id != null
+    && Number(dialog.id) === Number(state.pinnedDialogId)
+    && state.selectedDialog
+    && isSameDialog(state.selectedDialog, dialog)
+  ) {
+    return true;
+  }
   if (chipOn("waiting") && !(Number(dialog.last_from_peer || 0) === 1 || Boolean(dialog.waiting) || Boolean(dialog.last_from_other))) return false;
-  if (chipOn("our_turn") && !(Number(dialog.last_from_peer || 0) === 0 && Boolean(dialog.last_message_at))) return false;
-  if (chipOn("unread") && !dialog.unread_count) return false;
-  if (chipOn("groups") && dialog.peer_type !== "group" && !dialog.is_group) return false;
+  if (chipOn("our_turn") && !(Number(dialog.last_from_peer || 0) === 0)) return false;
+  if (chipOn("unread") && !(Number(dialog.unread_count || 0) > 0)) return false;
+  if (chipOn("groups") && dialog.peer_type !== "group" && dialog.peer_type !== "chat" && !dialog.is_group) return false;
   if (chipOn("muted") && !dialog.muted) return false;
   return true;
 }
 
 function renderDialogs() {
+  renderInboxChipCounts();
   const list = document.querySelector("#dialog-results");
   const matched = state.dialogs.filter(passChips);
   if (state.inbox === "error") return;
@@ -1952,7 +2216,7 @@ function renderDialogs() {
     const button = el("button", {
       type: "button",
       className: "dialog",
-      onclick: () => selectDialog(dialog),
+      onclick: () => selectDialog(dialog, { markRead: true }),
     }, [
       el("span", { className: "avatar", "aria-hidden": "true" }, [initials(name)]),
       who,
@@ -2030,7 +2294,7 @@ function selectedAccount() {
   return state.accounts.find((account) => account.id === id) || null;
 }
 
-async function selectDialog(dialog) {
+async function selectDialog(dialog, options = {}) {
   if (dialog && dialog.account_id) {
     const select = document.querySelector("#tg-account");
     if (select && [...select.options].some((opt) => opt.value === String(dialog.account_id))) {
@@ -2038,9 +2302,27 @@ async function selectDialog(dialog) {
     }
   }
   state.selectedDialog = dialog;
+  if (options && options.markRead && dialog && dialog.id != null) {
+    state.pinnedDialogId = dialog.id;
+  }
   state.messages = [];
   setView("#thread-view", "loading");
-  renderDialogs();
+  if (options && options.markRead && dialog && dialog.id && Number(dialog.unread_count) > 0) {
+    dialog.unread_count = 0;
+    upsertDialog(dialog);
+    api(`/api/inbox/dialogs/${dialog.id}/read`, { method: "POST" }).then((res) => {
+      const connectedCount = (state.accounts || []).filter((acc) => acc.status === "connected").length;
+      const useAll = state.inboxSessionFilter === "all" && connectedCount > 1;
+      if (res && useAll && res.all_counts) {
+        state.inboxCounts = res.all_counts;
+      } else if (res && res.counts) {
+        state.inboxCounts = res.counts;
+      }
+      renderInboxChipCounts();
+    }).catch(() => {});
+  } else {
+    renderDialogs();
+  }
   const reply = document.querySelector("#reply-text");
   if (reply) reply.value = "";
   let loadError = "";
@@ -2080,7 +2362,65 @@ function leadForDialog(dialog) {
   }) || null;
 }
 
-function renderSide() {
+const LEAD_EVENT_META = {
+  created: { label: "Создан", badge: "b-new" },
+  status_changed: { label: "Стадия", badge: "b-talk" },
+  amount_changed: { label: "Бюджет", badge: "b-won" },
+  outreach_sent: { label: "Рассылка", badge: "b-wait" },
+  reply_received: { label: "Ответ", badge: "b-ok" },
+  note_added: { label: "Заметка", badge: "b-new" },
+  reminder_set: { label: "Напоминание", badge: "b-wait" },
+  merged: { label: "Слияние", badge: "b-talk" },
+};
+
+function renderLeadEventsSection(lead, { compact = false } = {}) {
+  const cardData = (lead && lead.id && state.cards[lead.id]) || lead || {};
+  const rawEvents = Array.isArray(cardData.events)
+    ? cardData.events
+    : (Array.isArray(lead && lead.events) ? lead.events : []);
+  const items = compact ? rawEvents.slice(-5).reverse() : [...rawEvents].reverse();
+  const listNode = items.length
+    ? el("ol", { className: `event-timeline${compact ? " is-compact" : ""}` }, items.map((ev) => {
+      const meta = LEAD_EVENT_META[ev.event_type] || { label: ev.event_type || "Событие", badge: "b-new" };
+      const stampText = formatDue(ev.created_at) || formatShortTime(ev.created_at) || "";
+      return el("li", {
+        className: "event-timeline-item",
+        "data-event-type": ev.event_type || "",
+      }, [
+        el("div", { className: "event-timeline-head" }, [
+          el("span", { className: `badge ${meta.badge} event-type-badge` }, [meta.label]),
+          stampText ? el("time", { className: "meta event-time", datetime: ev.created_at || "" }, [stampText]) : null,
+        ].filter(Boolean)),
+        el("p", { className: "event-timeline-title" }, [ev.title || ""]),
+      ]);
+    }))
+    : el("p", { className: "hint" }, ["Событий пока нет"]);
+
+  return el("section", {
+    className: "lead-events-section stack",
+    "aria-label": "История событий",
+  }, [
+    el("div", { className: "row event-section-head" }, [
+      el("h4", {}, ["История событий"]),
+      el("span", { className: "badge b-new event-count-badge" }, [String(rawEvents.length)]),
+    ]),
+    listNode,
+  ]);
+}
+
+function refreshSideEvents(leadId) {
+  const dialog = state.selectedDialog;
+  if (!dialog) return;
+  const lead = leadForDialog(dialog);
+  if (!lead || Number(lead.id) !== Number(leadId)) return;
+  const existing = document.querySelector("#side-card .lead-events-section");
+  const nextNode = renderLeadEventsSection(state.cards[lead.id] || lead, { compact: true });
+  if (existing && existing.parentNode) {
+    existing.replaceWith(nextNode);
+  }
+}
+
+function renderSide({ syncSelectedLead = true } = {}) {
   const dialog = state.selectedDialog;
   if (!dialog) {
     setView("#side-view", "empty");
@@ -2091,7 +2431,9 @@ function renderSide() {
     setView("#side-view", "nolead");
     return;
   }
-  state.selectedLeadId = lead.id;
+  if (syncSelectedLead) {
+    state.selectedLeadId = lead.id;
+  }
   const badge = BADGE[lead.status] || "b-new";
   const label = (STATUSES.find(([value]) => value === lead.status) || ["", lead.status])[1];
   const provider = normalizeProvider(lead.provider || dialog.provider || "telegram");
@@ -2105,15 +2447,23 @@ function renderSide() {
       el("div", { className: "row" }, [
         channelBadgeEl(provider),
         el("span", { className: `badge ${badge}` }, [label]),
+        el("span", { className: "badge b-won side-amount-badge", "data-side-amount": String(leadAmount(lead)) }, [
+          formatMoney(leadAmount(lead), lead.currency),
+        ]),
       ]),
       el("p", { className: "hint" }, [handleParts.join(" · ")]),
+      el("label", { className: "side-amount-label" }, ["Бюджет ($)", amountField(lead, "Бюджет ($)")]),
       leadTrackingBox(lead),
       el("p", { className: "note" }, [sideNoteText(lead)]),
       el("p", { className: "hint" }, [lead.next_step ? `Дальше: ${lead.next_step}` : "Следующий шаг не задан"]),
+      renderLeadEventsSection(state.cards[lead.id] || lead, { compact: true }),
       el("a", {
         className: "btn secondary sm",
         href: "#s09",
         onclick: (event) => {
+          state.selectedLeadId = lead.id;
+          renderCard();
+          renderBoard();
           if (state.viewMode === "sheet") {
             event.preventDefault();
             openSheetPopup("card");
@@ -2123,8 +2473,15 @@ function renderSide() {
     ]),
   );
   setView("#side-view", "filled");
-  renderCard();
-  renderBoard();
+  if (syncSelectedLead) {
+    renderCard();
+    renderBoard();
+  } else if (!state.cards[lead.id]) {
+    api(`/api/leads/${lead.id}/card`).then((cardData) => {
+      state.cards[lead.id] = cardData;
+      refreshSideNote(lead.id);
+    }).catch(() => {});
+  }
 }
 
 function selectedLead() {
@@ -2152,6 +2509,7 @@ function refreshSideNote(leadId) {
   if (!lead || lead.id !== leadId) return;
   const note = document.querySelector("#side-card .note");
   if (note) note.textContent = sideNoteText(lead);
+  refreshSideEvents(leadId);
 }
 
 async function focusLead(id) {
@@ -2216,6 +2574,7 @@ function openReminderModal(lead) {
       method: "POST",
       body: { lead_id: lead.id, due_at: due, text: body },
     });
+    delete state.cards[lead.id];
     await loadReminders();
     toast("Напоминание на столе", "ok");
     return true;
@@ -2292,6 +2651,7 @@ function taskList(lead) {
         await api(`/api/tasks/${item.id}/done`, { method: "POST", body: { done: box.checked } });
         delete state.cards[lead.id];
         await renderCard();
+        loadFocusToday().catch(() => {});
       } catch (error) {
         box.checked = !box.checked;
         box.disabled = false;
@@ -2323,6 +2683,7 @@ function taskForm(lead) {
         text.value = "";
         delete state.cards[lead.id];
         await renderCard();
+        loadFocusToday().catch(() => {});
         toast("Задача поставлена", "ok");
       } catch (error) {
         toast(error.message, "error");
@@ -2487,6 +2848,7 @@ function paintCard(lead) {
     el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
     el("label", {}, ["Телефон", textField(lead, "phone", "Телефон")]),
     el("label", {}, ["Статус", statusSelect(lead)]),
+    el("label", {}, ["Бюджет ($)", amountField(lead, "Бюджет ($)")]),
     el("p", { id: "card-folder" }, [
       lead.folder_name ? `Папка: ${lead.folder_name}` : "Папка не задана",
     ]),
@@ -2502,6 +2864,7 @@ function paintCard(lead) {
   profile.push(
     el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
     timeline,
+    renderLeadEventsSection(lead),
     el("section", { "aria-label": "Задачи" }, [
       el("h4", {}, ["Задачи"]),
       taskList(lead),
@@ -2670,12 +3033,14 @@ function updateWorkspaceStats() {
     const pctAcc = Math.min(100, Math.max(10, Math.round((connectedCount / 10) * 100)));
     quotaAccFill.style.width = `${pctAcc}%`;
   }
+  scheduleAnalyticsRefresh();
 }
 
 function renderBoard() {
   const { status: stage, folderId, channel, followup } = pipelineFilters();
   const board = document.querySelector("#board");
   board.replaceChildren();
+  board.style.setProperty("--stage-cols", String(Math.max(1, STATUSES.length)));
   STATUSES.forEach(([value, label]) => {
     const cards = state.leads.filter((lead) => {
       if (lead.status !== value) return false;
@@ -2685,6 +3050,7 @@ function renderBoard() {
       if (!matchFollowupFilter(lead, followup)) return false;
       return true;
     });
+    const stageSum = cards.reduce((acc, item) => acc + leadAmount(item), 0);
     const items = cards.length
       ? cards.map((lead) => {
         const current = lead.id === state.selectedLeadId;
@@ -2693,6 +3059,8 @@ function renderBoard() {
         const userText = lead.username
           ? `@${lead.username}`
           : (provider === "whatsapp" && lead.phone ? lead.phone : "без ника");
+        const amt = leadAmount(lead);
+        const amtText = formatMoney(amt, lead.currency);
         const tr = resolveLeadTracking(lead);
         const bodyNodes = [
           el("span", { className: "card-top" }, [
@@ -2708,6 +3076,7 @@ function renderBoard() {
         const folderTitle = folderTitleById(lead.folder_id);
         const tagNodes = [
           channelBadgeEl(provider),
+          el("span", { className: "card-amount", "data-card-amount": String(amt) }, [amtText]),
           el("span", { className: "card-pill" }, [folderTitle || label]),
         ];
         if (tr.accountName || tr.accountPhone) {
@@ -2728,9 +3097,33 @@ function renderBoard() {
         }
         bodyNodes.push(el("span", { className: "card-tags" }, tagNodes));
         const link = el("a", {
-          className: "card",
+          className: "card lead-card",
+          draggable: "true",
+          "data-lead-id": String(lead.id),
+          "data-status": String(lead.status),
+          "data-amount": String(amt),
           href: "#s09",
+          ondragstart: (event) => {
+            state.draggedLeadId = lead.id;
+            link.classList.add("is-dragging");
+            if (event.dataTransfer) {
+              event.dataTransfer.effectAllowed = "move";
+              try {
+                event.dataTransfer.setData("text/plain", String(lead.id));
+              } catch (_err) { /* ignore */ }
+            }
+          },
+          ondragend: () => {
+            state.draggedLeadId = null;
+            link.classList.remove("is-dragging");
+            document.querySelectorAll("#board .col.is-drag-over").forEach((colNode) => {
+              colNode.classList.remove("is-drag-over");
+            });
+          },
           onclick: (event) => {
+            if (event.target && event.target.closest && event.target.closest(".lead-bulk-checkbox")) {
+              return;
+            }
             state.selectedLeadId = lead.id;
             renderCard();
             renderBoard();
@@ -2747,15 +3140,80 @@ function renderBoard() {
         return link;
       })
       : [el("p", { className: "hint" }, ["Пусто"])];
-    const dot = el("span", { className: "stage-dot", "data-stage": value, "aria-hidden": "true" }, []);
-    const count = el("span", { className: "meta" }, [String(cards.length)]);
-    board.append(el("section", { className: "col" }, [
-      el("header", {}, [dot, el("h3", {}, [label]), count]),
+    const stageMeta = (state.pipelineStages || []).find((s) => String(s.key) === String(value));
+    const stageColor = stageMeta && stageMeta.color ? String(stageMeta.color).trim() : "";
+    const dot = el("span", {
+      className: "stage-dot",
+      "data-stage": value,
+      "data-stage-color": stageColor || undefined,
+      "aria-hidden": "true",
+    }, []);
+    if (stageColor) {
+      dot.style.background = stageColor;
+    }
+    const titleEl = el("h3", {
+      "data-stage-key": value,
+      title: "Двойной клик для переименования стадии",
+      ondblclick: () => promptRenameStage(value, label),
+    }, [label]);
+    const sep1 = el("span", { className: "col-sep", "aria-hidden": "true" }, [" · "]);
+    const count = el("span", { className: "meta col-count", "data-col-count": String(cards.length) }, [String(cards.length)]);
+    const sep2 = el("span", { className: "col-sep", "aria-hidden": "true" }, [" · "]);
+    const activeCurrencies = [...new Set(
+      (cards.filter((item) => leadAmount(item) > 0).length ? cards.filter((item) => leadAmount(item) > 0) : cards)
+        .map((item) => String(item.currency || "USD").toUpperCase())
+    )];
+    const stageCurrency = activeCurrencies.length === 1 ? activeCurrencies[0] : "USD";
+    const sumEl = el("span", { className: "meta col-sum", "data-col-sum": String(stageSum) }, [formatMoney(stageSum, stageCurrency)]);
+    const colEl = el("section", {
+      className: "col",
+      "data-stage": value,
+      ondragover: (event) => {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+        colEl.classList.add("is-drag-over");
+      },
+      ondragleave: (event) => {
+        if (!colEl.contains(event.relatedTarget)) {
+          colEl.classList.remove("is-drag-over");
+        }
+      },
+      ondrop: async (event) => {
+        event.preventDefault();
+        colEl.classList.remove("is-drag-over");
+        let rawId = "";
+        if (event.dataTransfer) {
+          try {
+            rawId = event.dataTransfer.getData("text/plain");
+          } catch (_err) { /* ignore */ }
+        }
+        const leadId = Number(rawId || state.draggedLeadId || 0);
+        state.draggedLeadId = null;
+        if (!leadId) return;
+        const targetLead = state.leads.find((l) => Number(l.id) === leadId) || state.leadCache[leadId];
+        if (targetLead && targetLead.status === value) return;
+        if (targetLead) {
+          targetLead.status = value;
+          if (state.leadCache[leadId]) state.leadCache[leadId].status = value;
+          if (state.cards[leadId]) state.cards[leadId].status = value;
+          renderBoard();
+          renderLeadTable();
+          if (state.selectedLeadId === leadId && state.cards[leadId]) {
+            paintCard(state.cards[leadId]);
+          }
+          renderSide();
+        }
+        await patchLead(leadId, { status: value });
+      },
+    }, [
+      el("header", {}, [dot, titleEl, sep1, count, sep2, sumEl]),
       ...items,
-    ]));
+    ]);
+    board.append(colEl);
   });
   updateFilterNote();
   updateWorkspaceStats();
+  if (typeof decorateBoardBulkCheckboxes === "function") decorateBoardBulkCheckboxes();
 }
 
 function reminderForm(lead) {
@@ -2784,6 +3242,7 @@ function reminderForm(lead) {
         date.value = "";
         time.value = "";
         text.value = "";
+        delete state.cards[lead.id];
         await loadReminders();
         toast("Напоминание на столе", "ok");
       } catch (error) {
@@ -2838,13 +3297,18 @@ function renderLeadTable() {
         `${formatDue(rem.due_at)} · ${rem.text}`,
       ])
     ));
+    const bulkCell = typeof createLeadBulkCell === "function"
+      ? createLeadBulkCell(lead)
+      : el("td", { className: "bulk-check-col" }, []);
     const row = el("tr", {
+      "data-lead-id": String(lead.id),
       onclick: () => {
         state.selectedLeadId = lead.id;
         renderCard();
         renderBoard();
       },
     }, [
+      bulkCell,
       el("td", {}, [
         el("div", { className: "lead-name-cell" }, [
           channelBadgeEl(provider),
@@ -2875,6 +3339,7 @@ function renderLeadTable() {
     ]);
     body.append(row);
   });
+  if (typeof syncBulkSelectionUI === "function") syncBulkSelectionUI();
 }
 
 async function loadLeads(query, keepId) {
@@ -2894,7 +3359,8 @@ async function loadLeads(query, keepId) {
   renderLeadTable();
   renderBoard();
   renderCard();
-  renderSide();
+  renderSide({ syncSelectedLead: keepId == null && state.selectedLeadId == null });
+  loadFocusToday().catch(() => {});
   const leadMode = leads.length ? "filled" : (state.leadQuery ? "none" : "empty");
   setView("#leads-view", leadMode);
   setView("#board-view", leads.length ? "filled" : "empty");
@@ -3026,6 +3492,199 @@ async function loadReminders() {
   renderLeadTable();
   renderBoard();
   renderCard();
+  loadFocusToday().catch(() => {});
+}
+
+function renderFocusToday(data) {
+  const waitingList = document.querySelector("#focus-waiting-reply-list");
+  const remList = document.querySelector("#focus-due-reminders-list");
+  const staleList = document.querySelector("#focus-stale-leads-list");
+  if (!waitingList || !remList || !staleList) return;
+
+  const waiting = Array.isArray(data?.waiting_reply) ? data.waiting_reply : [];
+  const rawReminders = Array.isArray(data?.due_reminders) ? data.due_reminders : [];
+  const rawTasks = Array.isArray(data?.open_tasks) ? data.open_tasks : [];
+  const dueReminders = rawReminders.filter((item) => item && item.kind !== "task");
+  const openTasks = rawTasks.length
+    ? rawTasks
+    : rawReminders.filter((item) => item && item.kind === "task");
+  const staleLeads = Array.isArray(data?.stale_leads) ? data.stale_leads : [];
+
+  const countWaitNode = document.querySelector("#focus-count-waiting");
+  const countRemNode = document.querySelector("#focus-count-reminders");
+  const countStaleNode = document.querySelector("#focus-count-stale");
+  const totalBadgeNode = document.querySelector("#focus-today-total-badge");
+
+  const remAndTaskCount = dueReminders.length + openTasks.length;
+  const totalFocus = waiting.length + remAndTaskCount + staleLeads.length;
+
+  if (countWaitNode) countWaitNode.textContent = String(waiting.length);
+  if (countRemNode) countRemNode.textContent = String(remAndTaskCount);
+  if (countStaleNode) countStaleNode.textContent = String(staleLeads.length);
+  if (totalBadgeNode) totalBadgeNode.textContent = `${totalFocus} в фокусе`;
+
+  waitingList.replaceChildren();
+  if (!waiting.length) {
+    waitingList.append(el("p", { className: "hint empty-state" }, ["Все диалоги отвечены"]));
+  } else {
+    waiting.slice(0, 6).forEach((item) => {
+      const who = item.lead_name || item.name || item.username || item.phone || `Диалог #${item.dialog_id}`;
+      const handle = item.username ? `@${item.username}` : (item.phone || "");
+      const preview = item.last_message_preview || "Входящее сообщение";
+      const provider = normalizeProvider(item.provider || "telegram");
+      const actions = [
+        el("button", {
+          type: "button",
+          className: "btn primary sm",
+          onclick: () => openChat({
+            id: item.lead_id || null,
+            account_id: item.account_id || null,
+            telegram_user_id: item.telegram_user_id || null,
+            username: item.username || "",
+            name: who,
+            phone: item.phone || "",
+            provider,
+          }),
+        }, ["Ответить"]),
+      ];
+      if (item.lead_id) {
+        actions.push(el("button", {
+          type: "button",
+          className: "btn ghost sm",
+          onclick: () => focusLead(item.lead_id),
+        }, ["К лиду"]));
+      }
+      waitingList.append(el("div", { className: "focus-item", "data-focus-kind": "waiting_reply" }, [
+        el("div", { className: "focus-item-top" }, [
+          channelBadgeEl(provider),
+          el("strong", { className: "focus-item-title" }, [who]),
+          handle ? el("span", { className: "meta" }, [handle]) : null,
+        ].filter(Boolean)),
+        el("p", { className: "focus-item-sub" }, [preview]),
+        el("div", { className: "row focus-item-actions" }, actions),
+      ]));
+    });
+  }
+
+  remList.replaceChildren();
+  if (!dueReminders.length && !openTasks.length) {
+    remList.append(el("p", { className: "hint empty-state" }, ["На сегодня напоминаний нет"]));
+  } else {
+    dueReminders.slice(0, 5).forEach((rem) => {
+      const who = rem.lead_name || rem.lead_username || `Лид #${rem.lead_id}`;
+      const isOverdue = Boolean(rem.overdue);
+      const remId = rem.reminder_id || rem.id;
+      remList.append(el("div", {
+        className: `focus-item${isOverdue ? " is-overdue" : ""}`,
+        "data-focus-kind": "due_reminder",
+      }, [
+        el("div", { className: "focus-item-top" }, [
+          el("span", { className: `badge ${isOverdue ? "b-wait" : "b-talk"}` }, [
+            isOverdue ? "Просрочено" : "Сегодня",
+          ]),
+          el("strong", { className: "focus-item-title" }, [who]),
+        ]),
+        el("p", { className: "focus-item-sub" }, [rem.text || ""]),
+        el("div", { className: "row focus-item-actions" }, [
+          el("button", {
+            type: "button",
+            className: "btn secondary sm",
+            onclick: async () => {
+              try {
+                await api(`/api/reminders/${remId}/done`, { method: "POST" });
+                if (rem.lead_id) delete state.cards[rem.lead_id];
+                await loadReminders();
+              } catch (err) {
+                toast(err.message, "error");
+              }
+            },
+          }, ["Сделано"]),
+          el("button", {
+            type: "button",
+            className: "btn ghost sm",
+            onclick: () => focusLead(rem.lead_id),
+          }, ["К лиду"]),
+        ]),
+      ]));
+    });
+    openTasks.slice(0, 3).forEach((task) => {
+      const who = task.lead_name || task.lead_username || `Лид #${task.lead_id}`;
+      const taskId = task.task_id || task.id;
+      remList.append(el("div", { className: "focus-item", "data-focus-kind": "open_task" }, [
+        el("div", { className: "focus-item-top" }, [
+          el("span", { className: "badge b-new" }, ["Задача"]),
+          el("strong", { className: "focus-item-title" }, [who]),
+        ]),
+        el("p", { className: "focus-item-sub" }, [task.title || task.text || ""]),
+        el("div", { className: "row focus-item-actions" }, [
+          el("button", {
+            type: "button",
+            className: "btn secondary sm",
+            onclick: async () => {
+              try {
+                await api(`/api/tasks/${taskId}/done`, { method: "POST", body: { done: true } });
+                if (task.lead_id) delete state.cards[task.lead_id];
+                await renderCard();
+                await loadFocusToday();
+              } catch (err) {
+                toast(err.message, "error");
+              }
+            },
+          }, ["Сделано"]),
+          el("button", {
+            type: "button",
+            className: "btn ghost sm",
+            onclick: () => focusLead(task.lead_id),
+          }, ["К лиду"]),
+        ]),
+      ]));
+    });
+  }
+
+  staleList.replaceChildren();
+  if (!staleLeads.length) {
+    staleList.append(el("p", { className: "hint empty-state" }, ["Зависших сделок нет"]));
+  } else {
+    staleLeads.slice(0, 6).forEach((lead) => {
+      const who = lead.name || (lead.username ? `@${lead.username}` : `Лид #${lead.id}`);
+      const stageLabel = (STATUSES.find(([v]) => v === lead.status) || ["", lead.status])[1];
+      const days = Number(lead.days_stale) || 3;
+      const amt = Number(lead.amount) || 0;
+      staleList.append(el("div", { className: "focus-item", "data-focus-kind": "stale_lead" }, [
+        el("div", { className: "focus-item-top" }, [
+          el("span", { className: `badge ${BADGE[lead.status] || "b-wait"}` }, [stageLabel]),
+          el("strong", { className: "focus-item-title" }, [who]),
+          amt > 0 ? el("span", { className: "badge b-won" }, [formatMoney(amt, lead.currency)]) : null,
+        ].filter(Boolean)),
+        el("p", { className: "focus-item-sub" }, [
+          `Без движения ${days} дн.${lead.next_step ? ` · ${lead.next_step}` : ""}`,
+        ]),
+        el("div", { className: "row focus-item-actions" }, [
+          el("button", {
+            type: "button",
+            className: "btn secondary sm",
+            onclick: () => openChat(lead),
+          }, ["Написать"]),
+          el("button", {
+            type: "button",
+            className: "btn ghost sm",
+            onclick: () => focusLead(lead.id),
+          }, ["К карточке"]),
+        ]),
+      ]));
+    });
+  }
+}
+
+async function loadFocusToday() {
+  try {
+    const data = await api("/api/focus/today");
+    state.focusToday = data;
+    renderFocusToday(data);
+    return data;
+  } catch (_err) {
+    return null;
+  }
 }
 
 function setInboxLive(on) {
@@ -3048,6 +3707,16 @@ function upsertDialog(dialog) {
   const idx = state.dialogs.findIndex((row) => isSameDialog(row, dialog));
   if (idx >= 0) state.dialogs[idx] = { ...state.dialogs[idx], ...dialog };
   else state.dialogs.unshift(dialog);
+  if (Array.isArray(state.allDialogs)) {
+    const allIdx = state.allDialogs.findIndex((row) => isSameDialog(row, dialog));
+    if (allIdx >= 0) state.allDialogs[allIdx] = { ...state.allDialogs[allIdx], ...dialog };
+    else state.allDialogs.unshift(dialog);
+    if (!state.inboxCounts || state.allDialogs.length < 30) {
+      state.inboxCounts = computeLocalInboxCounts(state.allDialogs);
+    }
+  } else if (!state.inboxCounts || state.dialogs.length < 30) {
+    state.inboxCounts = computeLocalInboxCounts(state.dialogs);
+  }
   if (state.inbox !== "filled") {
     state.inbox = "filled";
     setView("#inbox-view", "filled");
@@ -3086,8 +3755,14 @@ function openInboxLive(accountId) {
     try {
       const rows = JSON.parse(event.data);
       if (!Array.isArray(rows)) return;
-      state.dialogs = rows;
-      state.inbox = rows.length ? "filled" : "empty";
+      state.allDialogs = [...rows];
+      if (!state.inboxCounts || rows.length < 30) {
+        state.inboxCounts = computeLocalInboxCounts(rows);
+      }
+      if (!activeInboxChips().length) {
+        state.dialogs = rows;
+        state.inbox = rows.length ? "filled" : "empty";
+      }
       renderDialogs();
     } catch (_err) { /* битый кадр не затирает список */ }
   });
@@ -3114,6 +3789,8 @@ async function loadInbox() {
   const select = document.querySelector("#tg-account");
   if (!select.value) {
     state.dialogs = [];
+    state.allDialogs = [];
+    state.inboxCounts = { waiting: 0, our_turn: 0, unread: 0, groups: 0, muted: 0 };
     state.inbox = "empty";
     state.dialogQuery = "";
     renderDialogs();
@@ -3124,7 +3801,19 @@ async function loadInbox() {
   const targetAccountId = (state.inboxSessionFilter === "all" && connectedCount > 1)
     ? "0"
     : select.value;
-  const dialogs = await api(`/api/inbox?account_id=${targetAccountId}`);
+  const activeChips = activeInboxChips().join(",");
+  const qs = new URLSearchParams({ account_id: String(targetAccountId), with_counts: "1" });
+  if (activeChips) qs.set("chip", activeChips);
+  const res = await api(`/api/inbox?${qs.toString()}`);
+  const dialogs = Array.isArray(res) ? res : (res && Array.isArray(res.dialogs) ? res.dialogs : []);
+  if (res && res.counts && typeof res.counts === "object") {
+    state.inboxCounts = res.counts;
+  } else {
+    state.inboxCounts = computeLocalInboxCounts(dialogs);
+  }
+  if (!activeChips) {
+    state.allDialogs = [...dialogs];
+  }
   state.dialogs = dialogs;
   state.dialogQuery = "";
   state.inbox = "filled";
@@ -3650,14 +4339,33 @@ document.querySelector("#search-form").addEventListener("submit", async (event) 
   }
 });
 
-document.querySelector(".chips").addEventListener("click", (event) => {
+document.querySelector(".chips").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-chip]");
   if (!button) return;
+  state.pinnedDialogId = null;
   const on = button.getAttribute("aria-pressed") === "true";
-  button.setAttribute("aria-pressed", on ? "false" : "true");
+  const nextState = !on;
+  button.setAttribute("aria-pressed", nextState ? "true" : "false");
+  if (nextState && button.dataset.chip === "waiting") {
+    const other = document.querySelector('#s04 [data-chip="our_turn"]');
+    if (other) other.setAttribute("aria-pressed", "false");
+  } else if (nextState && button.dataset.chip === "our_turn") {
+    const other = document.querySelector('#s04 [data-chip="waiting"]');
+    if (other) other.setAttribute("aria-pressed", "false");
+  }
   const any = [...document.querySelectorAll("[data-chip]")].some((item) => item.getAttribute("aria-pressed") === "true");
   document.querySelector("#chip-note").hidden = !any;
-  if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") renderDialogs();
+  if (!state.dialogQuery) {
+    if (Array.isArray(state.allDialogs) && state.allDialogs.length) {
+      state.dialogs = [...state.allDialogs];
+    }
+    if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") renderDialogs();
+    try {
+      await loadInbox();
+    } catch (_err) { /* оставляем локальную фильтрацию */ }
+  } else if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") {
+    renderDialogs();
+  }
 });
 
 document.querySelector("#folder-account").addEventListener("change", () => {
@@ -4095,6 +4803,10 @@ document.querySelector("#manual-lead").addEventListener("submit", async (event) 
   button.disabled = true;
   try {
     const provider = form.get("provider") || "telegram";
+    const rawAmount = form.get("amount");
+    const amount = rawAmount != null && String(rawAmount).trim() !== ""
+      ? Math.max(0, Math.round(Number(rawAmount) || 0))
+      : 0;
     const lead = await api("/api/leads", {
       method: "POST",
       body: {
@@ -4102,6 +4814,7 @@ document.querySelector("#manual-lead").addEventListener("submit", async (event) 
         username: form.get("username"),
         phone: form.get("phone"),
         provider,
+        amount,
         note: form.get("note"),
         url: form.get("url"),
         email: form.get("email"),
@@ -4381,6 +5094,7 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
         body: { text },
       });
       state.messages = [...(state.messages || []), message];
+      state.pinnedDialogId = dialog.id;
       dialog.last_message_preview = text;
       dialog.last_from_peer = 0;
       dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
@@ -4391,6 +5105,7 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
       renderDialogs();
       loadAccounts().catch(() => {});
       loadCampaigns().catch(() => {});
+      loadFocusToday().catch(() => {});
     } catch (err) {
       error.hidden = false;
       error.textContent = err.message;
@@ -4402,11 +5117,48 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
   });
 }
 
-document.querySelector("#mark-unread").addEventListener("click", () => {
+document.querySelector("#mark-unread").addEventListener("click", async () => {
   const error = document.querySelector("#thread-error");
-  error.hidden = false;
-  error.textContent = "Пометка непрочитанного ещё не подключена.";
-  toast(error.textContent, "error");
+  const dialog = state.selectedDialog;
+  error.hidden = true;
+  error.textContent = "";
+  if (!dialog || !dialog.id) {
+    error.hidden = false;
+    error.textContent = "Выберите разговор";
+    toast(error.textContent, "error");
+    return;
+  }
+  const btn = document.querySelector("#mark-unread");
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+  }
+  try {
+    const res = await api(`/api/inbox/dialogs/${dialog.id}/unread`, { method: "POST" });
+    state.pinnedDialogId = dialog.id;
+    dialog.unread_count = Number(res && res.unread_count != null ? res.unread_count : Math.max(1, Number(dialog.unread_count) || 0));
+    dialog.last_from_peer = 1;
+    upsertDialog(dialog);
+    const connectedCount = (state.accounts || []).filter((acc) => acc.status === "connected").length;
+    const useAll = state.inboxSessionFilter === "all" && connectedCount > 1;
+    if (res && useAll && res.all_counts) {
+      state.inboxCounts = res.all_counts;
+    } else if (res && res.counts) {
+      state.inboxCounts = res.counts;
+    }
+    renderDialogs();
+    loadFocusToday().catch(() => {});
+    toast("Диалог отмечен непрочитанным", "ok");
+  } catch (err) {
+    error.hidden = false;
+    error.textContent = err.message || "Не удалось отметить непрочитанным";
+    toast(error.textContent, "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+    }
+  }
 });
 
 document.querySelector("#modal-form").addEventListener("submit", async (event) => {
@@ -5164,6 +5916,538 @@ if (aiBotSaveBtn) {
   });
 }
 
+let analyticsRefreshTimer = 0;
+
+function formatMoneyUsd(value) {
+  const num = Number(value) || 0;
+  return `$${num.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+}
+
+function scheduleAnalyticsRefresh() {
+  window.clearTimeout(analyticsRefreshTimer);
+  analyticsRefreshTimer = window.setTimeout(() => {
+    loadAnalyticsSummary().catch(() => {});
+  }, 60);
+}
+
+function renderAnalytics(data) {
+  const summary = data || state.analytics;
+  if (!summary) return;
+  const funnel = summary.funnel || {};
+  const outreach = summary.outreach || {};
+  const accounts = summary.accounts || {};
+
+  const pipelineVal = formatMoneyUsd(funnel.pipeline_value ?? summary.pipeline_value ?? 0);
+  const wonVal = formatMoneyUsd(funnel.won_value ?? summary.won_value ?? 0);
+  const totalVal = formatMoneyUsd(funnel.total_value ?? summary.total_value ?? 0);
+  const winRate = `${Number(funnel.win_rate_pct ?? summary.win_rate_pct ?? 0).toFixed(1).replace(/\.0$/, "")}%`;
+  const closedWinRate = `${Number(funnel.closed_win_rate_pct ?? 0).toFixed(1).replace(/\.0$/, "")}%`;
+  const replyRate = `${Number(outreach.reply_rate_pct ?? summary.reply_rate_pct ?? 0).toFixed(1).replace(/\.0$/, "")}%`;
+
+  const setText = (sel, text) => {
+    const node = document.querySelector(sel);
+    if (node) node.textContent = text;
+  };
+
+  // 1. Topbar chips
+  setText("#stat-pipeline-value", pipelineVal);
+  setText("#stat-won-value", wonVal);
+  setText("#stat-win-rate", winRate);
+  setText("#stat-reply-rate", replyRate);
+
+  // 2. Above-pipeline KPI bar
+  setText("#analytics-kpi-pipeline", pipelineVal);
+  setText("#analytics-kpi-pipeline-sub", `${funnel.active_leads || 0} активных сделок`);
+  setText("#analytics-kpi-won", wonVal);
+  setText("#analytics-kpi-won-sub", `${funnel.won_leads || 0} выиграно · всего ${funnel.total_leads || 0}`);
+  setText("#analytics-kpi-win-rate", winRate);
+  setText("#analytics-kpi-win-rate-sub", `Общий объём: ${totalVal}`);
+  setText("#analytics-kpi-reply-rate", replyRate);
+  setText("#analytics-kpi-reply-rate-sub", `Ответили: ${outreach.replied || 0} из ${outreach.sent || 0}`);
+  setText("#analytics-kpi-pool", `${accounts.sent_today || 0} / ${accounts.daily_limit || 0}`);
+  const activeHealth = (accounts.by_health && accounts.by_health.active) || 0;
+  setText("#analytics-kpi-pool-sub", `Активных сессий: ${activeHealth} · Загрузка ${accounts.utilization_pct || 0}%`);
+
+  const convStrip = document.querySelector("#pipeline-conversion-strip");
+  if (convStrip) {
+    convStrip.replaceChildren();
+    const conversions = Array.isArray(funnel.conversions) ? funnel.conversions : [];
+    conversions.forEach((step) => {
+      convStrip.append(el("span", { className: "conversion-pill" }, [
+        el("span", { className: "conversion-label" }, [step.label || `${step.from_stage} → ${step.to_stage}`]),
+        el("strong", { className: "conversion-rate" }, [`${step.rate_pct ?? 0}%`]),
+      ]));
+    });
+  }
+
+  // 3. Dedicated #analytics section
+  setText("#analytics-funnel-badge", `${funnel.total_leads || 0} сделок · ${totalVal}`);
+  setText("#analytics-funnel-pipeline", pipelineVal);
+  setText("#analytics-funnel-won", wonVal);
+  setText("#analytics-funnel-win-rate", winRate);
+  setText("#analytics-funnel-closed-rate", closedWinRate);
+
+  const stagesHost = document.querySelector("#analytics-stages-list");
+  if (stagesHost) {
+    stagesHost.replaceChildren();
+    const stages = Array.isArray(funnel.stages) ? funnel.stages : [];
+    const maxAmount = Math.max(1, ...stages.map((s) => Number(s.amount) || 0));
+    stages.forEach((stage) => {
+      const barPct = stage.amount > 0
+        ? Math.min(100, Math.max(6, Math.round((stage.amount / maxAmount) * 100)))
+        : (stage.count > 0 ? Math.min(100, Math.max(6, Math.round(stage.share_pct || 10))) : 0);
+      stagesHost.append(el("div", {
+        className: "analytics-stage-row",
+        "data-analytics-stage": stage.key,
+      }, [
+        el("div", { className: "analytics-stage-head" }, [
+          el("span", { className: "analytics-stage-title" }, [
+            el("span", { className: "stage-dot", "data-stage": stage.key, "aria-hidden": "true" }, []),
+            el("strong", {}, [stage.label || stage.key]),
+            el("span", { className: "hint" }, [`${stage.count || 0} шт. (${stage.share_pct || 0}%)`]),
+          ]),
+          el("strong", { className: "analytics-stage-amount" }, [formatMoneyUsd(stage.amount || 0)]),
+        ]),
+        el("div", { className: "analytics-bar-track", "aria-hidden": "true" }, [
+          el("span", {
+            className: `analytics-bar-fill stage-${stage.key}`,
+            style: `width: ${barPct}%`,
+          }, []),
+        ]),
+      ]));
+    });
+  }
+
+  const convListHost = document.querySelector("#analytics-conversions-list");
+  if (convListHost) {
+    convListHost.replaceChildren();
+    (funnel.conversions || []).forEach((c) => {
+      convListHost.append(el("div", { className: "analytics-conv-item" }, [
+        el("span", {}, [c.label || `${c.from_stage} → ${c.to_stage}`]),
+        el("span", { className: "row" }, [
+          el("span", { className: "hint" }, [`${c.to_count || 0} из ${c.from_count || 0}`]),
+          el("span", { className: "badge b-talk" }, [`${c.rate_pct ?? 0}%`]),
+        ]),
+      ]));
+    });
+  }
+
+  // Outreach card
+  setText("#analytics-outreach-badge", `Reply Rate: ${replyRate}`);
+  setText("#analytics-outreach-total", String(outreach.total_recipients || 0));
+  setText("#analytics-outreach-sent", String(outreach.sent || 0));
+  setText("#analytics-outreach-replied", String(outreach.replied || 0));
+  setText("#analytics-outreach-reply-rate", replyRate);
+
+  const campHost = document.querySelector("#analytics-campaigns-list");
+  if (campHost) {
+    campHost.replaceChildren();
+    const camps = Array.isArray(outreach.campaigns) ? outreach.campaigns : [];
+    if (!camps.length) {
+      campHost.append(el("p", { className: "hint empty-state" }, ["Нет кампаний рассылки"]));
+    } else {
+      camps.forEach((camp) => {
+        const [stLabel, stBadge] = CAMPAIGN_STATUS_LABEL[camp.status] || [camp.status, "b-new"];
+        campHost.append(el("div", {
+          className: "analytics-item-row",
+          "data-analytics-campaign": String(camp.id),
+        }, [
+          el("div", { className: "analytics-item-main" }, [
+            el("div", { className: "row" }, [
+              el("strong", {}, [camp.name]),
+              el("span", { className: `badge ${stBadge}` }, [stLabel]),
+            ]),
+            el("span", { className: "hint" }, [
+              `Получателей: ${camp.total_recipients} · Отправлено: ${camp.sent} · Ответили: ${camp.replied} · В очереди: ${camp.pending}`,
+            ]),
+          ]),
+          el("div", { className: "analytics-item-right" }, [
+            el("span", { className: "badge b-won" }, [`Reply ${camp.reply_rate_pct}%`]),
+          ]),
+        ]));
+      });
+    }
+  }
+
+  // Accounts card
+  setText("#analytics-accounts-badge", `Пул: ${accounts.sent_today || 0} / ${accounts.daily_limit || 0}`);
+  setText("#analytics-accounts-pool", `${accounts.sent_today || 0} / ${accounts.daily_limit || 0}`);
+  setText("#analytics-accounts-util", `${accounts.utilization_pct || 0}%`);
+  setText("#analytics-accounts-dialogs", String(accounts.total_dialogs || 0));
+  setText("#analytics-accounts-replies", String(accounts.total_replies || 0));
+
+  const healthHost = document.querySelector("#analytics-health-summary");
+  if (healthHost) {
+    healthHost.replaceChildren();
+    const bh = accounts.by_health || {};
+    const healthEntries = [
+      ["active", "Активны", "b-ok"],
+      ["offline", "Офлайн", "b-off"],
+      ["unauthorized", "Не авторизован", "b-bad"],
+      ["banned", "Бан", "b-bad"],
+      ["frozen", "Заморожен", "b-bad"],
+    ];
+    healthEntries.forEach(([key, label, cls]) => {
+      const cnt = Number(bh[key] || 0);
+      if (cnt > 0 || key === "active" || key === "offline") {
+        healthHost.append(el("span", { className: `badge ${cls}` }, [`${label}: ${cnt}`]));
+      }
+    });
+  }
+
+  const accHost = document.querySelector("#analytics-accounts-list");
+  if (accHost) {
+    accHost.replaceChildren();
+    const items = Array.isArray(accounts.items) ? accounts.items : [];
+    if (!items.length) {
+      accHost.append(el("p", { className: "hint empty-state" }, ["Нет подключённых аккаунтов"]));
+    } else {
+      items.forEach((acc) => {
+        const [hLabel, hBadge] = ACCOUNT_HEALTH[acc.health] || [acc.health || "активен", "b-ok"];
+        accHost.append(el("div", {
+          className: "analytics-item-row",
+          "data-analytics-account": String(acc.id),
+        }, [
+          el("div", { className: "analytics-item-main" }, [
+            el("div", { className: "row" }, [
+              channelBadgeEl(acc.provider),
+              el("strong", {}, [acc.name || acc.phone || `Аккаунт #${acc.id}`]),
+              el("span", { className: `badge ${hBadge}` }, [hLabel]),
+            ]),
+            el("span", { className: "hint" }, [
+              `Пул сегодня: ${acc.sent_today} / ${acc.daily_limit} (${acc.utilization_pct}%) · Диалогов: ${acc.dialogs_count} · Ответов: ${acc.replies_count}`,
+            ]),
+          ]),
+          el("div", { className: "analytics-item-right" }, [
+            el("span", { className: "badge b-talk" }, [`Reply ${acc.reply_rate_pct}%`]),
+          ]),
+        ]));
+      });
+    }
+  }
+}
+
+async function loadAnalyticsSummary() {
+  try {
+    const summary = await api("/api/analytics/summary");
+    if (summary && typeof summary === "object") {
+      state.analytics = summary;
+      renderAnalytics(summary);
+    }
+    return summary;
+  } catch (_err) {
+    return null;
+  }
+}
+
+const analyticsRefreshBtn = document.querySelector("#analytics-refresh-btn");
+if (analyticsRefreshBtn) {
+  analyticsRefreshBtn.addEventListener("click", async () => {
+    analyticsRefreshBtn.disabled = true;
+    try {
+      await loadAnalyticsSummary();
+      toast("Аналитика обновлена", "ok");
+    } finally {
+      analyticsRefreshBtn.disabled = false;
+    }
+  });
+}
+
+function resolveSnippetLeadContext() {
+  const sessionFilter = String(state.inboxSessionFilter || "all");
+  const dialogMatchesSession = (d) => {
+    if (!d) return false;
+    if (sessionFilter === "all") return true;
+    return d.account_id != null && String(d.account_id) === sessionFilter;
+  };
+
+  const activeSelectedDialog = (state.selectedDialog && dialogMatchesSession(state.selectedDialog))
+    ? state.selectedDialog
+    : null;
+  const fallbackDialog = (Array.isArray(state.dialogs) ? state.dialogs.find(dialogMatchesSession) : null)
+    || (Array.isArray(state.allDialogs) ? state.allDialogs.find(dialogMatchesSession) : null)
+    || null;
+  const dialog = activeSelectedDialog || fallbackDialog;
+
+  let lead = null;
+  if (dialog) {
+    lead = leadForDialog(dialog);
+  } else if (sessionFilter === "all") {
+    lead = selectedLead() || (state.leads && state.leads[0]) || null;
+  }
+
+  const rawName = String(
+    (lead && lead.name)
+    || (dialog && (dialog.name || dialog.title))
+    || (lead && lead.username)
+    || (dialog && dialog.username)
+    || ""
+  ).trim();
+
+  let rawCompany = String((lead && lead.company) || "").trim();
+  let cleanName = rawName;
+
+  if (rawName.includes("·")) {
+    const parts = rawName.split("·").map((part) => part.trim());
+    cleanName = parts[0] || "";
+    if (!rawCompany && parts[1]) {
+      rawCompany = parts.slice(1).join(" · ").trim();
+    }
+  }
+
+  if (!rawCompany && lead) {
+    const card = state.cards && state.cards[lead.id];
+    const props = (card && Array.isArray(card.properties) && card.properties)
+      || (Array.isArray(lead.properties) && lead.properties)
+      || [];
+    for (const prop of props) {
+      if (!prop) continue;
+      const pName = String(prop.name || "").trim().toLowerCase();
+      const pKey = String(prop.key || "").trim().toLowerCase();
+      if (
+        ["компания", "company", "проект", "организация"].includes(pName)
+        || ["компания", "company", "org", "project"].includes(pKey)
+      ) {
+        const val = String(prop.value_text || "").trim();
+        if (val) {
+          rawCompany = val;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    name: cleanName || "коллега",
+    company: rawCompany || "вашей компании",
+    lead,
+    dialog,
+  };
+}
+
+function renderSnippetBody(body) {
+  const { name, company } = resolveSnippetLeadContext();
+  return String(body || "")
+    .replace(/\{name\}/gi, () => name)
+    .replace(/\{company\}/gi, () => company);
+}
+
+async function copyTextToClipboard(text) {
+  state.lastCopiedSnippet = text;
+  window.__lastCopiedSnippet = text;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_err) {
+      // Fallback to execCommand below
+    }
+  }
+  try {
+    const temp = document.createElement("textarea");
+    temp.value = text;
+    temp.setAttribute("readonly", "readonly");
+    temp.style.position = "fixed";
+    temp.style.opacity = "0";
+    temp.style.pointerEvents = "none";
+    document.body.appendChild(temp);
+    temp.select();
+    document.execCommand("copy");
+    document.body.removeChild(temp);
+    return true;
+  } catch (_err2) {
+    return false;
+  }
+}
+
+async function applySnippet(snippet) {
+  if (!snippet) return;
+  const rendered = renderSnippetBody(snippet.body);
+  const replyField = document.querySelector("#reply-text");
+  if (replyField) {
+    replyField.value = rendered;
+    replyField.dispatchEvent(new Event("input", { bubbles: true }));
+    if (!replyField.closest("[hidden]")) {
+      replyField.focus();
+    }
+  }
+  const suggest = document.querySelector("#reply-snippets-suggest");
+  if (suggest) {
+    suggest.hidden = true;
+    suggest.replaceChildren();
+  }
+  await copyTextToClipboard(rendered);
+  const statusNode = document.querySelector("#snippet-copy-status");
+  if (statusNode) {
+    statusNode.hidden = false;
+    statusNode.textContent = `Скопировано (${snippet.shortcut}): ${rendered}`;
+  }
+  toast(`Шаблон ${snippet.shortcut} скопирован для Telegram Web и вставлен в ответ`, "ok");
+}
+
+async function deleteSnippetById(snippetId) {
+  if (!snippetId) return;
+  try {
+    await api(`/api/snippets/${snippetId}`, { method: "DELETE" });
+    await loadSnippets();
+    toast("Шаблон удалён", "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось удалить шаблон", "error");
+  }
+}
+
+function buildSnippetChipEl(snippet, includeDelete = true) {
+  const children = [
+    el("button", {
+      type: "button",
+      className: "snippet-chip-btn",
+      "data-snippet-id": String(snippet.id || ""),
+      "data-snippet-shortcut": snippet.shortcut,
+      title: snippet.body,
+      onclick: () => {
+        applySnippet(snippet);
+      },
+    }, [
+      el("code", {}, [snippet.shortcut]),
+      el("span", {}, [snippet.title]),
+    ]),
+  ];
+  if (includeDelete && snippet.id != null) {
+    children.push(
+      el("button", {
+        type: "button",
+        className: "snippet-delete-btn",
+        "data-delete-snippet-id": String(snippet.id),
+        "data-delete-snippet-shortcut": snippet.shortcut,
+        title: `Удалить шаблон ${snippet.shortcut}`,
+        "aria-label": `Удалить шаблон ${snippet.shortcut}`,
+        onclick: (event) => {
+          event.stopPropagation();
+          deleteSnippetById(snippet.id);
+        },
+      }, ["×"])
+    );
+  }
+  return el("div", {
+    className: "snippet-chip",
+    "data-snippet-id": String(snippet.id || ""),
+    "data-snippet-shortcut": snippet.shortcut,
+  }, children);
+}
+
+function renderSnippets() {
+  const items = Array.isArray(state.snippets) ? state.snippets : [];
+  const sideHost = document.querySelector("#side-snippets-list");
+  const replyHost = document.querySelector("#reply-snippets-list");
+  const tgWebHost = document.querySelector("#tg-web-snippets-list");
+
+  if (sideHost) {
+    sideHost.replaceChildren(...items.map((item) => buildSnippetChipEl(item, true)));
+  }
+  if (replyHost) {
+    replyHost.replaceChildren(...items.map((item) => buildSnippetChipEl(item, true)));
+  }
+  if (tgWebHost) {
+    tgWebHost.replaceChildren(...items.map((item) => buildSnippetChipEl(item, false)));
+  }
+}
+
+async function loadSnippets() {
+  try {
+    const items = await api("/api/snippets");
+    state.snippets = Array.isArray(items) ? items : [];
+    renderSnippets();
+    return state.snippets;
+  } catch (_err) {
+    return [];
+  }
+}
+
+{
+  const snippetForm = document.querySelector("#snippet-create-form");
+  if (snippetForm) {
+    snippetForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const shortcutInput = document.querySelector("#snippet-shortcut");
+      const titleInput = document.querySelector("#snippet-title");
+      const bodyInput = document.querySelector("#snippet-body");
+      const submitBtn = document.querySelector("#snippet-submit-btn");
+
+      const shortcut = (shortcutInput && shortcutInput.value.trim()) || "";
+      const title = (titleInput && titleInput.value.trim()) || "";
+      const body = (bodyInput && bodyInput.value.trim()) || "";
+
+      if (!shortcut || !title || !body) {
+        toast("Заполните команду, название и текст шаблона", "error");
+        return;
+      }
+
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        const created = await api("/api/snippets", {
+          method: "POST",
+          body: { shortcut, title, body },
+        });
+        if (shortcutInput) shortcutInput.value = "";
+        if (titleInput) titleInput.value = "";
+        if (bodyInput) bodyInput.value = "";
+        await loadSnippets();
+        toast(`Шаблон ${created.shortcut} добавлен`, "ok");
+      } catch (error) {
+        toast(error.message || "Не удалось добавить шаблон", "error");
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+
+  const replyField = document.querySelector("#reply-text");
+  const suggestHost = document.querySelector("#reply-snippets-suggest");
+  if (replyField && suggestHost) {
+    replyField.addEventListener("input", () => {
+      const val = replyField.value || "";
+      if (!val.startsWith("/") || /\s/.test(val)) {
+        suggestHost.hidden = true;
+        suggestHost.replaceChildren();
+        return;
+      }
+      const query = val.toLowerCase();
+      const matches = (state.snippets || []).filter((item) =>
+        String(item.shortcut || "").toLowerCase().startsWith(query)
+        || String(item.title || "").toLowerCase().includes(query.slice(1))
+      );
+      if (!matches.length) {
+        suggestHost.hidden = true;
+        suggestHost.replaceChildren();
+        return;
+      }
+      suggestHost.hidden = false;
+      suggestHost.replaceChildren(
+        ...matches.map((item) =>
+          el("button", {
+            type: "button",
+            className: "btn ghost sm snippet-suggest-btn",
+            "data-suggest-shortcut": item.shortcut,
+            onclick: () => applySnippet(item),
+          }, [`${item.shortcut} · ${item.title}`])
+        )
+      );
+    });
+
+    replyField.addEventListener("keydown", (event) => {
+      if (event.key === "Tab" && !suggestHost.hidden) {
+        const firstBtn = suggestHost.querySelector("[data-suggest-shortcut]");
+        if (firstBtn) {
+          event.preventDefault();
+          const sc = firstBtn.getAttribute("data-suggest-shortcut");
+          const found = (state.snippets || []).find((s) => s.shortcut === sc);
+          if (found) applySnippet(found);
+        }
+      }
+    });
+  }
+}
+
 async function boot() {
   const initialHashSheet = sheetFromHash(window.location.hash);
   if (initialHashSheet) state.activeSheet = initialHashSheet;
@@ -5171,6 +6455,13 @@ async function boot() {
   renderBuilderSteps();
   renderScheduleDays();
   renderCrmProperties();
+  loadSnippets().catch(() => {});
+  const addStageBtn = document.querySelector("#add-stage-btn");
+  if (addStageBtn && !addStageBtn.dataset.bound) {
+    addStageBtn.dataset.bound = "1";
+    addStageBtn.addEventListener("click", () => promptCreateStage());
+  }
+  await loadPipelineStages();
 
   setView("#accounts-view", "loading");
   setView("#inbox-view", "empty");
@@ -5209,17 +6500,27 @@ async function boot() {
   } catch (error) {
     toast(error.message, "error");
   }
+  const focusRefreshBtn = document.querySelector("#focus-today-refresh");
+  if (focusRefreshBtn && !focusRefreshBtn.dataset.bound) {
+    focusRefreshBtn.dataset.bound = "1";
+    focusRefreshBtn.addEventListener("click", () => {
+      loadFocusToday().then(() => toast("Фокус на сегодня обновлён", "ok"));
+    });
+  }
   try {
     await loadReminders();
   } catch (error) {
     failRegion("#digest-view", "#digest-error", error);
   }
+  await loadFocusToday();
   try {
     await loadCampaigns();
   } catch (_error) { /* рассылки могут загрузиться позже */ }
   loadOutreachSchedule().catch(() => {});
   loadCrmProperties().catch(() => {});
+  await loadSnippets();
   updateWorkspaceStats();
+  await loadAnalyticsSummary();
 }
 
 const seedDemoButton = document.querySelector("#seed-demo");
@@ -5247,4 +6548,539 @@ if (seedDemoButton) {
   });
 }
 
+/* =========================================================================
+ * Блок 5: Массовые операции (Bulk Actions), Слияние дублей и Экспорт в CSV
+ * ========================================================================= */
+state.bulkSelectedIds = new Set();
+state.bulkHostTarget = "leads";
+
+function getFilteredLeadsForBulk() {
+  const { status: stage, folderId, channel, followup } = pipelineFilters();
+  return (state.leads || []).filter((lead) => {
+    if (stage && lead.status !== stage) return false;
+    if (folderId && String(lead.folder_id || "") !== String(folderId)) return false;
+    if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
+    if (!matchFollowupFilter(lead, followup)) return false;
+    return true;
+  });
+}
+
+function syncBulkHostContainer(preferredTarget) {
+  if (preferredTarget === "s07" || preferredTarget === "leads") {
+    state.bulkHostTarget = preferredTarget;
+  }
+  const leadsSec = document.querySelector("#leads");
+  const boardSec = document.querySelector("#s07");
+  const bulkBar = document.querySelector("#leads-bulk-bar");
+  const dupModal = document.querySelector("#leads-duplicates-modal");
+  if (!bulkBar || !leadsSec || !boardSec) return;
+
+  const isBoardActive = (state.bulkHostTarget === "s07" && !boardSec.hidden)
+    || (state.viewMode === "sheet" && state.activeSheet === "s07" && leadsSec.hidden);
+  if (isBoardActive) {
+    const header = boardSec.querySelector(".pipeline-header");
+    if (bulkBar.parentElement !== boardSec) {
+      if (header && header.nextSibling) {
+        boardSec.insertBefore(bulkBar, header.nextSibling);
+      } else {
+        boardSec.prepend(bulkBar);
+      }
+    }
+    if (dupModal && dupModal.parentElement !== boardSec) {
+      boardSec.insertBefore(dupModal, bulkBar.nextSibling);
+    }
+  } else {
+    const paneHead = leadsSec.querySelector(".pane-head");
+    if (bulkBar.parentElement !== leadsSec) {
+      if (paneHead && paneHead.nextSibling) {
+        leadsSec.insertBefore(bulkBar, paneHead.nextSibling);
+      } else {
+        leadsSec.prepend(bulkBar);
+      }
+    }
+    if (dupModal && dupModal.parentElement !== leadsSec) {
+      leadsSec.insertBefore(dupModal, bulkBar.nextSibling);
+    }
+  }
+}
+
+function toggleLeadBulkSelection(leadId, checked, hostTarget) {
+  const id = Number(leadId);
+  if (!id) return;
+  if (hostTarget === "s07" || hostTarget === "leads") {
+    state.bulkHostTarget = hostTarget;
+  }
+  if (checked) {
+    state.bulkSelectedIds.add(id);
+  } else {
+    state.bulkSelectedIds.delete(id);
+  }
+  syncBulkSelectionUI();
+}
+
+function createLeadBulkCell(lead) {
+  const id = Number(lead.id);
+  const cb = el("input", {
+    type: "checkbox",
+    className: "lead-bulk-checkbox",
+    "data-lead-id": String(id),
+    "aria-label": `Выбрать лид ${lead.name || lead.username || id}`,
+    onclick: (event) => {
+      event.stopPropagation();
+    },
+    onchange: (event) => {
+      toggleLeadBulkSelection(id, event.target.checked, "leads");
+    },
+  });
+  cb.checked = state.bulkSelectedIds.has(id);
+  return el("td", {
+    className: "bulk-check-col",
+    onclick: (event) => {
+      event.stopPropagation();
+    },
+  }, [cb]);
+}
+
+function decorateBoardBulkCheckboxes() {
+  const board = document.querySelector("#board");
+  if (!board) return;
+  const { status: stage, folderId, channel, followup } = pipelineFilters();
+  const cols = board.querySelectorAll(".col");
+  cols.forEach((colEl) => {
+    const dot = colEl.querySelector(".stage-dot[data-stage]");
+    const stageVal = dot ? dot.getAttribute("data-stage") : (colEl.getAttribute("data-stage") || "");
+    const stageLeads = (state.leads || []).filter((lead) => {
+      if (stageVal && lead.status !== stageVal) return false;
+      if (stage && stage !== lead.status) return false;
+      if (folderId && String(lead.folder_id || "") !== String(folderId)) return false;
+      if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
+      if (!matchFollowupFilter(lead, followup)) return false;
+      return true;
+    });
+    const cardEls = colEl.querySelectorAll(".card");
+    cardEls.forEach((cardEl, idx) => {
+      let lid = Number(cardEl.getAttribute("data-lead-id") || 0);
+      if (!lid && stageLeads[idx]) {
+        lid = Number(stageLeads[idx].id);
+        cardEl.setAttribute("data-lead-id", String(lid));
+      }
+      if (!lid) return;
+      let cb = cardEl.querySelector(".card-bulk-checkbox");
+      if (!cb) {
+        cb = el("input", {
+          type: "checkbox",
+          className: "lead-bulk-checkbox card-bulk-checkbox",
+          "data-lead-id": String(lid),
+          "aria-label": `Выбрать карточку #${lid}`,
+          onclick: (event) => {
+            event.stopPropagation();
+          },
+          onchange: (event) => {
+            event.stopPropagation();
+            toggleLeadBulkSelection(lid, event.target.checked, "s07");
+          },
+        });
+        cardEl.prepend(cb);
+      }
+      cb.checked = state.bulkSelectedIds.has(lid);
+      cardEl.classList.toggle("bulk-selected", cb.checked);
+    });
+  });
+  syncBulkSelectionUI();
+}
+
+function populateBulkBarSelects() {
+  const folderSelect = document.querySelector("#bulk-folder-select");
+  if (folderSelect) {
+    const prev = folderSelect.value;
+    folderSelect.replaceChildren(el("option", { value: "" }, ["Без папки"]));
+    const seen = new Set();
+    Object.values(state.folderLists || {}).flat().forEach((f) => {
+      if (!f || seen.has(Number(f.id))) return;
+      seen.add(Number(f.id));
+      folderSelect.append(el("option", { value: String(f.id) }, [f.title || `Папка #${f.id}`]));
+    });
+    if ([...folderSelect.options].some((o) => o.value === prev)) {
+      folderSelect.value = prev;
+    }
+  }
+
+  const campSelect = document.querySelector("#bulk-campaign-select");
+  if (campSelect) {
+    const prev = campSelect.value;
+    campSelect.replaceChildren(el("option", { value: "" }, ["Кампания рассылки..."]));
+    (state.campaigns || []).forEach((c) => {
+      campSelect.append(el("option", { value: String(c.id) }, [c.name || `Кампания #${c.id}`]));
+    });
+    if ([...campSelect.options].some((o) => o.value === prev)) {
+      campSelect.value = prev;
+    } else if ((state.campaigns || []).length === 1) {
+      campSelect.value = String(state.campaigns[0].id);
+    }
+  }
+
+  const statusSelectEl = document.querySelector("#bulk-status-select");
+  if (statusSelectEl && Array.isArray(STATUSES) && STATUSES.length) {
+    const prev = statusSelectEl.value;
+    statusSelectEl.replaceChildren(
+      ...STATUSES.map(([val, label]) => el("option", { value: val }, [label]))
+    );
+    if ([...statusSelectEl.options].some((o) => o.value === prev)) {
+      statusSelectEl.value = prev;
+    }
+  }
+}
+
+function syncBulkSelectionUI() {
+  syncBulkHostContainer();
+  const validIds = new Set((state.leads || []).map((l) => Number(l.id)));
+  Array.from(state.bulkSelectedIds).forEach((id) => {
+    if (!validIds.has(Number(id))) {
+      state.bulkSelectedIds.delete(id);
+    }
+  });
+
+  const count = state.bulkSelectedIds.size;
+  const countNode = document.querySelector("#bulk-selected-count");
+  if (countNode) countNode.textContent = String(count);
+
+  const bulkBar = document.querySelector("#leads-bulk-bar");
+  if (bulkBar) {
+    bulkBar.hidden = count === 0;
+  }
+
+  if (count > 0) {
+    populateBulkBarSelects();
+  }
+
+  document.querySelectorAll(".lead-bulk-checkbox[data-lead-id]").forEach((cb) => {
+    const id = Number(cb.getAttribute("data-lead-id"));
+    const isChecked = state.bulkSelectedIds.has(id);
+    if (cb.checked !== isChecked) cb.checked = isChecked;
+    const rowOrCard = cb.closest("tr, .card");
+    if (rowOrCard) rowOrCard.classList.toggle("bulk-selected", isChecked);
+  });
+
+  const filtered = getFilteredLeadsForBulk();
+  const selectAllCb = document.querySelector("#leads-select-all-checkbox");
+  if (selectAllCb) {
+    selectAllCb.checked = filtered.length > 0 && filtered.every((l) => state.bulkSelectedIds.has(Number(l.id)));
+  }
+}
+
+function selectAllFilteredLeads(hostTarget) {
+  if (hostTarget === "s07" || hostTarget === "leads") {
+    state.bulkHostTarget = hostTarget;
+  }
+  const filtered = getFilteredLeadsForBulk();
+  if (!filtered.length) {
+    toast("В текущем фильтре нет лидов", "error");
+    return;
+  }
+  const allSelected = filtered.every((l) => state.bulkSelectedIds.has(Number(l.id)));
+  if (allSelected) {
+    filtered.forEach((l) => state.bulkSelectedIds.delete(Number(l.id)));
+  } else {
+    filtered.forEach((l) => state.bulkSelectedIds.add(Number(l.id)));
+  }
+  syncBulkSelectionUI();
+}
+
+async function runBulkAction(action, extraPayload = {}) {
+  const leadIds = Array.from(state.bulkSelectedIds);
+  if (!leadIds.length) {
+    toast("Выберите хотя бы одного лида", "error");
+    return;
+  }
+  try {
+    const res = await api("/api/leads/bulk", {
+      method: "POST",
+      body: {
+        lead_ids: leadIds,
+        action,
+        ...extraPayload,
+      },
+    });
+    if (action === "delete") {
+      state.bulkSelectedIds.clear();
+      toast(`Удалено карточек: ${res.deleted || leadIds.length}`, "ok");
+    } else if (action === "enroll_campaign") {
+      toast(`Добавлено в рассылку: ${res.imported ?? res.updated ?? 0}`, "ok");
+      await loadCampaigns().catch(() => {});
+    } else if (action === "set_status") {
+      toast(`Стадия обновлена для ${res.updated || leadIds.length} лидов`, "ok");
+    } else if (action === "set_folder") {
+      toast(`Папка обновлена для ${res.updated || leadIds.length} лидов`, "ok");
+    } else if (action === "set_amount") {
+      toast(`Бюджет обновлён для ${res.updated || leadIds.length} лидов`, "ok");
+    }
+    state.cards = {};
+    await loadLeads(state.leadQuery || "", state.selectedLeadId);
+    syncBulkSelectionUI();
+  } catch (error) {
+    toast(error.message || "Ошибка массовой операции", "error");
+  }
+}
+
+async function exportCurrentLeadsCsv() {
+  const { status, folderId, channel } = pipelineFilters();
+  const params = new URLSearchParams();
+  if (state.leadQuery) params.set("q", state.leadQuery);
+  if (status) params.set("status", status);
+  if (folderId) params.set("folder_id", folderId);
+  if (channel) params.set("provider", channel);
+
+  const url = `/api/leads/export.csv${params.toString() ? `?${params.toString()}` : ""}`;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error("Не удалось выгрузить CSV");
+    }
+    const csvText = await response.text();
+    const blob = new Blob([csvText], { type: "text/csv;charset=utf-8;" });
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = "leads_export.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+    toast("CSV выгружен", "ok");
+  } catch (error) {
+    toast(error.message || "Ошибка экспорта CSV", "error");
+  }
+}
+
+function populateManualMergeSelects() {
+  const srcSelect = document.querySelector("#manual-merge-source-select");
+  const tgtSelect = document.querySelector("#manual-merge-target-select");
+  if (!srcSelect || !tgtSelect) return;
+
+  const leads = state.leads || [];
+  const makeOptions = () => leads.map((l) => {
+    const label = `#${l.id} · ${l.name || "Без имени"}${l.username ? ` (@${l.username})` : ""}${l.phone ? ` · ${l.phone}` : ""}`;
+    return el("option", { value: String(l.id) }, [label]);
+  });
+
+  srcSelect.replaceChildren(...makeOptions());
+  tgtSelect.replaceChildren(...makeOptions());
+  if (leads.length >= 2) {
+    srcSelect.value = String(leads[1].id);
+    tgtSelect.value = String(leads[0].id);
+  }
+}
+
+async function executeMergeLeads(sourceId, targetId) {
+  const sId = Number(sourceId);
+  const tId = Number(targetId);
+  if (!sId || !tId || sId === tId) {
+    toast("Выберите две разные карточки для слияния", "error");
+    return;
+  }
+  try {
+    await api("/api/leads/merge", {
+      method: "POST",
+      body: { source_lead_id: sId, target_lead_id: tId },
+    });
+    state.bulkSelectedIds.delete(sId);
+    delete state.cards[sId];
+    delete state.cards[tId];
+    toast(`Дубль #${sId} слит в карточку #${tId}`, "ok");
+    await loadLeads(state.leadQuery || "", tId);
+    await loadAndRenderDuplicates();
+  } catch (error) {
+    toast(error.message || "Не удалось слить дубли", "error");
+  }
+}
+
+async function loadAndRenderDuplicates() {
+  const host = document.querySelector("#duplicates-groups-list");
+  if (!host) return;
+  host.replaceChildren(el("p", { className: "hint" }, ["Поиск дублей..."]));
+  populateManualMergeSelects();
+  try {
+    const groups = await api("/api/leads/duplicates");
+    host.replaceChildren();
+    if (!Array.isArray(groups) || !groups.length) {
+      host.append(el("p", { className: "hint empty-state" }, [
+        "Дублей по username, телефону или Telegram ID не найдено.",
+      ]));
+      return;
+    }
+    groups.forEach((group) => {
+      const targetLead = group.leads[0];
+      const sourceLeads = group.leads.slice(1);
+      const reasonBadges = (group.fields || [group.field]).map((f) => {
+        const val = (group.match_values && group.match_values[f]) || group.value || "";
+        return el("span", { className: "badge b-wait" }, [`${f}: ${val}`]);
+      });
+
+      const leadItems = (group.leads || []).map((l, idx) => el("div", { className: "dup-lead-item" }, [
+        el("span", { className: `badge ${idx === 0 ? "b-ok" : "b-new"}` }, [
+          idx === 0 ? `Основной #${l.id}` : `Дубль #${l.id}`,
+        ]),
+        el("strong", {}, [l.name || "Без имени"]),
+        l.username ? el("span", { className: "meta" }, [`@${l.username}`]) : null,
+        l.phone ? el("span", { className: "meta" }, [l.phone]) : null,
+        l.amount ? el("span", { className: "badge b-won" }, [`$${l.amount}`]) : null,
+      ].filter(Boolean)));
+
+      const mergeBtns = sourceLeads.map((src) => el("button", {
+        type: "button",
+        className: "btn primary sm merge-dup-group-btn",
+        "data-source-id": String(src.id),
+        "data-target-id": String(targetLead.id),
+        onclick: () => executeMergeLeads(src.id, targetLead.id),
+      }, [`Слить #${src.id} → #${targetLead.id}`]));
+
+      host.append(el("div", { className: "dup-group-card surface-subcard" }, [
+        el("div", { className: "dup-group-head row" }, [
+          el("div", { className: "row" }, [
+            el("strong", {}, [`Группа дублей (${group.count})`]),
+            ...reasonBadges,
+          ]),
+          el("div", { className: "row" }, mergeBtns),
+        ]),
+        el("div", { className: "dup-leads-stack" }, leadItems),
+      ]));
+    });
+  } catch (error) {
+    host.replaceChildren(el("p", { className: "msg", role: "alert" }, [
+      error.message || "Ошибка при поиске дублей",
+    ]));
+  }
+}
+
+async function openDuplicatesModal(preferredTarget) {
+  syncBulkHostContainer(preferredTarget);
+  const modal = document.querySelector("#leads-duplicates-modal");
+  if (!modal) return;
+  modal.hidden = false;
+  await loadAndRenderDuplicates();
+}
+
+function bindBlock5Events() {
+  const selectAllCb = document.querySelector("#leads-select-all-checkbox");
+  if (selectAllCb) {
+    selectAllCb.addEventListener("change", () => {
+      state.bulkHostTarget = "leads";
+      const filtered = getFilteredLeadsForBulk();
+      if (selectAllCb.checked) {
+        filtered.forEach((l) => state.bulkSelectedIds.add(Number(l.id)));
+      } else {
+        filtered.forEach((l) => state.bulkSelectedIds.delete(Number(l.id)));
+      }
+      syncBulkSelectionUI();
+    });
+  }
+
+  const leadsSelectAllBtn = document.querySelector("#leads-select-all-btn");
+  if (leadsSelectAllBtn) {
+    leadsSelectAllBtn.addEventListener("click", () => selectAllFilteredLeads("leads"));
+  }
+  const boardSelectAllBtn = document.querySelector("#board-select-all-btn");
+  if (boardSelectAllBtn) {
+    boardSelectAllBtn.addEventListener("click", () => selectAllFilteredLeads("s07"));
+  }
+  const bulkSelectAllBtn = document.querySelector("#bulk-select-all-btn");
+  if (bulkSelectAllBtn) {
+    bulkSelectAllBtn.addEventListener("click", () => selectAllFilteredLeads());
+  }
+
+  const clearBtn = document.querySelector("#bulk-clear-btn");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      state.bulkSelectedIds.clear();
+      syncBulkSelectionUI();
+    });
+  }
+
+  const applyStatusBtn = document.querySelector("#bulk-apply-status-btn");
+  if (applyStatusBtn) {
+    applyStatusBtn.addEventListener("click", () => {
+      const status = document.querySelector("#bulk-status-select")?.value || "new";
+      runBulkAction("set_status", { status });
+    });
+  }
+
+  const applyFolderBtn = document.querySelector("#bulk-apply-folder-btn");
+  if (applyFolderBtn) {
+    applyFolderBtn.addEventListener("click", () => {
+      const raw = document.querySelector("#bulk-folder-select")?.value || "";
+      runBulkAction("set_folder", { folder_id: raw ? Number(raw) : null });
+    });
+  }
+
+  const applyAmountBtn = document.querySelector("#bulk-apply-amount-btn");
+  if (applyAmountBtn) {
+    applyAmountBtn.addEventListener("click", () => {
+      const raw = document.querySelector("#bulk-amount-input")?.value;
+      if (raw === "" || raw == null) {
+        toast("Введите бюджет", "error");
+        return;
+      }
+      runBulkAction("set_amount", { amount: Number(raw) });
+    });
+  }
+
+  const applyCampBtn = document.querySelector("#bulk-apply-campaign-btn");
+  if (applyCampBtn) {
+    applyCampBtn.addEventListener("click", () => {
+      const raw = document.querySelector("#bulk-campaign-select")?.value;
+      if (!raw) {
+        toast("Выберите кампанию рассылки", "error");
+        return;
+      }
+      runBulkAction("enroll_campaign", { campaign_id: Number(raw) });
+    });
+  }
+
+  const deleteBtn = document.querySelector("#bulk-delete-btn");
+  if (deleteBtn) {
+    deleteBtn.addEventListener("click", () => {
+      runBulkAction("delete");
+    });
+  }
+
+  ["#leads-export-csv-btn", "#board-export-csv-btn"].forEach((sel) => {
+    const btn = document.querySelector(sel);
+    if (btn) btn.addEventListener("click", exportCurrentLeadsCsv);
+  });
+
+  const leadsMergeBtn = document.querySelector("#leads-merge-dups-btn");
+  if (leadsMergeBtn) {
+    leadsMergeBtn.addEventListener("click", () => openDuplicatesModal("leads"));
+  }
+  const boardMergeBtn = document.querySelector("#board-merge-dups-btn");
+  if (boardMergeBtn) {
+    boardMergeBtn.addEventListener("click", () => openDuplicatesModal("s07"));
+  }
+
+  const refreshDupsBtn = document.querySelector("#refresh-duplicates-btn");
+  if (refreshDupsBtn) {
+    refreshDupsBtn.addEventListener("click", loadAndRenderDuplicates);
+  }
+
+  const closeDupsBtn = document.querySelector("#close-duplicates-modal-btn");
+  if (closeDupsBtn) {
+    closeDupsBtn.addEventListener("click", () => {
+      const modal = document.querySelector("#leads-duplicates-modal");
+      if (modal) modal.hidden = true;
+    });
+  }
+
+  const manualMergeBtn = document.querySelector("#manual-merge-submit-btn");
+  if (manualMergeBtn) {
+    manualMergeBtn.addEventListener("click", () => {
+      const sId = document.querySelector("#manual-merge-source-select")?.value;
+      const tId = document.querySelector("#manual-merge-target-select")?.value;
+      executeMergeLeads(sId, tId);
+    });
+  }
+}
+
+bindBlock5Events();
+
 boot();
+

@@ -32,6 +32,9 @@ def _due_key(value: str) -> str:
         return value or ""
 
 
+from app.events import record_lead_event  # noqa: E402
+
+
 def create_reminder(conn, lead_id: int, due_at: str, text: str) -> dict:
     lead = conn.execute("SELECT id FROM leads WHERE id = ?", (lead_id,)).fetchone()
     if lead is None:
@@ -47,6 +50,14 @@ def create_reminder(conn, lead_id: int, due_at: str, text: str) -> dict:
         VALUES (?, ?, ?, NULL, ?)
         """,
         (lead_id, due, body, now),
+    )
+    record_lead_event(
+        conn,
+        lead_id,
+        "reminder_set",
+        f"Поставлено напоминание на {due[:16].replace('T', ' ')}",
+        {"reminder_id": int(cur.lastrowid), "due_at": due, "text": body},
+        created_at=now,
     )
     conn.commit()
     row = conn.execute("SELECT * FROM reminders WHERE id = ?", (cur.lastrowid,)).fetchone()

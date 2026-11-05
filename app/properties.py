@@ -170,6 +170,22 @@ def set_lead_property(conn, lead_id: int, property_id: int, value) -> dict:
             """,
             (property_id, lead_id, text, value_int, now, now),
         )
+    if prop["type"] == "amount":
+        from app.events import record_lead_event
+
+        record_lead_event(
+            conn,
+            lead_id,
+            "amount_changed",
+            f"Поле «{prop['name']}»: {text or '0'}",
+            {
+                "property_id": property_id,
+                "property_name": prop["name"],
+                "value_text": text,
+                "value_int": value_int,
+            },
+            created_at=now,
+        )
     conn.commit()
     for row in list_lead_properties(conn, lead_id):
         if row["id"] == property_id:

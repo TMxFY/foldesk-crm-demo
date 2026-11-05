@@ -1,7 +1,9 @@
+import fs from 'fs';
 import { defineConfig } from '@playwright/test';
 
 const port = process.env.E2E_PORT || '18765';
 const baseURL = `http://127.0.0.1:${port}`;
+const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
 export default defineConfig({
   testDir: '.',
@@ -16,6 +18,7 @@ export default defineConfig({
     baseURL,
     viewport: { width: 1440, height: 900 },
     trace: 'retain-on-failure',
+    launchOptions: fs.existsSync(chromePath) ? { executablePath: chromePath } : undefined,
   },
   webServer: {
     command: '../.venv/bin/python serve.py',

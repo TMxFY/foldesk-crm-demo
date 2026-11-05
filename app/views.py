@@ -1,6 +1,6 @@
 import sqlite3
 
-from app.db import STATUSES, as_dict, utc_now
+from app.db import STATUSES, as_dict, utc_now, valid_statuses
 
 
 def list_views(conn) -> list:
@@ -22,7 +22,7 @@ def save_view(conn, name, status=None, folder_id=None) -> dict:
         status = None
     else:
         status = str(status).strip()
-        if status not in STATUSES:
+        if status not in valid_statuses(conn):
             raise ValueError("Неизвестный статус")
     if folder_id is None or folder_id == "":
         folder_id = None

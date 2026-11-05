@@ -68,6 +68,7 @@ def _cleanup_existing_demo(conn) -> None:
         conn.execute(f"DELETE FROM notes WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM tasks WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM property_values WHERE lead_id IN ({placeholders})", lead_ids)
+        conn.execute(f"DELETE FROM lead_events WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"UPDATE dialogs SET lead_id = NULL WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM leads WHERE id IN ({placeholders})", lead_ids)
 
@@ -426,22 +427,31 @@ def seed_demo(conn) -> dict:
     prop_amount = create_property_def(conn, name="Сумма сделки", type_="amount", object_type="lead")
     prop_company = create_property_def(conn, name="Компания", type_="text", object_type="lead")
 
+    from app.events import record_lead_event
+
     lead_ids_by_username = {}
     for idx, item in enumerate(leads_spec):
         lead_provider = item.get("provider") or "telegram"
         lead_acc_id = item.get("account_id") or account_id
-        if lead_provider == "whatsapp":
+        if item["username"] == "maria_adscale":
+            stamp = _iso(now_dt - timedelta(days=4, hours=3))
+        elif item["username"] == "ilya_c9":
+            stamp = _iso(now_dt - timedelta(days=5, hours=2))
+        elif item["username"] == "ruslan_auto_wa":
+            stamp = _iso(now_dt - timedelta(days=4, hours=1))
+        elif lead_provider == "whatsapp":
             stamp = _iso(now_dt - timedelta(minutes=10 + idx * 3))
         else:
             stamp = _iso(now_dt - timedelta(minutes=(8 - idx) * 7))
         folder_id = folder_map[item["folder"]] if item.get("folder") else None
+        lead_amount = int(item.get("amount_cents", 0) or 0) // 100
         lcur = conn.execute(
             """
             INSERT INTO leads (
                 account_id, telegram_user_id, username, name, phone,
                 status, note, next_step, created_at, updated_at,
-                description, email, url, folder_id, provider
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                description, email, url, folder_id, provider, amount, currency
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD')
             """,
             (
                 lead_acc_id,
@@ -459,10 +469,43 @@ def seed_demo(conn) -> dict:
                 item["url"],
                 folder_id,
                 lead_provider,
+                lead_amount,
             ),
         )
         lead_id = lcur.lastrowid
         lead_ids_by_username[item["username"]] = lead_id
+
+        record_lead_event(
+            conn,
+            lead_id,
+            "created",
+            f"Создан лид {item['name']}",
+            {
+                "status": "new",
+                "provider": lead_provider,
+                "amount": lead_amount,
+                "currency": "USD",
+            },
+            created_at=stamp,
+        )
+        if lead_amount > 0:
+            record_lead_event(
+                conn,
+                lead_id,
+                "amount_changed",
+                f"Установлен бюджет: {item['amount_text']} USD",
+                {"old_amount": 0, "new_amount": lead_amount, "currency": "USD"},
+                created_at=stamp,
+            )
+        if item["status"] != "new":
+            record_lead_event(
+                conn,
+                lead_id,
+                "status_changed",
+                f"Стадия изменена: new → {item['status']}",
+                {"old_status": "new", "new_status": item["status"]},
+                created_at=stamp,
+            )
 
         conn.execute(
             """
@@ -491,6 +534,14 @@ def seed_demo(conn) -> dict:
                 VALUES (?, ?, 'manual', ?, ?)
                 """,
                 (lead_id, note_body, n_stamp, n_stamp),
+            )
+            record_lead_event(
+                conn,
+                lead_id,
+                "note_added",
+                f"Добавлена заметка: {note_body[:80]}",
+                {"body": note_body[:200], "source": "manual"},
+                created_at=n_stamp,
             )
 
         for t_idx, (task_title, is_done) in enumerate(item["tasks"]):
@@ -675,13 +726,9 @@ def seed_demo(conn) -> dict:
             )
             message_count += 1
 
-    end_of_day = now_dt.replace(hour=23, minute=58, second=0, microsecond=0)
-    today_due_1 = min(now_dt + timedelta(hours=2), end_of_day - timedelta(minutes=2))
-    if today_due_1 <= now_dt:
-        today_due_1 = now_dt + timedelta(seconds=45)
+    end_of_day = now_dt.replace(hour=23, minute=59, second=50, microsecond=0)
+    today_due_1 = min(now_dt + timedelta(hours=2), end_of_day - timedelta(seconds=20))
     today_due_2 = min(now_dt + timedelta(hours=4), end_of_day)
-    if today_due_2 <= now_dt:
-        today_due_2 = now_dt + timedelta(seconds=90)
 
     reminders_spec = [
         (
@@ -706,12 +753,20 @@ def seed_demo(conn) -> dict:
         ),
     ]
     for r_lead_id, due_at, r_text in reminders_spec:
-        conn.execute(
+        rcur = conn.execute(
             """
             INSERT INTO reminders (lead_id, due_at, text, done_at, created_at)
             VALUES (?, ?, ?, NULL, ?)
             """,
             (r_lead_id, due_at, r_text, now),
+        )
+        record_lead_event(
+            conn,
+            r_lead_id,
+            "reminder_set",
+            f"Напоминание на {due_at[:16].replace('T', ' ')}: {r_text[:80]}",
+            {"reminder_id": int(rcur.lastrowid), "due_at": due_at, "text": r_text},
+            created_at=now,
         )
 
     c1_account_ids = [account_id, account2_id, account3_id]
@@ -840,6 +895,33 @@ def seed_demo(conn) -> dict:
             """,
             (camp1_id, r_lead_id, r_acc_id, r_tg_id, r_user, r_name, r_phone, r_comp, r_note, r_step, r_status, r_sent, now, now),
         )
+        if r_lead_id and r_step >= 1 and r_sent:
+            record_lead_event(
+                conn,
+                r_lead_id,
+                "outreach_sent",
+                f"Отправлен шаг {r_step}/3 кампании «Web3 Founders · Осень»",
+                {
+                    "campaign_id": camp1_id,
+                    "campaign_name": "Web3 Founders · Осень",
+                    "step": r_step,
+                    "account_id": r_acc_id,
+                },
+                created_at=r_sent,
+            )
+        if r_lead_id and r_status == "replied":
+            record_lead_event(
+                conn,
+                r_lead_id,
+                "reply_received",
+                "Получен ответ от клиента — рассылка остановлена, стадия «Разговор»",
+                {
+                    "campaign_id": camp1_id,
+                    "account_id": r_acc_id,
+                    "username": r_user,
+                },
+                created_at=_iso(now_dt - timedelta(minutes=25)),
+            )
 
     c2_account_ids = [account2_id, account3_id]
     c2_cur = conn.execute(
@@ -893,6 +975,10 @@ def seed_demo(conn) -> dict:
 
     save_view(conn, "VIP в работе", status="talking", folder_id=folder_map["VIP Клиенты"])
     save_view(conn, "Ожидают оплаты", status="waiting", folder_id=None)
+
+    from app.snippets import seed_default_snippets
+
+    seed_default_snippets(conn)
 
     return {
         "ok": True,

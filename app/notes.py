@@ -1,6 +1,7 @@
 import sqlite3
 
 from app.db import as_dict, utc_now
+from app.events import record_lead_event
 
 SOURCES = ("manual", "forwarded")
 
@@ -22,6 +23,14 @@ def add_note(conn, lead_id: int, body: str, source: str = "manual") -> dict:
             VALUES (?, ?, ?, ?, ?)
             """,
             (lead_id, text, source, now, now),
+        )
+        record_lead_event(
+            conn,
+            lead_id,
+            "note_added",
+            "Добавлена заметка в карточку",
+            {"note_id": int(cur.lastrowid), "source": source, "body": text[:200]},
+            created_at=now,
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:

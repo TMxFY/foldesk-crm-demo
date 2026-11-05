@@ -88,6 +88,10 @@
 
         <div class="nav-group">
           <span class="nav-caption">СИСТЕМА</span>
+          <a href="#analytics" data-sheet-link="analytics" data-sheet="analytics">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+            Аналитика
+          </a>
           <a href="#digest" data-sheet-link="digest" data-sheet="digest">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
             Напоминания
@@ -138,6 +142,10 @@
         </div>
 
         <div class="topbar-stats" id="workspace-stats" aria-label="Сводка">
+          <span class="stat-chip stat-chip-money">В работе: <strong id="stat-pipeline-value">$0</strong></span>
+          <span class="stat-chip stat-chip-won">Выиграно: <strong id="stat-won-value">$0</strong></span>
+          <span class="stat-chip">Win Rate: <strong id="stat-win-rate">0%</strong></span>
+          <span class="stat-chip">Reply Rate: <strong id="stat-reply-rate">0%</strong></span>
           <span class="stat-chip">Сделки: <strong id="stat-leads">0</strong></span>
           <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
           <span class="stat-chip">Рассылки: <strong id="stat-campaigns">0</strong></span>
@@ -184,6 +192,10 @@
               </select>
             </label>
             <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
+            <button type="button" class="btn secondary sm" id="board-select-all-btn">Выбрать все</button>
+            <button type="button" class="btn secondary sm" id="board-export-csv-btn">Экспорт CSV</button>
+            <button type="button" class="btn secondary sm" id="board-merge-dups-btn">Слияние дублей</button>
+            <button type="button" class="btn secondary sm" id="add-stage-btn">+ Стадия</button>
             <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Виды</button>
             <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
             <div id="views-popup-box" class="views-popup-box" data-popup-box="views">
@@ -205,6 +217,41 @@
             </div>
           </div>
         </div>
+
+        <div id="pipeline-analytics-bar" class="pipeline-analytics-bar" aria-label="Сквозная сводка воронки и денег">
+          <div class="pipeline-kpi-grid">
+            <div class="pipeline-kpi-card">
+              <span class="pipeline-kpi-label">В работе (Pipeline)</span>
+              <strong id="analytics-kpi-pipeline" class="pipeline-kpi-value">$0</strong>
+              <span id="analytics-kpi-pipeline-sub" class="hint">0 активных сделок</span>
+            </div>
+            <div class="pipeline-kpi-card">
+              <span class="pipeline-kpi-label">Выиграно (Won)</span>
+              <strong id="analytics-kpi-won" class="pipeline-kpi-value is-won">$0</strong>
+              <span id="analytics-kpi-won-sub" class="hint">0 закрытых сделок</span>
+            </div>
+            <div class="pipeline-kpi-card">
+              <span class="pipeline-kpi-label">Win Rate воронки</span>
+              <strong id="analytics-kpi-win-rate" class="pipeline-kpi-value">0%</strong>
+              <span id="analytics-kpi-win-rate-sub" class="hint">Общий объём: $0</span>
+            </div>
+            <div class="pipeline-kpi-card">
+              <span class="pipeline-kpi-label">КПД рассылок (Reply Rate)</span>
+              <strong id="analytics-kpi-reply-rate" class="pipeline-kpi-value">0%</strong>
+              <span id="analytics-kpi-reply-rate-sub" class="hint">Ответили: 0 из 0</span>
+            </div>
+            <div class="pipeline-kpi-card">
+              <span class="pipeline-kpi-label">Пул аккаунтов (сегодня)</span>
+              <strong id="analytics-kpi-pool" class="pipeline-kpi-value">0 / 0</strong>
+              <span id="analytics-kpi-pool-sub" class="hint">Активных: 0</span>
+            </div>
+          </div>
+          <div class="pipeline-conversion-row">
+            <div id="pipeline-conversion-strip" class="pipeline-conversion-strip" aria-label="Конверсия между этапами"></div>
+            <a href="#analytics" data-sheet-link="analytics" class="btn secondary sm">Сквозная аналитика →</a>
+          </div>
+        </div>
+
         <div id="board-view" data-state="loading">
           <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
           <p data-when="error" id="board-error" class="msg" role="alert"></p>
@@ -226,6 +273,20 @@
                 <button type="button" id="inbox-mode-crm" class="btn ghost sm" aria-pressed="false">CRM Чаты + Карточка</button>
               </div>
               <a id="tg-web-a-external-link" href="/a/" target="_blank" rel="noopener" class="btn primary sm">Открыть /a/ во весь экран ↗</a>
+            </div>
+          </div>
+          <div id="tg-web-snippets-bar" class="snippets-bar tg-web-snippets-bar" aria-label="Быстрые шаблоны для Telegram Web">
+            <span class="snippets-bar-label">Быстрые шаблоны:</span>
+            <div id="tg-web-snippets-list" class="snippets-chips-row">
+              <div class="snippet-chip" data-snippet-shortcut="/price">
+                <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/price"><code>/price</code> <span>Прайс</span></button>
+              </div>
+              <div class="snippet-chip" data-snippet-shortcut="/cases">
+                <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/cases"><code>/cases</code> <span>Кейсы</span></button>
+              </div>
+              <div class="snippet-chip" data-snippet-shortcut="/call">
+                <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/call"><code>/call</code> <span>Созвон</span></button>
+              </div>
             </div>
           </div>
           <div id="tg-web-a-frame-wrap" class="tg-web-a-frame-wrap">
@@ -301,9 +362,26 @@
               <p id="thread-error" class="msg" role="alert" hidden></p>
               <ol id="messages" class="messages"></ol>
               <p id="thread-gap" class="hint empty-state">Сообщений пока нет</p>
+              <div id="reply-snippets-bar" class="snippets-bar reply-snippets-bar" aria-label="Быстрые шаблоны для чата">
+                <div class="snippets-bar-top">
+                  <span class="snippets-bar-label">Шаблоны:</span>
+                  <div id="reply-snippets-list" class="snippets-chips-row">
+                    <div class="snippet-chip" data-snippet-shortcut="/price">
+                      <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/price"><code>/price</code> <span>Прайс</span></button>
+                    </div>
+                    <div class="snippet-chip" data-snippet-shortcut="/cases">
+                      <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/cases"><code>/cases</code> <span>Кейсы</span></button>
+                    </div>
+                    <div class="snippet-chip" data-snippet-shortcut="/call">
+                      <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/call"><code>/call</code> <span>Созвон</span></button>
+                    </div>
+                  </div>
+                </div>
+                <div id="reply-snippets-suggest" class="snippets-suggest" hidden></div>
+              </div>
               <form id="reply-form" class="reply-form">
                 <label for="reply-text">Ответ</label>
-                <textarea id="reply-text" name="text" placeholder="Напишите сообщение..."></textarea>
+                <textarea id="reply-text" name="text" placeholder="Напишите сообщение или введите / для шаблона..."></textarea>
                 <div class="row">
                   <button type="submit" class="btn primary sm">Отправить</button>
                   <button type="button" class="btn ghost sm" id="mark-unread">Непрочитанное</button>
@@ -326,6 +404,34 @@
               </div>
               <div data-when="filled" id="side-card"></div>
               <p data-when="error" id="side-error" class="msg" role="alert"></p>
+            </div>
+            <div id="side-snippets-panel" class="snippets-panel" aria-label="Быстрые шаблоны рядом с чатом">
+              <div class="snippets-panel-head">
+                <strong class="snippets-panel-title">Быстрые шаблоны (Snippets)</strong>
+                <span class="hint">Клик подставит <code>{name}</code>, <code>{company}</code> и скопирует для /a/</span>
+              </div>
+              <div id="side-snippets-list" class="snippets-chips-row">
+                <div class="snippet-chip" data-snippet-shortcut="/price">
+                  <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/price"><code>/price</code> <span>Прайс</span></button>
+                </div>
+                <div class="snippet-chip" data-snippet-shortcut="/cases">
+                  <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/cases"><code>/cases</code> <span>Кейсы</span></button>
+                </div>
+                <div class="snippet-chip" data-snippet-shortcut="/call">
+                  <button type="button" class="snippet-chip-btn" data-snippet-shortcut="/call"><code>/call</code> <span>Созвон</span></button>
+                </div>
+              </div>
+              <p id="snippet-copy-status" class="hint snippet-copy-status" role="status" hidden></p>
+              <form id="snippet-create-form" class="snippet-create-form" aria-label="Добавить быстрый шаблон">
+                <div class="snippet-form-row">
+                  <input id="snippet-shortcut" name="shortcut" type="text" autocomplete="off" placeholder="/команда (напр. /demo)" aria-label="Команда шаблона" required>
+                  <input id="snippet-title" name="title" type="text" autocomplete="off" placeholder="Название (Демо)" aria-label="Название шаблона" required>
+                </div>
+                <textarea id="snippet-body" name="body" rows="2" placeholder="Текст шаблона с {name} и {company}..." aria-label="Текст шаблона" required></textarea>
+                <div class="row">
+                  <button type="submit" id="snippet-submit-btn" class="btn secondary sm">+ Добавить шаблон</button>
+                </div>
+              </form>
             </div>
           </section>
 
@@ -351,6 +457,47 @@
             <button type="button" class="btn secondary sm" id="digest-send">Прислать сводку</button>
           </div>
           <div id="reminders" class="stack">
+            <div id="focus-today-widget" class="focus-today-widget surface-subcard stack" aria-labelledby="focus-today-title">
+              <div class="subcard-head">
+                <div class="pipeline-title-row">
+                  <h3 id="focus-today-title">Мой фокус на сегодня</h3>
+                  <span id="focus-today-total-badge" class="badge b-talk">0 в фокусе</span>
+                </div>
+                <button type="button" class="btn ghost sm" id="focus-today-refresh">Обновить фокус</button>
+              </div>
+              <div class="focus-today-grid">
+                <div class="focus-col" data-focus-col="waiting_reply">
+                  <div class="focus-col-head">
+                    <strong>Горящие ответы</strong>
+                    <span id="focus-count-waiting" class="badge b-wait">0</span>
+                  </div>
+                  <p class="hint">Клиент написал последним — ждёт ответа</p>
+                  <div id="focus-waiting-reply-list" class="focus-items-list">
+                    <p class="hint empty-state">Все диалоги отвечены</p>
+                  </div>
+                </div>
+                <div class="focus-col" data-focus-col="due_reminders">
+                  <div class="focus-col-head">
+                    <strong>Напоминания и задачи</strong>
+                    <span id="focus-count-reminders" class="badge b-talk">0</span>
+                  </div>
+                  <p class="hint">Просроченные и сегодняшние касания</p>
+                  <div id="focus-due-reminders-list" class="focus-items-list">
+                    <p class="hint empty-state">На сегодня напоминаний нет</p>
+                  </div>
+                </div>
+                <div class="focus-col" data-focus-col="stale_leads">
+                  <div class="focus-col-head">
+                    <strong>Пора дожать</strong>
+                    <span id="focus-count-stale" class="badge b-cold">0</span>
+                  </div>
+                  <p class="hint">Сделки в работе без касаний &gt; 3 дней</p>
+                  <div id="focus-stale-leads-list" class="focus-items-list">
+                    <p class="hint empty-state">Зависших сделок нет</p>
+                  </div>
+                </div>
+              </div>
+            </div>
             <p id="digest-send-status" class="hint" role="status" hidden></p>
             <div class="switch" id="reminder-scopes" role="group" aria-label="Срок">
               <button type="button" data-scope="open" class="btn secondary sm" aria-pressed="true">Открытые</button>
@@ -542,6 +689,8 @@
           <div class="pipeline-title-row">
             <h2 id="outreach-title">Рассылки</h2>
             <span id="schedule-summary-badge" class="badge b-new">Пн–Пт · 09:00–18:00 UTC</span>
+            <button type="button" id="outreach-autopilot-toggle" class="chip" aria-pressed="true" data-autopilot-enabled="true">Автопилот по расписанию: ВКЛ</button>
+            <span id="outreach-autopilot-status" class="hint" role="status">Проверка каждые 30 сек</span>
           </div>
           <div class="row outreach-head-actions">
             <button type="button" id="outreach-open-schedule-btn" class="btn secondary sm">Расписание</button>
@@ -646,10 +795,11 @@
 
               <div class="steps-toolbar">
                 <div class="steps-toolbar-head">
-                  <span class="steps-caption">Переменные (подтягиваются из столбцов CSV):</span>
+                  <span class="steps-caption">Переменные и Spintax (подтягиваются из столбцов CSV):</span>
                   <label for="csv-file" class="chip var-chip-upload" id="load-csv-vars-btn">Подтянуть столбцы из CSV</label>
                 </div>
                 <div id="builder-var-chips" class="var-chips" role="group" aria-label="Переменные шаблона">
+                  <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{Привет|Добрый день|Здравствуйте}">+ Spintax {Привет|Добрый день}</button>
                   <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{name}">+ {name}</button>
                   <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{company}">+ {company}</button>
                   <button type="button" class="chip var-chip" data-default-var="true" data-insert-var="{username}">+ {username}</button>
@@ -747,8 +897,75 @@
       <section id="leads" data-sheet="leads" class="surface-box" aria-labelledby="leads-title">
         <div class="pane-head">
           <h2 id="leads-title">Лиды</h2>
-          <button type="button" id="open-lead-popup" class="btn primary sm sheet-only-btn">+ Завести карточку</button>
+          <div class="row leads-toolbar-actions">
+            <button type="button" id="leads-select-all-btn" class="btn secondary sm">Выбрать все в фильтре</button>
+            <button type="button" id="leads-export-csv-btn" class="btn secondary sm">Экспорт CSV</button>
+            <button type="button" id="leads-merge-dups-btn" class="btn secondary sm">Слияние дублей</button>
+            <button type="button" id="open-lead-popup" class="btn primary sm sheet-only-btn">+ Завести карточку</button>
+          </div>
         </div>
+
+        <div id="leads-bulk-bar" class="bulk-actions-bar surface-subcard" role="region" aria-label="Массовые действия с лидами" hidden>
+          <div class="bulk-bar-summary">
+            <span class="badge b-talk">Выбрано: <strong id="bulk-selected-count">0</strong></span>
+            <button type="button" id="bulk-select-all-btn" class="btn ghost sm">Все в фильтре</button>
+            <button type="button" id="bulk-clear-btn" class="btn ghost sm">Снять выбор</button>
+          </div>
+          <div class="bulk-bar-controls">
+            <div class="bulk-control-group">
+              <select id="bulk-status-select" aria-label="Новый статус для выбранных лидов">
+                <option value="new">Лид</option>
+                <option value="talking">Разговор</option>
+                <option value="waiting">Ждём</option>
+                <option value="won">Выигран</option>
+                <option value="lost">Проигран</option>
+              </select>
+              <button type="button" id="bulk-apply-status-btn" class="btn secondary sm">Сменить стадию</button>
+            </div>
+            <div class="bulk-control-group">
+              <select id="bulk-folder-select" aria-label="Папка для выбранных лидов">
+                <option value="">Без папки</option>
+              </select>
+              <button type="button" id="bulk-apply-folder-btn" class="btn secondary sm">В папку</button>
+            </div>
+            <div class="bulk-control-group">
+              <input type="number" id="bulk-amount-input" min="0" step="100" placeholder="Бюджет $" aria-label="Бюджет для выбранных лидов">
+              <button type="button" id="bulk-apply-amount-btn" class="btn secondary sm">Бюджет</button>
+            </div>
+            <div class="bulk-control-group">
+              <select id="bulk-campaign-select" aria-label="Кампания для выбранных лидов">
+                <option value="">Кампания рассылки...</option>
+              </select>
+              <button type="button" id="bulk-apply-campaign-btn" class="btn secondary sm">В рассылку</button>
+            </div>
+            <button type="button" id="bulk-delete-btn" class="btn ghost sm bulk-delete-btn">Удалить</button>
+          </div>
+        </div>
+
+        <div id="leads-duplicates-modal" class="duplicates-modal-box surface-subcard stack" role="dialog" aria-labelledby="duplicates-modal-title" hidden>
+          <div class="popup-box-head">
+            <div>
+              <strong id="duplicates-modal-title">Поиск и слияние дублей лидов</strong>
+              <p class="hint">Поиск совпадений по username, телефону и Telegram ID. При слиянии все заметки, задачи, напоминания, диалоги, поля и рассылки переносятся в целевую карточку.</p>
+            </div>
+            <div class="row">
+              <button type="button" id="refresh-duplicates-btn" class="btn secondary sm">Обновить поиск</button>
+              <button type="button" id="close-duplicates-modal-btn" class="btn ghost sm" aria-label="Закрыть окно дублей">Закрыть ×</button>
+            </div>
+          </div>
+          <div id="duplicates-groups-list" class="duplicates-groups-list"></div>
+          <div class="manual-merge-row">
+            <span class="hint">Ручное слияние карточек:</span>
+            <label class="inline">Дубль (откуда)
+              <select id="manual-merge-source-select" aria-label="Исходный дубль лида"></select>
+            </label>
+            <label class="inline">Основной (куда)
+              <select id="manual-merge-target-select" aria-label="Целевой основной лид"></select>
+            </label>
+            <button type="button" id="manual-merge-submit-btn" class="btn primary sm">Слить выбранные</button>
+          </div>
+        </div>
+
         <div id="manual-lead-box" class="manual-lead-box" data-popup-box="lead">
           <div class="popup-box-head sheet-only-flex">
             <strong>Новая карточка контакта</strong>
@@ -764,6 +981,7 @@
                 <option value="whatsapp">WhatsApp (WA)</option>
               </select>
             </label>
+            <label>Бюджет ($) <input name="amount" id="manual-lead-amount" type="number" min="0" step="1" autocomplete="off" placeholder="2500"></label>
             <label>Заметка <input name="note" autocomplete="off" placeholder="Контекст сделки"></label>
             <label>Ссылка <input name="url" type="url" autocomplete="off" inputmode="url" placeholder="https://..."></label>
             <label>Почта <input name="email" type="email" autocomplete="email" placeholder="ivan@company.ru"></label>
@@ -779,6 +997,7 @@
             <table>
               <thead>
                 <tr>
+                  <th class="bulk-check-col"><input type="checkbox" id="leads-select-all-checkbox" aria-label="Выбрать все лиды"></th>
                   <th>Имя</th>
                   <th>Username</th>
                   <th class="num">Telegram id</th>
@@ -984,8 +1203,118 @@
             <label for="ai-bot-goal">Цель квалификации (Target Action)
               <input id="ai-bot-goal" type="text" value="Назначить 15-минутный демо-созвон в Google Meet или отправить 3 примера UGC-креативов">
             </label>
-            <div class="row">
+          <div class="row">
               <button type="button" id="ai-bot-save-btn" class="btn primary sm">Сохранить конфигурацию AI</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="analytics" data-sheet="analytics" class="surface-box analytics-section" aria-labelledby="analytics-title">
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="analytics-title">Сквозная аналитика</h2>
+            <span class="badge b-ok">Воронка · Рассылки · Аккаунты</span>
+          </div>
+          <div class="row">
+            <button type="button" id="analytics-refresh-btn" class="btn secondary sm">Обновить аналитику</button>
+          </div>
+        </div>
+
+        <div class="analytics-dashboard-grid">
+          <div id="analytics-funnel-card" class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>1. Воронка и деньги</h3>
+              <span id="analytics-funnel-badge" class="badge b-new">0 сделок · $0</span>
+            </div>
+            <div class="analytics-mini-kpis">
+              <div class="analytics-mini-kpi">
+                <span class="hint">В работе (Pipeline)</span>
+                <strong id="analytics-funnel-pipeline">$0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Выиграно (Won)</span>
+                <strong id="analytics-funnel-won" class="is-won">$0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Win Rate</span>
+                <strong id="analytics-funnel-win-rate">0%</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Закрытые (Won/Lost)</span>
+                <strong id="analytics-funnel-closed-rate">0%</strong>
+              </div>
+            </div>
+            <div class="stack">
+              <span class="steps-caption">РАЗБИВКА ПО СТАДИЯМ ВОРОНКИ</span>
+              <div id="analytics-stages-list" class="analytics-list"></div>
+            </div>
+            <div class="stack">
+              <span class="steps-caption">КОНВЕРСИЯ МЕЖДУ ЭТАПАМИ</span>
+              <div id="analytics-conversions-list" class="analytics-conversions-list"></div>
+            </div>
+          </div>
+
+          <div id="analytics-outreach-card" class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>2. КПД рассылок</h3>
+              <span id="analytics-outreach-badge" class="badge b-talk">Reply Rate: 0%</span>
+            </div>
+            <div class="analytics-mini-kpis">
+              <div class="analytics-mini-kpi">
+                <span class="hint">Получателей</span>
+                <strong id="analytics-outreach-total">0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Отправлено</span>
+                <strong id="analytics-outreach-sent">0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Ответили</span>
+                <strong id="analytics-outreach-replied" class="is-won">0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Reply Rate</span>
+                <strong id="analytics-outreach-reply-rate">0%</strong>
+              </div>
+            </div>
+            <div class="stack">
+              <span class="steps-caption">КАМПАНИИ РАССЫЛОК</span>
+              <div id="analytics-campaigns-list" class="analytics-list">
+                <p class="hint empty-state">Нет кампаний рассылки</p>
+              </div>
+            </div>
+          </div>
+
+          <div id="analytics-accounts-card" class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>3. Эффективность и здоровье сессий</h3>
+              <span id="analytics-accounts-badge" class="badge b-ok">Пул: 0 / 0</span>
+            </div>
+            <div class="analytics-mini-kpis">
+              <div class="analytics-mini-kpi">
+                <span class="hint">Суточный пул</span>
+                <strong id="analytics-accounts-pool">0 / 0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Загрузка пула</span>
+                <strong id="analytics-accounts-util">0%</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Диалогов</span>
+                <strong id="analytics-accounts-dialogs">0</strong>
+              </div>
+              <div class="analytics-mini-kpi">
+                <span class="hint">Ответов</span>
+                <strong id="analytics-accounts-replies">0</strong>
+              </div>
+            </div>
+            <div id="analytics-health-summary" class="analytics-health-summary"></div>
+            <div class="stack">
+              <span class="steps-caption">ПОКАЗАТЕЛИ ПО АККАУНТАМ</span>
+              <div id="analytics-accounts-list" class="analytics-list">
+                <p class="hint empty-state">Нет подключённых аккаунтов</p>
+              </div>
             </div>
           </div>
         </div>
