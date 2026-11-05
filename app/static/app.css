@@ -3243,3 +3243,443 @@ tr.bulk-selected,
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* =========================================================================
+ * v5: Airtable Sync · SoftUGC Deal Card · MCP Modal · Calendar · 5 Charts
+ * ========================================================================= */
+#s07.pipeline-section {
+  padding: 10px 14px;
+  gap: 8px;
+}
+
+#s07 .pipeline-header {
+  gap: 6px;
+}
+
+#s07 .pipeline-analytics-bar {
+  padding: 8px 10px;
+  gap: 6px;
+}
+
+#s07 .pipeline-kpi-card {
+  padding: 6px 10px;
+  gap: 2px;
+}
+
+#s07 .focus-today-widget {
+  padding: 8px 10px;
+  gap: 6px;
+}
+
+#s07 .focus-col {
+  padding: 6px 8px;
+  gap: 4px;
+}
+
+#s07 .focus-items-list {
+  max-height: 96px;
+}
+
+.board {
+  align-items: start;
+}
+
+.board .col {
+  min-height: 0 !important;
+  gap: 5px;
+  padding: 6px 8px;
+}
+
+.board .card {
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 5px;
+  padding: 5px 7px;
+}
+
+.board .card .avatar {
+  width: 24px;
+  height: 24px;
+  font-size: 10px;
+}
+
+.board .card-top .name {
+  font-size: 12px;
+  line-height: 14px;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.board .card-top .meta {
+  font-size: 10px;
+  line-height: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.board .card-step {
+  font-size: 10px;
+  line-height: 13px;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.board .card-tags {
+  gap: 3px;
+  margin-top: 2px;
+  max-height: 20px;
+  overflow: hidden;
+}
+
+.board .card-tag,
+.board .card-pill,
+.board .card-amount {
+  min-height: 16px;
+  padding: 1px 5px;
+  font-size: 10px;
+  line-height: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.stage-dot[data-stage="call_scheduled"] {
+  background: #8b5cf6;
+}
+.stage-dot[data-stage="on_hold"] {
+  background: #94a3b8;
+}
+
+.softugc-deal-box {
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+}
+
+.softugc-fields-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.softugc-field-wide {
+  grid-column: 1 / -1;
+}
+
+.mcp-modal-box {
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--accent, #3b82f6);
+}
+
+.mcp-modal-box[hidden] {
+  display: none !important;
+}
+
+.mcp-configs-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.mcp-code-block {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: rgba(15, 23, 42, 0.72);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #e2e8f0;
+  overflow-x: auto;
+  max-height: 190px;
+}
+
+.mcp-tools-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: var(--space-2);
+}
+
+.mcp-tool-card {
+  display: grid;
+  gap: 4px;
+  padding: var(--space-2);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.mcp-tool-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent, #60a5fa);
+}
+
+.mcp-tool-desc {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+/* Internal Calendar */
+.calendar-toolbar-actions {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.cal-period-label {
+  min-width: 128px;
+  text-align: center;
+  font-size: var(--text-sm);
+}
+
+.calendar-event-form[hidden] {
+  display: none !important;
+}
+
+.calendar-form-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-2);
+  align-items: end;
+}
+
+.cal-form-submit-cell {
+  display: flex;
+  align-items: flex-end;
+}
+
+.calendar-grid-container {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.cal-weekdays-row {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.cal-weekday-head {
+  padding: 6px 8px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.cal-month-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.cal-week-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cal-day-view-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.cal-day-cell {
+  min-height: 54px;
+  padding: 4px 6px;
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.cal-day-cell.is-muted-month {
+  opacity: 0.55;
+}
+
+.cal-day-cell.is-today {
+  border-color: var(--accent, #3b82f6);
+}
+
+.cal-day-cell.is-drag-over {
+  border-color: #10b981;
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.cal-day-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.cal-day-num {
+  font-weight: 600;
+}
+
+.cal-day-count {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.18);
+  color: var(--text);
+}
+
+.cal-day-items {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.cal-item-chip {
+  padding: 5px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--cal-chip-color, #3b82f6);
+  background: var(--surface);
+  font-size: 11px;
+  line-height: 1.3;
+  cursor: grab;
+  display: grid;
+  gap: 3px;
+}
+
+.cal-item-chip.is-completed {
+  opacity: 0.6;
+  text-decoration: line-through;
+}
+
+.cal-chip-main {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.cal-chip-time {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.cal-chip-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cal-chip-sub {
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cal-chip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.cal-chip-btn {
+  padding: 1px 5px;
+  font-size: 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--sunken);
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+/* 5 SVG Analytics Charts */
+.analytics-charts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+#analytics-chart-heatmap {
+  grid-column: 1 / -1;
+}
+
+.analytics-svg-host {
+  min-height: 170px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.analytics-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.analytics-donut-svg {
+  width: 150px;
+  height: 150px;
+  flex-shrink: 0;
+}
+
+.analytics-cs-layout {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.analytics-cs-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.analytics-source-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.analytics-channel-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 11px;
+}
+
+@media (max-width: 1180px) {
+  .mcp-configs-grid,
+  .calendar-form-grid,
+  .analytics-charts-grid,
+  .cal-day-view-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cal-month-grid,
+  .cal-week-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -1,3 +1,4 @@
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -7,6 +8,15 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
 
 STATUSES = ("new", "talking", "waiting", "won", "lost")
+AIRTABLE_STAGE_KEYS = (
+    "new",
+    "talking",
+    "call_scheduled",
+    "waiting",
+    "on_hold",
+    "won",
+    "lost",
+)
 DEFAULT_PIPELINE_STAGES = (
     ("new", "Лид", 1, "#94a3b8"),
     ("talking", "Разговор", 2, "#38bdf8"),
@@ -14,6 +24,51 @@ DEFAULT_PIPELINE_STAGES = (
     ("won", "Выигран", 4, "#34d399"),
     ("lost", "Проигран", 5, "#f87171"),
 )
+AIRTABLE_PIPELINE_STAGES = (
+    ("new", "Лид", 1, "#94a3b8"),
+    ("talking", "Разговор", 2, "#38bdf8"),
+    ("call_scheduled", "Созвон назначен", 3, "#a855f7"),
+    ("waiting", "Ждём", 4, "#fbbf24"),
+    ("on_hold", "На паузе", 5, "#64748b"),
+    ("won", "Выигран", 6, "#34d399"),
+    ("lost", "Проигран", 7, "#f87171"),
+)
+AIRTABLE_STATUS_TO_KEY = {
+    "new": "new",
+    "лид": "new",
+    "in conversation": "talking",
+    "talking": "talking",
+    "разговор": "talking",
+    "call scheduled": "call_scheduled",
+    "call_scheduled": "call_scheduled",
+    "созвон назначен": "call_scheduled",
+    "offer sent": "waiting",
+    "waiting": "waiting",
+    "ждём": "waiting",
+    "оффер отправлен": "waiting",
+    "on hold": "on_hold",
+    "on_hold": "on_hold",
+    "на паузе": "on_hold",
+    "signed": "won",
+    "won": "won",
+    "выигран": "won",
+    "cancelled": "lost",
+    "canceled": "lost",
+    "lost": "lost",
+    "проигран": "lost",
+    "contacted": "talking",
+    "qualified": "waiting",
+    "converted": "won",
+}
+KEY_TO_AIRTABLE_STATUS = {
+    "new": "New",
+    "talking": "In conversation",
+    "call_scheduled": "Call scheduled",
+    "waiting": "Offer sent",
+    "on_hold": "On hold",
+    "won": "Signed",
+    "lost": "Cancelled",
+}
 ACCOUNT_STATUSES = ("pending_code", "pending_password", "connected", "error")
 
 
@@ -364,9 +419,103 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS lead_events_lead_created ON lead_events(lead_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            event_type TEXT NOT NULL DEFAULT 'call',
+            start_at TEXT NOT NULL,
+            end_at TEXT,
+            all_day INTEGER NOT NULL DEFAULT 0 CHECK (all_day IN (0, 1)),
+            lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+            meet_link TEXT,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'scheduled' CHECK (
+                status IN ('scheduled', 'completed', 'cancelled')
+            ),
+            source TEXT NOT NULL DEFAULT 'crm',
+            external_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS calendar_events_start ON calendar_events(start_at);
+        CREATE INDEX IF NOT EXISTS calendar_events_lead ON calendar_events(lead_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS calendar_events_ext_unique
+            ON calendar_events(source, external_id)
+            WHERE external_id IS NOT NULL;
         """
     )
     _migrate(conn)
+
+
+def _migrate_legacy_leads_status_check(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leads'"
+    ).fetchone()
+    if not row or not row[0] or "status IN (" not in str(row[0]):
+        return
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(leads)").fetchall()]
+    col_list = ", ".join(cols)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE leads__new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                telegram_user_id INTEGER,
+                username TEXT,
+                name TEXT,
+                phone TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                note TEXT,
+                next_step TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                description TEXT,
+                email TEXT,
+                url TEXT,
+                dialog_id INTEGER,
+                provider TEXT NOT NULL DEFAULT 'telegram',
+                folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
+                amount INTEGER NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                company TEXT,
+                niche TEXT,
+                offer_type TEXT,
+                offer_details TEXT,
+                monthly_value INTEGER NOT NULL DEFAULT 0,
+                lead_source TEXT,
+                next_follow_up TEXT,
+                last_contacted TEXT,
+                airtable_record_id TEXT,
+                airtable_status TEXT,
+                airtable_synced_at TEXT,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            )
+            """
+        )
+        conn.execute(f"INSERT INTO leads__new ({col_list}) SELECT {col_list} FROM leads")
+        conn.execute("DROP TABLE leads")
+        conn.execute("ALTER TABLE leads__new RENAME TO leads")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS leads_account_tg_unique
+                ON leads(account_id, telegram_user_id)
+                WHERE telegram_user_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS leads_null_account_tg_unique
+                ON leads(telegram_user_id)
+                WHERE account_id IS NULL AND telegram_user_id IS NOT NULL
+            """
+        )
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -378,6 +527,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "leads", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
     _ensure_column(conn, "leads", "amount", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "leads", "currency", "TEXT NOT NULL DEFAULT 'USD'")
+    _ensure_column(conn, "leads", "company", "TEXT")
+    _ensure_column(conn, "leads", "niche", "TEXT")
+    _ensure_column(conn, "leads", "offer_type", "TEXT")
+    _ensure_column(conn, "leads", "offer_details", "TEXT")
+    _ensure_column(conn, "leads", "monthly_value", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "leads", "lead_source", "TEXT")
+    _ensure_column(conn, "leads", "next_follow_up", "TEXT")
+    _ensure_column(conn, "leads", "last_contacted", "TEXT")
+    _ensure_column(conn, "leads", "airtable_record_id", "TEXT")
+    _ensure_column(conn, "leads", "airtable_status", "TEXT")
+    _ensure_column(conn, "leads", "airtable_synced_at", "TEXT")
+    _migrate_legacy_leads_status_check(conn)
     _ensure_column(conn, "accounts", "health", "TEXT")
     _ensure_column(conn, "accounts", "last_error", "TEXT")
     _ensure_column(conn, "accounts", "updated_at", "TEXT")
@@ -421,6 +582,38 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            event_type TEXT NOT NULL DEFAULT 'call',
+            start_at TEXT NOT NULL,
+            end_at TEXT,
+            all_day INTEGER NOT NULL DEFAULT 0 CHECK (all_day IN (0, 1)),
+            lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+            meet_link TEXT,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'scheduled' CHECK (
+                status IN ('scheduled', 'completed', 'cancelled')
+            ),
+            source TEXT NOT NULL DEFAULT 'crm',
+            external_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS calendar_events_start ON calendar_events(start_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS calendar_events_lead ON calendar_events(lead_id)")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS calendar_events_ext_unique
+            ON calendar_events(source, external_id)
+            WHERE external_id IS NOT NULL
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS leads_airtable_rec ON leads(airtable_record_id)")
     _ensure_default_pipeline_stages(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")
@@ -437,7 +630,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
-    for key, label, position, color in DEFAULT_PIPELINE_STAGES:
+    is_test_env = (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+    )
+    stages = DEFAULT_PIPELINE_STAGES if is_test_env else AIRTABLE_PIPELINE_STAGES
+    for key, label, position, color in stages:
         conn.execute(
             """
             INSERT OR IGNORE INTO pipeline_stages (key, label, position, color)
@@ -445,6 +643,25 @@ def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
             """,
             (key, label, position, color),
         )
+    if not is_test_env:
+        ensure_airtable_pipeline_stages(conn)
+
+
+def ensure_airtable_pipeline_stages(conn: sqlite3.Connection) -> list[dict]:
+    for key, label, position, color in AIRTABLE_PIPELINE_STAGES:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO pipeline_stages (key, label, position, color)
+            VALUES (?, ?, ?, ?)
+            """,
+            (key, label, position, color),
+        )
+        conn.execute(
+            "UPDATE pipeline_stages SET position = ? WHERE key = ?",
+            (position, key),
+        )
+    conn.commit()
+    return list_pipeline_stages(conn)
 
 
 def as_dict(row):
@@ -454,7 +671,7 @@ def as_dict(row):
 
 
 def valid_statuses(conn: sqlite3.Connection | None = None) -> set[str]:
-    allowed = set(STATUSES)
+    allowed = set(STATUSES) | set(AIRTABLE_STAGE_KEYS) | set(KEY_TO_AIRTABLE_STATUS.values())
     if conn is not None:
         try:
             rows = conn.execute("SELECT key FROM pipeline_stages").fetchall()
@@ -462,6 +679,25 @@ def valid_statuses(conn: sqlite3.Connection | None = None) -> set[str]:
         except Exception:
             pass
     return allowed
+
+
+def normalize_status(raw: str | None, conn: sqlite3.Connection | None = None) -> str:
+    if raw is None:
+        return "new"
+    s = str(raw).strip()
+    if not s:
+        return "new"
+    lower = s.lower()
+    if lower in AIRTABLE_STATUS_TO_KEY:
+        return AIRTABLE_STATUS_TO_KEY[lower]
+    if s in valid_statuses(conn):
+        return s
+    return s
+
+
+def status_to_airtable(status: str | None) -> str:
+    norm = normalize_status(status)
+    return KEY_TO_AIRTABLE_STATUS.get(norm, "New")
 
 
 def list_pipeline_stages(conn: sqlite3.Connection) -> list[dict]:

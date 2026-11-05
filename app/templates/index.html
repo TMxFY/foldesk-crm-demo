@@ -88,6 +88,10 @@
 
         <div class="nav-group">
           <span class="nav-caption">СИСТЕМА</span>
+          <a href="#calendar" data-sheet-link="calendar" data-sheet="calendar">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+            Календарь
+          </a>
           <a href="#analytics" data-sheet-link="analytics" data-sheet="analytics">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
             Аналитика
@@ -150,7 +154,39 @@
           <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
           <span class="stat-chip">Рассылки: <strong id="stat-campaigns">0</strong></span>
           <span class="stat-chip">Напоминания: <strong id="stat-reminders">0</strong></span>
+          <button type="button" id="open-mcp-modal-btn" class="btn secondary sm" title="Подключить AI-агента по MCP">MCP для агентов</button>
           <button type="button" id="toggle-view-mode" class="btn secondary sm">Все блоки</button>
+        </div>
+      </div>
+
+      <div id="mcp-modal-box" class="surface-subcard mcp-modal-box stack" role="dialog" aria-labelledby="mcp-modal-title" hidden>
+        <div class="popup-box-head">
+          <div class="pipeline-title-row">
+            <strong id="mcp-modal-title">MCP-сервер Foldesk для AI-агентов</strong>
+            <span id="mcp-status-badge" class="badge b-ok">Активен · 13 инструментов · Без отправки в чаты</span>
+          </div>
+          <button type="button" id="close-mcp-modal-btn" class="btn ghost sm" aria-label="Закрыть окно MCP">Закрыть ×</button>
+        </div>
+        <p class="hint">Подключите Claude Desktop, Cursor, Windsurf или своего AI-агента к базе сделок, аналитике, календарю и Airtable по протоколу MCP (чтение всей CRM и переписок + обновление сделок, заметок, задач и созвонов без риска случайной отправки сообщений).</p>
+        <div class="mcp-configs-grid">
+          <div class="mcp-config-card stack">
+            <div class="subcard-head">
+              <strong>1. Stdio-конфиг (Claude Desktop / локальный агент)</strong>
+              <button type="button" id="copy-mcp-stdio-btn" class="btn secondary sm">Скопировать stdio-конфиг</button>
+            </div>
+            <pre class="mcp-code-pre"><code id="mcp-config-stdio">{}</code></pre>
+          </div>
+          <div class="mcp-config-card stack">
+            <div class="subcard-head">
+              <strong>2. HTTP /mcp конфиг (Cursor / удалённый агент)</strong>
+              <button type="button" id="copy-mcp-http-btn" class="btn secondary sm">Скопировать HTTP /mcp конфиг</button>
+            </div>
+            <pre class="mcp-code-pre"><code id="mcp-config-http">{}</code></pre>
+          </div>
+        </div>
+        <div class="stack">
+          <span class="steps-caption">ДОСТУПНЫЕ ИНСТРУМЕНТЫ MCP (13 TOOLS):</span>
+          <div id="mcp-tools-list" class="mcp-tools-grid"></div>
         </div>
       </div>
 
@@ -195,6 +231,7 @@
             <button type="button" class="btn secondary sm" id="board-select-all-btn">Выбрать все</button>
             <button type="button" class="btn secondary sm" id="board-export-csv-btn">Экспорт CSV</button>
             <button type="button" class="btn secondary sm" id="board-merge-dups-btn">Слияние дублей</button>
+            <button type="button" class="btn secondary sm" id="board-airtable-sync-btn">Синхронизировать с Airtable</button>
             <button type="button" class="btn secondary sm" id="add-stage-btn">+ Стадия</button>
             <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Виды</button>
             <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
@@ -670,7 +707,10 @@
         <section id="s11" data-sheet="s11" class="surface-box" aria-labelledby="s11-title">
           <div class="pane-head">
             <h2 id="s11-title">Папки Telegram</h2>
-            <button type="button" id="folders-refresh" class="btn secondary sm">Обновить папки</button>
+            <div class="row">
+              <button type="button" id="folders-refresh" class="btn secondary sm">Обновить папки</button>
+              <button type="button" id="folders-sync-all" class="btn primary sm">Синхронизировать все</button>
+            </div>
           </div>
           <label for="folder-account">Для аккаунта
             <select id="folder-account"></select>
@@ -896,8 +936,12 @@
 
       <section id="leads" data-sheet="leads" class="surface-box" aria-labelledby="leads-title">
         <div class="pane-head">
-          <h2 id="leads-title">Лиды</h2>
+          <div class="pipeline-title-row">
+            <h2 id="leads-title">Лиды</h2>
+            <span id="airtable-status-badge" class="badge b-new">Airtable · SoftUGC</span>
+          </div>
           <div class="row leads-toolbar-actions">
+            <button type="button" id="airtable-sync-btn" class="btn secondary sm">Синхронизировать с Airtable</button>
             <button type="button" id="leads-select-all-btn" class="btn secondary sm">Выбрать все в фильтре</button>
             <button type="button" id="leads-export-csv-btn" class="btn secondary sm">Экспорт CSV</button>
             <button type="button" id="leads-merge-dups-btn" class="btn secondary sm">Слияние дублей</button>
@@ -1210,14 +1254,137 @@
         </div>
       </section>
 
+      <section id="calendar" data-sheet="calendar" class="surface-box calendar-section stack" aria-labelledby="calendar-title">
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="calendar-title">Календарь и расписание</h2>
+            <span id="cal-count-total" class="badge b-new">0 событий</span>
+            <span id="cal-count-calls" class="badge b-talk">Созвоны: 0</span>
+            <span id="cal-count-followups" class="badge b-ok">Follow-up: 0</span>
+            <span id="cal-count-deadlines" class="badge b-wait">Дедлайны: 0</span>
+          </div>
+          <div class="row calendar-toolbar-actions">
+            <div class="row cal-nav-controls" role="group" aria-label="Навигация по календарю">
+              <button type="button" id="cal-prev-btn" class="btn ghost sm" aria-label="Предыдущий период">←</button>
+              <button type="button" id="cal-today-btn" class="btn secondary sm">Сегодня</button>
+              <button type="button" id="cal-next-btn" class="btn ghost sm" aria-label="Следующий период">→</button>
+              <strong id="cal-period-label" class="cal-period-label">Ноябрь 2026</strong>
+            </div>
+            <div id="cal-view-switch" class="switch" role="group" aria-label="Вид календаря">
+              <button type="button" class="btn secondary sm" data-cal-view="month" aria-pressed="true">Месяц</button>
+              <button type="button" class="btn ghost sm" data-cal-view="week" aria-pressed="false">Неделя</button>
+              <button type="button" class="btn ghost sm" data-cal-view="day" aria-pressed="false">День</button>
+              <button type="button" class="btn ghost sm" data-cal-view="agenda" aria-pressed="false">Повестка</button>
+            </div>
+            <label class="inline" for="cal-type-filter">Тип
+              <select id="cal-type-filter" aria-label="Фильтр типов событий">
+                <option value="all">Все типы</option>
+                <option value="calls">Созвоны и встречи</option>
+                <option value="followups">Follow-up лидов</option>
+                <option value="reminders">Напоминания</option>
+                <option value="deadlines">Дедлайны Airtable</option>
+              </select>
+            </label>
+            <button type="button" id="cal-toggle-form-btn" class="btn primary sm">+ Назначить созвон / событие</button>
+          </div>
+        </div>
+
+        <form id="calendar-event-form" class="surface-subcard calendar-event-form" aria-label="Назначить созвон или событие">
+          <div class="calendar-form-grid">
+            <label for="cal-ev-title">Название созвона / встречи
+              <input id="cal-ev-title" name="title" type="text" autocomplete="off" placeholder="Демо-созвон по креативам" required>
+            </label>
+            <label for="cal-ev-type">Тип события
+              <select id="cal-ev-type" name="event_type">
+                <option value="call">Созвон</option>
+                <option value="meeting">Встреча</option>
+                <option value="followup">Follow-up</option>
+                <option value="task_deadline">Дедлайн задачи</option>
+              </select>
+            </label>
+            <label for="cal-ev-start">Начало созвона
+              <input id="cal-ev-start" name="start_at" type="datetime-local" required>
+            </label>
+            <label for="cal-ev-end">Окончание созвона
+              <input id="cal-ev-end" name="end_at" type="datetime-local">
+            </label>
+            <label for="cal-ev-lead">Привязка к лиду
+              <select id="cal-ev-lead" name="lead_id">
+                <option value="">Без привязки к лиду</option>
+              </select>
+            </label>
+            <label for="cal-ev-link">Ссылка (Zoom / Meet / TG)
+              <input id="cal-ev-link" name="meet_link" type="text" autocomplete="off" placeholder="https://meet.google.com/...">
+            </label>
+            <label for="cal-ev-notes">Повестка / комментарий
+              <input id="cal-ev-notes" name="notes" type="text" autocomplete="off" placeholder="Обсудить KPI и тестовый пак">
+            </label>
+            <div class="cal-form-submit-cell">
+              <button type="submit" id="cal-ev-submit-btn" class="btn primary sm">Добавить в календарь</button>
+            </div>
+          </div>
+        </form>
+
+        <div id="calendar-grid-container" class="calendar-grid-container" data-cal-view="month"></div>
+      </section>
+
       <section id="analytics" data-sheet="analytics" class="surface-box analytics-section" aria-labelledby="analytics-title">
         <div class="pane-head">
           <div class="pipeline-title-row">
             <h2 id="analytics-title">Сквозная аналитика</h2>
             <span class="badge b-ok">Воронка · Рассылки · Аккаунты</span>
+            <span id="analytics-mrr-badge" class="badge b-won">MRR: $0/мес</span>
           </div>
           <div class="row">
+            <div id="analytics-period-switch" class="switch" role="group" aria-label="Период аналитики">
+              <button type="button" class="btn ghost sm analytics-period-btn" data-period="7d" aria-pressed="false">7 дней</button>
+              <button type="button" class="btn secondary sm analytics-period-btn" data-period="30d" aria-pressed="true">30 дней</button>
+              <button type="button" class="btn ghost sm analytics-period-btn" data-period="90d" aria-pressed="false">90 дней</button>
+              <button type="button" class="btn ghost sm analytics-period-btn" data-period="all" aria-pressed="false">Всё время</button>
+            </div>
             <button type="button" id="analytics-refresh-btn" class="btn secondary sm">Обновить аналитику</button>
+          </div>
+        </div>
+
+        <div id="analytics-charts-grid" class="analytics-charts-grid">
+          <div id="analytics-chart-daily-flow" class="surface-subcard analytics-chart-card stack">
+            <div class="subcard-head">
+              <h3>1. Динамика потока по дням: Лиды · Отправки · Ответы</h3>
+              <div id="analytics-daily-flow-badges" class="row"></div>
+            </div>
+            <div class="analytics-svg-host" data-chart-host="daily-flow"></div>
+          </div>
+
+          <div id="analytics-chart-revenue" class="surface-subcard analytics-chart-card stack">
+            <div class="subcard-head">
+              <h3>2. Динамика денег: Won Revenue · Pipeline · MRR ($)</h3>
+              <div id="analytics-revenue-badges" class="row"></div>
+            </div>
+            <div class="analytics-svg-host" data-chart-host="revenue"></div>
+          </div>
+
+          <div id="analytics-chart-funnel-dropoff" class="surface-subcard analytics-chart-card stack">
+            <div class="subcard-head">
+              <h3>3. Сквозная воронка по 7 стадиям и потери (Drop-off)</h3>
+              <span id="analytics-dropoff-badge" class="badge b-talk">Конверсия этапов</span>
+            </div>
+            <div class="analytics-svg-host" data-chart-host="funnel-dropoff"></div>
+          </div>
+
+          <div id="analytics-chart-channels-sources" class="surface-subcard analytics-chart-card stack">
+            <div class="subcard-head">
+              <h3>4. Каналы (TG vs WA) и источники лидов (Lead Source)</h3>
+              <span id="analytics-sources-badge" class="badge b-ok">Источники и каналы</span>
+            </div>
+            <div class="analytics-svg-host" data-chart-host="channels-sources"></div>
+          </div>
+
+          <div id="analytics-chart-heatmap" class="surface-subcard analytics-chart-card stack">
+            <div class="subcard-head">
+              <h3>5. Тепловая карта активности ответов (Дни × Часы)</h3>
+              <span id="analytics-heatmap-peak-badge" class="badge b-won">Пик ответов: —</span>
+            </div>
+            <div class="analytics-svg-host" data-chart-host="heatmap"></div>
           </div>
         </div>
 

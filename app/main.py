@@ -48,7 +48,7 @@ from app.inbox import (
     start_direct_dialog,
     sync_inbox,
 )
-from app.folders import list_folders, pull_folders, sync_folder, update_folder
+from app.folders import list_folders, pull_folders, sync_all_folders, sync_folder, update_folder
 from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
 from app.outreach import (
@@ -178,6 +178,15 @@ class LeadIn(BaseModel):
     provider: str | None = None
     amount: int | float | str | None = 0
     currency: str | None = "USD"
+    company: str | None = None
+    niche: str | None = None
+    offer_type: list[str] | str | None = None
+    offer_details: str | None = None
+    monthly_value: int | float | str | None = 0
+    lead_source: str | None = None
+    next_follow_up: str | None = None
+    last_contacted: str | None = None
+    airtable_record_id: str | None = None
 
 
 class LeadPatch(BaseModel):
@@ -185,6 +194,7 @@ class LeadPatch(BaseModel):
     note: str | None = None
     next_step: str | None = None
     name: str | None = None
+    username: str | None = None
     phone: str | None = None
     description: str | None = None
     email: str | None = None
@@ -193,6 +203,15 @@ class LeadPatch(BaseModel):
     provider: str | None = None
     amount: int | float | str | None = None
     currency: str | None = None
+    company: str | None = None
+    niche: str | None = None
+    offer_type: list[str] | str | None = None
+    offer_details: str | None = None
+    monthly_value: int | float | str | None = None
+    lead_source: str | None = None
+    next_follow_up: str | None = None
+    last_contacted: str | None = None
+    airtable_record_id: str | None = None
 
 
 class PipelineStageIn(BaseModel):
@@ -756,6 +775,13 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             sync_folder, request.app.state.conn, folder_id, gateway
         )
 
+    @app.post("/api/folders/sync-all")
+    async def folders_sync_all(body: FolderPullIn, request: Request):
+        gateway = _gateway(request)
+        return await _call_async(
+            sync_all_folders, request.app.state.conn, body.account_id, gateway
+        )
+
     @app.get("/api/accounts/{account_id}/dialogs")
     async def account_dialogs(account_id: int, request: Request, q: str = ""):
         try:
@@ -804,6 +830,15 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             provider=body.provider,
             amount=body.amount,
             currency=body.currency,
+            company=body.company,
+            niche=body.niche,
+            offer_type=body.offer_type,
+            offer_details=body.offer_details,
+            monthly_value=body.monthly_value,
+            lead_source=body.lead_source,
+            next_follow_up=body.next_follow_up,
+            last_contacted=body.last_contacted,
+            airtable_record_id=body.airtable_record_id,
         )
 
     @app.get("/api/leads")
@@ -1541,8 +1576,171 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
     @app.get("/api/analytics/summary")
-    def analytics_summary(request: Request):
-        return _call(get_analytics_summary, request.app.state.conn)
+    def analytics_summary(request: Request, period: str = "30d"):
+        return _call(get_analytics_summary, request.app.state.conn, period=period)
+
+    class AirtableSyncIn(BaseModel):
+        direction: str = "both"
+
+    @app.get("/api/airtable/status")
+    def airtable_status_get(request: Request):
+        from app.airtable_sync import get_airtable_config
+
+        return _call(get_airtable_config, request.app.state.conn)
+
+    @app.post("/api/airtable/sync")
+    def airtable_sync_run(request: Request, body: AirtableSyncIn | None = None):
+        from app.airtable_sync import sync_airtable
+
+        direction = body.direction if body is not None else "both"
+        client = getattr(request.app.state, "airtable_client", None)
+        return _call(
+            sync_airtable,
+            request.app.state.conn,
+            direction=direction,
+            client=client,
+        )
+
+    @app.post("/api/airtable/push/{lead_id}")
+    def airtable_push_lead(lead_id: int, request: Request):
+        from app.airtable_sync import push_lead_to_airtable
+
+        client = getattr(request.app.state, "airtable_client", None)
+        return _call(
+            push_lead_to_airtable,
+            request.app.state.conn,
+            lead_id,
+            client=client,
+        )
+
+    @app.post("/api/pipeline/stages/airtable")
+    def pipeline_stages_ensure_airtable(request: Request):
+        from app.db import ensure_airtable_pipeline_stages
+
+        return _call(ensure_airtable_pipeline_stages, request.app.state.conn)
+
+    class CalendarEventIn(BaseModel):
+        title: str
+        start_at: str
+        end_at: str | None = None
+        event_type: str = "call"
+        all_day: bool = False
+        lead_id: int | None = None
+        meet_link: str | None = None
+        notes: str | None = None
+        status: str = "scheduled"
+
+    class CalendarEventPatch(BaseModel):
+        title: str | None = None
+        start_at: str | None = None
+        end_at: str | None = None
+        event_type: str | None = None
+        all_day: bool | None = None
+        lead_id: int | None = None
+        meet_link: str | None = None
+        notes: str | None = None
+        status: str | None = None
+
+    class CalendarRescheduleIn(BaseModel):
+        uid: str | None = None
+        item_kind: str | None = None
+        item_id: int | None = None
+        new_start_at: str
+        new_end_at: str | None = None
+
+    @app.get("/api/calendar")
+    def calendar_list(
+        request: Request,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        event_type: str | None = None,
+        lead_id: int | None = None,
+        include_completed: bool = True,
+    ):
+        from app.calendar_events import list_calendar_items
+
+        return _call(
+            list_calendar_items,
+            request.app.state.conn,
+            start_date=start_date,
+            end_date=end_date,
+            event_type=event_type,
+            lead_id=lead_id,
+            include_completed=include_completed,
+        )
+
+    @app.post("/api/calendar/events")
+    def calendar_event_create(body: CalendarEventIn, request: Request):
+        from app.calendar_events import create_calendar_event
+
+        return _call(
+            create_calendar_event,
+            request.app.state.conn,
+            title=body.title,
+            start_at=body.start_at,
+            end_at=body.end_at,
+            event_type=body.event_type,
+            all_day=body.all_day,
+            lead_id=body.lead_id,
+            meet_link=body.meet_link,
+            notes=body.notes,
+            status=body.status,
+        )
+
+    @app.patch("/api/calendar/events/{event_id}")
+    def calendar_event_patch(
+        event_id: int, body: CalendarEventPatch, request: Request
+    ):
+        from app.calendar_events import update_calendar_event
+
+        fields = body.model_dump(exclude_unset=True)
+        return _call(
+            update_calendar_event,
+            request.app.state.conn,
+            event_id,
+            **fields,
+        )
+
+    @app.delete("/api/calendar/events/{event_id}")
+    def calendar_event_delete(event_id: int, request: Request):
+        from app.calendar_events import delete_calendar_event
+
+        return _call(delete_calendar_event, request.app.state.conn, event_id)
+
+    @app.post("/api/calendar/reschedule")
+    def calendar_item_reschedule(body: CalendarRescheduleIn, request: Request):
+        from app.calendar_events import reschedule_calendar_item
+
+        res = _call(
+            reschedule_calendar_item,
+            request.app.state.conn,
+            uid=body.uid,
+            item_kind=body.item_kind,
+            item_id=body.item_id,
+            new_start_at=body.new_start_at,
+            new_end_at=body.new_end_at,
+        )
+        if res.get("needs_airtable_push") and "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                from app.airtable_sync import get_airtable_config, push_calendar_date_to_airtable
+
+                cfg = get_airtable_config(request.app.state.conn)
+                if cfg.get("configured"):
+                    client = getattr(request.app.state, "airtable_client", None)
+                    push_calendar_date_to_airtable(
+                        request.app.state.conn,
+                        item_kind=res["item_kind"],
+                        item_id=int(res["item_id"]),
+                        new_date=res["new_date"],
+                        client=client,
+                    )
+            except Exception:
+                pass
+        return res
+
+    from app.mcp_server import register_mcp_routes
+
+    register_mcp_routes(app)
 
     @app.post("/api/demo/seed")
     def demo_seed(request: Request):

@@ -405,16 +405,80 @@ def get_today_focus(
             ld["currency"] = ld.get("currency") or "USD"
             stale_leads.append(ld)
 
+    # 4. today_calls: scheduled calendar events due today or overdue
+    today_calls = []
+    try:
+        cal_rows = conn.execute(
+            """
+            SELECT
+                ce.*,
+                l.name AS lead_name,
+                l.username AS lead_username,
+                l.company AS lead_company,
+                l.status AS lead_status,
+                l.provider AS lead_provider
+            FROM calendar_events ce
+            LEFT JOIN leads l ON l.id = ce.lead_id
+            WHERE ce.status = 'scheduled'
+            ORDER BY ce.start_at ASC, ce.id ASC
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        cal_rows = []
+
+    for row in cal_rows:
+        ce = as_dict(row)
+        start_str = str(ce.get("start_at") or "")
+        start_date = start_str[:10]
+        start_norm = _due_key(start_str) if len(start_str) > 10 else start_date
+        if (start_date and start_date <= today_date) or (
+            start_norm and start_norm <= today_end_iso
+        ):
+            is_overdue = (
+                bool(start_norm and len(start_str) > 10 and start_norm <= now_iso)
+                or bool(start_date and start_date < today_date)
+            )
+            today_calls.append(
+                {
+                    "id": int(ce["id"]),
+                    "calendar_event_id": int(ce["id"]),
+                    "uid": f"ev:{int(ce['id'])}",
+                    "kind": "calendar_event",
+                    "event_type": ce.get("event_type") or "call",
+                    "title": ce.get("title") or "",
+                    "text": ce.get("title") or "",
+                    "start_at": start_str,
+                    "end_at": ce.get("end_at"),
+                    "due_at": start_str,
+                    "all_day": bool(ce.get("all_day")),
+                    "lead_id": int(ce["lead_id"]) if ce.get("lead_id") is not None else None,
+                    "lead_name": ce.get("lead_name"),
+                    "lead_username": ce.get("lead_username"),
+                    "lead_company": ce.get("lead_company"),
+                    "lead_status": ce.get("lead_status"),
+                    "provider": ce.get("lead_provider") or "telegram",
+                    "meet_link": ce.get("meet_link"),
+                    "notes": ce.get("notes"),
+                    "status": ce.get("status") or "scheduled",
+                    "source": ce.get("source") or "crm",
+                    "is_overdue": is_overdue,
+                    "overdue": is_overdue,
+                    "created_at": ce.get("created_at"),
+                }
+            )
+
     return {
         "waiting_reply": waiting_reply,
         "due_reminders": due_reminders,
         "open_tasks": open_tasks,
         "stale_leads": stale_leads,
+        "today_calls": today_calls,
         "counts": {
             "waiting_reply": len(waiting_reply),
             "due_reminders": len(due_reminders),
             "open_tasks": len(open_tasks),
             "stale_leads": len(stale_leads),
+            "today_calls": len(today_calls),
             "total": len(waiting_reply) + len(due_reminders) + len(stale_leads),
             "total_focus": len(waiting_reply) + len(due_reminders) + len(stale_leads),
         },

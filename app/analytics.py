@@ -1,19 +1,44 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 import sqlite3
 
-from app.db import STATUSES, as_dict, utc_today
+from app.db import (
+    AIRTABLE_STAGE_KEYS,
+    KEY_TO_AIRTABLE_STATUS,
+    STATUSES,
+    as_dict,
+    normalize_status,
+    utc_today,
+)
 from app.outreach import _parse_account_ids, _sync_campaign_replies
 
 STAGE_LABELS = {
     "new": "Лид",
     "talking": "Разговор",
+    "call_scheduled": "Созвон назначен",
     "waiting": "Ждём",
+    "on_hold": "На паузе",
     "won": "Выигран",
     "lost": "Проигран",
 }
 
+STAGE_COLORS = {
+    "new": "#94a3b8",
+    "talking": "#38bdf8",
+    "call_scheduled": "#a855f7",
+    "waiting": "#fbbf24",
+    "on_hold": "#64748b",
+    "won": "#34d399",
+    "lost": "#f87171",
+}
+
 HEALTH_KEYS = ("active", "offline", "unauthorized", "banned", "frozen")
+
+VALID_PERIODS = ("7d", "30d", "90d", "all")
+
+HEATMAP_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+HEATMAP_SLOTS = ["00–04", "04–08", "08–12", "12–16", "16–20", "20–24"]
 
 
 def _parse_money_text(raw_text: str | None) -> int | None:
@@ -41,7 +66,35 @@ def _parse_money_text(raw_text: str | None) -> int | None:
         return None
 
 
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    if len(s) >= 11 and s[10] == " ":
+        s = s[:10] + "T" + s[11:]
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
 def _load_stage_catalog(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    db_labels: dict[str, str] = {}
+    extra_stages: list[tuple[str, str]] = []
     has_table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_stages'"
     ).fetchone()
@@ -50,22 +103,27 @@ def _load_stage_catalog(conn: sqlite3.Connection) -> list[tuple[str, str]]:
             rows = conn.execute(
                 "SELECT key, label FROM pipeline_stages ORDER BY position ASC, rowid ASC"
             ).fetchall()
-            if rows:
-                seen = set()
-                out = []
-                for r in rows:
-                    k = str(r["key"] or "").strip()
-                    lbl = str(r["label"] or STAGE_LABELS.get(k, k)).strip()
-                    if k and k not in seen:
-                        seen.add(k)
-                        out.append((k, lbl))
-                for std_k in STATUSES:
-                    if std_k not in seen:
-                        out.append((std_k, STAGE_LABELS.get(std_k, std_k)))
-                return out
+            for r in rows:
+                k = str(r["key"] or "").strip()
+                lbl = str(r["label"] or STAGE_LABELS.get(k, k)).strip()
+                if k:
+                    db_labels[k] = lbl
+                    if k not in AIRTABLE_STAGE_KEYS and k not in STATUSES:
+                        extra_stages.append((k, lbl))
         except Exception:
             pass
-    return [(k, STAGE_LABELS.get(k, k)) for k in STATUSES]
+
+    out: list[tuple[str, str]] = []
+    seen = set()
+    for std_k in AIRTABLE_STAGE_KEYS:
+        lbl = db_labels.get(std_k) or STAGE_LABELS.get(std_k, std_k)
+        out.append((std_k, lbl))
+        seen.add(std_k)
+    for k, lbl in extra_stages:
+        if k not in seen:
+            seen.add(k)
+            out.append((k, lbl))
+    return out
 
 
 def _load_lead_amounts_from_properties(conn: sqlite3.Connection) -> dict[int, int]:
@@ -116,6 +174,18 @@ def _resolve_lead_amount(lead: dict, prop_amounts: dict[int, int]) -> int:
     return 0
 
 
+def _resolve_lead_monthly(lead: dict) -> int:
+    raw_val = lead.get("monthly_value")
+    if raw_val is None:
+        return 0
+    try:
+        val = int(raw_val)
+        return max(0, val)
+    except (TypeError, ValueError):
+        parsed = _parse_money_text(str(raw_val))
+        return max(0, parsed) if parsed is not None else 0
+
+
 def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
     stage_catalog = _load_stage_catalog(conn)
     prop_amounts = _load_lead_amounts_from_properties(conn)
@@ -123,17 +193,21 @@ def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
 
     stage_counts: dict[str, int] = {k: 0 for k, _ in stage_catalog}
     stage_amounts: dict[str, int] = {k: 0 for k, _ in stage_catalog}
+    stage_monthly: dict[str, int] = {k: 0 for k, _ in stage_catalog}
     stage_labels: dict[str, str] = {k: lbl for k, lbl in stage_catalog}
 
     for lead in lead_rows:
-        st = str(lead.get("status") or "new").strip() or "new"
+        st = normalize_status(lead.get("status"), conn) or "new"
         if st not in stage_counts:
             stage_counts[st] = 0
             stage_amounts[st] = 0
+            stage_monthly[st] = 0
             stage_labels[st] = STAGE_LABELS.get(st, st)
         amt = _resolve_lead_amount(lead, prop_amounts)
+        mrr = _resolve_lead_monthly(lead)
         stage_counts[st] += 1
         stage_amounts[st] += amt
+        stage_monthly[st] += mrr
 
     total_leads = len(lead_rows)
     won_leads = stage_counts.get("won", 0)
@@ -149,6 +223,12 @@ def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
     )
     total_value = pipeline_value + won_value + lost_value
 
+    active_monthly_value = sum(
+        m for st, m in stage_monthly.items() if st not in ("won", "lost")
+    )
+    won_monthly_value = stage_monthly.get("won", 0)
+    monthly_value = active_monthly_value + won_monthly_value
+
     win_rate_pct = round((won_leads / total_leads) * 100, 1) if total_leads > 0 else 0.0
     closed_total = won_leads + lost_leads
     closed_win_rate_pct = (
@@ -160,30 +240,51 @@ def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
     for st_key, st_label in stage_labels.items():
         cnt = stage_counts.get(st_key, 0)
         amt = stage_amounts.get(st_key, 0)
+        mrr = stage_monthly.get(st_key, 0)
         share_pct = round((cnt / total_leads) * 100, 1) if total_leads > 0 else 0.0
         item = {
             "key": st_key,
             "status": st_key,
             "label": st_label,
+            "airtable_label": KEY_TO_AIRTABLE_STATUS.get(st_key, st_label),
+            "color": STAGE_COLORS.get(st_key, "#6366f1"),
             "count": cnt,
             "amount": amt,
+            "monthly_value": mrr,
             "share_pct": share_pct,
         }
         stages_list.append(item)
         by_stage[st_key] = item
 
-    # Cumulative funnel conversion: new -> talking -> waiting -> won
+    # Cumulative funnel conversion: new -> talking (incl. call_scheduled) -> waiting (incl. on_hold) -> won
     reached_new = total_leads
     reached_talking = (
         stage_counts.get("talking", 0)
+        + stage_counts.get("call_scheduled", 0)
         + stage_counts.get("waiting", 0)
+        + stage_counts.get("on_hold", 0)
         + stage_counts.get("won", 0)
     )
-    reached_waiting = stage_counts.get("waiting", 0) + stage_counts.get("won", 0)
+    reached_call_scheduled = (
+        stage_counts.get("call_scheduled", 0)
+        + stage_counts.get("waiting", 0)
+        + stage_counts.get("on_hold", 0)
+        + stage_counts.get("won", 0)
+    )
+    reached_waiting = (
+        stage_counts.get("waiting", 0)
+        + stage_counts.get("on_hold", 0)
+        + stage_counts.get("won", 0)
+    )
     reached_won = stage_counts.get("won", 0)
 
     new_to_talking_pct = (
         round((reached_talking / reached_new) * 100, 1) if reached_new > 0 else 0.0
+    )
+    talking_to_call_scheduled_pct = (
+        round((reached_call_scheduled / reached_talking) * 100, 1)
+        if reached_talking > 0
+        else 0.0
     )
     talking_to_waiting_pct = (
         round((reached_waiting / reached_talking) * 100, 1)
@@ -234,6 +335,7 @@ def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
 
     conversion_rates = {
         "new_to_talking_pct": new_to_talking_pct,
+        "talking_to_call_scheduled_pct": talking_to_call_scheduled_pct,
         "talking_to_waiting_pct": talking_to_waiting_pct,
         "waiting_to_won_pct": waiting_to_won_pct,
         "new_to_won_pct": win_rate_pct,
@@ -249,6 +351,9 @@ def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
         "won_revenue": won_value,
         "lost_value": lost_value,
         "total_value": total_value,
+        "monthly_value": monthly_value,
+        "active_monthly_value": active_monthly_value,
+        "won_monthly_value": won_monthly_value,
         "win_rate_pct": win_rate_pct,
         "closed_win_rate_pct": closed_win_rate_pct,
         "stages": stages_list,
@@ -317,7 +422,7 @@ def _compute_outreach_analytics(conn: sqlite3.Connection) -> dict:
         c_talking = sum(
             1
             for r in recs
-            if r.get("lead_status") in ("talking", "waiting", "won")
+            if r.get("lead_status") in ("talking", "call_scheduled", "waiting", "on_hold", "won")
             or r.get("status") == "replied"
         )
         c_won = sum(1 for r in recs if r.get("lead_status") == "won")
@@ -575,19 +680,477 @@ def _compute_accounts_analytics(conn: sqlite3.Connection) -> dict:
     }
 
 
-def get_analytics_summary(conn: sqlite3.Connection) -> dict:
+def _resolve_date_list_and_cutoff(
+    conn: sqlite3.Connection, period: str
+) -> tuple[list[str], str | None]:
+    today_dt = datetime.now(timezone.utc).date()
+    clean_p = str(period or "30d").strip().lower()
+    if clean_p == "7d":
+        days_count = 7
+        cutoff_dt = today_dt - timedelta(days=days_count - 1)
+    elif clean_p == "90d":
+        days_count = 90
+        cutoff_dt = today_dt - timedelta(days=days_count - 1)
+    elif clean_p == "all":
+        earliest_str: str | None = None
+        for sql in (
+            "SELECT MIN(substr(created_at, 1, 10)) FROM leads WHERE created_at IS NOT NULL AND created_at != ''",
+            "SELECT MIN(substr(sent_at, 1, 10)) FROM messages WHERE sent_at IS NOT NULL AND sent_at != ''",
+            "SELECT MIN(substr(last_sent_at, 1, 10)) FROM campaign_recipients WHERE last_sent_at IS NOT NULL AND last_sent_at != ''",
+        ):
+            try:
+                val = conn.execute(sql).fetchone()[0]
+                if val and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(val)[:10]):
+                    d_str = str(val)[:10]
+                    if earliest_str is None or d_str < earliest_str:
+                        earliest_str = d_str
+            except Exception:
+                pass
+        if earliest_str:
+            try:
+                earliest_date = datetime.strptime(earliest_str, "%Y-%m-%d").date()
+            except ValueError:
+                earliest_date = today_dt - timedelta(days=13)
+        else:
+            earliest_date = today_dt - timedelta(days=13)
+        span_days = (today_dt - earliest_date).days + 1
+        days_count = max(14, min(span_days, 120))
+        cutoff_dt = today_dt - timedelta(days=days_count - 1)
+    else:
+        days_count = 30
+        cutoff_dt = today_dt - timedelta(days=days_count - 1)
+
+    dates = [
+        (cutoff_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+        for i in range(days_count)
+    ]
+    cutoff_filter = None if clean_p == "all" else dates[0]
+    return dates, cutoff_filter
+
+
+def _compute_charts_analytics(
+    conn: sqlite3.Connection,
+    *,
+    period: str,
+    accounts_analytics: dict,
+) -> dict:
+    dates, cutoff_date = _resolve_date_list_and_cutoff(conn, period)
+    prop_amounts = _load_lead_amounts_from_properties(conn)
+    stage_catalog = _load_stage_catalog(conn)
+
+    lead_rows = [as_dict(r) for r in conn.execute("SELECT * FROM leads ORDER BY id").fetchall()]
+    msg_rows = [
+        as_dict(r)
+        for r in conn.execute(
+            "SELECT id, dialog_id, direction, sent_at, created_at FROM messages ORDER BY id"
+        ).fetchall()
+    ]
+    camp_rec_rows = [
+        as_dict(r)
+        for r in conn.execute(
+            "SELECT id, lead_id, status, last_sent_at, updated_at FROM campaign_recipients ORDER BY id"
+        ).fetchall()
+    ]
+
+    # 1. daily_flow
+    new_leads_by_day: dict[str, int] = {d: 0 for d in dates}
+    out_msgs_by_day: dict[str, int] = {d: 0 for d in dates}
+    in_msgs_by_day: dict[str, int] = {d: 0 for d in dates}
+    camp_sent_by_day: dict[str, int] = {d: 0 for d in dates}
+
+    for ld in lead_rows:
+        c_day = str(ld.get("created_at") or "")[:10]
+        if c_day in new_leads_by_day:
+            new_leads_by_day[c_day] += 1
+
+    for m in msg_rows:
+        s_day = str(m.get("sent_at") or m.get("created_at") or "")[:10]
+        if s_day not in out_msgs_by_day:
+            continue
+        if m.get("direction") == "out":
+            out_msgs_by_day[s_day] += 1
+        elif m.get("direction") == "in":
+            in_msgs_by_day[s_day] += 1
+
+    for cr in camp_rec_rows:
+        ls_day = str(cr.get("last_sent_at") or "")[:10]
+        if ls_day in camp_sent_by_day and cr.get("status") in (
+            "in_progress",
+            "completed",
+            "replied",
+        ):
+            camp_sent_by_day[ls_day] += 1
+
+    daily_flow = []
+    for d in dates:
+        lbl = f"{d[8:10]}.{d[5:7]}"
+        sent_cnt = max(out_msgs_by_day.get(d, 0), camp_sent_by_day.get(d, 0))
+        daily_flow.append(
+            {
+                "date": d,
+                "label": lbl,
+                "new_leads": new_leads_by_day.get(d, 0),
+                "messages_sent": sent_cnt,
+                "replies_received": in_msgs_by_day.get(d, 0),
+            }
+        )
+
+    # 2. revenue_timeline
+    enriched_leads = []
+    for ld in lead_rows:
+        st = normalize_status(ld.get("status"), conn) or "new"
+        amt = _resolve_lead_amount(ld, prop_amounts)
+        mrr = _resolve_lead_monthly(ld)
+        c_day = str(ld.get("created_at") or "")[:10]
+        u_day = str(ld.get("updated_at") or ld.get("created_at") or "")[:10]
+        enriched_leads.append(
+            {
+                "raw": ld,
+                "status": st,
+                "amount": amt,
+                "monthly_value": mrr,
+                "created_day": c_day,
+                "updated_day": u_day,
+            }
+        )
+
+    won_before_window = sum(
+        el["amount"]
+        for el in enriched_leads
+        if el["status"] == "won" and el["updated_day"] and el["updated_day"] < dates[0]
+    )
+    cumulative_won = won_before_window
+    revenue_timeline = []
+    for d in dates:
+        lbl = f"{d[8:10]}.{d[5:7]}"
+        won_on_day = sum(
+            el["amount"]
+            for el in enriched_leads
+            if el["status"] == "won" and el["updated_day"] == d
+        )
+        cumulative_won += won_on_day
+        pipeline_on_day = sum(
+            el["amount"]
+            for el in enriched_leads
+            if el["status"] not in ("won", "lost")
+            and (not el["created_day"] or el["created_day"] <= d)
+        )
+        mrr_on_day = sum(
+            el["monthly_value"]
+            for el in enriched_leads
+            if el["status"] != "lost"
+            and (not el["created_day"] or el["created_day"] <= d)
+        )
+        revenue_timeline.append(
+            {
+                "date": d,
+                "label": lbl,
+                "won_amount": won_on_day,
+                "pipeline_amount": pipeline_on_day,
+                "monthly_value": mrr_on_day,
+                "cumulative_won": cumulative_won,
+            }
+        )
+
+    # Filter leads by period cutoff if applicable
+    if cutoff_date:
+        period_leads = [
+            el
+            for el in enriched_leads
+            if (el["created_day"] and el["created_day"] >= cutoff_date)
+            or (el["updated_day"] and el["updated_day"] >= cutoff_date)
+        ]
+    else:
+        period_leads = list(enriched_leads)
+
+    # 3. funnel_dropoff
+    stage_counts: dict[str, int] = {k: 0 for k, _ in stage_catalog}
+    stage_amounts: dict[str, int] = {k: 0 for k, _ in stage_catalog}
+    stage_mrr: dict[str, int] = {k: 0 for k, _ in stage_catalog}
+    stage_labels: dict[str, str] = {k: lbl for k, lbl in stage_catalog}
+
+    for el in period_leads:
+        st = el["status"]
+        if st not in stage_counts:
+            stage_counts[st] = 0
+            stage_amounts[st] = 0
+            stage_mrr[st] = 0
+            stage_labels[st] = STAGE_LABELS.get(st, st)
+        stage_counts[st] += 1
+        stage_amounts[st] += el["amount"]
+        stage_mrr[st] += el["monthly_value"]
+
+    total_period_leads = len(period_leads)
+    total_period_amount = sum(el["amount"] for el in period_leads)
+
+    progressive_keys = [
+        k for k, _ in stage_catalog if k != "lost"
+    ]
+    funnel_dropoff = []
+    prev_reached_count = total_period_leads
+    prev_reached_amount = total_period_amount
+
+    for idx, st_key in enumerate(progressive_keys):
+        cnt = stage_counts.get(st_key, 0)
+        amt = stage_amounts.get(st_key, 0)
+        mrr = stage_mrr.get(st_key, 0)
+        if idx == 0:
+            reached_cnt = total_period_leads
+            reached_amt = total_period_amount
+            conv_pct = 100.0 if reached_cnt > 0 else 0.0
+            dropoff_cnt = 0
+            dropoff_amt = 0
+        else:
+            tail_keys = progressive_keys[idx:]
+            reached_cnt = sum(stage_counts.get(tk, 0) for tk in tail_keys)
+            reached_amt = sum(stage_amounts.get(tk, 0) for tk in tail_keys)
+            conv_pct = (
+                round((reached_cnt / prev_reached_count) * 100, 1)
+                if prev_reached_count > 0
+                else 0.0
+            )
+            dropoff_cnt = max(0, prev_reached_count - reached_cnt)
+            dropoff_amt = max(0, prev_reached_amount - reached_amt)
+
+        prev_reached_count = reached_cnt
+        prev_reached_amount = reached_amt
+        lbl = stage_labels.get(st_key, STAGE_LABELS.get(st_key, st_key))
+        funnel_dropoff.append(
+            {
+                "key": st_key,
+                "label": lbl,
+                "airtable_label": KEY_TO_AIRTABLE_STATUS.get(st_key, lbl),
+                "count": cnt,
+                "amount": amt,
+                "monthly_value": mrr,
+                "reached_count": reached_cnt,
+                "reached_amount": reached_amt,
+                "conversion_from_prev_pct": conv_pct,
+                "dropoff_count": dropoff_cnt,
+                "dropoff_amount": dropoff_amt,
+                "color": STAGE_COLORS.get(st_key, "#6366f1"),
+            }
+        )
+
+    lost_cnt = stage_counts.get("lost", 0)
+    lost_amt = stage_amounts.get("lost", 0)
+    lost_mrr = stage_mrr.get("lost", 0)
+    lost_lbl = stage_labels.get("lost", STAGE_LABELS["lost"])
+    lost_pct = (
+        round((lost_cnt / total_period_leads) * 100, 1)
+        if total_period_leads > 0
+        else 0.0
+    )
+    funnel_dropoff.append(
+        {
+            "key": "lost",
+            "label": lost_lbl,
+            "airtable_label": KEY_TO_AIRTABLE_STATUS.get("lost", "Cancelled"),
+            "count": lost_cnt,
+            "amount": lost_amt,
+            "monthly_value": lost_mrr,
+            "reached_count": lost_cnt,
+            "reached_amount": lost_amt,
+            "conversion_from_prev_pct": lost_pct,
+            "dropoff_count": lost_cnt,
+            "dropoff_amount": lost_amt,
+            "color": STAGE_COLORS["lost"],
+        }
+    )
+
+    # 4. channels_and_sources
+    channel_stats: dict[str, dict] = {
+        "telegram": {
+            "provider": "telegram",
+            "channel": "telegram",
+            "label": "Telegram",
+            "leads_count": 0,
+            "won_count": 0,
+            "pipeline_value": 0,
+            "won_value": 0,
+            "monthly_value": 0,
+            "dialogs_count": 0,
+            "replies_count": 0,
+            "reply_rate_pct": 0.0,
+        },
+        "whatsapp": {
+            "provider": "whatsapp",
+            "channel": "whatsapp",
+            "label": "WhatsApp",
+            "leads_count": 0,
+            "won_count": 0,
+            "pipeline_value": 0,
+            "won_value": 0,
+            "monthly_value": 0,
+            "dialogs_count": 0,
+            "replies_count": 0,
+            "reply_rate_pct": 0.0,
+        },
+    }
+
+    for el in period_leads:
+        ld = el["raw"]
+        prov = str(ld.get("provider") or "telegram").strip().lower()
+        if prov not in channel_stats:
+            prov = "telegram"
+        cs = channel_stats[prov]
+        cs["leads_count"] += 1
+        if el["status"] == "won":
+            cs["won_count"] += 1
+            cs["won_value"] += el["amount"]
+            cs["monthly_value"] += el["monthly_value"]
+        elif el["status"] != "lost":
+            cs["pipeline_value"] += el["amount"]
+            cs["monthly_value"] += el["monthly_value"]
+
+    for acc in accounts_analytics.get("items", []):
+        prov = str(acc.get("provider") or "telegram").strip().lower()
+        if prov not in channel_stats:
+            prov = "telegram"
+        channel_stats[prov]["dialogs_count"] += int(acc.get("dialogs_count") or 0)
+        channel_stats[prov]["replies_count"] += int(acc.get("replies_count") or 0)
+
+    for prov, cs in channel_stats.items():
+        if cs["dialogs_count"] > 0:
+            cs["reply_rate_pct"] = round(
+                min(100.0, (cs["replies_count"] / cs["dialogs_count"]) * 100), 1
+            )
+        else:
+            cs["reply_rate_pct"] = 0.0
+
+    by_channel = [channel_stats["telegram"], channel_stats["whatsapp"]]
+
+    source_buckets: dict[str, dict] = {}
+    for el in period_leads:
+        ld = el["raw"]
+        raw_src = (ld.get("lead_source") or "").strip()
+        if not raw_src:
+            prov = str(ld.get("provider") or "telegram").strip().lower()
+            raw_src = "WhatsApp" if prov == "whatsapp" else "Telegram"
+        bucket = source_buckets.setdefault(
+            raw_src,
+            {
+                "source": raw_src,
+                "label": raw_src,
+                "count": 0,
+                "won_count": 0,
+                "amount": 0,
+                "monthly_value": 0,
+                "win_rate_pct": 0.0,
+            },
+        )
+        bucket["count"] += 1
+        bucket["amount"] += el["amount"]
+        bucket["monthly_value"] += el["monthly_value"]
+        if el["status"] == "won":
+            bucket["won_count"] += 1
+
+    by_source = []
+    for b in source_buckets.values():
+        b["win_rate_pct"] = (
+            round((b["won_count"] / b["count"]) * 100, 1) if b["count"] > 0 else 0.0
+        )
+        by_source.append(b)
+    by_source.sort(key=lambda x: (x["amount"], x["count"], x["won_count"]), reverse=True)
+
+    accounts_ranking = sorted(
+        list(accounts_analytics.get("items", [])),
+        key=lambda a: (
+            float(a.get("reply_rate_pct") or 0.0),
+            int(a.get("sent_today") or 0),
+            int(a.get("replies_count") or 0),
+        ),
+        reverse=True,
+    )
+
+    channels_and_sources = {
+        "by_channel": by_channel,
+        "by_source": by_source,
+        "accounts_ranking": accounts_ranking,
+    }
+
+    # 5. reply_heatmap (7 days x 6 4-hour slots + 24 hours)
+    matrix = [[0 for _ in range(6)] for _ in range(7)]
+    hourly_matrix = [[0 for _ in range(24)] for _ in range(7)]
+    by_hour = [0 for _ in range(24)]
+    total_inbound = 0
+
+    for m in msg_rows:
+        if m.get("direction") != "in":
+            continue
+        raw_ts = m.get("sent_at") or m.get("created_at")
+        dt = _parse_iso_dt(raw_ts)
+        if dt is None:
+            continue
+        day_str = dt.strftime("%Y-%m-%d")
+        if cutoff_date and day_str < cutoff_date:
+            continue
+        wday = dt.weekday()  # 0 = Mon .. 6 = Sun
+        hr = dt.hour  # 0 .. 23
+        slot_idx = min(5, hr // 4)
+        matrix[wday][slot_idx] += 1
+        hourly_matrix[wday][hr] += 1
+        by_hour[hr] += 1
+        total_inbound += 1
+
+    max_value = 0
+    peak_day_idx = 0
+    peak_slot_idx = 0
+    for d_idx in range(7):
+        for s_idx in range(6):
+            val = matrix[d_idx][s_idx]
+            if val > max_value:
+                max_value = val
+                peak_day_idx = d_idx
+                peak_slot_idx = s_idx
+
+    reply_heatmap = {
+        "days": list(HEATMAP_DAYS),
+        "slots": list(HEATMAP_SLOTS),
+        "matrix": matrix,
+        "hourly_matrix": hourly_matrix,
+        "by_hour": by_hour,
+        "max_value": max_value,
+        "peak_day": HEATMAP_DAYS[peak_day_idx] if max_value > 0 else "—",
+        "peak_slot": HEATMAP_SLOTS[peak_slot_idx] if max_value > 0 else "—",
+        "total_inbound": total_inbound,
+    }
+
+    return {
+        "daily_flow": daily_flow,
+        "revenue_timeline": revenue_timeline,
+        "funnel_dropoff": funnel_dropoff,
+        "channels_and_sources": channels_and_sources,
+        "reply_heatmap": reply_heatmap,
+    }
+
+
+def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict:
+    clean_period = str(period or "30d").strip().lower()
+    if clean_period not in VALID_PERIODS:
+        clean_period = "30d"
+
     funnel = _compute_funnel_analytics(conn)
     outreach = _compute_outreach_analytics(conn)
     accounts = _compute_accounts_analytics(conn)
+    charts = _compute_charts_analytics(
+        conn,
+        period=clean_period,
+        accounts_analytics=accounts,
+    )
+
     return {
+        "period": clean_period,
         "funnel": funnel,
         "outreach": outreach,
         "accounts": accounts,
+        "charts": charts,
         "pipeline_value": funnel["pipeline_value"],
         "won_value": funnel["won_value"],
         "won_revenue": funnel["won_value"],
         "lost_value": funnel["lost_value"],
         "total_value": funnel["total_value"],
+        "monthly_value": funnel["monthly_value"],
         "win_rate_pct": funnel["win_rate_pct"],
         "reply_rate_pct": outreach["reply_rate_pct"],
     }

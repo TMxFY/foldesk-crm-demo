@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 import re
 import sqlite3
 
@@ -7,6 +8,8 @@ from app.db import (
     as_dict,
     create_pipeline_stage,
     list_pipeline_stages,
+    normalize_status,
+    status_to_airtable,
     update_pipeline_stage,
     utc_now,
     valid_statuses,
@@ -182,13 +185,40 @@ def _enrich_lead(conn, data: dict | None) -> dict | None:
     return data
 
 
+def _parse_offer_type(raw) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    s = str(raw).strip()
+    if s.startswith("["):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    return [part.strip() for part in s.split(",") if part.strip()]
+
+
+def _serialize_offer_type(raw) -> str | None:
+    items = _parse_offer_type(raw)
+    if not items:
+        return None
+    return json.dumps(items, ensure_ascii=False)
+
+
 def _public(row, conn=None) -> dict | None:
     data = as_dict(row)
     if data is None:
         return None
     data["provider"] = data.get("provider") or "telegram"
     data["amount"] = int(data.get("amount") or 0)
+    data["monthly_value"] = int(data.get("monthly_value") or 0)
     data["currency"] = data.get("currency") or "USD"
+    data["offer_type"] = _parse_offer_type(data.get("offer_type"))
+    st = data.get("status") or "new"
+    data["airtable_status"] = data.get("airtable_status") or status_to_airtable(st)
     if conn is not None:
         return _enrich_lead(conn, data)
     return data
@@ -313,9 +343,21 @@ def create_lead(
     provider: str | None = None,
     amount: int | float | str | None = 0,
     currency: str | None = "USD",
+    company: str | None = None,
+    niche: str | None = None,
+    offer_type=None,
+    offer_details: str | None = None,
+    monthly_value: int | float | str | None = 0,
+    lead_source: str | None = None,
+    next_follow_up: str | None = None,
+    last_contacted: str | None = None,
+    airtable_record_id: str | None = None,
 ) -> dict:
-    if status not in valid_statuses(conn):
+    norm_status = normalize_status(status, conn)
+    if norm_status not in valid_statuses(conn):
         raise ValueError("Неизвестный статус")
+    status = norm_status
+    airtable_st = status_to_airtable(status)
     resolved_provider = _resolve_provider(conn, provider, account_id)
     username = _clean_username(username)
     name = (name or "").strip() or None
@@ -325,6 +367,15 @@ def create_lead(
     description = _blank(description)
     email = _blank(email)
     url = _blank(url)
+    company = _blank(company)
+    niche = _blank(niche)
+    clean_offer_type = _serialize_offer_type(offer_type)
+    offer_details = _blank(offer_details)
+    clean_monthly = _clean_amount(monthly_value)
+    lead_source = _blank(lead_source)
+    next_follow_up = _blank(next_follow_up)
+    last_contacted = _blank(last_contacted)
+    airtable_record_id = _blank(airtable_record_id)
     clean_amt = _clean_amount(amount)
     clean_cur = _clean_currency(currency)
     if not any((name, username, phone, telegram_user_id)):
@@ -352,8 +403,10 @@ def create_lead(
             INSERT INTO leads (
                 account_id, telegram_user_id, username, name, phone,
                 status, note, next_step, created_at, updated_at,
-                description, email, url, provider, amount, currency
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                description, email, url, provider, amount, currency,
+                company, niche, offer_type, offer_details, monthly_value,
+                lead_source, next_follow_up, last_contacted, airtable_record_id, airtable_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account_id,
@@ -372,6 +425,16 @@ def create_lead(
                 resolved_provider,
                 clean_amt,
                 clean_cur,
+                company,
+                niche,
+                clean_offer_type,
+                offer_details,
+                clean_monthly,
+                lead_source,
+                next_follow_up,
+                last_contacted,
+                airtable_record_id,
+                airtable_st,
             ),
         )
         new_id = int(cur.lastrowid)
@@ -476,7 +539,9 @@ def lead_card(conn, lead_id: int) -> dict:
 def update_lead(conn, lead_id: int, **fields) -> dict:
     allowed = {
         "status", "note", "next_step", "name", "description", "email", "url", "folder_id",
-        "phone", "provider", "amount", "currency",
+        "phone", "provider", "amount", "currency", "company", "niche", "offer_type",
+        "offer_details", "monthly_value", "lead_source", "next_follow_up", "last_contacted",
+        "airtable_record_id", "airtable_status", "airtable_synced_at", "username",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -488,19 +553,34 @@ def update_lead(conn, lead_id: int, **fields) -> dict:
         out = _public(row, conn)
         out["events"] = list_lead_events(conn, lead_id)
         return out
-    if "status" in fields and fields["status"] not in valid_statuses(conn):
-        raise ValueError("Неизвестный статус")
+    if "status" in fields:
+        norm_st = normalize_status(fields["status"], conn)
+        if norm_st not in valid_statuses(conn):
+            raise ValueError("Неизвестный статус")
+        fields["status"] = norm_st
+        if "airtable_status" not in fields:
+            fields["airtable_status"] = status_to_airtable(norm_st)
     if "provider" in fields and fields["provider"] is not None:
         fields["provider"] = _resolve_provider(conn, fields["provider"], row["account_id"])
     if "folder_id" in fields:
         fields["folder_id"] = _own_folder(conn, row, fields["folder_id"])
     if "amount" in fields:
         fields["amount"] = _clean_amount(fields["amount"])
+    if "monthly_value" in fields:
+        fields["monthly_value"] = _clean_amount(fields["monthly_value"])
     if "currency" in fields:
         fields["currency"] = _clean_currency(fields["currency"])
+    if "offer_type" in fields:
+        fields["offer_type"] = _serialize_offer_type(fields["offer_type"])
+    if "username" in fields:
+        fields["username"] = _clean_username(fields["username"])
     if "name" in fields and fields["name"] is not None:
         fields["name"] = str(fields["name"]).strip() or None
-    for key in ("description", "email", "url", "phone"):
+    for key in (
+        "description", "email", "url", "phone", "company", "niche",
+        "offer_details", "lead_source", "next_follow_up", "last_contacted",
+        "airtable_record_id", "airtable_status", "airtable_synced_at",
+    ):
         if key in fields and fields[key] is not None:
             fields[key] = str(fields[key]).strip() or None
 
@@ -568,8 +648,11 @@ def search_leads(
     folder_id: int | None = None,
     provider: str | None = None,
 ) -> list:
-    if status is not None and status not in valid_statuses(conn):
-        raise ValueError("Неизвестный статус")
+    if status is not None and str(status).strip() != "":
+        norm_st = normalize_status(status, conn)
+        if norm_st not in valid_statuses(conn):
+            raise ValueError("Неизвестный статус")
+        status = norm_st
     clean_provider = None
     if provider is not None and str(provider).strip() != "":
         clean_provider = str(provider).strip().lower()
@@ -619,6 +702,9 @@ def search_leads(
                 lead.get("email") or "",
                 lead.get("url") or "",
                 lead.get("provider") or "",
+                lead.get("company") or "",
+                lead.get("niche") or "",
+                lead.get("note") or "",
             )
         )
         if folded in blob.casefold():
@@ -722,18 +808,7 @@ def _ensure_lead_amount_columns(conn) -> None:
 
 
 def _valid_statuses(conn) -> set[str]:
-    valid = set(STATUSES)
-    try:
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_stages'"
-        ).fetchone()
-        if has_table:
-            for r in conn.execute("SELECT key FROM pipeline_stages").fetchall():
-                if r["key"]:
-                    valid.add(str(r["key"]))
-    except Exception:
-        pass
-    return valid
+    return valid_statuses(conn)
 
 
 def _has_table(conn, table_name: str) -> bool:
@@ -829,14 +904,15 @@ def bulk_leads_action(
 
     if act == "set_status":
         target_status = status if status is not None else value
-        target_status = str(target_status or "").strip()
+        target_status = normalize_status(str(target_status or "").strip(), conn)
         if not target_status or target_status not in _valid_statuses(conn):
             raise ValueError("Неизвестный статус")
+        airtable_st = status_to_airtable(target_status)
         for chunk in _iter_chunks(existing_ids):
             ep = ",".join("?" for _ in chunk)
             conn.execute(
-                f"UPDATE leads SET status = ?, updated_at = ? WHERE id IN ({ep})",
-                [target_status, now, *chunk],
+                f"UPDATE leads SET status = ?, airtable_status = ?, updated_at = ? WHERE id IN ({ep})",
+                [target_status, airtable_st, now, *chunk],
             )
         for lid in existing_ids:
             old_status = existing_by_id[lid].get("status") or "new"

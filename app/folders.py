@@ -7,9 +7,11 @@ def list_folders(conn, account_id: int) -> list:
     _require_account(conn, account_id)
     rows = conn.execute(
         """
-        SELECT * FROM folders
-        WHERE account_id = ?
-        ORDER BY title, id
+        SELECT f.*,
+               (SELECT COUNT(*) FROM leads l WHERE l.folder_id = f.id) AS leads_count
+        FROM folders f
+        WHERE f.account_id = ?
+        ORDER BY f.title, f.id
         """,
         (account_id,),
     ).fetchall()
@@ -22,10 +24,23 @@ async def pull_folders(conn, account_id: int, gateway) -> list:
     if not isinstance(remote, list):
         raise ValueError("Список папок пустой")
     now = utc_now()
+    remote_tg_ids = []
     for item in remote:
         if not isinstance(item, dict) or item.get("telegram_folder_id") is None:
             continue
+        remote_tg_ids.append(int(item["telegram_folder_id"]))
         _upsert_folder(conn, account_id, item, now)
+    if remote_tg_ids:
+        ph = ",".join("?" for _ in remote_tg_ids)
+        stale_rows = conn.execute(
+            f"SELECT id FROM folders WHERE account_id = ? AND telegram_folder_id NOT IN ({ph})",
+            [account_id, *remote_tg_ids],
+        ).fetchall()
+        stale_ids = [int(r["id"]) for r in stale_rows]
+        if stale_ids:
+            sph = ",".join("?" for _ in stale_ids)
+            conn.execute(f"UPDATE leads SET folder_id = NULL WHERE folder_id IN ({sph})", stale_ids)
+            conn.execute(f"DELETE FROM folders WHERE id IN ({sph})", stale_ids)
     conn.commit()
     return list_folders(conn, account_id)
 
@@ -68,6 +83,28 @@ async def sync_folder(conn, folder_id: int, gateway) -> dict:
             """,
             (account["id"], telegram_user_id),
         ).fetchone()
+        if existing is None and peer.get("username"):
+            clean_u = str(peer.get("username") or "").strip().lstrip("@").lower()
+            if clean_u:
+                unlinked = conn.execute(
+                    """
+                    SELECT id FROM leads
+                    WHERE account_id IS NULL AND telegram_user_id IS NULL AND lower(username) = ?
+                    ORDER BY id LIMIT 1
+                    """,
+                    (clean_u,),
+                ).fetchone()
+                if unlinked is not None:
+                    conn.execute(
+                        """
+                        UPDATE leads
+                        SET account_id = ?, telegram_user_id = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (account["id"], telegram_user_id, utc_now(), unlinked["id"]),
+                    )
+                    conn.commit()
+                    existing = unlinked
         lead = add_lead_from_dialog(
             conn,
             account["id"],
@@ -94,6 +131,31 @@ async def sync_folder(conn, folder_id: int, gateway) -> dict:
         "added": added,
         "total": len(lead_ids),
         "lead_ids": lead_ids,
+    }
+
+
+async def sync_all_folders(conn, account_id: int, gateway) -> dict:
+    folders = await pull_folders(conn, account_id, gateway)
+    synced_folders = 0
+    total_added = 0
+    total_leads = 0
+    for f in folders:
+        if f.get("blocked_reason"):
+            continue
+        try:
+            res = await sync_folder(conn, int(f["id"]), gateway)
+            synced_folders += 1
+            total_added += int(res.get("added") or 0)
+            total_leads += int(res.get("total") or 0)
+        except Exception:
+            continue
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "synced_folders": synced_folders,
+        "added": total_added,
+        "total": total_leads,
+        "folders": list_folders(conn, account_id),
     }
 
 

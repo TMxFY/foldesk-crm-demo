@@ -65,12 +65,14 @@ def _cleanup_existing_demo(conn) -> None:
         placeholders = ",".join("?" for _ in lead_ids)
         conn.execute(f"DELETE FROM campaign_recipients WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM reminders WHERE lead_id IN ({placeholders})", lead_ids)
+        conn.execute(f"DELETE FROM calendar_events WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM notes WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM tasks WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM property_values WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM lead_events WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"UPDATE dialogs SET lead_id = NULL WHERE lead_id IN ({placeholders})", lead_ids)
         conn.execute(f"DELETE FROM leads WHERE id IN ({placeholders})", lead_ids)
+    conn.execute("DELETE FROM calendar_events WHERE source LIKE 'demo%'")
 
     if acc_ids:
         acc_ph = ",".join("?" for _ in acc_ids)
@@ -445,13 +447,19 @@ def seed_demo(conn) -> dict:
             stamp = _iso(now_dt - timedelta(minutes=(8 - idx) * 7))
         folder_id = folder_map[item["folder"]] if item.get("folder") else None
         lead_amount = int(item.get("amount_cents", 0) or 0) // 100
+        lead_company = item.get("company")
+        lead_niche = "Web3 & Crypto" if item.get("folder") == "Web3 & SaaS" else ("FinTech & B2B" if item.get("folder") == "VIP Клиенты" else "Performance & Agencies")
+        lead_monthly = max(500, int(round(lead_amount * 0.45))) if lead_amount > 0 else 0
+        lead_src = "Cold outreach" if idx % 2 == 0 else "Referral"
+        follow_day = (now_dt + timedelta(days=(idx % 5) + 1)).strftime("%Y-%m-%d")
         lcur = conn.execute(
             """
             INSERT INTO leads (
                 account_id, telegram_user_id, username, name, phone,
                 status, note, next_step, created_at, updated_at,
-                description, email, url, folder_id, provider, amount, currency
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD')
+                description, email, url, folder_id, provider, amount, currency,
+                company, niche, monthly_value, lead_source, next_follow_up, offer_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?)
             """,
             (
                 lead_acc_id,
@@ -470,6 +478,12 @@ def seed_demo(conn) -> dict:
                 folder_id,
                 lead_provider,
                 lead_amount,
+                lead_company,
+                lead_niche,
+                lead_monthly,
+                lead_src,
+                follow_day,
+                json.dumps(["Performance"] if idx % 2 == 0 else ["Custom project"]),
             ),
         )
         lead_id = lcur.lastrowid

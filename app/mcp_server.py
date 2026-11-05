@@ -1,0 +1,1314 @@
+import asyncio
+import inspect
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from app.analytics import get_analytics_summary
+from app.db import (
+    ROOT,
+    as_dict,
+    connect,
+    ensure_airtable_pipeline_stages,
+    init_db,
+    list_pipeline_stages,
+    normalize_status,
+    status_to_airtable,
+    utc_now,
+)
+from app.events import get_today_focus, record_lead_event
+from app.inbox import get_inbox_counts, list_inbox, list_messages
+from app.leads import create_lead, lead_card, search_leads, update_lead
+from app.notes import add_note
+from app.reminders import (
+    complete_reminder,
+    create_reminder,
+    list_reminders,
+    normalize_due,
+    postpone_reminder,
+)
+from app.tasks import create_task, list_tasks, set_task_done
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+SERVER_INFO = {
+    "name": "foldesk-crm-mcp",
+    "version": "1.0.0",
+    "title": "Foldesk CRM MCP Server",
+    "description": (
+        "MCP-сервер Foldesk CRM для AI-агентов: полное чтение воронки, карточек, "
+        "переписок, аналитики и расписания + изменение сделок, заметок, задач, "
+        "календаря и синхронизация с Airtable (без отправки сообщений в мессенджеры)."
+    ),
+}
+
+TOOLS_SCHEMA: list[dict[str, Any]] = [
+    {
+        "name": "get_analytics_summary",
+        "description": (
+            "Полная аналитика CRM по воронке, бюджетам, конверсиям, рассылкам, "
+            "аккаунтам и графикам за выбранный период."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": ["7d", "30d", "90d", "all"],
+                    "default": "30d",
+                    "description": "Период аналитики: 7d, 30d, 90d или all.",
+                }
+            },
+        },
+    },
+    {
+        "name": "get_pipeline_stages",
+        "description": "Получить список всех стадий воронки CRM (включая 7 стадий Airtable).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ensure_airtable_stages": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Гарантировать наличие всех 7 стадий Airtable в БД.",
+                }
+            },
+        },
+    },
+    {
+        "name": "search_leads",
+        "description": (
+            "Поиск и фильтрация сделок (лидов) по тексту, стадии воронки, папке, "
+            "мессенджеру, компании, нише и минимальному бюджету."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "default": "", "description": "Поисковый запрос"},
+                "status": {"type": "string", "default": "", "description": "Статус / стадия сделки"},
+                "folder_id": {"type": ["integer", "null"], "description": "ID папки"},
+                "provider": {"type": "string", "default": "", "description": "telegram или whatsapp"},
+                "company": {"type": "string", "default": "", "description": "Фильтр по компании"},
+                "niche": {"type": "string", "default": "", "description": "Фильтр по нише"},
+                "min_amount": {"type": ["integer", "null"], "description": "Минимальный бюджет сделки"},
+                "limit": {"type": "integer", "default": 50, "description": "Максимум результатов"},
+            },
+        },
+    },
+    {
+        "name": "get_lead_full_card",
+        "description": (
+            "Получить полную карточку лида со всеми полями, заметками, задачами, "
+            "последними 50 сообщениями переписки, открытыми напоминаниями и созвонами в календаре."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lead_id": {"type": ["integer", "null"], "description": "ID лида"},
+                "username": {"type": "string", "description": "Telegram @username лида (если lead_id не указан)"},
+                "name": {"type": "string", "description": "Имя или компания лида (если lead_id не указан)"},
+            },
+        },
+    },
+    {
+        "name": "create_or_update_lead",
+        "description": (
+            "Создать нового лида или обновить существующего (статус из 7 стадий Airtable/CRM, "
+            "бюджет amount, monthly_value, компания, ниша, оффер, следующий шаг, дата фоллоу-апа)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lead_id": {"type": ["integer", "null"], "description": "ID лида для обновления"},
+                "name": {"type": ["string", "null"], "description": "Имя контакта"},
+                "username": {"type": ["string", "null"], "description": "Telegram username"},
+                "phone": {"type": ["string", "null"], "description": "Телефон"},
+                "status": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Стадия: New / In conversation / Call scheduled / Offer sent / "
+                        "On hold / Signed / Cancelled (или new, talking, call_scheduled, waiting, on_hold, won, lost)"
+                    ),
+                },
+                "amount": {"type": ["integer", "null"], "description": "Бюджет сделки"},
+                "monthly_value": {"type": ["integer", "null"], "description": "Ежемесячный чек (MRR)"},
+                "currency": {"type": ["string", "null"], "description": "Валюта (USD, EUR, RUB)"},
+                "company": {"type": ["string", "null"], "description": "Название компании"},
+                "niche": {"type": ["string", "null"], "description": "Ниша клиента"},
+                "offer_type": {
+                    "type": ["array", "string", "null"],
+                    "items": {"type": "string"},
+                    "description": "Тип оффера (список или строка)",
+                },
+                "offer_details": {"type": ["string", "null"], "description": "Детали оффера"},
+                "next_step": {"type": ["string", "null"], "description": "Следующий шаг по сделке"},
+                "next_follow_up": {"type": ["string", "null"], "description": "Дата следующего контакта (YYYY-MM-DD)"},
+                "lead_source": {"type": ["string", "null"], "description": "Источник лида"},
+                "note": {"type": ["string", "null"], "description": "Заметка в карточке"},
+                "url": {"type": ["string", "null"], "description": "Ссылка на сайт или профиль"},
+                "email": {"type": ["string", "null"], "description": "Email"},
+                "provider": {"type": ["string", "null"], "description": "telegram или whatsapp"},
+            },
+        },
+    },
+    {
+        "name": "add_lead_note",
+        "description": "Добавить текстовую заметку в таймлайн карточки лида.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lead_id": {"type": "integer", "description": "ID лида"},
+                "body": {"type": "string", "description": "Текст заметки"},
+            },
+            "required": ["lead_id", "body"],
+        },
+    },
+    {
+        "name": "manage_lead_tasks",
+        "description": "Управление чек-лист задачами по лиду: список (list), создание (create), выполнение (complete), возврат в работу (reopen).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "complete", "reopen"],
+                    "description": "Действие над задачей",
+                },
+                "lead_id": {"type": ["integer", "null"], "description": "ID лида (для list и create)"},
+                "task_id": {"type": ["integer", "null"], "description": "ID задачи (для complete и reopen)"},
+                "title": {"type": "string", "default": "", "description": "Текст новой задачи (для create)"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_reminders",
+        "description": "Управление напоминаниями по лидам: список (list), создание (create), перенос срока (postpone), закрытие (complete).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "postpone", "complete"],
+                    "description": "Действие с напоминанием",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["open", "overdue", "all"],
+                    "default": "open",
+                    "description": "Фильтр для list: open, overdue, all",
+                },
+                "lead_id": {"type": ["integer", "null"], "description": "ID лида (для create или фильтрации list)"},
+                "reminder_id": {"type": ["integer", "null"], "description": "ID напоминания (для postpone и complete)"},
+                "due_at": {"type": "string", "default": "", "description": "Срок напоминания ISO 8601 (YYYY-MM-DDTHH:MM)"},
+                "text": {"type": "string", "default": "", "description": "Текст напоминания"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "get_calendar_schedule",
+        "description": "Получить расписание из календаря CRM (созвоны, фоллоу-апы, напоминания) за период.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": ["string", "null"], "description": "Начало периода (YYYY-MM-DD)"},
+                "end_date": {"type": ["string", "null"], "description": "Конец периода (YYYY-MM-DD)"},
+                "event_type": {"type": ["string", "null"], "description": "Фильтр по типу: call, followup, reminder, task"},
+                "lead_id": {"type": ["integer", "null"], "description": "Фильтр по ID лида"},
+            },
+        },
+    },
+    {
+        "name": "schedule_calendar_event",
+        "description": "Создать, обновить, перенести (reschedule), завершить (complete), отменить (cancel) или удалить (delete) событие в календаре CRM.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "update", "reschedule", "complete", "cancel", "delete"],
+                    "default": "create",
+                    "description": "Действие над событием календаря",
+                },
+                "event_id": {"type": ["integer", "null"], "description": "ID события в таблице calendar_events"},
+                "uid": {"type": ["string", "null"], "description": "Универсальный идентификатор элемента (например event:1, reminder:2, lead_followup:3)"},
+                "title": {"type": "string", "default": "", "description": "Название события / созвона"},
+                "start_at": {"type": "string", "default": "", "description": "Время начала ISO 8601 (YYYY-MM-DDTHH:MM:SS)"},
+                "end_at": {"type": ["string", "null"], "description": "Время окончания ISO 8601"},
+                "event_type": {
+                    "type": "string",
+                    "default": "call",
+                    "description": "Тип события: call, followup, meeting, internal",
+                },
+                "lead_id": {"type": ["integer", "null"], "description": "ID привязанного лида"},
+                "meet_link": {"type": ["string", "null"], "description": "Ссылка на Google Meet / Zoom / Telegram Call"},
+                "notes": {"type": ["string", "null"], "description": "Заметки к встрече"},
+            },
+        },
+    },
+    {
+        "name": "list_inbox_dialogs",
+        "description": (
+            "Чтение диалогов и переписок из Inbox (ТОЛЬКО ЧТЕНИЕ, без отправки сообщений). "
+            "Если указан dialog_id — возвращает диалог и его сообщения, иначе список диалогов и счётчики."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chip": {
+                    "type": "string",
+                    "enum": ["all", "waiting", "unread", "our_turn", "groups"],
+                    "default": "all",
+                    "description": "Фильтр вкладки Inbox",
+                },
+                "account_id": {"type": ["integer", "null"], "description": "ID аккаунта (опционально)"},
+                "dialog_id": {"type": ["integer", "null"], "description": "ID конкретного диалога для чтения истории сообщений"},
+                "limit": {"type": "integer", "default": 30, "description": "Лимит диалогов или сообщений"},
+            },
+        },
+    },
+    {
+        "name": "get_focus_today",
+        "description": "Сводка «Фокус дня»: кто ждёт ответа в чатах, горящие напоминания, открытые задачи, созвоны на сегодня и зависшие сделки.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stale_days": {"type": "integer", "default": 3, "description": "Порог дней без обновлений для зависших лидов"},
+            },
+        },
+    },
+    {
+        "name": "sync_airtable",
+        "description": "Запустить двустороннюю или одностороннюю синхронизацию сделок с Airtable (или проверить статус конфигурации).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["both", "pull", "push", "status"],
+                    "default": "both",
+                    "description": "Направление синхронизации: both, pull, push или status",
+                }
+            },
+        },
+    },
+]
+
+RESOURCES_SCHEMA: list[dict[str, Any]] = [
+    {
+        "uri": "crm://analytics/summary",
+        "name": "Сводная аналитика Foldesk CRM",
+        "description": "Текущие показатели воронки, выручки, рассылок и аккаунтов",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "crm://focus/today",
+        "name": "Фокус дня CRM",
+        "description": "Горящие ответы, напоминания, созвоны и зависшие сделки на сегодня",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "crm://pipeline/stages",
+        "name": "Стадии воронки CRM",
+        "description": "Список всех стадий пайплайна и их ключей",
+        "mimeType": "application/json",
+    },
+]
+
+
+def _normalize_iso_datetime(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("Укажите дату и время события")
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return f"{text}T10:00:00"
+    try:
+        return normalize_due(text)
+    except ValueError:
+        return text
+
+
+def _find_lead_by_lookup(
+    conn: sqlite3.Connection,
+    *,
+    lead_id: int | None = None,
+    username: str | None = None,
+    name: str | None = None,
+    phone: str | None = None,
+) -> dict | None:
+    if lead_id is not None:
+        row = conn.execute("SELECT * FROM leads WHERE id = ?", (int(lead_id),)).fetchone()
+        if row is not None:
+            return as_dict(row)
+    clean_username = (username or "").strip().lstrip("@")
+    if clean_username:
+        row = conn.execute(
+            "SELECT * FROM leads WHERE username IS NOT NULL AND lower(username) = lower(?) ORDER BY id ASC LIMIT 1",
+            (clean_username,),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+    clean_phone = (phone or "").strip()
+    if clean_phone:
+        row = conn.execute(
+            "SELECT * FROM leads WHERE phone IS NOT NULL AND phone = ? ORDER BY id ASC LIMIT 1",
+            (clean_phone,),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+    clean_name = (name or "").strip()
+    if clean_name:
+        row = conn.execute(
+            """
+            SELECT * FROM leads
+            WHERE (name IS NOT NULL AND lower(name) = lower(?))
+               OR (company IS NOT NULL AND lower(company) = lower(?))
+            ORDER BY id ASC LIMIT 1
+            """,
+            (clean_name, clean_name),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+        row = conn.execute(
+            """
+            SELECT * FROM leads
+            WHERE (name IS NOT NULL AND lower(name) LIKE lower(?))
+               OR (company IS NOT NULL AND lower(company) LIKE lower(?))
+            ORDER BY id ASC LIMIT 1
+            """,
+            (f"%{clean_name}%", f"%{clean_name}%"),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+    return None
+
+
+def _fallback_list_calendar_items(
+    conn: sqlite3.Connection,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    event_type: str | None = None,
+    lead_id: int | None = None,
+) -> dict:
+    start_prefix = (start_date or "").strip()[:10] if start_date else None
+    end_prefix = (end_date or "").strip()[:10] if end_date else None
+    wanted_type = (event_type or "").strip().lower() or None
+    wanted_lead = int(lead_id) if lead_id is not None else None
+
+    items: list[dict] = []
+
+    def _in_range(dt_str: str | None) -> bool:
+        if not dt_str:
+            return False
+        day = str(dt_str).strip()[:10]
+        if start_prefix and day < start_prefix:
+            return False
+        if end_prefix and day > end_prefix:
+            return False
+        return True
+
+    ev_sql = """
+        SELECT ce.*, l.name AS lead_name, l.username AS lead_username, l.company AS lead_company
+        FROM calendar_events ce
+        LEFT JOIN leads l ON l.id = ce.lead_id
+        ORDER BY ce.start_at ASC, ce.id ASC
+    """
+    for row in conn.execute(ev_sql).fetchall():
+        ev = as_dict(row)
+        if wanted_lead is not None and ev.get("lead_id") != wanted_lead:
+            continue
+        ev_t = str(ev.get("event_type") or "call").strip().lower()
+        if wanted_type and ev_t != wanted_type:
+            continue
+        if not _in_range(ev.get("start_at")):
+            continue
+        items.append(
+            {
+                "uid": f"event:{ev['id']}",
+                "id": int(ev["id"]),
+                "source_kind": "calendar_event",
+                "title": ev.get("title") or "Созвон",
+                "event_type": ev_t,
+                "start_at": ev.get("start_at"),
+                "end_at": ev.get("end_at"),
+                "all_day": bool(ev.get("all_day")),
+                "status": ev.get("status") or "scheduled",
+                "lead_id": ev.get("lead_id"),
+                "lead_name": ev.get("lead_name") or ev.get("lead_company") or ev.get("lead_username"),
+                "meet_link": ev.get("meet_link"),
+                "notes": ev.get("notes"),
+            }
+        )
+
+    if not wanted_type or wanted_type == "reminder":
+        rem_sql = """
+            SELECT r.*, l.name AS lead_name, l.username AS lead_username, l.company AS lead_company
+            FROM reminders r
+            JOIN leads l ON l.id = r.lead_id
+            ORDER BY r.due_at ASC, r.id ASC
+        """
+        for row in conn.execute(rem_sql).fetchall():
+            rem = as_dict(row)
+            if wanted_lead is not None and int(rem["lead_id"]) != wanted_lead:
+                continue
+            if not _in_range(rem.get("due_at")):
+                continue
+            items.append(
+                {
+                    "uid": f"reminder:{rem['id']}",
+                    "id": int(rem["id"]),
+                    "source_kind": "reminder",
+                    "title": rem.get("text") or "Напоминание",
+                    "event_type": "reminder",
+                    "start_at": rem.get("due_at"),
+                    "end_at": None,
+                    "all_day": False,
+                    "status": "completed" if rem.get("done_at") else "scheduled",
+                    "lead_id": int(rem["lead_id"]),
+                    "lead_name": rem.get("lead_name") or rem.get("lead_company") or rem.get("lead_username"),
+                    "meet_link": None,
+                    "notes": None,
+                }
+            )
+
+    if not wanted_type or wanted_type in ("followup", "follow_up"):
+        for row in conn.execute(
+            "SELECT id, name, username, company, next_follow_up, next_step, status FROM leads WHERE next_follow_up IS NOT NULL AND trim(next_follow_up) != ''"
+        ).fetchall():
+            ld = as_dict(row)
+            if wanted_lead is not None and int(ld["id"]) != wanted_lead:
+                continue
+            nf = str(ld["next_follow_up"]).strip()
+            start_iso = f"{nf}T10:00:00" if len(nf) == 10 else nf
+            if not _in_range(start_iso):
+                continue
+            label = ld.get("name") or ld.get("company") or ld.get("username") or f"Лид #{ld['id']}"
+            items.append(
+                {
+                    "uid": f"lead_followup:{ld['id']}",
+                    "id": int(ld["id"]),
+                    "source_kind": "lead_followup",
+                    "title": f"Фоллоу-ап: {label}" + (f" ({ld['next_step']})" if ld.get("next_step") else ""),
+                    "event_type": "followup",
+                    "start_at": start_iso,
+                    "end_at": None,
+                    "all_day": len(nf) == 10,
+                    "status": "scheduled",
+                    "lead_id": int(ld["id"]),
+                    "lead_name": label,
+                    "meet_link": None,
+                    "notes": ld.get("next_step"),
+                }
+            )
+
+    items.sort(key=lambda x: (str(x.get("start_at") or ""), str(x.get("uid") or "")))
+    return {
+        "items": items,
+        "count": len(items),
+        "start_date": start_prefix,
+        "end_date": end_prefix,
+    }
+
+
+def _handle_schedule_calendar_event(conn: sqlite3.Connection, arguments: dict) -> dict:
+    action = str(arguments.get("action") or "create").strip().lower()
+    event_id = arguments.get("event_id")
+    uid = str(arguments.get("uid") or "").strip() or None
+    title = str(arguments.get("title") or "").strip()
+    start_at = str(arguments.get("start_at") or "").strip()
+    end_at = arguments.get("end_at")
+    event_type = str(arguments.get("event_type") or "call").strip().lower() or "call"
+    lead_id = int(arguments["lead_id"]) if arguments.get("lead_id") is not None else None
+    meet_link = (str(arguments["meet_link"]).strip() or None) if arguments.get("meet_link") else None
+    notes = (str(arguments["notes"]).strip() or None) if arguments.get("notes") else None
+
+    if uid and not event_id and uid.startswith("event:"):
+        try:
+            event_id = int(uid.split(":", 1)[1])
+        except ValueError:
+            pass
+
+    try:
+        import app.calendar_events as cal_mod
+    except ImportError:
+        cal_mod = None
+
+    if action == "create":
+        if not title:
+            if lead_id is not None:
+                lrow = conn.execute("SELECT name, company, username FROM leads WHERE id = ?", (lead_id,)).fetchone()
+                if lrow is None:
+                    raise LookupError("Лид не найден")
+                label = lrow["name"] or lrow["company"] or lrow["username"] or f"Лид #{lead_id}"
+                title = f"Созвон: {label}"
+            else:
+                raise ValueError("Укажите название события (title)")
+        norm_start = _normalize_iso_datetime(start_at)
+        norm_end = _normalize_iso_datetime(end_at) if end_at else None
+
+        if cal_mod and hasattr(cal_mod, "create_calendar_event"):
+            sig = inspect.signature(cal_mod.create_calendar_event)
+            kwargs: dict[str, Any] = {}
+            for k, v in (
+                ("title", title),
+                ("start_at", norm_start),
+                ("end_at", norm_end),
+                ("event_type", event_type),
+                ("lead_id", lead_id),
+                ("meet_link", meet_link),
+                ("notes", notes),
+            ):
+                if k in sig.parameters:
+                    kwargs[k] = v
+            ev = cal_mod.create_calendar_event(conn, **kwargs)
+            return {"ok": True, "action": "create", "event": ev}
+
+        if lead_id is not None:
+            lcheck = conn.execute("SELECT id FROM leads WHERE id = ?", (lead_id,)).fetchone()
+            if lcheck is None:
+                raise LookupError("Лид не найден")
+        now = utc_now()
+        cur = conn.execute(
+            """
+            INSERT INTO calendar_events (
+                title, event_type, start_at, end_at, all_day,
+                lead_id, meet_link, notes, status, source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'scheduled', 'crm', ?, ?)
+            """,
+            (title, event_type, norm_start, norm_end, lead_id, meet_link, notes, now, now),
+        )
+        new_id = int(cur.lastrowid)
+        if lead_id is not None and event_type == "call":
+            conn.execute(
+                """
+                UPDATE leads
+                SET status = CASE WHEN status IN ('new', 'talking') THEN 'call_scheduled' ELSE status END,
+                    airtable_status = CASE WHEN status IN ('new', 'talking') THEN 'Call scheduled' ELSE airtable_status END,
+                    next_follow_up = COALESCE(?, next_follow_up),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (norm_start[:10], now, lead_id),
+            )
+            record_lead_event(
+                conn,
+                lead_id,
+                "reminder_set",
+                f"Назначен созвон: {title} ({norm_start[:16].replace('T', ' ')})",
+                {"event_id": new_id, "start_at": norm_start, "meet_link": meet_link},
+                created_at=now,
+            )
+        conn.commit()
+        row = conn.execute("SELECT * FROM calendar_events WHERE id = ?", (new_id,)).fetchone()
+        ev = as_dict(row)
+        ev["uid"] = f"event:{new_id}"
+        return {"ok": True, "action": "create", "event": ev}
+
+    if action == "reschedule" and uid and not event_id:
+        norm_start = _normalize_iso_datetime(start_at)
+        norm_end = _normalize_iso_datetime(end_at) if end_at else None
+        if cal_mod and hasattr(cal_mod, "reschedule_calendar_item"):
+            res = cal_mod.reschedule_calendar_item(conn, uid=uid, new_start_at=norm_start, new_end_at=norm_end)
+            return {"ok": True, "action": "reschedule", "event": res}
+        if uid.startswith("reminder:"):
+            rem_id = int(uid.split(":", 1)[1])
+            updated = postpone_reminder(conn, rem_id, norm_start)
+            return {"ok": True, "action": "reschedule", "reminder": updated}
+        if uid.startswith("lead_followup:"):
+            lid = int(uid.split(":", 1)[1])
+            updated = update_lead(conn, lid, next_follow_up=norm_start[:10])
+            return {"ok": True, "action": "reschedule", "lead": updated}
+
+    if event_id is None:
+        raise ValueError("Укажите event_id или uid события")
+    eid = int(event_id)
+    existing = conn.execute("SELECT * FROM calendar_events WHERE id = ?", (eid,)).fetchone()
+    if existing is None:
+        raise LookupError("Событие календаря не найдено")
+
+    now = utc_now()
+    if action == "delete":
+        if cal_mod and hasattr(cal_mod, "delete_calendar_event"):
+            cal_mod.delete_calendar_event(conn, eid)
+        else:
+            conn.execute("DELETE FROM calendar_events WHERE id = ?", (eid,))
+            conn.commit()
+        return {"ok": True, "action": "delete", "deleted_id": eid}
+
+    updates: dict[str, Any] = {}
+    if action == "complete":
+        updates["status"] = "completed"
+    elif action == "cancel":
+        updates["status"] = "cancelled"
+    elif action in ("update", "reschedule"):
+        if title:
+            updates["title"] = title
+        if start_at:
+            updates["start_at"] = _normalize_iso_datetime(start_at)
+        if end_at is not None:
+            updates["end_at"] = _normalize_iso_datetime(end_at) if end_at else None
+        if "event_type" in arguments and arguments["event_type"]:
+            updates["event_type"] = event_type
+        if "lead_id" in arguments:
+            updates["lead_id"] = lead_id
+        if "meet_link" in arguments:
+            updates["meet_link"] = meet_link
+        if "notes" in arguments:
+            updates["notes"] = notes
+    else:
+        raise ValueError(f"Неизвестное действие schedule_calendar_event: {action}")
+
+    if updates:
+        assigns = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            f"UPDATE calendar_events SET {assigns}, updated_at = ? WHERE id = ?",
+            [*updates.values(), now, eid],
+        )
+        conn.commit()
+    row = conn.execute("SELECT * FROM calendar_events WHERE id = ?", (eid,)).fetchone()
+    ev = as_dict(row)
+    ev["uid"] = f"event:{eid}"
+    return {"ok": True, "action": action, "event": ev}
+
+
+def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict | None = None) -> dict:
+    args = dict(arguments or {})
+
+    if name == "get_analytics_summary":
+        period = str(args.get("period") or "30d").strip() or "30d"
+        try:
+            sig = inspect.signature(get_analytics_summary)
+            if "period" in sig.parameters:
+                data = get_analytics_summary(conn, period=period)
+            else:
+                data = get_analytics_summary(conn)
+        except TypeError:
+            data = get_analytics_summary(conn)
+        if isinstance(data, dict) and "period" not in data:
+            data["period"] = period
+        return data
+
+    if name == "get_pipeline_stages":
+        if args.get("ensure_airtable_stages"):
+            stages = ensure_airtable_pipeline_stages(conn)
+        else:
+            stages = list_pipeline_stages(conn)
+        return {"stages": stages, "count": len(stages)}
+
+    if name == "search_leads":
+        query = str(args.get("query") or args.get("q") or "").strip()
+        status = str(args.get("status") or "").strip() or None
+        folder_id = args.get("folder_id")
+        provider = str(args.get("provider") or "").strip() or None
+        company = str(args.get("company") or "").strip().casefold()
+        niche = str(args.get("niche") or "").strip().casefold()
+        min_amount = args.get("min_amount")
+        limit = max(1, min(int(args.get("limit") or 50), 500))
+
+        found = search_leads(
+            conn,
+            q=query,
+            status=status,
+            folder_id=folder_id,
+            provider=provider,
+        )
+        if company:
+            found = [
+                ld for ld in found if company in str(ld.get("company") or "").casefold()
+            ]
+        if niche:
+            found = [
+                ld for ld in found if niche in str(ld.get("niche") or "").casefold()
+            ]
+        if min_amount is not None and str(min_amount).strip() != "":
+            min_val = int(min_amount)
+            found = [
+                ld
+                for ld in found
+                if max(int(ld.get("amount") or 0), int(ld.get("monthly_value") or 0)) >= min_val
+            ]
+        sliced = found[:limit]
+        return {"leads": sliced, "count": len(sliced), "total_matched": len(found)}
+
+    if name == "get_lead_full_card":
+        lead_id = args.get("lead_id")
+        if lead_id is None:
+            matched = _find_lead_by_lookup(
+                conn,
+                username=args.get("username"),
+                name=args.get("name"),
+                phone=args.get("phone"),
+            )
+            if matched is None:
+                raise LookupError("Лид не найден по указанным параметрам")
+            lead_id = int(matched["id"])
+        else:
+            lead_id = int(lead_id)
+
+        card = lead_card(conn, lead_id)
+
+        # Last 50 messages from linked dialog
+        dlg_id = card.get("dialog_id")
+        if not dlg_id:
+            dlg_row = conn.execute(
+                "SELECT id FROM dialogs WHERE lead_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+                (lead_id,),
+            ).fetchone()
+            if dlg_row is not None:
+                dlg_id = int(dlg_row["id"])
+        messages = []
+        if dlg_id:
+            try:
+                messages = list_messages(conn, int(dlg_id), limit=50)
+            except LookupError:
+                messages = []
+        card["messages"] = messages
+
+        # Open reminders for this lead
+        rem_rows = conn.execute(
+            "SELECT * FROM reminders WHERE lead_id = ? AND done_at IS NULL ORDER BY due_at ASC, id ASC",
+            (lead_id,),
+        ).fetchall()
+        card["reminders"] = [as_dict(r) for r in rem_rows]
+
+        # Calendar events for this lead
+        cal_rows = conn.execute(
+            "SELECT * FROM calendar_events WHERE lead_id = ? ORDER BY start_at ASC, id ASC",
+            (lead_id,),
+        ).fetchall()
+        card["calendar_events"] = [as_dict(r) for r in cal_rows]
+        return card
+
+    if name == "create_or_update_lead":
+        ensure_airtable_pipeline_stages(conn)
+        lead_id = args.get("lead_id")
+        if lead_id is None and (args.get("username") or args.get("phone")):
+            existing = _find_lead_by_lookup(
+                conn,
+                username=args.get("username"),
+                phone=args.get("phone"),
+            )
+            if existing is not None:
+                lead_id = int(existing["id"])
+
+        allowed_fields = (
+            "name",
+            "username",
+            "phone",
+            "status",
+            "amount",
+            "monthly_value",
+            "currency",
+            "company",
+            "niche",
+            "offer_type",
+            "offer_details",
+            "next_step",
+            "next_follow_up",
+            "lead_source",
+            "note",
+            "url",
+            "email",
+            "provider",
+            "description",
+        )
+        payload = {
+            k: args[k]
+            for k in allowed_fields
+            if k in args and args[k] is not None
+        }
+        if "status" in payload:
+            norm_st = normalize_status(str(payload["status"]), conn)
+            payload["status"] = norm_st
+
+        if lead_id is not None:
+            updated = update_lead(conn, int(lead_id), **payload)
+            return {"action": "updated", "lead": updated}
+        created = create_lead(conn, **payload)
+        return {"action": "created", "lead": created}
+
+    if name == "add_lead_note":
+        if args.get("lead_id") is None:
+            raise ValueError("Укажите lead_id")
+        note = add_note(conn, int(args["lead_id"]), str(args.get("body") or ""))
+        return {"ok": True, "note": note}
+
+    if name == "manage_lead_tasks":
+        action = str(args.get("action") or "list").strip().lower()
+        if action == "list":
+            if args.get("lead_id") is None:
+                raise ValueError("Для получения списка задач укажите lead_id")
+            tasks = list_tasks(conn, int(args["lead_id"]))
+            return {"action": "list", "lead_id": int(args["lead_id"]), "tasks": tasks}
+        if action == "create":
+            if args.get("lead_id") is None:
+                raise ValueError("Для создания задачи укажите lead_id")
+            task = create_task(conn, int(args["lead_id"]), str(args.get("title") or ""))
+            return {"action": "create", "task": task}
+        if action in ("complete", "reopen"):
+            if args.get("task_id") is None:
+                raise ValueError("Укажите task_id")
+            task = set_task_done(conn, int(args["task_id"]), done=(action == "complete"))
+            return {"action": action, "task": task}
+        raise ValueError(f"Неизвестное действие manage_lead_tasks: {action}")
+
+    if name == "manage_reminders":
+        action = str(args.get("action") or "list").strip().lower()
+        if action == "list":
+            scope = str(args.get("scope") or "open").strip().lower() or "open"
+            items = list_reminders(conn, scope=scope)
+            if args.get("lead_id") is not None:
+                lid = int(args["lead_id"])
+                items = [r for r in items if int(r.get("lead_id") or 0) == lid]
+            return {"action": "list", "scope": scope, "reminders": items, "count": len(items)}
+        if action == "create":
+            if args.get("lead_id") is None:
+                raise ValueError("Укажите lead_id для напоминания")
+            rem = create_reminder(
+                conn,
+                int(args["lead_id"]),
+                str(args.get("due_at") or ""),
+                str(args.get("text") or ""),
+            )
+            return {"action": "create", "reminder": rem}
+        if action == "postpone":
+            if args.get("reminder_id") is None:
+                raise ValueError("Укажите reminder_id")
+            rem = postpone_reminder(conn, int(args["reminder_id"]), str(args.get("due_at") or ""))
+            return {"action": "postpone", "reminder": rem}
+        if action == "complete":
+            if args.get("reminder_id") is None:
+                raise ValueError("Укажите reminder_id")
+            rem = complete_reminder(conn, int(args["reminder_id"]))
+            return {"action": "complete", "reminder": rem}
+        raise ValueError(f"Неизвестное действие manage_reminders: {action}")
+
+    if name == "get_calendar_schedule":
+        start_date = args.get("start_date")
+        end_date = args.get("end_date")
+        event_type = args.get("event_type")
+        lead_id = int(args["lead_id"]) if args.get("lead_id") is not None else None
+        try:
+            from app.calendar_events import list_calendar_items
+
+            sig = inspect.signature(list_calendar_items)
+            call_kwargs: dict[str, Any] = {}
+            for k, v in (
+                ("start_date", start_date),
+                ("end_date", end_date),
+                ("event_type", event_type),
+                ("lead_id", lead_id),
+            ):
+                if k in sig.parameters and v is not None:
+                    call_kwargs[k] = v
+            res = list_calendar_items(conn, **call_kwargs)
+            if isinstance(res, list):
+                return {"items": res, "count": len(res)}
+            return res
+        except (ImportError, AttributeError, TypeError):
+            return _fallback_list_calendar_items(
+                conn,
+                start_date=start_date,
+                end_date=end_date,
+                event_type=event_type,
+                lead_id=lead_id,
+            )
+
+    if name == "schedule_calendar_event":
+        return _handle_schedule_calendar_event(conn, args)
+
+    if name == "list_inbox_dialogs":
+        dialog_id = args.get("dialog_id")
+        limit = max(1, min(int(args.get("limit") or 30), 200))
+        if dialog_id is not None:
+            did = int(dialog_id)
+            dlg_row = conn.execute("SELECT * FROM dialogs WHERE id = ?", (did,)).fetchone()
+            if dlg_row is None:
+                raise LookupError("Диалог не найден")
+            msgs = list_messages(conn, did, limit=limit)
+            return {
+                "dialog": as_dict(dlg_row),
+                "messages": msgs,
+                "messages_count": len(msgs),
+            }
+        chip_raw = str(args.get("chip") or "all").strip().lower()
+        chip = None if chip_raw in ("", "all") else chip_raw
+        account_id = int(args["account_id"]) if args.get("account_id") is not None else None
+        dialogs = list_inbox(conn, account_id=account_id, chip=chip)
+        counts = get_inbox_counts(conn, account_id=account_id)
+        sliced = list(dialogs)[:limit]
+        return {
+            "chip": chip_raw or "all",
+            "dialogs": sliced,
+            "count": len(sliced),
+            "counts": counts,
+        }
+
+    if name == "get_focus_today":
+        stale_days = int(args.get("stale_days") or 3)
+        focus = get_today_focus(conn, stale_days=stale_days)
+        if "today_calls" not in focus:
+            today_prefix = utc_now()[:10]
+            cal_today = conn.execute(
+                """
+                SELECT ce.*, l.name AS lead_name, l.company AS lead_company
+                FROM calendar_events ce
+                LEFT JOIN leads l ON l.id = ce.lead_id
+                WHERE substr(ce.start_at, 1, 10) = ? AND ce.status = 'scheduled'
+                ORDER BY ce.start_at ASC
+                """,
+                (today_prefix,),
+            ).fetchall()
+            focus["today_calls"] = [as_dict(r) for r in cal_today]
+            focus["counts"]["today_calls"] = len(focus["today_calls"])
+        return focus
+
+    if name == "sync_airtable":
+        direction = str(args.get("direction") or "both").strip().lower() or "both"
+        try:
+            import app.airtable_sync as at_mod
+
+            if direction == "status" and hasattr(at_mod, "get_airtable_config"):
+                return at_mod.get_airtable_config(conn)
+            if hasattr(at_mod, "sync_airtable"):
+                return at_mod.sync_airtable(conn, direction=direction)
+        except ImportError:
+            pass
+        rows = dict(
+            conn.execute(
+                "SELECT key, value FROM kv_settings WHERE key LIKE 'airtable_%'"
+            ).fetchall()
+        )
+        return {
+            "ok": False,
+            "direction": direction,
+            "configured": bool(rows.get("airtable_token") and rows.get("airtable_base_id")),
+            "detail": "Модуль синхронизации Airtable не настроен или токен не задан",
+        }
+
+    raise KeyError(f"Неизвестный MCP-инструмент: {name}")
+
+
+def _read_mcp_resource(conn: sqlite3.Connection, uri: str) -> dict:
+    clean_uri = str(uri or "").strip()
+    if clean_uri == "crm://analytics/summary":
+        data = call_mcp_tool_handler(conn, "get_analytics_summary", {"period": "30d"})
+    elif clean_uri == "crm://focus/today":
+        data = call_mcp_tool_handler(conn, "get_focus_today", {})
+    elif clean_uri == "crm://pipeline/stages":
+        data = call_mcp_tool_handler(conn, "get_pipeline_stages", {})
+    else:
+        raise LookupError(f"Ресурс не найден: {clean_uri}")
+    return {
+        "contents": [
+            {
+                "uri": clean_uri,
+                "mimeType": "application/json",
+                "text": json.dumps(data, ensure_ascii=False, indent=2),
+            }
+        ]
+    }
+
+
+def handle_jsonrpc_message(conn: sqlite3.Connection, payload: dict | list) -> dict | list | None:
+    if isinstance(payload, list):
+        responses = []
+        for item in payload:
+            resp = handle_jsonrpc_message(conn, item)
+            if resp is not None:
+                responses.append(resp)
+        return responses if responses else None
+
+    if not isinstance(payload, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+
+    req_id = payload.get("id")
+    method = str(payload.get("method") or "").strip()
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+
+    # Notifications have no id and expect no response
+    if req_id is None and method.startswith("notifications/"):
+        return None
+
+    if method == "initialize":
+        client_version = params.get("protocolVersion") or MCP_PROTOCOL_VERSION
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": client_version,
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
+                },
+                "serverInfo": SERVER_INFO,
+            },
+        }
+
+    if method == "notifications/initialized":
+        if req_id is None:
+            return None
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": TOOLS_SCHEMA},
+        }
+
+    if method == "tools/call":
+        tool_name = str(params.get("name") or "").strip()
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        if not tool_name:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": "Не указано имя инструмента (name)"},
+            }
+        try:
+            result_data = call_mcp_tool_handler(conn, tool_name, arguments)
+            formatted = json.dumps(result_data, ensure_ascii=False, indent=2)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": formatted}],
+                    "structuredContent": result_data,
+                    "isError": False,
+                },
+            }
+        except KeyError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": str(exc)},
+            }
+        except (ValueError, LookupError) as exc:
+            err_payload = {"error": str(exc), "tool": tool_name}
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(err_payload, ensure_ascii=False, indent=2),
+                        }
+                    ],
+                    "structuredContent": err_payload,
+                    "isError": True,
+                },
+            }
+        except Exception as exc:
+            err_payload = {"error": f"Ошибка выполнения {tool_name}: {exc}", "tool": tool_name}
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(err_payload, ensure_ascii=False, indent=2),
+                        }
+                    ],
+                    "structuredContent": err_payload,
+                    "isError": True,
+                },
+            }
+
+    if method == "resources/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"resources": RESOURCES_SCHEMA},
+        }
+
+    if method == "resources/read":
+        uri = str(params.get("uri") or "").strip()
+        try:
+            res = _read_mcp_resource(conn, uri)
+            return {"jsonrpc": "2.0", "id": req_id, "result": res}
+        except LookupError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": str(exc)},
+            }
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+def _verify_mcp_auth(request: Request) -> None:
+    expected_key = os.getenv("MCP_API_KEY", "").strip()
+    if not expected_key:
+        return
+    auth_header = (request.headers.get("authorization") or "").strip()
+    bearer_token = ""
+    if auth_header.lower().startswith("bearer "):
+        bearer_token = auth_header[7:].strip()
+    header_key = (request.headers.get("x-mcp-key") or "").strip()
+    query_key = (request.query_params.get("api_key") or "").strip()
+
+    provided = bearer_token or header_key or query_key
+    if provided != expected_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Неверный или отсутствующий MCP_API_KEY",
+        )
+
+
+def get_mcp_server_info(base_url: str = "http://127.0.0.1:8000") -> dict:
+    clean_base = str(base_url or "http://127.0.0.1:8000").rstrip("/")
+    venv_python = ROOT / ".venv" / "bin" / "python"
+    python_cmd = str(venv_python) if venv_python.exists() else sys.executable
+    has_key = bool(os.getenv("MCP_API_KEY", "").strip())
+
+    stdio_config = {
+        "mcpServers": {
+            "foldesk-crm": {
+                "command": python_cmd,
+                "args": ["-m", "app.mcp_server"],
+                "cwd": str(ROOT),
+            }
+        }
+    }
+    http_entry: dict[str, Any] = {
+        "url": f"{clean_base}/mcp",
+        "transport": "streamable-http",
+    }
+    if has_key:
+        http_entry["headers"] = {"Authorization": "Bearer <MCP_API_KEY>"}
+    else:
+        http_entry["headers"] = {"Authorization": "Bearer <опционально: MCP_API_KEY>"}
+
+    http_config = {
+        "mcpServers": {
+            "foldesk-crm-remote": http_entry,
+        }
+    }
+
+    return {
+        "status": "ready",
+        "server": SERVER_INFO,
+        "protocol_version": MCP_PROTOCOL_VERSION,
+        "auth_required": has_key,
+        "safety_policy": "Чтение всей CRM + управление сделками, задачами, календарём и Airtable (без отправки сообщений в мессенджеры).",
+        "endpoints": {
+            "http": f"{clean_base}/mcp",
+            "sse": f"{clean_base}/mcp/sse",
+            "info": f"{clean_base}/api/mcp/info",
+        },
+        "tools_count": len(TOOLS_SCHEMA),
+        "tools": [
+            {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": list((t.get("inputSchema", {}).get("properties") or {}).keys()),
+            }
+            for t in TOOLS_SCHEMA
+        ],
+        "configs": {
+            "stdio": stdio_config,
+            "http": http_config,
+        },
+    }
+
+
+def register_mcp_routes(app: FastAPI) -> None:
+    @app.get("/api/mcp/info")
+    def mcp_info(request: Request):
+        base_url = str(request.base_url).rstrip("/")
+        return get_mcp_server_info(base_url=base_url)
+
+    @app.post("/mcp")
+    async def mcp_http_endpoint(request: Request):
+        _verify_mcp_auth(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error"},
+                },
+            )
+        conn = getattr(request.app.state, "conn", None)
+        if conn is None:
+            conn = connect()
+            init_db(conn)
+        response_data = handle_jsonrpc_message(conn, payload)
+        if response_data is None:
+            return Response(status_code=202)
+        return JSONResponse(content=response_data)
+
+    @app.get("/mcp/sse")
+    async def mcp_sse_endpoint(request: Request):
+        _verify_mcp_auth(request)
+        api_key = (request.query_params.get("api_key") or "").strip()
+        post_endpoint = f"/mcp?api_key={api_key}" if api_key else "/mcp"
+
+        async def sse_stream():
+            yield f"event: endpoint\ndata: {post_endpoint}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    await asyncio.sleep(15)
+                except asyncio.CancelledError:
+                    break
+                yield ": ping\n\n"
+
+        return StreamingResponse(
+            sse_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+
+def run_stdio_server(db_path: str | Path | None = None) -> None:
+    conn = connect(db_path)
+    init_db(conn)
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            err = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error"},
+            }
+            sys.stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            continue
+        resp = handle_jsonrpc_message(conn, payload)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    run_stdio_server()

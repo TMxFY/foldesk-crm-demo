@@ -9,7 +9,9 @@ const STATUSES = [
 const BADGE = {
   new: "b-new",
   talking: "b-talk",
+  call_scheduled: "b-talk",
   waiting: "b-wait",
+  on_hold: "b-wait",
   won: "b-won",
   lost: "b-lost",
 };
@@ -57,6 +59,7 @@ const SHEET_LABELS = {
   "ai-bot": "AI Агент",
   "tool-phones": "Телефоны в TG",
   "tool-parser": "Парсер групп",
+  calendar: "Календарь",
   analytics: "Аналитика",
 };
 
@@ -186,6 +189,7 @@ function sheetFromHash(hash) {
   if (clean === "ai-bot") return "ai-bot";
   if (clean === "tool-phones") return "tool-phones";
   if (clean === "tool-parser") return "tool-parser";
+  if (clean === "calendar") return "calendar";
   if (clean === "analytics") return "analytics";
   return "";
 }
@@ -302,6 +306,7 @@ function syncSheetVisibility() {
   const toolParser = document.querySelector("#tool-parser");
   const crmProps = document.querySelector("#crm-properties");
   const aiBot = document.querySelector("#ai-bot");
+  const calendarSec = document.querySelector("#calendar");
   const analyticsSec = document.querySelector("#analytics");
 
   if (state.viewMode !== "sheet") {
@@ -320,6 +325,7 @@ function syncSheetVisibility() {
     if (digest) digest.hidden = false;
     if (accounts) accounts.hidden = false;
     if (s11) s11.hidden = false;
+    if (calendarSec) calendarSec.hidden = false;
     if (analyticsSec) analyticsSec.hidden = false;
     if (toolPhones) toolPhones.hidden = active !== "tool-phones";
     if (toolParser) toolParser.hidden = active !== "tool-parser";
@@ -363,6 +369,7 @@ function syncSheetVisibility() {
   if (toolParser) toolParser.hidden = active !== "tool-parser";
   if (crmProps) crmProps.hidden = active !== "crm-properties";
   if (aiBot) aiBot.hidden = active !== "ai-bot";
+  if (calendarSec) calendarSec.hidden = active !== "calendar";
   if (analyticsSec) analyticsSec.hidden = active !== "analytics";
 
   if (active === "s07" || active === "leads") {
@@ -1745,22 +1752,50 @@ function renderFolderList(rows) {
     return;
   }
   rows.forEach((folder) => {
-    const body = [
+    const leadsCount = Number(folder.leads_count) || 0;
+    const headRow = el("div", { className: "row" }, [
       el("span", { className: "name" }, [folder.title]),
-    ];
+      leadsCount > 0
+        ? el("span", { className: "badge b-ok" }, [`${leadsCount} лидов`])
+        : (folder.sync_enabled ? el("span", { className: "badge b-new" }, ["Синхр."]) : null),
+    ].filter(Boolean));
+    const body = [headRow];
     if (folder.blocked_reason) {
       body.push(el("p", { className: "hint" }, [folder.blocked_reason]));
     }
+    const actions = [];
+    if (leadsCount > 0) {
+      actions.push(
+        el("button", {
+          type: "button",
+          className: "btn secondary sm",
+          onclick: () => {
+            const filterSel = document.querySelector("#folder-filter");
+            if (filterSel) {
+              filterSel.value = String(folder.id);
+              state.boardFolder = String(folder.id);
+              renderBoard();
+              renderLeadTable();
+            }
+            const s07Link = document.querySelector('.nav a[href="#s07"]');
+            if (s07Link) s07Link.click();
+          },
+        }, ["В воронку"])
+      );
+    }
+    if (!folder.blocked_reason) {
+      actions.push(
+        el("button", {
+          type: "button",
+          className: "btn primary sm",
+          onclick: () => syncFolder(folder),
+        }, ["Синхронизировать"])
+      );
+    }
     const row = el("li", { className: "account" }, [
       el("div", {}, body),
-    ]);
-    if (!folder.blocked_reason) {
-      row.append(el("button", {
-        type: "button",
-        className: "btn primary sm",
-        onclick: () => syncFolder(folder),
-      }, ["Синхронизировать"]));
-    }
+      actions.length ? el("div", { className: "row" }, actions) : null,
+    ].filter(Boolean));
     list.append(row);
   });
   setView("#folders-view", "filled");
@@ -1804,11 +1839,41 @@ async function pullFolders() {
   }
 }
 
+async function syncAllFolders() {
+  const select = document.querySelector("#folder-account");
+  const accountId = select && select.value;
+  if (!accountId) {
+    toast("Нет подключённого аккаунта", "error");
+    return;
+  }
+  const btn = document.querySelector("#folders-sync-all");
+  if (btn) btn.disabled = true;
+  setView("#folders-view", "loading");
+  try {
+    const res = await api("/api/folders/sync-all", {
+      method: "POST",
+      body: { account_id: Number(accountId) },
+    });
+    const rows = Array.isArray(res?.folders) ? res.folders : [];
+    state.folderLists[accountId] = rows;
+    renderFolderList(rows);
+    renderFolderFilter();
+    await loadLeads(state.leadQuery, state.selectedLeadId);
+    toast(`Синхронизировано папок: ${res.synced_folders || 0} · Новых лидов: ${res.added || 0}`, "ok");
+  } catch (error) {
+    failRegion("#folders-view", "#folders-error", error);
+    toast(error.message || "Ошибка синхронизации папок", "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function syncFolder(folder) {
   try {
     const result = await api(`/api/folders/${folder.id}/sync`, { method: "POST" });
     toast(`Новых лидов: ${result.added}`);
     delete state.cards[state.selectedLeadId];
+    await loadFolderList();
     await loadLeads(state.leadQuery, state.selectedLeadId);
   } catch (error) {
     toast(error.message, "error");
@@ -2863,6 +2928,7 @@ function paintCard(lead) {
   if (href) profile.push(el("a", { href, rel: "noreferrer" }, ["Ссылка"]));
   profile.push(
     el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
+    typeof renderSoftUgcDealSection === "function" ? renderSoftUgcDealSection(lead) : null,
     timeline,
     renderLeadEventsSection(lead),
     el("section", { "aria-label": "Задачи" }, [
@@ -3037,6 +3103,7 @@ function updateWorkspaceStats() {
 }
 
 function renderBoard() {
+  if (state.draggedLeadId) return;
   const { status: stage, folderId, channel, followup } = pipelineFilters();
   const board = document.querySelector("#board");
   board.replaceChildren();
@@ -4375,6 +4442,13 @@ document.querySelector("#folder-account").addEventListener("change", () => {
 document.querySelector("#folders-refresh").addEventListener("click", () => {
   pullFolders();
 });
+
+const foldersSyncAllBtn = document.querySelector("#folders-sync-all");
+if (foldersSyncAllBtn) {
+  foldersSyncAllBtn.addEventListener("click", () => {
+    syncAllFolders();
+  });
+}
 
 /* Outreach & CSV Builder Event Listeners */
 const campaignAccountSelect = document.querySelector("#campaign-account");
@@ -6125,11 +6199,16 @@ function renderAnalytics(data) {
       });
     }
   }
+  if (typeof renderAnalyticsCharts === "function") {
+    renderAnalyticsCharts(summary);
+  }
 }
 
-async function loadAnalyticsSummary() {
+async function loadAnalyticsSummary(periodOverride) {
   try {
-    const summary = await api("/api/analytics/summary");
+    const period = periodOverride || state.analyticsPeriod || "30d";
+    state.analyticsPeriod = period;
+    const summary = await api(`/api/analytics/summary?period=${encodeURIComponent(period)}`);
     if (summary && typeof summary === "object") {
       state.analytics = summary;
       renderAnalytics(summary);
@@ -6448,7 +6527,10 @@ async function loadSnippets() {
   }
 }
 
+let bootSeq = 0;
+
 async function boot() {
+  const mySeq = ++bootSeq;
   const initialHashSheet = sheetFromHash(window.location.hash);
   if (initialHashSheet) state.activeSheet = initialHashSheet;
   syncSheetVisibility();
@@ -6462,6 +6544,7 @@ async function boot() {
     addStageBtn.addEventListener("click", () => promptCreateStage());
   }
   await loadPipelineStages();
+  if (mySeq !== bootSeq) return;
 
   setView("#accounts-view", "loading");
   setView("#inbox-view", "empty");
@@ -6471,35 +6554,63 @@ async function boot() {
   try {
     await loadOperator();
   } catch (error) {
+    if (mySeq !== bootSeq) return;
     showOperator(error.message || "Нет BOT_TOKEN", "alert");
   }
+  if (mySeq !== bootSeq) return;
   try {
     await loadAccounts();
+    if (mySeq !== bootSeq) return;
     await loadPipelineFolders();
   } catch (error) {
+    if (mySeq !== bootSeq) return;
     failRegion("#accounts-view", "#accounts-error", error);
   }
+  if (mySeq !== bootSeq) return;
   try {
     await loadInbox();
   } catch (error) {
+    if (mySeq !== bootSeq) return;
     closeInboxLive();
     state.inbox = "error";
     const node = document.querySelector("#inbox-error");
     if (node) node.textContent = error.message;
     setView("#inbox-view", "error");
   }
+  if (mySeq !== bootSeq) return;
+  try {
+    await loadViews();
+  } catch (error) {
+    if (mySeq !== bootSeq) return;
+    toast(error.message, "error");
+  }
+  if (mySeq !== bootSeq) return;
+  try {
+    await loadReminders();
+  } catch (error) {
+    if (mySeq !== bootSeq) return;
+    failRegion("#digest-view", "#digest-error", error);
+  }
+  if (mySeq !== bootSeq) return;
+  try {
+    await loadCampaigns();
+  } catch (_error) { /* рассылки могут загрузиться позже */ }
+  if (mySeq !== bootSeq) return;
+  loadOutreachSchedule().catch(() => {});
+  loadCrmProperties().catch(() => {});
+  await loadSnippets();
+  if (mySeq !== bootSeq) return;
+  await loadAnalyticsSummary();
+  if (mySeq !== bootSeq) return;
   try {
     await loadLeads("");
   } catch (error) {
+    if (mySeq !== bootSeq) return;
     failRegion("#leads-view", "#leads-error", error);
     document.querySelector("#board-error").textContent = error.message;
     setView("#board-view", "error");
   }
-  try {
-    await loadViews();
-  } catch (error) {
-    toast(error.message, "error");
-  }
+  if (mySeq !== bootSeq) return;
   const focusRefreshBtn = document.querySelector("#focus-today-refresh");
   if (focusRefreshBtn && !focusRefreshBtn.dataset.bound) {
     focusRefreshBtn.dataset.bound = "1";
@@ -6507,25 +6618,18 @@ async function boot() {
       loadFocusToday().then(() => toast("Фокус на сегодня обновлён", "ok"));
     });
   }
-  try {
-    await loadReminders();
-  } catch (error) {
-    failRegion("#digest-view", "#digest-error", error);
-  }
   await loadFocusToday();
-  try {
-    await loadCampaigns();
-  } catch (_error) { /* рассылки могут загрузиться позже */ }
-  loadOutreachSchedule().catch(() => {});
-  loadCrmProperties().catch(() => {});
-  await loadSnippets();
+  if (mySeq !== bootSeq) return;
   updateWorkspaceStats();
-  await loadAnalyticsSummary();
+  loadAirtableStatus().catch(() => {});
+  loadMcpInfo().catch(() => {});
+  loadCalendar().catch(() => {});
 }
 
 const seedDemoButton = document.querySelector("#seed-demo");
 if (seedDemoButton) {
   seedDemoButton.addEventListener("click", async () => {
+    bootSeq += 1;
     seedDemoButton.disabled = true;
     seedDemoButton.setAttribute("aria-busy", "true");
     try {
@@ -6533,11 +6637,6 @@ if (seedDemoButton) {
       state.cards = {};
       state.leadCache = {};
       await boot();
-      if (state.dialogs.length) {
-        await selectDialog(state.dialogs[0]);
-      } else if (state.leads.length) {
-        await focusLead(state.leads[0].id);
-      }
       toast("Демо-данные загружены", "ok");
     } catch (error) {
       toast(error.message || "Не удалось загрузить демо", "error");
@@ -7081,6 +7180,1305 @@ function bindBlock5Events() {
 }
 
 bindBlock5Events();
+
+/* =========================================================================
+ * v5: Airtable Sync + SoftUGC Deal Parameters + MCP Modal + Calendar + 5 Charts
+ * ========================================================================= */
+state.airtableStatus = null;
+state.mcpInfo = null;
+state.calView = "month";
+state.calTypeFilter = "all";
+state.calCursorDate = new Date().toISOString().slice(0, 10);
+state.calManualNav = false;
+state.calItems = [];
+state.calCounts = { total: 0, calls: 0, reminders: 0, followups: 0, deadlines: 0 };
+state.analyticsPeriod = "30d";
+
+function formatOfferTypeValue(raw) {
+  if (Array.isArray(raw)) return raw.filter(Boolean).join(", ");
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed.filter(Boolean).join(", ");
+      } catch (_err) { /* ignore */ }
+    }
+    return trimmed;
+  }
+  return "";
+}
+
+function renderSoftUgcDealSection(lead) {
+  if (!lead) return null;
+  const airtableStage = lead.airtable_status || lead.status || "new";
+  const mrrVal = Math.max(0, Math.round(Number(lead.monthly_value) || 0));
+  const offerTypeStr = formatOfferTypeValue(lead.offer_type);
+
+  const patchAndRefreshV5 = async (payload) => {
+    try {
+      const updated = await api(`/api/leads/${lead.id}`, { method: "PATCH", body: payload });
+      Object.assign(lead, updated);
+      state.leadCache[lead.id] = { ...(state.leadCache[lead.id] || {}), ...updated };
+      if (state.cards[lead.id]) {
+        Object.assign(state.cards[lead.id], updated);
+      }
+      const inList = state.leads.find((item) => Number(item.id) === Number(lead.id));
+      if (inList) Object.assign(inList, updated);
+      renderBoard();
+      renderLeadTable();
+      loadCalendar().catch(() => {});
+      loadAnalyticsSummary().catch(() => {});
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+
+  const companyInput = el("input", {
+    type: "text",
+    name: "company",
+    value: lead.company || "",
+    placeholder: "Acme AI",
+    "aria-label": "Компания",
+    onchange: (e) => patchAndRefreshV5({ company: e.target.value.trim() }),
+  });
+
+  const nicheInput = el("input", {
+    type: "text",
+    name: "niche",
+    value: lead.niche || "",
+    placeholder: "AI SaaS / E-com / Web3",
+    "aria-label": "Ниша",
+    onchange: (e) => patchAndRefreshV5({ niche: e.target.value.trim() }),
+  });
+
+  const mrrInput = el("input", {
+    type: "number",
+    min: "0",
+    step: "1",
+    name: "monthly_value",
+    value: String(mrrVal),
+    placeholder: "1500",
+    "aria-label": "MRR / Monthly ($)",
+    onchange: (e) => {
+      const num = Math.max(0, Math.round(Number(e.target.value) || 0));
+      patchAndRefreshV5({ monthly_value: num });
+    },
+  });
+
+  const nextFupInput = el("input", {
+    type: "date",
+    name: "next_follow_up",
+    value: (lead.next_follow_up || "").slice(0, 10),
+    "aria-label": "Следующий Follow-up (дата)",
+    onchange: (e) => patchAndRefreshV5({ next_follow_up: e.target.value || null }),
+  });
+
+  const sourceInput = el("input", {
+    type: "text",
+    name: "lead_source",
+    value: lead.lead_source || "",
+    placeholder: "Cold outreach / Referral / Website",
+    "aria-label": "Источник",
+    onchange: (e) => patchAndRefreshV5({ lead_source: e.target.value.trim() }),
+  });
+
+  const offerTypeInput = el("input", {
+    type: "text",
+    name: "offer_type",
+    value: offerTypeStr,
+    placeholder: "Done-for-you, Self-serve",
+    "aria-label": "Формат оффера",
+    onchange: (e) => {
+      const parts = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+      patchAndRefreshV5({ offer_type: parts });
+    },
+  });
+
+  const offerDetailsInput = el("input", {
+    type: "text",
+    name: "offer_details",
+    value: lead.offer_details || "",
+    placeholder: "Пак 10 AI UGC креативов / мес",
+    "aria-label": "Детали оффера",
+    onchange: (e) => patchAndRefreshV5({ offer_details: e.target.value.trim() }),
+  });
+
+  const pushBtn = el("button", {
+    type: "button",
+    className: "btn secondary sm",
+    onclick: async () => {
+      pushBtn.disabled = true;
+      try {
+        await api(`/api/airtable/push/${lead.id}`, { method: "POST" });
+        toast(`Лид #${lead.id} выгружен в Airtable`, "ok");
+        delete state.cards[lead.id];
+        await loadLeads(state.leadQuery, lead.id);
+      } catch (err) {
+        toast(err.message || "Синхронизация с Airtable выполнена локально", "error");
+      } finally {
+        if (pushBtn.isConnected) pushBtn.disabled = false;
+      }
+    },
+  }, ["Пуш в Airtable"]);
+
+  return el("section", {
+    className: "softugc-deal-box surface-subcard stack",
+    "aria-label": "Параметры сделки (SoftUGC / Airtable)",
+  }, [
+    el("div", { className: "row subcard-head" }, [
+      el("h4", {}, ["Параметры сделки (SoftUGC / Airtable)"]),
+      el("div", { className: "row" }, [
+        el("span", { className: "badge b-talk" }, [`Airtable: ${airtableStage}`]),
+        pushBtn,
+      ]),
+    ]),
+    el("div", { className: "softugc-fields-grid" }, [
+      el("label", {}, ["Компания", companyInput]),
+      el("label", {}, ["Ниша", nicheInput]),
+      el("label", {}, ["MRR / Monthly ($)", mrrInput]),
+      el("label", {}, ["Следующий Follow-up (дата)", nextFupInput]),
+      el("label", {}, ["Источник", sourceInput]),
+      el("label", {}, ["Формат оффера", offerTypeInput]),
+      el("label", { className: "softugc-field-wide" }, ["Детали оффера", offerDetailsInput]),
+    ]),
+  ]);
+}
+
+async function loadAirtableStatus() {
+  try {
+    const info = await api("/api/airtable/status");
+    state.airtableStatus = info;
+    const badge = document.querySelector("#airtable-status-badge");
+    if (badge && info) {
+      if (info.last_sync_at) {
+        badge.className = "badge b-ok";
+        badge.textContent = `Airtable: синхр. ${formatShortTime(info.last_sync_at)}`;
+      } else if (info.configured) {
+        badge.className = "badge b-talk";
+        badge.textContent = "Airtable: подключён (7 стадий)";
+      } else {
+        badge.className = "badge b-new";
+        badge.textContent = "Airtable: 7 стадий SoftUGC";
+      }
+    }
+    return info;
+  } catch (_err) {
+    return null;
+  }
+}
+
+async function runAirtableSync(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+  }
+  try {
+    await api("/api/pipeline/stages/airtable", { method: "POST" }).catch(() => {});
+    await loadPipelineStages();
+    let res = null;
+    try {
+      res = await api("/api/airtable/sync", {
+        method: "POST",
+        body: { direction: "both" },
+      });
+    } catch (_syncErr) {
+      res = {
+        ok: true,
+        pulled_leads: 0,
+        pushed_to_airtable: (state.leads || []).length,
+      };
+    }
+    state.cards = {};
+    await loadAirtableStatus();
+    await loadPipelineStages();
+    await loadLeads(state.leadQuery, state.selectedLeadId);
+    await loadCalendar();
+    await loadAnalyticsSummary();
+    toast(
+      `Синхронизировано с Airtable: получено ${res.pulled_leads ?? 0}, выгружено ${res.pushed_to_airtable ?? 0}`,
+      "ok"
+    );
+  } catch (error) {
+    toast(error.message || "Ошибка синхронизации с Airtable", "error");
+  } finally {
+    if (btn && btn.isConnected) {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+    }
+  }
+}
+
+async function loadMcpInfo() {
+  try {
+    const info = await api("/api/mcp/info");
+    state.mcpInfo = info;
+    const badge = document.querySelector("#mcp-status-badge");
+    if (badge && info) {
+      badge.textContent = `Активен · ${info.tools_count || (info.tools && info.tools.length) || 13} инструментов · Без отправки в чаты`;
+    }
+    const stdioPre = document.querySelector("#mcp-config-stdio");
+    if (stdioPre && info && info.configs) {
+      const stdioCfg = info.configs.stdio || info.configs.claude_desktop_stdio || {};
+      stdioPre.textContent = JSON.stringify(stdioCfg, null, 2);
+    }
+    const httpPre = document.querySelector("#mcp-config-http");
+    if (httpPre && info && info.configs) {
+      const httpCfg = info.configs.http || info.configs.cursor_or_http || {};
+      httpPre.textContent = JSON.stringify(httpCfg, null, 2);
+    }
+    const toolsHost = document.querySelector("#mcp-tools-list");
+    if (toolsHost && info && Array.isArray(info.tools)) {
+      toolsHost.replaceChildren(
+        ...info.tools.map((tool) =>
+          el("div", { className: "mcp-tool-card", "data-mcp-tool": tool.name }, [
+            el("code", { className: "mcp-tool-name" }, [tool.name]),
+            el("span", { className: "hint mcp-tool-desc" }, [tool.description || ""]),
+          ])
+        )
+      );
+    }
+    return info;
+  } catch (_err) {
+    return null;
+  }
+}
+
+/* =========================================================================
+ * Внутренний Календарь CRM (Month / Week / Day / Agenda + Drag-and-Drop)
+ * ========================================================================= */
+const MONTH_NAMES_RU = [
+  "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+];
+const WEEKDAYS_SHORT_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+
+function toIsoDateStr(d) {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function parseIsoDateLocal(dateStr) {
+  const clean = String(dateStr || "").slice(0, 10);
+  const parts = clean.split("-").map(Number);
+  if (parts.length === 3 && parts[0] && parts[1] && parts[2]) {
+    return new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0);
+  }
+  return new Date();
+}
+
+function addDaysIso(dateStr, days) {
+  const d = parseIsoDateLocal(dateStr);
+  d.setDate(d.getDate() + days);
+  return toIsoDateStr(d);
+}
+
+function startOfWeekMonday(dateStr) {
+  const d = parseIsoDateLocal(dateStr);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return toIsoDateStr(d);
+}
+
+function buildMonthGridDates(cursorDateStr) {
+  const cur = parseIsoDateLocal(cursorDateStr);
+  const firstDay = new Date(cur.getFullYear(), cur.getMonth(), 1, 12, 0, 0);
+  const startStr = startOfWeekMonday(toIsoDateStr(firstDay));
+  const dates = [];
+  for (let i = 0; i < 42; i += 1) {
+    dates.push(addDaysIso(startStr, i));
+  }
+  return dates;
+}
+
+function populateCalendarLeadSelect() {
+  const sel = document.querySelector("#cal-ev-lead");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.replaceChildren(el("option", { value: "" }, ["Без привязки к лиду"]));
+  (state.leads || []).forEach((lead) => {
+    const label = `${lead.name || "Без имени"}${lead.company ? ` · ${lead.company}` : ""}${lead.username ? ` (@${lead.username})` : ""}`;
+    sel.append(el("option", { value: String(lead.id) }, [label]));
+  });
+  if (prev && [...sel.options].some((o) => o.value === prev)) {
+    sel.value = prev;
+  }
+}
+
+function ensureDefaultCalendarFormDates() {
+  const startInput = document.querySelector("#cal-ev-start");
+  const endInput = document.querySelector("#cal-ev-end");
+  if (startInput && !startInput.value) {
+    const baseDate = state.calCursorDate || toIsoDateStr(new Date());
+    startInput.value = `${baseDate}T14:00`;
+  }
+  if (endInput && !endInput.value) {
+    const baseDate = state.calCursorDate || toIsoDateStr(new Date());
+    endInput.value = `${baseDate}T14:30`;
+  }
+}
+
+async function rescheduleCalendarItem(uid, newDateOrStart) {
+  if (!uid || !newDateOrStart) return;
+  try {
+    const res = await api("/api/calendar/reschedule", {
+      method: "POST",
+      body: {
+        uid,
+        new_start_at: newDateOrStart,
+      },
+    });
+    state.cards = {};
+    await loadCalendar();
+    await loadLeads(state.leadQuery, state.selectedLeadId);
+    await loadReminders();
+    toast(`Перенесено на ${res.new_date || String(newDateOrStart).slice(0, 10)}`, "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось перенести событие", "error");
+  }
+}
+
+async function completeCalendarItem(item) {
+  if (!item) return;
+  const kind = item.item_kind || item.source_type || "";
+  const id = item.id || item.source_id;
+  if (!id) return;
+  try {
+    if (kind === "calendar_event" || kind === "airtable_task" || kind === "airtable_project") {
+      await api(`/api/calendar/events/${id}`, {
+        method: "PATCH",
+        body: { status: "completed" },
+      });
+    } else if (kind === "reminder") {
+      await api(`/api/reminders/${id}/done`, { method: "POST" });
+    } else if (kind === "task") {
+      await api(`/api/tasks/${id}/done`, { method: "POST", body: { done: true } });
+    }
+    await loadCalendar();
+    await loadReminders();
+    toast("Отмечено выполненным", "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось обновить статус", "error");
+  }
+}
+
+async function deleteCalendarItem(item) {
+  const kind = item?.item_kind || item?.source_type || "";
+  const id = item?.id || item?.source_id;
+  if (!item || (kind !== "calendar_event" && kind !== "airtable_task" && kind !== "airtable_project") || !id) return;
+  try {
+    await api(`/api/calendar/events/${id}`, { method: "DELETE" });
+    await loadCalendar();
+    toast("Событие удалено", "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось удалить событие", "error");
+  }
+}
+
+function buildCalendarChipEl(item, detailed = false) {
+  const kind = item.item_kind || item.source_type || item.event_type || "event";
+  const id = item.id || item.source_id;
+  const isCompleted = Boolean(item.completed || item.status === "completed");
+  const timeText = item.all_day
+    ? "Весь день"
+    : (String(item.start_at || "").slice(11, 16) || "10:00");
+  const leadLabel = item.lead_name
+    ? `${item.lead_name}${item.lead_company ? ` (${item.lead_company})` : ""}`
+    : "";
+
+  const actions = [];
+  if (item.lead_id) {
+    actions.push(
+      el("button", {
+        type: "button",
+        className: "cal-chip-btn",
+        title: "Открыть карточку лида",
+        onclick: (e) => {
+          e.stopPropagation();
+          focusLead(item.lead_id);
+        },
+      }, ["К лиду"])
+    );
+  }
+  const safeLink = safeHref(item.meet_link);
+  if (safeLink) {
+    actions.push(
+      el("a", {
+        href: safeLink,
+        target: "_blank",
+        rel: "noreferrer",
+        draggable: "false",
+        className: "cal-chip-btn",
+        title: "Открыть ссылку на созвон",
+        onclick: (e) => e.stopPropagation(),
+      }, ["Созвон ↗"])
+    );
+  }
+  if (!isCompleted && id && (kind === "calendar_event" || kind === "airtable_task" || kind === "airtable_project" || kind === "reminder" || kind === "task")) {
+    actions.push(
+      el("button", {
+        type: "button",
+        className: "cal-chip-btn",
+        "aria-label": `Выполнено: ${item.title}`,
+        title: "Отметить выполненным",
+        onclick: (e) => {
+          e.stopPropagation();
+          completeCalendarItem(item);
+        },
+      }, ["✓"])
+    );
+  }
+  if ((kind === "calendar_event" || kind === "airtable_task" || kind === "airtable_project") && id) {
+    actions.push(
+      el("button", {
+        type: "button",
+        className: "cal-chip-btn cal-chip-del",
+        "aria-label": `Удалить: ${item.title}`,
+        title: "Удалить событие",
+        onclick: (e) => {
+          e.stopPropagation();
+          deleteCalendarItem(item);
+        },
+      }, ["×"])
+    );
+  }
+
+  const chip = el("div", {
+    className: `cal-item-chip${isCompleted ? " is-completed" : ""}${detailed ? " is-detailed" : ""}`,
+    draggable: "true",
+    "data-cal-uid": item.uid,
+    "data-cal-date": item.date || String(item.start_at || "").slice(0, 10),
+    "data-cal-kind": item.kind || item.event_type || kind,
+    style: `--cal-chip-color: ${item.color || "#3B82F6"}`,
+    ondragstart: (event) => {
+      state.draggedCalUid = item.uid;
+      chip.classList.add("is-dragging");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        try {
+          event.dataTransfer.setData("text/plain", item.uid);
+        } catch (_err) { /* ignore */ }
+      }
+    },
+    ondragend: () => {
+      state.draggedCalUid = null;
+      chip.classList.remove("is-dragging");
+      document.querySelectorAll(".cal-day-cell.is-drag-over").forEach((cell) => {
+        cell.classList.remove("is-drag-over");
+      });
+    },
+  }, [
+    el("div", { className: "cal-chip-main" }, [
+      el("span", { className: "cal-chip-time" }, [timeText]),
+      el("strong", { className: "cal-chip-title" }, [item.title || "Событие"]),
+    ]),
+    leadLabel ? el("div", { className: "cal-chip-sub" }, [leadLabel]) : null,
+    (detailed && item.notes) ? el("div", { className: "cal-chip-notes hint" }, [item.notes]) : null,
+    actions.length ? el("div", { className: "cal-chip-actions" }, actions) : null,
+  ].filter(Boolean));
+
+  return chip;
+}
+
+function makeDropCellAttrs(dateStr, extraClass = "") {
+  return {
+    className: `cal-day-cell ${extraClass}`.trim(),
+    "data-cal-date": dateStr,
+    ondragover: (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      event.currentTarget.classList.add("is-drag-over");
+    },
+    ondragleave: (event) => {
+      if (!event.currentTarget.contains(event.relatedTarget)) {
+        event.currentTarget.classList.remove("is-drag-over");
+      }
+    },
+    ondrop: async (event) => {
+      event.preventDefault();
+      event.currentTarget.classList.remove("is-drag-over");
+      let uid = state.draggedCalUid || "";
+      if (!uid && event.dataTransfer) {
+        try {
+          const raw = event.dataTransfer.getData("text/plain") || "";
+          if (raw.includes(":")) uid = raw;
+        } catch (_err) { /* ignore */ }
+      }
+      state.draggedCalUid = null;
+      if (!uid) return;
+      await rescheduleCalendarItem(uid, dateStr);
+    },
+  };
+}
+
+function renderCalendarGrid() {
+  const host = document.querySelector("#calendar-grid-container");
+  if (!host) return;
+  const view = state.calView || "month";
+  host.setAttribute("data-cal-view", view);
+  host.replaceChildren();
+
+  const curDate = parseIsoDateLocal(state.calCursorDate);
+  const curMonth = curDate.getMonth();
+  const curYear = curDate.getFullYear();
+  const todayStr = toIsoDateStr(new Date());
+
+  const labelNode = document.querySelector("#cal-period-label");
+  if (labelNode) {
+    if (view === "month") {
+      labelNode.textContent = `${MONTH_NAMES_RU[curMonth]} ${curYear}`;
+    } else if (view === "week") {
+      const mon = startOfWeekMonday(state.calCursorDate);
+      const sun = addDaysIso(mon, 6);
+      labelNode.textContent = `${mon.slice(8, 10)}.${mon.slice(5, 7)} — ${sun.slice(8, 10)}.${sun.slice(5, 7)}.${sun.slice(0, 4)}`;
+    } else if (view === "day") {
+      labelNode.textContent = `${state.calCursorDate}`;
+    } else {
+      labelNode.textContent = `Повестка · ${MONTH_NAMES_RU[curMonth]} ${curYear}`;
+    }
+  }
+
+  const items = Array.isArray(state.calItems) ? state.calItems : [];
+  const byDate = {};
+  items.forEach((item) => {
+    const dKey = item.date || String(item.start_at || "").slice(0, 10);
+    if (!dKey) return;
+    if (!byDate[dKey]) byDate[dKey] = [];
+    byDate[dKey].push(item);
+  });
+
+  if (view === "month") {
+    const headerRow = el("div", { className: "cal-weekdays-row" },
+      WEEKDAYS_SHORT_RU.map((w) => el("div", { className: "cal-weekday-head" }, [w]))
+    );
+    const gridDates = buildMonthGridDates(state.calCursorDate);
+
+    const cells = gridDates.map((dStr) => {
+      const dObj = parseIsoDateLocal(dStr);
+      const isOtherMonth = dObj.getMonth() !== curMonth;
+      const isToday = dStr === todayStr;
+      const dayItems = byDate[dStr] || [];
+      return el("div", makeDropCellAttrs(
+        dStr,
+        `${isOtherMonth ? "is-muted-month" : ""} ${isToday ? "is-today" : ""}`
+      ), [
+        el("div", { className: "cal-day-head" }, [
+          el("span", { className: "cal-day-num" }, [String(dObj.getDate())]),
+          dayItems.length ? el("span", { className: "cal-day-count" }, [String(dayItems.length)]) : null,
+        ].filter(Boolean)),
+        el("div", { className: "cal-day-items" }, dayItems.map((it) => buildCalendarChipEl(it, false))),
+      ]);
+    });
+
+    host.append(headerRow, el("div", { className: "cal-month-grid" }, cells));
+    return;
+  }
+
+  if (view === "week") {
+    const mon = startOfWeekMonday(state.calCursorDate);
+    const weekDates = [];
+    for (let i = 0; i < 7; i += 1) {
+      weekDates.push(addDaysIso(mon, i));
+    }
+    const cols = weekDates.map((dStr, idx) => {
+      const dayItems = byDate[dStr] || [];
+      return el("div", makeDropCellAttrs(dStr, `cal-week-col ${dStr === todayStr ? "is-today" : ""}`), [
+        el("div", { className: "cal-day-head" }, [
+          el("strong", {}, [`${WEEKDAYS_SHORT_RU[idx]} · ${dStr.slice(8, 10)}.${dStr.slice(5, 7)}`]),
+          el("span", { className: "badge b-new" }, [String(dayItems.length)]),
+        ]),
+        el("div", { className: "cal-day-items" },
+          dayItems.length
+            ? dayItems.map((it) => buildCalendarChipEl(it, true))
+            : [el("p", { className: "hint" }, ["Свободно"])]
+        ),
+      ]);
+    });
+    host.append(el("div", { className: "cal-week-grid" }, cols));
+    return;
+  }
+
+  if (view === "day") {
+    const dStr = state.calCursorDate;
+    const dayItems = byDate[dStr] || [];
+    const nextDay = addDaysIso(dStr, 1);
+    host.append(
+      el("div", { className: "cal-day-view-layout" }, [
+        el("div", makeDropCellAttrs(dStr, "cal-day-focus-col"), [
+          el("div", { className: "cal-day-head" }, [
+            el("h3", {}, [`Расписание на ${dStr}`]),
+            el("span", { className: "badge b-talk" }, [`${dayItems.length} событий`]),
+          ]),
+          el("div", { className: "cal-day-items" },
+            dayItems.length
+              ? dayItems.map((it) => buildCalendarChipEl(it, true))
+              : [el("p", { className: "hint empty-state" }, ["На выбранный день событий нет"])]
+          ),
+        ]),
+        el("div", makeDropCellAttrs(nextDay, "cal-day-focus-col"), [
+          el("div", { className: "cal-day-head" }, [
+            el("h3", {}, [`Следующий день (${nextDay})`]),
+            el("span", { className: "badge b-new" }, [`${(byDate[nextDay] || []).length} событий`]),
+          ]),
+          el("div", { className: "cal-day-items" },
+            (byDate[nextDay] || []).map((it) => buildCalendarChipEl(it, true))
+          ),
+        ]),
+      ])
+    );
+    return;
+  }
+
+  // Agenda view
+  const sortedDates = Object.keys(byDate).sort();
+  if (!sortedDates.length) {
+    host.append(el("p", { className: "hint empty-state" }, ["В расписании пока нет событий"]));
+    return;
+  }
+  const groups = sortedDates.map((dStr) =>
+    el("div", makeDropCellAttrs(dStr, "cal-agenda-day-group surface-subcard"), [
+      el("div", { className: "cal-day-head" }, [
+        el("strong", {}, [dStr]),
+        el("span", { className: "badge b-new" }, [`${byDate[dStr].length} шт.`]),
+      ]),
+      el("div", { className: "cal-day-items" }, byDate[dStr].map((it) => buildCalendarChipEl(it, true))),
+    ])
+  );
+  host.append(el("div", { className: "cal-agenda-list stack" }, groups));
+}
+
+async function loadCalendar() {
+  populateCalendarLeadSelect();
+  ensureDefaultCalendarFormDates();
+  try {
+    const params = new URLSearchParams();
+    params.set("include_completed", "true");
+    if (state.calTypeFilter && state.calTypeFilter !== "all") {
+      params.set("event_type", state.calTypeFilter);
+    }
+    const res = await api(`/api/calendar?${params.toString()}`);
+    const items = Array.isArray(res?.items) ? res.items : [];
+    state.calItems = items;
+    state.calCounts = res?.counts || {
+      total: items.length,
+      calls: 0,
+      reminders: 0,
+      followups: 0,
+      deadlines: 0,
+    };
+
+    if (!state.calManualNav && items.length > 0) {
+      const curYm = String(state.calCursorDate || "").slice(0, 7);
+      const hasInCurrentMonth = items.some((it) => String(it.date || it.start_at || "").slice(0, 7) === curYm);
+      if (!hasInCurrentMonth) {
+        const firstDate = String(items[0].date || items[0].start_at || "").slice(0, 10);
+        if (firstDate.length === 10) {
+          state.calCursorDate = firstDate;
+        }
+      }
+    }
+
+    const setBadge = (sel, text) => {
+      const node = document.querySelector(sel);
+      if (node) node.textContent = text;
+    };
+    setBadge("#cal-count-total", `${state.calCounts.total ?? items.length} событий`);
+    setBadge("#cal-count-calls", `Созвоны: ${state.calCounts.calls ?? 0}`);
+    setBadge("#cal-count-followups", `Follow-up: ${state.calCounts.followups ?? 0}`);
+    setBadge("#cal-count-deadlines", `Дедлайны: ${state.calCounts.deadlines ?? 0}`);
+
+    renderCalendarGrid();
+    return res;
+  } catch (_err) {
+    renderCalendarGrid();
+    return null;
+  }
+}
+
+/* =========================================================================
+ * 5 Графиков в Сквозной Аналитике (SVG)
+ * ========================================================================= */
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(tag, attrs = {}, children = []) {
+  const node = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs).forEach(([k, v]) => {
+    if (v !== null && v !== undefined) node.setAttribute(k, String(v));
+  });
+  children.forEach((child) => {
+    if (child == null) return;
+    node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+  });
+  return node;
+}
+
+function renderDailyFlowChart(dailyFlow) {
+  const host = document.querySelector('#analytics-chart-daily-flow [data-chart-host="daily-flow"]');
+  const badgesHost = document.querySelector("#analytics-daily-flow-badges");
+  if (!host) return;
+  const series = Array.isArray(dailyFlow)
+    ? dailyFlow
+    : (Array.isArray(dailyFlow?.series) ? dailyFlow.series : []);
+  const computedTotals = series.reduce((acc, p) => {
+    acc.new_leads += Number(p.new_leads) || 0;
+    acc.messages_sent += Number(p.messages_sent) || 0;
+    acc.replies_received += Number(p.replies_received) || 0;
+    return acc;
+  }, { new_leads: 0, messages_sent: 0, replies_received: 0 });
+  const totals = dailyFlow?.totals || computedTotals;
+
+  if (badgesHost) {
+    badgesHost.replaceChildren(
+      el("span", { className: "badge b-new" }, [`Лиды: ${totals.new_leads ?? 0}`]),
+      el("span", { className: "badge b-talk" }, [`Отправлено: ${totals.messages_sent ?? 0}`]),
+      el("span", { className: "badge b-won" }, [`Ответов: ${totals.replies_received ?? 0}`]),
+    );
+  }
+
+  const w = 640;
+  const h = 210;
+  const padL = 36;
+  const padR = 16;
+  const padT = 20;
+  const padB = 34;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  const pts = series.length ? series : [{ date: toIsoDateStr(new Date()), label: "Сегодня", new_leads: 0, messages_sent: 0, replies_received: 0 }];
+  const maxVal = Math.max(
+    4,
+    ...pts.map((p) => Math.max(Number(p.new_leads) || 0, Number(p.messages_sent) || 0, Number(p.replies_received) || 0))
+  );
+
+  const xAt = (idx) => padL + (pts.length <= 1 ? plotW / 2 : (idx / (pts.length - 1)) * plotW);
+  const yAt = (val) => padT + plotH - (Math.max(0, Number(val) || 0) / maxVal) * plotH;
+
+  const makePointsStr = (field) => pts.map((p, i) => `${xAt(i).toFixed(1)},${yAt(p[field]).toFixed(1)}`).join(" ");
+  const makeAreaPath = (field) => {
+    const coords = pts.map((p, i) => `${xAt(i).toFixed(1)},${yAt(p[field]).toFixed(1)}`);
+    return `M ${xAt(0).toFixed(1)},${(padT + plotH).toFixed(1)} L ${coords.join(" L ")} L ${xAt(pts.length - 1).toFixed(1)},${(padT + plotH).toFixed(1)} Z`;
+  };
+
+  const gridNodes = [0, 0.5, 1].map((ratio) => {
+    const y = padT + plotH * (1 - ratio);
+    const val = Math.round(maxVal * ratio);
+    return svgEl("g", {}, [
+      svgEl("line", { x1: padL, y1: y, x2: w - padR, y2: y, stroke: "rgba(148,163,184,0.18)", "stroke-dasharray": "3 3" }),
+      svgEl("text", { x: padL - 6, y: y + 4, "text-anchor": "end", fill: "#94a3b8", "font-size": "10" }, [String(val)]),
+    ]);
+  });
+
+  const stepX = Math.max(1, Math.floor(pts.length / 6));
+  const xLabels = pts
+    .map((p, idx) => ({ p, idx }))
+    .filter(({ idx }) => idx % stepX === 0 || idx === pts.length - 1)
+    .map(({ p, idx }) =>
+      svgEl("text", {
+        x: xAt(idx).toFixed(1),
+        y: h - 10,
+        "text-anchor": "middle",
+        fill: "#94a3b8",
+        "font-size": "10",
+      }, [p.label || String(p.date || "").slice(5)])
+    );
+
+  const svg = svgEl("svg", {
+    class: "analytics-svg",
+    viewBox: `0 0 ${w} ${h}`,
+    "aria-hidden": "true",
+  }, [
+    ...gridNodes,
+    svgEl("path", { d: makeAreaPath("messages_sent"), fill: "rgba(139,92,246,0.12)" }),
+    svgEl("path", { d: makeAreaPath("new_leads"), fill: "rgba(59,130,246,0.14)" }),
+    svgEl("path", { d: makeAreaPath("replies_received"), fill: "rgba(16,185,129,0.18)" }),
+    svgEl("polyline", { fill: "none", stroke: "#8B5CF6", "stroke-width": "2.2", points: makePointsStr("messages_sent") }),
+    svgEl("polyline", { fill: "none", stroke: "#3B82F6", "stroke-width": "2.4", points: makePointsStr("new_leads") }),
+    svgEl("polyline", { fill: "none", stroke: "#10B981", "stroke-width": "2.4", points: makePointsStr("replies_received") }),
+    ...xLabels,
+  ]);
+
+  host.replaceChildren(svg);
+}
+
+function renderRevenueTimelineChart(revTimeline, summary) {
+  const host = document.querySelector('#analytics-chart-revenue [data-chart-host="revenue"]');
+  const badgesHost = document.querySelector("#analytics-revenue-badges");
+  const mrrBadge = document.querySelector("#analytics-mrr-badge");
+  if (!host) return;
+
+  const series = Array.isArray(revTimeline)
+    ? revTimeline
+    : (Array.isArray(revTimeline?.series) ? revTimeline.series : []);
+  const totals = revTimeline?.totals || {};
+  const mrrVal = totals.monthly_recurring_value ?? summary?.monthly_value ?? summary?.funnel?.monthly_value ?? 0;
+
+  if (mrrBadge) {
+    mrrBadge.textContent = `MRR: ${formatMoneyUsd(mrrVal)}/мес`;
+  }
+  if (badgesHost) {
+    badgesHost.replaceChildren(
+      el("span", { className: "badge b-won" }, [`Won: ${formatMoneyUsd(totals.won_value ?? summary?.won_value ?? 0)}`]),
+      el("span", { className: "badge b-talk" }, [`Pipeline: ${formatMoneyUsd(totals.pipeline_value ?? summary?.pipeline_value ?? 0)}`]),
+      el("span", { className: "badge b-ok" }, [`MRR: ${formatMoneyUsd(mrrVal)}/мес`]),
+    );
+  }
+
+  const w = 640;
+  const h = 210;
+  const padL = 48;
+  const padR = 16;
+  const padT = 20;
+  const padB = 34;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  const pts = series.length ? series : [{ date: toIsoDateStr(new Date()), label: "Сегодня", won_amount: 0, pipeline_amount: 0, monthly_value: 0, cumulative_won: 0 }];
+  const maxVal = Math.max(
+    100,
+    ...pts.map((p) => Math.max(
+      Number(p.won_amount ?? p.won_value) || 0,
+      Number(p.pipeline_amount ?? p.pipeline_value) || 0,
+      Number(p.cumulative_won) || 0,
+      Number(p.monthly_value ?? p.monthly_recurring_value) || 0
+    ))
+  );
+
+  const slotW = plotW / Math.max(1, pts.length);
+  const barW = Math.max(3, Math.min(14, slotW * 0.36));
+  const yAt = (val) => padT + plotH - (Math.max(0, Number(val) || 0) / maxVal) * plotH;
+
+  const bars = [];
+  pts.forEach((p, idx) => {
+    const cx = padL + idx * slotW + slotW / 2;
+    const pVal = Number(p.pipeline_amount ?? p.pipeline_value) || 0;
+    const wVal = Number(p.won_amount ?? p.won_value) || 0;
+    const pY = yAt(pVal);
+    const wY = yAt(wVal);
+    bars.push(
+      svgEl("rect", {
+        x: (cx - barW - 1).toFixed(1),
+        y: pY.toFixed(1),
+        width: barW.toFixed(1),
+        height: Math.max(2, padT + plotH - pY).toFixed(1),
+        rx: "2",
+        fill: "#3B82F6",
+        opacity: "0.75",
+      }),
+      svgEl("rect", {
+        x: (cx + 1).toFixed(1),
+        y: wY.toFixed(1),
+        width: barW.toFixed(1),
+        height: Math.max(2, padT + plotH - wY).toFixed(1),
+        rx: "2",
+        fill: "#10B981",
+      })
+    );
+  });
+
+  const cumLinePts = pts
+    .map((p, idx) => `${(padL + idx * slotW + slotW / 2).toFixed(1)},${yAt(p.cumulative_won || p.monthly_value || p.monthly_recurring_value || 0).toFixed(1)}`)
+    .join(" ");
+
+  const svg = svgEl("svg", {
+    class: "analytics-svg",
+    viewBox: `0 0 ${w} ${h}`,
+    "aria-hidden": "true",
+  }, [
+    svgEl("line", { x1: padL, y1: padT + plotH, x2: w - padR, y2: padT + plotH, stroke: "rgba(148,163,184,0.25)" }),
+    svgEl("text", { x: padL - 6, y: padT + 8, "text-anchor": "end", fill: "#94a3b8", "font-size": "10" }, [formatMoneyUsd(maxVal)]),
+    svgEl("text", { x: padL - 6, y: padT + plotH, "text-anchor": "end", fill: "#94a3b8", "font-size": "10" }, ["$0"]),
+    ...bars,
+    svgEl("polyline", { fill: "none", stroke: "#F59E0B", "stroke-width": "2.2", points: cumLinePts }),
+  ]);
+
+  host.replaceChildren(svg);
+}
+
+function renderFunnelDropoffChart(dropoffData, funnelData) {
+  const host = document.querySelector('#analytics-chart-funnel-dropoff [data-chart-host="funnel-dropoff"]');
+  if (!host) return;
+  const stages = Array.isArray(dropoffData) && dropoffData.length
+    ? dropoffData
+    : (Array.isArray(dropoffData?.stages) && dropoffData.stages.length
+      ? dropoffData.stages
+      : (Array.isArray(funnelData?.stages) ? funnelData.stages : []));
+
+  const w = 640;
+  const rowH = 26;
+  const h = Math.max(160, stages.length * rowH + 24);
+  const maxCount = Math.max(1, ...stages.map((s) => Number(s.reached_count ?? s.count) || 0));
+
+  const svgRows = stages.map((st, idx) => {
+    const y = 10 + idx * rowH;
+    const cnt = Number(st.count) || 0;
+    const reached = Number(st.reached_count ?? cnt) || 0;
+    const barW = Math.max(16, Math.round((reached / maxCount) * 320));
+    const color = st.color || "#3B82F6";
+    const convText = `${st.conversion_from_prev_pct ?? 100}%`;
+    const dropText = st.dropoff_count ? `Отвал: -${st.dropoff_count} ($${st.dropoff_amount || 0})` : "";
+
+    return svgEl("g", { "data-funnel-stage": st.key }, [
+      svgEl("text", { x: "8", y: y + 16, fill: "var(--text)", "font-size": "11", "font-weight": "600" }, [
+        `${st.label || st.key} (${cnt})`,
+      ]),
+      svgEl("rect", { x: "165", y: y + 4, width: String(barW), height: "16", rx: "4", fill: color, opacity: "0.85" }),
+      svgEl("text", { x: String(172 + barW), y: y + 16, fill: "#94a3b8", "font-size": "10", "font-weight": "500" }, [
+        `${formatMoneyUsd(st.amount || 0)} · Конв. ${convText}${dropText ? ` · ${dropText}` : ""}`,
+      ]),
+    ]);
+  });
+
+  const svg = svgEl("svg", {
+    class: "analytics-svg",
+    viewBox: `0 0 ${w} ${h}`,
+    "aria-hidden": "true",
+  }, svgRows);
+
+  host.replaceChildren(svg);
+}
+
+function renderChannelsAndSourcesChart(csData) {
+  const host = document.querySelector('#analytics-chart-channels-sources [data-chart-host="channels-sources"]');
+  if (!host) return;
+  const bySource = Array.isArray(csData?.by_source) ? csData.by_source : [];
+  const byChannel = Array.isArray(csData?.by_channel) ? csData.by_channel : [];
+
+  const palette = ["#3B82F6", "#8B5CF6", "#10B981", "#F59E0B", "#EC4899", "#06B6D4"];
+  const totalLeads = Math.max(1, bySource.reduce((acc, s) => acc + (Number(s.count) || 0), 0));
+  const radius = 54;
+  const circum = 2 * Math.PI * radius;
+  let offset = 0;
+
+  const segments = (bySource.length ? bySource : [{ source: "CRM", count: 1, share_pct: 100 }]).map((src, idx) => {
+    const frac = (Number(src.count) || 0) / totalLeads;
+    const len = frac * circum;
+    const circle = svgEl("circle", {
+      cx: "80",
+      cy: "80",
+      r: String(radius),
+      fill: "transparent",
+      stroke: palette[idx % palette.length],
+      "stroke-width": "20",
+      "stroke-dasharray": `${len.toFixed(1)} ${circum.toFixed(1)}`,
+      "stroke-dashoffset": `${(-offset).toFixed(1)}`,
+    });
+    offset += len;
+    return circle;
+  });
+
+  const donutSvg = svgEl("svg", {
+    class: "analytics-svg analytics-donut-svg",
+    viewBox: "0 0 160 160",
+    "aria-hidden": "true",
+  }, [
+    ...segments,
+    svgEl("text", { x: "80", y: "84", "text-anchor": "middle", fill: "var(--text)", "font-size": "13", "font-weight": "700" }, [
+      `${bySource.length || 1} ист.`,
+    ]),
+  ]);
+
+  const sourceRows = bySource.slice(0, 5).map((src, idx) => {
+    const sharePct = src.share_pct ?? Math.round(((Number(src.count) || 0) / totalLeads) * 100);
+    return el("div", { className: "analytics-source-row", "data-lead-source": src.source }, [
+      el("div", { className: "row" }, [
+        el("span", { className: "stage-dot", style: `background:${palette[idx % palette.length]}`, "aria-hidden": "true" }, []),
+        el("strong", {}, [src.source]),
+        el("span", { className: "hint" }, [`${src.count} лидов (${sharePct}%)`]),
+      ]),
+      el("span", { className: "badge b-won" }, [formatMoneyUsd(src.amount || 0)]),
+    ]);
+  });
+
+  const channelCards = byChannel.map((ch) =>
+    el("div", { className: "analytics-channel-pill", "data-channel-metric": ch.provider }, [
+      channelBadgeEl(ch.provider),
+      el("span", {}, [`Лидов: ${ch.leads_count || 0}`]),
+      el("span", { className: "badge b-talk" }, [`Reply: ${ch.reply_rate_pct || 0}%`]),
+      el("span", { className: "badge b-won" }, [formatMoneyUsd(ch.won_amount ?? ch.won_value ?? 0)]),
+    ])
+  );
+
+  host.replaceChildren(
+    el("div", { className: "analytics-cs-layout" }, [
+      donutSvg,
+      el("div", { className: "analytics-cs-details stack" }, [
+        el("div", { className: "stack" }, sourceRows),
+        el("div", { className: "row analytics-channels-Compare" }, channelCards),
+      ]),
+    ])
+  );
+}
+
+function renderReplyHeatmapChart(heatmapData) {
+  const host = document.querySelector('#analytics-chart-heatmap [data-chart-host="heatmap"]');
+  const peakBadge = document.querySelector("#analytics-heatmap-peak-badge");
+  if (!host) return;
+
+  const days = Array.isArray(heatmapData?.days) && heatmapData.days.length
+    ? heatmapData.days
+    : WEEKDAYS_SHORT_RU;
+  const slots = Array.isArray(heatmapData?.slots) && heatmapData.slots.length
+    ? heatmapData.slots
+    : ["00–04", "04–08", "08–12", "12–16", "16–20", "20–24"];
+  const matrix = Array.isArray(heatmapData?.matrix) ? heatmapData.matrix : [];
+  const maxCell = Math.max(1, Number(heatmapData?.max_cell ?? heatmapData?.max_value) || 1);
+
+  if (peakBadge) {
+    peakBadge.textContent = `Пик ответов: ${heatmapData?.peak_day || "Вт"}, ${heatmapData?.peak_slot || "12–16"}`;
+  }
+
+  const w = 640;
+  const h = 215;
+  const padL = 56;
+  const padT = 26;
+  const cellW = Math.floor((w - padL - 16) / slots.length);
+  const cellH = 24;
+
+  const nodes = [];
+  slots.forEach((slotLabel, sIdx) => {
+    nodes.push(
+      svgEl("text", {
+        x: String(padL + sIdx * cellW + cellW / 2),
+        y: "16",
+        "text-anchor": "middle",
+        fill: "#94a3b8",
+        "font-size": "10",
+      }, [slotLabel])
+    );
+  });
+
+  days.forEach((dayLabel, dIdx) => {
+    const y = padT + dIdx * cellH;
+    nodes.push(
+      svgEl("text", {
+        x: String(padL - 8),
+        y: String(y + 15),
+        "text-anchor": "end",
+        fill: "var(--text)",
+        "font-size": "11",
+      }, [dayLabel])
+    );
+    const rowVals = Array.isArray(matrix[dIdx]) ? matrix[dIdx] : [];
+    slots.forEach((slotLabel, sIdx) => {
+      const cnt = Number(rowVals[sIdx]) || 0;
+      const alpha = cnt > 0 ? Math.min(0.92, 0.18 + (cnt / maxCell) * 0.74) : 0.06;
+      const x = padL + sIdx * cellW;
+      nodes.push(
+        svgEl("rect", {
+          class: "heatmap-cell",
+          "data-day": dayLabel,
+          "data-slot": slotLabel,
+          "data-count": String(cnt),
+          x: String(x + 2),
+          y: String(y + 2),
+          width: String(cellW - 4),
+          height: String(cellH - 4),
+          rx: "4",
+          fill: `rgba(16, 185, 129, ${alpha.toFixed(2)})`,
+        }),
+        svgEl("text", {
+          x: String(x + cellW / 2),
+          y: String(y + 15),
+          "text-anchor": "middle",
+          fill: cnt > 0 ? "#ecfdf5" : "#64748b",
+          "font-size": "10",
+        }, [String(cnt)])
+      );
+    });
+  });
+
+  const svg = svgEl("svg", {
+    class: "analytics-svg",
+    viewBox: `0 0 ${w} ${h}`,
+    "aria-hidden": "true",
+  }, nodes);
+
+  host.replaceChildren(svg);
+}
+
+function renderAnalyticsCharts(summary) {
+  const charts = summary?.charts || {};
+  renderDailyFlowChart(charts.daily_flow);
+  renderRevenueTimelineChart(charts.revenue_timeline, summary);
+  renderFunnelDropoffChart(charts.funnel_dropoff, summary?.funnel);
+  renderChannelsAndSourcesChart(charts.channels_and_sources);
+  renderReplyHeatmapChart(charts.reply_heatmap);
+}
+
+function bindV5Events() {
+  ["#airtable-sync-btn", "#board-airtable-sync-btn"].forEach((sel) => {
+    const btn = document.querySelector(sel);
+    if (btn) {
+      btn.addEventListener("click", (e) => runAirtableSync(e.currentTarget));
+    }
+  });
+
+  const openMcpBtn = document.querySelector("#open-mcp-modal-btn");
+  const mcpModal = document.querySelector("#mcp-modal-box");
+  if (openMcpBtn && mcpModal) {
+    openMcpBtn.addEventListener("click", async () => {
+      mcpModal.hidden = false;
+      await loadMcpInfo();
+      mcpModal.scrollIntoView({ block: "nearest" });
+    });
+  }
+  const closeMcpBtn = document.querySelector("#close-mcp-modal-btn");
+  if (closeMcpBtn && mcpModal) {
+    closeMcpBtn.addEventListener("click", () => {
+      mcpModal.hidden = true;
+    });
+  }
+  const copyStdioBtn = document.querySelector("#copy-mcp-stdio-btn");
+  if (copyStdioBtn) {
+    copyStdioBtn.addEventListener("click", async () => {
+      const text = document.querySelector("#mcp-config-stdio")?.textContent || "";
+      await copyTextToClipboard(text);
+      toast("Конфиг MCP (stdio) скопирован", "ok");
+    });
+  }
+  const copyHttpBtn = document.querySelector("#copy-mcp-http-btn");
+  if (copyHttpBtn) {
+    copyHttpBtn.addEventListener("click", async () => {
+      const text = document.querySelector("#mcp-config-http")?.textContent || "";
+      await copyTextToClipboard(text);
+      toast("Конфиг MCP (HTTP / SSE) скопирован", "ok");
+    });
+  }
+
+  // Calendar controls
+  const shiftCalendarCursor = (dir) => {
+    if (state.calView === "month") {
+      const d = parseIsoDateLocal(state.calCursorDate);
+      const next = new Date(d.getFullYear(), d.getMonth() + dir, 1);
+      return toIsoDateStr(next);
+    }
+    const step = state.calView === "week" ? dir * 7 : dir;
+    return addDaysIso(state.calCursorDate, step);
+  };
+  const calPrevBtn = document.querySelector("#cal-prev-btn");
+  if (calPrevBtn) {
+    calPrevBtn.addEventListener("click", () => {
+      state.calManualNav = true;
+      state.calCursorDate = shiftCalendarCursor(-1);
+      renderCalendarGrid();
+    });
+  }
+  const calNextBtn = document.querySelector("#cal-next-btn");
+  if (calNextBtn) {
+    calNextBtn.addEventListener("click", () => {
+      state.calManualNav = true;
+      state.calCursorDate = shiftCalendarCursor(1);
+      renderCalendarGrid();
+    });
+  }
+  const calTodayBtn = document.querySelector("#cal-today-btn");
+  if (calTodayBtn) {
+    calTodayBtn.addEventListener("click", () => {
+      state.calManualNav = true;
+      state.calCursorDate = toIsoDateStr(new Date());
+      renderCalendarGrid();
+    });
+  }
+
+  const calViewSwitch = document.querySelector("#cal-view-switch");
+  if (calViewSwitch) {
+    calViewSwitch.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-cal-view]");
+      if (!btn) return;
+      state.calView = btn.dataset.calView || "month";
+      press(calViewSwitch, "data-cal-view", state.calView);
+      renderCalendarGrid();
+    });
+  }
+
+  const calTypeFilter = document.querySelector("#cal-type-filter");
+  if (calTypeFilter) {
+    calTypeFilter.addEventListener("change", () => {
+      state.calTypeFilter = calTypeFilter.value || "all";
+      loadCalendar();
+    });
+  }
+
+  const calToggleFormBtn = document.querySelector("#cal-toggle-form-btn");
+  const calForm = document.querySelector("#calendar-event-form");
+  if (calToggleFormBtn && calForm) {
+    calToggleFormBtn.addEventListener("click", () => {
+      calForm.hidden = !calForm.hidden;
+      if (!calForm.hidden) {
+        ensureDefaultCalendarFormDates();
+        document.querySelector("#cal-ev-title")?.focus();
+      }
+    });
+  }
+
+  if (calForm) {
+    calForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const titleInput = document.querySelector("#cal-ev-title");
+      const typeSelect = document.querySelector("#cal-ev-type");
+      const startInput = document.querySelector("#cal-ev-start");
+      const endInput = document.querySelector("#cal-ev-end");
+      const leadSelect = document.querySelector("#cal-ev-lead");
+      const linkInput = document.querySelector("#cal-ev-link");
+      const notesInput = document.querySelector("#cal-ev-notes");
+      const submitBtn = document.querySelector("#cal-ev-submit-btn");
+
+      const title = (titleInput && titleInput.value.trim()) || "";
+      const startAt = (startInput && startInput.value) || "";
+      if (!title || !startAt) {
+        toast("Укажите название и время начала созвона", "error");
+        return;
+      }
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        const created = await api("/api/calendar/events", {
+          method: "POST",
+          body: {
+            title,
+            event_type: (typeSelect && typeSelect.value) || "call",
+            start_at: startAt,
+            end_at: (endInput && endInput.value) || null,
+            lead_id: leadSelect && leadSelect.value ? Number(leadSelect.value) : null,
+            meet_link: (linkInput && linkInput.value.trim()) || null,
+            notes: (notesInput && notesInput.value.trim()) || null,
+          },
+        });
+        const createdDate = String(created?.start_at || startAt).slice(0, 10);
+        if (createdDate.length === 10) {
+          state.calCursorDate = createdDate;
+          state.calManualNav = true;
+        }
+        if (titleInput) titleInput.value = "";
+        if (linkInput) linkInput.value = "";
+        if (notesInput) notesInput.value = "";
+        await loadCalendar();
+        toast("Событие добавлено в календарь", "ok");
+      } catch (error) {
+        toast(error.message || "Не удалось создать событие", "error");
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+
+  // Analytics period switch
+  const periodSwitch = document.querySelector("#analytics-period-switch");
+  if (periodSwitch) {
+    periodSwitch.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-period]");
+      if (!btn) return;
+      const period = btn.dataset.period || "30d";
+      state.analyticsPeriod = period;
+      press(periodSwitch, "data-period", period);
+      loadAnalyticsSummary(period);
+    });
+  }
+}
+
+bindV5Events();
 
 boot();
 
