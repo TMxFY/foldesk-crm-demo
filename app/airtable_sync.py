@@ -413,10 +413,21 @@ def _ensure_dirty_tracking_trigger(conn: sqlite3.Connection) -> None:
     )
 
 
+def _as_str(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        parts = [_as_str(item) for item in val]
+        return ", ".join(p for p in parts if p).strip()
+    if isinstance(val, dict):
+        return str(val.get("value") or val.get("name") or "").strip()
+    return str(val or "").strip()
+
+
 def _clean_date(value: Any) -> str | None:
     if value is None:
         return None
-    s = str(value).strip()
+    s = _as_str(value)
     if not s:
         return None
     m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
@@ -425,11 +436,11 @@ def _clean_date(value: Any) -> str | None:
     return s[:10] if len(s) >= 10 else s
 
 
-def parse_airtable_contact(raw_contact: str | None) -> tuple[str | None, str | None]:
+def parse_airtable_contact(raw_contact: Any) -> tuple[str | None, str | None]:
     """Extract (@username without '@', phone) from Airtable 'Contact' field."""
     if not raw_contact:
         return None, None
-    text = str(raw_contact).strip()
+    text = _as_str(raw_contact)
     if not text:
         return None, None
 
@@ -503,25 +514,39 @@ def map_airtable_record_to_lead_fields(
     rec_id = str(record.get("id") or "").strip() or None
     fields = record.get("fields") or {}
 
-    raw_name = (fields.get("Lead Name") or "").strip() or None
-    company = (fields.get("Company") or "").strip() or None
+    raw_name = _as_str(fields.get("Lead Name")) or None
+    company = _as_str(fields.get("Company")) or None
     username, phone = parse_airtable_contact(fields.get("Contact"))
 
-    raw_status = (fields.get("Status") or "New").strip() or "New"
+    raw_status = _as_str(fields.get("Status")) or "New"
     norm_status = normalize_status(raw_status, conn)
     airtable_status = KEY_TO_AIRTABLE_STATUS.get(norm_status, raw_status)
 
-    amount = _clean_amount(fields.get("Value"))
-    monthly_value = _clean_amount(fields.get("Monthly Value"))
-    url = (fields.get("Website") or "").strip() or None
-    niche = (fields.get("Niche") or "").strip() or None
+    raw_val = fields.get("Value")
+    try:
+        amount = _clean_amount(
+            _as_str(raw_val) if isinstance(raw_val, (list, dict)) else raw_val
+        )
+    except ValueError:
+        amount = 0
+
+    raw_mval = fields.get("Monthly Value")
+    try:
+        monthly_value = _clean_amount(
+            _as_str(raw_mval) if isinstance(raw_mval, (list, dict)) else raw_mval
+        )
+    except ValueError:
+        monthly_value = 0
+
+    url = _as_str(fields.get("Website")) or None
+    niche = _as_str(fields.get("Niche")) or None
     offer_type = _parse_offer_type(fields.get("Offer Type"))
-    offer_details = (fields.get("Offer Details") or "").strip() or None
-    next_step = (fields.get("Next Step") or "").strip() or None
+    offer_details = _as_str(fields.get("Offer Details")) or None
+    next_step = _as_str(fields.get("Next Step")) or None
     next_follow_up = _clean_date(fields.get("Next Follow-up"))
     last_contacted = _clean_date(fields.get("Last Contacted"))
-    lead_source = (fields.get("Lead Source") or "").strip() or None
-    note = (fields.get("Notes") or "").strip() or None
+    lead_source = _as_str(fields.get("Lead Source")) or None
+    note = _as_str(fields.get("Notes")) or None
 
     name = raw_name or company or (f"@{username}" if username else None) or phone
     return {
@@ -655,15 +680,21 @@ def _find_matching_crm_lead(
                 SELECT * FROM leads
                 WHERE name IS NOT NULL AND lower(name) = lower(?)
                   AND company IS NOT NULL AND lower(company) = lower(?)
+                  AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
                 ORDER BY id ASC LIMIT 1
                 """,
-                (name, company),
+                (name, company, rec_id or ""),
             ).fetchone()
             if row is not None:
                 return as_dict(row)
         row = conn.execute(
-            "SELECT * FROM leads WHERE name IS NOT NULL AND lower(name) = lower(?) ORDER BY id ASC LIMIT 1",
-            (name,),
+            """
+            SELECT * FROM leads
+            WHERE name IS NOT NULL AND lower(name) = lower(?)
+              AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
+            ORDER BY id ASC LIMIT 1
+            """,
+            (name, rec_id or ""),
         ).fetchone()
         if row is not None:
             return as_dict(row)
@@ -779,13 +810,13 @@ def _sync_tasks_and_projects(
     for rec in task_records or []:
         rec_id = str(rec.get("id") or "").strip()
         fields = rec.get("fields") or {}
-        title = (fields.get("Task Name") or fields.get("Name") or "").strip()
+        title = (_as_str(fields.get("Task Name")) or _as_str(fields.get("Name"))).strip()
         due_date = _clean_date(fields.get("Due Date"))
         if not rec_id or not title or not due_date:
             continue
         lead_id = _resolve_related_lead_id(conn, fields.get("Related Lead"))
-        notes = (fields.get("Description") or fields.get("Notes") or "").strip() or None
-        raw_status = str(fields.get("Status") or "").strip().lower()
+        notes = (_as_str(fields.get("Description")) or _as_str(fields.get("Notes"))).strip() or None
+        raw_status = _as_str(fields.get("Status")).lower()
         status = (
             "completed"
             if raw_status in ("completed", "done", "сделано", "завершено")
@@ -814,18 +845,17 @@ def _sync_tasks_and_projects(
     for rec in project_records or []:
         rec_id = str(rec.get("id") or "").strip()
         fields = rec.get("fields") or {}
-        title = (fields.get("Project Name") or fields.get("Name") or "").strip()
+        title = (_as_str(fields.get("Project Name")) or _as_str(fields.get("Name"))).strip()
         end_date = _clean_date(fields.get("End Date"))
         if not rec_id or not title or not end_date:
             continue
         lead_id = _resolve_related_lead_id(conn, fields.get("Related Lead"))
         notes = (
-            fields.get("Project Description")
-            or fields.get("Description")
-            or fields.get("Notes")
-            or ""
+            _as_str(fields.get("Project Description"))
+            or _as_str(fields.get("Description"))
+            or _as_str(fields.get("Notes"))
         ).strip() or None
-        raw_status = str(fields.get("Status") or "").strip().lower()
+        raw_status = _as_str(fields.get("Status")).lower()
         status = (
             "completed"
             if raw_status in ("completed", "done", "сделано", "завершено")
@@ -887,14 +917,26 @@ def pull_from_airtable(
         if existing is not None:
             lead_id = int(existing["id"])
             is_dirty = bool(
-                existing.get("airtable_record_id")
-                and existing.get("airtable_synced_at")
-                and str(existing.get("updated_at") or "")
-                > str(existing.get("airtable_synced_at") or "")
+                (
+                    existing.get("airtable_record_id")
+                    and existing.get("airtable_synced_at")
+                    and str(existing.get("updated_at") or "")
+                    > str(existing.get("airtable_synced_at") or "")
+                )
+                or (
+                    not existing.get("airtable_record_id")
+                    and (
+                        (existing.get("status") or "new") != "new"
+                        or int(existing.get("amount") or 0) > 0
+                        or bool(str(existing.get("note") or "").strip())
+                        or bool(str(existing.get("next_step") or "").strip())
+                    )
+                )
             )
             if preserve_dirty and is_dirty:
                 continue
 
+            raw_fields = record.get("fields") or {}
             patch: dict[str, Any] = {
                 "status": mapped["status"],
                 "airtable_status": mapped["airtable_status"],
@@ -918,9 +960,19 @@ def pull_from_airtable(
                     patch[key] = mapped[key]
             if mapped.get("offer_type"):
                 patch["offer_type"] = mapped["offer_type"]
-            if mapped.get("amount") is not None:
+            raw_val = raw_fields.get("Value")
+            if mapped.get("amount") is not None and (
+                int(mapped["amount"] or 0) > 0
+                or (raw_val is not None and _as_str(raw_val) in ("0", "0.0", "$0"))
+                or not int(existing.get("amount") or 0)
+            ):
                 patch["amount"] = mapped["amount"]
-            if mapped.get("monthly_value") is not None:
+            raw_mval = raw_fields.get("Monthly Value")
+            if mapped.get("monthly_value") is not None and (
+                int(mapped["monthly_value"] or 0) > 0
+                or (raw_mval is not None and _as_str(raw_mval) in ("0", "0.0", "$0"))
+                or not int(existing.get("monthly_value") or 0)
+            ):
                 patch["monthly_value"] = mapped["monthly_value"]
 
             update_lead(conn, lead_id, **patch)

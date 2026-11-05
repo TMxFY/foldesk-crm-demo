@@ -900,6 +900,16 @@ def _compute_charts_analytics(
             conv_pct = 100.0 if reached_cnt > 0 else 0.0
             dropoff_cnt = 0
             dropoff_amt = 0
+        elif st_key == "on_hold":
+            reached_cnt = cnt
+            reached_amt = amt
+            conv_pct = (
+                round((reached_cnt / prev_reached_count) * 100, 1)
+                if prev_reached_count > 0
+                else 0.0
+            )
+            dropoff_cnt = max(0, prev_reached_count - reached_cnt)
+            dropoff_amt = max(0, prev_reached_amount - reached_amt)
         else:
             tail_keys = progressive_keys[idx:]
             reached_cnt = sum(stage_counts.get(tk, 0) for tk in tail_keys)
@@ -912,8 +922,9 @@ def _compute_charts_analytics(
             dropoff_cnt = max(0, prev_reached_count - reached_cnt)
             dropoff_amt = max(0, prev_reached_amount - reached_amt)
 
-        prev_reached_count = reached_cnt
-        prev_reached_amount = reached_amt
+        if st_key != "on_hold":
+            prev_reached_count = reached_cnt
+            prev_reached_amount = reached_amt
         lbl = stage_labels.get(st_key, STAGE_LABELS.get(st_key, st_key))
         funnel_dropoff.append(
             {

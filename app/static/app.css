@@ -540,6 +540,7 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar .nav-sublink {
   display: none;
 }
 
+.workspace[data-view-mode="sheet"] .messenger-grid[data-card-overlay="true"] > #tg-web-a-panel,
 .workspace[data-view-mode="sheet"] .messenger-grid[data-card-overlay="true"] > #s04,
 .workspace[data-view-mode="sheet"] .messenger-grid[data-card-overlay="true"] > #s05,
 .workspace[data-view-mode="sheet"] .messenger-grid[data-card-overlay="true"] .inspector-col > #s06 {
@@ -3331,7 +3332,7 @@ tr.bulk-selected,
 .board .card-tags {
   gap: 3px;
   margin-top: 2px;
-  max-height: 20px;
+  max-height: 44px;
   overflow: hidden;
 }
 

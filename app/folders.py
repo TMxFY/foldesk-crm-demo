@@ -47,6 +47,17 @@ async def pull_folders(conn, account_id: int, gateway) -> list:
             sph = ",".join("?" for _ in stale_ids)
             conn.execute(f"UPDATE leads SET folder_id = NULL WHERE folder_id IN ({sph})", stale_ids)
             conn.execute(f"DELETE FROM folders WHERE id IN ({sph})", stale_ids)
+    else:
+        stale_rows = conn.execute(
+            "SELECT id FROM folders WHERE account_id = ?",
+            (account_id,),
+        ).fetchall()
+        stale_ids = [int(r["id"]) for r in stale_rows]
+        if stale_ids:
+            sph = ",".join("?" for _ in stale_ids)
+            conn.execute(f"UPDATE leads SET folder_id = NULL WHERE folder_id IN ({sph})", stale_ids)
+        conn.execute("UPDATE leads SET folder_id = NULL WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM folders WHERE account_id = ?", (account_id,))
     conn.commit()
     return list_folders(conn, account_id)
 
@@ -149,6 +160,17 @@ async def sync_folder(conn, folder_id: int, gateway) -> dict:
             )
             conn.commit()
         lead_ids.append(lead["id"])
+    if lead_ids:
+        ph = ",".join("?" for _ in lead_ids)
+        conn.execute(
+            f"UPDATE leads SET folder_id = NULL, updated_at = ? WHERE folder_id = ? AND id NOT IN ({ph})",
+            [utc_now(), folder["id"], *lead_ids],
+        )
+    else:
+        conn.execute(
+            "UPDATE leads SET folder_id = NULL, updated_at = ? WHERE folder_id = ?",
+            (utc_now(), folder["id"]),
+        )
     conn.execute(
         "UPDATE folders SET sync_enabled = 1, updated_at = ? WHERE id = ?",
         (utc_now(), folder["id"]),

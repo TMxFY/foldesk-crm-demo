@@ -1,5 +1,6 @@
 import hashlib
 import re
+import sqlite3
 
 from app.db import as_dict, utc_now
 
@@ -117,19 +118,33 @@ def _upsert_contact_to_crm(
     created = False
     if existing is not None:
         lead_id = int(existing["id"])
-        conn.execute(
-            """
-            UPDATE leads
-            SET telegram_user_id = COALESCE(telegram_user_id, ?),
-                username = COALESCE(username, ?),
-                phone = COALESCE(phone, ?),
-                note = COALESCE(note, ?),
-                description = COALESCE(description, ?),
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (int(telegram_user_id), username, phone, note, description, now, lead_id),
-        )
+        try:
+            conn.execute(
+                """
+                UPDATE leads
+                SET telegram_user_id = COALESCE(telegram_user_id, ?),
+                    username = COALESCE(username, ?),
+                    phone = COALESCE(phone, ?),
+                    note = COALESCE(note, ?),
+                    description = COALESCE(description, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (int(telegram_user_id), username, phone, note, description, now, lead_id),
+            )
+        except sqlite3.IntegrityError:
+            conn.execute(
+                """
+                UPDATE leads
+                SET username = COALESCE(username, ?),
+                    phone = COALESCE(phone, ?),
+                    note = COALESCE(note, ?),
+                    description = COALESCE(description, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (username, phone, note, description, now, lead_id),
+            )
     else:
         cur = conn.execute(
             """
@@ -283,12 +298,13 @@ async def convert_phones_to_tg(conn, gateway, payload: dict) -> dict:
     account = _pick_account(conn, account_id_in)
     target_account_id = int(account["id"]) if account else None
     session_path = str(account.get("session_path") or "") if account else ""
+    is_demo = session_path.startswith("data/sessions/demo")
 
     resolved_map: dict[str, dict] = {}
     if (
         gateway is not None
         and session_path
-        and not session_path.startswith("data/sessions/demo")
+        and not is_demo
         and hasattr(gateway, "resolve_phones")
     ):
         try:
@@ -308,21 +324,45 @@ async def convert_phones_to_tg(conn, gateway, payload: dict) -> dict:
     for phone in unique_phones:
         if phone in resolved_map:
             info = resolved_map[phone]
-            tg_id = int(info.get("telegram_user_id") or 0)
-            username = info.get("username")
-            name = info.get("name") or username or phone
-            found = bool(info.get("found", True))
+            found = bool(
+                info.get("found", bool(info.get("telegram_user_id") or info.get("username")))
+            )
+            if found:
+                tg_id = int(info.get("telegram_user_id") or 0) or None
+                username = info.get("username")
+                name = info.get("name") or username or phone
+            else:
+                tg_id = None
+                username = None
+                name = None
         else:
             lead_row = conn.execute(
                 "SELECT * FROM leads WHERE phone = ? ORDER BY id LIMIT 1",
                 (phone,),
             ).fetchone()
+            dlg_row = None
+            if lead_row is None:
+                dlg_row = conn.execute(
+                    "SELECT * FROM dialogs WHERE phone = ? ORDER BY id LIMIT 1",
+                    (phone,),
+                ).fetchone()
             if lead_row is not None:
                 ld = as_dict(lead_row)
                 tg_id = int(ld.get("telegram_user_id") or (85000000 + int(ld["id"])))
                 username = ld.get("username")
                 name = ld.get("name") or username or phone
                 found = True
+            elif dlg_row is not None:
+                dd = as_dict(dlg_row)
+                tg_id = int(dd.get("peer_id") or (85000000 + int(dd["id"])))
+                username = dd.get("username")
+                name = dd.get("title") or username or phone
+                found = True
+            elif gateway is not None and not is_demo:
+                tg_id = None
+                username = None
+                name = None
+                found = False
             else:
                 seed = int(hashlib.md5(phone.encode("utf-8")).hexdigest()[:8], 16)
                 fn_ru, fn_en = _FIRST_NAMES[seed % len(_FIRST_NAMES)]
@@ -334,7 +374,7 @@ async def convert_phones_to_tg(conn, gateway, payload: dict) -> dict:
                 found = True
 
         lead_id = None
-        if found and (add_to_leads or campaign_id is not None):
+        if found and tg_id and (add_to_leads or campaign_id is not None):
             lead_id, was_created = _upsert_contact_to_crm(
                 conn,
                 target_account_id,
@@ -349,7 +389,7 @@ async def convert_phones_to_tg(conn, gateway, payload: dict) -> dict:
             if add_to_leads:
                 added_to_leads += 1
 
-        if found and campaign_id is not None:
+        if found and tg_id and campaign_id is not None:
             if _add_contact_to_campaign(
                 conn,
                 campaign_id,
@@ -423,46 +463,50 @@ async def parse_telegram_group(conn, gateway, payload: dict) -> dict:
     account = _pick_account(conn, account_id_in)
     target_account_id = int(account["id"]) if account else None
     session_path = str(account.get("session_path") or "") if account else ""
+    is_demo = session_path.startswith("data/sessions/demo")
 
     participants = None
     if (
         gateway is not None
         and session_path
-        and not session_path.startswith("data/sessions/demo")
+        and not is_demo
         and hasattr(gateway, "get_participants")
     ):
         try:
             gw_list = await gateway.get_participants(session_path, group_link, limit=limit)
-            if isinstance(gw_list, list) and gw_list:
+            if isinstance(gw_list, list):
                 participants = gw_list
-                if gw_list[0].get("group_title"):
+                if gw_list and gw_list[0].get("group_title"):
                     group_title = str(gw_list[0]["group_title"])
         except Exception:
             participants = None
 
     if participants is None:
-        count = min(limit, 15) if limit == 50 else min(limit, 50)
-        base_seed = int(hashlib.md5(slug.encode("utf-8")).hexdigest()[:8], 16)
-        participants = []
-        for idx in range(count):
-            s = base_seed + idx * 31
-            fn_ru, fn_en = _FIRST_NAMES[s % len(_FIRST_NAMES)]
-            ln_ru, ln_en = _LAST_NAMES[(s // 7) % len(_LAST_NAMES)]
-            bio = _BIOS[idx % len(_BIOS)]
-            role = "founder" if idx == 0 else ("admin" if idx in (1, 2) else "member")
-            tg_id = 88000000 + ((base_seed + idx * 101) % 8000000)
-            username = f"{fn_en}_{ln_en}_{slug[:8]}_{idx + 1}"
-            participants.append(
-                {
-                    "telegram_user_id": tg_id,
-                    "username": username,
-                    "name": f"{fn_ru} {ln_ru}",
-                    "bio": bio,
-                    "role": role,
-                    "is_premium": bool(idx % 3 == 0),
-                    "group_title": group_title,
-                }
-            )
+        if gateway is not None and not is_demo:
+            participants = []
+        else:
+            count = min(limit, 15) if limit == 50 else min(limit, 50)
+            base_seed = int(hashlib.md5(slug.encode("utf-8")).hexdigest()[:8], 16)
+            participants = []
+            for idx in range(count):
+                s = base_seed + idx * 31
+                fn_ru, fn_en = _FIRST_NAMES[s % len(_FIRST_NAMES)]
+                ln_ru, ln_en = _LAST_NAMES[(s // 7) % len(_LAST_NAMES)]
+                bio = _BIOS[idx % len(_BIOS)]
+                role = "founder" if idx == 0 else ("admin" if idx in (1, 2) else "member")
+                tg_id = 88000000 + ((base_seed + idx * 101) % 8000000)
+                username = f"{fn_en}_{ln_en}_{slug[:8]}_{idx + 1}"
+                participants.append(
+                    {
+                        "telegram_user_id": tg_id,
+                        "username": username,
+                        "name": f"{fn_ru} {ln_ru}",
+                        "bio": bio,
+                        "role": role,
+                        "is_premium": bool(idx % 3 == 0),
+                        "group_title": group_title,
+                    }
+                )
 
     now = utc_now()
     added_to_leads = 0

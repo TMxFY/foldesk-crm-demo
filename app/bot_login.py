@@ -192,6 +192,23 @@ def _save_forward_lead(conn, person: dict) -> tuple:
         existing = _lead_for_telegram(conn, tg_id)
         if existing:
             return existing, False
+    else:
+        uname = (person.get("username") or "").strip().lstrip("@")
+        if uname:
+            row = conn.execute(
+                "SELECT * FROM leads WHERE lower(username) = lower(?) ORDER BY id LIMIT 1",
+                (uname,),
+            ).fetchone()
+            if row is not None:
+                return as_dict(row), False
+        name = (person.get("name") or "").strip()
+        if name:
+            row = conn.execute(
+                "SELECT * FROM leads WHERE telegram_user_id IS NULL AND name = ? ORDER BY id LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row is not None:
+                return as_dict(row), False
     try:
         lead = create_lead(
             conn,
@@ -313,9 +330,13 @@ def poll_bot_login(conn, opener=None) -> dict:
         raise ValueError(NO_TOKEN)
     if not _expected_chat():
         raise ValueError(NO_CHAT)
+    params: dict = {"timeout": 0, "allowed_updates": ["message"]}
+    row = conn.execute("SELECT MAX(update_id) FROM bot_seen_updates").fetchone()
+    if row and row[0] is not None:
+        params["offset"] = int(row[0]) + 1
     parsed = _read(
         GET_UPDATES.format(token=token),
-        {"timeout": 0, "allowed_updates": ["message"]},
+        params,
         opener,
     )
     result = parsed.get("result")

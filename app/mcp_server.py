@@ -327,11 +327,8 @@ def _normalize_iso_datetime(value: str | None) -> str:
     if not text:
         raise ValueError("Укажите дату и время события")
     if len(text) == 10 and text[4] == "-" and text[7] == "-":
-        return f"{text}T10:00:00"
-    try:
-        return normalize_due(text)
-    except ValueError:
-        return text
+        text = f"{text}T10:00:00"
+    return normalize_due(text)
 
 
 def _find_lead_by_lookup(
@@ -529,7 +526,7 @@ def _handle_schedule_calendar_event(conn: sqlite3.Connection, arguments: dict) -
     meet_link = (str(arguments["meet_link"]).strip() or None) if arguments.get("meet_link") else None
     notes = (str(arguments["notes"]).strip() or None) if arguments.get("notes") else None
 
-    if uid and not event_id and uid.startswith("event:"):
+    if uid and not event_id and uid.startswith(("ev:", "event:")):
         try:
             event_id = int(uid.split(":", 1)[1])
         except ValueError:
@@ -611,17 +608,36 @@ def _handle_schedule_calendar_event(conn: sqlite3.Connection, arguments: dict) -
         ev["uid"] = f"event:{new_id}"
         return {"ok": True, "action": "create", "event": ev}
 
-    if action == "reschedule" and uid and not event_id:
-        norm_start = _normalize_iso_datetime(start_at)
-        norm_end = _normalize_iso_datetime(end_at) if end_at else None
+    if action == "reschedule" and (uid or event_id is not None):
+        clean_start = start_at.strip()
+        if len(clean_start) == 10 and clean_start[4] == "-" and clean_start[7] == "-":
+            _normalize_iso_datetime(clean_start)
+            resched_start = clean_start
+        else:
+            resched_start = _normalize_iso_datetime(clean_start)
+
+        resched_end = None
+        if end_at:
+            clean_end = str(end_at).strip()
+            if len(clean_end) == 10 and clean_end[4] == "-" and clean_end[7] == "-":
+                _normalize_iso_datetime(clean_end)
+                resched_end = clean_end
+            else:
+                resched_end = _normalize_iso_datetime(clean_end)
+
         if cal_mod and hasattr(cal_mod, "reschedule_calendar_item"):
-            res = cal_mod.reschedule_calendar_item(conn, uid=uid, new_start_at=norm_start, new_end_at=norm_end)
+            target_uid = uid or f"ev:{int(event_id)}"
+            res = cal_mod.reschedule_calendar_item(
+                conn, uid=target_uid, new_start_at=resched_start, new_end_at=resched_end
+            )
             return {"ok": True, "action": "reschedule", "event": res}
-        if uid.startswith("reminder:"):
+
+        norm_start = _normalize_iso_datetime(start_at)
+        if uid and uid.startswith(("rem:", "reminder:")):
             rem_id = int(uid.split(":", 1)[1])
             updated = postpone_reminder(conn, rem_id, norm_start)
             return {"ok": True, "action": "reschedule", "reminder": updated}
-        if uid.startswith("lead_followup:"):
+        if uid and uid.startswith(("followup:", "lead_followup:")):
             lid = int(uid.split(":", 1)[1])
             updated = update_lead(conn, lid, next_follow_up=norm_start[:10])
             return {"ok": True, "action": "reschedule", "lead": updated}
@@ -871,17 +887,23 @@ def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict |
         if action == "create":
             if args.get("lead_id") is None:
                 raise ValueError("Укажите lead_id для напоминания")
+            raw_due = str(args.get("due_at") or "").strip()
+            if len(raw_due) == 10 and raw_due[4] == "-" and raw_due[7] == "-":
+                raw_due = f"{raw_due}T10:00:00"
             rem = create_reminder(
                 conn,
                 int(args["lead_id"]),
-                str(args.get("due_at") or ""),
+                raw_due,
                 str(args.get("text") or ""),
             )
             return {"action": "create", "reminder": rem}
         if action == "postpone":
             if args.get("reminder_id") is None:
                 raise ValueError("Укажите reminder_id")
-            rem = postpone_reminder(conn, int(args["reminder_id"]), str(args.get("due_at") or ""))
+            raw_due = str(args.get("due_at") or "").strip()
+            if len(raw_due) == 10 and raw_due[4] == "-" and raw_due[7] == "-":
+                raw_due = f"{raw_due}T10:00:00"
+            rem = postpone_reminder(conn, int(args["reminder_id"]), raw_due)
             return {"action": "postpone", "reminder": rem}
         if action == "complete":
             if args.get("reminder_id") is None:
@@ -989,7 +1011,10 @@ def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict |
         return {
             "ok": False,
             "direction": direction,
-            "configured": bool(rows.get("airtable_token") and rows.get("airtable_base_id")),
+            "configured": bool(
+                (rows.get("airtable_api_key") or rows.get("airtable_token"))
+                and rows.get("airtable_base_id")
+            ),
             "detail": "Модуль синхронизации Airtable не настроен или токен не задан",
         }
 

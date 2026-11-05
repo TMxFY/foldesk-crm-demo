@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import ssl
 import urllib.error
@@ -83,9 +84,11 @@ def extract_all_telethon_web_sessions(conn) -> list[dict]:
                 dc_id = int(srow[0])
                 auth_key_hex = bytes(srow[1]).hex()
                 user_id = acc.get("telegram_user_id")
-                if not user_id:
+                raw_phone = re.sub(r"\D", "", str(acc.get("phone") or ""))
+                if not user_id and raw_phone:
                     erow = sconn.execute(
-                        "SELECT id FROM entities WHERE id > 0 AND id != 777000 ORDER BY id DESC LIMIT 1"
+                        "SELECT id FROM entities WHERE (phone = ? OR CAST(phone AS TEXT) = ?) AND id > 0 LIMIT 1",
+                        (int(raw_phone) if raw_phone.isdigit() else raw_phone, raw_phone),
                     ).fetchone()
                     if erow:
                         user_id = int(erow[0])
@@ -242,42 +245,55 @@ def build_session_init_js(
     var authKey = "{auth_key_hex}";
     var userId = "{user_id}";
     var accId = "{acc_id}";
+    var allSessions = {sessions_json};
+    for (var k = 0; k < allSessions.length; k++) {{
+      var s = allSessions[k];
+      var slotKey = "account" + s.slot;
+      var slotObj = {{
+        userId: String(s.user_id),
+        dcId: Number(s.dc_id)
+      }};
+      slotObj["dc" + s.dc_id + "_auth_key"] = s.auth_key_hex;
+      if (s.first_name) slotObj.firstName = s.first_name;
+      if (s.last_name) slotObj.lastName = s.last_name;
+      if (s.phone) slotObj.phone = s.phone;
+      localStorage.setItem(slotKey, JSON.stringify(slotObj));
+    }}
+
+    var urlParams = new URLSearchParams(window.location.search || "");
+    var rawSlot = urlParams.get("account");
+    var slotParam = rawSlot ? Number(rawSlot) : 0;
+    var active = null;
+    if (slotParam >= 1) {{
+      for (var m = 0; m < allSessions.length; m++) {{
+        if (Number(allSessions[m].slot) === slotParam) {{
+          active = allSessions[m];
+          break;
+        }}
+      }}
+    }}
+    if (!active) {{
+      for (var n = 0; n < allSessions.length; n++) {{
+        if (String(allSessions[n].account_id) === String(accId)) {{
+          active = allSessions[n];
+          break;
+        }}
+      }}
+    }}
+    if (active) {{
+      dc = Number(active.dc_id);
+      authKey = String(active.auth_key_hex);
+      userId = String(active.user_id);
+      accId = String(active.account_id);
+    }}
+
     var sig = accId + ":" + dc + ":" + userId + ":" + authKey.slice(0, 24);
     var prevSig = localStorage.getItem("foldesk_tg_session_sig");
-    var failedSig = localStorage.getItem("foldesk_tg_failed_sig");
     var existingKey = localStorage.getItem("dc" + dc + "_auth_key");
     var existingUser = localStorage.getItem("user_auth");
+    localStorage.removeItem("foldesk_tg_failed_sig");
 
-    if (prevSig === sig && (!existingKey || !existingUser)) {{
-      localStorage.setItem("foldesk_tg_failed_sig", sig);
-      localStorage.removeItem("account1");
-      localStorage.removeItem("tt-global-state");
-      for (var d = 1; d <= 5; d++) {{
-        localStorage.removeItem("dc" + d + "_auth_key");
-      }}
-      return;
-    }}
-    if (failedSig === sig) {{
-      return;
-    }}
-
-    var allSessions = {sessions_json};
-    var urlParams = new URLSearchParams(window.location.search || "");
-    var slotParam = Number(urlParams.get("account") || "1");
-    if ((!slotParam || slotParam === 1) && prevSig !== sig) {{
-      for (var k = 0; k < allSessions.length; k++) {{
-        var s = allSessions[k];
-        var slotKey = "account" + s.slot;
-        var slotObj = {{
-          userId: String(s.user_id),
-          dcId: Number(s.dc_id)
-        }};
-        slotObj["dc" + s.dc_id + "_auth_key"] = s.auth_key_hex;
-        if (s.first_name) slotObj.firstName = s.first_name;
-        if (s.last_name) slotObj.lastName = s.last_name;
-        if (s.phone) slotObj.phone = s.phone;
-        localStorage.setItem(slotKey, JSON.stringify(slotObj));
-      }}
+    if (prevSig !== sig || !existingKey || !existingUser) {{
       localStorage.setItem("dc", String(dc));
       localStorage.setItem("dc" + dc + "_auth_key", JSON.stringify(authKey));
       localStorage.setItem("user_auth", JSON.stringify({{

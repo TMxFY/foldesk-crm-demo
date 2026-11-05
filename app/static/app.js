@@ -109,6 +109,7 @@ const state = {
   dialogs: [],
   messages: [],
   dialogQuery: "",
+  inboxSearchQuery: "",
   leadQuery: "",
   inbox: "empty",
   inboxSessionFilter: "all",
@@ -158,6 +159,7 @@ let toastTimer = 0;
 let inboxSource = null;
 let inboxLiveAccount = "";
 let cardToken = 0;
+let dialogLoadToken = 0;
 
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -420,8 +422,9 @@ function toast(message, kind) {
     return;
   }
   node.hidden = false;
-  node.dataset.kind = kind === "error" ? "error" : "ok";
-  node.setAttribute("role", kind === "error" ? "alert" : "status");
+  const isError = kind === "error" || kind === "err";
+  node.dataset.kind = isError ? "error" : "ok";
+  node.setAttribute("role", isError ? "alert" : "status");
   node.textContent = message;
   toastTimer = window.setTimeout(() => {
     node.hidden = true;
@@ -684,10 +687,10 @@ async function patchLead(id, body) {
     const updated = await api(`/api/leads/${id}`, { method: "PATCH", body });
     delete state.cards[id];
     state.leadCache[updated.id] = updated;
-    await loadLeads(state.leadQuery, updated.id);
+    await loadLeads(state.leadQuery, updated.id, true);
   } catch (error) {
     toast(error.message, "error");
-    await loadLeads(state.leadQuery, id);
+    await loadLeads(state.leadQuery, id, true);
   }
 }
 
@@ -1016,8 +1019,9 @@ function renderAccounts() {
     if (account.telegram_username && `@${account.telegram_username}` !== label) {
       subParts.push(`@${account.telegram_username}`);
     }
-    const proxyLabel = account.proxy_location || account.proxy || "Proxy: Auto";
-    const accessLabel = account.access === "personal" ? "Personal" : "Workspace";
+    const proxyLabel = account.proxy_location || account.proxy_url || account.proxy || "Auto";
+    const isPersonal = (account.access_scope || account.access) === "personal";
+    const accessLabel = isPersonal ? "Personal" : "Workspace";
     const identityBlock = el("div", { className: "account-identity" }, [
       el("div", { className: "account-title-line" }, [
         el("span", { className: "conn-dot", "data-conn": connState, "aria-hidden": "true" }, []),
@@ -1150,7 +1154,9 @@ function renderAccounts() {
 }
 
 function fillFolderAccounts() {
-  const connected = state.accounts.filter((account) => account.status === "connected");
+  const connected = state.accounts.filter(
+    (account) => account.status === "connected" && normalizeProvider(account.provider) === "telegram",
+  );
   ["#folder-account", "#tool-phones-account", "#tool-parser-account"].forEach((selector) => {
     const select = document.querySelector(selector);
     if (!select) return;
@@ -2058,8 +2064,8 @@ function syncTelegramWebAPanel(connected) {
       title: "Подключить ещё один Telegram-аккаунт",
       onclick: () => {
         activateSheet("accounts");
-        const ws = document.querySelector("#workspace-main");
-        if (ws) ws.dataset.activePopup = "login";
+        switchAuthTab("phone");
+        openSheetPopup("login");
         const phoneInput = document.querySelector("#phone");
         if (phoneInput) phoneInput.focus();
       },
@@ -2235,6 +2241,23 @@ function passChips(dialog) {
   if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
     if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
   }
+  const searchRaw = String(state.inboxSearchQuery || "").trim().toLowerCase();
+  if (searchRaw) {
+    const cleanQ = searchRaw.replace(/^@/, "");
+    const haystack = [
+      dialog.name,
+      dialog.title,
+      dialog.username,
+      dialog.phone,
+      dialog.last_message_preview,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    if (!haystack.includes(searchRaw) && (!cleanQ || !haystack.includes(cleanQ))) {
+      return false;
+    }
+  }
   if (
     state.pinnedDialogId != null
     && dialog
@@ -2386,6 +2409,7 @@ function selectedAccount() {
 }
 
 async function selectDialog(dialog, options = {}) {
+  const reqToken = ++dialogLoadToken;
   if (dialog && dialog.account_id) {
     const select = document.querySelector("#tg-account");
     if (select && [...select.options].some((opt) => opt.value === String(dialog.account_id))) {
@@ -2417,13 +2441,16 @@ async function selectDialog(dialog, options = {}) {
   const reply = document.querySelector("#reply-text");
   if (reply) reply.value = "";
   let loadError = "";
-  if (dialog.id) {
+  let loadedMessages = [];
+  if (dialog && dialog.id) {
     try {
-      state.messages = await api(`/api/dialogs/${dialog.id}/messages`);
+      loadedMessages = await api(`/api/dialogs/${dialog.id}/messages`);
     } catch (error) {
       loadError = error.message;
     }
   }
+  if (reqToken !== dialogLoadToken) return;
+  state.messages = loadedMessages;
   renderThread();
   if (loadError) {
     const error = document.querySelector("#thread-error");
@@ -2724,6 +2751,9 @@ async function openChat(lead) {
 
   upsertDialog(dialog);
   closeSheetPopup();
+  if (state.inboxChatMode !== "crm") {
+    setInboxChatMode("crm");
+  }
   if (state.viewMode === "sheet") activateSheet("inbox");
   await selectDialog(dialog);
   const s05 = document.querySelector("#s05");
@@ -3049,6 +3079,7 @@ function applyPipelineView(view) {
   }
   folder.value = folderId;
   renderBoard();
+  renderLeadTable();
 }
 
 async function savePipelineView() {
@@ -3085,6 +3116,8 @@ async function resetPipelineView() {
   if (state.mode === "crm") {
     const query = document.querySelector("#q");
     if (query) query.value = "";
+    state.inboxSearchQuery = "";
+    renderDialogs();
   }
   await loadLeads("");
 }
@@ -3356,8 +3389,10 @@ function reminderForm(lead) {
 function renderLeadTable() {
   const body = document.querySelector("#lead-rows");
   body.replaceChildren();
-  const { channel, followup } = pipelineFilters();
+  const { status, folderId, channel, followup } = pipelineFilters();
   const filteredLeads = state.leads.filter((lead) => {
+    if (status && lead.status !== status) return false;
+    if (folderId && String(lead.folder_id || "") !== String(folderId)) return false;
     if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
     if (!matchFollowupFilter(lead, followup)) return false;
     return true;
@@ -3395,10 +3430,12 @@ function renderLeadTable() {
       : el("td", { className: "bulk-check-col" }, []);
     const row = el("tr", {
       "data-lead-id": String(lead.id),
-      onclick: () => {
+      onclick: (ev) => {
+        if (ev && ev.target && typeof ev.target.closest === "function" && ev.target.closest("input, select, button, a, label")) return;
         state.selectedLeadId = lead.id;
         renderCard();
         renderBoard();
+        if (state.viewMode === "sheet") openSheetPopup("card");
       },
     }, [
       bulkCell,
@@ -3435,10 +3472,12 @@ function renderLeadTable() {
   if (typeof syncBulkSelectionUI === "function") syncBulkSelectionUI();
 }
 
-async function loadLeads(query, keepId) {
+async function loadLeads(query = "", keepId = null, silent = false) {
   state.leadQuery = query || "";
-  setView("#leads-view", "loading");
-  setView("#board-view", "loading");
+  if (!silent) {
+    setView("#leads-view", "loading");
+    setView("#board-view", "loading");
+  }
   const params = new URLSearchParams();
   if (state.leadQuery) params.set("q", state.leadQuery);
   const leads = await api(`/api/leads?${params.toString()}`);
@@ -4220,11 +4259,11 @@ if (openSessionImportPopupBtn) {
 bindBusy(document.querySelector("#login-form"), async (event) => {
   const formData = new FormData(event.target);
   const phone = formData.get("phone");
-  const proxy = document.querySelector("#account-proxy-select")?.value || "auto_ru";
-  const access = document.querySelector("#account-access-select")?.value || "team";
+  const proxy = document.querySelector("#account-proxy-select")?.value || "auto";
+  const access = document.querySelector("#account-access-select")?.value || "workspace";
   const result = await api("/api/accounts/start", {
     method: "POST",
-    body: { phone, proxy, access },
+    body: { phone, proxy_url: proxy, access_scope: access, proxy, access },
   });
   state.loginId = result.id;
   document.querySelector("#code-form").hidden = false;
@@ -4398,6 +4437,10 @@ document.querySelector("#search-mode").addEventListener("click", (event) => {
   state.mode = button.dataset.mode;
   press(document.querySelector("#search-mode"), "data-mode", state.mode);
   const telegram = state.mode === "telegram";
+  if (telegram && state.inboxSearchQuery) {
+    state.inboxSearchQuery = "";
+    renderDialogs();
+  }
   document.querySelectorAll(".tg-only").forEach((item) => { item.hidden = !telegram; });
 });
 
@@ -4413,8 +4456,18 @@ document.querySelector("#search-form").addEventListener("submit", async (event) 
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   try {
-    if (state.mode === "telegram") await searchTelegram(query);
-    else await loadLeads(query);
+    if (state.mode === "telegram") {
+      state.inboxSearchQuery = "";
+      await searchTelegram(query);
+    } else {
+      state.inboxSearchQuery = query;
+      if (state.dialogQuery && Array.isArray(state.allDialogs) && state.allDialogs.length) {
+        state.dialogs = [...state.allDialogs];
+        state.dialogQuery = "";
+      }
+      await loadLeads(query);
+      renderDialogs();
+    }
   } catch (error) {
     if (state.mode === "telegram") {
       state.inbox = "error";
@@ -4990,11 +5043,13 @@ document.querySelector("#reminder-scopes").addEventListener("click", async (even
 document.querySelector("#stage-filter").addEventListener("change", () => {
   document.querySelector("#saved-view").value = "";
   renderBoard();
+  renderLeadTable();
 });
 
 document.querySelector("#folder-filter").addEventListener("change", () => {
   document.querySelector("#saved-view").value = "";
   renderBoard();
+  renderLeadTable();
 });
 
 const channelFilterSelect = document.querySelector("#channel-filter");
@@ -5376,7 +5431,10 @@ const popupOpenMap = [
 popupOpenMap.forEach(([selector, kind]) => {
   const btn = document.querySelector(selector);
   if (!btn) return;
-  btn.addEventListener("click", () => openSheetPopup(kind));
+  btn.addEventListener("click", () => {
+    if (selector === "#open-login-popup") switchAuthTab("phone");
+    openSheetPopup(kind);
+  });
 });
 
 const openViewsPopupBtn = document.querySelector("#open-views-popup");
@@ -5522,6 +5580,26 @@ function renderScheduleDays() {
   updateScheduleSummaryBadge();
 }
 
+function syncOutreachAutopilotUI(data) {
+  if (!data || typeof data !== "object") return;
+  const enabled = data.autopilot_enabled !== false;
+  state.outreachSchedule.autopilot_enabled = enabled;
+  const toggleBtn = document.querySelector("#outreach-autopilot-toggle");
+  if (toggleBtn) {
+    toggleBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
+    toggleBtn.dataset.autopilotEnabled = enabled ? "true" : "false";
+    toggleBtn.textContent = enabled
+      ? "Автопилот по расписанию: ВКЛ"
+      : "Автопилот по расписанию: ВЫКЛ";
+    toggleBtn.classList.toggle("is-active", enabled);
+    toggleBtn.classList.toggle("is-off", !enabled);
+  }
+  const statusEl = document.querySelector("#outreach-autopilot-status");
+  if (statusEl && data.next_run_label) {
+    statusEl.textContent = data.next_run_label;
+  }
+}
+
 async function loadOutreachSchedule() {
   try {
     const res = await api("/api/outreach/schedule");
@@ -5530,8 +5608,10 @@ async function loadOutreachSchedule() {
         timezone: res.timezone || "UTC",
         random_delay: res.random_delay || "30-90",
         pause_night: res.pause_night !== false,
+        autopilot_enabled: res.autopilot_enabled !== false,
         days: normalizeScheduleDays(res.days),
       };
+      syncOutreachAutopilotUI(res);
     }
   } catch (_err) { /* расписание по умолчанию уже в state */ }
   const tz = document.querySelector("#schedule-timezone");
@@ -5579,13 +5659,14 @@ async function submitOutreachSchedule(event) {
     saveScheduleBtn.setAttribute("aria-busy", "true");
   }
   try {
-    await api("/api/outreach/schedule", {
+    const res = await api("/api/outreach/schedule", {
       method: "PUT",
       body: {
         timezone: state.outreachSchedule.timezone,
         days: scheduleDaysToDict(state.outreachSchedule.days),
       },
     });
+    if (res && typeof res === "object") syncOutreachAutopilotUI(res);
   } catch (_err) { /* сохранено в локальном расписании сессии */ } finally {
     if (saveScheduleBtn) {
       saveScheduleBtn.disabled = false;
@@ -5607,6 +5688,34 @@ if (scheduleForm) {
 } else {
   const saveScheduleBtn = document.querySelector("#save-schedule-btn");
   if (saveScheduleBtn) saveScheduleBtn.addEventListener("click", submitOutreachSchedule);
+}
+
+const outreachAutopilotToggle = document.querySelector("#outreach-autopilot-toggle");
+if (outreachAutopilotToggle) {
+  outreachAutopilotToggle.addEventListener("click", async () => {
+    const currentEnabled = outreachAutopilotToggle.getAttribute("aria-pressed") === "true"
+      || outreachAutopilotToggle.dataset.autopilotEnabled === "true";
+    const nextEnabled = !currentEnabled;
+    outreachAutopilotToggle.disabled = true;
+    outreachAutopilotToggle.setAttribute("aria-busy", "true");
+    try {
+      const res = await api("/api/outreach/autopilot", {
+        method: "POST",
+        body: { enabled: nextEnabled, activate_drafts: true },
+      });
+      syncOutreachAutopilotUI(res || { autopilot_enabled: nextEnabled });
+      await loadCampaigns();
+      toast(
+        nextEnabled ? "Автопилот по расписанию включён" : "Автопилот по расписанию выключен",
+        "ok"
+      );
+    } catch (err) {
+      toast(err.message || "Не удалось переключить автопилот", "err");
+    } finally {
+      outreachAutopilotToggle.disabled = false;
+      outreachAutopilotToggle.removeAttribute("aria-busy");
+    }
+  });
 }
 
 function renderFromLeadsChecklist() {
@@ -5774,32 +5883,17 @@ if (toolPhonesSubmitBtn) {
     toolPhonesSubmitBtn.disabled = true;
     toolPhonesSubmitBtn.setAttribute("aria-busy", "true");
     try {
-      let rows = [];
-      try {
-        const res = await api("/api/tools/phone-converter", {
-          method: "POST",
-          body: {
-            phones,
-            phones_text: raw,
-            add_to_leads: addToCrm,
-            account_id: accountId,
-            campaign_id: campaignId,
-          },
-        });
-        rows = Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []);
-      } catch (_err) {
-        rows = phones.map((phone, idx) => {
-          const digits = phone.replace(/\D/g, "");
-          const tail = digits.slice(-4) || String(1000 + idx);
-          return {
-            phone,
-            found: true,
-            username: `tg_contact_${tail}`,
-            name: `Контакт ${tail}`,
-            telegram_user_id: Number(`7000${tail}`),
-          };
-        });
-      }
+      const res = await api("/api/tools/phone-converter", {
+        method: "POST",
+        body: {
+          phones,
+          phones_text: raw,
+          add_to_leads: addToCrm,
+          account_id: accountId,
+          campaign_id: campaignId,
+        },
+      });
+      const rows = Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []);
       const list = document.querySelector("#tool-phones-results");
       const summary = document.querySelector("#tool-phones-count-badge") || document.querySelector("#tool-phones-summary");
       const foundCount = rows.filter((r) => r.found !== false).length;
@@ -5837,8 +5931,8 @@ if (toolPhonesSubmitBtn) {
         await loadCampaigns();
       }
       toast(`Проверено номеров: ${rows.length}`, "ok");
-    } catch (error) {
-      toast(error.message || "Ошибка конвертера номеров", "error");
+    } catch (err) {
+      toast(err.message || "Ошибка конвертера номеров", "err");
     } finally {
       toolPhonesSubmitBtn.disabled = false;
       toolPhonesSubmitBtn.removeAttribute("aria-busy");
@@ -5872,30 +5966,20 @@ if (toolParserSubmitBtn) {
     toolParserSubmitBtn.disabled = true;
     toolParserSubmitBtn.setAttribute("aria-busy", "true");
     try {
-      let rows = [];
-      try {
-        const res = await api("/api/tools/group-parser", {
-          method: "POST",
-          body: {
-            group_link: source,
-            source,
-            limit,
-            add_to_leads: addToCrm,
-            account_id: accountId,
-            campaign_id: campaignId,
-          },
-        });
-        rows = Array.isArray(res?.participants)
-          ? res.participants
-          : (Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []));
-      } catch (_err) {
-        const cleanSlug = source.replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "") || "group";
-        rows = [
-          { name: "Артём Соколов", username: `${cleanSlug}_founder`, bio: "CEO / B2B SaaS", telegram_user_id: 880101 },
-          { name: "Мария Крылова", username: `${cleanSlug}_growth`, bio: "Head of Growth", telegram_user_id: 880102 },
-          { name: "Денис Волков", username: `${cleanSlug}_sales`, bio: "Sales Lead", telegram_user_id: 880103 },
-        ];
-      }
+      const res = await api("/api/tools/group-parser", {
+        method: "POST",
+        body: {
+          group_link: source,
+          source,
+          limit,
+          add_to_leads: addToCrm,
+          account_id: accountId,
+          campaign_id: campaignId,
+        },
+      });
+      const rows = Array.isArray(res?.participants)
+        ? res.participants
+        : (Array.isArray(res?.results) ? res.results : (Array.isArray(res) ? res : []));
       const list = document.querySelector("#tool-parser-results");
       const summary = document.querySelector("#tool-parser-count-badge") || document.querySelector("#tool-parser-summary");
       if (summary) summary.textContent = `${rows.length} участников`;
@@ -5929,8 +6013,8 @@ if (toolParserSubmitBtn) {
         await loadCampaigns();
       }
       toast(`Спарсено участников из ${source}: ${rows.length}`, "ok");
-    } catch (error) {
-      toast(error.message || "Ошибка парсера групп", "error");
+    } catch (err) {
+      toast(err.message || "Ошибка парсера групп", "err");
     } finally {
       toolParserSubmitBtn.disabled = false;
       toolParserSubmitBtn.removeAttribute("aria-busy");
@@ -6006,25 +6090,78 @@ if (crmPropertyCreateForm) {
   });
 }
 
+function applyAiBotConfig(rawConfig) {
+  const cfg = (rawConfig && rawConfig.config && typeof rawConfig.config === "object")
+    ? rawConfig.config
+    : (rawConfig && typeof rawConfig === "object" ? rawConfig : null);
+  if (!cfg) return;
+  const copilotToggle = document.querySelector("#ai-bot-copilot-toggle");
+  const enabledToggle = document.querySelector("#ai-bot-enabled");
+  const isEnabled = cfg.copilot_enabled !== undefined ? Boolean(cfg.copilot_enabled) : Boolean(cfg.enabled);
+  if (copilotToggle) copilotToggle.checked = isEnabled;
+  if (enabledToggle) enabledToggle.checked = isEnabled;
+  const autoQualify = document.querySelector("#ai-bot-auto-qualify");
+  if (autoQualify && cfg.auto_qualify !== undefined) {
+    autoQualify.checked = Boolean(cfg.auto_qualify);
+  }
+  const goalInput = document.querySelector("#ai-bot-goal");
+  if (goalInput && cfg.goal !== undefined) {
+    goalInput.value = cfg.goal || "";
+  }
+  const stageMap = [
+    ["#ai-stage-classifier", "classifier_prompt"],
+    ["#ai-stage-strategist", "strategist_prompt"],
+    ["#ai-stage-generator", "generator_prompt"],
+    ["#ai-stage-selector", "selector_prompt"],
+  ];
+  stageMap.forEach(([sel, key]) => {
+    const node = document.querySelector(sel);
+    if (node && cfg[key] !== undefined) node.value = cfg[key] || "";
+  });
+}
+
+async function loadAiBotConfig() {
+  try {
+    const res = await api("/api/ai-bot/config");
+    applyAiBotConfig(res);
+    return res;
+  } catch (_err) {
+    return null;
+  }
+}
+
 const aiBotSaveBtn = document.querySelector("#ai-bot-save-btn");
 if (aiBotSaveBtn) {
   aiBotSaveBtn.addEventListener("click", async () => {
+    const copilotToggle = document.querySelector("#ai-bot-copilot-toggle")
+      || document.querySelector("#ai-bot-enabled");
+    const autoQualifyToggle = document.querySelector("#ai-bot-auto-qualify");
+    const goalInput = document.querySelector("#ai-bot-goal");
+    const enabled = copilotToggle ? Boolean(copilotToggle.checked) : true;
+    const autoQualify = autoQualifyToggle ? Boolean(autoQualifyToggle.checked) : true;
+    const goal = (goalInput && goalInput.value.trim()) || "";
     const payload = {
-      enabled: Boolean(document.querySelector("#ai-bot-enabled")?.checked),
+      enabled,
+      copilot_enabled: enabled,
+      auto_qualify: autoQualify,
+      goal,
       classifier_prompt: document.querySelector("#ai-stage-classifier")?.value || "",
-      strategist_prompt: document.querySelector("#ai-stage-strategist")?.value || "",
+      strategist_prompt: document.querySelector("#ai-stage-strategist")?.value || goal,
       generator_prompt: document.querySelector("#ai-stage-generator")?.value || "",
       selector_prompt: document.querySelector("#ai-stage-selector")?.value || "",
     };
     aiBotSaveBtn.disabled = true;
     aiBotSaveBtn.setAttribute("aria-busy", "true");
     try {
-      await api("/api/ai-bot/config", { method: "POST", body: payload });
-    } catch (_err) { /* локальное сохранение конфигурации пайплайна */ } finally {
+      const res = await api("/api/ai-bot/config", { method: "POST", body: payload });
+      applyAiBotConfig(res);
+      toast("Конфигурация AI Агента (4 этапа) сохранена", "ok");
+    } catch (err) {
+      toast(err.message || "Не удалось сохранить конфигурацию AI Агента", "err");
+    } finally {
       aiBotSaveBtn.disabled = false;
       aiBotSaveBtn.removeAttribute("aria-busy");
     }
-    toast("Конфигурация AI Агента (4 этапа) сохранена", "ok");
   });
 }
 
@@ -6636,6 +6773,7 @@ async function boot() {
   if (mySeq !== bootSeq) return;
   loadOutreachSchedule().catch(() => {});
   loadCrmProperties().catch(() => {});
+  loadAiBotConfig().catch(() => {});
   await loadSnippets();
   if (mySeq !== bootSeq) return;
   await loadAnalyticsSummary();

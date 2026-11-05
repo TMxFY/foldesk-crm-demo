@@ -98,18 +98,19 @@ def build_digest(rows: list) -> tuple[str, dict | None]:
         if clock:
             line = f"{line} ({clock})"
         lines.append(line)
-        if row.get("kind") == "calendar_event":
-            btns = [{"text": "Сделано", "callback_data": f"cal_done:{row['id']}"}]
-            if row.get("lead_id") is not None:
-                btns.append({"text": "К лиду", "callback_data": f"lead:{row['lead_id']}"})
-            keyboard.append(btns)
-        else:
-            keyboard.append(
-                [
-                    {"text": "Сделано", "callback_data": f"done:{row['id']}"},
-                    {"text": "К лиду", "callback_data": f"lead:{row['lead_id']}"},
-                ]
-            )
+        if len(keyboard) < 45:
+            if row.get("kind") == "calendar_event":
+                btns = [{"text": "Сделано", "callback_data": f"cal_done:{row['id']}"}]
+                if row.get("lead_id") is not None:
+                    btns.append({"text": "К лиду", "callback_data": f"lead:{row['lead_id']}"})
+                keyboard.append(btns)
+            else:
+                keyboard.append(
+                    [
+                        {"text": "Сделано", "callback_data": f"done:{row['id']}"},
+                        {"text": "К лиду", "callback_data": f"lead:{row['lead_id']}"},
+                    ]
+                )
     return "\n".join(lines), {"inline_keyboard": keyboard}
 
 

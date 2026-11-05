@@ -106,7 +106,9 @@ def load_env_file() -> None:
 class StartIn(BaseModel):
     phone: str = ""
     proxy_url: str | None = None
-    access_scope: str = "workspace"
+    proxy: str | None = None
+    access_scope: str | None = None
+    access: str | None = None
     provider: str = "telegram"
     auth_mode: str = "code"
 
@@ -136,8 +138,12 @@ class OutreachAutopilotTickIn(BaseModel):
 
 
 class OpenByLeadIn(BaseModel):
-    lead_id: int
+    lead_id: int | None = None
     account_id: int | None = None
+    telegram_user_id: int | None = None
+    username: str | None = None
+    phone: str | None = None
+    name: str | None = None
 
 
 class StartDirectDialogIn(BaseModel):
@@ -330,7 +336,7 @@ class CampaignRunIn(BaseModel):
 def _resolve_tg_creds(conn=None) -> tuple[str, str]:
     api_id = os.getenv("TG_API_ID", "").strip()
     api_hash = os.getenv("TG_API_HASH", "").strip()
-    if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
+    if not api_id or not api_hash:
         if conn is not None:
             try:
                 rows = dict(
@@ -342,7 +348,7 @@ def _resolve_tg_creds(conn=None) -> tuple[str, str]:
                 api_hash = api_hash or str(rows.get("tg_api_hash") or "").strip()
             except Exception:
                 pass
-        if not api_id or not api_hash:
+        if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
             api_id = "2040"
             api_hash = "b18441a1ff607e10a989891a5462e627"
     return api_id, api_hash
@@ -612,12 +618,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         try:
             yield
         finally:
-            try:
-                from app.cloud_persistence import backup_to_cloud
+            if (
+                conn is None
+                and "PYTEST_CURRENT_TEST" not in os.environ
+                and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+            ):
+                try:
+                    from app.cloud_persistence import backup_to_cloud
 
-                await asyncio.to_thread(backup_to_cloud, getattr(app.state, "conn", None))
-            except Exception:
-                pass
+                    await asyncio.to_thread(backup_to_cloud, None)
+                except Exception:
+                    pass
             await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
 
@@ -690,13 +701,15 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.post("/api/accounts/start")
     async def accounts_start(body: StartIn, request: Request):
         gateway = _gateway_for_provider(request, body.provider)
+        proxy_url = body.proxy_url if body.proxy_url is not None else body.proxy
+        access_scope = body.access_scope or body.access or "workspace"
         return await _call_async(
             start_login,
             request.app.state.conn,
             body.phone,
             gateway,
-            proxy_url=body.proxy_url,
-            access_scope=body.access_scope,
+            proxy_url=proxy_url,
+            access_scope=access_scope,
             provider=body.provider,
             auth_mode=body.auth_mode,
         )
@@ -725,7 +738,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         account_id: int, body: AccountSettingsPatch, request: Request
     ):
         fields = body.model_dump(exclude_unset=True)
-        return _call(
+        updated = _call(
             update_account_settings,
             request.app.state.conn,
             account_id,
@@ -734,6 +747,16 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             daily_limit=body.daily_limit,
             has_proxy=("proxy_url" in fields),
         )
+        row = request.app.state.conn.execute(
+            "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        gw = getattr(request.app.state, "gateway", None)
+        if row and row["session_path"] and gw is not None and hasattr(gw, "set_proxy"):
+            try:
+                gw.set_proxy(row["session_path"], updated.get("proxy_url"))
+            except Exception:
+                pass
+        return updated
 
     @app.post("/api/accounts/{account_id}/code")
     async def accounts_code(account_id: int, body: CodeIn, request: Request):
@@ -854,6 +877,21 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 provider=body.provider,
                 amount=body.amount,
                 currency=body.currency,
+                status=body.status,
+                note=body.note,
+                next_step=body.next_step,
+                description=body.description,
+                email=body.email,
+                url=body.url,
+                company=body.company,
+                niche=body.niche,
+                offer_type=body.offer_type,
+                offer_details=body.offer_details,
+                monthly_value=body.monthly_value,
+                lead_source=body.lead_source,
+                next_follow_up=body.next_follow_up,
+                last_contacted=body.last_contacted,
+                airtable_record_id=body.airtable_record_id,
             )
         return _call(
             create_lead,
@@ -1280,6 +1318,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             request.app.state.conn,
             body.lead_id,
             body.account_id,
+            telegram_user_id=body.telegram_user_id,
+            username=body.username,
+            phone=body.phone,
+            name=body.name,
         )
 
     @app.post("/api/dialogs/start-direct")
@@ -1362,9 +1404,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             """,
             (dialog_id,),
         ).fetchone()
-        has_tg_creds = bool(
-            os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
-        )
+        tg_id, tg_hash = _resolve_tg_creds(conn)
+        has_tg_creds = bool(tg_id and tg_hash)
         if (
             demo_row
             and (
@@ -1400,9 +1441,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             """,
             (dialog_id,),
         ).fetchone()
-        has_tg_creds = bool(
-            os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
-        )
+        tg_id, tg_hash = _resolve_tg_creds(conn)
+        has_tg_creds = bool(tg_id and tg_hash)
         if demo_row and str(demo_row["provider"] or "telegram").strip().lower() == "whatsapp":
             gateway = _gateway_for_provider(request, "whatsapp")
         elif (
@@ -1574,24 +1614,38 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         respect_delays = bool(body.respect_delays) if body is not None else False
         camp_row = request.app.state.conn.execute(
             """
-            SELECT a.session_path, a.provider
+            SELECT a.session_path, a.provider, c.account_ids_json
             FROM campaigns c
             LEFT JOIN accounts a ON a.id = c.account_id
             WHERE c.id = ?
             """,
             (campaign_id,),
         ).fetchone()
-        has_tg_creds = bool(
-            os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
-        )
+        session_path = camp_row["session_path"] if camp_row else None
+        provider = camp_row["provider"] if camp_row else None
+        if camp_row and not session_path and camp_row["account_ids_json"]:
+            try:
+                acc_ids = json.loads(camp_row["account_ids_json"])
+                if isinstance(acc_ids, list) and acc_ids:
+                    acc_row = request.app.state.conn.execute(
+                        "SELECT session_path, provider FROM accounts WHERE id = ?",
+                        (int(acc_ids[0]),),
+                    ).fetchone()
+                    if acc_row:
+                        session_path = acc_row["session_path"]
+                        provider = acc_row["provider"]
+            except Exception:
+                pass
+        tg_id, tg_hash = _resolve_tg_creds(request.app.state.conn)
+        has_tg_creds = bool(tg_id and tg_hash)
         wa_gateway = _gateway_for_provider(request, "whatsapp")
         if (
             camp_row
             and request.app.state.gateway is None
-            and str(camp_row["session_path"] or "").startswith("data/sessions/demo")
+            and str(session_path or "").startswith("data/sessions/demo")
         ):
             gateway = None
-        elif camp_row and str(camp_row["provider"] or "").strip().lower() == "whatsapp":
+        elif camp_row and str(provider or "").strip().lower() == "whatsapp":
             gateway = (
                 request.app.state.gateway
                 if request.app.state.gateway is not None
@@ -1603,7 +1657,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             and not has_tg_creds
         ):
             gateway = None
-        elif camp_row and camp_row["session_path"]:
+        elif camp_row and session_path:
             gateway = _gateway(request)
         else:
             gateway = request.app.state.gateway
@@ -1853,6 +1907,55 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             except Exception:
                 pass
         return res
+
+    class AiBotConfigIn(BaseModel):
+        enabled: bool = True
+        copilot_enabled: bool = True
+        auto_qualify: bool = True
+        goal: str = ""
+        classifier_prompt: str = ""
+        strategist_prompt: str = ""
+        generator_prompt: str = ""
+        selector_prompt: str = ""
+
+    @app.get("/api/ai-bot/config")
+    def ai_bot_config_get(request: Request):
+        row = request.app.state.conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'ai_bot_config'"
+        ).fetchone()
+        default_cfg = {
+            "enabled": True,
+            "copilot_enabled": True,
+            "auto_qualify": True,
+            "goal": "",
+            "classifier_prompt": "",
+            "strategist_prompt": "",
+            "generator_prompt": "",
+            "selector_prompt": "",
+        }
+        if row and row["value"]:
+            try:
+                parsed = json.loads(row["value"])
+                if isinstance(parsed, dict):
+                    default_cfg.update(parsed)
+            except Exception:
+                pass
+        return {"ok": True, "config": default_cfg}
+
+    @app.post("/api/ai-bot/config")
+    def ai_bot_config_save(body: AiBotConfigIn, request: Request):
+        cfg = body.model_dump()
+        now = utc_now()
+        request.app.state.conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at)
+            VALUES ('ai_bot_config', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (json.dumps(cfg, ensure_ascii=False), now),
+        )
+        request.app.state.conn.commit()
+        return {"ok": True, "config": cfg}
 
     from app.mcp_server import register_mcp_routes
 

@@ -90,8 +90,9 @@ def resolve_session(session_path: str) -> Path:
 def connect(db_path=None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -457,6 +458,8 @@ def _migrate_legacy_leads_status_check(conn: sqlite3.Connection) -> None:
         return
     cols = [r[1] for r in conn.execute("PRAGMA table_info(leads)").fetchall()]
     col_list = ", ".join(cols)
+    if conn.in_transaction:
+        conn.commit()
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
         conn.execute(
@@ -515,6 +518,8 @@ def _migrate_legacy_leads_status_check(conn: sqlite3.Connection) -> None:
         )
         conn.commit()
     finally:
+        if conn.in_transaction:
+            conn.commit()
         conn.execute("PRAGMA foreign_keys = ON")
 
 
@@ -648,6 +653,17 @@ def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
 
 
 def ensure_airtable_pipeline_stages(conn: sqlite3.Connection) -> list[dict]:
+    existing_rows = conn.execute(
+        "SELECT key, position FROM pipeline_stages"
+    ).fetchall()
+    existing_by_key = {str(r[0]): int(r[1]) for r in existing_rows}
+    airtable_keys = {k for k, _, _, _ in AIRTABLE_PIPELINE_STAGES}
+    all_present = airtable_keys.issubset(existing_by_key.keys())
+    airtable_positions = [
+        existing_by_key[k] for k in airtable_keys if k in existing_by_key
+    ]
+    positions_unique = len(airtable_positions) == len(set(airtable_positions))
+
     for key, label, position, color in AIRTABLE_PIPELINE_STAGES:
         conn.execute(
             """
@@ -656,10 +672,11 @@ def ensure_airtable_pipeline_stages(conn: sqlite3.Connection) -> list[dict]:
             """,
             (key, label, position, color),
         )
-        conn.execute(
-            "UPDATE pipeline_stages SET position = ? WHERE key = ?",
-            (position, key),
-        )
+        if not (all_present and positions_unique):
+            conn.execute(
+                "UPDATE pipeline_stages SET position = ? WHERE key = ?",
+                (position, key),
+            )
     conn.commit()
     return list_pipeline_stages(conn)
 
@@ -825,6 +842,8 @@ def bootstrap_prod_snapshot(conn: sqlite3.Connection) -> bool:
     if not isinstance(data, dict):
         return False
 
+    if conn.in_transaction:
+        conn.commit()
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
         if data.get("pipeline_stages"):
@@ -864,6 +883,8 @@ def bootstrap_prod_snapshot(conn: sqlite3.Connection) -> bool:
                 )
         conn.commit()
     finally:
+        if conn.in_transaction:
+            conn.commit()
         conn.execute("PRAGMA foreign_keys = ON")
     return True
 

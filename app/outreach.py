@@ -12,7 +12,12 @@ from app.accounts import _load as load_account
 from app.accounts import _public as public_account
 from app.accounts import increment_daily_sent
 from app.db import as_dict, utc_now, utc_today
-from app.inbox import _cache_messages, _record_lead_event_safe, stop_outreach_on_reply
+from app.inbox import (
+    _cache_messages,
+    _is_synthetic_peer_id,
+    _record_lead_event_safe,
+    stop_outreach_on_reply,
+)
 
 CAMPAIGN_STATUSES = ("draft", "running", "paused", "completed")
 RECIPIENT_STATUSES = ("pending", "in_progress", "completed", "replied", "failed")
@@ -102,16 +107,19 @@ HEADER_ALIASES = {
     "first_touch": "step1_text",
     "шаг 1": "step1_text",
     "step1": "step1_text",
+    "step1_text": "step1_text",
     "фоллоуап 1": "step2_text",
     "followup 1": "step2_text",
     "followup_1": "step2_text",
     "шаг 2": "step2_text",
     "step2": "step2_text",
+    "step2_text": "step2_text",
     "фоллоуап 2": "step3_text",
     "followup 2": "step3_text",
     "followup_2": "step3_text",
     "шаг 3": "step3_text",
     "step3": "step3_text",
+    "step3_text": "step3_text",
     "note": "note",
     "notes": "note",
     "comment": "note",
@@ -379,23 +387,31 @@ def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> l
 
 
 def _dialog_has_client_reply(conn, dialog: dict, rec: dict) -> bool:
-    if int(dialog.get("last_from_peer") or 0) == 1:
-        return True
-    dlg_id = int(dialog["id"])
-    last_sent_at = rec.get("last_sent_at")
     current_step = int(rec.get("current_step") or 0)
-    if last_sent_at:
+    last_sent_at = rec.get("last_sent_at")
+    if current_step < 1 and not last_sent_at:
+        return False
+    ref_ts = str(last_sent_at or rec.get("created_at") or "").strip()
+    if int(dialog.get("last_from_peer") or 0) == 1:
+        dlg_last_at = str(dialog.get("last_message_at") or "").strip()
+        if ref_ts and dlg_last_at:
+            if dlg_last_at >= ref_ts:
+                return True
+        else:
+            return True
+    dlg_id = int(dialog["id"])
+    if ref_ts:
         in_row = conn.execute(
             """
             SELECT id FROM messages
             WHERE dialog_id = ? AND direction = 'in' AND sent_at >= ?
             LIMIT 1
             """,
-            (dlg_id, str(last_sent_at)),
+            (dlg_id, ref_ts),
         ).fetchone()
         if in_row is not None:
             return True
-    if current_step >= 1:
+    elif current_step >= 1:
         any_in = conn.execute(
             """
             SELECT id FROM messages
@@ -1290,9 +1306,17 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
         existing_tg_id = lead_row["telegram_user_id"]
         if existing_tg_id is None:
             existing_tg_id = tg_id if tg_id is not None else (900000 + lead_id)
+            try:
+                conn.execute(
+                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                    (existing_tg_id, now, lead_id),
+                )
+            except sqlite3.IntegrityError:
+                pass
+        if company:
             conn.execute(
-                "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
-                (existing_tg_id, now, lead_id),
+                "UPDATE leads SET company = COALESCE(company, ?), description = COALESCE(description, ?), updated_at = ? WHERE id = ?",
+                (company, company, now, lead_id),
             )
         if phone and not lead_row["phone"]:
             conn.execute("UPDATE leads SET phone = ?, updated_at = ? WHERE id = ?", (phone, now, lead_id))
@@ -1306,8 +1330,8 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
         """
         INSERT INTO leads (
             account_id, telegram_user_id, username, name, phone,
-            status, note, next_step, created_at, updated_at, description, url, provider
-        ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)
+            status, note, next_step, created_at, updated_at, description, company, url, provider
+        ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             account_id,
@@ -1320,6 +1344,7 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
             now,
             now,
             company,
+            company,
             url_val,
             provider,
         ),
@@ -1327,10 +1352,13 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
     lead_id = int(cur.lastrowid)
     if tg_id is None:
         tg_id = 900000 + lead_id
-        conn.execute(
-            "UPDATE leads SET telegram_user_id = ? WHERE id = ?",
-            (tg_id, lead_id),
-        )
+        try:
+            conn.execute(
+                "UPDATE leads SET telegram_user_id = ? WHERE id = ?",
+                (tg_id, lead_id),
+            )
+        except sqlite3.IntegrityError:
+            pass
     return lead_id, int(tg_id)
 
 
@@ -1360,7 +1388,8 @@ def import_campaign_csv(
 
     now = utc_now()
     imported = 0
-    has_step3 = False
+    has_step2 = any((r.get("step2_text") or "").strip() for r in contacts)
+    has_step3 = any((r.get("step3_text") or "").strip() for r in contacts)
     detected_headers: list[str] = []
     for item in contacts:
         if not detected_headers and item.get("_headers"):
@@ -1379,6 +1408,8 @@ def import_campaign_csv(
         step1_text, error_reason = _clean_step1_text(item.get("step1_text"))
         step2_text = (item.get("step2_text") or "").strip() or None
         step3_text = (item.get("step3_text") or "").strip() or None
+        if step2_text:
+            has_step2 = True
         if step3_text:
             has_step3 = True
 
@@ -1443,13 +1474,13 @@ def import_campaign_csv(
         seen_leads.add(lead_id)
         imported += 1
 
-    if has_step3:
+    if has_step2 or has_step3:
         existing_steps = conn.execute(
             "SELECT step_order FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order",
             (campaign_id,),
         ).fetchall()
         existing_orders = {int(s["step_order"]) for s in existing_steps}
-        if existing_orders and 3 not in existing_orders:
+        if existing_orders:
             if 2 not in existing_orders:
                 conn.execute(
                     """
@@ -1458,13 +1489,14 @@ def import_campaign_csv(
                     """,
                     (campaign_id, now),
                 )
-            conn.execute(
-                """
-                INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, created_at)
-                VALUES (?, 3, 72, '{followup_2}', ?)
-                """,
-                (campaign_id, now),
-            )
+            if has_step3 and 3 not in existing_orders:
+                conn.execute(
+                    """
+                    INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, created_at)
+                    VALUES (?, 3, 72, '{followup_2}', ?)
+                    """,
+                    (campaign_id, now),
+                )
 
     if detected_headers:
         conn.execute(
@@ -1567,10 +1599,13 @@ def enroll_leads_from_crm(
 
         if tg_id is None:
             tg_id = 900000 + lid
-            conn.execute(
-                "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
-                (tg_id, now, lid),
-            )
+            try:
+                conn.execute(
+                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                    (tg_id, now, lid),
+                )
+            except sqlite3.IntegrityError:
+                pass
 
         if (
             lid in seen_leads
@@ -1581,11 +1616,16 @@ def enroll_leads_from_crm(
             skipped_count += 1
             continue
 
-        company = (lead.get("description") or "").strip() or None
+        company = (lead.get("company") or lead.get("description") or "").strip() or None
         if name and "·" in name and not company:
             parts = [p.strip() for p in name.split("·", 1)]
             if len(parts) == 2 and parts[1]:
                 company = parts[1]
+        if company and (not lead.get("company") or not lead.get("description")):
+            conn.execute(
+                "UPDATE leads SET company = COALESCE(company, ?), description = COALESCE(description, ?), updated_at = ? WHERE id = ?",
+                (company, company, now, lid),
+            )
         note = (lead.get("note") or "").strip() or None
         website = (lead.get("url") or "").strip() or None
 
@@ -1788,6 +1828,24 @@ async def run_campaign_batch(
         if not available:
             break
 
+        assigned_id = rec.get("assigned_account_id")
+        if assigned_id is not None and int(assigned_id) in state_by_id:
+            pinned_state = state_by_id[int(assigned_id)]
+            if pinned_state["sent_today"] < pinned_state["daily_limit"]:
+                chosen_state = pinned_state
+            elif step_idx >= 1:
+                continue
+            else:
+                chosen_state = min(
+                    available,
+                    key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
+                )
+        else:
+            chosen_state = min(
+                available,
+                key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
+            )
+
         if jitter_range is not None and len(jitter_range) == 2:
             j_min = max(0.0, float(jitter_range[0]))
             j_max = max(j_min, float(jitter_range[1]))
@@ -1795,19 +1853,6 @@ async def run_campaign_batch(
             jitter_delays_ms.append(int(round(j_sec * 1000)))
             if j_sec > 0:
                 await asyncio.sleep(j_sec)
-
-        assigned_id = rec.get("assigned_account_id")
-        if (
-            assigned_id is not None
-            and int(assigned_id) in state_by_id
-            and state_by_id[int(assigned_id)]["sent_today"] < state_by_id[int(assigned_id)]["daily_limit"]
-        ):
-            chosen_state = state_by_id[int(assigned_id)]
-        else:
-            chosen_state = min(
-                available,
-                key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
-            )
 
         chosen_account_id = chosen_state["id"]
         account_raw = chosen_state["raw"]
@@ -1831,7 +1876,7 @@ async def run_campaign_batch(
                     conn, chosen_account_id, rec, now, provider="whatsapp"
                 )
             else:
-                if use_gateway and rec.get("username") and (not rec.get("telegram_user_id") or int(rec["telegram_user_id"]) >= 900000):
+                if use_gateway and rec.get("username") and (not rec.get("telegram_user_id") or _is_synthetic_peer_id(rec["telegram_user_id"])):
                     found = await active_gw.search_dialogs(session_path, f"@{rec['username']}", limit=1)
                     if found and found[0].get("telegram_user_id"):
                         real_tg_id = int(found[0]["telegram_user_id"])
@@ -1907,7 +1952,7 @@ async def run_campaign_batch(
                 if use_gateway:
                     peer_target = (
                         f"@{rec['username']}"
-                        if (int(dialog["peer_id"]) >= 900000 and rec.get("username"))
+                        if (_is_synthetic_peer_id(dialog["peer_id"]) and rec.get("username"))
                         else dialog["peer_id"]
                     )
                     sent = await active_gw.send_message(

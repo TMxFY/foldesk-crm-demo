@@ -241,10 +241,19 @@ class TelethonGateway(TelegramGateway):
         if not session_path:
             return
         clean = (proxy_url or "").strip() or None
+        old_proxy = self._proxies.get(session_path)
         if clean:
             self._proxies[session_path] = clean
         else:
             self._proxies.pop(session_path, None)
+        if clean != old_proxy:
+            old_client = self._clients.pop(session_path, None)
+            if old_client is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(old_client.disconnect())
+                except Exception:
+                    pass
 
     def set_app_credentials(
         self, session_path: str, app_id: int | str | None, app_hash: str | None
@@ -321,7 +330,14 @@ class TelethonGateway(TelegramGateway):
         proxy_tuple = _parse_proxy_for_telethon(self._resolve_proxy(session_path))
         kwargs = {"proxy": proxy_tuple} if proxy_tuple else {}
         client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
-        await client.connect()
+        try:
+            await client.connect()
+        except Exception:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
         self._clients[session_path] = client
         return client, False
 
@@ -662,6 +678,11 @@ class TelethonGateway(TelegramGateway):
             except Exception:
                 client.remove_event_handler(handler)
                 self._clients.pop(session_path, None)
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                except Exception:
+                    pass
                 raise
 
         try:
@@ -669,6 +690,11 @@ class TelethonGateway(TelegramGateway):
         finally:
             client.remove_event_handler(handler)
             self._clients.pop(session_path, None)
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
 
     async def _resolve_username(self, client, query: str) -> list:
         from telethon.tl.types import User

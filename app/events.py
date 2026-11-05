@@ -25,7 +25,14 @@ STATUS_LABELS_RU = {
 
 
 def ensure_events_table(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lead_events'"
+        ).fetchone()
+        is not None
+    ):
+        return
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS lead_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,9 +41,13 @@ def ensure_events_table(conn: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             meta_json TEXT,
             created_at TEXT NOT NULL
-        );
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS lead_events_lead_created
-            ON lead_events(lead_id, created_at);
+            ON lead_events(lead_id, created_at)
         """
     )
 
@@ -148,6 +159,7 @@ log_lead_event = record_lead_event
 
 
 def list_lead_events(conn: sqlite3.Connection, lead_id: int, limit: int = 200) -> list[dict]:
+    was_in_tx = bool(getattr(conn, "in_transaction", False))
     ensure_events_table(conn)
     lid = int(lead_id)
     cap = max(1, int(limit or 200))
@@ -175,7 +187,7 @@ def list_lead_events(conn: sqlite3.Connection, lead_id: int, limit: int = 200) -
                 f"Лид создан: {label}",
                 {"status": ld.get("status") or "new", "provider": ld.get("provider") or "telegram"},
                 created_at=ld.get("created_at") or utc_now(),
-                commit=True,
+                commit=not was_in_tx,
             )
             rows = conn.execute(
                 """
@@ -375,8 +387,6 @@ def get_today_focus(
             "created_at": t.get("created_at"),
         }
         open_tasks.append(task_item)
-    if not due_reminders and open_tasks:
-        due_reminders = list(open_tasks)
 
     # 3. stale_leads: leads in talking / waiting without updates
     cutoff_days = max(0, int(stale_days if stale_days is not None else 3))
@@ -479,8 +489,8 @@ def get_today_focus(
             "open_tasks": len(open_tasks),
             "stale_leads": len(stale_leads),
             "today_calls": len(today_calls),
-            "total": len(waiting_reply) + len(due_reminders) + len(stale_leads),
-            "total_focus": len(waiting_reply) + len(due_reminders) + len(stale_leads),
+            "total": len(waiting_reply) + len(due_reminders) + len(stale_leads) + len(today_calls),
+            "total_focus": len(waiting_reply) + len(due_reminders) + len(stale_leads) + len(today_calls),
         },
         "generated_at": now_iso,
     }

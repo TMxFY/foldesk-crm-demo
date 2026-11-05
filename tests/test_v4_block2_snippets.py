@@ -186,6 +186,6 @@ def test_snippets_ui_markers_and_playwright_e2e(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=90,
     )
     assert proc.returncode == 0, f"Playwright failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

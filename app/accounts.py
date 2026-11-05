@@ -168,11 +168,35 @@ def update_account_settings(
     return _public(_load(conn, account_id))
 
 
+def _unlink_account_refs(conn, account_ids: list[int]) -> None:
+    if not account_ids:
+        return
+    for aid in account_ids:
+        try:
+            conn.execute("UPDATE leads SET account_id = NULL WHERE account_id = ?", (aid,))
+        except sqlite3.IntegrityError:
+            lead_rows = conn.execute(
+                "SELECT id FROM leads WHERE account_id = ?", (aid,)
+            ).fetchall()
+            for lrow in lead_rows:
+                lid = lrow[0]
+                try:
+                    conn.execute("UPDATE leads SET account_id = NULL WHERE id = ?", (lid,))
+                except sqlite3.IntegrityError:
+                    conn.execute(
+                        "UPDATE leads SET account_id = NULL, telegram_user_id = NULL WHERE id = ?",
+                        (lid,),
+                    )
+        try:
+            conn.execute("UPDATE campaigns SET account_id = NULL WHERE account_id = ?", (aid,))
+        except sqlite3.OperationalError:
+            pass
+
+
 def delete_account(conn, account_id: int) -> dict:
     current = _load(conn, account_id)
     session_path = str(current.get("session_path") or "").strip()
-    conn.execute("UPDATE leads SET account_id = NULL WHERE account_id = ?", (account_id,))
-    conn.execute("UPDATE campaigns SET account_id = NULL WHERE account_id = ?", (account_id,))
+    _unlink_account_refs(conn, [int(account_id)])
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     conn.commit()
     if (
@@ -335,6 +359,19 @@ def restore_disk_sessions(conn) -> int:
                     (now, account_id),
                 )
                 restored += 1
+            elif (
+                row.get("health") == "offline"
+                and "InvokeWithLayerRequest" in str(row.get("last_error") or "")
+            ):
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET health = 'active', last_error = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, account_id),
+                )
+                restored += 1
             connected_phones.add(str(row.get("phone") or "").strip())
 
     # Register any authorized .session files on disk that are missing from accounts table
@@ -378,10 +415,17 @@ def restore_disk_sessions(conn) -> int:
     # Remove stale duplicate pending_code/error rows for already connected phones
     for c_phone in connected_phones:
         if c_phone:
-            conn.execute(
-                "DELETE FROM accounts WHERE phone = ? AND status IN ('pending_code', 'error')",
+            stale_rows = conn.execute(
+                "SELECT id FROM accounts WHERE phone = ? AND status IN ('pending_code', 'error')",
                 (c_phone,),
-            )
+            ).fetchall()
+            stale_ids = [int(r[0]) for r in stale_rows]
+            if stale_ids:
+                _unlink_account_refs(conn, stale_ids)
+                conn.execute(
+                    "DELETE FROM accounts WHERE phone = ? AND status IN ('pending_code', 'error')",
+                    (c_phone,),
+                )
 
     conn.commit()
     return restored
@@ -406,7 +450,7 @@ async def start_login(
     clean_proxy = (proxy_url or "").strip() or None
     clean_scope = (access_scope or "workspace").strip() or "workspace"
 
-    # If this phone already has a connected session with an active MTProto auth key, reuse it
+    # If this phone already has a connected session with an active MTProto/WhatsApp session, reuse it
     existing_connected = conn.execute(
         """
         SELECT id, session_path, proxy_url, access_scope, health
@@ -419,7 +463,10 @@ async def start_login(
     if (
         existing_connected
         and existing_connected["health"] == "active"
-        and _inspect_telethon_session(existing_connected["session_path"]) is not None
+        and (
+            _inspect_telethon_session(existing_connected["session_path"]) is not None
+            or _inspect_whatsmeow_db(existing_connected["session_path"]) is not None
+        )
     ):
         return {
             "id": int(existing_connected["id"]),
@@ -432,6 +479,16 @@ async def start_login(
         }
 
     # Remove previous unfinished/error attempts for the same phone + provider
+    stale_rows = conn.execute(
+        """
+        SELECT id FROM accounts
+        WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
+        """,
+        (phone, norm_provider),
+    ).fetchall()
+    stale_ids = [int(r[0]) for r in stale_rows]
+    if stale_ids:
+        _unlink_account_refs(conn, stale_ids)
     conn.execute(
         """
         DELETE FROM accounts
@@ -442,16 +499,22 @@ async def start_login(
     conn.commit()
     if existing_connected:
         account_id = int(existing_connected["id"])
-        old_sess = resolve_session(existing_connected["session_path"] or f"data/sessions/{account_id}.session")
-        if old_sess.exists():
+        old_sess_rel = existing_connected["session_path"] or f"data/sessions/{account_id}.session"
+        old_sess = resolve_session(old_sess_rel)
+        has_live_sess = (
+            _inspect_telethon_session(old_sess_rel) is not None
+            or _inspect_whatsmeow_db(old_sess_rel) is not None
+        )
+        if old_sess.exists() and not has_live_sess:
             try:
                 old_sess.unlink()
             except Exception:
                 pass
-        conn.execute(
-            "UPDATE accounts SET session_blob = NULL WHERE id = ?",
-            (account_id,),
-        )
+        if not has_live_sess:
+            conn.execute(
+                "UPDATE accounts SET session_blob = NULL WHERE id = ?",
+                (account_id,),
+            )
     else:
         cur = conn.execute(
             """
@@ -715,7 +778,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 tg_id = None
         if tg_id is None:
             if provider == "whatsapp" and phone_digits.isdigit():
-                tg_id = int(phone_digits[-12:])
+                tg_id = int(phone_digits[-15:])
             else:
                 seed_int = int(hashlib.md5(phone.encode("utf-8")).hexdigest()[:8], 16)
                 tg_id = 77000000 + (seed_int % 9000000)
@@ -822,14 +885,9 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 gateway.set_app_credentials(session_path, app_id_val, app_hash_val)
 
         existing = conn.execute(
-            "SELECT id FROM accounts WHERE phone = ? AND provider = ? ORDER BY id LIMIT 1",
+            "SELECT id FROM accounts WHERE phone = ? AND COALESCE(provider, 'telegram') = ? ORDER BY id LIMIT 1",
             (phone, provider),
         ).fetchone()
-        if existing is None:
-            existing = conn.execute(
-                "SELECT id FROM accounts WHERE phone = ? ORDER BY id LIMIT 1",
-                (phone,),
-            ).fetchone()
         if existing:
             account_id = int(existing["id"])
             conn.execute(
@@ -883,6 +941,8 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 ),
             )
             account_id = int(cur.lastrowid)
+
+        _sync_session_blob(conn, account_id)
 
         if gateway is not None and hasattr(gateway, "_pending") and isinstance(gateway._pending, dict):
             gateway._pending[session_path] = {

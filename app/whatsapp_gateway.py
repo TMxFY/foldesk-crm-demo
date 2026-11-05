@@ -101,7 +101,7 @@ def _inspect_whatsmeow_db(session_path: str) -> dict | None:
                 "raw_jid": raw_jid,
                 "wa_jid": f"{digits}@s.whatsapp.net",
                 "phone": f"+{digits}",
-                "telegram_user_id": int(digits[-12:]),
+                "telegram_user_id": int(digits[-15:]),
                 "name": push_name or f"WhatsApp +{digits}",
             }
     except Exception:
@@ -188,6 +188,16 @@ class WhatsAppGateway(TelegramGateway):
         self.sent = []
         self.presence_log = []
         self._message_seq = 5000
+        try:
+            if DEFAULT_DB.exists():
+                with sqlite3.connect(DEFAULT_DB) as conn:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(telegram_message_id), 5000) FROM messages"
+                    ).fetchone()
+                    if row and row[0] is not None:
+                        self._message_seq = max(5000, int(row[0]))
+        except Exception:
+            pass
         self._lock = threading.Lock()
         self._listeners = {}
         self._backlog = {}
@@ -310,7 +320,7 @@ class WhatsAppGateway(TelegramGateway):
                 info = _inspect_whatsmeow_db(session_path) or {
                     "wa_jid": f"{digits}@s.whatsapp.net" if digits else None,
                     "phone": f"+{digits}" if digits else None,
-                    "telegram_user_id": int(digits[-12:]) if digits else None,
+                    "telegram_user_id": int(digits[-15:]) if digits else None,
                     "name": bname or (f"WhatsApp +{digits}" if digits else "WhatsApp"),
                 }
                 p = self._pending.setdefault(session_path, {})
@@ -353,7 +363,7 @@ class WhatsAppGateway(TelegramGateway):
                 ).strip()
                 if not text:
                     return
-                peer_id = int(digits[-12:])
+                peer_id = int(digits[-15:])
                 push_name = str(getattr(info_proto, "Pushname", "") or f"WA +{digits}").strip()
                 self._message_seq += 1
                 payload = {
@@ -527,7 +537,7 @@ class WhatsAppGateway(TelegramGateway):
             raise GatewayError("Неверный код сопряжения WhatsApp")
 
         digits = re.sub(r"\D", "", clean_phone) or "79990000000"
-        int_from_phone = int(digits[-12:]) if digits else 79990000000
+        int_from_phone = int(digits[-15:]) if digits else 79990000000
         wa_jid = f"{digits}@s.whatsapp.net"
 
         path = resolve_session(session_path)
@@ -555,7 +565,7 @@ class WhatsAppGateway(TelegramGateway):
         digits = re.sub(r"\D", "", phone) or "79990000000"
         return {
             "status": "connected",
-            "telegram_user_id": int(digits[-12:]),
+            "telegram_user_id": int(digits[-15:]),
             "telegram_username": None,
             "telegram_name": f"WhatsApp {phone}",
             "wa_jid": f"{digits}@s.whatsapp.net",
@@ -618,7 +628,7 @@ class WhatsAppGateway(TelegramGateway):
                         digits = re.sub(r"\D", "", u_part)
                         if not digits:
                             continue
-                        peer_id = int(digits[-12:])
+                        peer_id = int(digits[-15:])
                         if peer_id in seen_peers:
                             continue
                         seen_peers.add(peer_id)
@@ -697,7 +707,7 @@ class WhatsAppGateway(TelegramGateway):
 
         digits = re.sub(r"\D", "", q)
         if digits and len(digits) >= 7 and not matched:
-            peer_id = int(digits[-12:])
+            peer_id = int(digits[-15:])
             matched.append(
                 {
                     "telegram_user_id": peer_id,
@@ -725,7 +735,7 @@ class WhatsAppGateway(TelegramGateway):
             peer_key = int(peer_id)
         else:
             digits = re.sub(r"\D", "", str(peer_id))
-            peer_key = int(digits[-12:]) if digits else str(peer_id).strip()
+            peer_key = int(digits[-15:]) if digits else str(peer_id).strip()
 
         if simulate_typing:
             self.presence_log.append(
@@ -844,7 +854,7 @@ class WhatsAppGateway(TelegramGateway):
             digits = re.sub(r"\D", "", str(raw or ""))
             if not digits or len(digits) < 7:
                 continue
-            peer_id = int(digits[-12:])
+            peer_id = int(digits[-15:])
             results.append(
                 {
                     "phone": f"+{digits}",

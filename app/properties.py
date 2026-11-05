@@ -1,3 +1,4 @@
+import re
 import sqlite3
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -28,7 +29,11 @@ def _key(name: str) -> str:
 
 
 def _cents(text: str) -> int:
-    cleaned = text.replace(" ", "").replace(",", ".")
+    cleaned = re.sub(r"[\s$€₽£]", "", str(text))
+    if re.search(r",\d{3}(?:\D|$)", cleaned):
+        cleaned = cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(",", ".")
     try:
         number = Decimal(cleaned)
     except InvalidOperation as exc:

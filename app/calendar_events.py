@@ -295,6 +295,30 @@ def update_calendar_event(conn: sqlite3.Connection, event_id: int, **fields) -> 
                 default_time=default_time,
                 required=False,
             )
+    elif "start_at" in updates and curr.get("end_at"):
+        old_start_dt = _parse_iso_dt(str(curr.get("start_at") or ""))
+        old_end_dt = _parse_iso_dt(str(curr.get("end_at") or ""))
+        new_start_dt = _parse_iso_dt(updates["start_at"])
+        if (
+            old_start_dt is not None
+            and old_end_dt is not None
+            and new_start_dt is not None
+        ):
+            shifted_end_dt = old_end_dt + (new_start_dt - old_start_dt)
+            if shifted_end_dt < new_start_dt:
+                shifted_end_dt = new_start_dt
+            updates["end_at"] = (
+                shifted_end_dt.strftime("%Y-%m-%d")
+                if is_all_day
+                else shifted_end_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            )
+        elif str(curr.get("end_at") or "") < updates["start_at"]:
+            updates["end_at"] = updates["start_at"]
+
+    eff_start = updates.get("start_at") or str(curr.get("start_at") or "")
+    eff_end = updates.get("end_at") if "end_at" in updates else curr.get("end_at")
+    if eff_start and eff_end and str(eff_end) < str(eff_start):
+        updates["end_at"] = eff_start
 
     if "lead_id" in fields:
         raw_lid = fields["lead_id"]
@@ -566,18 +590,17 @@ def list_calendar_items(
                     next_step_obj = st_obj
                     break
 
+        if next_step_obj is None:
+            continue
         last_sent_str = cr.get("last_sent_at") or cr.get("updated_at")
         base_dt = _parse_iso_dt(last_sent_str)
         if base_dt is None:
             continue
-        if next_step_obj is not None:
-            delay_hours = max(1, int(next_step_obj.get("delay_hours") or 24))
-            next_step_num = int(next_step_obj.get("step_order") or (curr_step + 1))
-        elif cr.get("last_sent_at"):
-            delay_hours = 24
-            next_step_num = curr_step + 1
+        if next_step_obj.get("delay_hours") is not None:
+            delay_hours = max(0, int(next_step_obj["delay_hours"]))
         else:
-            continue
+            delay_hours = 24
+        next_step_num = int(next_step_obj.get("step_order") or (curr_step + 1))
 
         due_dt = base_dt + timedelta(hours=delay_hours)
         due_iso = due_dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -709,7 +732,7 @@ def reschedule_calendar_item(
                 resolved_kind = "reminder"
             elif p in ("followup", "lead_followup"):
                 resolved_kind = "lead_followup"
-            elif p in ("camp", "campaign_step"):
+            elif p in ("camp", "campaign_step", "outreach_step"):
                 resolved_kind = "campaign_step"
             else:
                 resolved_kind = p
@@ -877,6 +900,128 @@ def reschedule_calendar_item(
             "new_date": new_date,
             "new_start_at": fu_start,
             "needs_airtable_push": needs_airtable,
+        }
+
+    # 4. Campaign recipient outreach step (campaign_step)
+    elif resolved_kind in ("camp", "campaign_step", "outreach_step"):
+        rec_row = conn.execute(
+            "SELECT * FROM campaign_recipients WHERE id = ?", (resolved_id,)
+        ).fetchone()
+        if rec_row is None:
+            raise LookupError("campaign_recipient")
+        rec = as_dict(rec_row)
+        cid = int(rec["campaign_id"])
+        curr_step = int(rec.get("current_step") or 0)
+        step_number = curr_step + 1
+        step_row = conn.execute(
+            "SELECT * FROM campaign_steps WHERE campaign_id = ? AND step_order = ? ORDER BY id ASC LIMIT 1",
+            (cid, step_number),
+        ).fetchone()
+        if step_row is None:
+            step_row = conn.execute(
+                "SELECT * FROM campaign_steps WHERE campaign_id = ? AND step_order > ? ORDER BY step_order ASC LIMIT 1",
+                (cid, curr_step),
+            ).fetchone()
+        if step_row is not None:
+            sd = as_dict(step_row)
+            step_number = int(sd.get("step_order") or step_number)
+            delay_hours = (
+                max(0, int(sd["delay_hours"]))
+                if sd.get("delay_hours") is not None
+                else 24
+            )
+        else:
+            delay_hours = 24
+
+        old_base_dt = _parse_iso_dt(
+            rec.get("last_sent_at") or rec.get("updated_at") or rec.get("created_at")
+        )
+        if old_base_dt is not None:
+            old_due_dt = old_base_dt + timedelta(hours=delay_hours)
+            default_time = old_due_dt.strftime("%H:%M:%S")
+        else:
+            default_time = "10:00:00"
+
+        new_target_iso = _normalize_calendar_datetime(
+            new_start_at,
+            all_day=False,
+            default_time=default_time,
+            required=True,
+        )
+        new_target_dt = _parse_iso_dt(new_target_iso)
+        new_last_sent_iso = (
+            new_target_dt - timedelta(hours=delay_hours)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        now = utc_now()
+        conn.execute(
+            "UPDATE campaign_recipients SET last_sent_at = ?, updated_at = ? WHERE id = ?",
+            (new_last_sent_iso, now, resolved_id),
+        )
+
+        lead_id_val = int(rec["lead_id"]) if rec.get("lead_id") is not None else None
+        ld_info: dict = {}
+        if lead_id_val is not None:
+            conn.execute(
+                "UPDATE leads SET next_follow_up = ?, updated_at = ? WHERE id = ?",
+                (new_target_iso[:10], now, lead_id_val),
+            )
+            l_row = conn.execute(
+                "SELECT name, username, company, status FROM leads WHERE id = ?",
+                (lead_id_val,),
+            ).fetchone()
+            if l_row is not None:
+                ld_info = as_dict(l_row)
+
+        conn.commit()
+        camp_row = conn.execute(
+            "SELECT name FROM campaigns WHERE id = ?", (cid,)
+        ).fetchone()
+        camp_name = (
+            (camp_row["name"] if camp_row and camp_row["name"] else None)
+            or f"Кампания #{cid}"
+        )
+        rec_name = (
+            rec.get("name")
+            or ld_info.get("name")
+            or rec.get("username")
+            or ld_info.get("username")
+            or rec.get("phone")
+            or f"Получатель #{resolved_id}"
+        )
+        camp_item = {
+            "id": resolved_id,
+            "uid": f"camp:{resolved_id}",
+            "item_kind": "campaign_step",
+            "title": f"Шаг {step_number} ({camp_name}): {rec_name}",
+            "event_type": "outreach_step",
+            "start_at": new_target_iso,
+            "end_at": None,
+            "date": new_target_iso[:10],
+            "all_day": False,
+            "lead_id": lead_id_val,
+            "lead_name": rec_name,
+            "lead_username": rec.get("username") or ld_info.get("username"),
+            "lead_company": rec.get("company") or ld_info.get("company"),
+            "lead_status": ld_info.get("status"),
+            "meet_link": None,
+            "notes": None,
+            "status": "scheduled",
+            "source": "crm",
+            "external_id": None,
+            "color": EVENT_TYPE_COLORS["outreach_step"],
+            "campaign_id": cid,
+            "step_order": step_number,
+            "last_sent_at": new_last_sent_iso,
+        }
+        return {
+            **camp_item,
+            "ok": True,
+            "item": camp_item,
+            "item_kind": "campaign_step",
+            "item_id": resolved_id,
+            "new_date": new_target_iso[:10],
+            "new_start_at": new_target_iso,
+            "needs_airtable_push": False,
         }
 
     raise ValueError(f"Неподдерживаемый тип элемента календаря: {resolved_kind}")

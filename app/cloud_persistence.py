@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -157,21 +158,39 @@ def backup_to_cloud(
     conn: sqlite3.Connection | None = None,
     db_path: Path = DEFAULT_DB,
 ) -> dict[str, Any]:
-    cfg = _resolve_r2_config(conn)
+    in_bg_thread = threading.current_thread() is not threading.main_thread()
+    use_separate_conn = conn is None or in_bg_thread
+    cfg = _resolve_r2_config(None if use_separate_conn else conn)
     if not cfg:
         return {"ok": False, "configured": False, "reason": "R2 credentials not set"}
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
+    sessions_map: dict[str, str] = {}
     try:
-        src_conn = conn if conn is not None else sqlite3.connect(db_path)
-        dst_conn = sqlite3.connect(tmp_path)
+        src_conn = (
+            sqlite3.connect(db_path, timeout=30.0)
+            if use_separate_conn
+            else conn
+        )
+        dst_conn = sqlite3.connect(tmp_path, timeout=30.0)
         try:
             src_conn.backup(dst_conn)
+            try:
+                rows = src_conn.execute(
+                    "SELECT session_path, session_blob FROM accounts WHERE session_blob IS NOT NULL"
+                ).fetchall()
+                for s_path, s_blob in rows:
+                    if s_path and s_blob and len(bytes(s_blob)) > 100:
+                        fname = Path(str(s_path)).name
+                        if fname.endswith(".session"):
+                            sessions_map[fname] = base64.b64encode(bytes(s_blob)).decode("ascii")
+            except Exception:
+                pass
         finally:
             dst_conn.close()
-            if conn is None:
+            if use_separate_conn:
                 src_conn.close()
         db_bytes = tmp_path.read_bytes()
     finally:
@@ -179,7 +198,6 @@ def backup_to_cloud(
             tmp_path.unlink()
 
     sessions_dir = ROOT / "data" / "sessions"
-    sessions_map: dict[str, str] = {}
     if sessions_dir.exists():
         for sf in sorted(sessions_dir.glob("*.session")):
             if sf.is_file() and sf.stat().st_size > 100:
@@ -238,6 +256,33 @@ def restore_from_cloud(db_path: Path = DEFAULT_DB) -> dict[str, Any]:
     if not db_b64:
         return {"ok": False, "restored": False, "configured": True}
 
+    saved_at = str(bundle.get("saved_at") or "")
+    if saved_at and db_path.exists() and db_path.stat().st_size > 4096:
+        try:
+            local_conn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                local_max = ""
+                for tbl, col in (("leads", "updated_at"), ("dialogs", "updated_at"), ("messages", "sent_at")):
+                    try:
+                        row = local_conn.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()
+                        if row and row[0] and str(row[0]) > local_max:
+                            local_max = str(row[0])
+                    except Exception:
+                        pass
+                if local_max and local_max > saved_at:
+                    return {
+                        "ok": True,
+                        "restored": False,
+                        "configured": True,
+                        "reason": "local_db_newer",
+                        "local_updated_at": local_max,
+                        "cloud_saved_at": saved_at,
+                    }
+            finally:
+                local_conn.close()
+        except Exception:
+            pass
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_path.write_bytes(base64.b64decode(db_b64))
 
@@ -279,14 +324,19 @@ def schedule_cloud_backup(app: Any, delay_seconds: float = 1.5) -> None:
         return
     existing_task = getattr(app.state, "cloud_backup_task", None)
     if existing_task is not None and not existing_task.done():
+        app.state._cloud_backup_rerun = True
         return
 
     async def _runner():
-        await asyncio.sleep(delay_seconds)
-        try:
-            await asyncio.to_thread(backup_to_cloud, getattr(app.state, "conn", None))
-        except Exception:
-            pass
+        while True:
+            app.state._cloud_backup_rerun = False
+            await asyncio.sleep(delay_seconds)
+            try:
+                await asyncio.to_thread(backup_to_cloud, None, DEFAULT_DB)
+            except Exception:
+                pass
+            if not getattr(app.state, "_cloud_backup_rerun", False):
+                break
 
     try:
         loop = asyncio.get_running_loop()

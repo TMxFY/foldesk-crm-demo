@@ -726,12 +726,28 @@ def add_lead_from_dialog(
     provider=None,
     amount=None,
     currency=None,
+    status: str = "new",
+    note: str | None = None,
+    next_step: str | None = None,
+    description: str | None = None,
+    email: str | None = None,
+    url: str | None = None,
+    company: str | None = None,
+    niche: str | None = None,
+    offer_type: str | list[str] | None = None,
+    offer_details: str | None = None,
+    monthly_value: int | float | str | None = None,
+    lead_source: str | None = None,
+    next_follow_up: str | None = None,
+    last_contacted: str | None = None,
+    airtable_record_id: str | None = None,
 ) -> dict:
     if telegram_user_id is None and phone:
         telegram_user_id = _phone_digits_id(phone)
     if account_id is None or telegram_user_id is None:
         raise ValueError("Нужны account_id и telegram_user_id")
 
+    dlg = None
     dlg_row = conn.execute(
         """
         SELECT * FROM dialogs
@@ -771,29 +787,84 @@ def add_lead_from_dialog(
             updates["amount"] = _clean_amount(amount)
         if currency is not None:
             updates["currency"] = _clean_currency(currency)
+        if status is not None and str(status).strip() and normalize_status(status, conn) != "new":
+            updates["status"] = status
+        if monthly_value is not None and int(_clean_amount(monthly_value)) > 0:
+            updates["monthly_value"] = _clean_amount(monthly_value)
+        for opt_key, opt_val in (
+            ("note", note),
+            ("next_step", next_step),
+            ("description", description),
+            ("email", email),
+            ("url", url),
+            ("company", company),
+            ("niche", niche),
+            ("offer_type", offer_type),
+            ("offer_details", offer_details),
+            ("lead_source", lead_source),
+            ("next_follow_up", next_follow_up),
+            ("last_contacted", last_contacted),
+            ("airtable_record_id", airtable_record_id),
+        ):
+            if opt_val is not None:
+                updates[opt_key] = opt_val
         if updates:
             existing = update_lead(conn, existing["id"], **updates)
-        return existing
-    try:
-        return create_lead(
-            conn,
-            account_id=account_id,
-            telegram_user_id=telegram_user_id,
-            username=username,
-            name=name,
-            phone=phone,
-            provider=resolved_provider,
-            status="new",
-            amount=amount if amount is not None else 0,
-            currency=currency if currency is not None else "USD",
-        )
-    except ValueError:
-        existing = _find_dialog_lead(
-            conn, account_id, telegram_user_id, phone=phone, provider=resolved_provider
-        )
-        if existing:
-            return existing
-        raise
+        lead = existing
+    else:
+        try:
+            lead = create_lead(
+                conn,
+                account_id=account_id,
+                telegram_user_id=telegram_user_id,
+                username=username,
+                name=name,
+                phone=phone,
+                provider=resolved_provider,
+                status=status if status is not None else "new",
+                note=note,
+                next_step=next_step,
+                description=description,
+                email=email,
+                url=url,
+                amount=amount if amount is not None else 0,
+                currency=currency if currency is not None else "USD",
+                company=company,
+                niche=niche,
+                offer_type=offer_type,
+                offer_details=offer_details,
+                monthly_value=monthly_value if monthly_value is not None else 0,
+                lead_source=lead_source,
+                next_follow_up=next_follow_up,
+                last_contacted=last_contacted,
+                airtable_record_id=airtable_record_id,
+            )
+        except ValueError:
+            existing = _find_dialog_lead(
+                conn, account_id, telegram_user_id, phone=phone, provider=resolved_provider
+            )
+            if not existing:
+                raise
+            lead = existing
+
+    if dlg is not None:
+        dlg_id = int(dlg["id"])
+        lid = int(lead["id"])
+        now = utc_now()
+        if dlg.get("lead_id") != lid:
+            conn.execute(
+                "UPDATE dialogs SET lead_id = ?, updated_at = ? WHERE id = ?",
+                (lid, now, dlg_id),
+            )
+        if lead.get("dialog_id") != dlg_id:
+            conn.execute(
+                "UPDATE leads SET dialog_id = ?, updated_at = ? WHERE id = ?",
+                (dlg_id, now, lid),
+            )
+        conn.commit()
+        lead = get_lead(conn, lid)
+
+    return lead
 
 
 BULK_ACTIONS = ("set_status", "set_folder", "set_amount", "enroll_campaign", "delete")
@@ -942,6 +1013,13 @@ def bulk_leads_action(
         raw_folder = folder_id if folder_id is not None else value
         if raw_folder is None or str(raw_folder).strip().lower() in ("", "0", "none", "null"):
             resolved_folder = None
+            for chunk in _iter_chunks(existing_ids):
+                ep = ",".join("?" for _ in chunk)
+                conn.execute(
+                    f"UPDATE leads SET folder_id = ?, updated_at = ? WHERE id IN ({ep})",
+                    [None, now, *chunk],
+                )
+            updated_ids = list(existing_ids)
         else:
             try:
                 resolved_folder = int(raw_folder)
@@ -953,18 +1031,31 @@ def bulk_leads_action(
             ).fetchone()
             if f_row is None:
                 raise ValueError("Папка не найдена")
-        for chunk in _iter_chunks(existing_ids):
-            ep = ",".join("?" for _ in chunk)
-            conn.execute(
-                f"UPDATE leads SET folder_id = ?, updated_at = ? WHERE id IN ({ep})",
-                [resolved_folder, now, *chunk],
-            )
+            folder_acc_id = int(f_row["account_id"])
+            updated_ids = []
+            for lid in existing_ids:
+                lead_acc = existing_by_id[lid].get("account_id")
+                if lead_acc is None:
+                    try:
+                        conn.execute(
+                            "UPDATE leads SET account_id = ?, folder_id = ?, updated_at = ? WHERE id = ?",
+                            (folder_acc_id, resolved_folder, now, lid),
+                        )
+                        updated_ids.append(lid)
+                    except sqlite3.IntegrityError:
+                        pass
+                elif int(lead_acc) == folder_acc_id:
+                    conn.execute(
+                        "UPDATE leads SET folder_id = ?, updated_at = ? WHERE id = ?",
+                        (resolved_folder, now, lid),
+                    )
+                    updated_ids.append(lid)
         conn.commit()
         return {
             "ok": True,
             "action": "set_folder",
-            "updated": len(existing_ids),
-            "lead_ids": existing_ids,
+            "updated": len(updated_ids),
+            "lead_ids": updated_ids,
             "folder_id": resolved_folder,
         }
 
@@ -1345,6 +1436,11 @@ def merge_leads(conn, source_lead_id: int, target_lead_id: int) -> dict:
             "UPDATE lead_events SET lead_id = ? WHERE lead_id = ?",
             (target_id, source_id),
         )
+    if _has_table(conn, "calendar_events"):
+        conn.execute(
+            "UPDATE calendar_events SET lead_id = ? WHERE lead_id = ?",
+            (target_id, source_id),
+        )
 
     # 2. Transfer property_values (respecting UNIQUE(property_id, lead_id))
     src_props = conn.execute(
@@ -1402,9 +1498,25 @@ def merge_leads(conn, source_lead_id: int, target_lead_id: int) -> dict:
         "next_step",
         "folder_id",
         "dialog_id",
+        "company",
+        "niche",
+        "offer_type",
+        "offer_details",
+        "lead_source",
+        "next_follow_up",
+        "last_contacted",
+        "airtable_record_id",
+        "airtable_status",
+        "airtable_synced_at",
     ):
         t_val = target.get(col)
         s_val = source.get(col)
+        if col == "offer_type":
+            t_empty = not _parse_offer_type(t_val)
+            s_empty = not _parse_offer_type(s_val)
+            if t_empty and not s_empty:
+                updates[col] = _serialize_offer_type(s_val)
+            continue
         t_empty = t_val is None or (isinstance(t_val, str) and not t_val.strip())
         s_empty = s_val is None or (isinstance(s_val, str) and not s_val.strip())
         if col == "telegram_user_id":
@@ -1424,6 +1536,9 @@ def merge_leads(conn, source_lead_id: int, target_lead_id: int) -> dict:
         ):
             updates["currency"] = source["currency"]
 
+    if int(target.get("monthly_value") or 0) == 0 and int(source.get("monthly_value") or 0) > 0:
+        updates["monthly_value"] = int(source.get("monthly_value") or 0)
+
     if not target.get("dialog_id") and "dialog_id" not in updates:
         dlg_row = conn.execute(
             "SELECT id FROM dialogs WHERE lead_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
@@ -1432,7 +1547,8 @@ def merge_leads(conn, source_lead_id: int, target_lead_id: int) -> dict:
         if dlg_row is not None:
             updates["dialog_id"] = int(dlg_row["id"])
 
-    # 4. Delete source lead BEFORE updating target to avoid UNIQUE constraint on telegram_user_id
+    # 4. Clear airtable_record_id and delete source lead BEFORE updating target to avoid UNIQUE constraints
+    conn.execute("UPDATE leads SET airtable_record_id = NULL WHERE id = ?", (source_id,))
     conn.execute("DELETE FROM leads WHERE id = ?", (source_id,))
 
     # 5. Update target lead safely without violating UNIQUE(account_id, telegram_user_id)
@@ -1459,6 +1575,19 @@ def merge_leads(conn, source_lead_id: int, target_lead_id: int) -> dict:
                         updates.pop("account_id", None)
                     else:
                         updates.pop("telegram_user_id", None)
+
+        if "folder_id" in updates and updates["folder_id"] is not None:
+            merged_account_id = updates.get("account_id", target.get("account_id"))
+            f_row = conn.execute(
+                "SELECT account_id FROM folders WHERE id = ?",
+                (int(updates["folder_id"]),),
+            ).fetchone()
+            if (
+                f_row is None
+                or merged_account_id is None
+                or int(f_row["account_id"]) != int(merged_account_id)
+            ):
+                updates.pop("folder_id", None)
 
     if updates:
         assigns = ", ".join(f"{k} = ?" for k in updates)
