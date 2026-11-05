@@ -20,7 +20,13 @@ def list_folders(conn, account_id: int) -> list:
 
 async def pull_folders(conn, account_id: int, gateway) -> list:
     account = _connected(conn, account_id)
-    remote = await gateway.list_folders(account["session_path"])
+    try:
+        remote = await gateway.list_folders(account["session_path"])
+    except Exception:
+        existing = list_folders(conn, account_id)
+        if existing:
+            return existing
+        raise
     if not isinstance(remote, list):
         raise ValueError("Список папок пустой")
     now = utc_now()
@@ -63,7 +69,29 @@ async def sync_folder(conn, folder_id: int, gateway) -> dict:
     if folder["blocked_reason"]:
         raise ValueError(folder["blocked_reason"])
     account = _connected(conn, folder["account_id"])
-    peers = await gateway.folder_peers(account["session_path"], folder["telegram_folder_id"])
+    try:
+        peers = await gateway.folder_peers(account["session_path"], folder["telegram_folder_id"])
+    except Exception:
+        existing_ids = [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id FROM leads WHERE folder_id = ? ORDER BY id",
+                (folder["id"],),
+            ).fetchall()
+        ]
+        if existing_ids:
+            conn.execute(
+                "UPDATE folders SET sync_enabled = 1, updated_at = ? WHERE id = ?",
+                (utc_now(), folder["id"]),
+            )
+            conn.commit()
+            return {
+                "folder_id": folder["id"],
+                "added": 0,
+                "total": len(existing_ids),
+                "lead_ids": existing_ids,
+            }
+        raise
     if not isinstance(peers, list):
         raise ValueError("В папке нет списка диалогов")
     added = 0

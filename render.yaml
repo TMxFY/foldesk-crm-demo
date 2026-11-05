@@ -3,8 +3,11 @@ services:
     name: foldesk-crm-demo
     runtime: docker
     plan: free
+    autoDeploy: true
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/accounts
     envVars:
       - key: PORT
         value: "8000"
+      - key: BOOTSTRAP_PROD_SNAPSHOT
+        value: "1"

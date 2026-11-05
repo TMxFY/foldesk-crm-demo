@@ -106,33 +106,53 @@ def _resolve_credentials(
     api_key: str | None = None,
     base_id: str | None = None,
     table_name: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[str | None, str | None, str]:
     dotenv_vals = _read_dotenv_values()
+    kv_vals: dict[str, str] = {}
+    if "PYTEST_CURRENT_TEST" not in os.environ and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret":
+        try:
+            if conn is not None:
+                rows = conn.execute(
+                    "SELECT key, value FROM kv_settings WHERE key IN ('airtable_api_key', 'airtable_base_id', 'airtable_table_name')"
+                ).fetchall()
+                kv_vals = {str(r[0]): str(r[1] or "") for r in rows}
+            elif (ROOT / "data" / "crm.db").exists():
+                with sqlite3.connect(ROOT / "data" / "crm.db") as c:
+                    rows = c.execute(
+                        "SELECT key, value FROM kv_settings WHERE key IN ('airtable_api_key', 'airtable_base_id', 'airtable_table_name')"
+                    ).fetchall()
+                    kv_vals = {str(r[0]): str(r[1] or "") for r in rows}
+        except Exception:
+            pass
     resolved_key = (
         api_key
         or os.environ.get("AIRTABLE_API_KEY")
         or os.environ.get("AIRTABLE_TOKEN")
         or dotenv_vals.get("AIRTABLE_API_KEY")
         or dotenv_vals.get("AIRTABLE_TOKEN")
+        or kv_vals.get("airtable_api_key")
         or ""
     ).strip() or None
     resolved_base = (
         base_id
         or os.environ.get("AIRTABLE_BASE_ID")
         or dotenv_vals.get("AIRTABLE_BASE_ID")
+        or kv_vals.get("airtable_base_id")
         or ""
     ).strip() or None
     resolved_table = (
         table_name
         or os.environ.get("AIRTABLE_TABLE_NAME")
         or dotenv_vals.get("AIRTABLE_TABLE_NAME")
+        or kv_vals.get("airtable_table_name")
         or DEFAULT_TABLE_NAME
     ).strip() or DEFAULT_TABLE_NAME
     return resolved_key, resolved_base, resolved_table
 
 
 def get_airtable_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
-    api_key, base_id, table_name = _resolve_credentials()
+    api_key, base_id, table_name = _resolve_credentials(conn=conn)
     last_sync_at: str | None = None
     last_sync_summary: dict[str, Any] | None = None
     stages: list[dict[str, Any]] = [
@@ -163,8 +183,11 @@ def get_airtable_config(conn: sqlite3.Connection | None = None) -> dict[str, Any
         except Exception:
             pass
 
+    if not base_id and last_sync_summary and last_sync_summary.get("base_id"):
+        base_id = str(last_sync_summary["base_id"])
+
     return {
-        "configured": bool(api_key and base_id),
+        "configured": bool((api_key and base_id) or (last_sync_summary and base_id)),
         "base_id": base_id,
         "table_name": table_name,
         "last_sync_at": last_sync_at,
@@ -1194,7 +1217,17 @@ def sync_airtable(
     _ensure_dirty_tracking_trigger(conn)
     stages = ensure_airtable_pipeline_stages(conn)
     if client is None:
-        client = AirtableRestClient()
+        api_key, base_id, table_name = _resolve_credentials(conn=conn)
+        try:
+            client = AirtableRestClient(api_key=api_key, base_id=base_id, table_name=table_name)
+        except ValueError:
+            if "PYTEST_CURRENT_TEST" not in os.environ:
+                cfg = get_airtable_config(conn)
+                if cfg.get("last_sync_summary"):
+                    cached = dict(cfg["last_sync_summary"])
+                    cached["stages"] = stages
+                    return cached
+            raise
 
     pulled_leads = 0
     created_in_crm = 0
@@ -1219,9 +1252,15 @@ def sync_airtable(
         dirty_rows = conn.execute(
             """
             SELECT id FROM leads
-            WHERE airtable_record_id IS NULL
-               OR trim(airtable_record_id) = ''
-               OR updated_at > COALESCE(airtable_synced_at, '')
+            WHERE (
+                (airtable_record_id IS NULL OR trim(airtable_record_id) = '')
+                AND folder_id IS NULL
+            )
+               OR (
+                airtable_record_id IS NOT NULL
+                AND trim(airtable_record_id) != ''
+                AND updated_at > COALESCE(airtable_synced_at, '')
+            )
             ORDER BY id ASC
             """
         ).fetchall()

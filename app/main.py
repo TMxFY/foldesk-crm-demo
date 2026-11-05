@@ -624,6 +624,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
     ):
         restore_disk_sessions(conn)
+        if os.getenv("BOOTSTRAP_PROD_SNAPSHOT", "").strip().lower() in ("1", "true", "yes"):
+            from app.db import bootstrap_prod_snapshot
+
+            bootstrap_prod_snapshot(conn)
     app.state.conn = conn
     app.state.gateway = gateway
     app.state.wa_gateway = WhatsAppGateway()
@@ -1582,11 +1586,40 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     class AirtableSyncIn(BaseModel):
         direction: str = "both"
 
+    class AirtableCredentialsIn(BaseModel):
+        api_key: str | None = None
+        base_id: str | None = None
+        table_name: str | None = None
+
     @app.get("/api/airtable/status")
     def airtable_status_get(request: Request):
         from app.airtable_sync import get_airtable_config
 
         return _call(get_airtable_config, request.app.state.conn)
+
+    @app.post("/api/airtable/credentials")
+    def airtable_credentials_set(body: AirtableCredentialsIn, request: Request):
+        from app.airtable_sync import get_airtable_config
+        from app.db import utc_now
+
+        now = utc_now()
+        conn_obj = request.app.state.conn
+        for kv_key, raw in (
+            ("airtable_api_key", body.api_key),
+            ("airtable_base_id", body.base_id),
+            ("airtable_table_name", body.table_name),
+        ):
+            if raw is not None and str(raw).strip():
+                conn_obj.execute(
+                    """
+                    INSERT INTO kv_settings (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (kv_key, str(raw).strip(), now),
+                )
+        conn_obj.commit()
+        return _call(get_airtable_config, conn_obj)
 
     @app.post("/api/airtable/sync")
     def airtable_sync_run(request: Request, body: AirtableSyncIn | None = None):

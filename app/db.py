@@ -807,3 +807,64 @@ def create_pipeline_stage(
     ).fetchone()
     return as_dict(row)
 
+
+def bootstrap_prod_snapshot(conn: sqlite3.Connection) -> bool:
+    import json
+
+    snap_path = Path(__file__).resolve().parent / "prod_snapshot.json"
+    if not snap_path.exists():
+        return False
+    lead_cnt = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    folder_cnt = conn.execute("SELECT COUNT(*) FROM folders").fetchone()[0]
+    if int(lead_cnt or 0) > 0 or int(folder_cnt or 0) > 0:
+        return False
+    try:
+        data = json.loads(snap_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        if data.get("pipeline_stages"):
+            conn.execute("DELETE FROM pipeline_stages")
+        for table_name in (
+            "pipeline_stages",
+            "accounts",
+            "folders",
+            "leads",
+            "calendar_events",
+            "dialogs",
+            "lead_events",
+            "property_defs",
+            "outreach_schedule",
+            "snippets",
+            "kv_settings",
+        ):
+            rows = data.get(table_name)
+            if not isinstance(rows, list) or not rows:
+                continue
+            valid_cols = {
+                r["name"]
+                for r in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            }
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                cols = [k for k in row.keys() if k in valid_cols]
+                if not cols:
+                    continue
+                col_list = ", ".join(f'"{c}"' for c in cols)
+                placeholders = ", ".join("?" for _ in cols)
+                vals = [row[c] for c in cols]
+                conn.execute(
+                    f'INSERT OR REPLACE INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
+                    vals,
+                )
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+    return True
+
+
