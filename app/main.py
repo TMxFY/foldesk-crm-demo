@@ -612,10 +612,27 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         try:
             yield
         finally:
+            try:
+                from app.cloud_persistence import backup_to_cloud
+
+                await asyncio.to_thread(backup_to_cloud, getattr(app.state, "conn", None))
+            except Exception:
+                pass
             await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
 
     app = FastAPI(title="CRM Telegram", lifespan=lifespan)
+    if (
+        conn is None
+        and "PYTEST_CURRENT_TEST" not in os.environ
+        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+    ):
+        try:
+            from app.cloud_persistence import restore_from_cloud
+
+            restore_from_cloud()
+        except Exception:
+            pass
     if conn is None:
         conn = connect()
     init_db(conn)
@@ -635,6 +652,19 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     app.state.inbox_tasks = {}
     app.state.inbox_synced = set()
     app.state.inbox_sync_lock = asyncio.Lock()
+
+    @app.middleware("http")
+    async def _cloud_persistence_middleware(request: Request, call_next):
+        response = await call_next(request)
+        if (
+            request.method in ("POST", "PATCH", "PUT", "DELETE")
+            and response.status_code < 400
+            and not request.url.path.startswith("/api/test")
+        ):
+            from app.cloud_persistence import schedule_cloud_backup
+
+            schedule_cloud_backup(request.app)
+        return response
     app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
     register_tg_web_routes(app)
 
@@ -1628,6 +1658,51 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 )
         conn_obj.commit()
         return _call(get_airtable_config, conn_obj)
+
+    class CloudCredentialsIn(BaseModel):
+        account_id: str | None = None
+        access_key: str | None = None
+        secret_key: str | None = None
+        bucket: str | None = None
+
+    @app.get("/api/cloud/status")
+    def cloud_status_get(request: Request):
+        from app.cloud_persistence import get_cloud_status
+
+        return _call(get_cloud_status, request.app.state.conn)
+
+    @app.post("/api/cloud/backup")
+    def cloud_backup_run(request: Request):
+        from app.cloud_persistence import backup_to_cloud
+
+        return _call(backup_to_cloud, request.app.state.conn)
+
+    @app.post("/api/cloud/credentials")
+    def cloud_credentials_set(body: CloudCredentialsIn, request: Request):
+        from app.cloud_persistence import backup_to_cloud
+        from app.db import utc_now
+
+        now = utc_now()
+        conn_obj = request.app.state.conn
+        for kv_key, env_key, raw in (
+            ("r2_account_id", "R2_ACCOUNT_ID", body.account_id),
+            ("r2_access_key", "R2_ACCESS_KEY", body.access_key),
+            ("r2_secret_key", "R2_SECRET_KEY", body.secret_key),
+            ("r2_bucket", "R2_BUCKET", body.bucket),
+        ):
+            if raw is not None and str(raw).strip():
+                clean_v = str(raw).strip()
+                os.environ[env_key] = clean_v
+                conn_obj.execute(
+                    """
+                    INSERT INTO kv_settings (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (kv_key, clean_v, now),
+                )
+        conn_obj.commit()
+        return _call(backup_to_cloud, conn_obj)
 
     @app.post("/api/airtable/sync")
     def airtable_sync_run(request: Request, body: AirtableSyncIn | None = None):
