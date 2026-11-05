@@ -406,17 +406,21 @@ async def start_login(
     clean_proxy = (proxy_url or "").strip() or None
     clean_scope = (access_scope or "workspace").strip() or "workspace"
 
-    # If this phone already has a connected session with a valid MTProto auth key, reuse it
+    # If this phone already has a connected session with an active MTProto auth key, reuse it
     existing_connected = conn.execute(
         """
-        SELECT id, session_path, proxy_url, access_scope
+        SELECT id, session_path, proxy_url, access_scope, health
         FROM accounts
         WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status = 'connected'
         ORDER BY id ASC LIMIT 1
         """,
         (phone, norm_provider),
     ).fetchone()
-    if existing_connected and _inspect_telethon_session(existing_connected["session_path"]) is not None:
+    if (
+        existing_connected
+        and existing_connected["health"] == "active"
+        and _inspect_telethon_session(existing_connected["session_path"]) is not None
+    ):
         return {
             "id": int(existing_connected["id"]),
             "status": "connected",
@@ -436,14 +440,27 @@ async def start_login(
         (phone, norm_provider),
     )
     conn.commit()
-    cur = conn.execute(
-        """
-        INSERT INTO accounts (phone, session_path, status, created_at, proxy_url, access_scope, provider)
-        VALUES (?, '', 'pending_code', ?, ?, ?, ?)
-        """,
-        (phone, utc_now(), clean_proxy, clean_scope, norm_provider),
-    )
-    account_id = cur.lastrowid
+    if existing_connected:
+        account_id = int(existing_connected["id"])
+        old_sess = resolve_session(existing_connected["session_path"] or f"data/sessions/{account_id}.session")
+        if old_sess.exists():
+            try:
+                old_sess.unlink()
+            except Exception:
+                pass
+        conn.execute(
+            "UPDATE accounts SET session_blob = NULL WHERE id = ?",
+            (account_id,),
+        )
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO accounts (phone, session_path, status, created_at, proxy_url, access_scope, provider)
+            VALUES (?, '', 'pending_code', ?, ?, ?, ?)
+            """,
+            (phone, utc_now(), clean_proxy, clean_scope, norm_provider),
+        )
+        account_id = cur.lastrowid
     if norm_provider == "whatsapp":
         session_path = f"data/sessions/wa_{account_id}.session"
     else:

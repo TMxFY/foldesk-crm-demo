@@ -183,21 +183,37 @@ def _fetch_upstream_asset(rel_path: str) -> tuple[bytes, str]:
 def build_session_init_js(
     session_info: dict | None, all_sessions: list[dict] | None = None
 ) -> str:
+    multitab_guard = """
+    if (typeof window.BroadcastChannel === "function" && !window.__foldeskBcPatched) {
+      var NativeBC = window.BroadcastChannel;
+      var tabUid = Math.random().toString(36).slice(2, 10);
+      window.BroadcastChannel = function(name) {
+        var n = String(name || "");
+        if (n.indexOf("tt-establish") === 0 || n.indexOf("tt-multitab") === 0) {
+          return new NativeBC(n + "_" + tabUid);
+        }
+        return new NativeBC(n);
+      };
+      window.BroadcastChannel.prototype = NativeBC.prototype;
+      window.__foldeskBcPatched = true;
+    }
+"""
     if not session_info:
-        return """(function() {
-  try {
-    if (localStorage.getItem("foldesk_tg_session_sig")) {
+        return f"""(function() {{
+  try {{{multitab_guard}
+    if (localStorage.getItem("foldesk_tg_session_sig")) {{
       localStorage.removeItem("foldesk_tg_session_sig");
+      localStorage.removeItem("foldesk_tg_failed_sig");
       localStorage.removeItem("user_auth");
       localStorage.removeItem("account1");
       localStorage.removeItem("tt-global-state");
-      for (var i = 1; i <= 5; i++) {
+      for (var i = 1; i <= 5; i++) {{
         localStorage.removeItem("dc" + i + "_auth_key");
         localStorage.removeItem("dc" + i + "_hash");
-      }
-    }
-  } catch (e) {}
-})();
+      }}
+    }}
+  }} catch (e) {{}}
+}})();
 """
     sessions_list = all_sessions if all_sessions else [session_info]
     dc_id = int(session_info["dc_id"])
@@ -221,7 +237,7 @@ def build_session_init_js(
         ensure_ascii=False,
     )
     return f"""(function() {{
-  try {{
+  try {{{multitab_guard}
     var dc = {dc_id};
     var authKey = "{auth_key_hex}";
     var userId = "{user_id}";
