@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 import os
+import re
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from datetime import timezone
@@ -193,14 +196,259 @@ def _history_limit(limit) -> int:
     return min(cap, 50)
 
 
-def _parse_proxy_for_telethon(proxy_url: str | None) -> tuple | None:
+_PROXY_PRESET_COUNTRIES = {
+    "eu_residential": "de",
+    "us_dedicated": "us",
+    "cis_mobile": "kz",
+}
+
+_PHONE_PREFIX_COUNTRIES = (
+    ("380", "ua"),
+    ("375", "by"),
+    ("998", "uz"),
+    ("374", "am"),
+    ("995", "ge"),
+    ("971", "ae"),
+    ("77", "kz"),
+    ("7", "ru"),
+    ("44", "gb"),
+    ("49", "de"),
+    ("33", "fr"),
+    ("31", "nl"),
+    ("34", "es"),
+    ("39", "it"),
+    ("48", "pl"),
+    ("90", "tr"),
+    ("62", "id"),
+    ("55", "br"),
+    ("1", "us"),
+)
+
+
+def infer_proxy_country(
+    phone: str | None = None,
+    preset: str | None = None,
+    default_country: str = "us",
+) -> str:
+    fallback = (default_country or "us").strip().lower() or "us"
+    raw_preset = (preset or "").strip().lower()
+    if raw_preset in _PROXY_PRESET_COUNTRIES:
+        return _PROXY_PRESET_COUNTRIES[raw_preset]
+    if raw_preset.startswith("country-") and len(raw_preset) == 10:
+        return raw_preset.split("-", 1)[1]
+    if raw_preset.startswith("nodemaven:") and len(raw_preset.split(":", 1)[1]) == 2:
+        return raw_preset.split(":", 1)[1]
+    if len(raw_preset) == 2 and raw_preset.isalpha():
+        return raw_preset
+
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if digits:
+        for prefix, iso in _PHONE_PREFIX_COUNTRIES:
+            if digits.startswith(prefix):
+                return iso
+    return fallback
+
+
+def resolve_nodemaven_config(conn=None) -> dict | None:
+    user = os.getenv("NODEMAVEN_USER", "").strip()
+    password = os.getenv("NODEMAVEN_PASS", "").strip() or os.getenv("NODEMAVEN_PASSWORD", "").strip()
+    host = os.getenv("NODEMAVEN_HOST", "").strip()
+    port = os.getenv("NODEMAVEN_PORT", "").strip()
+    ttl = os.getenv("NODEMAVEN_TTL", "").strip()
+    flt = os.getenv("NODEMAVEN_FILTER", "").strip()
+    default_country = os.getenv("NODEMAVEN_DEFAULT_COUNTRY", "").strip()
+
+    def _read_kv(c) -> None:
+        nonlocal user, password, host, port, ttl, flt, default_country
+        try:
+            rows = dict(
+                c.execute(
+                    """
+                    SELECT key, value FROM kv_settings
+                    WHERE key IN (
+                        'nodemaven_user', 'nodemaven_pass', 'nodemaven_host',
+                        'nodemaven_port', 'nodemaven_ttl', 'nodemaven_filter',
+                        'nodemaven_default_country'
+                    )
+                    """
+                ).fetchall()
+            )
+            user = user or str(rows.get("nodemaven_user") or "").strip()
+            password = password or str(rows.get("nodemaven_pass") or "").strip()
+            host = host or str(rows.get("nodemaven_host") or "").strip()
+            port = port or str(rows.get("nodemaven_port") or "").strip()
+            ttl = ttl or str(rows.get("nodemaven_ttl") or "").strip()
+            flt = flt or str(rows.get("nodemaven_filter") or "").strip()
+            default_country = default_country or str(rows.get("nodemaven_default_country") or "").strip()
+        except Exception:
+            pass
+
+    if conn is not None:
+        _read_kv(conn)
+    elif (not user or not password) and "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+        try:
+            with sqlite3.connect(DEFAULT_DB) as c:
+                _read_kv(c)
+        except Exception:
+            pass
+
+    if not user or not password:
+        return None
+
+    try:
+        port_int = int(port or 1080)
+    except (TypeError, ValueError):
+        port_int = 1080
+    try:
+        ttl_int = max(60, int(ttl or 86400))
+    except (TypeError, ValueError):
+        ttl_int = 86400
+
+    return {
+        "user": user,
+        "password": password,
+        "host": host or "gate.nodemaven.com",
+        "port": port_int,
+        "ttl": ttl_int,
+        "filter": (flt or "medium").strip().lower(),
+        "default_country": (default_country or "us").strip().lower() or "us",
+    }
+
+
+def make_nodemaven_sid(account_key: str | int) -> str:
+    raw = str(account_key or "").strip()
+    if raw.endswith(".session"):
+        raw = Path(raw).stem
+    clean = re.sub(r"[^a-zA-Z0-9]", "", raw).lower()
+    if not clean:
+        clean = hashlib.sha1(str(account_key).encode("utf-8")).hexdigest()[:10]
+    sid = f"foldeskacc{clean}"
+    return sid[:28]
+
+
+def build_nodemaven_proxy_url(
+    account_key: str | int,
+    phone: str | None = None,
+    preset: str | None = None,
+    conn=None,
+) -> str | None:
+    cfg = resolve_nodemaven_config(conn)
+    if not cfg:
+        return None
+    country = infer_proxy_country(phone=phone, preset=preset, default_country=cfg["default_country"])
+    sid = make_nodemaven_sid(account_key)
+    base_user = cfg["user"]
+    # If the user pasted a full NodeMaven login string from dashboard, normalize sid and country
+    if "-sid-" in base_user:
+        base_user = re.sub(r"-sid-[a-zA-Z0-9_]+", "", base_user)
+    if "-country-" in base_user:
+        base_user = re.sub(r"-country-[a-zA-Z]{2}", "", base_user)
+    if "-ttl-" in base_user:
+        base_user = re.sub(r"-ttl-\d+", "", base_user)
+    if "-filter-" in base_user:
+        base_user = re.sub(r"-filter-[a-zA-Z0-9_]+", "", base_user)
+    base_user = base_user.strip("-")
+
+    full_user = (
+        f"{base_user}-country-{country}-sid-{sid}"
+        f"-ttl-{cfg['ttl']}-filter-{cfg['filter']}"
+    )
+    return f"socks5://{full_user}:{cfg['password']}@{cfg['host']}:{cfg['port']}"
+
+
+def mask_proxy_url(proxy_url: str | None) -> str | None:
     if not proxy_url:
         return None
     raw = str(proxy_url).strip()
+    if "://" not in raw:
+        return raw
+    try:
+        parsed = urlparse(raw)
+        if not parsed.hostname:
+            return raw
+        auth = ""
+        if parsed.username:
+            auth = f"{unquote(parsed.username)}:***@" if parsed.password else f"{unquote(parsed.username)}@"
+        port_part = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{auth}{parsed.hostname}{port_part}"
+    except Exception:
+        return raw
+
+
+def _normalize_raw_proxy_url(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+    # Support raw NodeMaven generator format: host:port:username:password
+    if "://" not in text and "@" not in text:
+        parts = text.split(":")
+        if len(parts) == 4 and parts[1].isdigit():
+            host, port, user, pwd = parts
+            return f"socks5://{user}:{pwd}@{host}:{port}"
+    if "://" not in text:
+        return f"socks5://{text}"
+    return text
+
+
+async def probe_proxy_ip(proxy_url: str, timeout: float = 8.0) -> dict:
+    norm = _normalize_raw_proxy_url(proxy_url)
+    parsed_tuple = _parse_proxy_for_telethon(norm)
+    if not parsed_tuple:
+        return {"ok": False, "error": "Некорректный формат прокси"}
+    try:
+        from python_socks.async_.asyncio import Proxy
+        import json as _json
+
+        proxy = Proxy.from_url(norm, rdns=True)
+        sock = await asyncio.wait_for(
+            proxy.connect(dest_host="ip-api.com", dest_port=80),
+            timeout=timeout,
+        )
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(sock=sock),
+            timeout=timeout,
+        )
+        try:
+            req = (
+                "GET /json/?fields=status,country,countryCode,city,isp,query HTTP/1.1\r\n"
+                "Host: ip-api.com\r\n"
+                "User-Agent: FoldeskCRM/1.0\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            writer.write(req.encode("ascii"))
+            await writer.drain()
+            raw_resp = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+        finally:
+            writer.close()
+        body = raw_resp.decode("utf-8", "replace").split("\r\n\r\n", 1)[-1].strip()
+        start = body.find("{")
+        end = body.rfind("}")
+        if start != -1 and end != -1:
+            data = _json.loads(body[start : end + 1])
+            return {
+                "ok": data.get("status") == "success",
+                "ip": data.get("query"),
+                "country": data.get("country"),
+                "country_code": str(data.get("countryCode") or "").lower(),
+                "city": data.get("city"),
+                "isp": data.get("isp"),
+                "proxy_masked": mask_proxy_url(norm),
+            }
+        return {"ok": False, "error": "Пустой ответ от гео-сервиса", "proxy_masked": mask_proxy_url(norm)}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": _clip_error(exc),
+            "proxy_masked": mask_proxy_url(norm),
+        }
+
+
+def _parse_proxy_for_telethon(proxy_url: str | None) -> tuple | None:
+    if not proxy_url:
+        return None
+    raw = _normalize_raw_proxy_url(str(proxy_url))
     if not raw:
         return None
-    if "://" not in raw:
-        raw = f"socks5://{raw}"
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "socks5").lower()
     host = parsed.hostname
@@ -265,23 +513,52 @@ class TelethonGateway(TelegramGateway):
         except (TypeError, ValueError):
             pass
 
-    def _resolve_proxy(self, session_path: str) -> str | None:
-        if session_path in self._proxies:
-            return self._proxies[session_path]
+    def _resolve_proxy(self, session_path: str, conn=None) -> str | None:
+        cached = self._proxies.get(session_path)
+        if cached and _parse_proxy_for_telethon(cached) is not None:
+            return cached
+
+        acc_id = None
+        phone = None
+        db_proxy = cached
         try:
-            if DEFAULT_DB.exists():
-                with sqlite3.connect(DEFAULT_DB) as conn:
-                    row = conn.execute(
-                        "SELECT proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
+            if conn is not None:
+                row = conn.execute(
+                    "SELECT id, phone, proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
+                    (session_path,),
+                ).fetchone()
+                if row:
+                    acc_id, phone, db_proxy = row[0], row[1], db_proxy or row[2]
+            elif DEFAULT_DB.exists():
+                with sqlite3.connect(DEFAULT_DB) as c:
+                    row = c.execute(
+                        "SELECT id, phone, proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
                         (session_path,),
                     ).fetchone()
-                    if row and row[0]:
-                        proxy_val = str(row[0]).strip()
-                        if proxy_val:
-                            self._proxies[session_path] = proxy_val
-                            return proxy_val
+                    if row:
+                        acc_id, phone, db_proxy = row[0], row[1], db_proxy or row[2]
         except Exception:
             pass
+
+        proxy_val = str(db_proxy or "").strip()
+        if proxy_val and _parse_proxy_for_telethon(proxy_val) is not None:
+            self._proxies[session_path] = proxy_val
+            return proxy_val
+
+        # Preset or empty -> try building sticky NodeMaven URL for this account
+        nm_url = build_nodemaven_proxy_url(
+            account_key=acc_id or session_path,
+            phone=phone,
+            preset=proxy_val or "auto",
+            conn=conn,
+        )
+        if nm_url:
+            self._proxies[session_path] = nm_url
+            return nm_url
+
+        if proxy_val:
+            self._proxies[session_path] = proxy_val
+            return proxy_val
         return None
 
     def _session_lock(self, session_path: str) -> asyncio.Lock:

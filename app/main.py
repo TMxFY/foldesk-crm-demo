@@ -1957,6 +1957,160 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         request.app.state.conn.commit()
         return {"ok": True, "config": cfg}
 
+    class NodeMavenConfigIn(BaseModel):
+        user: str = ""
+        password: str = ""
+        host: str = "gate.nodemaven.com"
+        port: int = 1080
+        ttl: int = 86400
+        filter: str = "medium"
+        default_country: str = "us"
+
+    class ProxyProbeIn(BaseModel):
+        account_id: int | None = None
+        phone: str | None = None
+        preset: str | None = None
+        proxy_url: str | None = None
+
+    @app.get("/api/proxy/nodemaven/config")
+    def nodemaven_config_get(request: Request):
+        from app.telegram_gateway import (
+            build_nodemaven_proxy_url,
+            infer_proxy_country,
+            make_nodemaven_sid,
+            mask_proxy_url,
+            resolve_nodemaven_config,
+        )
+
+        conn = request.app.state.conn
+        cfg = resolve_nodemaven_config(conn)
+        rows = conn.execute(
+            "SELECT id, phone, telegram_username, telegram_name, proxy_url, provider FROM accounts ORDER BY id"
+        ).fetchall()
+        accounts_preview = []
+        for r in rows:
+            aid = r["id"]
+            phone = r["phone"]
+            raw_proxy = str(r["proxy_url"] or "").strip()
+            nm_url = build_nodemaven_proxy_url(
+                account_key=aid,
+                phone=phone,
+                preset=raw_proxy or "auto",
+                conn=conn,
+            )
+            effective = nm_url or raw_proxy or None
+            accounts_preview.append(
+                {
+                    "account_id": aid,
+                    "phone": phone,
+                    "username": r["telegram_username"],
+                    "title": r["telegram_name"],
+                    "sid": make_nodemaven_sid(aid),
+                    "country": infer_proxy_country(
+                        phone=phone,
+                        preset=raw_proxy or "auto",
+                        default_country=(cfg or {}).get("default_country", "us"),
+                    ),
+                    "proxy_masked": mask_proxy_url(effective),
+                }
+            )
+        if not cfg:
+            return {
+                "ok": True,
+                "configured": False,
+                "host": "gate.nodemaven.com",
+                "port": 1080,
+                "ttl": 86400,
+                "filter": "medium",
+                "default_country": "us",
+                "user_masked": None,
+                "accounts": accounts_preview,
+            }
+        u = cfg["user"]
+        user_masked = f"{u[:3]}***{u[-2:]}" if len(u) > 5 else "***"
+        return {
+            "ok": True,
+            "configured": True,
+            "host": cfg["host"],
+            "port": cfg["port"],
+            "ttl": cfg["ttl"],
+            "filter": cfg["filter"],
+            "default_country": cfg["default_country"],
+            "user_masked": user_masked,
+            "accounts": accounts_preview,
+        }
+
+    @app.post("/api/proxy/nodemaven/config")
+    def nodemaven_config_save(body: NodeMavenConfigIn, request: Request):
+        conn = request.app.state.conn
+        now = utc_now()
+        pairs = {
+            "nodemaven_user": body.user.strip(),
+            "nodemaven_host": (body.host or "gate.nodemaven.com").strip(),
+            "nodemaven_port": str(int(body.port or 1080)),
+            "nodemaven_ttl": str(max(60, int(body.ttl or 86400))),
+            "nodemaven_filter": (body.filter or "medium").strip().lower(),
+            "nodemaven_default_country": (body.default_country or "us").strip().lower(),
+        }
+        if body.password.strip():
+            pairs["nodemaven_pass"] = body.password.strip()
+        for k, v in pairs.items():
+            conn.execute(
+                """
+                INSERT INTO kv_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (k, v, now),
+            )
+        conn.commit()
+        gw = _resolve_app_gateway(request.app, "telegram")
+        if gw is not None and hasattr(gw, "_proxies"):
+            gw._proxies.clear()
+        return nodemaven_config_get(request)
+
+    @app.post("/api/proxy/nodemaven/test")
+    async def nodemaven_proxy_test(body: ProxyProbeIn, request: Request):
+        from app.telegram_gateway import (
+            build_nodemaven_proxy_url,
+            mask_proxy_url,
+            probe_proxy_ip,
+        )
+
+        conn = request.app.state.conn
+        target_url = (body.proxy_url or "").strip()
+        if not target_url:
+            acc_key: int | str = body.account_id or 1
+            phone = body.phone
+            preset = body.preset or "auto"
+            if body.account_id:
+                row = conn.execute(
+                    "SELECT id, phone, proxy_url FROM accounts WHERE id = ?",
+                    (int(body.account_id),),
+                ).fetchone()
+                if row:
+                    phone = phone or row["phone"]
+                    preset = body.preset or row["proxy_url"] or "auto"
+            target_url = (
+                build_nodemaven_proxy_url(
+                    account_key=acc_key,
+                    phone=phone,
+                    preset=preset,
+                    conn=conn,
+                )
+                or ""
+            )
+        if not target_url:
+            return {
+                "ok": False,
+                "configured": False,
+                "error": "Ключи NodeMaven ещё не заданы (NODEMAVEN_USER / NODEMAVEN_PASS)",
+            }
+        result = await probe_proxy_ip(target_url)
+        result["configured"] = True
+        result.setdefault("proxy_masked", mask_proxy_url(target_url))
+        return result
+
     from app.mcp_server import register_mcp_routes
 
     register_mcp_routes(app)
