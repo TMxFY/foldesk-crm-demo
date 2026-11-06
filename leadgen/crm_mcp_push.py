@@ -80,6 +80,35 @@ LEGACY_CSV_STATE_PATH = os.path.join(_DEFAULT_STATE_DIR, "csv_export_state.json"
 _SHEET_WIDTH = 15
 
 
+def _load_ui_leadgen_config() -> dict[str, Any]:
+    try:
+        from app.leadgen_settings import get_leadgen_config
+
+        return get_leadgen_config()
+    except Exception:
+        pass
+    cfg_path = Path(os.environ.get("LEADGEN_CONFIG_PATH") or (WORKTREE_ROOT / "data" / "leadgen_config.json"))
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _resolve_b2b_touch_mode(explicit: str | None = None) -> str:
+    if explicit:
+        mode = explicit.strip().lower()
+    elif os.environ.get("LEADGEN_TOUCH_MODE"):
+        mode = os.environ["LEADGEN_TOUCH_MODE"].strip().lower()
+    else:
+        b2b = (_load_ui_leadgen_config().get("b2b") or {})
+        mode = str(b2b.get("touch_mode") or "micro_ping").strip().lower()
+    return "direct" if mode in ("direct", "full") else "micro_ping"
+
+
 def log(*args: Any) -> None:
     print(time.strftime("[%H:%M:%S]"), *args, flush=True)
 
@@ -210,7 +239,7 @@ def build_lead_payload_from_sheet_row(
     lead_source: str = "Google Sheet",
 ) -> dict[str, Any]:
     """Convert a 15..19 column Google Sheet row into an `ingest_discovered_leads` item."""
-    mode = (touch_mode or os.environ.get("LEADGEN_TOUCH_MODE") or "micro_ping").strip().lower()
+    mode = _resolve_b2b_touch_mode(touch_mode)
     tg_col = _cell(row, 0)
     category = _cell(row, 3)
     raw_name = _cell(row, 4)
@@ -298,7 +327,7 @@ def build_lead_payload_from_dict(
     touch_mode: str | None = None,
 ) -> dict[str, Any]:
     """Convert a JSONL lead dict (from TG pipeline, YC/PH, channel graph, or ad spy) into MCP format."""
-    mode = (touch_mode or os.environ.get("LEADGEN_TOUCH_MODE") or "micro_ping").strip().lower()
+    mode = _resolve_b2b_touch_mode(touch_mode)
     raw_name = str(
         record.get("founder_name")
         or record.get("name")
@@ -698,27 +727,45 @@ def push_leads_via_mcp(
 
 
 def main() -> int:
+    ui_cfg = _load_ui_leadgen_config()
+    b2b_cfg = ui_cfg.get("b2b") or {}
+    default_touch = os.environ.get("LEADGEN_TOUCH_MODE") or str(b2b_cfg.get("touch_mode") or "micro_ping")
+    default_camp_tg = os.environ.get("LEADGEN_CAMPAIGN_NAME") or str(
+        b2b_cfg.get("target_campaign_tg") or "Leadgen Auto (TG)"
+    )
+    default_camp_wa = str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)")
+    total_daily_quota = int(ui_cfg.get("total_daily_quota") or 50)
+    b2b_daily_limit = int(b2b_cfg.get("campaign_daily_limit") or 30)
+    effective_quota = min(total_daily_quota, b2b_daily_limit) if total_daily_quota > 0 else b2b_daily_limit
+
     ap = argparse.ArgumentParser(description="Push discovered leads into Foldesk CRM via MCP")
     ap.add_argument("--jsonl", default="", help="Ingest leads directly from a local JSONL file")
     ap.add_argument("--tab", default="", help="Only process a single Google Sheet tab (Все2, Direct, X)")
     ap.add_argument("--force", action="store_true", help="Push even if below threshold")
     ap.add_argument(
         "--touch-mode",
-        choices=("micro_ping", "full"),
-        default=os.environ.get("LEADGEN_TOUCH_MODE", "micro_ping"),
-        help="Step 1 message mode: micro_ping (default, short question) or full (case study in step 1)",
+        choices=("micro_ping", "full", "direct"),
+        default=default_touch,
+        help="Step 1 message mode: micro_ping (default, short question) or direct/full (case study in step 1)",
     )
-    ap.add_argument("--campaign-name", default=os.environ.get("LEADGEN_CAMPAIGN_NAME", "Leadgen Autopilot"))
+    ap.add_argument("--campaign-name", default=default_camp_tg)
+    ap.add_argument("--campaign-name-wa", default=default_camp_wa)
     ap.add_argument("--campaign-id", type=int, default=None)
     ap.add_argument("--no-campaign", action="store_true", help="Only create/update CRM leads without campaign enrollment")
     ap.add_argument("--mcp-url", default=os.environ.get("CRMTG_MCP_URL", ""), help="Remote HTTP MCP base URL")
     ap.add_argument("--use-llm", action="store_true", help="Enable LLM follow-up generation when reading sheet rows")
     args = ap.parse_args()
 
-    enroll = not args.no_campaign
+    if not ui_cfg.get("enabled", True) or not b2b_cfg.get("enabled", True):
+        log("[crm_mcp_push] B2B leadgen disabled in UI settings; skipping")
+        return 0
+
+    enroll = bool(ui_cfg.get("auto_push_to_crm", True)) and not args.no_campaign
 
     if args.jsonl:
         leads = load_leads_from_jsonl(args.jsonl, touch_mode=args.touch_mode, use_llm=args.use_llm)
+        if effective_quota > 0:
+            leads = leads[:effective_quota]
         if not leads:
             log(f"[jsonl] no sendable leads found in {args.jsonl}")
             return 0
@@ -744,8 +791,11 @@ def main() -> int:
     total_created = 0
     total_updated = 0
     total_enrolled = 0
+    remaining_quota = effective_quota if effective_quota > 0 else 999999
 
     for tab, state_key, _slug in targets:
+        if remaining_quota <= 0:
+            break
         try:
             rows = sheet_rows(tab)
         except Exception as exc:
@@ -774,15 +824,18 @@ def main() -> int:
             log(f"[{tab}] {sendable} < {THRESHOLD} new leads, skipping (use --force to push anyway)")
             continue
 
+        batch = leads[:remaining_quota]
+        target_camp = args.campaign_name_wa if tab == "Direct" and any(l.get("provider") == "whatsapp" for l in batch) else args.campaign_name
         res = push_leads_via_mcp(
-            leads,
+            batch,
             enroll_in_campaign=enroll,
             campaign_id=args.campaign_id,
-            campaign_name=args.campaign_name,
+            campaign_name=target_camp,
             mcp_url=args.mcp_url or None,
         )
         state[state_key] = total
         write_state(state)
+        remaining_quota = max(0, remaining_quota - len(batch))
         total_created += int(res.get("created_leads", 0))
         total_updated += int(res.get("updated_leads", 0))
         total_enrolled += int(res.get("enrolled_in_campaign", 0))

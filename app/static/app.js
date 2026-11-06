@@ -57,6 +57,7 @@ const SHEET_LABELS = {
   s11: "Папки",
   "crm-properties": "Поля CRM",
   "ai-bot": "AI Агент",
+  leadgen: "Лидген и Вакансии",
   "tool-phones": "Телефоны в TG",
   "tool-parser": "Парсер групп",
   calendar: "Календарь",
@@ -149,6 +150,9 @@ const state = {
   activePopup: null,
   expandedCampaigns: {},
   expandedAccountPools: {},
+  expandedCampaignSettings: {},
+  leadgenConfig: null,
+  leadgenStatus: null,
   selectedBuilderAccountIds: null,
   csvHeaders: [],
 };
@@ -189,6 +193,7 @@ function sheetFromHash(hash) {
   if (clean === "s11" || clean === "folders") return "s11";
   if (clean === "crm-properties" || clean === "properties") return "crm-properties";
   if (clean === "ai-bot") return "ai-bot";
+  if (clean === "leadgen") return "leadgen";
   if (clean === "tool-phones") return "tool-phones";
   if (clean === "tool-parser") return "tool-parser";
   if (clean === "calendar") return "calendar";
@@ -296,6 +301,12 @@ function syncSheetVisibility() {
     else step.removeAttribute("aria-current");
   });
 
+  const navLinks = [...document.querySelectorAll(".nav a[data-sheet-link]")];
+  navLinks.forEach((item) => {
+    if (item.dataset.sheetLink === active) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
+  });
+
   const s07 = document.querySelector("#s07");
   const messengerGrid = document.querySelector(".messenger-grid");
   const outreach = document.querySelector("#outreach");
@@ -304,6 +315,7 @@ function syncSheetVisibility() {
   const digest = document.querySelector("#digest");
   const accounts = document.querySelector("#accounts");
   const s11 = document.querySelector("#s11");
+  const leadgenSec = document.querySelector("#leadgen");
   const toolPhones = document.querySelector("#tool-phones");
   const toolParser = document.querySelector("#tool-parser");
   const crmProps = document.querySelector("#crm-properties");
@@ -329,6 +341,7 @@ function syncSheetVisibility() {
     if (s11) s11.hidden = false;
     if (calendarSec) calendarSec.hidden = false;
     if (analyticsSec) analyticsSec.hidden = false;
+    if (leadgenSec) leadgenSec.hidden = active !== "leadgen";
     if (toolPhones) toolPhones.hidden = active !== "tool-phones";
     if (toolParser) toolParser.hidden = active !== "tool-parser";
     if (crmProps) crmProps.hidden = active !== "crm-properties";
@@ -367,6 +380,7 @@ function syncSheetVisibility() {
   if (digest) digest.hidden = active !== "digest";
   if (accounts) accounts.hidden = active !== "accounts";
   if (s11) s11.hidden = active !== "s11";
+  if (leadgenSec) leadgenSec.hidden = active !== "leadgen";
   if (toolPhones) toolPhones.hidden = active !== "tool-phones";
   if (toolParser) toolParser.hidden = active !== "tool-parser";
   if (crmProps) crmProps.hidden = active !== "crm-properties";
@@ -1419,6 +1433,247 @@ function resolveCampaignAccounts(camp) {
     .filter(Boolean);
 }
 
+const CAMPAIGN_LEADGEN_SOURCE_OPTIONS = [
+  ["tg_groups", "TG-группы"],
+  ["yc_ph", "YC & PH"],
+  ["meta_ads", "Meta Ads"],
+  ["tg_ad_spy", "TG Ad Spy"],
+  ["channel_graph", "Channel Graph"],
+  ["social_x_reddit", "X & Reddit"],
+  ["buyer_catalogs", "Каталоги"],
+  ["linkedin_jobs", "LinkedIn"],
+  ["tg_vacancies", "TG Вакансии"],
+];
+
+function buildCampaignSettingsPanel(camp, opts) {
+  const { settingsOpen, dailyLimit, leadgenEnabled, leadgenQuota, leadgenSourcesList, steps } = opts;
+
+  const nameInput = el("input", {
+    type: "text",
+    className: "camp-edit-name",
+    value: camp.name || "",
+    placeholder: "Название рассылки",
+  });
+
+  const limitInput = el("input", {
+    type: "number",
+    className: "camp-edit-limit",
+    min: "1",
+    max: "500",
+    value: String(dailyLimit),
+  });
+
+  const bumpLimit = (delta) => {
+    const cur = Number(limitInput.value) || dailyLimit;
+    limitInput.value = String(Math.max(1, Math.min(500, cur + delta)));
+  };
+
+  const limitStepper = el("div", { className: "stepper-control" }, [
+    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(-10) }, ["-10"]),
+    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(-5) }, ["-5"]),
+    limitInput,
+    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(5) }, ["+5"]),
+    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(10) }, ["+10"]),
+  ]);
+
+  const lgEnabledCheck = el("input", {
+    type: "checkbox",
+    className: "camp-edit-leadgen-enabled",
+  });
+  lgEnabledCheck.checked = Boolean(leadgenEnabled);
+
+  const lgQuotaInput = el("input", {
+    type: "number",
+    className: "camp-edit-leadgen-quota",
+    min: "0",
+    max: "500",
+    value: String(leadgenQuota),
+  });
+
+  const bumpLgQuota = (delta) => {
+    const cur = Number(lgQuotaInput.value) || 0;
+    lgQuotaInput.value = String(Math.max(0, Math.min(500, cur + delta)));
+  };
+
+  const lgQuotaStepper = el("div", { className: "stepper-control" }, [
+    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLgQuota(-5) }, ["-5"]),
+    lgQuotaInput,
+    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLgQuota(5) }, ["+5"]),
+  ]);
+
+  const sourceBoxes = [];
+  const sourceChecksNodes = CAMPAIGN_LEADGEN_SOURCE_OPTIONS.map(([code, label]) => {
+    const cb = el("input", {
+      type: "checkbox",
+      "data-camp-leadgen-source": code,
+    });
+    cb.checked = leadgenSourcesList.includes(code);
+    sourceBoxes.push(cb);
+    return el("label", { className: "pool-check-chip" }, [
+      cb,
+      el("span", { className: "pool-check-name" }, [label]),
+    ]);
+  });
+
+  const editableSteps = (Array.isArray(steps) && steps.length
+    ? steps
+    : [{ step_order: 1, delay_hours: 0, template_text: "Привет, {name}!" }]
+  ).map((st) => ({
+    delay_hours: Number(st.delay_hours) || 0,
+    template_text: String(st.template_text || ""),
+  }));
+
+  const stepsHost = el("div", { className: "stack camp-edit-steps-host" }, []);
+
+  const renderEditableSteps = () => {
+    stepsHost.replaceChildren();
+    editableSteps.forEach((st, idx) => {
+      const delayInput = el("input", {
+        type: "number",
+        min: "0",
+        max: "720",
+        value: String(st.delay_hours),
+        oninput: () => {
+          st.delay_hours = Math.max(0, Number(delayInput.value) || 0);
+        },
+      });
+      const textInput = el("textarea", {
+        rows: "2",
+        placeholder: "Текст сообщения шага...",
+        oninput: () => {
+          st.template_text = textInput.value;
+        },
+      });
+      textInput.value = st.template_text;
+
+      const removeStepBtn = editableSteps.length > 1
+        ? el("button", {
+          type: "button",
+          className: "btn ghost sm",
+          onclick: () => {
+            editableSteps.splice(idx, 1);
+            renderEditableSteps();
+          },
+        }, ["Удалить шаг ×"])
+        : null;
+
+      stepsHost.append(
+        el("div", { className: "step-card stack" }, [
+          el("div", { className: "subcard-head" }, [
+            el("strong", {}, [`Шаг ${idx + 1}`]),
+            el("div", { className: "row" }, [
+              el("label", { className: "inline" }, [
+                "Задержка (ч):",
+                delayInput,
+              ]),
+              removeStepBtn,
+            ].filter(Boolean)),
+          ]),
+          textInput,
+        ]),
+      );
+    });
+  };
+  renderEditableSteps();
+
+  const addStepBtn = el("button", {
+    type: "button",
+    className: "btn secondary sm",
+    onclick: () => {
+      editableSteps.push({
+        delay_hours: 24,
+        template_text: "{name}, возвращаюсь к вопросу выше — актуально обсудить?",
+      });
+      renderEditableSteps();
+    },
+  }, ["+ Добавить шаг"]);
+
+  const saveSettingsBtn = el("button", {
+    type: "button",
+    className: "btn primary sm campaign-save-settings-btn",
+    onclick: async () => {
+      const cleanSteps = editableSteps
+        .map((st, idx) => ({
+          step_order: idx + 1,
+          delay_hours: Math.max(0, Number(st.delay_hours) || 0),
+          template_text: String(st.template_text || "").trim(),
+        }))
+        .filter((st) => st.template_text);
+      if (!cleanSteps.length) {
+        toast("Добавьте хотя бы один непустой шаг рассылки", "error");
+        return;
+      }
+      const selectedSources = sourceBoxes
+        .filter((cb) => cb.checked)
+        .map((cb) => cb.getAttribute("data-camp-leadgen-source"))
+        .filter(Boolean);
+
+      saveSettingsBtn.disabled = true;
+      try {
+        await api(`/api/campaigns/${camp.id}`, {
+          method: "PUT",
+          body: {
+            name: nameInput.value.trim() || camp.name,
+            daily_limit: Math.max(1, Math.min(500, Number(limitInput.value) || dailyLimit)),
+            leadgen_enabled: Boolean(lgEnabledCheck.checked),
+            leadgen_daily_quota: Math.max(0, Math.min(500, Number(lgQuotaInput.value) || 0)),
+            leadgen_sources: selectedSources,
+            steps: cleanSteps,
+          },
+        });
+        await loadCampaigns();
+        toast(`Настройки рассылки «${nameInput.value.trim() || camp.name}» сохранены`, "ok");
+      } catch (error) {
+        toast(error.message || "Ошибка сохранения настроек рассылки", "error");
+      } finally {
+        saveSettingsBtn.disabled = false;
+      }
+    },
+  }, ["Сохранить настройки рассылки"]);
+
+  return el("div", {
+    className: "campaign-settings-panel stack",
+    hidden: !settingsOpen ? "hidden" : undefined,
+  }, [
+    el("div", { className: "subcard-head" }, [
+      el("strong", {}, ["Настройки рассылки и автоподачи Лидгена"]),
+      el("button", {
+        type: "button",
+        className: "btn ghost sm",
+        onclick: () => {
+          state.expandedCampaignSettings[camp.id] = false;
+          renderCampaigns();
+        },
+      }, ["Свернуть ×"]),
+    ]),
+    el("div", { className: "outreach-form-row" }, [
+      el("label", {}, ["Название рассылки", nameInput]),
+      el("label", {}, ["Суточный лимит отправки (daily_limit)", limitStepper]),
+    ]),
+    el("div", { className: "campaign-leadgen-box stack" }, [
+      el("div", { className: "outreach-form-row" }, [
+        el("label", { className: "row leadgen-switch-label" }, [
+          lgEnabledCheck,
+          el("strong", {}, ["Подливать новых лидов из Лидгена в эту рассылку"]),
+        ]),
+        el("label", {}, [
+          "Квота добавления из Лидгена (лидов в сутки)",
+          lgQuotaStepper,
+        ]),
+      ]),
+      el("div", { className: "stack" }, [
+        el("span", { className: "steps-caption" }, ["ИСТОЧНИКИ ЛИДГЕНА ДЛЯ ЭТОЙ РАССЫЛКИ:"]),
+        el("div", { className: "campaign-accounts-pool" }, sourceChecksNodes),
+      ]),
+    ]),
+    el("div", { className: "stack" }, [
+      el("span", { className: "steps-caption" }, ["ШАГИ ЦЕПОЧКИ СООБЩЕНИЙ (РЕДАКТОР):"]),
+      stepsHost,
+      el("div", { className: "row" }, [addStepBtn, saveSettingsBtn]),
+    ]),
+  ]);
+}
+
 async function updateCampaignAccounts(campaignId, accountIds) {
   const cleanIds = (accountIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
   try {
@@ -1547,10 +1802,17 @@ function renderCampaigns() {
       connectedAccounts.length > 1 ? attachAllBtn : null,
     ].filter(Boolean));
 
+    const defaultCampProvider = /\((wa|whatsapp)\)|whatsapp/i.test(String(camp.name || ""))
+      ? "whatsapp"
+      : "telegram";
     const campProviders = attachedAccounts.length
       ? [...new Set(attachedAccounts.map((acc) => normalizeProvider(acc.provider)))]
-      : ["telegram"];
+      : [defaultCampProvider];
     const channelBadges = campProviders.map((prov) => channelBadgeEl(prov));
+
+    const leadgenEnabled = Boolean(camp.leadgen_enabled);
+    const leadgenQuota = Number(camp.leadgen_daily_quota ?? 20);
+    const leadgenSourcesList = Array.isArray(camp.leadgen_sources) ? camp.leadgen_sources : ["tg_groups", "yc_ph", "meta_ads", "tg_ad_spy", "channel_graph"];
 
     const badgeNodes = [
       ...channelBadges,
@@ -1561,7 +1823,52 @@ function renderCampaigns() {
           ? `${sentToday} / ${dailyLimit} в сут · пул до ${poolCapacity}/сут`
           : `${sentToday} / ${dailyLimit} в сут`,
       ]),
+      el("span", {
+        className: `badge ${leadgenEnabled ? "b-won" : "b-off"} campaign-leadgen-badge`,
+        "data-leadgen-enabled": leadgenEnabled ? "true" : "false",
+      }, [
+        leadgenEnabled ? `Лидген: ВКЛ · до ${leadgenQuota} лидов/сут` : "Лидген: ВЫКЛ",
+      ]),
     ];
+
+    const quickLimitStep = async (delta) => {
+      const nextLimit = Math.max(1, Math.min(500, dailyLimit + delta));
+      try {
+        await api(`/api/campaigns/${camp.id}`, {
+          method: "PUT",
+          body: { daily_limit: nextLimit },
+        });
+        await loadCampaigns();
+        toast(`Лимит «${camp.name}»: ${nextLimit} сообщ./сут`, "ok");
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    };
+
+    const quickMinusBtn = el("button", {
+      type: "button",
+      className: "btn ghost sm campaign-quick-limit-btn",
+      title: "Убавить суточный лимит на 5",
+      onclick: () => quickLimitStep(-5),
+    }, ["-5/сут"]);
+
+    const quickPlusBtn = el("button", {
+      type: "button",
+      className: "btn ghost sm campaign-quick-limit-btn",
+      title: "Добавить суточный лимит на 5",
+      onclick: () => quickLimitStep(5),
+    }, ["+5/сут"]);
+
+    const settingsOpen = Boolean(state.expandedCampaignSettings[camp.id]);
+    const toggleSettingsBtn = el("button", {
+      type: "button",
+      className: "btn secondary sm campaign-settings-btn",
+      "aria-expanded": settingsOpen ? "true" : "false",
+      onclick: () => {
+        state.expandedCampaignSettings[camp.id] = !settingsOpen;
+        renderCampaigns();
+      },
+    }, ["Настройки и Лидген"]);
 
     const isRunning = camp.status === "running";
     const statusToggleBtn = el("button", {
@@ -1593,6 +1900,15 @@ function renderCampaigns() {
       },
     }, [isRunning ? "Пауза" : "В автопилот"]);
 
+    const campaignSettingsPanel = buildCampaignSettingsPanel(camp, {
+      settingsOpen,
+      dailyLimit,
+      leadgenEnabled,
+      leadgenQuota,
+      leadgenSourcesList,
+      steps,
+    });
+
     const cardChildren = [
       el("div", { className: "campaign-card-head" }, [
         el("h4", { className: "name" }, [camp.name]),
@@ -1618,7 +1934,16 @@ function renderCampaigns() {
       ]),
       el("div", { className: "sequence-preview" }, stepPills),
       poolEditorRow,
-      el("div", { className: "row" }, [runBtn, statusToggleBtn, selectForCsvBtn, togglePoolBtn]),
+      campaignSettingsPanel,
+      el("div", { className: "row campaign-actions-row" }, [
+        runBtn,
+        statusToggleBtn,
+        quickMinusBtn,
+        quickPlusBtn,
+        toggleSettingsBtn,
+        selectForCsvBtn,
+        togglePoolBtn,
+      ]),
     ];
 
     if (recipients.length) {
@@ -6800,6 +7125,12 @@ async function boot() {
   loadAirtableStatus().catch(() => {});
   loadMcpInfo().catch(() => {});
   loadCalendar().catch(() => {});
+  loadLeadgenConfig().catch(() => {});
+  loadCrmAuthStatus().catch(() => {});
+  if (window.location.hash === "#login" || window.location.hash === "#auth") {
+    const authModal = document.querySelector("#crm-auth-modal");
+    if (authModal) authModal.hidden = false;
+  }
 }
 
 const seedDemoButton = document.querySelector("#seed-demo");
@@ -8654,7 +8985,654 @@ function bindV5Events() {
   }
 }
 
+/* =========================================================================
+ * Leadgen & TG-Vacancies Settings (#leadgen)
+ * ========================================================================= */
+function ensureLeadgenState() {
+  if (!state.leadgenConfig || typeof state.leadgenConfig !== "object") {
+    state.leadgenConfig = {
+      enabled: true,
+      auto_push_to_crm: true,
+      total_daily_quota: 50,
+      b2b: {
+        enabled: true,
+        touch_mode: "micro_ping",
+        target_campaign_tg: "Leadgen Auto (TG)",
+        target_campaign_wa: "Leadgen Auto (WA)",
+        campaign_daily_limit: 30,
+        sources: {
+          tg_groups: true,
+          tg_comments: true,
+          channel_graph: true,
+          tg_ad_spy: true,
+          meta_ads: true,
+          yc_ph: true,
+          social_x_reddit: true,
+          buyer_catalogs: true,
+          linkedin_jobs: true,
+        },
+        tg_groups_old: ["solofounders", "producthunt_heroes", "id1613398776"],
+        tg_groups_new: ["solofounderschat", "shopifyeasy", "productcircle_chat"],
+        tg_comment_channels: [],
+        limits: {
+          yc_limit: 50,
+          ph_limit: 0,
+          msg_limit: 1800,
+          lurker_limit: 1000,
+          external_limit: 20,
+        },
+      },
+      vacancies: {
+        enabled: true,
+        touch_mode: "direct",
+        campaign_name: "TG Вакансии",
+        daily_limit: 20,
+        remote_only: true,
+        hot_priority: true,
+        layers: {
+          "AI-контент": true,
+          "автоматизация": true,
+          "трафик": true,
+          "AI-роль": true,
+        },
+        source_words: "ваканс|vacanc|работ[аыу]|\\bjob|фриланс|freelance|биржа|удал[её]н|подработ|\\bhr\\b|hr'?tg|найм|hiring|карьер|career|заказ",
+        source_stop: "kurilo|аренда|прокат|spam|premium bot|wallet",
+        extra_chats: ["itconnectbelgrade"],
+        pause_between_chats: 1.5,
+      },
+      cases_bank_md: "",
+    };
+  }
+  return state.leadgenConfig;
+}
+
+function renderLeadgenGroupChips() {
+  const cfg = ensureLeadgenState();
+  const b2b = cfg.b2b || {};
+  const b2bHost = document.querySelector("#leadgen-b2b-groups-chips");
+  if (b2bHost) {
+    b2bHost.replaceChildren();
+    const groupsMap = [
+      ["tg_groups_new", "Группа", Array.isArray(b2b.tg_groups_new) ? b2b.tg_groups_new : []],
+      ["tg_groups_old", "База", Array.isArray(b2b.tg_groups_old) ? b2b.tg_groups_old : []],
+      ["tg_comment_channels", "Комменты", Array.isArray(b2b.tg_comment_channels) ? b2b.tg_comment_channels : []],
+    ];
+    let totalChips = 0;
+    groupsMap.forEach(([listKey, tagType, items]) => {
+      items.forEach((handle, idx) => {
+        totalChips += 1;
+        const clean = String(handle || "").replace(/^@/, "");
+        b2bHost.append(
+          el("span", { className: "tag-chip", "data-group-list": listKey, "data-group-handle": clean }, [
+            el("span", { className: "tag-chip-badge" }, [tagType]),
+            el("span", { className: "tag-chip-text" }, [`@${clean}`]),
+            el("button", {
+              type: "button",
+              className: "tag-chip-remove",
+              "aria-label": `Удалить @${clean}`,
+              onclick: () => {
+                b2b[listKey] = (b2b[listKey] || []).filter((_, i) => i !== idx);
+                renderLeadgenGroupChips();
+              },
+            }, ["×"]),
+          ]),
+        );
+      });
+    });
+    if (!totalChips) {
+      b2bHost.append(el("span", { className: "hint" }, ["Список групп пуст — добавьте первый чат выше."]));
+    }
+  }
+
+  const vac = cfg.vacancies || {};
+  const vacHost = document.querySelector("#leadgen-vac-chats-chips");
+  if (vacHost) {
+    vacHost.replaceChildren();
+    const extraChats = Array.isArray(vac.extra_chats) ? vac.extra_chats : [];
+    if (!extraChats.length) {
+      vacHost.append(el("span", { className: "hint" }, ["Нет дополнительных чатов вакансий."]));
+    } else {
+      extraChats.forEach((chat, idx) => {
+        const clean = String(chat || "").replace(/^@/, "");
+        vacHost.append(
+          el("span", { className: "tag-chip", "data-vac-chat": clean }, [
+            el("span", { className: "tag-chip-badge" }, ["Вакансии"]),
+            el("span", { className: "tag-chip-text" }, [`@${clean}`]),
+            el("button", {
+              type: "button",
+              className: "tag-chip-remove",
+              "aria-label": `Удалить @${clean}`,
+              onclick: () => {
+                vac.extra_chats = (vac.extra_chats || []).filter((_, i) => i !== idx);
+                renderLeadgenGroupChips();
+              },
+            }, ["×"]),
+          ]),
+        );
+      });
+    }
+  }
+}
+
+function renderLeadgenConfig() {
+  const cfg = ensureLeadgenState();
+  const b2b = cfg.b2b || {};
+  const vac = cfg.vacancies || {};
+  const status = state.leadgenStatus || {};
+
+  const statusBadge = document.querySelector("#leadgen-status-badge");
+  if (statusBadge) {
+    const isOn = Boolean(cfg.enabled);
+    statusBadge.textContent = isOn
+      ? `Авто-лидген: ВКЛ · до ${cfg.total_daily_quota ?? 50}/сут`
+      : "Авто-лидген: ПАУЗА";
+    statusBadge.className = `badge ${isOn ? "b-ok" : "b-wait"}`;
+  }
+
+  const statsBadge = document.querySelector("#leadgen-stats-badge");
+  if (statsBadge) {
+    const counts = status.crm_leadgen_counts || {};
+    const lastRun = status.last_run || status.last_run_summary || {};
+    const totalInCrm = Number(counts.total_leadgen_leads) || 0;
+    const vacInCrm = Number(counts.vacancies_leads) || 0;
+    const b2bInCrm = Number(counts.b2b_leads) || 0;
+    const lastUnique = Number(lastRun.new_unique) || 0;
+    statsBadge.textContent = `В CRM из лидгена: ${totalInCrm} (B2B: ${b2bInCrm} · Вакансии: ${vacInCrm}) · Посл. прогон: +${lastUnique}`;
+  }
+
+  const setVal = (sel, val) => {
+    const node = document.querySelector(sel);
+    if (node) node.value = String(val ?? "");
+  };
+  const setCheck = (sel, checked) => {
+    const node = document.querySelector(sel);
+    if (node) node.checked = Boolean(checked);
+  };
+
+  setCheck("#leadgen-enabled-toggle", cfg.enabled !== false);
+  setCheck("#leadgen-autopush-toggle", cfg.auto_push_to_crm !== false);
+  setVal("#leadgen-total-quota", cfg.total_daily_quota ?? 50);
+
+  setCheck("#leadgen-b2b-enabled", b2b.enabled !== false);
+  setVal("#leadgen-b2b-touch-mode", b2b.touch_mode || "micro_ping");
+  setVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Leadgen Auto (TG)");
+  setVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Leadgen Auto (WA)");
+  setVal("#leadgen-b2b-daily-limit", b2b.campaign_daily_limit ?? 30);
+
+  const b2bSources = b2b.sources || {};
+  document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
+    const key = cb.getAttribute("data-b2b-source");
+    cb.checked = b2bSources[key] !== false;
+  });
+
+  const limits = b2b.limits || {};
+  setVal("#leadgen-limit-yc", limits.yc_limit ?? 50);
+  setVal("#leadgen-limit-ph", limits.ph_limit ?? 0);
+  setVal("#leadgen-limit-msg", limits.msg_limit ?? 1800);
+  setVal("#leadgen-limit-lurker", limits.lurker_limit ?? 1000);
+  setVal("#leadgen-limit-external", limits.external_limit ?? 20);
+
+  setCheck("#leadgen-vacancies-enabled", vac.enabled !== false);
+  setCheck("#leadgen-vac-remote-only", vac.remote_only !== false);
+  setCheck("#leadgen-vac-hot-priority", vac.hot_priority !== false);
+  setVal("#leadgen-vac-touch-mode", vac.touch_mode || "direct");
+  setVal("#leadgen-vac-campaign", vac.campaign_name || "TG Вакансии");
+  setVal("#leadgen-vac-daily-limit", vac.daily_limit ?? 20);
+  setVal("#leadgen-vac-source-words", vac.source_words || "");
+  setVal("#leadgen-vac-source-stop", vac.source_stop || "");
+  setVal("#leadgen-cases-bank", cfg.cases_bank_md || "");
+
+  const vacLayers = vac.layers || {};
+  document.querySelectorAll("[data-vac-layer]").forEach((cb) => {
+    const key = cb.getAttribute("data-vac-layer");
+    cb.checked = vacLayers[key] !== false;
+  });
+
+  renderLeadgenGroupChips();
+}
+
+function collectLeadgenFormPayload() {
+  const cfg = ensureLeadgenState();
+  const b2b = cfg.b2b || {};
+  const vac = cfg.vacancies || {};
+
+  const getVal = (sel, fallback = "") => {
+    const node = document.querySelector(sel);
+    return node ? node.value.trim() : fallback;
+  };
+  const getNum = (sel, fallback = 0, min = 0, max = 50000) => {
+    const node = document.querySelector(sel);
+    const val = node ? Number(node.value) : fallback;
+    if (!Number.isFinite(val)) return fallback;
+    return Math.max(min, Math.min(max, val));
+  };
+  const getCheck = (sel, fallback = true) => {
+    const node = document.querySelector(sel);
+    return node ? Boolean(node.checked) : fallback;
+  };
+
+  const sources = {};
+  document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
+    const key = cb.getAttribute("data-b2b-source");
+    if (key) sources[key] = Boolean(cb.checked);
+  });
+
+  const layers = {};
+  document.querySelectorAll("[data-vac-layer]").forEach((cb) => {
+    const key = cb.getAttribute("data-vac-layer");
+    if (key) layers[key] = Boolean(cb.checked);
+  });
+
+  const casesNode = document.querySelector("#leadgen-cases-bank");
+  return {
+    enabled: getCheck("#leadgen-enabled-toggle", true),
+    auto_push_to_crm: getCheck("#leadgen-autopush-toggle", true),
+    total_daily_quota: getNum("#leadgen-total-quota", 50, 0, 500),
+    b2b: {
+      enabled: getCheck("#leadgen-b2b-enabled", true),
+      touch_mode: getVal("#leadgen-b2b-touch-mode", "micro_ping"),
+      target_campaign_tg: getVal("#leadgen-b2b-campaign-tg", "Leadgen Auto (TG)"),
+      target_campaign_wa: getVal("#leadgen-b2b-campaign-wa", "Leadgen Auto (WA)"),
+      campaign_daily_limit: getNum("#leadgen-b2b-daily-limit", 30, 1, 500),
+      sources,
+      tg_groups_old: Array.isArray(b2b.tg_groups_old) ? b2b.tg_groups_old : [],
+      tg_groups_new: Array.isArray(b2b.tg_groups_new) ? b2b.tg_groups_new : [],
+      tg_comment_channels: Array.isArray(b2b.tg_comment_channels) ? b2b.tg_comment_channels : [],
+      limits: {
+        yc_limit: getNum("#leadgen-limit-yc", 50, 0, 5000),
+        ph_limit: getNum("#leadgen-limit-ph", 0, 0, 5000),
+        msg_limit: getNum("#leadgen-limit-msg", 1800, 50, 20000),
+        lurker_limit: getNum("#leadgen-limit-lurker", 1000, 0, 10000),
+        external_limit: getNum("#leadgen-limit-external", 20, 0, 1000),
+      },
+    },
+    vacancies: {
+      enabled: getCheck("#leadgen-vacancies-enabled", true),
+      touch_mode: getVal("#leadgen-vac-touch-mode", "direct"),
+      campaign_name: getVal("#leadgen-vac-campaign", "TG Вакансии"),
+      daily_limit: getNum("#leadgen-vac-daily-limit", 20, 1, 500),
+      remote_only: getCheck("#leadgen-vac-remote-only", true),
+      hot_priority: getCheck("#leadgen-vac-hot-priority", true),
+      layers,
+      source_words: getVal("#leadgen-vac-source-words", vac.source_words || ""),
+      source_stop: getVal("#leadgen-vac-source-stop", vac.source_stop || ""),
+      extra_chats: Array.isArray(vac.extra_chats) ? vac.extra_chats : [],
+      pause_between_chats: Number(vac.pause_between_chats) || 1.5,
+    },
+    cases_bank_md: casesNode ? casesNode.value : (cfg.cases_bank_md || ""),
+  };
+}
+
+async function loadLeadgenConfig() {
+  try {
+    const res = await api("/api/leadgen/config");
+    if (res && res.config) {
+      state.leadgenConfig = res.config;
+    } else if (res && typeof res === "object") {
+      state.leadgenConfig = res;
+    }
+    if (res && res.status) {
+      state.leadgenStatus = res.status;
+    }
+    renderLeadgenConfig();
+  } catch (_error) {
+    renderLeadgenConfig();
+  }
+}
+
+async function saveLeadgenConfig(button) {
+  const payload = collectLeadgenFormPayload();
+  state.leadgenConfig = payload;
+  if (button) button.disabled = true;
+  try {
+    const res = await api("/api/leadgen/config", {
+      method: "PUT",
+      body: { ...payload, config: payload, sync_campaigns: true },
+    });
+    if (res && res.config) state.leadgenConfig = res.config;
+    if (res && res.status) state.leadgenStatus = res.status;
+    renderLeadgenConfig();
+    await loadCampaigns().catch(() => {});
+    toast("Настройки Лидгена и TG-Вакансий сохранены", "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось сохранить настройки Лидгена", "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function syncLeadgenCampaigns(button) {
+  const payload = collectLeadgenFormPayload();
+  if (button) button.disabled = true;
+  try {
+    await api("/api/leadgen/config", {
+      method: "PUT",
+      body: { ...payload, config: payload, sync_campaigns: true },
+    }).catch(() => {});
+    const res = await api("/api/leadgen/sync-campaigns", {
+      method: "POST",
+      body: payload,
+    });
+    await loadCampaigns();
+    await loadLeadgenConfig();
+    toast(res?.message || "Целевые кампании Лидгена и Вакансий синхронизированы", "ok");
+  } catch (error) {
+    toast(error.message || "Ошибка синхронизации рассылок Лидгена", "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function pushLeadgenNow(button) {
+  if (button) button.disabled = true;
+  try {
+    const res = await api("/api/leadgen/push-now", {
+      method: "POST",
+      body: collectLeadgenFormPayload(),
+    });
+    await loadCampaigns().catch(() => {});
+    await loadLeads(state.leadQuery || "", state.selectedLeadId).catch(() => {});
+    await loadLeadgenConfig().catch(() => {});
+    const count = res?.ingested ?? res?.pushed ?? res?.imported ?? res?.total ?? "";
+    toast(
+      res?.message || (
+        count !== ""
+          ? `Заливка выполнена: добавлено/обновлено лидов (${count})`
+          : "Найденные лиды и вакансии залиты в CRM и рассылки"
+      ),
+      "ok",
+    );
+  } catch (error) {
+    toast(error.message || "Ошибка заливки лидов в CRM", "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindLeadgenEvents() {
+  const saveBtn = document.querySelector("#leadgen-save-btn");
+  if (saveBtn) {
+    saveBtn.addEventListener("click", (e) => saveLeadgenConfig(e.currentTarget));
+  }
+  const syncBtn = document.querySelector("#leadgen-sync-campaigns-btn");
+  if (syncBtn) {
+    syncBtn.addEventListener("click", (e) => syncLeadgenCampaigns(e.currentTarget));
+  }
+  const pushBtn = document.querySelector("#leadgen-push-now-btn");
+  if (pushBtn) {
+    pushBtn.addEventListener("click", (e) => pushLeadgenNow(e.currentTarget));
+  }
+
+  document.querySelectorAll("[data-leadgen-quota-step]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = document.querySelector("#leadgen-total-quota");
+      if (!input) return;
+      const step = Number(btn.getAttribute("data-leadgen-quota-step")) || 0;
+      const next = Math.max(0, Math.min(500, (Number(input.value) || 0) + step));
+      input.value = String(next);
+    });
+  });
+
+  document.querySelectorAll("[data-leadgen-quota-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = document.querySelector("#leadgen-total-quota");
+      if (!input) return;
+      input.value = String(Number(btn.getAttribute("data-leadgen-quota-preset")) || 50);
+    });
+  });
+
+  document.querySelectorAll("[data-b2b-limit-step]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = document.querySelector("#leadgen-b2b-daily-limit");
+      if (!input) return;
+      const step = Number(btn.getAttribute("data-b2b-limit-step")) || 0;
+      input.value = String(Math.max(1, Math.min(500, (Number(input.value) || 30) + step)));
+    });
+  });
+
+  document.querySelectorAll("[data-vac-limit-step]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = document.querySelector("#leadgen-vac-daily-limit");
+      if (!input) return;
+      const step = Number(btn.getAttribute("data-vac-limit-step")) || 0;
+      input.value = String(Math.max(1, Math.min(500, (Number(input.value) || 20) + step)));
+    });
+  });
+
+  const addGroupBtn = document.querySelector("#leadgen-add-group-btn");
+  const addGroupInput = document.querySelector("#leadgen-add-group-input");
+  const addGroupTarget = document.querySelector("#leadgen-add-group-target");
+  if (addGroupBtn && addGroupInput) {
+    const handleAddGroup = () => {
+      const raw = addGroupInput.value.trim();
+      if (!raw) return;
+      const clean = raw
+        .replace(/^https?:\/\/(t\.me|telegram\.me)\//i, "")
+        .replace(/^@/, "")
+        .split(/[/?#]/)[0]
+        .trim();
+      if (!clean) return;
+      const cfg = ensureLeadgenState();
+      const targetKey = (addGroupTarget && addGroupTarget.value) || "tg_groups_new";
+      if (!Array.isArray(cfg.b2b[targetKey])) cfg.b2b[targetKey] = [];
+      if (!cfg.b2b[targetKey].includes(clean)) {
+        cfg.b2b[targetKey].push(clean);
+      }
+      addGroupInput.value = "";
+      renderLeadgenGroupChips();
+    };
+    addGroupBtn.addEventListener("click", handleAddGroup);
+    addGroupInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleAddGroup();
+      }
+    });
+  }
+
+  const addVacChatBtn = document.querySelector("#leadgen-add-vac-chat-btn");
+  const addVacChatInput = document.querySelector("#leadgen-add-vac-chat-input");
+  if (addVacChatBtn && addVacChatInput) {
+    const handleAddVacChat = () => {
+      const raw = addVacChatInput.value.trim();
+      if (!raw) return;
+      const clean = raw
+        .replace(/^https?:\/\/(t\.me|telegram\.me)\//i, "")
+        .replace(/^@/, "")
+        .split(/[/?#]/)[0]
+        .trim();
+      if (!clean) return;
+      const cfg = ensureLeadgenState();
+      if (!Array.isArray(cfg.vacancies.extra_chats)) cfg.vacancies.extra_chats = [];
+      if (!cfg.vacancies.extra_chats.includes(clean)) {
+        cfg.vacancies.extra_chats.push(clean);
+      }
+      addVacChatInput.value = "";
+      renderLeadgenGroupChips();
+    };
+    addVacChatBtn.addEventListener("click", handleAddVacChat);
+    addVacChatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleAddVacChat();
+      }
+    });
+  }
+}
+
+/* =========================================================================
+ * CRM Auth Modal & Workspace User Switcher (/api/auth/*)
+ * ========================================================================= */
+function renderCrmAuthUI(authData) {
+  const isAuthed = Boolean(authData?.authenticated && authData?.user);
+  const user = authData?.user || null;
+  const users = Array.isArray(authData?.users) ? authData.users : [];
+
+  const labelText = isAuthed
+    ? `👤 ${user.display_name || user.username} (${user.username})`
+    : "👤 Войти / Регистрация";
+
+  ["#crm-user-btn", "#sidebar-user-btn"].forEach((sel) => {
+    const btn = document.querySelector(sel);
+    if (btn) btn.textContent = labelText;
+  });
+
+  const badge = document.querySelector("#crm-auth-status-badge");
+  if (badge) {
+    badge.textContent = isAuthed
+      ? `Вы вошли: ${user.display_name || user.username} (${user.role || "admin"})`
+      : "Гость (без входа)";
+    badge.className = `badge ${isAuthed ? "b-ok" : "b-wait"}`;
+  }
+
+  const logoutBtn = document.querySelector("#modal-logout-btn");
+  if (logoutBtn) {
+    logoutBtn.hidden = !isAuthed;
+  }
+
+  const usersHost = document.querySelector("#modal-users-list");
+  if (usersHost) {
+    usersHost.replaceChildren();
+    users.forEach((u) => {
+      const roleClass = u.role === "admin" ? "b-won" : u.role === "sales" ? "b-talk" : "b-new";
+      usersHost.append(
+        el("div", { className: "auth-user-pill", "data-auth-username": u.username }, [
+          el("strong", {}, [u.display_name || u.username]),
+          el("code", {}, [`@${u.username}`]),
+          el("span", { className: `badge ${roleClass}` }, [u.role || "operator"]),
+        ]),
+      );
+    });
+  }
+}
+
+async function loadCrmAuthStatus() {
+  try {
+    const data = await api("/api/auth/me");
+    state.authUser = data?.user || null;
+    state.authUsers = data?.users || [];
+    renderCrmAuthUI(data);
+  } catch (_err) {
+    /* ignore */
+  }
+}
+
+function bindCrmAuthEvents() {
+  const modal = document.querySelector("#crm-auth-modal");
+  const openModal = async () => {
+    if (!modal) return;
+    modal.hidden = false;
+    await loadCrmAuthStatus();
+    modal.scrollIntoView({ block: "nearest" });
+  };
+
+  ["#crm-user-btn", "#sidebar-user-btn"].forEach((sel) => {
+    const btn = document.querySelector(sel);
+    if (btn) btn.addEventListener("click", openModal);
+  });
+
+  const closeBtn = document.querySelector("#close-crm-auth-modal-btn");
+  if (closeBtn && modal) {
+    closeBtn.addEventListener("click", () => {
+      modal.hidden = true;
+    });
+  }
+
+  const tabLogin = document.querySelector("#modal-tab-login");
+  const tabReg = document.querySelector("#modal-tab-register");
+  const paneLogin = document.querySelector("#modal-pane-login");
+  const paneReg = document.querySelector("#modal-pane-register");
+  const switchModalAuthTab = (mode) => {
+    const isLogin = mode !== "register";
+    if (tabLogin) tabLogin.setAttribute("aria-selected", isLogin ? "true" : "false");
+    if (tabReg) tabReg.setAttribute("aria-selected", !isLogin ? "true" : "false");
+    if (paneLogin) paneLogin.hidden = !isLogin;
+    if (paneReg) paneReg.hidden = isLogin;
+  };
+  if (tabLogin) tabLogin.addEventListener("click", () => switchModalAuthTab("login"));
+  if (tabReg) tabReg.addEventListener("click", () => switchModalAuthTab("register"));
+
+  const performModalLogin = async (username, password) => {
+    const submitBtn = document.querySelector("#modal-login-submit-btn");
+    if (submitBtn) submitBtn.disabled = true;
+    try {
+      const res = await api("/api/auth/login", {
+        method: "POST",
+        body: { username, password },
+      });
+      await loadCrmAuthStatus();
+      toast(`Вход выполнен: ${res?.user?.display_name || username}`, "ok");
+    } catch (error) {
+      toast(error.message || "Ошибка входа", "error");
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  };
+
+  document.querySelectorAll("[data-modal-preset-user]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const u = btn.getAttribute("data-modal-preset-user") || "";
+      const p = btn.getAttribute("data-modal-preset-pass") || "";
+      const uInput = document.querySelector("#modal-login-username");
+      const pInput = document.querySelector("#modal-login-password");
+      if (uInput) uInput.value = u;
+      if (pInput) pInput.value = p;
+      performModalLogin(u, p);
+    });
+  });
+
+  const loginForm = document.querySelector("#modal-login-form");
+  if (loginForm) {
+    loginForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const u = document.querySelector("#modal-login-username")?.value.trim() || "";
+      const p = document.querySelector("#modal-login-password")?.value || "";
+      performModalLogin(u, p);
+    });
+  }
+
+  const regForm = document.querySelector("#modal-register-form");
+  if (regForm) {
+    regForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const username = document.querySelector("#modal-reg-username")?.value.trim() || "";
+      const display_name = document.querySelector("#modal-reg-display-name")?.value.trim() || "";
+      const role = document.querySelector("#modal-reg-role")?.value || "operator";
+      const password = document.querySelector("#modal-reg-password")?.value || "";
+      const submitBtn = document.querySelector("#modal-reg-submit-btn");
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        const res = await api("/api/auth/register", {
+          method: "POST",
+          body: { username, display_name, role, password },
+        });
+        await loadCrmAuthStatus();
+        toast(`Аккаунт «${res?.user?.display_name || username}» зарегистрирован и выполнен вход`, "ok");
+      } catch (error) {
+        toast(error.message || "Ошибка регистрации", "error");
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+
+  const logoutBtn = document.querySelector("#modal-logout-btn");
+  if (logoutBtn) {
+    logoutBtn.addEventListener("click", async () => {
+      try {
+        await api("/api/auth/logout", { method: "POST" });
+        await loadCrmAuthStatus();
+        toast("Вы вышли из аккаунта", "ok");
+      } catch (error) {
+        toast(error.message || "Ошибка выхода", "error");
+      }
+    });
+  }
+}
+
 bindV5Events();
+bindLeadgenEvents();
+bindCrmAuthEvents();
 
 boot();
 

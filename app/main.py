@@ -306,6 +306,12 @@ class CampaignIn(BaseModel):
     daily_limit: int = 20
     status: str | None = None
     steps: list[dict] | None = None
+    leadgen_enabled: bool | None = None
+    leadgen_daily_quota: int | None = None
+    leadgen_sources: list[str] | None = None
+
+
+CampaignCreateIn = CampaignIn
 
 
 class CampaignUpdateIn(BaseModel):
@@ -315,6 +321,9 @@ class CampaignUpdateIn(BaseModel):
     daily_limit: int | None = None
     status: str | None = None
     steps: list[dict] | None = None
+    leadgen_enabled: bool | None = None
+    leadgen_daily_quota: int | None = None
+    leadgen_sources: list[str] | None = None
 
 
 class CampaignCsvIn(BaseModel):
@@ -1563,6 +1572,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             steps=body.steps,
             account_ids=body.account_ids,
             status=body.status,
+            leadgen_enabled=body.leadgen_enabled,
+            leadgen_daily_quota=body.leadgen_daily_quota,
+            leadgen_sources=body.leadgen_sources,
         )
 
     @app.get("/api/campaigns/{campaign_id}")
@@ -1581,6 +1593,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             status=body.status,
             steps=body.steps,
             account_ids=body.account_ids,
+            leadgen_enabled=body.leadgen_enabled,
+            leadgen_daily_quota=body.leadgen_daily_quota,
+            leadgen_sources=body.leadgen_sources,
         )
 
     @app.post("/api/campaigns/{campaign_id}/csv")
@@ -2115,6 +2130,54 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         result["configured"] = True
         result.setdefault("proxy_masked", mask_proxy_url(target_url))
         return result
+
+    from app.leadgen_settings import (
+        get_leadgen_config,
+        get_leadgen_status,
+        push_discovered_now,
+        save_leadgen_config,
+        sync_leadgen_campaigns,
+    )
+
+    @app.get("/api/leadgen/config")
+    def leadgen_config_get(request: Request):
+        conn = request.app.state.conn
+        return {
+            "ok": True,
+            "config": _call(get_leadgen_config, conn),
+            "status": _call(get_leadgen_status, conn),
+        }
+
+    @app.put("/api/leadgen/config")
+    @app.post("/api/leadgen/config")
+    async def leadgen_config_save(request: Request):
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Ожидается объект JSON")
+        conn = request.app.state.conn
+        saved = _call(save_leadgen_config, conn, payload)
+        if bool(payload.get("sync_campaigns")):
+            _call(sync_leadgen_campaigns, conn, saved)
+        return {
+            "ok": True,
+            "config": saved,
+            "status": _call(get_leadgen_status, conn),
+        }
+
+    @app.post("/api/leadgen/sync-campaigns")
+    def leadgen_sync_campaigns(request: Request):
+        return _call(sync_leadgen_campaigns, request.app.state.conn)
+
+    @app.post("/api/leadgen/push-now")
+    def leadgen_push_now(request: Request):
+        return _call(push_discovered_now, request.app.state.conn)
+
+    from app.crm_auth import register_auth_routes
+
+    register_auth_routes(app, templates)
 
     from app.mcp_server import register_mcp_routes
 

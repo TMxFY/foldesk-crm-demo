@@ -336,6 +336,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             status TEXT NOT NULL DEFAULT 'draft' CHECK (
                 status IN ('draft', 'running', 'paused', 'completed')
             ),
+            leadgen_enabled INTEGER NOT NULL DEFAULT 0,
+            leadgen_daily_quota INTEGER NOT NULL DEFAULT 20,
+            leadgen_sources_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -445,6 +448,23 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS calendar_events_ext_unique
             ON calendar_events(source, external_id)
             WHERE external_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS crm_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'operator',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS crm_auth_sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES crm_users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
         """
     )
     _migrate(conn)
@@ -562,6 +582,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "messages", "external_message_id", "TEXT")
     _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
     _ensure_column(conn, "campaigns", "csv_headers_json", "TEXT")
+    _ensure_column(conn, "campaigns", "leadgen_enabled", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "campaigns", "leadgen_daily_quota", "INTEGER NOT NULL DEFAULT 20")
+    _ensure_column(conn, "campaigns", "leadgen_sources_json", "TEXT NOT NULL DEFAULT '[]'")
     _ensure_column(
         conn,
         "campaign_recipients",
@@ -619,6 +642,32 @@ def _migrate(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS leads_airtable_rec ON leads(airtable_record_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crm_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'operator',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crm_auth_sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES crm_users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+    from app.crm_auth import ensure_default_crm_users
+
+    ensure_default_crm_users(conn)
     _ensure_default_pipeline_stages(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")

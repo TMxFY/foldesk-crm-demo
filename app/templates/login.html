@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход и Регистрация — Foldesk CRM</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/design/tokens.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="auth-page-body">
+  <main class="auth-page-wrap">
+    <section class="surface-box auth-card stack" aria-labelledby="auth-card-title">
+      <div class="auth-card-header">
+        <div class="ws-header auth-ws-brand">
+          <span class="ws-logo" aria-hidden="true">F</span>
+          <div class="ws-meta">
+            <h1 id="auth-card-title" class="brand">Foldesk CRM</h1>
+            <span class="ws-sub">Telegram &amp; WhatsApp Sales Workspace</span>
+          </div>
+        </div>
+        <div class="row">
+          <span id="auth-current-badge" class="badge b-new">Проверка сессии...</span>
+          <button type="button" id="auth-theme-btn" class="btn ghost sm">Тема</button>
+        </div>
+      </div>
+
+      <div class="auth-mode-tabs" role="tablist" aria-label="Вход или регистрация">
+        <button type="button" class="auth-tab-btn" id="tab-btn-login" data-auth-tab="login" role="tab" aria-selected="true">Вход в CRM</button>
+        <button type="button" class="auth-tab-btn" id="tab-btn-register" data-auth-tab="register" role="tab" aria-selected="false">Регистрация</button>
+      </div>
+
+      <div id="pane-login" class="auth-tab-pane stack" role="tabpanel" aria-labelledby="tab-btn-login">
+        <div class="stack">
+          <span class="steps-caption">БЫСТРЫЙ ВЫБОР ПРОФИЛЯ (3 РАБОЧИХ АККАУНТА):</span>
+          <div class="auth-presets-grid">
+            <button type="button" class="auth-preset-card" data-preset-user="tim" data-preset-pass="TimFoldesk2026!">
+              <div class="row">
+                <strong>Тимофей</strong>
+                <span class="badge b-won">Owner · Admin</span>
+              </div>
+              <code>tim / TimFoldesk2026!</code>
+              <span class="hint">Полный доступ, Лидген, MCP, Рассылки</span>
+            </button>
+            <button type="button" class="auth-preset-card" data-preset-user="vlad" data-preset-pass="VladSales2026!">
+              <div class="row">
+                <strong>Влад</strong>
+                <span class="badge b-talk">Sales · Партнёр</span>
+              </div>
+              <code>vlad / VladSales2026!</code>
+              <span class="hint">Воронка сделок, Переписки, Созвоны</span>
+            </button>
+            <button type="button" class="auth-preset-card" data-preset-user="operator" data-preset-pass="Operator2026!">
+              <div class="row">
+                <strong>Оператор</strong>
+                <span class="badge b-new">Outreach</span>
+              </div>
+              <code>operator / Operator2026!</code>
+              <span class="hint">Аутрич, Очереди рассылок, Чаты</span>
+            </button>
+          </div>
+        </div>
+
+        <form id="login-page-form" class="stack">
+          <div class="outreach-form-row">
+            <label for="login-username">Логин
+              <input id="login-username" name="username" type="text" autocomplete="username" placeholder="tim, vlad или operator" value="tim" required>
+            </label>
+            <label for="login-password">Пароль
+              <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Пароль" value="TimFoldesk2026!" required>
+            </label>
+          </div>
+          <div class="row">
+            <button type="submit" id="login-submit-btn" class="btn primary sm">Войти в Foldesk CRM</button>
+            <button type="button" id="login-logout-btn" class="btn ghost sm" hidden>Выйти из текущего аккаунта</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="pane-register" class="auth-tab-pane stack" role="tabpanel" aria-labelledby="tab-btn-register" hidden>
+        <p class="hint">Создайте новый аккаунт сотрудника или партнёра для работы в общем пространстве Foldesk CRM.</p>
+        <form id="register-page-form" class="stack">
+          <div class="outreach-form-row">
+            <label for="reg-username">Логин (латиницей)
+              <input id="reg-username" name="username" type="text" autocomplete="username" placeholder="alex_sales" required>
+            </label>
+            <label for="reg-display-name">Имя и должность
+              <input id="reg-display-name" name="display_name" type="text" autocomplete="name" placeholder="Алексей (Account Executive)" required>
+            </label>
+          </div>
+          <div class="outreach-form-row">
+            <label for="reg-role">Роль в воркспейсе
+              <select id="reg-role" name="role">
+                <option value="admin">Admin (Владелец / Полный доступ)</option>
+                <option value="sales">Sales (Менеджер продаж / Партнёр)</option>
+                <option value="operator" selected>Operator (Оператор аутрича)</option>
+              </select>
+            </label>
+            <label for="reg-password">Пароль
+              <input id="reg-password" name="password" type="password" autocomplete="new-password" placeholder="Минимум 6 символов" required>
+            </label>
+          </div>
+          <label for="reg-password-confirm">Повтор пароля
+            <input id="reg-password-confirm" name="password_confirm" type="password" autocomplete="new-password" placeholder="Повторите пароль" required>
+          </label>
+          <div class="row">
+            <button type="submit" id="reg-submit-btn" class="btn primary sm">Зарегистрировать аккаунт и войти</button>
+          </div>
+        </form>
+      </div>
+
+      <p id="auth-status-msg" class="msg" role="status" hidden></p>
+
+      <div class="surface-subcard stack">
+        <div class="subcard-head">
+          <span class="steps-caption">АКТИВНЫЕ ПРОФИЛИ ВОРКСПЕЙСА:</span>
+          <span id="auth-users-count" class="badge b-ok">3 аккаунта</span>
+        </div>
+        <div id="auth-users-list" class="auth-users-list"></div>
+      </div>
+
+      <div class="auth-footer-row">
+        <a href="/" class="btn secondary sm">← Вернуться в рабочий стол CRM</a>
+        <span class="hint">Сессия сохраняется в защищённом cookie <code>foldesk_auth</code></span>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      const savedTheme = localStorage.getItem("theme") || "dark";
+      document.documentElement.dataset.theme = savedTheme;
+
+      const themeBtn = document.querySelector("#auth-theme-btn");
+      if (themeBtn) {
+        themeBtn.addEventListener("click", () => {
+          const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+          document.documentElement.dataset.theme = next;
+          localStorage.setItem("theme", next);
+        });
+      }
+
+      const tabLogin = document.querySelector("#tab-btn-login");
+      const tabReg = document.querySelector("#tab-btn-register");
+      const paneLogin = document.querySelector("#pane-login");
+      const paneReg = document.querySelector("#pane-register");
+      const statusMsg = document.querySelector("#auth-status-msg");
+
+      function showMsg(text, isError) {
+        if (!statusMsg) return;
+        statusMsg.hidden = !text;
+        statusMsg.textContent = text || "";
+        statusMsg.dataset.kind = isError ? "error" : "ok";
+      }
+
+      function switchTab(mode) {
+        const isLogin = mode !== "register";
+        if (tabLogin) tabLogin.setAttribute("aria-selected", isLogin ? "true" : "false");
+        if (tabReg) tabReg.setAttribute("aria-selected", !isLogin ? "true" : "false");
+        if (paneLogin) paneLogin.hidden = !isLogin;
+        if (paneReg) paneReg.hidden = isLogin;
+        showMsg("", false);
+      }
+
+      if (tabLogin) tabLogin.addEventListener("click", () => switchTab("login"));
+      if (tabReg) tabReg.addEventListener("click", () => switchTab("register"));
+      if (window.location.hash === "#register") switchTab("register");
+
+      async function apiCall(url, method, body) {
+        const res = await fetch(url, {
+          method: method || "GET",
+          headers: body ? { "Content-Type": "application/json" } : {},
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || data.error || "Ошибка запроса");
+        }
+        return data;
+      }
+
+      async function doLogin(username, password) {
+        const btn = document.querySelector("#login-submit-btn");
+        if (btn) btn.disabled = true;
+        try {
+          const res = await apiCall("/api/auth/login", "POST", { username, password });
+          showMsg("Вход выполнен: " + (res.user?.display_name || username) + ". Переход в CRM...", false);
+          await loadAuthMe();
+          setTimeout(() => {
+            window.location.href = "/";
+          }, 350);
+        } catch (err) {
+          showMsg(err.message || "Неверный логин или пароль", true);
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+      }
+
+      document.querySelectorAll("[data-preset-user]").forEach((card) => {
+        card.addEventListener("click", () => {
+          const u = card.getAttribute("data-preset-user") || "";
+          const p = card.getAttribute("data-preset-pass") || "";
+          const uInput = document.querySelector("#login-username");
+          const pInput = document.querySelector("#login-password");
+          if (uInput) uInput.value = u;
+          if (pInput) pInput.value = p;
+          doLogin(u, p);
+        });
+      });
+
+      const loginForm = document.querySelector("#login-page-form");
+      if (loginForm) {
+        loginForm.addEventListener("submit", (e) => {
+          e.preventDefault();
+          const u = document.querySelector("#login-username")?.value.trim() || "";
+          const p = document.querySelector("#login-password")?.value || "";
+          doLogin(u, p);
+        });
+      }
+
+      const regForm = document.querySelector("#register-page-form");
+      if (regForm) {
+        regForm.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const username = document.querySelector("#reg-username")?.value.trim() || "";
+          const display_name = document.querySelector("#reg-display-name")?.value.trim() || "";
+          const role = document.querySelector("#reg-role")?.value || "operator";
+          const password = document.querySelector("#reg-password")?.value || "";
+          const confirm = document.querySelector("#reg-password-confirm")?.value || "";
+          if (password !== confirm) {
+            showMsg("Пароли не совпадают", true);
+            return;
+          }
+          const btn = document.querySelector("#reg-submit-btn");
+          if (btn) btn.disabled = true;
+          try {
+            const res = await apiCall("/api/auth/register", "POST", {
+              username,
+              password,
+              display_name,
+              role,
+            });
+            showMsg("Аккаунт создан и авторизован: " + (res.user?.display_name || username), false);
+            await loadAuthMe();
+            setTimeout(() => {
+              window.location.href = "/";
+            }, 400);
+          } catch (err) {
+            showMsg(err.message || "Ошибка регистрации", true);
+          } finally {
+            if (btn) btn.disabled = false;
+          }
+        });
+      }
+
+      const logoutBtn = document.querySelector("#login-logout-btn");
+      if (logoutBtn) {
+        logoutBtn.addEventListener("click", async () => {
+          await apiCall("/api/auth/logout", "POST").catch(() => {});
+          showMsg("Вы вышли из аккаунта", false);
+          await loadAuthMe();
+        });
+      }
+
+      async function loadAuthMe() {
+        try {
+          const data = await apiCall("/api/auth/me", "GET");
+          const badge = document.querySelector("#auth-current-badge");
+          if (badge) {
+            if (data.authenticated && data.user) {
+              badge.textContent = "Активен: " + (data.user.display_name || data.user.username);
+              badge.className = "badge b-ok";
+              if (logoutBtn) logoutBtn.hidden = false;
+            } else {
+              badge.textContent = "Гость (не авторизован)";
+              badge.className = "badge b-wait";
+              if (logoutBtn) logoutBtn.hidden = true;
+            }
+          }
+          const list = document.querySelector("#auth-users-list");
+          const cnt = document.querySelector("#auth-users-count");
+          const users = Array.isArray(data.users) ? data.users : [];
+          if (cnt) cnt.textContent = users.length + " акк.";
+          if (list) {
+            list.replaceChildren();
+            users.forEach((u) => {
+              const row = document.createElement("div");
+              row.className = "auth-user-pill";
+              const nameEl = document.createElement("strong");
+              nameEl.textContent = u.display_name || u.username;
+              const codeEl = document.createElement("code");
+              codeEl.textContent = "@" + u.username;
+              const roleBadge = document.createElement("span");
+              roleBadge.className = "badge " + (u.role === "admin" ? "b-won" : u.role === "sales" ? "b-talk" : "b-new");
+              roleBadge.textContent = u.role || "operator";
+              row.append(nameEl, codeEl, roleBadge);
+              list.append(row);
+            });
+          }
+        } catch (_err) {
+          /* ignore */
+        }
+      }
+
+      loadAuthMe();
+    })();
+  </script>
+</body>
+</html>

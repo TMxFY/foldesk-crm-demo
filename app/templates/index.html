@@ -76,6 +76,10 @@
 
         <div class="nav-group">
           <span class="nav-caption">ИНСТРУМЕНТЫ</span>
+          <a href="#leadgen" data-sheet-link="leadgen" data-sheet="leadgen">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/></svg>
+            Лидген и Вакансии
+          </a>
           <a href="#tool-phones" data-sheet-link="tool-phones" data-sheet="tool-phones">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
             Телефоны в TG
@@ -121,8 +125,11 @@
       </div>
 
       <div class="sidebar-footer">
-        <button type="button" id="seed-demo" class="btn secondary sm">Демо-данные</button>
-        <button type="button" id="theme" class="btn ghost sm" aria-pressed="true">Тема</button>
+        <button type="button" id="sidebar-user-btn" class="btn secondary sm sidebar-user-btn" title="Профиль, вход и регистрация">👤 Войти / Регистрация</button>
+        <div class="row">
+          <button type="button" id="seed-demo" class="btn secondary sm">Демо-данные</button>
+          <button type="button" id="theme" class="btn ghost sm" aria-pressed="true">Тема</button>
+        </div>
       </div>
     </aside>
 
@@ -154,8 +161,100 @@
           <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
           <span class="stat-chip">Рассылки: <strong id="stat-campaigns">0</strong></span>
           <span class="stat-chip">Напоминания: <strong id="stat-reminders">0</strong></span>
+          <button type="button" id="crm-user-btn" class="btn secondary sm" title="Сменить аккаунт или зарегистрировать пользователя">👤 Войти / Регистрация</button>
           <button type="button" id="open-mcp-modal-btn" class="btn secondary sm" title="Подключить AI-агента по MCP">MCP для агентов</button>
           <button type="button" id="toggle-view-mode" class="btn secondary sm">Все блоки</button>
+        </div>
+      </div>
+
+      <div id="crm-auth-modal" class="surface-subcard mcp-modal-box crm-auth-modal stack" role="dialog" aria-labelledby="crm-auth-modal-title" hidden>
+        <div class="popup-box-head">
+          <div class="pipeline-title-row">
+            <strong id="crm-auth-modal-title">Аккаунты сотрудников · Вход и Регистрация в CRM</strong>
+            <span id="crm-auth-status-badge" class="badge b-new">Гость</span>
+          </div>
+          <div class="row">
+            <a href="/login" class="btn secondary sm">Открыть страницу /login ↗</a>
+            <button type="button" id="modal-logout-btn" class="btn ghost sm" hidden>Выйти из аккаунта</button>
+            <button type="button" id="close-crm-auth-modal-btn" class="btn ghost sm" aria-label="Закрыть окно авторизации">Закрыть ×</button>
+          </div>
+        </div>
+
+        <div class="auth-mode-tabs" role="tablist" aria-label="Режим авторизации">
+          <button type="button" class="auth-tab-btn" id="modal-tab-login" data-crm-auth-tab="login" role="tab" aria-selected="true">Вход по логину</button>
+          <button type="button" class="auth-tab-btn" id="modal-tab-register" data-crm-auth-tab="register" role="tab" aria-selected="false">Регистрация нового аккаунта</button>
+        </div>
+
+        <div id="modal-pane-login" class="auth-tab-pane stack">
+          <span class="steps-caption">БЫСТРЫЙ ВХОД В 1 КЛИК (3 РАБОЧИХ ПРОФИЛЯ):</span>
+          <div class="auth-presets-grid">
+            <button type="button" class="auth-preset-card" data-modal-preset-user="tim" data-modal-preset-pass="TimFoldesk2026!">
+              <div class="row">
+                <strong>Тимофей</strong>
+                <span class="badge b-won">Owner · Admin</span>
+              </div>
+              <code>tim / TimFoldesk2026!</code>
+            </button>
+            <button type="button" class="auth-preset-card" data-modal-preset-user="vlad" data-modal-preset-pass="VladSales2026!">
+              <div class="row">
+                <strong>Влад</strong>
+                <span class="badge b-talk">Sales · Партнёр</span>
+              </div>
+              <code>vlad / VladSales2026!</code>
+            </button>
+            <button type="button" class="auth-preset-card" data-modal-preset-user="operator" data-modal-preset-pass="Operator2026!">
+              <div class="row">
+                <strong>Оператор</strong>
+                <span class="badge b-new">Outreach</span>
+              </div>
+              <code>operator / Operator2026!</code>
+            </button>
+          </div>
+
+          <form id="modal-login-form" class="outreach-form-row">
+            <label for="modal-login-username">Логин
+              <input id="modal-login-username" name="username" type="text" autocomplete="username" value="tim" placeholder="tim / vlad / operator" required>
+            </label>
+            <label for="modal-login-password">Пароль
+              <input id="modal-login-password" name="password" type="password" autocomplete="current-password" value="TimFoldesk2026!" placeholder="Пароль" required>
+            </label>
+            <div class="row">
+              <button type="submit" id="modal-login-submit-btn" class="btn primary sm">Войти в аккаунт</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="modal-pane-register" class="auth-tab-pane stack" hidden>
+          <form id="modal-register-form" class="stack">
+            <div class="leadgen-form-row-3">
+              <label for="modal-reg-username">Логин (латиницей)
+                <input id="modal-reg-username" name="username" type="text" autocomplete="username" placeholder="alex_sales" required>
+              </label>
+              <label for="modal-reg-display-name">Имя и должность
+                <input id="modal-reg-display-name" name="display_name" type="text" autocomplete="name" placeholder="Алексей (Sales)" required>
+              </label>
+              <label for="modal-reg-role">Роль
+                <select id="modal-reg-role" name="role">
+                  <option value="admin">Admin (Полный доступ)</option>
+                  <option value="sales">Sales (Продажи)</option>
+                  <option value="operator" selected>Operator (Аутрич)</option>
+                </select>
+              </label>
+            </div>
+            <div class="outreach-form-row">
+              <label for="modal-reg-password">Пароль
+                <input id="modal-reg-password" name="password" type="password" autocomplete="new-password" placeholder="Пароль" required>
+              </label>
+              <div class="row">
+                <button type="submit" id="modal-reg-submit-btn" class="btn primary sm">Зарегистрировать и войти</button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <div class="stack">
+          <span class="steps-caption">ЗАРЕГИСТРИРОВАННЫЕ ПОЛЬЗОВАТЕЛИ ВОРОНКИ:</span>
+          <div id="modal-users-list" class="auth-users-list"></div>
         </div>
       </div>
 
@@ -1055,6 +1154,302 @@
               </thead>
               <tbody id="lead-rows"></tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="leadgen" data-sheet="leadgen" class="surface-box tool-section leadgen-section" aria-labelledby="leadgen-title" hidden>
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="leadgen-title">Настройки Лидгена и TG-Вакансий</h2>
+            <span id="leadgen-status-badge" class="badge b-ok">Авто-лидген: ВКЛ</span>
+            <span id="leadgen-stats-badge" class="badge b-new">Лидов в CRM: 0 · Последний прогон: —</span>
+          </div>
+          <div class="row">
+            <button type="button" id="leadgen-sync-campaigns-btn" class="btn secondary sm">Синхронизировать с рассылками</button>
+            <button type="button" id="leadgen-push-now-btn" class="btn secondary sm">Залить найденных лидов в CRM</button>
+            <button type="button" id="leadgen-save-btn" class="btn primary sm">Сохранить настройки</button>
+          </div>
+        </div>
+
+        <div class="surface-subcard leadgen-master-bar">
+          <div class="leadgen-master-toggles">
+            <label class="row leadgen-switch-label">
+              <input type="checkbox" id="leadgen-enabled-toggle" checked>
+              <strong>Автоматический сбор лидов активен</strong>
+            </label>
+            <label class="row leadgen-switch-label">
+              <input type="checkbox" id="leadgen-autopush-toggle" checked>
+              <span>Автозаливка в CRM и очереди рассылок по MCP</span>
+            </label>
+          </div>
+          <div class="leadgen-quota-block">
+            <span class="steps-caption">Суточный поток новых лидов в CRM (квота лидгена):</span>
+            <div class="row leadgen-quota-controls">
+              <div class="stepper-control" role="group" aria-label="Регулировка суточной квоты лидгена">
+                <button type="button" class="btn ghost sm" data-leadgen-quota-step="-10">-10</button>
+                <button type="button" class="btn ghost sm" data-leadgen-quota-step="-5">-5</button>
+                <input type="number" id="leadgen-total-quota" min="0" max="500" value="50" aria-label="Суточный поток новых лидов в CRM">
+                <button type="button" class="btn ghost sm" data-leadgen-quota-step="5">+5</button>
+                <button type="button" class="btn ghost sm" data-leadgen-quota-step="10">+10</button>
+              </div>
+              <div class="row leadgen-preset-group" role="group" aria-label="Пресеты суточной квоты">
+                <button type="button" class="chip" data-leadgen-quota-preset="15">15/сут</button>
+                <button type="button" class="chip" data-leadgen-quota-preset="30">30/сут</button>
+                <button type="button" class="chip" data-leadgen-quota-preset="50">50/сут</button>
+                <button type="button" class="chip" data-leadgen-quota-preset="100">100/сут</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="leadgen-grid">
+          <div class="surface-subcard stack leadgen-col">
+            <div class="subcard-head">
+              <div>
+                <h3>1. Поток B2B Фаундеры, SaaS &amp; E-com (<code>tg_pipeline</code>)</h3>
+                <p class="hint">Автоматический парсинг 9 источников покупателей AI-креативов и трафика</p>
+              </div>
+              <label class="row leadgen-switch-label">
+                <input type="checkbox" id="leadgen-b2b-enabled" checked>
+                <strong>Контур активен</strong>
+              </label>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">ИСТОЧНИКИ ЛИДГЕНА (ВКЛЮЧЕНИЕ / ОТКЛЮЧЕНИЕ):</span>
+              <div id="leadgen-b2b-sources-grid" class="source-toggle-grid">
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="tg_groups" checked>
+                  <div class="source-toggle-info">
+                    <strong>Telegram-группы и чаты</strong>
+                    <span class="hint">Постеры + активные участники (`tg_groups`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="tg_comments" checked>
+                  <div class="source-toggle-info">
+                    <strong>Комментарии под постами каналов</strong>
+                    <span class="hint">Авторы комментариев в целевых каналах (`tg_comments`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="channel_graph" checked>
+                  <div class="source-toggle-info">
+                    <strong>Похожие каналы (TG Lookalike Graph)</strong>
+                    <span class="hint">Граф рекомендаций и админы каналов (`channel_graph`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="tg_ad_spy" checked>
+                  <div class="source-toggle-info">
+                    <strong>Telegram Ad Spy (рекламодатели в TG)</strong>
+                    <span class="hint">Команды, закупающие посевы и TG Ads (`tg_ad_spy`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="meta_ads" checked>
+                  <div class="source-toggle-info">
+                    <strong>Meta Ad Library (видео-реклама FB/IG)</strong>
+                    <span class="hint">Активные рекламодатели с видео-креативами (`meta_ads`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="yc_ph" checked>
+                  <div class="source-toggle-info">
+                    <strong>Стартапы Y Combinator &amp; Product Hunt</strong>
+                    <span class="hint">Свежие релизы и фаундеры с контактами (`yc_ph`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="social_x_reddit" checked>
+                  <div class="source-toggle-info">
+                    <strong>Посты и реплаи X (Twitter) + Reddit</strong>
+                    <span class="hint">Фаундеры и маркетологи из соцсетей (`social_x_reddit`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="buyer_catalogs" checked>
+                  <div class="source-toggle-info">
+                    <strong>Каталоги SaaS, Whop и Bloss</strong>
+                    <span class="hint">Продукты и создатели из маркетов (`buyer_catalogs`)</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-b2b-source="linkedin_jobs" checked>
+                  <div class="source-toggle-info">
+                    <strong>Вакансии и найм в LinkedIn</strong>
+                    <span class="hint">Компании, нанимающие маркетинг/креаторов (`linkedin_jobs`)</span>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">НАСТРОЙКИ РАССЫЛКИ ДЛЯ B2B:</span>
+              <label for="leadgen-b2b-touch-mode">Режим касаний
+                <select id="leadgen-b2b-touch-mode">
+                  <option value="micro_ping">Micro-Ping: короткий вопрос без ссылок → оффер 183.5M на 2-м шаге</option>
+                  <option value="direct">Direct: полный оффер с кейсом 183.5M сразу в 1-м шаге</option>
+                </select>
+              </label>
+              <div class="leadgen-form-row-3">
+                <label for="leadgen-b2b-campaign-tg">Целевая рассылка TG
+                  <input type="text" id="leadgen-b2b-campaign-tg" value="Leadgen Auto (TG)" placeholder="Leadgen Auto (TG)">
+                </label>
+                <label for="leadgen-b2b-campaign-wa">Целевая рассылка WA
+                  <input type="text" id="leadgen-b2b-campaign-wa" value="Leadgen Auto (WA)" placeholder="Leadgen Auto (WA)">
+                </label>
+                <label for="leadgen-b2b-daily-limit">Суточный лимит отправки
+                  <div class="stepper-control">
+                    <button type="button" class="btn ghost sm" data-b2b-limit-step="-5">-5</button>
+                    <input type="number" id="leadgen-b2b-daily-limit" min="1" max="500" value="30">
+                    <button type="button" class="btn ghost sm" data-b2b-limit-step="5">+5</button>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">СПИСОК TELEGRAM-ГРУПП И КАНАЛОВ ДЛЯ ПАРСИНГА:</span>
+              <div class="leadgen-add-bar">
+                <select id="leadgen-add-group-target" aria-label="Куда добавить чат">
+                  <option value="tg_groups_new">Группы (новые / основные)</option>
+                  <option value="tg_groups_old">Группы (базовые / архив)</option>
+                  <option value="tg_comment_channels">Каналы для парсинга комментов</option>
+                </select>
+                <input type="text" id="leadgen-add-group-input" placeholder="@username или ссылка на чат/канал...">
+                <button type="button" id="leadgen-add-group-btn" class="btn secondary sm">+ Добавить группу/канал</button>
+              </div>
+              <div id="leadgen-b2b-groups-chips" class="tag-chips-list" aria-label="Список Telegram-групп и каналов"></div>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">ЛИМИТЫ ПАРСИНГА ЗА ПРОГОН:</span>
+              <div class="leadgen-limits-grid">
+                <label for="leadgen-limit-yc">YC лимит
+                  <input type="number" id="leadgen-limit-yc" min="0" max="5000" value="50">
+                </label>
+                <label for="leadgen-limit-ph">PH лимит
+                  <input type="number" id="leadgen-limit-ph" min="0" max="5000" value="0">
+                </label>
+                <label for="leadgen-limit-msg">Сообщений из чата
+                  <input type="number" id="leadgen-limit-msg" min="50" max="20000" value="1800">
+                </label>
+                <label for="leadgen-limit-lurker">Участников (lurkers)
+                  <input type="number" id="leadgen-limit-lurker" min="0" max="10000" value="1000">
+                </label>
+                <label for="leadgen-limit-external">External лимит
+                  <input type="number" id="leadgen-limit-external" min="0" max="1000" value="20">
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="surface-subcard stack leadgen-col">
+            <div class="subcard-head">
+              <div>
+                <h3>2. Монитор и авто-отклики на TG-Вакансии (<code>job_monitor</code> + <code>job_reply</code>)</h3>
+                <p class="hint">Поиск живых заказов и вакансий в TG-чатах с персонализированным откликом по кейсам</p>
+              </div>
+              <label class="row leadgen-switch-label">
+                <input type="checkbox" id="leadgen-vacancies-enabled" checked>
+                <strong>Мониторинг вакансий и генерация откликов активны</strong>
+              </label>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">СЛОИ ОТБОРА ВАКАНСИЙ (LAYERS):</span>
+              <div id="leadgen-vac-layers-grid" class="source-toggle-grid source-toggle-grid-2">
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-vac-layer="AI-контент" checked>
+                  <div class="source-toggle-info">
+                    <strong>AI-контент</strong>
+                    <span class="hint">AI-видео, UGC, рилсы, аватары</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-vac-layer="автоматизация" checked>
+                  <div class="source-toggle-info">
+                    <strong>Автоматизация</strong>
+                    <span class="hint">n8n, Make, TG-боты, AI-агенты, CRM</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-vac-layer="трафик" checked>
+                  <div class="source-toggle-info">
+                    <strong>Трафик</strong>
+                    <span class="hint">SMM с AI, контент-заводы, УБТ, воронки</span>
+                  </div>
+                </label>
+                <label class="source-toggle-card">
+                  <input type="checkbox" data-vac-layer="AI-роль" checked>
+                  <div class="source-toggle-info">
+                    <strong>AI-роль</strong>
+                    <span class="hint">Head of Content GenAI, CTO, AI Product Lead</span>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div class="row leadgen-filters-row">
+              <label class="row leadgen-switch-label">
+                <input type="checkbox" id="leadgen-vac-remote-only" checked>
+                <span>Только удалёнка (<code>remote_only</code>)</span>
+              </label>
+              <label class="row leadgen-switch-label">
+                <input type="checkbox" id="leadgen-vac-hot-priority" checked>
+                <span>Приоритет горячих (<code>hot_priority</code>)</span>
+              </label>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">НАСТРОЙКИ РАССЫЛКИ ПО ВАКАНСИЯМ:</span>
+              <label for="leadgen-vac-touch-mode">Режим отклика
+                <select id="leadgen-vac-touch-mode">
+                  <option value="direct">Direct: полный отклик с шоурилом и кейсами в 1-м шаге</option>
+                  <option value="micro_ping">Micro-Ping: короткий вопрос в 1 строку → кейсы во 2-м шаге</option>
+                </select>
+              </label>
+              <div class="outreach-form-row">
+                <label for="leadgen-vac-campaign">Целевая кампания
+                  <input type="text" id="leadgen-vac-campaign" value="TG Вакансии" placeholder="TG Вакансии">
+                </label>
+                <label for="leadgen-vac-daily-limit">Суточный лимит откликов
+                  <div class="stepper-control">
+                    <button type="button" class="btn ghost sm" data-vac-limit-step="-5">-5</button>
+                    <input type="number" id="leadgen-vac-daily-limit" min="1" max="500" value="20">
+                    <button type="button" class="btn ghost sm" data-vac-limit-step="5">+5</button>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div class="stack">
+              <span class="steps-caption">ДОПОЛНИТЕЛЬНЫЕ ЧАТЫ ВАКАНСИЙ (<code>extra_chats</code>):</span>
+              <div class="leadgen-add-bar">
+                <input type="text" id="leadgen-add-vac-chat-input" placeholder="@username чата вакансий (напр. itconnectbelgrade)">
+                <button type="button" id="leadgen-add-vac-chat-btn" class="btn secondary sm">+ Добавить чат</button>
+              </div>
+              <div id="leadgen-vac-chats-chips" class="tag-chips-list" aria-label="Дополнительные чаты вакансий"></div>
+            </div>
+
+            <div class="outreach-form-row">
+              <label for="leadgen-vac-source-words">Ключевые слова поиска чатов (Regex)
+                <input type="text" id="leadgen-vac-source-words" placeholder="ваканс|vacanc|работ|job|фриланс...">
+              </label>
+              <label for="leadgen-vac-source-stop">Стоп-слова для фильтра чатов
+                <input type="text" id="leadgen-vac-source-stop" placeholder="kurilo|аренда|прокат|spam...">
+              </label>
+            </div>
+
+            <div class="stack">
+              <div class="subcard-head">
+                <label for="leadgen-cases-bank"><strong>Банк кейсов и цифр для откликов (<code>job_cases_bank.md</code>)</strong></label>
+                <span class="hint">Используется генератором <code>job_reply.py</code> при составлении откликов</span>
+              </div>
+              <textarea id="leadgen-cases-bank" rows="6" placeholder="# Банк кейсов и цифр..."></textarea>
+            </div>
           </div>
         </div>
       </section>

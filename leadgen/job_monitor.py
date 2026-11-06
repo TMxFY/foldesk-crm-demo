@@ -69,6 +69,50 @@ SOURCE_STOP = re.compile(r"kurilo|аренда|прокат|spam|premium bot|wal
 EXTRA_USERS = {"itconnectbelgrade"}
 EXTRA_TITLE = re.compile(r"\bit connect\b", re.I)
 
+
+def _load_vacancies_ui_config() -> dict:
+    try:
+        from app.leadgen_settings import get_leadgen_config
+
+        return (get_leadgen_config().get("vacancies") or {})
+    except Exception:
+        pass
+    cfg_path = Path(os.environ.get("LEADGEN_CONFIG_PATH") or (WORKTREE_ROOT / "data" / "leadgen_config.json"))
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("vacancies"), dict):
+                return data["vacancies"]
+        except Exception:
+            pass
+    return {}
+
+
+def apply_vacancies_config(vac_cfg: dict | None = None) -> dict:
+    global PAUSE_BETWEEN_CHATS, SOURCE_WORDS, SOURCE_STOP, EXTRA_USERS
+    cfg = vac_cfg if isinstance(vac_cfg, dict) else _load_vacancies_ui_config()
+    if cfg.get("source_words"):
+        try:
+            SOURCE_WORDS = re.compile(str(cfg["source_words"]), re.I)
+        except re.error:
+            pass
+    if cfg.get("source_stop"):
+        try:
+            SOURCE_STOP = re.compile(str(cfg["source_stop"]), re.I)
+        except re.error:
+            pass
+    if isinstance(cfg.get("extra_chats"), list):
+        EXTRA_USERS = {str(u).strip().lower().lstrip("@") for u in cfg["extra_chats"] if str(u or "").strip()}
+    if cfg.get("pause_between_chats") is not None:
+        try:
+            PAUSE_BETWEEN_CHATS = max(0.0, float(cfg["pause_between_chats"]))
+        except (TypeError, ValueError):
+            pass
+    return cfg
+
+
+apply_vacancies_config()
+
 RESUME_RX = re.compile(
     r"#помогу|#резюме|#ищу_?работу|ищу работу|ищу подработ|ищу заказы"
     r"|ищу проект[ыи]?|возьму заказ|возьму проект|свободен для|открыт[ае]? для"
@@ -517,6 +561,16 @@ def judge_jev(posts):
         mark = "ФИТ" if v.get("fit") else "мимо"
         print(f"  {mark:5} {v.get('layer','') or '-':14} {p['text'][:52].splitlines()[0]}")
     fits = [p for p in judged if p["v"].get("fit")]
+    vac_cfg = apply_vacancies_config()
+    enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
+    if enabled_layers:
+        fits = [
+            p
+            for p in fits
+            if not (p["v"].get("layer") or "").strip() or (p["v"].get("layer") or "").strip() in enabled_layers
+        ]
+    if vac_cfg.get("remote_only", True):
+        fits = [p for p in fits if p["v"].get("remote") is not False]
     if fits:
         print(f"\nкарточки для {len(fits)} фитов (LLM, только они):")
         with futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -665,6 +719,16 @@ def main():
         print(f"\nк разбору: {len(cands)}\n")
         judged = judge(cands) if cands else []
     fits = [p for p in judged if p["v"].get("fit")]
+    vac_cfg = apply_vacancies_config()
+    enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
+    if enabled_layers:
+        fits = [
+            p
+            for p in fits
+            if not (p["v"].get("layer") or "").strip() or (p["v"].get("layer") or "").strip() in enabled_layers
+        ]
+    if vac_cfg.get("remote_only", True):
+        fits = [p for p in fits if p["v"].get("remote") is not False]
 
     text = report(fits, a.hours, len(posts))
     out = a.out or os.path.join(OUTDIR, f"job_monitor_{dt.date.today()}.md")

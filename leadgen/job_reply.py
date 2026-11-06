@@ -42,7 +42,34 @@ except ImportError:
 VAULT = "/Users/timofei/obsidian/Second Brain"
 LOCAL_BANK = WORKTREE_ROOT / "leadgen" / "job_cases_bank.md"
 VAULT_BANK = Path(VAULT) / "!ПРОЕКТЫ" / "Кейсы — банк для откликов.md"
-DEFAULT_CAMPAIGN_NAME = os.environ.get("JOBS_CAMPAIGN_NAME", "TG Вакансии")
+
+
+def _load_vacancies_ui_config() -> dict[str, Any]:
+    try:
+        from app.leadgen_settings import get_leadgen_config
+
+        cfg = get_leadgen_config()
+        vac = dict(cfg.get("vacancies") or {})
+        vac["cases_bank_md"] = cfg.get("cases_bank_md") or ""
+        return vac
+    except Exception:
+        pass
+    cfg_path = Path(os.environ.get("LEADGEN_CONFIG_PATH") or (WORKTREE_ROOT / "data" / "leadgen_config.json"))
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                vac = dict(data.get("vacancies") or {})
+                vac["cases_bank_md"] = data.get("cases_bank_md") or ""
+                return vac
+        except Exception:
+            pass
+    return {}
+
+
+DEFAULT_CAMPAIGN_NAME = os.environ.get("JOBS_CAMPAIGN_NAME") or str(
+    _load_vacancies_ui_config().get("campaign_name") or "TG Вакансии"
+)
 PROD_LOCAL_DB = Path("/Users/timofei/dev/Python/new era/crmtg/data/crm.db")
 WORKERS = 3
 
@@ -147,6 +174,9 @@ PROMPT = """Ты пишешь отклик и два коротких фолло
 
 
 def load_bank() -> str:
+    vac_cfg = _load_vacancies_ui_config()
+    if vac_cfg.get("cases_bank_md"):
+        return str(vac_cfg["cases_bank_md"])
     for p in (LOCAL_BANK, VAULT_BANK):
         if p.exists():
             try:
@@ -224,7 +254,7 @@ def build_vacancy_mcp_lead(
     item: dict[str, Any],
     draft_obj: dict[str, Any],
     *,
-    touch_mode: str = "direct",
+    touch_mode: str | None = None,
 ) -> dict[str, Any] | None:
     """Преобразует вакансию и черновик отклика в формат MCP `ingest_discovered_leads`."""
     raw_contact = str(item.get("contact") or "").strip()
@@ -249,7 +279,10 @@ def build_vacancy_mcp_lead(
     followup_1 = str(draft_obj.get("followup_1") or "").strip() or f1_def
     followup_2 = str(draft_obj.get("followup_2") or "").strip() or f2_def
 
-    mode = (touch_mode or "direct").strip().lower()
+    resolved_mode = touch_mode or os.environ.get("JOBS_TOUCH_MODE") or str(
+        _load_vacancies_ui_config().get("touch_mode") or "direct"
+    )
+    mode = str(resolved_mode or "direct").strip().lower()
     if mode == "micro_ping":
         step1_text = build_micro_ping(item)
         step2_text = full_reply
@@ -307,18 +340,23 @@ def _find_latest_monitor_report() -> str | None:
 
 
 def main() -> int:
+    vac_cfg = _load_vacancies_ui_config()
+    default_touch = os.environ.get("JOBS_TOUCH_MODE") or str(vac_cfg.get("touch_mode") or "direct")
+    default_camp = os.environ.get("JOBS_CAMPAIGN_NAME") or str(vac_cfg.get("campaign_name") or DEFAULT_CAMPAIGN_NAME)
+    default_limit = int(vac_cfg.get("daily_limit") or 0)
+
     ap = argparse.ArgumentParser(description="Генерация откликов на вакансии и заливка в Foldesk CRM через MCP")
     ap.add_argument("report", nargs="?", help="job_monitor_<дата>.json; по умолчанию самый свежий")
     ap.add_argument("--from-replies", default="", help="Использовать уже готовый job_replies_<дата>.json без повторного вызова LLM")
-    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--limit", type=int, default=default_limit)
     ap.add_argument("--out", default="", help="Куда сохранить JSON с черновиками")
     ap.add_argument(
         "--touch-mode",
         choices=("direct", "micro_ping"),
-        default=os.environ.get("JOBS_TOUCH_MODE", "direct"),
+        default=default_touch,
         help="Вариант А: direct (полный отклик в step 1, по умолчанию) или Вариант Б: micro_ping",
     )
-    ap.add_argument("--campaign-name", default=DEFAULT_CAMPAIGN_NAME, help="Название кампании в CRM")
+    ap.add_argument("--campaign-name", default=default_camp, help="Название кампании в CRM")
     ap.add_argument("--campaign-id", type=int, default=None)
     ap.add_argument("--no-campaign", action="store_true", help="Создать только сделки в CRM без добавления в кампанию рассылки")
     ap.add_argument("--no-crm", action="store_true", help="Не отправлять в CRM (только сгенерировать файл)")
@@ -332,7 +370,18 @@ def main() -> int:
         sys.exit("данных монитора нет — сначала запустите job_monitor.py")
 
     items = json.load(open(path, encoding="utf-8"))
-    if a.limit:
+    enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
+    if enabled_layers:
+        items = [
+            it
+            for it in items
+            if not (it.get("layer") or "").strip() or (it.get("layer") or "").strip() in enabled_layers
+        ]
+    if vac_cfg.get("remote_only", True):
+        items = [it for it in items if it.get("remote") is not False]
+    if vac_cfg.get("hot_priority", True):
+        items = sorted(items, key=lambda it: not bool((it or {}).get("hot")))
+    if a.limit and a.limit > 0:
         items = items[: a.limit]
     print(f"отчёт: {os.path.basename(path)} · вакансий: {len(items)}\n")
     if not items:

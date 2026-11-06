@@ -40,6 +40,53 @@ mkdir -p "$PENDING_DIR"
 # repo .env (LLM keys, MCP_API_KEY, CRMTG_MCP_URL etc.); missing file is fine
 [ -f "$ROOT/.env" ] && set -a && source "$ROOT/.env" && set +a
 
+# Load UI leadgen config from data/leadgen_config.json if present
+eval "$(python3 - "$ROOT" <<'PY'
+import json, os, shlex, sys
+root = sys.argv[1]
+cfg_path = os.environ.get("LEADGEN_CONFIG_PATH") or os.path.join(root, "data", "leadgen_config.json")
+if os.path.exists(cfg_path):
+    try:
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        b2b = cfg.get("b2b") or {}
+        sources = b2b.get("sources") or {}
+        limits = b2b.get("limits") or {}
+        def _emit(k, v):
+            print(f"export {k}={shlex.quote(str(v))}")
+        if isinstance(b2b.get("tg_groups_old"), list):
+            _emit("TG_GROUPS_OLD", ",".join(str(x).strip() for x in b2b["tg_groups_old"] if str(x).strip()))
+        if isinstance(b2b.get("tg_groups_new"), list):
+            _emit("TG_GROUPS_NEW", ",".join(str(x).strip() for x in b2b["tg_groups_new"] if str(x).strip()))
+        if isinstance(b2b.get("tg_comment_channels"), list) and not os.environ.get("TG_COMMENT_CHANNELS"):
+            _emit("TG_COMMENT_CHANNELS", ",".join(str(x).strip() for x in b2b["tg_comment_channels"] if str(x).strip()))
+        for env_k, lim_k in (
+            ("YC_LIMIT", "yc_limit"),
+            ("PH_LIMIT", "ph_limit"),
+            ("MSG_LIMIT", "msg_limit"),
+            ("TG_LURKER_LIMIT", "lurker_limit"),
+            ("CREATOR_EXTERNAL_LIMIT", "external_limit"),
+        ):
+            if lim_k in limits and not os.environ.get(env_k):
+                _emit(env_k, int(limits[lim_k]))
+        for src_k in (
+            "tg_groups",
+            "tg_comments",
+            "channel_graph",
+            "tg_ad_spy",
+            "meta_ads",
+            "yc_ph",
+            "social_x_reddit",
+            "buyer_catalogs",
+            "linkedin_jobs",
+        ):
+            _emit(f"SRC_{src_k.upper()}", "1" if sources.get(src_k, True) else "0")
+        if not sources.get("yc_ph", True):
+            _emit("SKIP_YC_PH", "1")
+    except Exception:
+        pass
+PY
+)"
+
 TS="$(date +%Y%m%d_%H%M%S)"
 RAW="$STATE_DIR/raw_$TS.jsonl"
 MASTER="$STATE_DIR/master_ids.jsonl"   # every id ever scraped
@@ -151,30 +198,38 @@ scrape() {
 }
 
 # 1. New public chats on tim3, then the older chats on tim2.
-scrape "$SESSION_NEW" "$TG_GROUPS_NEW" ""
-scrape "$SESSION_OLD" "$TG_GROUPS_OLD" append
+if [ "${SRC_TG_GROUPS:-1}" = "1" ]; then
+  [ -n "$TG_GROUPS_NEW" ] && scrape "$SESSION_NEW" "$TG_GROUPS_NEW" ""
+  [ -n "$TG_GROUPS_OLD" ] && scrape "$SESSION_OLD" "$TG_GROUPS_OLD" append
+else
+  echo "# tg_groups skipped (disabled in leadgen_config.json)"
+fi
 
 # 1b2. Comments under channel posts: resolve linked discussion chats for the
 # channels in TG_COMMENT_CHANNELS and any linked chats discovered by tg_channel_graph.py.
 LINKED_GROUPS=""
-if [ -n "${TG_COMMENT_CHANNELS:-}" ]; then
-  LINKED_GROUPS="$(python3 "$ROOT/leadgen/tg_resolve_linked.py" \
-    --session "$SESSION_NEW" --channels "$TG_COMMENT_CHANNELS" 2>&1 | grep '^id' | paste -sd, -)"
-fi
-if [ -s "$STATE_DIR/discovered_comment_channels.txt" ]; then
-  DISCOVERED_LINKED="$(grep '^id' "$STATE_DIR/discovered_comment_channels.txt" | sort -u | paste -sd, -)"
-  if [ -n "$DISCOVERED_LINKED" ]; then
-    LINKED_GROUPS="${LINKED_GROUPS:+$LINKED_GROUPS,}$DISCOVERED_LINKED"
+if [ "${SRC_TG_COMMENTS:-1}" = "1" ]; then
+  if [ -n "${TG_COMMENT_CHANNELS:-}" ]; then
+    LINKED_GROUPS="$(python3 "$ROOT/leadgen/tg_resolve_linked.py" \
+      --session "$SESSION_NEW" --channels "$TG_COMMENT_CHANNELS" 2>&1 | grep '^id' | paste -sd, -)"
   fi
-fi
-if [ -n "$LINKED_GROUPS" ]; then
-  scrape "$SESSION_NEW" "$LINKED_GROUPS" append
+  if [ -s "$STATE_DIR/discovered_comment_channels.txt" ]; then
+    DISCOVERED_LINKED="$(grep '^id' "$STATE_DIR/discovered_comment_channels.txt" | sort -u | paste -sd, -)"
+    if [ -n "$DISCOVERED_LINKED" ]; then
+      LINKED_GROUPS="${LINKED_GROUPS:+$LINKED_GROUPS,}$DISCOVERED_LINKED"
+    fi
+  fi
+  if [ -n "$LINKED_GROUPS" ]; then
+    scrape "$SESSION_NEW" "$LINKED_GROUPS" append
+  fi
 fi
 
 # 1b3. Lurkers: member lists of the same groups, appended to the same RAW.
 # Profile cache (.tg_pipeline/profile_cache.json, TTL 7d) absorbs the repeat lookups.
-TG_SCRAPE_MODE=members TG_MEMBER_LIMIT="${TG_LURKER_LIMIT:-1000}" scrape "$SESSION_NEW" "$TG_GROUPS_NEW" append
-TG_SCRAPE_MODE=members TG_MEMBER_LIMIT="${TG_LURKER_LIMIT:-1000}" scrape "$SESSION_OLD" "$TG_GROUPS_OLD" append
+if [ "${SRC_TG_GROUPS:-1}" = "1" ]; then
+  [ -n "$TG_GROUPS_NEW" ] && TG_SCRAPE_MODE=members TG_MEMBER_LIMIT="${TG_LURKER_LIMIT:-1000}" scrape "$SESSION_NEW" "$TG_GROUPS_NEW" append
+  [ -n "$TG_GROUPS_OLD" ] && TG_SCRAPE_MODE=members TG_MEMBER_LIMIT="${TG_LURKER_LIMIT:-1000}" scrape "$SESSION_OLD" "$TG_GROUPS_OLD" append
+fi
 
 # 1b. Bounded public discovery. A failing source is non-fatal.
 # Admission is only admit_discovered_row: Telegram, else X, else LinkedIn/email/WhatsApp, else drop.
@@ -187,50 +242,70 @@ python3 "$ROOT/leadgen/creator_external_leads.py" \
 
 # All buyer X queries plus competitor comments, and one subreddit. Same Jev gate.
 SOCIAL="$STATE_DIR/social_$TS.jsonl"
-{ python3 "$ROOT/leadgen/treg_social_leads.py" \
-    --output "$SOCIAL" \
-    --seen "$STATE_DIR/treg_social_seen.json" \
-    || echo "# treg X/Reddit discovery failed (non-fatal)"; } &
-SOCIAL_PID=$!
+if [ "${SRC_SOCIAL_X_REDDIT:-1}" = "1" ]; then
+  { python3 "$ROOT/leadgen/treg_social_leads.py" \
+      --output "$SOCIAL" \
+      --seen "$STATE_DIR/treg_social_seen.json" \
+      || echo "# treg X/Reddit discovery failed (non-fatal)"; } &
+  SOCIAL_PID=$!
+else
+  SOCIAL_PID=""
+fi
 
 # Whop owner only with x.com or t.me.
 BUYER="$STATE_DIR/buyer_$TS.jsonl"
-{ python3 "$ROOT/leadgen/buyer_public.py" --output "$BUYER" \
-    || echo "# whop/bloss/propinfa failed (non-fatal)"; } &
-BUYER_PID=$!
+if [ "${SRC_BUYER_CATALOGS:-1}" = "1" ]; then
+  { python3 "$ROOT/leadgen/buyer_public.py" --output "$BUYER" \
+      || echo "# whop/bloss/propinfa failed (non-fatal)"; } &
+  BUYER_PID=$!
+else
+  BUYER_PID=""
+fi
 
 # One LinkedIn jobs search. A dead call must not stop the scrape.
 JOBS="$STATE_DIR/linkedin_jobs_$TS.jsonl"
-{ python3 "$ROOT/leadgen/linkedin_jobs.py" --output "$JOBS" \
-    || echo "# linkedin jobs failed (non-fatal)"; } &
-JOBS_PID=$!
+if [ "${SRC_LINKEDIN_JOBS:-1}" = "1" ]; then
+  { python3 "$ROOT/leadgen/linkedin_jobs.py" --output "$JOBS" \
+      || echo "# linkedin jobs failed (non-fatal)"; } &
+  JOBS_PID=$!
+else
+  JOBS_PID=""
+fi
 
 # Public catalogs, one request each. A dead page must not stop the scrape.
 CATALOGS="$STATE_DIR/buyer_catalogs_$TS.jsonl"
-{ python3 "$ROOT/leadgen/buyer_catalogs.py" --output "$CATALOGS" \
-    || echo "# buyer catalogs failed (non-fatal)"; } &
-CATALOGS_PID=$!
+if [ "${SRC_BUYER_CATALOGS:-1}" = "1" ]; then
+  { python3 "$ROOT/leadgen/buyer_catalogs.py" --output "$CATALOGS" \
+      || echo "# buyer catalogs failed (non-fatal)"; } &
+  CATALOGS_PID=$!
+else
+  CATALOGS_PID=""
+fi
 
 # Active Meta Ad Library video advertisers enriched with decision-maker contacts.
 export META_ADS="$STATE_DIR/meta_ads_$TS.jsonl"
-{ python3 "$ROOT/leadgen/meta_ad_leads.py" \
-    --output "$META_ADS" \
-    --seen "$STATE_DIR/meta_ads_seen.json" \
-    || echo "# meta ad leads failed (non-fatal)"; } &
-META_ADS_PID=$!
+if [ "${SRC_META_ADS:-1}" = "1" ]; then
+  { python3 "$ROOT/leadgen/meta_ad_leads.py" \
+      --output "$META_ADS" \
+      --seen "$STATE_DIR/meta_ads_seen.json" \
+      || echo "# meta ad leads failed (non-fatal)"; } &
+  META_ADS_PID=$!
+else
+  META_ADS_PID=""
+fi
 
 # Optional Workstream C sources: Telegram channel graph lookalike & Telegram Ad Spy.
 # Run sequentially inside one background job so both do not lock tim3.session concurrently.
 export CHANNEL_GRAPH="$STATE_DIR/channel_graph_$TS.jsonl"
 export AD_SPY="$STATE_DIR/tg_ad_spy_$TS.jsonl"
 {
-  if [ -f "$ROOT/leadgen/tg_channel_graph.py" ]; then
+  if [ "${SRC_CHANNEL_GRAPH:-1}" = "1" ] && [ -f "$ROOT/leadgen/tg_channel_graph.py" ]; then
     python3 "$ROOT/leadgen/tg_channel_graph.py" \
       --output "$CHANNEL_GRAPH" \
       --state "$STATE_DIR/tg_channel_graph_seen.json" \
       || echo "# tg_channel_graph failed (non-fatal)"
   fi
-  if [ -f "$ROOT/leadgen/tg_ad_spy.py" ]; then
+  if [ "${SRC_TG_AD_SPY:-1}" = "1" ] && [ -f "$ROOT/leadgen/tg_ad_spy.py" ]; then
     python3 "$ROOT/leadgen/tg_ad_spy.py" \
       --output "$AD_SPY" \
       --seen "$STATE_DIR/tg_ad_spy_seen.json" \
@@ -239,7 +314,9 @@ export AD_SPY="$STATE_DIR/tg_ad_spy_$TS.jsonl"
 } &
 TG_EXTRA_PID=$!
 
-wait "$SOCIAL_PID" "$BUYER_PID" "$JOBS_PID" "$CATALOGS_PID" "$META_ADS_PID" "$TG_EXTRA_PID" || true
+for pid in "$SOCIAL_PID" "$BUYER_PID" "$JOBS_PID" "$CATALOGS_PID" "$META_ADS_PID" "$TG_EXTRA_PID"; do
+  [ -n "$pid" ] && wait "$pid" || true
+done
 
 python3 - "$ROOT" "$RAW" "$EXTERNAL" "$SOCIAL" "$BUYER" "$JOBS" "$CATALOGS" <<'PY'
 import json, os, sys

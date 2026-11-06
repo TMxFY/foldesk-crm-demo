@@ -3684,3 +3684,378 @@ tr.bulk-selected,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* =========================================================================
+ * v6: Leadgen & TG-Vacancies Settings (#leadgen) + Outreach Leadgen Controls
+ * ========================================================================= */
+.leadgen-section {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.leadgen-master-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+}
+
+.leadgen-master-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.leadgen-switch-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--text-sm);
+}
+
+.leadgen-switch-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent, #3b82f6);
+  cursor: pointer;
+  margin: 0;
+}
+
+.leadgen-quota-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.leadgen-quota-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.stepper-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  background: var(--surface);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.stepper-control input[type="number"] {
+  width: 68px;
+  text-align: center;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  padding: 4px 6px;
+}
+
+.leadgen-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.leadgen-col {
+  min-width: 0;
+}
+
+.source-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.source-toggle-grid.source-toggle-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.source-toggle-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  min-width: 0;
+}
+
+.source-toggle-card:hover {
+  border-color: var(--accent, #3b82f6);
+}
+
+.source-toggle-card input[type="checkbox"] {
+  margin-top: 2px;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent, #3b82f6);
+  flex-shrink: 0;
+}
+
+.source-toggle-info {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.source-toggle-info strong {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.source-toggle-info .hint {
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.leadgen-form-row-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  align-items: end;
+}
+
+.leadgen-limits-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: var(--space-2);
+  align-items: end;
+}
+
+.leadgen-add-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.leadgen-add-bar select {
+  width: auto;
+  min-width: 190px;
+}
+
+.leadgen-add-bar input[type="text"] {
+  flex: 1;
+  min-width: 180px;
+}
+
+.tag-chips-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: var(--space-2);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--sunken);
+  min-height: 40px;
+  align-items: center;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: var(--line) solid var(--border);
+  background: var(--surface);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.tag-chip-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--sunken);
+}
+
+.tag-chip-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.tag-chip-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.tag-chip-remove:hover {
+  color: #ef4444;
+}
+
+.leadgen-filters-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--sunken);
+}
+
+#leadgen-cases-bank {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.campaign-settings-panel {
+  padding: var(--space-3);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  margin: var(--space-2) 0;
+}
+
+.campaign-leadgen-box {
+  padding: var(--space-2) var(--space-3);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.campaign-actions-row {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+@media (max-width: 1240px) {
+  .leadgen-grid,
+  .source-toggle-grid,
+  .leadgen-form-row-3 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .leadgen-limits-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* =========================================================================
+ * v6.1: Login & Register Page (/login) + CRM Auth Modal (#crm-auth-modal)
+ * ========================================================================= */
+.auth-page-body {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: var(--bg);
+}
+
+.auth-page-wrap {
+  width: 100%;
+  max-width: 720px;
+}
+
+.auth-card {
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+}
+
+.auth-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.auth-ws-brand {
+  flex: 1;
+  min-width: 220px;
+}
+
+.auth-presets-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.auth-preset-card {
+  display: grid;
+  gap: 6px;
+  padding: var(--space-2) var(--space-3);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.12s ease;
+}
+
+.auth-preset-card:hover {
+  border-color: var(--accent, #3b82f6);
+  transform: translateY(-1px);
+}
+
+.auth-users-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.auth-user-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.auth-footer-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: var(--line) solid var(--border);
+}
+
+.sidebar-footer {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-2);
+}
+
+.sidebar-user-btn {
+  width: 100%;
+  justify-content: center;
+}
+
+@media (max-width: 780px) {
+  .auth-presets-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

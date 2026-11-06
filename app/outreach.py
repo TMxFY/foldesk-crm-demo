@@ -613,6 +613,24 @@ def get_campaign(conn, campaign_id: int) -> dict:
         if (r.get("last_sent_at") or "").startswith(today)
     )
 
+    try:
+        raw_sources = json.loads(camp.get("leadgen_sources_json") or "[]")
+        leadgen_sources = [str(s).strip() for s in raw_sources if str(s or "").strip()] if isinstance(raw_sources, list) else []
+    except Exception:
+        leadgen_sources = []
+
+    camp_name_low = str(camp.get("name") or "").lower()
+    raw_lg_enabled = camp.get("leadgen_enabled")
+    if raw_lg_enabled is not None and int(raw_lg_enabled or 0) != 0:
+        leadgen_enabled = True
+    elif raw_lg_enabled == 0 and ("leadgen" in camp_name_low or "ваканс" in camp_name_low) and not camp.get("leadgen_sources_json"):
+        leadgen_enabled = True
+    else:
+        leadgen_enabled = bool(int(raw_lg_enabled or 0))
+
+    raw_lg_quota = camp.get("leadgen_daily_quota")
+    leadgen_daily_quota = int(raw_lg_quota) if raw_lg_quota is not None else 20
+
     camp["account_ids"] = account_ids
     camp["accounts"] = accounts_list
     camp["steps"] = steps
@@ -625,6 +643,9 @@ def get_campaign(conn, campaign_id: int) -> dict:
     camp["replied_count"] = replied_count
     camp["failed_count"] = failed_count
     camp["sent_today"] = sent_today
+    camp["leadgen_enabled"] = leadgen_enabled
+    camp["leadgen_daily_quota"] = leadgen_daily_quota
+    camp["leadgen_sources"] = leadgen_sources
     return camp
 
 
@@ -672,6 +693,9 @@ def create_campaign(
     steps: list | None = None,
     account_ids: list[int] | None = None,
     status: str | None = None,
+    leadgen_enabled: bool | None = None,
+    leadgen_daily_quota: int | None = None,
+    leadgen_sources: list[str] | None = None,
 ) -> dict:
     clean_name = (name or "").strip()
     if not clean_name:
@@ -688,14 +712,51 @@ def create_campaign(
             raise ValueError("Аккаунт не найден")
     primary_account_id = resolved_ids[0] if resolved_ids else None
     account_ids_json = json.dumps(resolved_ids)
+
+    name_low = clean_name.lower()
+    if leadgen_enabled is None:
+        lg_enabled_val = 1 if ("leadgen" in name_low or "ваканс" in name_low) else 0
+    else:
+        lg_enabled_val = 1 if bool(leadgen_enabled) else 0
+
+    if leadgen_daily_quota is None:
+        lg_quota_val = int(daily_limit)
+    else:
+        if isinstance(leadgen_daily_quota, bool) or not isinstance(leadgen_daily_quota, int) or not (0 <= int(leadgen_daily_quota) <= 500):
+            raise ValueError("Квота лидгена должна быть от 0 до 500")
+        lg_quota_val = int(leadgen_daily_quota)
+
+    if leadgen_sources is None:
+        lg_sources_list: list[str] = []
+    elif isinstance(leadgen_sources, (list, tuple, set)):
+        lg_sources_list = [str(s).strip() for s in leadgen_sources if str(s or "").strip()]
+    else:
+        raise ValueError("leadgen_sources должен быть списком строк")
+    lg_sources_json = json.dumps(lg_sources_list, ensure_ascii=False)
+
     norm_steps = _normalize_steps(steps)
     now = utc_now()
     cur = conn.execute(
         """
-        INSERT INTO campaigns (name, account_id, account_ids_json, daily_limit, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO campaigns (
+            name, account_id, account_ids_json, daily_limit, status,
+            leadgen_enabled, leadgen_daily_quota, leadgen_sources_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (clean_name, primary_account_id, account_ids_json, int(daily_limit), initial_status, now, now),
+        (
+            clean_name,
+            primary_account_id,
+            account_ids_json,
+            int(daily_limit),
+            initial_status,
+            lg_enabled_val,
+            lg_quota_val,
+            lg_sources_json,
+            now,
+            now,
+        ),
     )
     campaign_id = cur.lastrowid
     for step in norm_steps:
@@ -725,6 +786,9 @@ def update_campaign(
     status: str | None = None,
     steps: list | None = None,
     account_ids: list[int] | None = None,
+    leadgen_enabled: bool | None = None,
+    leadgen_daily_quota: int | None = None,
+    leadgen_sources: list[str] | None = None,
 ) -> dict:
     row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
     if row is None:
@@ -755,14 +819,46 @@ def update_campaign(
     if new_status not in CAMPAIGN_STATUSES:
         raise ValueError("Неизвестный статус рассылки")
 
+    if leadgen_enabled is None:
+        new_lg_enabled = int(current.get("leadgen_enabled") or 0)
+    else:
+        new_lg_enabled = 1 if bool(leadgen_enabled) else 0
+
+    if leadgen_daily_quota is None:
+        new_lg_quota = int(current.get("leadgen_daily_quota") if current.get("leadgen_daily_quota") is not None else 20)
+    else:
+        if isinstance(leadgen_daily_quota, bool) or not isinstance(leadgen_daily_quota, int) or not (0 <= int(leadgen_daily_quota) <= 500):
+            raise ValueError("Квота лидгена должна быть от 0 до 500")
+        new_lg_quota = int(leadgen_daily_quota)
+
+    if leadgen_sources is None:
+        new_lg_sources_json = current.get("leadgen_sources_json") or "[]"
+    elif isinstance(leadgen_sources, (list, tuple, set)):
+        clean_src = [str(s).strip() for s in leadgen_sources if str(s or "").strip()]
+        new_lg_sources_json = json.dumps(clean_src, ensure_ascii=False)
+    else:
+        raise ValueError("leadgen_sources должен быть списком строк")
+
     now = utc_now()
     conn.execute(
         """
         UPDATE campaigns
-        SET name = ?, account_id = ?, account_ids_json = ?, daily_limit = ?, status = ?, updated_at = ?
+        SET name = ?, account_id = ?, account_ids_json = ?, daily_limit = ?, status = ?,
+            leadgen_enabled = ?, leadgen_daily_quota = ?, leadgen_sources_json = ?, updated_at = ?
         WHERE id = ?
         """,
-        (new_name, primary_account_id, account_ids_json, int(new_limit), new_status, now, campaign_id),
+        (
+            new_name,
+            primary_account_id,
+            account_ids_json,
+            int(new_limit),
+            new_status,
+            new_lg_enabled,
+            new_lg_quota,
+            new_lg_sources_json,
+            now,
+            campaign_id,
+        ),
     )
     if steps is not None:
         norm_steps = _normalize_steps(steps)
