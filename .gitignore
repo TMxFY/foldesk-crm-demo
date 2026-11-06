@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 data/
+.tg_pipeline
 .env
 *.session
 *.session-journal
