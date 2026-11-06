@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY leadgen ./leadgen
 COPY replica/design/tokens.css ./replica/design/tokens.css
 COPY scripts ./scripts
 
