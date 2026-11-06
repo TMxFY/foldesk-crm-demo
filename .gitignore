@@ -1,3 +1,4 @@
+.venv
 .venv/
 __pycache__/
 .pytest_cache/
@@ -7,6 +8,7 @@ data/
 *.session
 *.session-journal
 .DS_Store
+node_modules
 node_modules/
 e2e/.tmp/
 e2e/test-results/

@@ -7,6 +7,7 @@ import random
 import re
 import sqlite3
 from zoneinfo import ZoneInfo
+from typing import Any
 
 from app.accounts import _load as load_account
 from app.accounts import _public as public_account
@@ -1728,6 +1729,89 @@ def _ensure_recipient_dialog(
     return dlg
 
 
+async def prewarm_recipient_stories(
+    client, peer_or_username: Any, reaction_emoticon: str = "🔥"
+) -> dict:
+    if client is None:
+        return {"prewarmed": False, "stories_count": 0, "error": "client is None"}
+    try:
+        from telethon.tl import functions, types
+
+        target_peer = peer_or_username
+        if hasattr(client, "get_input_entity"):
+            try:
+                resolved = client.get_input_entity(peer_or_username)
+                if asyncio.iscoroutine(resolved):
+                    resolved = await resolved
+                if resolved is not None:
+                    target_peer = resolved
+            except Exception:
+                target_peer = peer_or_username
+
+        res = await client(functions.stories.GetPeerStoriesRequest(peer=target_peer))
+        stories_obj = getattr(res, "stories", None)
+        if isinstance(stories_obj, (list, tuple)):
+            stories_list = list(stories_obj)
+        elif stories_obj is not None and hasattr(stories_obj, "stories"):
+            stories_list = list(getattr(stories_obj, "stories") or [])
+        elif isinstance(res, dict):
+            raw_s = res.get("stories")
+            stories_list = list(raw_s.get("stories") if isinstance(raw_s, dict) else (raw_s or []))
+        else:
+            stories_list = []
+
+        valid_ids = []
+        for s in stories_list:
+            sid = s.get("id") if isinstance(s, dict) else getattr(s, "id", None)
+            if sid is not None:
+                try:
+                    valid_ids.append(int(sid))
+                except (TypeError, ValueError):
+                    pass
+
+        if not valid_ids:
+            return {"prewarmed": False, "stories_count": 0, "error": "no_active_stories"}
+
+        last_id = max(valid_ids)
+        await client(functions.stories.ReadStoriesRequest(peer=target_peer, max_id=last_id))
+        await client(
+            functions.stories.SendReactionRequest(
+                peer=target_peer,
+                story_id=last_id,
+                reaction=types.ReactionEmoji(emoticon=reaction_emoticon),
+            )
+        )
+        return {
+            "prewarmed": True,
+            "stories_count": len(valid_ids),
+            "story_id": last_id,
+        }
+    except Exception as e:
+        return {"prewarmed": False, "stories_count": 0, "error": str(e)}
+
+
+async def _resolve_telethon_client_for_prewarm(gateway, session_path: str):
+    if gateway is None:
+        return None
+    if hasattr(gateway, "client") and gateway.client is not None:
+        return gateway.client
+    if hasattr(gateway, "_clients") and isinstance(gateway._clients, dict):
+        cached = gateway._clients.get(session_path)
+        if cached is not None:
+            return cached
+    if hasattr(gateway, "_open") and callable(gateway._open):
+        try:
+            opened = await gateway._open(session_path)
+            if isinstance(opened, tuple) and len(opened) >= 1:
+                return opened[0]
+            return opened
+        except Exception:
+            return None
+    if callable(gateway):
+        return gateway
+    return None
+
+
 async def run_campaign_batch(
     conn,
     campaign_id: int,
@@ -1949,12 +2033,20 @@ async def run_campaign_batch(
                     tg_mid = int(next_row["next_id"])
                     sent_at = now
             else:
+                next_step_order = step_idx + 1
                 if use_gateway:
                     peer_target = (
                         f"@{rec['username']}"
                         if (_is_synthetic_peer_id(dialog["peer_id"]) and rec.get("username"))
                         else dialog["peer_id"]
                     )
+                    if next_step_order == 1:
+                        target_entity = peer_target
+                        client = await _resolve_telethon_client_for_prewarm(
+                            active_gw, session_path
+                        )
+                        if client is not None:
+                            await prewarm_recipient_stories(client, target_entity)
                     sent = await active_gw.send_message(
                         session_path, peer_target, rendered_text, None
                     )
