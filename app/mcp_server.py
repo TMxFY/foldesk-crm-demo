@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -26,6 +27,13 @@ from app.events import get_today_focus, record_lead_event
 from app.inbox import get_inbox_counts, list_inbox, list_messages
 from app.leads import create_lead, lead_card, search_leads, update_lead
 from app.notes import add_note
+from app.outreach import (
+    _clean_company_title,
+    _clean_handle,
+    _clean_step1_text,
+    _parse_account_ids,
+    create_campaign,
+)
 from app.reminders import (
     complete_reminder,
     create_reminder,
@@ -296,6 +304,62 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "description": "Направление синхронизации: both, pull, push или status",
                 }
             },
+        },
+    },
+    {
+        "name": "ingest_discovered_leads",
+        "description": (
+            "Загрузить список найденных лидов в CRM (создание/обновление сделок в leads) "
+            "и при необходимости автоматически добавить их в кампанию рассылки (campaign_recipients)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "leads": {
+                    "type": "array",
+                    "description": "Список найденных лидов",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "username": {"type": ["string", "null"]},
+                            "name": {"type": ["string", "null"]},
+                            "company": {"type": ["string", "null"]},
+                            "phone": {"type": ["string", "null"]},
+                            "email": {"type": ["string", "null"]},
+                            "website": {"type": ["string", "null"]},
+                            "url": {"type": ["string", "null"]},
+                            "category": {"type": ["string", "null"]},
+                            "niche": {"type": ["string", "null"]},
+                            "their_angle": {"type": ["string", "null"]},
+                            "our_angle": {"type": ["string", "null"]},
+                            "hook": {"type": ["string", "null"]},
+                            "step1_text": {"type": ["string", "null"]},
+                            "step2_text": {"type": ["string", "null"]},
+                            "step3_text": {"type": ["string", "null"]},
+                            "lead_source": {"type": ["string", "null"]},
+                            "note": {"type": ["string", "null"]},
+                            "telegram_user_id": {"type": ["integer", "string", "null"]},
+                            "provider": {"type": ["string", "null"]},
+                        },
+                    },
+                },
+                "enroll_in_campaign": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Добавлять ли лидов сразу в кампанию рассылки (campaign_recipients).",
+                },
+                "campaign_id": {
+                    "type": ["integer", "null"],
+                    "default": None,
+                    "description": "ID кампании рассылки. Если не указан — ищется или создаётся кампания по campaign_name.",
+                },
+                "campaign_name": {
+                    "type": ["string", "null"],
+                    "default": "Leadgen Autopilot",
+                    "description": "Имя кампании для поиска или создания, если campaign_id не передан.",
+                },
+            },
+            "required": ["leads"],
         },
     },
 ]
@@ -1018,7 +1082,297 @@ def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict |
             "detail": "Модуль синхронизации Airtable не настроен или токен не задан",
         }
 
+    if name == "ingest_discovered_leads":
+        return _handle_ingest_discovered_leads(conn, args)
+
     raise KeyError(f"Неизвестный MCP-инструмент: {name}")
+
+
+def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dict:
+    raw_leads = args.get("leads")
+    if not isinstance(raw_leads, list):
+        raise ValueError("Параметр leads должен быть списком объектов")
+
+    enroll_in_campaign = bool(args.get("enroll_in_campaign", True))
+    raw_cid = args.get("campaign_id")
+    campaign_id: int | None = int(raw_cid) if raw_cid is not None else None
+    campaign_name = str(args.get("campaign_name") or "Leadgen Autopilot").strip() or "Leadgen Autopilot"
+
+    account_id: int | None = None
+    seen_usernames: set[str] = set()
+    seen_phones: set[str] = set()
+    seen_leads: set[int] = set()
+    seen_tg_ids: set[int] = set()
+
+    if enroll_in_campaign:
+        if campaign_id is not None:
+            crow = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+            if crow is None:
+                raise LookupError(f"Кампания #{campaign_id} не найдена")
+            camp_dict = as_dict(crow)
+        else:
+            crow = conn.execute(
+                "SELECT * FROM campaigns WHERE lower(name) = lower(?) ORDER BY id ASC LIMIT 1",
+                (campaign_name,),
+            ).fetchone()
+            if crow is not None:
+                camp_dict = as_dict(crow)
+                campaign_id = int(camp_dict["id"])
+            else:
+                created_camp = create_campaign(
+                    conn,
+                    name=campaign_name,
+                    status="draft",
+                    steps=[
+                        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+                        {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
+                        {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
+                    ],
+                )
+                campaign_id = int(created_camp["id"])
+                camp_dict = created_camp
+
+        acc_ids = _parse_account_ids(camp_dict.get("account_id"), camp_dict.get("account_ids_json"))
+        account_id = acc_ids[0] if acc_ids else camp_dict.get("account_id")
+
+        existing_rows = conn.execute(
+            "SELECT username, phone, lead_id, telegram_user_id FROM campaign_recipients WHERE campaign_id = ?",
+            (campaign_id,),
+        ).fetchall()
+        seen_usernames = {str(r["username"]).lower() for r in existing_rows if r["username"]}
+        seen_phones = {str(r["phone"]) for r in existing_rows if r["phone"]}
+        seen_leads = {int(r["lead_id"]) for r in existing_rows if r["lead_id"]}
+        seen_tg_ids = {int(r["telegram_user_id"]) for r in existing_rows if r["telegram_user_id"]}
+
+    processed = 0
+    created_leads = 0
+    updated_leads = 0
+    enrolled_in_campaign = 0
+    skipped_duplicates = 0
+    lead_ids: list[int] = []
+    now = utc_now()
+
+    for item in raw_leads:
+        if not isinstance(item, dict):
+            continue
+        username = _clean_handle(item.get("username"))
+        company = _clean_company_title(item.get("company"))
+        explicit_name = (str(item.get("name") or "").strip()) or None
+        phone = (str(item.get("phone") or "").strip()) or None
+        email = (str(item.get("email") or "").strip()) or None
+        website_raw = (str(item.get("website") or item.get("url") or "").strip())
+        website = website_raw or None
+        url_val = None
+        if website_raw:
+            url_val = website_raw if re.match(r"^https?://", website_raw, flags=re.IGNORECASE) else f"https://{website_raw}"
+
+        category = (str(item.get("category") or item.get("niche") or "").strip()) or None
+        their_angle = (str(item.get("their_angle") or "").strip()) or None
+        our_angle = (str(item.get("our_angle") or "").strip()) or None
+        hook = (str(item.get("hook") or "").strip()) or None
+        lead_source = (str(item.get("lead_source") or "").strip()) or None
+        raw_note = (str(item.get("note") or "").strip()) or None
+        provider = (str(item.get("provider") or "telegram").strip().lower())
+        if provider not in ("telegram", "whatsapp"):
+            provider = "telegram"
+
+        tg_id_raw = item.get("telegram_user_id")
+        tg_id: int | None = None
+        if tg_id_raw is not None and str(tg_id_raw).strip():
+            try:
+                tg_id = int(str(tg_id_raw).strip())
+            except ValueError:
+                tg_id = None
+
+        display_name = explicit_name or company or (f"{username} · {company}" if username and company else username) or phone
+        if not any((display_name, username, phone, tg_id)):
+            continue
+
+        processed += 1
+
+        note_parts = []
+        if raw_note:
+            note_parts.append(raw_note)
+        if their_angle and their_angle not in note_parts:
+            note_parts.append(f"Их угол: {their_angle}" if raw_note else their_angle)
+        if our_angle and our_angle not in note_parts:
+            note_parts.append(f"Наш угол: {our_angle}")
+        combined_note = "\n".join(note_parts).strip() or None
+
+        existing = None
+        if tg_id is not None:
+            row = conn.execute(
+                "SELECT * FROM leads WHERE telegram_user_id = ? ORDER BY id ASC LIMIT 1",
+                (tg_id,),
+            ).fetchone()
+            if row is not None:
+                existing = as_dict(row)
+        if existing is None and (username or phone):
+            existing = _find_lead_by_lookup(conn, username=username, phone=phone)
+        if existing is None and company:
+            row = conn.execute(
+                "SELECT * FROM leads WHERE company IS NOT NULL AND lower(company) = lower(?) ORDER BY id ASC LIMIT 1",
+                (company,),
+            ).fetchone()
+            if row is not None:
+                existing = as_dict(row)
+
+        if existing is not None:
+            lid = int(existing["id"])
+            upd_fields: dict[str, Any] = {}
+            if company and not existing.get("company"):
+                upd_fields["company"] = company
+            if company and not existing.get("description"):
+                upd_fields["description"] = company
+            if category and not existing.get("niche"):
+                upd_fields["niche"] = category
+            if url_val and not existing.get("url"):
+                upd_fields["url"] = url_val
+            if lead_source and not existing.get("lead_source"):
+                upd_fields["lead_source"] = lead_source
+            if email and not existing.get("email"):
+                upd_fields["email"] = email
+            if phone and not existing.get("phone"):
+                upd_fields["phone"] = phone
+            if username and not existing.get("username"):
+                upd_fields["username"] = username
+            if our_angle and not existing.get("offer_details"):
+                upd_fields["offer_details"] = our_angle
+
+            old_note = (existing.get("note") or "").strip()
+            if combined_note:
+                if not old_note:
+                    upd_fields["note"] = combined_note
+                else:
+                    additions = [
+                        part for part in note_parts
+                        if part and part not in old_note
+                    ]
+                    if additions:
+                        upd_fields["note"] = old_note + "\n" + "\n".join(additions)
+
+            if upd_fields:
+                update_lead(conn, lid, **upd_fields)
+            existing_tg_id = existing.get("telegram_user_id")
+            if existing_tg_id is None:
+                existing_tg_id = tg_id if tg_id is not None else (900000 + lid)
+                try:
+                    conn.execute(
+                        "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                        (existing_tg_id, now, lid),
+                    )
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    pass
+            tg_id = int(existing_tg_id)
+            updated_leads += 1
+        else:
+            created = create_lead(
+                conn,
+                account_id=account_id,
+                telegram_user_id=tg_id,
+                username=username,
+                name=display_name,
+                phone=phone,
+                company=company,
+                description=company,
+                niche=category,
+                url=url_val,
+                lead_source=lead_source,
+                email=email,
+                note=combined_note,
+                offer_details=our_angle,
+                provider=provider,
+                next_step="Отправить цепочку рассылки" if enroll_in_campaign else None,
+            )
+            lid = int(created["id"])
+            if tg_id is None:
+                tg_id = created.get("telegram_user_id") or (900000 + lid)
+                try:
+                    conn.execute(
+                        "UPDATE leads SET telegram_user_id = ? WHERE id = ? AND telegram_user_id IS NULL",
+                        (int(tg_id), lid),
+                    )
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    pass
+            tg_id = int(tg_id)
+            created_leads += 1
+
+        lead_ids.append(lid)
+
+        if enroll_in_campaign and campaign_id is not None:
+            is_dup = (
+                lid in seen_leads
+                or (tg_id and int(tg_id) in seen_tg_ids)
+                or (username and username.lower() in seen_usernames)
+                or (phone and phone in seen_phones)
+            )
+            if is_dup:
+                skipped_duplicates += 1
+                continue
+
+            step1_text, error_reason = _clean_step1_text(item.get("step1_text") or item.get("first_touch"))
+            step2_text = (str(item.get("step2_text") or item.get("followup_1") or "").strip()) or None
+            step3_text = (str(item.get("step3_text") or item.get("followup_2") or "").strip()) or None
+            rec_status = "failed" if error_reason else "pending"
+            rec_note = raw_note or their_angle
+
+            conn.execute(
+                """
+                INSERT INTO campaign_recipients (
+                    campaign_id, lead_id, telegram_user_id, username, name,
+                    phone, company, note, website, category, their_angle,
+                    our_angle, hook, step1_text, step2_text, step3_text,
+                    extra_json, current_step, status, last_sent_at, error_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    campaign_id,
+                    lid,
+                    tg_id,
+                    username,
+                    display_name or username or phone or f"Лид #{lid}",
+                    phone,
+                    company,
+                    rec_note,
+                    website,
+                    category,
+                    their_angle,
+                    our_angle,
+                    hook,
+                    step1_text,
+                    step2_text,
+                    step3_text,
+                    rec_status,
+                    error_reason,
+                    now,
+                    now,
+                ),
+            )
+            seen_leads.add(lid)
+            if tg_id:
+                seen_tg_ids.add(int(tg_id))
+            if username:
+                seen_usernames.add(username.lower())
+            if phone:
+                seen_phones.add(phone)
+            enrolled_in_campaign += 1
+
+    if enroll_in_campaign and campaign_id is not None:
+        conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
+    conn.commit()
+
+    return {
+        "ok": True,
+        "processed": processed,
+        "created_leads": created_leads,
+        "updated_leads": updated_leads,
+        "enrolled_in_campaign": enrolled_in_campaign,
+        "skipped_duplicates": skipped_duplicates,
+        "campaign_id": campaign_id,
+        "lead_ids": lead_ids,
+    }
 
 
 def _read_mcp_resource(conn: sqlite3.Connection, uri: str) -> dict:
