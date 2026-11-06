@@ -1435,14 +1435,14 @@ function resolveCampaignAccounts(camp) {
 
 const CAMPAIGN_LEADGEN_SOURCE_OPTIONS = [
   ["tg_groups", "TG-группы"],
-  ["yc_ph", "YC & PH"],
-  ["meta_ads", "Meta Ads"],
-  ["tg_ad_spy", "TG Ad Spy"],
-  ["channel_graph", "Channel Graph"],
-  ["social_x_reddit", "X & Reddit"],
-  ["buyer_catalogs", "Каталоги"],
+  ["yc_ph", "YC и Product Hunt"],
+  ["meta_ads", "Реклама Meta"],
+  ["tg_ad_spy", "Реклама Telegram"],
+  ["channel_graph", "Похожие каналы"],
+  ["social_x_reddit", "X и Reddit"],
+  ["buyer_catalogs", "Каталоги SaaS"],
   ["linkedin_jobs", "LinkedIn"],
-  ["tg_vacancies", "TG Вакансии"],
+  ["tg_vacancies", "TG-Вакансии"],
 ];
 
 function buildCampaignSettingsPanel(camp, opts) {
@@ -1469,11 +1469,9 @@ function buildCampaignSettingsPanel(camp, opts) {
   };
 
   const limitStepper = el("div", { className: "stepper-control" }, [
-    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(-10) }, ["-10"]),
     el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(-5) }, ["-5"]),
     limitInput,
     el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(5) }, ["+5"]),
-    el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLimit(10) }, ["+10"]),
   ]);
 
   const lgEnabledCheck = el("input", {
@@ -1481,6 +1479,16 @@ function buildCampaignSettingsPanel(camp, opts) {
     className: "camp-edit-leadgen-enabled",
   });
   lgEnabledCheck.checked = Boolean(leadgenEnabled);
+
+  const lgPillBadge = el("span", {
+    className: `badge ${leadgenEnabled ? "b-ok" : "b-off"}`,
+  }, [leadgenEnabled ? "ВКЛ" : "ВЫКЛ"]);
+
+  lgEnabledCheck.addEventListener("change", () => {
+    const isOn = Boolean(lgEnabledCheck.checked);
+    lgPillBadge.textContent = isOn ? "ВКЛ" : "ВЫКЛ";
+    lgPillBadge.className = `badge ${isOn ? "b-ok" : "b-off"}`;
+  });
 
   const lgQuotaInput = el("input", {
     type: "number",
@@ -1503,16 +1511,32 @@ function buildCampaignSettingsPanel(camp, opts) {
 
   const sourceBoxes = [];
   const sourceChecksNodes = CAMPAIGN_LEADGEN_SOURCE_OPTIONS.map(([code, label]) => {
+    const isChecked = leadgenSourcesList.includes(code);
     const cb = el("input", {
       type: "checkbox",
       "data-camp-leadgen-source": code,
+      hidden: "hidden",
     });
-    cb.checked = leadgenSourcesList.includes(code);
+    cb.checked = isChecked;
     sourceBoxes.push(cb);
-    return el("label", { className: "pool-check-chip" }, [
-      cb,
-      el("span", { className: "pool-check-name" }, [label]),
-    ]);
+
+    const pillBtn = el("button", {
+      type: "button",
+      className: `camp-source-chip ${isChecked ? "is-active" : ""}`,
+      "aria-pressed": isChecked ? "true" : "false",
+      onclick: () => {
+        cb.checked = !cb.checked;
+        pillBtn.classList.toggle("is-active", cb.checked);
+        pillBtn.setAttribute("aria-pressed", cb.checked ? "true" : "false");
+        stateDot.className = `badge ${cb.checked ? "b-ok" : "b-off"}`;
+        stateDot.textContent = cb.checked ? "ВКЛ" : "ВЫКЛ";
+      },
+    }, []);
+    const stateDot = el("span", {
+      className: `badge ${isChecked ? "b-ok" : "b-off"}`,
+    }, [isChecked ? "ВКЛ" : "ВЫКЛ"]);
+    pillBtn.append(cb, el("span", {}, [label]), stateDot);
+    return pillBtn;
   });
 
   const editableSteps = (Array.isArray(steps) && steps.length
@@ -1524,9 +1548,13 @@ function buildCampaignSettingsPanel(camp, opts) {
   }));
 
   const stepsHost = el("div", { className: "stack camp-edit-steps-host" }, []);
+  const stepsSummaryNode = el("summary", { className: "campaign-steps-summary" }, [
+    `Редактировать тексты шагов цепочки (${editableSteps.length})`,
+  ]);
 
   const renderEditableSteps = () => {
     stepsHost.replaceChildren();
+    stepsSummaryNode.textContent = `Редактировать тексты шагов цепочки (${editableSteps.length})`;
     editableSteps.forEach((st, idx) => {
       const delayInput = el("input", {
         type: "number",
@@ -1563,7 +1591,7 @@ function buildCampaignSettingsPanel(camp, opts) {
             el("strong", {}, [`Шаг ${idx + 1}`]),
             el("div", { className: "row" }, [
               el("label", { className: "inline" }, [
-                "Задержка (ч):",
+                "Через (ч):",
                 delayInput,
               ]),
               removeStepBtn,
@@ -1637,39 +1665,43 @@ function buildCampaignSettingsPanel(camp, opts) {
   }, [
     el("div", { className: "subcard-head" }, [
       el("strong", {}, ["Настройки рассылки и автоподачи Лидгена"]),
-      el("button", {
-        type: "button",
-        className: "btn ghost sm",
-        onclick: () => {
-          state.expandedCampaignSettings[camp.id] = false;
-          renderCampaigns();
-        },
-      }, ["Свернуть ×"]),
+      el("div", { className: "row" }, [
+        saveSettingsBtn,
+        el("button", {
+          type: "button",
+          className: "btn ghost sm",
+          onclick: () => {
+            state.expandedCampaignSettings[camp.id] = false;
+            renderCampaigns();
+          },
+        }, ["Свернуть ×"]),
+      ]),
     ]),
-    el("div", { className: "outreach-form-row" }, [
+    el("div", { className: "leadgen-form-row-3" }, [
       el("label", {}, ["Название рассылки", nameInput]),
-      el("label", {}, ["Суточный лимит отправки (daily_limit)", limitStepper]),
-    ]),
-    el("div", { className: "campaign-leadgen-box stack" }, [
-      el("div", { className: "outreach-form-row" }, [
-        el("label", { className: "row leadgen-switch-label" }, [
+      el("label", {}, ["Лимит отправки в сутки", limitStepper]),
+      el("div", { className: "stack" }, [
+        el("label", { className: "leadgen-pill-toggle" }, [
           lgEnabledCheck,
-          el("strong", {}, ["Подливать новых лидов из Лидгена в эту рассылку"]),
+          el("strong", {}, ["Поток из Лидгена"]),
+          lgPillBadge,
         ]),
         el("label", {}, [
-          "Квота добавления из Лидгена (лидов в сутки)",
+          "Лидов в сутки из Лидгена",
           lgQuotaStepper,
         ]),
       ]),
-      el("div", { className: "stack" }, [
-        el("span", { className: "steps-caption" }, ["ИСТОЧНИКИ ЛИДГЕНА ДЛЯ ЭТОЙ РАССЫЛКИ:"]),
-        el("div", { className: "campaign-accounts-pool" }, sourceChecksNodes),
-      ]),
     ]),
-    el("div", { className: "stack" }, [
-      el("span", { className: "steps-caption" }, ["ШАГИ ЦЕПОЧКИ СООБЩЕНИЙ (РЕДАКТОР):"]),
-      stepsHost,
-      el("div", { className: "row" }, [addStepBtn, saveSettingsBtn]),
+    el("div", { className: "campaign-leadgen-box stack" }, [
+      el("span", { className: "hint" }, ["Откуда брать новых получателей для этой рассылки (кликните, чтобы включить или выключить):"]),
+      el("div", { className: "campaign-sources-chips-row" }, sourceChecksNodes),
+    ]),
+    el("details", { className: "campaign-steps-details" }, [
+      stepsSummaryNode,
+      el("div", { className: "stack campaign-steps-details-body" }, [
+        stepsHost,
+        el("div", { className: "row" }, [addStepBtn]),
+      ]),
     ]),
   ]);
 }
@@ -9114,30 +9146,123 @@ function renderLeadgenGroupChips() {
   }
 }
 
+function syncLeadgenSwitchBadges() {
+  document.querySelectorAll(".leadgen-switch-row").forEach((row) => {
+    const cb = row.querySelector('input[type="checkbox"]');
+    const badge = row.querySelector(".leadgen-row-badge");
+    if (!cb || !badge) return;
+    const isOn = Boolean(cb.checked);
+    row.classList.toggle("is-on", isOn);
+    badge.textContent = isOn ? "ВКЛ" : "ВЫКЛ";
+    badge.className = `badge ${isOn ? "b-ok" : "b-off"} leadgen-row-badge`;
+  });
+
+  const syncPill = (inputSel, pillKey, onText = "ВКЛ", offText = "ВЫКЛ") => {
+    const cb = document.querySelector(inputSel);
+    const pill = document.querySelector(`[data-switch-pill="${pillKey}"]`);
+    if (!cb || !pill) return;
+    const isOn = Boolean(cb.checked);
+    pill.textContent = isOn ? onText : offText;
+    pill.className = `badge ${isOn ? "b-ok" : "b-off"}`;
+  };
+
+  syncPill("#leadgen-enabled-toggle", "leadgen-enabled", "ВКЛ", "ПАУЗА");
+  syncPill("#leadgen-autopush-toggle", "leadgen-autopush", "ВКЛ", "ВЫКЛ");
+  syncPill("#leadgen-b2b-enabled", "b2b-enabled", "Поток ВКЛ", "Поток ВЫКЛ");
+  syncPill("#leadgen-vacancies-enabled", "vac-enabled", "Поток ВКЛ", "Поток ВЫКЛ");
+
+  const b2bBoxes = [...document.querySelectorAll("[data-b2b-source]")];
+  const b2bOn = b2bBoxes.filter((cb) => cb.checked).length;
+  const b2bCountBadge = document.querySelector("#b2b-active-count-badge");
+  if (b2bCountBadge && b2bBoxes.length) {
+    b2bCountBadge.textContent = `Включено: ${b2bOn} из ${b2bBoxes.length}`;
+    b2bCountBadge.className = `badge ${b2bOn > 0 ? "b-ok" : "b-off"}`;
+  }
+
+  const vacBoxes = [...document.querySelectorAll("[data-vac-layer]")];
+  const vacOn = vacBoxes.filter((cb) => cb.checked).length;
+  const vacCountBadge = document.querySelector("#vac-active-count-badge");
+  if (vacCountBadge && vacBoxes.length) {
+    vacCountBadge.textContent = `Включено: ${vacOn} из ${vacBoxes.length}`;
+    vacCountBadge.className = `badge ${vacOn > 0 ? "b-ok" : "b-off"}`;
+  }
+
+  const statusBadge = document.querySelector("#leadgen-status-badge");
+  const enabledCb = document.querySelector("#leadgen-enabled-toggle");
+  const quotaInput = document.querySelector("#leadgen-total-quota");
+  if (statusBadge && enabledCb) {
+    const isOn = Boolean(enabledCb.checked);
+    const q = Number(quotaInput?.value) || 50;
+    statusBadge.textContent = isOn ? `Активен · ${q} лидов/сут` : "На паузе";
+    statusBadge.className = `badge ${isOn ? "b-ok" : "b-wait"}`;
+  }
+}
+
+function applyLeadgenProfilePreset(profileCode) {
+  document.querySelectorAll("[data-leadgen-profile]").forEach((btn) => {
+    const match = btn.getAttribute("data-leadgen-profile") === profileCode;
+    btn.setAttribute("aria-pressed", match ? "true" : "false");
+  });
+
+  const setCheck = (sel, val) => {
+    const elNode = document.querySelector(sel);
+    if (elNode) elNode.checked = Boolean(val);
+  };
+  const setVal = (sel, val) => {
+    const elNode = document.querySelector(sel);
+    if (elNode) elNode.value = String(val);
+  };
+
+  setCheck("#leadgen-enabled-toggle", true);
+  setCheck("#leadgen-autopush-toggle", true);
+
+  if (profileCode === "all") {
+    setVal("#leadgen-total-quota", 50);
+    setCheck("#leadgen-b2b-enabled", true);
+    setCheck("#leadgen-vacancies-enabled", true);
+    document.querySelectorAll("[data-b2b-source]").forEach((cb) => { cb.checked = true; });
+    document.querySelectorAll("[data-vac-layer]").forEach((cb) => { cb.checked = true; });
+  } else if (profileCode === "vacancies_only") {
+    setVal("#leadgen-total-quota", 25);
+    setCheck("#leadgen-b2b-enabled", false);
+    setCheck("#leadgen-vacancies-enabled", true);
+    document.querySelectorAll("[data-b2b-source]").forEach((cb) => { cb.checked = false; });
+    document.querySelectorAll("[data-vac-layer]").forEach((cb) => { cb.checked = true; });
+  } else if (profileCode === "b2b_only") {
+    setVal("#leadgen-total-quota", 40);
+    setCheck("#leadgen-b2b-enabled", true);
+    setCheck("#leadgen-vacancies-enabled", false);
+    document.querySelectorAll("[data-b2b-source]").forEach((cb) => { cb.checked = true; });
+    document.querySelectorAll("[data-vac-layer]").forEach((cb) => { cb.checked = false; });
+  } else if (profileCode === "safe_warmup") {
+    setVal("#leadgen-total-quota", 15);
+    setCheck("#leadgen-b2b-enabled", true);
+    setCheck("#leadgen-vacancies-enabled", true);
+    const safeB2b = new Set(["tg_groups", "yc_ph"]);
+    document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
+      cb.checked = safeB2b.has(cb.getAttribute("data-b2b-source"));
+    });
+    const safeVac = new Set(["AI-контент", "автоматизация"]);
+    document.querySelectorAll("[data-vac-layer]").forEach((cb) => {
+      cb.checked = safeVac.has(cb.getAttribute("data-vac-layer"));
+    });
+  }
+  syncLeadgenSwitchBadges();
+}
+
 function renderLeadgenConfig() {
   const cfg = ensureLeadgenState();
   const b2b = cfg.b2b || {};
   const vac = cfg.vacancies || {};
   const status = state.leadgenStatus || {};
 
-  const statusBadge = document.querySelector("#leadgen-status-badge");
-  if (statusBadge) {
-    const isOn = Boolean(cfg.enabled);
-    statusBadge.textContent = isOn
-      ? `Авто-лидген: ВКЛ · до ${cfg.total_daily_quota ?? 50}/сут`
-      : "Авто-лидген: ПАУЗА";
-    statusBadge.className = `badge ${isOn ? "b-ok" : "b-wait"}`;
-  }
-
   const statsBadge = document.querySelector("#leadgen-stats-badge");
   if (statsBadge) {
     const counts = status.crm_leadgen_counts || {};
-    const lastRun = status.last_run || status.last_run_summary || {};
     const totalInCrm = Number(counts.total_leadgen_leads) || 0;
     const vacInCrm = Number(counts.vacancies_leads) || 0;
     const b2bInCrm = Number(counts.b2b_leads) || 0;
-    const lastUnique = Number(lastRun.new_unique) || 0;
-    statsBadge.textContent = `В CRM из лидгена: ${totalInCrm} (B2B: ${b2bInCrm} · Вакансии: ${vacInCrm}) · Посл. прогон: +${lastUnique}`;
+    statsBadge.textContent = `В CRM: ${totalInCrm} лидов (B2B: ${b2bInCrm} · Вакансии: ${vacInCrm})`;
   }
 
   const setVal = (sel, val) => {
@@ -9189,6 +9314,7 @@ function renderLeadgenConfig() {
   });
 
   renderLeadgenGroupChips();
+  syncLeadgenSwitchBadges();
 }
 
 function collectLeadgenFormPayload() {
@@ -9363,6 +9489,54 @@ function bindLeadgenEvents() {
     pushBtn.addEventListener("click", (e) => pushLeadgenNow(e.currentTarget));
   }
 
+  document.querySelectorAll("[data-leadgen-profile]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const code = btn.getAttribute("data-leadgen-profile") || "all";
+      applyLeadgenProfilePreset(code);
+    });
+  });
+
+  document.querySelectorAll("[data-leadgen-tab]").forEach((tabBtn) => {
+    tabBtn.addEventListener("click", () => {
+      const target = tabBtn.getAttribute("data-leadgen-tab") || "sources";
+      document.querySelectorAll("[data-leadgen-tab]").forEach((b) => {
+        b.setAttribute("aria-selected", b.getAttribute("data-leadgen-tab") === target ? "true" : "false");
+      });
+      const panes = {
+        sources: document.querySelector("#leadgen-pane-sources"),
+        chats: document.querySelector("#leadgen-pane-chats"),
+        templates: document.querySelector("#leadgen-pane-templates"),
+      };
+      Object.entries(panes).forEach(([key, pane]) => {
+        if (pane) pane.hidden = key !== target;
+      });
+    });
+  });
+
+  const allOnBtn = document.querySelector("#b2b-sources-all-on-btn");
+  if (allOnBtn) {
+    allOnBtn.addEventListener("click", () => {
+      document.querySelectorAll("[data-b2b-source]").forEach((cb) => { cb.checked = true; });
+      syncLeadgenSwitchBadges();
+    });
+  }
+  const allOffBtn = document.querySelector("#b2b-sources-all-off-btn");
+  if (allOffBtn) {
+    allOffBtn.addEventListener("click", () => {
+      document.querySelectorAll("[data-b2b-source]").forEach((cb) => { cb.checked = false; });
+      syncLeadgenSwitchBadges();
+    });
+  }
+
+  const leadgenSec = document.querySelector("#leadgen");
+  if (leadgenSec) {
+    leadgenSec.addEventListener("change", (e) => {
+      if (e.target && e.target.matches('input[type="checkbox"], #leadgen-total-quota')) {
+        syncLeadgenSwitchBadges();
+      }
+    });
+  }
+
   document.querySelectorAll("[data-leadgen-quota-step]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const input = document.querySelector("#leadgen-total-quota");
@@ -9370,6 +9544,7 @@ function bindLeadgenEvents() {
       const step = Number(btn.getAttribute("data-leadgen-quota-step")) || 0;
       const next = Math.max(0, Math.min(500, (Number(input.value) || 0) + step));
       input.value = String(next);
+      syncLeadgenSwitchBadges();
     });
   });
 
@@ -9378,6 +9553,7 @@ function bindLeadgenEvents() {
       const input = document.querySelector("#leadgen-total-quota");
       if (!input) return;
       input.value = String(Number(btn.getAttribute("data-leadgen-quota-preset")) || 50);
+      syncLeadgenSwitchBadges();
     });
   });
 
