@@ -467,19 +467,48 @@ function failRegion(view, box, error) {
 
 async function api(path, options) {
   const opts = options || {};
-  const res = await fetch(path, {
-    method: opts.method || "GET",
-    headers: opts.body ? { "Content-Type": "application/json" } : undefined,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  const text = await res.text();
+  const method = (opts.method || "GET").toUpperCase();
+  const maxAttempts = method === "GET" ? 3 : 1;
+  let res = null;
+  let text = "";
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      res = await fetch(path, {
+        method,
+        headers: opts.body ? { "Content-Type": "application/json" } : undefined,
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+      text = await res.text();
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1200 * attempt));
+        continue;
+      }
+      break;
+    } catch (fetchErr) {
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1200 * attempt));
+        continue;
+      }
+      throw fetchErr;
+    }
+  }
+
   let data = null;
   if (text) {
     try { data = JSON.parse(text); } catch (_err) { data = { detail: text }; }
   }
   if (!res.ok) {
-    const detail = data && data.detail;
-    throw new Error(typeof detail === "string" ? detail : "Запрос не дошёл");
+    let detail = data && data.detail;
+    if (typeof detail === "string") {
+      const trimmed = detail.trim();
+      if (trimmed.startsWith("<") || /<!doctype\s+html|<html/i.test(trimmed)) {
+        detail = `Сервер временно перезапускается (HTTP ${res.status}), подождите пару секунд`;
+      } else if (trimmed.length > 260) {
+        detail = `${trimmed.slice(0, 260)}…`;
+      }
+    }
+    throw new Error(typeof detail === "string" && detail ? detail : `Запрос не дошёл (HTTP ${res.status})`);
   }
   return data;
 }

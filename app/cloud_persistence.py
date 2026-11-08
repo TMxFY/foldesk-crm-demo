@@ -288,6 +288,22 @@ def restore_from_cloud(
         except Exception:
             pass
 
+    existing_auth_sessions: list[tuple] = []
+    try:
+        chk_conn = live_conn if live_conn is not None else (sqlite3.connect(db_path, timeout=5.0) if db_path.exists() else None)
+        if chk_conn is not None:
+            try:
+                existing_auth_sessions = chk_conn.execute(
+                    "SELECT token, user_id, created_at, expires_at FROM crm_auth_sessions"
+                ).fetchall()
+            except Exception:
+                pass
+            finally:
+                if live_conn is None:
+                    chk_conn.close()
+    except Exception:
+        pass
+
     raw_db_bytes = base64.b64decode(db_b64)
     if live_conn is not None:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
@@ -299,12 +315,33 @@ def restore_from_cloud(
                 src_conn.backup(live_conn)
             finally:
                 src_conn.close()
+            if existing_auth_sessions:
+                try:
+                    for srow in existing_auth_sessions:
+                        live_conn.execute(
+                            "INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                            (srow[0], srow[1], srow[2], srow[3]),
+                        )
+                    live_conn.commit()
+                except Exception:
+                    pass
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         db_path.write_bytes(raw_db_bytes)
+        if existing_auth_sessions:
+            try:
+                with sqlite3.connect(db_path, timeout=5.0) as dconn:
+                    for srow in existing_auth_sessions:
+                        dconn.execute(
+                            "INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                            (srow[0], srow[1], srow[2], srow[3]),
+                        )
+                    dconn.commit()
+            except Exception:
+                pass
 
     sessions_map = bundle.get("sessions") or {}
     sessions_dir = ROOT / "data" / "sessions"
