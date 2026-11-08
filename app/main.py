@@ -14,6 +14,7 @@ from app.accounts import (
     check_all_accounts,
     confirm_login,
     confirm_password,
+    delete_account,
     import_session_accounts,
     list_accounts,
     reconnect_account,
@@ -790,6 +791,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/accounts")
     def accounts_list(request: Request):
         return list_accounts(request.app.state.conn)
+
+    @app.delete("/api/accounts/{account_id}")
+    def accounts_delete(account_id: int, request: Request):
+        return _call(delete_account, request.app.state.conn, account_id)
 
     @app.post("/api/accounts/check-all")
     async def accounts_check_all(request: Request):

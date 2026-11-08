@@ -660,11 +660,40 @@ def test_tg_web_a_session_init_js_and_persistence(tmp_path):
         assert '"slot": 1' in js_res.text
         assert '"slot": 2' in js_res.text
 
-        # Calling /api/accounts/start for the already connected phone reuses the session instead of creating pending_code
+        # Calling /api/accounts/start for an already connected phone returns 400 error and prevents duplicates
         again = client.post("/api/accounts/start", json={"phone": "+905346380943"})
-        assert again.status_code == 200
-        assert again.json()["status"] == "connected"
-        assert again.json()["id"] == acc_id
+        assert again.status_code == 400
+        assert "уже добавлен" in again.json()["detail"].lower()
         assert len(client.get("/api/accounts").json()) == 2
+
+        # Formatted phone (+90 534 638 09 43) also matches the same digits and is rejected
+        formatted_again = client.post("/api/accounts/start", json={"phone": "+90 534 638-09-43"})
+        assert formatted_again.status_code == 400
+        assert "уже добавлен" in formatted_again.json()["detail"].lower()
+        assert len(client.get("/api/accounts").json()) == 2
+
+        # Importing an already-connected account also returns 400 error
+        imp_dup = client.post(
+            "/api/accounts/import-session",
+            json={"phone": "+905346380943", "telegram_user_id": 5680938518, "session_string": "dup"},
+        )
+        assert imp_dup.status_code == 400
+        assert "уже добавлен" in imp_dup.json()["detail"].lower()
+
+        # If a duplicate row is inserted directly into SQLite, list_accounts automatically removes the duplicate
+        conn.execute(
+            """
+            INSERT INTO accounts (
+                phone, session_path, status, telegram_user_id,
+                telegram_username, telegram_name, created_at,
+                health, updated_at, daily_limit, sent_today, provider
+            ) VALUES ('+905346380943', 'data/sessions/1.session', 'connected', 5680938518, 'tim_cros', 'Tim Korznikov', ?, 'active', ?, 25, 0, 'telegram')
+            """,
+            (now, now),
+        )
+        conn.commit()
+        deduped = client.get("/api/accounts").json()
+        assert len(deduped) == 2
+        assert [a["id"] for a in deduped] == [acc_id, acc_id_2]
 
 
