@@ -265,7 +265,86 @@ def _mark_error(conn, account_id: int) -> None:
     conn.commit()
 
 
+def _phone_digits(phone: str | None) -> str:
+    return re.sub(r"\D", "", str(phone or ""))
+
+
+def _find_duplicate_account(
+    conn,
+    provider: str = "telegram",
+    phone: str | None = None,
+    telegram_user_id: int | None = None,
+    exclude_id: int | None = None,
+    connected_only: bool = True,
+) -> dict | None:
+    norm_prov = "whatsapp" if str(provider or "").strip().lower() == "whatsapp" else "telegram"
+    target_digits = _phone_digits(phone)
+    rows = conn.execute(
+        "SELECT * FROM accounts WHERE COALESCE(provider, 'telegram') = ? ORDER BY CASE WHEN status = 'connected' THEN 0 ELSE 1 END, id ASC",
+        (norm_prov,),
+    ).fetchall()
+    for raw in rows:
+        row = as_dict(raw)
+        rid = int(row["id"])
+        if exclude_id is not None and rid == int(exclude_id):
+            continue
+        if connected_only and row.get("status") != "connected":
+            continue
+        row_digits = _phone_digits(row.get("phone"))
+        if target_digits and len(target_digits) >= 3 and row_digits == target_digits:
+            return row
+        if (
+            telegram_user_id is not None
+            and row.get("telegram_user_id") is not None
+            and int(row["telegram_user_id"]) == int(telegram_user_id)
+        ):
+            return row
+    return None
+
+
+def deduplicate_accounts(conn) -> int:
+    rows = conn.execute(
+        "SELECT * FROM accounts ORDER BY CASE WHEN status = 'connected' THEN 0 ELSE 1 END, id ASC"
+    ).fetchall()
+    seen_phones: dict[tuple[str, str], int] = {}
+    seen_uids: dict[tuple[str, int], int] = {}
+    dup_ids: list[int] = []
+
+    for raw in rows:
+        row = as_dict(raw)
+        aid = int(row["id"])
+        prov = "whatsapp" if str(row.get("provider") or "").strip().lower() == "whatsapp" else "telegram"
+        pdigits = _phone_digits(row.get("phone"))
+        uid = row.get("telegram_user_id")
+
+        is_dup = False
+        if pdigits and len(pdigits) >= 3:
+            if (prov, pdigits) in seen_phones:
+                is_dup = True
+            else:
+                seen_phones[(prov, pdigits)] = aid
+        if uid is not None:
+            try:
+                uid_int = int(uid)
+                if (prov, uid_int) in seen_uids:
+                    is_dup = True
+                else:
+                    seen_uids[(prov, uid_int)] = aid
+            except (TypeError, ValueError):
+                pass
+        if is_dup:
+            dup_ids.append(aid)
+
+    if dup_ids:
+        _unlink_account_refs(conn, dup_ids)
+        for did in dup_ids:
+            conn.execute("DELETE FROM accounts WHERE id = ?", (did,))
+        conn.commit()
+    return len(dup_ids)
+
+
 def list_accounts(conn) -> list:
+    deduplicate_accounts(conn)
     rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
     return [_public(as_dict(row)) for row in rows]
 
@@ -394,6 +473,8 @@ def restore_disk_sessions(conn) -> int:
         tg_uid = 5680938518 if is_tim else None
         tg_user = "tim_cros" if is_tim else None
         tg_name = "Tim Korznikov" if is_tim else f"Telegram ({sess_file.stem})"
+        if _find_duplicate_account(conn, "telegram", phone=phone, telegram_user_id=tg_uid, connected_only=False) is not None:
+            continue
         try:
             blob = sess_file.read_bytes()
         except Exception:
@@ -427,6 +508,7 @@ def restore_disk_sessions(conn) -> int:
                     (c_phone,),
                 )
 
+    deduplicate_accounts(conn)
     conn.commit()
     return restored
 
@@ -450,52 +532,32 @@ async def start_login(
     clean_proxy = (proxy_url or "").strip() or None
     clean_scope = (access_scope or "workspace").strip() or "workspace"
 
-    # If this phone already has a connected session with an active MTProto/WhatsApp session, reuse it
-    existing_connected = conn.execute(
-        """
-        SELECT id, session_path, proxy_url, access_scope, health
-        FROM accounts
-        WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status = 'connected'
-        ORDER BY id ASC LIMIT 1
-        """,
-        (phone, norm_provider),
-    ).fetchone()
-    if (
-        existing_connected
-        and existing_connected["health"] == "active"
-        and (
-            _inspect_telethon_session(existing_connected["session_path"]) is not None
-            or _inspect_whatsmeow_db(existing_connected["session_path"]) is not None
-        )
+    existing_connected = _find_duplicate_account(conn, norm_provider, phone=phone, connected_only=True)
+    if existing_connected and str(existing_connected.get("health") or "active") not in (
+        "unauthorized",
+        "banned",
+        "frozen",
     ):
-        return {
-            "id": int(existing_connected["id"]),
-            "status": "connected",
-            "provider": norm_provider,
-            "pairing_code": None,
-            "qr_code": None,
-            "proxy_url": existing_connected["proxy_url"] or clean_proxy,
-            "access_scope": existing_connected["access_scope"] or clean_scope,
-        }
+        raise ValueError(f"Аккаунт {existing_connected['phone']} уже добавлен")
 
     # Remove previous unfinished/error attempts for the same phone + provider
-    stale_rows = conn.execute(
+    target_digits = _phone_digits(phone)
+    all_pending = conn.execute(
         """
-        SELECT id FROM accounts
-        WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
+        SELECT id, phone FROM accounts
+        WHERE COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
         """,
-        (phone, norm_provider),
+        (norm_provider,),
     ).fetchall()
-    stale_ids = [int(r[0]) for r in stale_rows]
+    stale_ids = [
+        int(r[0])
+        for r in all_pending
+        if str(r[1] or "").strip() == phone or (target_digits and _phone_digits(r[1]) == target_digits)
+    ]
     if stale_ids:
         _unlink_account_refs(conn, stale_ids)
-    conn.execute(
-        """
-        DELETE FROM accounts
-        WHERE phone = ? AND COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
-        """,
-        (phone, norm_provider),
-    )
+        for sid in stale_ids:
+            conn.execute("DELETE FROM accounts WHERE id = ?", (sid,))
     conn.commit()
     if existing_connected:
         account_id = int(existing_connected["id"])
@@ -884,10 +946,27 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             if hasattr(gateway, "set_app_credentials") and app_id_val and app_hash_val:
                 gateway.set_app_credentials(session_path, app_id_val, app_hash_val)
 
-        existing = conn.execute(
-            "SELECT id FROM accounts WHERE phone = ? AND COALESCE(provider, 'telegram') = ? ORDER BY id LIMIT 1",
-            (phone, provider),
-        ).fetchone()
+        dup_connected = _find_duplicate_account(
+            conn,
+            provider,
+            phone=phone,
+            telegram_user_id=tg_id,
+            connected_only=True,
+        )
+        if dup_connected and str(dup_connected.get("health") or "active") not in (
+            "unauthorized",
+            "banned",
+            "frozen",
+        ):
+            raise ValueError(f"Аккаунт {dup_connected['phone']} уже добавлен")
+
+        existing = _find_duplicate_account(
+            conn,
+            provider,
+            phone=phone,
+            telegram_user_id=tg_id,
+            connected_only=False,
+        )
         if existing:
             account_id = int(existing["id"])
             conn.execute(
@@ -1108,6 +1187,24 @@ async def check_all_accounts(conn, gateway=None, wa_gateway=None) -> dict:
 def _apply_result(conn, account_id: int, result: dict) -> None:
     status = result["status"]
     if status == "connected":
+        current = _load(conn, account_id)
+        dup = _find_duplicate_account(
+            conn,
+            str(current.get("provider") or "telegram"),
+            phone=current.get("phone"),
+            telegram_user_id=result.get("telegram_user_id"),
+            exclude_id=account_id,
+            connected_only=True,
+        )
+        if dup and str(dup.get("health") or "active") not in (
+            "unauthorized",
+            "banned",
+            "frozen",
+        ):
+            _unlink_account_refs(conn, [int(account_id)])
+            conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            conn.commit()
+            raise ValueError(f"Аккаунт {dup['phone']} уже добавлен")
         conn.execute(
             """
             UPDATE accounts
