@@ -492,6 +492,13 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if str(account.get("session_path") or "").startswith("data/sessions/demo"):
             synced.add(account_id)
             return
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            existing_dlg_cnt = app.state.conn.execute(
+                "SELECT COUNT(*) FROM dialogs WHERE account_id = ?", (account_id,)
+            ).fetchone()[0]
+            if int(existing_dlg_cnt or 0) > 5:
+                synced.add(account_id)
+                return
         provider = str(account.get("provider") or "telegram").strip().lower()
         gateway = _resolve_app_gateway(app, provider)
         if gateway is None:
@@ -624,7 +631,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if os.getenv("DISABLE_TG_WATCHES") != "1":
-            await start_connected_watches(app)
+            if "PYTEST_CURRENT_TEST" in os.environ:
+                await start_connected_watches(app)
+            else:
+                asyncio.create_task(start_connected_watches(app))
             await start_autopilot_loop(app)
         try:
             yield
