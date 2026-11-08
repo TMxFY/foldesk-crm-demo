@@ -438,6 +438,8 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
     now = utc_now()
     for row in rows:
         rec = as_dict(row)
+        if int(rec.get("current_step") or 0) < 1 and not rec.get("last_sent_at"):
+            continue
         dialogs = _find_recipient_dialogs(conn, rec, account_id=account_id)
         if not dialogs and account_id is not None:
             # Also check across any account if assigned_account_id or dialog exists elsewhere
@@ -472,11 +474,7 @@ def get_campaign(conn, campaign_id: int) -> dict:
         raise LookupError("campaign")
     camp = as_dict(row)
     account_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
-    if account_ids:
-        for aid in account_ids:
-            _sync_campaign_replies(conn, campaign_id, aid)
-    else:
-        _sync_campaign_replies(conn, campaign_id, None)
+    _sync_campaign_replies(conn, campaign_id, account_ids[0] if len(account_ids) == 1 else None)
 
     accounts_list = []
     acc_name_map = {}
@@ -517,6 +515,36 @@ def get_campaign(conn, campaign_id: int) -> dict:
                     seen_csv_headers.append(hs)
     except Exception:
         pass
+
+    out_by_lead_id: dict[int, str] = {}
+    out_by_peer_id: dict[int, str] = {}
+    out_by_uname: dict[str, str] = {}
+    out_by_phone: dict[str, str] = {}
+    for drow in conn.execute(
+        """
+        SELECT d.lead_id, d.peer_id, lower(d.username) AS uname, d.phone,
+               (
+                   SELECT m.text FROM messages m
+                   WHERE m.dialog_id = d.id AND m.direction = 'out'
+                   ORDER BY m.sent_at DESC, m.id DESC
+                   LIMIT 1
+               ) AS last_out_text
+        FROM dialogs d
+        WHERE d.peer_type = 'user'
+        ORDER BY d.last_message_at DESC, d.id DESC
+        """
+    ).fetchall():
+        txt = drow["last_out_text"]
+        if not txt:
+            continue
+        if drow["lead_id"] is not None:
+            out_by_lead_id.setdefault(int(drow["lead_id"]), txt)
+        if drow["peer_id"] is not None:
+            out_by_peer_id.setdefault(int(drow["peer_id"]), txt)
+        if drow["uname"]:
+            out_by_uname.setdefault(str(drow["uname"]).strip().lower(), txt)
+        if drow["phone"]:
+            out_by_phone.setdefault(str(drow["phone"]).strip(), txt)
 
     for r in rec_rows:
         rd = as_dict(r)
@@ -574,19 +602,14 @@ def get_campaign(conn, campaign_id: int) -> dict:
 
         # Compute last_sent_text from messages or rendered step
         last_sent_text = None
-        dlgs = _find_recipient_dialogs(conn, rd, account_id=assigned_id)
-        if dlgs:
-            msg_row = conn.execute(
-                """
-                SELECT text FROM messages
-                WHERE dialog_id = ? AND direction = 'out'
-                ORDER BY sent_at DESC, id DESC
-                LIMIT 1
-                """,
-                (dlgs[0]["id"],),
-            ).fetchone()
-            if msg_row and msg_row["text"]:
-                last_sent_text = msg_row["text"]
+        if rd.get("lead_id") is not None:
+            last_sent_text = out_by_lead_id.get(int(rd["lead_id"]))
+        if not last_sent_text and rd.get("telegram_user_id") is not None:
+            last_sent_text = out_by_peer_id.get(int(rd["telegram_user_id"]))
+        if not last_sent_text and rd.get("username"):
+            last_sent_text = out_by_uname.get(str(rd["username"]).strip().lower())
+        if not last_sent_text and rd.get("phone"):
+            last_sent_text = out_by_phone.get(str(rd["phone"]).strip())
         if last_sent_text is None and cur_step >= 1 and cur_step - 1 < len(steps):
             prev_idx = cur_step - 1
             if prev_idx == 0 and (rd.get("step1_text") or "").strip():

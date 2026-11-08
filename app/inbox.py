@@ -1325,10 +1325,19 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
                         conn.rollback()
         except Exception:
             pass
-    if _is_synthetic_peer_id(peer_id):
+    if _is_synthetic_peer_id(peer_id) or gateway is None:
         return list_messages(conn, dialog_id, cap)
-    fetched = await gateway.fetch_messages(account["session_path"], peer_id, cap)
+    try:
+        fetched = await gateway.fetch_messages(account["session_path"], peer_id, cap)
+    except Exception:
+        cached = list_messages(conn, dialog_id, cap)
+        if cached:
+            return cached
+        raise
     if not isinstance(fetched, list):
+        cached = list_messages(conn, dialog_id, cap)
+        if cached:
+            return cached
         raise GatewayError("История без списка")
     _cache_messages(conn, dialog_id, fetched[-cap:])
     return list_messages(conn, dialog_id, cap)

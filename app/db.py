@@ -671,6 +671,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_default_pipeline_stages(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS accounts_health ON accounts(health)")
     conn.execute("CREATE INDEX IF NOT EXISTS leads_folder ON leads(folder_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_peer ON dialogs(peer_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_lead ON dialogs(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_uname ON dialogs(username COLLATE NOCASE)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_dlg_dir ON messages(dialog_id, direction, sent_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_camp ON campaign_recipients(campaign_id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_lead ON campaign_recipients(lead_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_tg ON campaign_recipients(telegram_user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_uname ON campaign_recipients(username COLLATE NOCASE)")
     snippets_count = conn.execute("SELECT COUNT(*) FROM snippets").fetchone()[0]
     if snippets_count == 0:
         user_mod = conn.execute(
