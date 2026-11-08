@@ -113,6 +113,7 @@ const state = {
   inboxSearchQuery: "",
   leadQuery: "",
   inbox: "empty",
+  inboxChatMode: "crm",
   inboxSessionFilter: "all",
   selectedDialog: null,
   selectedLeadId: null,
@@ -820,6 +821,11 @@ function resolveLeadTracking(lead) {
     || (lastFromPeer === 0 && Boolean(lastMessageAt))
     || lead.status === "waiting"
   );
+  const nextStepStr = String(lead.next_step || "");
+  const offerTypeStr = String(lead.offer_type || "");
+  const noteStr = String(lead.note || "");
+  const isWaitingOurAnswer = lastFromPeer === 1 || nextStepStr.startsWith("🔥");
+  const isPositiveReply = offerTypeStr.includes("+ Позитив") || nextStepStr.includes("+ Позитив") || noteStr.includes("+ Позитив");
   return {
     accountName,
     accountPhone,
@@ -831,6 +837,8 @@ function resolveLeadTracking(lead) {
     nextFollowupAt,
     isReplied,
     isWaitingReply,
+    isWaitingOurAnswer,
+    isPositiveReply,
     isFollowupDue,
     openReminders,
   };
@@ -839,6 +847,8 @@ function resolveLeadTracking(lead) {
 function matchFollowupFilter(lead, followup) {
   if (!followup) return true;
   const tr = resolveLeadTracking(lead);
+  if (followup === "waiting_our_answer") return tr.isWaitingOurAnswer;
+  if (followup === "positive_reply") return tr.isPositiveReply;
   if (followup === "replied") return tr.isReplied;
   if (followup === "waiting_reply") return tr.isWaitingReply;
   if (followup === "due_followup") return tr.isFollowupDue;
@@ -1957,7 +1967,7 @@ function renderCampaigns() {
         ]),
         el("div", { className: "campaign-kpi" }, [
           el("span", {}, ["Отправлено"]),
-          el("strong", {}, [String((camp.in_progress_count || 0) + (camp.completed_count || 0))]),
+          el("strong", {}, [String((camp.in_progress_count || 0) + (camp.completed_count || 0) + (camp.replied_count || 0))]),
         ]),
         el("div", { className: "campaign-kpi" }, [
           el("span", {}, ["Ответили"]),
@@ -1980,9 +1990,14 @@ function renderCampaigns() {
 
     if (recipients.length) {
       const isExpanded = Boolean(state.expandedCampaigns[camp.id]);
-      const visibleRecipients = (state.viewMode === "sheet" && !isExpanded && recipients.length > 3)
-        ? recipients.slice(0, 3)
-        : recipients;
+      const visibleLimit = isExpanded ? (state.campaignRecipientLimits?.[camp.id] || 60) : 5;
+      const sortedRecipients = [...recipients].sort((a, b) => {
+        const rank = (r) => (r.status === "replied" ? 0 : r.status === "in_progress" ? 1 : r.status === "completed" ? 2 : 3);
+        return rank(a) - rank(b);
+      });
+      const visibleRecipients = (state.viewMode === "sheet" && !isExpanded && sortedRecipients.length > 3)
+        ? sortedRecipients.slice(0, 3)
+        : sortedRecipients.slice(0, visibleLimit);
       const recRows = [
         el("div", { className: "recipients-header" }, [
           el("span", {}, ["Контакт / Сайт"]),
@@ -2060,7 +2075,7 @@ function renderCampaigns() {
       cardChildren.push(
         el("div", { className: "recipients-grid", role: "region", "aria-label": `Получатели ${camp.name}` }, recRows),
       );
-      if (state.viewMode === "sheet" && recipients.length > 3) {
+      if (recipients.length > 5) {
         cardChildren.push(
           el("div", { className: "row" }, [
             el("button", {
@@ -2070,7 +2085,7 @@ function renderCampaigns() {
                 state.expandedCampaigns[camp.id] = !isExpanded;
                 renderCampaigns();
               },
-            }, [isExpanded ? "Свернуть список" : `Все получатели (${recipients.length})`]),
+            }, [isExpanded ? "Свернуть список" : `Показать получателей (${recipients.length})`]),
           ]),
         );
       }
@@ -2368,7 +2383,7 @@ function syncTelegramWebAPanel(connected) {
   }
 
   panel.hidden = false;
-  const mode = state.inboxChatMode === "crm" ? "crm" : "tgweb";
+  const mode = state.inboxChatMode === "tgweb" ? "tgweb" : "crm";
   if (grid) grid.dataset.tgwebActive = mode === "tgweb" ? "true" : "false";
   const activeKey = String(state.inboxSessionFilter || "all");
   const targetIdx = Math.max(0, webReady.findIndex((acc) => String(acc.id) === activeKey));
@@ -2403,7 +2418,6 @@ function syncTelegramWebAPanel(connected) {
         "data-tgweb-slot": String(slot),
         "aria-pressed": isSelected ? "true" : "false",
         onclick: () => {
-          state.inboxChatMode = "tgweb";
           switchInboxSession(key);
         },
       }, [
@@ -3111,7 +3125,7 @@ async function openChat(lead) {
   if (state.inboxChatMode !== "crm") {
     setInboxChatMode("crm");
   }
-  if (state.viewMode === "sheet") activateSheet("inbox");
+  activateSheet("inbox");
   await selectDialog(dialog);
   const s05 = document.querySelector("#s05");
   if (s05) s05.scrollIntoView({ block: "nearest" });
@@ -3532,6 +3546,12 @@ function renderBoard() {
       if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
       if (!matchFollowupFilter(lead, followup)) return false;
       return true;
+    }).sort((a, b) => {
+      const ta = resolveLeadTracking(a);
+      const tb = resolveLeadTracking(b);
+      if (ta.isWaitingOurAnswer !== tb.isWaitingOurAnswer) return ta.isWaitingOurAnswer ? -1 : 1;
+      if (ta.isPositiveReply !== tb.isPositiveReply) return ta.isPositiveReply ? -1 : 1;
+      return 0;
     });
     const stageSum = cards.reduce((acc, item) => acc + leadAmount(item), 0);
     const items = cards.length
@@ -3566,6 +3586,12 @@ function renderBoard() {
           tagNodes.push(el("span", { className: "card-tag card-account-tag" }, [
             `Акк: ${tr.accountName || tr.accountPhone}`,
           ]));
+        }
+        if (tr.isWaitingOurAnswer) {
+          tagNodes.push(el("span", { className: "badge b-wait" }, ["🔥 Ждёт нашего ответа"]));
+        }
+        if (tr.isPositiveReply) {
+          tagNodes.push(el("span", { className: "badge b-won" }, ["+ Позитив"]));
         }
         if (tr.isReplied) {
           tagNodes.push(el("span", { className: "card-pill card-pill-replied" }, ["Ответил · Авто-стоп"]));
@@ -6734,6 +6760,395 @@ function renderAnalytics(data) {
   if (typeof renderAnalyticsCharts === "function") {
     renderAnalyticsCharts(summary);
   }
+  if (typeof renderDeepOutreachAnalytics === "function") {
+    renderDeepOutreachAnalytics(summary);
+  }
+}
+
+function buildDeepOutreachNode(deepData, hostPrefix) {
+  const s = deepData.summary || {};
+  const steps = Array.isArray(deepData.steps_breakdown) ? deepData.steps_breakdown : [];
+  const hooks = Array.isArray(deepData.hooks_breakdown) ? deepData.hooks_breakdown : [];
+  const cats = Array.isArray(deepData.categories_breakdown) ? deepData.categories_breakdown : [];
+  const niches = Array.isArray(deepData.niches_breakdown) ? deepData.niches_breakdown : [];
+  const waitingItems = Array.isArray(deepData.waiting_items) ? deepData.waiting_items : [];
+  const stalledItems = Array.isArray(deepData.stalled_items) ? deepData.stalled_items : [];
+  const positiveItems = Array.isArray(deepData.positive_items) ? deepData.positive_items : [];
+
+  const quickCountEl = document.querySelector("#quick-waiting-count");
+  if (quickCountEl && s.waiting_our_answer != null) {
+    quickCountEl.textContent = String(s.waiting_our_answer);
+  }
+
+  // 1. Summary KPI Card
+  const kpiCard = el("div", { className: "surface-subcard stack" }, [
+    el("div", { className: "subcard-head" }, [
+      el("div", { className: "pipeline-title-row" }, [
+        el("h3", {}, ["Аудит базы 2 174 лидов (Все2) по 9 аккаунтам: Статусы · Шаги · Форматы · Кто отвечает +"]),
+        el("span", { className: "badge b-wait" }, [`🔥 Ждут нашего ответа: ${s.waiting_our_answer || 0} (из них + Позитив: ${s.waiting_positive || 0})`]),
+        el("span", { className: "badge b-won" }, [`Целевой + Позитив: ${s.positive_count || 0} (${s.positive_pct || 0}%)`]),
+      ]),
+      el("div", { className: "row" }, [
+        el("button", {
+          type: "button",
+          className: "btn primary sm",
+          onclick: () => {
+            const fupSel = document.querySelector("#followup-filter");
+            const stgSel = document.querySelector("#stage-filter");
+            if (fupSel) fupSel.value = "waiting_our_answer";
+            if (stgSel) stgSel.value = "";
+            setActiveSheet("s07");
+            renderBoard();
+            renderLeadTable();
+          },
+        }, [`Открыть 129 ждущих ответа на доске Воронки →`]),
+      ]),
+    ]),
+    el("div", { className: "analytics-mini-kpis" }, [
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["Написали (из 2 174)"]),
+        el("strong", {}, [`${s.contacted || 0}`]),
+        el("span", { className: "hint" }, [`В очереди: ${s.pending_queue || 0}`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["Прочитали (2 галочки)"]),
+        el("strong", {}, [`${s.read || 0} (${s.open_rate_pct || 0}%)`]),
+        el("span", { className: "hint" }, [`1 галочка: ${s.unseen_total || 0}`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["Ответили всего"]),
+        el("strong", { className: "is-won" }, [`${s.replied || 0} (${s.reply_rate_pct || 0}%)`]),
+        el("span", { className: "hint" }, [`${s.reply_of_read_pct || 0}% от прочитавших!`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["Конструктив (+ и ?)"]),
+        el("strong", { className: "is-won" }, [`${s.constructive_count || 0} (${s.constructive_pct || 0}%)`]),
+        el("span", { className: "hint" }, [`+ Позитив: ${s.positive_count || 0} · ? Вопрос: ${s.question_count || 0}`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["🔥 Ждут НАШЕГО ответа"]),
+        el("strong", { style: "color: #fbbf24;" }, [`${s.waiting_our_answer || 0}`]),
+        el("span", { className: "hint" }, [`Мяч на нашей стороне`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["💬 Прочитали наш ответ и молчат"]),
+        el("strong", {}, [`${s.stalled_after_answer || 0}`]),
+        el("span", { className: "hint" }, [`Нужен пинг · Не прочит.: ${s.unseen_our_answer || 0}`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["👀 Ждут Шаг 2 / Шаг 3"]),
+        el("strong", {}, [`${(s.need_step2 || 0) + (s.need_step3 || 0)}`]),
+        el("span", { className: "hint" }, [`Шаг 2: ${s.need_step2 || 0} · Шаг 3: ${s.need_step3 || 0}`]),
+      ]),
+      el("div", { className: "analytics-mini-kpi" }, [
+        el("span", { className: "hint" }, ["Отказы (-) / Позже"]),
+        el("strong", {}, [`${s.refusal_count || 0} / ${s.defer_count || 0}`]),
+        el("span", { className: "hint" }, [`Всего 3.6% отказов от базы`]),
+      ]),
+    ]),
+  ]);
+
+  // 2. Steps & Messages Card
+  const stepsTableRows = steps.map((st) => el("tr", {}, [
+    el("td", {}, [
+      el("strong", {}, [st.title]),
+      el("div", { className: "hint" }, [`Задержка: ${st.delay_label}`]),
+    ]),
+    el("td", { className: "num" }, [String(st.reached)]),
+    el("td", { className: "num" }, [String(st.read)]),
+    el("td", { className: "num" }, [
+      el("strong", {}, [`${st.replied} (${st.reply_rate_pct}%)`]),
+    ]),
+    el("td", { className: "num" }, [
+      el("span", { className: "badge b-won" }, [`+${st.positive} (${st.positive_of_reached_pct}% охв. / ${st.positive_of_replied_pct}% отв.)`]),
+    ]),
+    el("td", { className: "num" }, [`${st.constructive} (${st.constructive_pct}%)`]),
+    el("td", {}, [
+      el("div", { className: "hint", style: "max-width: 440px; white-space: pre-wrap; font-size: 12px;" }, [st.template_text]),
+    ]),
+  ]));
+
+  const stepsCard = el("div", { className: "surface-subcard stack" }, [
+    el("div", { className: "subcard-head" }, [
+      el("h3", {}, ["1. На какое сообщение лучше всего отвечают (Конверсия по 3 шагам и тексты сообщений)"]),
+      el("span", { className: "badge b-talk" }, ["Фоллоу-апы Шага 2 и 3 принесли 96 ответов (30.5% всей выручки)!"]),
+    ]),
+    el("div", { className: "table-wrap" }, [
+      el("table", {}, [
+        el("thead", {}, [
+          el("tr", {}, [
+            el("th", {}, ["Шаг воронки"]),
+            el("th", { className: "num" }, ["Дошло"]),
+            el("th", { className: "num" }, ["Прочитано"]),
+            el("th", { className: "num" }, ["Ответили (Reply %)"]),
+            el("th", { className: "num" }, ["Целевой + Позитив"]),
+            el("th", { className: "num" }, ["Конструктив (+ и ?)"]),
+            el("th", {}, ["Текст сообщения шага"]),
+          ]),
+        ]),
+        el("tbody", {}, stepsTableRows),
+      ]),
+    ]),
+  ]);
+
+  // 3. Formats / Hooks Card
+  const hooksTableRows = hooks.map((hk) => el("tr", {}, [
+    el("td", {}, [el("strong", {}, [hk.hook])]),
+    el("td", { className: "num" }, [String(hk.contacted)]),
+    el("td", { className: "num" }, [`${hk.read} (${hk.open_rate_pct}%)`]),
+    el("td", { className: "num" }, [el("strong", {}, [`${hk.replied} (${hk.reply_rate_pct}%)`])]),
+    el("td", { className: "num" }, [
+      el("span", { className: "badge b-won" }, [`+${hk.positive} (${hk.positive_of_contacted_pct}% нап. / ${hk.positive_of_replied_pct}% отв.)`]),
+    ]),
+    el("td", { className: "num" }, [`${hk.constructive} (${hk.constructive_pct}%)`]),
+    el("td", { className: "num" }, [String(hk.refusal)]),
+    el("td", {}, [
+      el("div", { className: "hint", style: "max-width: 400px; white-space: pre-wrap; font-size: 12px;" }, [hk.sample_text || "—"]),
+    ]),
+  ]));
+
+  const hooksCard = el("div", { className: "surface-subcard stack" }, [
+    el("div", { className: "subcard-head" }, [
+      el("h3", {}, ["2. Конверсия по форматам и углам захода (Hooks) в 1-м сообщении + тексты"]),
+      el("span", { className: "badge b-won" }, ["Лидеры: RU-питч СНГ (28.6% в +) и Партнёрский питч для агентств (27.8% в +)"]),
+    ]),
+    el("div", { className: "table-wrap" }, [
+      el("table", {}, [
+        el("thead", {}, [
+          el("tr", {}, [
+            el("th", {}, ["Формат / Угол захода (Hook)"]),
+            el("th", { className: "num" }, ["Написали"]),
+            el("th", { className: "num" }, ["Прочитали (Open %)"]),
+            el("th", { className: "num" }, ["Ответили (Reply %)"]),
+            el("th", { className: "num" }, ["Целевой + Позитив"]),
+            el("th", { className: "num" }, ["Конструктив (+ и ?)"]),
+            el("th", { className: "num" }, ["Отказы (-)"]),
+            el("th", {}, ["Пример реального сообщения этого формата"]),
+          ]),
+        ]),
+        el("tbody", {}, hooksTableRows),
+      ]),
+    ]),
+  ]);
+
+  // 4. Who replies + (By Category & By Niche)
+  const buildBreakdownTable = (items, keyField, labelHeader) => el("div", { className: "table-wrap" }, [
+    el("table", {}, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", {}, [labelHeader]),
+          el("th", { className: "num" }, ["Написали"]),
+          el("th", { className: "num" }, ["Прочитали (Open %)"]),
+          el("th", { className: "num" }, ["Ответили (Reply %)"]),
+          el("th", { className: "num" }, ["Целевой + Позитив"]),
+          el("th", { className: "num" }, ["Конструктив (+ и ?)"]),
+          el("th", { className: "num" }, ["🔥 Ждут ответа"]),
+          el("th", {}, ["Примеры живых + из базы"]),
+        ]),
+      ]),
+      el("tbody", {}, items.map((row) => el("tr", {}, [
+        el("td", {}, [el("strong", {}, [row[keyField]])]),
+        el("td", { className: "num" }, [String(row.contacted)]),
+        el("td", { className: "num" }, [`${row.read} (${row.open_rate_pct}%)`]),
+        el("td", { className: "num" }, [el("strong", {}, [`${row.replied} (${row.reply_rate_pct}%)`])]),
+        el("td", { className: "num" }, [
+          el("span", { className: "badge b-won" }, [`+${row.positive} (${row.positive_of_contacted_pct}% нап. / ${row.positive_of_replied_pct}% отв.)`]),
+        ]),
+        el("td", { className: "num" }, [`${row.constructive} (${row.constructive_pct}%)`]),
+        el("td", { className: "num" }, [
+          row.waiting > 0
+            ? el("span", { className: "badge b-wait" }, [`🔥 ${row.waiting}`])
+            : el("span", { className: "hint" }, ["0"]),
+        ]),
+        el("td", {}, [
+          el("span", { className: "hint" }, [(row.examples || []).join(", ") || "—"]),
+        ]),
+      ]))),
+    ]),
+  ]);
+
+  const whoRepliesCard = el("div", { className: "surface-subcard stack" }, [
+    el("div", { className: "subcard-head" }, [
+      el("h3", {}, ["3. Кто отвечает + (Разбивка по категориям Все2 и продуктовым нишам)"]),
+      el("span", { className: "badge b-ok" }, ["AI (30.6% в +) · Gaming/iGaming (25.2% в +) · Агентства (49 целевых +)"]),
+    ]),
+    el("span", { className: "steps-caption" }, ["А. ПО КАТЕГОРИЯМ ТАБЛИЦЫ ВСЕ2:"]),
+    buildBreakdownTable(cats, "category", "Категория клиента"),
+    el("span", { className: "steps-caption", style: "margin-top: 12px;" }, ["Б. ПО ПРОДУКТОВЫМ ВЕРТИКАЛЯМ (ЧЕМ ЗАНИМАЕТСЯ КОМПАНИЯ):"]),
+    buildBreakdownTable(niches, "niche", "Продуктовая вертикаль / Ниша"),
+  ]);
+
+  // 5. Interactive Waiting for our answer / Stalled / Positive list
+  const activeTabKey = state[`${hostPrefix}_tab`] || "waiting";
+  const activeAccFilter = state[`${hostPrefix}_acc`] || "";
+  const activeList = activeTabKey === "stalled"
+    ? stalledItems
+    : (activeTabKey === "positive" ? positiveItems : waitingItems);
+  const filteredList = activeAccFilter
+    ? activeList.filter((item) => item.sender_account === activeAccFilter)
+    : activeList;
+
+  const accCounts = s.waiting_by_account || {};
+  const accFilterBtns = [
+    el("button", {
+      type: "button",
+      className: `chip ${!activeAccFilter ? "is-active" : ""}`,
+      "aria-pressed": !activeAccFilter ? "true" : "false",
+      onclick: () => {
+        state[`${hostPrefix}_acc`] = "";
+        renderDeepOutreachAnalytics(state.analytics);
+      },
+    }, [`Все аккаунты (${activeList.length})`]),
+    ...Object.entries(accCounts).map(([accHandle, cnt]) => el("button", {
+      type: "button",
+      className: `chip ${activeAccFilter === accHandle ? "is-active" : ""}`,
+      "aria-pressed": activeAccFilter === accHandle ? "true" : "false",
+      onclick: () => {
+        state[`${hostPrefix}_acc`] = accHandle;
+        renderDeepOutreachAnalytics(state.analytics);
+      },
+    }, [`${accHandle} (${cnt})`])),
+  ];
+
+  const waitingCard = el("div", { className: "surface-subcard stack" }, [
+    el("div", { className: "subcard-head" }, [
+      el("div", { className: "pipeline-title-row" }, [
+        el("h3", {}, ["4. Приоритетная очередь: Кто ждёт нашего ответа и все целевые диалоги"]),
+        el("span", { className: "badge b-wait" }, [`Показано: ${filteredList.length}`]),
+      ]),
+      el("div", { className: "switch", role: "group" }, [
+        el("button", {
+          type: "button",
+          className: `btn ${activeTabKey === "waiting" ? "primary" : "ghost"} sm`,
+          onclick: () => {
+            state[`${hostPrefix}_tab`] = "waiting";
+            renderDeepOutreachAnalytics(state.analytics);
+          },
+        }, [`🔥 Ждут нашего ответа (${waitingItems.length})`]),
+        el("button", {
+          type: "button",
+          className: `btn ${activeTabKey === "stalled" ? "primary" : "ghost"} sm`,
+          onclick: () => {
+            state[`${hostPrefix}_tab`] = "stalled";
+            renderDeepOutreachAnalytics(state.analytics);
+          },
+        }, [`💬 Прочитали наш ответ — нужен пинг (${stalledItems.length})`]),
+        el("button", {
+          type: "button",
+          className: `btn ${activeTabKey === "positive" ? "primary" : "ghost"} sm`,
+          onclick: () => {
+            state[`${hostPrefix}_tab`] = "positive";
+            renderDeepOutreachAnalytics(state.analytics);
+          },
+        }, [`➕ Все целевые + Позитив (${positiveItems.length})`]),
+      ]),
+    ]),
+    el("div", { className: "chips", role: "group" }, accFilterBtns),
+    el("div", { className: "table-wrap", style: "max-height: 540px; overflow-y: auto;" }, [
+      el("table", {}, [
+        el("thead", {}, [
+          el("tr", {}, [
+            el("th", {}, ["Лид / Компания"]),
+            el("th", {}, ["Категория / Ниша"]),
+            el("th", {}, ["Наш аккаунт"]),
+            el("th", {}, ["На какой шаг и формат ответил"]),
+            el("th", {}, ["Реакция"]),
+            el("th", {}, ["Текст ответа клиента"]),
+            el("th", {}, ["Действие"]),
+          ]),
+        ]),
+        el("tbody", {}, filteredList.map((item) => {
+          const isPos = item.reply_intent === "positive_interested";
+          return el("tr", {}, [
+            el("td", {}, [
+              el("strong", {}, [item.name || item.username]),
+              el("div", { className: "hint" }, [`@${item.username}${item.website ? ` · ${item.website}` : ""}`]),
+            ]),
+            el("td", {}, [
+              el("span", { className: "badge b-new" }, [item.category]),
+              el("div", { className: "hint" }, [item.niche]),
+            ]),
+            el("td", {}, [
+              el("strong", {}, [item.sender_account]),
+            ]),
+            el("td", {}, [
+              el("span", { className: "badge b-talk" }, [item.replied_to_step_label]),
+              el("div", { className: "hint", style: "font-size: 11px;" }, [item.hook_format]),
+            ]),
+            el("td", {}, [
+              el("span", { className: `badge ${isPos ? "b-won" : "b-wait"}` }, [item.reply_intent_label]),
+            ]),
+            el("td", {}, [
+              el("div", { style: "max-width: 380px; white-space: pre-wrap; font-size: 12.5px;" }, [item.reply_text || "—"]),
+            ]),
+            el("td", {}, [
+              el("div", { className: "row" }, [
+                el("button", {
+                  type: "button",
+                  className: "btn primary sm",
+                  "data-open-chat-uname": item.username || "",
+                  onclick: () => openChat({
+                    id: item.lead_id || null,
+                    username: item.username || "",
+                    name: item.name || "",
+                    account_id: item.account_id || null,
+                  }),
+                }, ["Открыть чат"]),
+                item.lead_id ? el("button", {
+                  type: "button",
+                  className: "btn secondary sm",
+                  onclick: () => {
+                    state.selectedLeadId = item.lead_id;
+                    renderCard();
+                    if (state.viewMode === "sheet") {
+                      openSheetPopup("card");
+                    } else {
+                      setActiveSheet("s07");
+                    }
+                  },
+                }, ["Карточка"]) : null,
+              ].filter(Boolean)),
+            ]),
+          ]);
+        })),
+      ]),
+    ]),
+  ]);
+
+  return el("div", { className: "stack" }, [
+    kpiCard,
+    waitingCard,
+    stepsCard,
+    hooksCard,
+    whoRepliesCard,
+  ]);
+}
+
+function renderDeepOutreachAnalytics(summary) {
+  const data = summary || state.analytics;
+  if (!data || !data.deep_outreach) return;
+  const analyticsBox = document.querySelector("#analytics-deep-outreach-box");
+  if (analyticsBox) {
+    analyticsBox.replaceChildren(buildDeepOutreachNode(data.deep_outreach, "an_deep"));
+  }
+  const outreachBox = document.querySelector("#outreach-deep-stats-box");
+  if (outreachBox) {
+    outreachBox.replaceChildren(buildDeepOutreachNode(data.deep_outreach, "out_deep"));
+  }
+}
+
+const quickWaitingOurAnswerBtn = document.querySelector("#quick-waiting-our-answer-btn");
+if (quickWaitingOurAnswerBtn) {
+  quickWaitingOurAnswerBtn.addEventListener("click", () => {
+    const fupSel = document.querySelector("#followup-filter");
+    const stgSel = document.querySelector("#stage-filter");
+    if (fupSel) {
+      fupSel.value = fupSel.value === "waiting_our_answer" ? "" : "waiting_our_answer";
+    }
+    if (stgSel) stgSel.value = "";
+    renderBoard();
+    renderLeadTable();
+  });
 }
 
 async function loadAnalyticsSummary(periodOverride) {

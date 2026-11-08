@@ -232,8 +232,13 @@ def backup_to_cloud(
     }
 
 
-def restore_from_cloud(db_path: Path = DEFAULT_DB) -> dict[str, Any]:
-    cfg = _resolve_r2_config(None)
+def restore_from_cloud(
+    db_path: Path = DEFAULT_DB,
+    *,
+    force: bool = False,
+    live_conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    cfg = _resolve_r2_config(live_conn)
     if not cfg:
         return {"ok": False, "restored": False, "configured": False}
     url, headers = _sigv4_headers("GET", cfg, R2_OBJECT_KEY, b"")
@@ -257,7 +262,7 @@ def restore_from_cloud(db_path: Path = DEFAULT_DB) -> dict[str, Any]:
         return {"ok": False, "restored": False, "configured": True}
 
     saved_at = str(bundle.get("saved_at") or "")
-    if saved_at and db_path.exists() and db_path.stat().st_size > 4096:
+    if not force and saved_at and db_path.exists() and db_path.stat().st_size > 4096:
         try:
             local_conn = sqlite3.connect(db_path, timeout=5.0)
             try:
@@ -283,8 +288,23 @@ def restore_from_cloud(db_path: Path = DEFAULT_DB) -> dict[str, Any]:
         except Exception:
             pass
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    db_path.write_bytes(base64.b64decode(db_b64))
+    raw_db_bytes = base64.b64decode(db_b64)
+    if live_conn is not None:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tmp_path.write_bytes(raw_db_bytes)
+            src_conn = sqlite3.connect(tmp_path, timeout=30.0)
+            try:
+                src_conn.backup(live_conn)
+            finally:
+                src_conn.close()
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+    else:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(raw_db_bytes)
 
     sessions_map = bundle.get("sessions") or {}
     sessions_dir = ROOT / "data" / "sessions"

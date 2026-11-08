@@ -372,11 +372,7 @@ def _compute_outreach_analytics(conn: sqlite3.Connection) -> dict:
         cid = int(camp["id"])
         acc_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
         try:
-            if acc_ids:
-                for aid in acc_ids:
-                    _sync_campaign_replies(conn, cid, aid)
-            else:
-                _sync_campaign_replies(conn, cid, None)
+            _sync_campaign_replies(conn, cid, acc_ids[0] if len(acc_ids) == 1 else None)
         except Exception:
             pass
 
@@ -1136,6 +1132,390 @@ def _compute_charts_analytics(
     }
 
 
+def _compute_outreach_deep_breakdown(conn: sqlite3.Connection) -> dict:
+    import json as _json
+    from collections import defaultdict
+
+    rec_rows = [
+        as_dict(r)
+        for r in conn.execute(
+            """
+            SELECT cr.*, d.id AS dialog_id, a.telegram_username AS acc_username
+            FROM campaign_recipients cr
+            LEFT JOIN dialogs d ON d.lead_id = cr.lead_id AND cr.lead_id IS NOT NULL
+            LEFT JOIN accounts a ON a.id = cr.assigned_account_id
+            ORDER BY cr.id
+            """
+        ).fetchall()
+    ]
+
+    # Deduplicate by username if multiple campaigns exist, preferring rows with extra_json
+    by_uname: dict[str, dict] = {}
+    for r in rec_rows:
+        u = str(r.get("username") or "").strip().lower().lstrip("@")
+        if not u:
+            continue
+        if u not in by_uname or (r.get("extra_json") and not by_uname[u].get("extra_json")):
+            by_uname[u] = r
+
+    unique_recs = list(by_uname.values()) if by_uname else rec_rows
+
+    total_base = len(unique_recs)
+    contacted_recs = []
+    replied_recs = []
+
+    fine_counts: dict[str, int] = defaultdict(int)
+    intent_counts: dict[str, int] = defaultdict(int)
+    waiting_by_account: dict[str, int] = defaultdict(int)
+    waiting_items = []
+    stalled_items = []
+    positive_items = []
+
+    STEP_LABELS_RU = {
+        "step1_personal_pitch": "Шаг 1: Персонализированный питч",
+        "inbound_first": "Шаг 1: Персонализированный питч",
+        "empty": "Шаг 1: Персонализированный питч",
+        "step2_xplabs_case": "Шаг 2: Кейс XPLabs (80M views + видео)",
+        "step2_followup": "Шаг 2: Кейс XPLabs (80M views + видео)",
+        "step3_revshare_cpa": "Шаг 3: Revshare / CPA ($600 пилот)",
+        "step3_followup": "Шаг 3: Revshare / CPA ($600 пилот)",
+    }
+    INTENT_LABELS_RU = {
+        "positive_interested": "+ Позитив / Целевой интерес",
+        "neutral_or_question": "? Конструктивный вопрос",
+        "defer_contact_later": "⏳ Написать позже",
+        "refusal_not_interested": "- Отказ",
+        "media_or_auto": "📎 Медиа / Автоответ",
+    }
+
+    cat_stats = defaultdict(
+        lambda: {"contacted": 0, "read": 0, "replied": 0, "pos": 0, "constr": 0, "refusal": 0, "waiting": 0, "examples": []}
+    )
+    niche_stats = defaultdict(
+        lambda: {"contacted": 0, "read": 0, "replied": 0, "pos": 0, "constr": 0, "refusal": 0, "waiting": 0, "examples": []}
+    )
+    hook_stats = defaultdict(
+        lambda: {"contacted": 0, "read": 0, "replied": 0, "pos": 0, "constr": 0, "refusal": 0, "sample_text": ""}
+    )
+
+    for r in unique_recs:
+        extra = {}
+        if r.get("extra_json"):
+            try:
+                extra = _json.loads(r["extra_json"])
+            except Exception:
+                extra = {}
+        r["_extra"] = extra
+        fine = str(extra.get("fine_status") or "")
+        if not fine:
+            st = r.get("status")
+            if st == "replied":
+                fine = "replied_waiting_our_answer"
+            elif st in ("in_progress", "completed"):
+                fine = "unseen_after_all_3_steps"
+            elif st == "failed":
+                fine = "invalid_or_deleted_username"
+            else:
+                fine = "not_contacted_skipped"
+        r["_fine"] = fine
+        fine_counts[fine] += 1
+
+        is_contacted = r.get("status") in ("in_progress", "completed", "replied") or int(r.get("current_step") or 0) >= 1
+        if not is_contacted:
+            continue
+
+        contacted_recs.append(r)
+        in_cnt = int(extra.get("in_count") or (1 if r.get("status") == "replied" else 0))
+        is_read = bool(extra.get("last_out_read")) or in_cnt > 0
+        r["_is_read"] = is_read
+        r["_in_cnt"] = in_cnt
+
+        cat = str(r.get("category") or "SaaS").strip() or "SaaS"
+        niche = str(extra.get("niche") or cat).strip()
+        hook = str(extra.get("hook_format") or r.get("hook") or "EN: Прямой продуктовый хук").strip()
+
+        cat_stats[cat]["contacted"] += 1
+        niche_stats[niche]["contacted"] += 1
+        hook_stats[hook]["contacted"] += 1
+        if not hook_stats[hook]["sample_text"] and r.get("step1_text") and len(str(r.get("step1_text"))) > 60:
+            hook_stats[hook]["sample_text"] = str(r.get("step1_text")).strip()
+
+        if is_read:
+            cat_stats[cat]["read"] += 1
+            niche_stats[niche]["read"] += 1
+            hook_stats[hook]["read"] += 1
+
+        if in_cnt > 0:
+            replied_recs.append(r)
+            intent = str(extra.get("reply_intent") or "neutral_or_question")
+            rep_step = str(extra.get("replied_to_step") or "step1_personal_pitch")
+            r["_intent"] = intent
+            r["_rep_step"] = rep_step
+            intent_counts[intent] += 1
+
+            cat_stats[cat]["replied"] += 1
+            niche_stats[niche]["replied"] += 1
+            hook_stats[hook]["replied"] += 1
+
+            if intent == "positive_interested":
+                cat_stats[cat]["pos"] += 1
+                niche_stats[niche]["pos"] += 1
+                hook_stats[hook]["pos"] += 1
+                ex_tag = f"@{r.get('username')} ({r.get('company') or r.get('name')})"
+                if len(cat_stats[cat]["examples"]) < 3:
+                    cat_stats[cat]["examples"].append(ex_tag)
+                if len(niche_stats[niche]["examples"]) < 3:
+                    niche_stats[niche]["examples"].append(ex_tag)
+            if intent in ("positive_interested", "neutral_or_question"):
+                cat_stats[cat]["constr"] += 1
+                niche_stats[niche]["constr"] += 1
+                hook_stats[hook]["constr"] += 1
+            if intent == "refusal_not_interested":
+                cat_stats[cat]["refusal"] += 1
+                niche_stats[niche]["refusal"] += 1
+                hook_stats[hook]["refusal"] += 1
+
+            sender_acc = str(extra.get("sender_account") or (f"@{r['acc_username']}" if r.get("acc_username") else "@vladwilhelm"))
+            item_obj = {
+                "lead_id": r.get("lead_id"),
+                "dialog_id": r.get("dialog_id"),
+                "account_id": r.get("assigned_account_id"),
+                "sender_account": sender_acc,
+                "username": r.get("username"),
+                "name": r.get("name") or r.get("company") or r.get("username"),
+                "company": r.get("company") or "",
+                "website": r.get("website") or "",
+                "category": cat,
+                "niche": niche,
+                "hook_format": hook,
+                "replied_to_step": rep_step,
+                "replied_to_step_label": STEP_LABELS_RU.get(rep_step, f"Шаг {r.get('current_step') or 1}"),
+                "reply_intent": intent,
+                "reply_intent_label": INTENT_LABELS_RU.get(intent, intent),
+                "reply_text": str(extra.get("all_in_texts") or extra.get("first_in_text") or r.get("note") or "")[:360],
+                "step1_text": str(r.get("step1_text") or "")[:360],
+                "last_touch_at": r.get("last_sent_at") or "",
+                "fine_status": fine,
+            }
+            if fine == "replied_waiting_our_answer":
+                cat_stats[cat]["waiting"] += 1
+                niche_stats[niche]["waiting"] += 1
+                waiting_by_account[sender_acc] += 1
+                waiting_items.append(item_obj)
+            elif fine == "replied_we_answered_seen_stalled":
+                stalled_items.append(item_obj)
+            if intent == "positive_interested":
+                positive_items.append(item_obj)
+
+    # Sort waiting_items so positive_interested comes first
+    waiting_items.sort(key=lambda x: (0 if x["reply_intent"] == "positive_interested" else 1, x["sender_account"]))
+    stalled_items.sort(key=lambda x: (0 if x["reply_intent"] == "positive_interested" else 1, x["sender_account"]))
+    positive_items.sort(key=lambda x: (0 if x["fine_status"] == "replied_waiting_our_answer" else 1, x["sender_account"]))
+
+    # Step conversion breakdown
+    s1_reached = len(contacted_recs)
+    s1_read = sum(1 for r in contacted_recs if r.get("_is_read"))
+    s1_rep_list = [r for r in replied_recs if r.get("_rep_step", "").startswith("step1") or r.get("_rep_step") in ("inbound_first", "empty", "")]
+    s1_pos = sum(1 for r in s1_rep_list if r.get("_intent") == "positive_interested")
+    s1_constr = sum(1 for r in s1_rep_list if r.get("_intent") in ("positive_interested", "neutral_or_question"))
+
+    s2_reached_list = [
+        r for r in contacted_recs
+        if (int(r.get("current_step") or 0) >= 2 and r not in s1_rep_list)
+        or str(r.get("_rep_step") or "").startswith("step2")
+        or str(r.get("_rep_step") or "").startswith("step3")
+    ]
+    s2_reached = len(s2_reached_list)
+    s2_rep_list = [r for r in replied_recs if str(r.get("_rep_step") or "").startswith("step2")]
+    s2_pos = sum(1 for r in s2_rep_list if r.get("_intent") == "positive_interested")
+    s2_constr = sum(1 for r in s2_rep_list if r.get("_intent") in ("positive_interested", "neutral_or_question"))
+
+    s3_reached_list = [
+        r for r in contacted_recs
+        if (int(r.get("current_step") or 0) >= 3 and r not in s1_rep_list and r not in s2_rep_list)
+        or str(r.get("_rep_step") or "").startswith("step3")
+    ]
+    s3_reached = len(s3_reached_list)
+    s3_rep_list = [r for r in replied_recs if str(r.get("_rep_step") or "").startswith("step3")]
+    s3_pos = sum(1 for r in s3_rep_list if r.get("_intent") == "positive_interested")
+    s3_constr = sum(1 for r in s3_rep_list if r.get("_intent") in ("positive_interested", "neutral_or_question"))
+
+    steps_breakdown = [
+        {
+            "step_order": 1,
+            "key": "step1_personal_pitch",
+            "title": "Шаг 1: Персонализированный питч (SoftUGC / CreatorOS)",
+            "delay_label": "Сразу (0 ч)",
+            "reached": s1_reached,
+            "read": s1_read,
+            "replied": len(s1_rep_list),
+            "reply_rate_pct": round(len(s1_rep_list) / max(1, s1_reached) * 100, 1),
+            "positive": s1_pos,
+            "positive_of_reached_pct": round(s1_pos / max(1, s1_reached) * 100, 1),
+            "positive_of_replied_pct": round(s1_pos / max(1, len(s1_rep_list)) * 100, 1),
+            "constructive": s1_constr,
+            "constructive_pct": round(s1_constr / max(1, len(s1_rep_list)) * 100, 1),
+            "template_text": "Hey, Scaling community-driven growth often hits a wall with inconsistent organic reach and high content production costs. Our system, CreatorOS / SoftUGC, acts as a plug-and-play growth arm with AI production and our own account network. We generated 183.5M views in 90 days without live shoots...",
+        },
+        {
+            "step_order": 2,
+            "key": "step2_xplabs_case",
+            "title": "Шаг 2: Фоллоу-ап — Кейс XPLabs (1.2M кликов / 80M просмотров + видео MP4)",
+            "delay_label": "Через 48 ч",
+            "reached": s2_reached,
+            "read": sum(1 for r in s2_reached_list if r.get("_is_read")),
+            "replied": len(s2_rep_list),
+            "reply_rate_pct": round(len(s2_rep_list) / max(1, s2_reached) * 100, 1),
+            "positive": s2_pos,
+            "positive_of_reached_pct": round(s2_pos / max(1, s2_reached) * 100, 1),
+            "positive_of_replied_pct": round(s2_pos / max(1, len(s2_rep_list)) * 100, 1),
+            "constructive": s2_constr,
+            "constructive_pct": round(s2_constr / max(1, len(s2_rep_list)) * 100, 1),
+            "template_text": "Hey, last month we drove 1.2M clicks through tracked links and 80M views on a web3 gaming campaign for XPlabs — here's one of the top-performing creatives we produced for them. [+ MP4 видео-креатив]",
+        },
+        {
+            "step_order": 3,
+            "key": "step3_revshare_cpa",
+            "title": "Шаг 3: Фоллоу-ап — Оффер Revshare и CPA (Оплата за результат)",
+            "delay_label": "Через 96 ч (4 дня)",
+            "reached": s3_reached,
+            "read": sum(1 for r in s3_reached_list if r.get("_is_read")),
+            "replied": len(s3_rep_list),
+            "reply_rate_pct": round(len(s3_rep_list) / max(1, s3_reached) * 100, 1),
+            "positive": s3_pos,
+            "positive_of_reached_pct": round(s3_pos / max(1, s3_reached) * 100, 1),
+            "positive_of_replied_pct": round(s3_pos / max(1, len(s3_rep_list)) * 100, 1),
+            "constructive": s3_constr,
+            "constructive_pct": round(s3_constr / max(1, len(s3_rep_list)) * 100, 1),
+            "template_text": "Hello! Are you interested in organic promotion of your product? We work almost exclusively on revshare and CPA, so our main income comes from what you earn.",
+        },
+    ]
+
+    hooks_list = []
+    for h_name, st in sorted(hook_stats.items(), key=lambda x: -x[1]["pos"] / max(1, x[1]["contacted"])):
+        c = st["contacted"]
+        rd = st["read"]
+        rep = st["replied"]
+        pos = st["pos"]
+        constr = st["constr"]
+        hooks_list.append(
+            {
+                "hook": h_name,
+                "contacted": c,
+                "read": rd,
+                "open_rate_pct": round(rd / max(1, c) * 100, 1),
+                "replied": rep,
+                "reply_rate_pct": round(rep / max(1, c) * 100, 1),
+                "positive": pos,
+                "positive_of_contacted_pct": round(pos / max(1, c) * 100, 1),
+                "positive_of_replied_pct": round(pos / max(1, rep) * 100, 1),
+                "constructive": constr,
+                "constructive_pct": round(constr / max(1, rep) * 100, 1),
+                "refusal": st["refusal"],
+                "sample_text": st["sample_text"][:320],
+            }
+        )
+
+    categories_list = []
+    for c_name, st in sorted(cat_stats.items(), key=lambda x: (-x[1]["pos"] / max(1, x[1]["contacted"]), -x[1]["contacted"])):
+        c = st["contacted"]
+        rd = st["read"]
+        rep = st["replied"]
+        pos = st["pos"]
+        constr = st["constr"]
+        categories_list.append(
+            {
+                "category": c_name,
+                "contacted": c,
+                "read": rd,
+                "open_rate_pct": round(rd / max(1, c) * 100, 1),
+                "replied": rep,
+                "reply_rate_pct": round(rep / max(1, c) * 100, 1),
+                "positive": pos,
+                "positive_of_contacted_pct": round(pos / max(1, c) * 100, 1),
+                "positive_of_replied_pct": round(pos / max(1, rep) * 100, 1),
+                "constructive": constr,
+                "constructive_pct": round(constr / max(1, rep) * 100, 1),
+                "refusal": st["refusal"],
+                "waiting": st["waiting"],
+                "examples": st["examples"],
+            }
+        )
+
+    niches_list = []
+    for n_name, st in sorted(niche_stats.items(), key=lambda x: (-x[1]["pos"] / max(1, x[1]["contacted"]), -x[1]["contacted"])):
+        c = st["contacted"]
+        rd = st["read"]
+        rep = st["replied"]
+        pos = st["pos"]
+        constr = st["constr"]
+        niches_list.append(
+            {
+                "niche": n_name,
+                "contacted": c,
+                "read": rd,
+                "open_rate_pct": round(rd / max(1, c) * 100, 1),
+                "replied": rep,
+                "reply_rate_pct": round(rep / max(1, c) * 100, 1),
+                "positive": pos,
+                "positive_of_contacted_pct": round(pos / max(1, c) * 100, 1),
+                "positive_of_replied_pct": round(pos / max(1, rep) * 100, 1),
+                "constructive": constr,
+                "constructive_pct": round(constr / max(1, rep) * 100, 1),
+                "refusal": st["refusal"],
+                "waiting": st["waiting"],
+                "examples": st["examples"],
+            }
+        )
+
+    total_contacted = len(contacted_recs)
+    total_read = sum(1 for r in contacted_recs if r.get("_is_read"))
+    total_replied = len(replied_recs)
+    pos_total = intent_counts.get("positive_interested", 0)
+    q_total = intent_counts.get("neutral_or_question", 0)
+
+    return {
+        "summary": {
+            "total_base": total_base,
+            "contacted": total_contacted,
+            "read": total_read,
+            "open_rate_pct": round(total_read / max(1, total_contacted) * 100, 1),
+            "replied": total_replied,
+            "reply_rate_pct": round(total_replied / max(1, total_contacted) * 100, 1),
+            "reply_of_read_pct": round(total_replied / max(1, total_read) * 100, 1),
+            "positive_count": pos_total,
+            "positive_pct": round(pos_total / max(1, total_replied) * 100, 1),
+            "question_count": q_total,
+            "constructive_count": pos_total + q_total,
+            "constructive_pct": round((pos_total + q_total) / max(1, total_replied) * 100, 1),
+            "defer_count": intent_counts.get("defer_contact_later", 0),
+            "refusal_count": intent_counts.get("refusal_not_interested", 0),
+            "waiting_our_answer": fine_counts.get("replied_waiting_our_answer", 0),
+            "waiting_positive": sum(1 for x in waiting_items if x["reply_intent"] == "positive_interested"),
+            "waiting_question": sum(1 for x in waiting_items if x["reply_intent"] != "positive_interested"),
+            "stalled_after_answer": fine_counts.get("replied_we_answered_seen_stalled", 0),
+            "unseen_our_answer": fine_counts.get("replied_we_answered_unseen", 0),
+            "need_step2": fine_counts.get("seen_step1_no_reply_need_followup2", 0),
+            "need_step3": fine_counts.get("seen_step2_no_reply_need_followup3", 0),
+            "seen_all_3_ghosted": fine_counts.get("seen_all_3_steps_ghosted", 0),
+            "unseen_total": (
+                fine_counts.get("unseen_stopped_at_step1", 0)
+                + fine_counts.get("unseen_stopped_at_step2", 0)
+                + fine_counts.get("unseen_after_all_3_steps", 0)
+            ),
+            "pending_queue": sum(1 for r in unique_recs if r.get("status") == "pending"),
+            "waiting_by_account": dict(sorted(waiting_by_account.items(), key=lambda x: -x[1])),
+        },
+        "steps_breakdown": steps_breakdown,
+        "hooks_breakdown": hooks_list,
+        "categories_breakdown": categories_list,
+        "niches_breakdown": niches_list,
+        "waiting_items": waiting_items,
+        "stalled_items": stalled_items,
+        "positive_items": positive_items,
+    }
+
+
 def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict:
     clean_period = str(period or "30d").strip().lower()
     if clean_period not in VALID_PERIODS:
@@ -1149,6 +1529,7 @@ def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict
         period=clean_period,
         accounts_analytics=accounts,
     )
+    deep_outreach = _compute_outreach_deep_breakdown(conn)
 
     return {
         "period": clean_period,
@@ -1156,6 +1537,7 @@ def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict
         "outreach": outreach,
         "accounts": accounts,
         "charts": charts,
+        "deep_outreach": deep_outreach,
         "pipeline_value": funnel["pipeline_value"],
         "won_value": funnel["won_value"],
         "won_revenue": funnel["won_value"],

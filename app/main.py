@@ -374,7 +374,7 @@ def _resolve_app_gateway(app, provider: str = "telegram"):
         return wa_gw
     if app.state.gateway is not None:
         return app.state.gateway
-    if "PYTEST_CURRENT_TEST" in os.environ:
+    if "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("DISABLE_TG_WATCHES") == "1":
         return None
     api_id, api_hash = _resolve_tg_creds(getattr(app.state, "conn", None))
     if not api_id or not api_hash:
@@ -623,22 +623,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await start_connected_watches(app)
-        await start_autopilot_loop(app)
+        if os.getenv("DISABLE_TG_WATCHES") != "1":
+            await start_connected_watches(app)
+            await start_autopilot_loop(app)
         try:
             yield
         finally:
-            if (
-                conn is None
-                and "PYTEST_CURRENT_TEST" not in os.environ
-                and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
-            ):
-                try:
-                    from app.cloud_persistence import backup_to_cloud
-
-                    await asyncio.to_thread(backup_to_cloud, None)
-                except Exception:
-                    pass
             await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
 
@@ -1427,7 +1417,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 or (
                     str(demo_row["provider"] or "telegram").strip().lower() != "whatsapp"
                     and request.app.state.gateway is None
-                    and not has_tg_creds
+                    and (not has_tg_creds or os.environ.get("DISABLE_TG_WATCHES") == "1")
                 )
             )
             and demo_row["status"] == "connected"
@@ -1750,6 +1740,14 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         from app.cloud_persistence import backup_to_cloud
 
         return _call(backup_to_cloud, request.app.state.conn)
+
+    @app.post("/api/cloud/restore")
+    def cloud_restore_run(request: Request):
+        from app.cloud_persistence import restore_from_cloud
+
+        return _call(
+            lambda: restore_from_cloud(force=True, live_conn=request.app.state.conn)
+        )
 
     @app.post("/api/cloud/credentials")
     def cloud_credentials_set(body: CloudCredentialsIn, request: Request):

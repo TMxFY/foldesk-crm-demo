@@ -6,7 +6,7 @@
   <title>Foldesk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261106v3">
+  <link rel="stylesheet" href="/static/app.css?v=20261108v5">
 </head>
 <body>
   <a class="skip" href="#s04">К списку разговоров</a>
@@ -321,11 +321,14 @@
             <label class="inline" for="followup-filter">Касание
               <select id="followup-filter" aria-label="Статус касания">
                 <option value="">Все по касаниям</option>
+                <option value="waiting_our_answer">🔥 Ждут нашего ответа</option>
+                <option value="positive_reply">+ Позитив (Целевой интерес)</option>
                 <option value="replied">Ответили (Авто-стоп)</option>
                 <option value="waiting_reply">Ждём ответа клиента</option>
                 <option value="due_followup">Пора фоллоу-апить</option>
               </select>
             </label>
+            <button type="button" class="btn secondary sm" id="quick-waiting-our-answer-btn" title="Показать 129 лидов, которые написали последними и ждут нашего ответа">🔥 Ждут ответа: <strong id="quick-waiting-count">129</strong></button>
             <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
             <button type="button" class="btn secondary sm" id="board-select-all-btn">Выбрать все</button>
             <button type="button" class="btn secondary sm" id="board-export-csv-btn">Экспорт CSV</button>
@@ -405,8 +408,8 @@
             </div>
             <div class="row">
               <div class="switch" role="group" aria-label="Режим чатов">
-                <button type="button" id="inbox-mode-tgweb" class="btn secondary sm" aria-pressed="true">Telegram Web (/a/)</button>
-                <button type="button" id="inbox-mode-crm" class="btn ghost sm" aria-pressed="false">CRM Чаты + Карточка</button>
+                <button type="button" id="inbox-mode-crm" class="btn secondary sm" aria-pressed="true">CRM Чаты + Карточка</button>
+                <button type="button" id="inbox-mode-tgweb" class="btn ghost sm" aria-pressed="false">Telegram Web (/a/)</button>
               </div>
               <a id="tg-web-a-external-link" href="/a/" target="_blank" rel="noopener" class="btn primary sm">Открыть /a/ во весь экран ↗</a>
             </div>
@@ -1032,6 +1035,7 @@
             </div>
           </div>
         </div>
+        <div id="outreach-deep-stats-box" class="stack" style="margin-top: 16px;"></div>
       </section>
 
       <section id="leads" data-sheet="leads" class="surface-box" aria-labelledby="leads-title">
@@ -1969,6 +1973,8 @@
             </div>
           </div>
         </div>
+
+        <div id="analytics-deep-outreach-box" class="stack" style="margin-top: 16px;"></div>
       </section>
     </main>
   </div>
@@ -1982,6 +1988,6 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261106v3"></script>
+  <script src="/static/app.js?v=20261108v5"></script>
 </body>
 </html>
