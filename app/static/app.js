@@ -718,12 +718,99 @@ async function promptCreateStage() {
   }
 }
 
-function textField(lead, field, label) {
+function textField(lead, field, label, extraAttrs = {}) {
+  const placeholders = {
+    name: "Имя контакта",
+    note: "Добавить заметку или контекст...",
+    next_step: "Указать следующий шаг...",
+    phone: "+7...",
+  };
   return el("input", {
     value: lead[field] || "",
+    placeholder: extraAttrs.placeholder || placeholders[field] || "",
+    className: extraAttrs.className || `field-input field-${field}`,
     "aria-label": label,
     onchange: (event) => patchLead(lead.id, { [field]: event.target.value }),
   });
+}
+
+function formatStructuredNoteNode(rawNote, { compact = false } = {}) {
+  const text = String(rawNote || "").trim();
+  if (!text) return null;
+  const parts = text.split(/\s*\|\s*(?=(?:💬|Их продукт:|Наш оффер:|Компания:|Бюджет:|Источник:))/i);
+  if (parts.length <= 1 && !/^💬\s*Ответ лида/i.test(text)) {
+    return null;
+  }
+  const rows = [];
+  parts.forEach((segment) => {
+    const cleanSeg = segment.trim();
+    if (!cleanSeg) return;
+    if (/^💬\s*Ответ лида/i.test(cleanSeg)) {
+      const quoteMatch = cleanSeg.match(/«([\s\S]*?)»/);
+      const headerMatch = cleanSeg.match(/^💬\s*Ответ лида\s*(?:\(([^)]+)\))?/i);
+      const toneText = headerMatch && headerMatch[1] ? headerMatch[1].replace(/\s+на Шаг.*$/i, "").trim() : "Ответ клиента";
+      const quoteBody = quoteMatch
+        ? quoteMatch[1].split(/\s*\|\s*/).map((s) => s.trim()).filter(Boolean).join(" · ")
+        : cleanSeg.replace(/^💬\s*Ответ лида[^:]*:\s*/i, "");
+      rows.push(el("div", { className: "structured-note-row is-reply" }, [
+        el("span", { className: "structured-note-tag" }, [`💬 ${toneText}:`]),
+        el("span", { className: "structured-note-val" }, [quoteBody]),
+      ]));
+    } else if (/^Их продукт:/i.test(cleanSeg)) {
+      rows.push(el("div", { className: "structured-note-row" }, [
+        el("span", { className: "structured-note-label" }, ["Продукт:"]),
+        el("span", { className: "structured-note-val" }, [cleanSeg.replace(/^Их продукт:\s*/i, "")]),
+      ]));
+    } else if (/^Наш оффер:/i.test(cleanSeg)) {
+      rows.push(el("div", { className: "structured-note-row" }, [
+        el("span", { className: "structured-note-label" }, ["Оффер:"]),
+        el("span", { className: "structured-note-val" }, [cleanSeg.replace(/^Наш оффер:\s*/i, "")]),
+      ]));
+    } else {
+      rows.push(el("div", { className: "structured-note-row" }, [
+        el("span", { className: "structured-note-val" }, [cleanSeg]),
+      ]));
+    }
+  });
+  return el("div", { className: `structured-note-block${compact ? " is-compact" : ""}`, title: text }, rows);
+}
+
+function formatStructuredStepNode(rawStep) {
+  const text = String(rawStep || "").trim();
+  if (!text) return null;
+  const parts = text.split(/\s*·\s*/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1 && !/^[🔥❌✅]/u.test(text)) {
+    return null;
+  }
+  const head = parts[0];
+  const rest = parts.slice(1).join(" · ");
+  let badgeCls = "b-talk";
+  if (head.startsWith("🔥")) badgeCls = "b-wait";
+  else if (head.startsWith("❌")) badgeCls = "b-lost";
+  else if (head.includes("+ Позитив")) badgeCls = "b-won";
+  return el("div", { className: "structured-step-block", title: text }, [
+    el("span", { className: `badge ${badgeCls} structured-step-badge` }, [head]),
+    rest ? el("span", { className: "structured-step-sub" }, [rest]) : null,
+  ].filter(Boolean));
+}
+
+function formatCleanCardPreview(lead) {
+  const step = String(lead.next_step || "").trim();
+  if (step) {
+    const parts = step.split(/\s*·\s*/).map((s) => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      return parts.slice(1).join(" · ");
+    }
+    return step;
+  }
+  const note = String(lead.note || "").trim();
+  if (!note) return "";
+  const quoteMatch = note.match(/«([\s\S]*?)»/);
+  if (quoteMatch) {
+    const cleanQuote = quoteMatch[1].split(/\s*\|\s*/).filter(Boolean).slice(-1)[0] || quoteMatch[1];
+    return `💬 «${cleanQuote.slice(0, 90)}»`;
+  }
+  return note.split(/\s*\|\s*/)[0].slice(0, 95);
 }
 
 async function patchLead(id, body) {
@@ -2413,7 +2500,11 @@ function syncTelegramWebAPanel(connected) {
 
   panel.hidden = false;
   const mode = state.inboxChatMode === "tgweb" ? "tgweb" : "crm";
+  panel.dataset.chatMode = mode;
   if (grid) grid.dataset.tgwebActive = mode === "tgweb" ? "true" : "false";
+  const snippetsBar = document.querySelector("#tg-web-snippets-bar");
+  if (snippetsBar) snippetsBar.hidden = mode === "crm";
+  if (pillsHost) pillsHost.hidden = mode === "crm";
   const activeKey = String(state.inboxSessionFilter || "all");
   const targetIdx = Math.max(0, webReady.findIndex((acc) => String(acc.id) === activeKey));
   const target = webReady[targetIdx] || webReady[0];
@@ -2972,8 +3063,11 @@ function renderSide({ syncSelectedLead = true } = {}) {
       el("p", { className: "hint" }, [handleParts.join(" · ")]),
       el("label", { className: "side-amount-label" }, ["Бюджет ($)", amountField(lead, "Бюджет ($)")]),
       leadTrackingBox(lead),
-      el("p", { className: "note" }, [sideNoteText(lead)]),
-      el("p", { className: "hint" }, [lead.next_step ? `Дальше: ${lead.next_step}` : "Следующий шаг не задан"]),
+      formatStructuredStepNode(lead.next_step) || el("p", { className: "hint" }, [lead.next_step || "Следующий шаг не задан"]),
+      el("div", { id: "side-note-host" }, [
+        formatStructuredNoteNode(sideNoteText(lead), { compact: true }),
+        el("p", { className: "note", hidden: Boolean(formatStructuredNoteNode(sideNoteText(lead), { compact: true })) }, [sideNoteText(lead)]),
+      ].filter(Boolean)),
       renderLeadEventsSection(state.cards[lead.id] || lead, { compact: true }),
       el("a", {
         className: "btn secondary sm",
@@ -3025,8 +3119,20 @@ function refreshSideNote(leadId) {
   if (!dialog) return;
   const lead = leadForDialog(dialog);
   if (!lead || lead.id !== leadId) return;
-  const note = document.querySelector("#side-card .note");
-  if (note) note.textContent = sideNoteText(lead);
+  const rawText = sideNoteText(lead);
+  const host = document.querySelector("#side-note-host");
+  if (host) {
+    const structNode = formatStructuredNoteNode(rawText, { compact: true });
+    host.replaceChildren(
+      ...[
+        structNode,
+        el("p", { className: "note", hidden: Boolean(structNode) }, [rawText]),
+      ].filter(Boolean),
+    );
+  } else {
+    const note = document.querySelector("#side-card .note");
+    if (note) note.textContent = rawText;
+  }
   refreshSideEvents(leadId);
 }
 
@@ -3360,49 +3466,64 @@ function paintCard(lead) {
     : el("p", { className: "hint" }, ["Заметок пока нет"]);
   const href = safeHref(lead.url);
   const provider = normalizeProvider(lead.provider || "telegram");
+  const structuredNote = formatStructuredNoteNode(lead.note);
+  const structuredStep = formatStructuredStepNode(lead.next_step);
   const profile = [
-    el("div", { className: "row" }, [
-      channelBadgeEl(provider),
-      el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
+    el("div", { className: "card-head-bar" }, [
+      el("div", { className: "row" }, [
+        channelBadgeEl(provider),
+        el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
+      ]),
+      el("div", { className: "row card-quick-actions" }, [
+        el("button", { type: "button", className: "btn primary sm", onclick: () => openChat(lead) }, ["Открыть чат"]),
+        el("button", { type: "button", className: "btn secondary sm", onclick: () => openNoteModal(lead) }, ["Заметка"]),
+        el("button", { type: "button", className: "btn secondary sm", onclick: () => openReminderModal(lead) }, ["Напоминание"]),
+      ]),
     ]),
-    leadTrackingBox(lead),
-    el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
-    el("label", {}, ["Телефон", textField(lead, "phone", "Телефон")]),
-    el("label", {}, ["Статус", statusSelect(lead)]),
-    el("label", {}, ["Бюджет ($)", amountField(lead, "Бюджет ($)")]),
-    el("p", { id: "card-folder" }, [
-      lead.folder_name ? `Папка: ${lead.folder_name}` : "Папка не задана",
-    ]),
-    el("label", {}, ["Папка", folderField(lead)]),
-    el("p", { className: "hint" }, [
+    el("p", { className: "hint card-handle-line" }, [
       lead.username ? `@${lead.username}` : "без ника",
       lead.phone ? ` · ${lead.phone}` : "",
-      lead.telegram_user_id ? ` · ${lead.telegram_user_id}` : "",
+      lead.telegram_user_id ? ` · ID ${lead.telegram_user_id}` : "",
     ]),
-  ];
-  if (lead.email) profile.push(el("p", {}, [lead.email]));
-  if (href) profile.push(el("a", { href, rel: "noreferrer" }, ["Ссылка"]));
-  profile.push(
-    el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
+    lead.email ? el("p", { className: "hint" }, [lead.email]) : null,
+    href ? el("a", { href, rel: "noreferrer", className: "card-ext-link" }, ["Ссылка"]) : null,
+    leadTrackingBox(lead),
+    el("div", { className: "card-primary-grid" }, [
+      el("label", {}, ["Имя", textField(lead, "name", "Имя")]),
+      el("label", {}, ["Статус", statusSelect(lead)]),
+      el("label", {}, ["Бюджет ($)", amountField(lead, "Бюджет ($)")]),
+      el("label", {}, ["Телефон", textField(lead, "phone", "Телефон")]),
+      el("label", {}, ["Папка", folderField(lead)]),
+      el("p", { id: "card-folder", className: "hint" }, [
+        lead.folder_name ? `Папка: ${lead.folder_name}` : "Папка не задана",
+      ]),
+    ]),
+    el("section", { className: "surface-subcard stack card-context-box", "aria-label": "Следующий шаг и контекст" }, [
+      el("div", { className: "subcard-head" }, [
+        el("h4", {}, ["Следующий шаг и заметка"]),
+      ]),
+      structuredStep,
+      el("label", {}, ["Следующий шаг", textField(lead, "next_step", "Следующий шаг")]),
+      structuredNote,
+      el("label", {}, ["Заметка по сделке", textField(lead, "note", "Заметка по сделке")]),
+    ].filter(Boolean)),
     typeof renderSoftUgcDealSection === "function" ? renderSoftUgcDealSection(lead) : null,
-    timeline,
-    renderLeadEventsSection(lead),
-    el("section", { "aria-label": "Задачи" }, [
+    el("section", { className: "surface-subcard stack", "aria-label": "Задачи" }, [
       el("h4", {}, ["Задачи"]),
       taskList(lead),
       taskForm(lead),
     ]),
-    el("section", { "aria-label": "Свои поля" }, [
-      el("h4", {}, ["Свои поля"]),
-      propertyList(lead),
-      propertyForm(lead),
+    el("details", { className: "surface-subcard stack custom-prop-details" }, [
+      el("summary", { className: "subcard-head" }, [
+        el("h4", {}, ["Быстро добавить новое поле CRM"]),
+      ]),
+      el("section", { "aria-label": "Свои поля", className: "stack" }, [
+        propertyForm(lead),
+      ]),
     ]),
-    el("div", { className: "row" }, [
-      el("button", { type: "button", className: "btn secondary sm", onclick: () => openNoteModal(lead) }, ["Заметка"]),
-      el("button", { type: "button", className: "btn secondary sm", onclick: () => openReminderModal(lead) }, ["Напоминание"]),
-      el("button", { type: "button", className: "btn ghost sm", onclick: () => openChat(lead) }, ["Открыть чат"]),
-    ]),
-  );
+    timeline,
+    renderLeadEventsSection(lead),
+  ].filter(Boolean);
   document.querySelector("#lead-card").replaceChildren(
     el("div", { className: "panel", "aria-labelledby": "card-name" }, profile),
   );
@@ -3597,41 +3718,37 @@ function renderBoard() {
         const bodyNodes = [
           el("span", { className: "card-top" }, [
             el("span", { className: "name" }, [nameText]),
-            el("span", { className: "meta" }, [userText]),
+            el("span", { className: "meta" }, [
+              lead.company ? `${userText} · ${lead.company}` : userText,
+            ]),
           ]),
         ];
-        if (lead.next_step || lead.note) {
-          bodyNodes.push(el("span", { className: "card-step" }, [
-            lead.next_step ? `Сегодня · ${lead.next_step}` : lead.note,
-          ]));
+        const cleanPreview = formatCleanCardPreview(lead);
+        if (cleanPreview) {
+          bodyNodes.push(el("span", { className: "card-step" }, [cleanPreview]));
         }
         const folderTitle = folderTitleById(lead.folder_id);
         const tagNodes = [
           channelBadgeEl(provider),
           el("span", { className: "card-amount", "data-card-amount": String(amt) }, [amtText]),
-          el("span", { className: "card-pill" }, [folderTitle || label]),
         ];
-        if (tr.accountName || tr.accountPhone) {
-          tagNodes.push(el("span", { className: "card-tag card-account-tag" }, [
-            `Акк: ${tr.accountName || tr.accountPhone}`,
-          ]));
+        if (folderTitle) {
+          tagNodes.push(el("span", { className: "card-pill" }, [folderTitle]));
         }
         if (tr.isWaitingOurAnswer) {
-          tagNodes.push(el("span", { className: "badge b-wait" }, ["🔥 Ждёт нашего ответа"]));
+          tagNodes.push(el("span", { className: "badge b-wait" }, ["🔥 Ждёт ответа"]));
+        } else if (tr.isReplied) {
+          tagNodes.push(el("span", { className: "card-pill card-pill-replied" }, ["💬 Ответил"]));
+        } else if (tr.campaignStatus === "in_progress") {
+          tagNodes.push(el("span", { className: "card-tag card-followup-tag" }, [`Шаг ${tr.campaignStep || 1}`]));
         }
         if (tr.isPositiveReply) {
           tagNodes.push(el("span", { className: "badge b-won" }, ["+ Позитив"]));
         }
-        if (tr.isReplied) {
-          tagNodes.push(el("span", { className: "card-pill card-pill-replied" }, ["Ответил · Авто-стоп"]));
-        } else if (tr.campaignStatus === "in_progress") {
-          const nextFupText = tr.nextFollowupAt ? ` · фоллоу-ап ${formatShortTime(tr.nextFollowupAt)}` : "";
-          tagNodes.push(el("span", { className: "card-tag card-followup-tag" }, [
-            `Шаг ${tr.campaignStep || 1}${nextFupText}`,
+        if (tr.accountName || tr.accountPhone) {
+          tagNodes.push(el("span", { className: "card-tag card-account-tag" }, [
+            `${tr.accountName || tr.accountPhone}`,
           ]));
-        }
-        if (lead.phone) {
-          tagNodes.push(el("span", { className: "card-tag" }, [lead.phone]));
         }
         bodyNodes.push(el("span", { className: "card-tags" }, tagNodes));
         const link = el("a", {
@@ -3798,15 +3915,75 @@ function reminderForm(lead) {
   ]);
 }
 
+function buildLeadCrmPills(lead) {
+  const pills = [];
+  const amt = leadAmount(lead);
+  if (amt > 0) {
+    pills.push(el("span", { className: "crm-field-pill is-budget" }, [formatMoney(amt, lead.currency)]));
+  }
+  const cleanCompany = String(lead.company || "").trim();
+  if (cleanCompany && !cleanCompany.startsWith("+ Позитив")) {
+    pills.push(el("span", { className: "crm-field-pill", title: cleanCompany }, [
+      `🏢 ${cleanCompany.length > 24 ? `${cleanCompany.slice(0, 24)}…` : cleanCompany}`,
+    ]));
+  }
+  const cleanNiche = String(lead.niche || "").trim();
+  if (cleanNiche) {
+    const shortNiche = cleanNiche.split(/\s*·\s*/)[0].trim();
+    pills.push(el("span", { className: "crm-field-pill", title: cleanNiche }, [
+      `🎯 ${shortNiche.length > 22 ? `${shortNiche.slice(0, 22)}…` : shortNiche}`,
+    ]));
+  }
+  const cachedCard = state.cards && state.cards[lead.id];
+  const props = (cachedCard && cachedCard.properties) || lead.properties || [];
+  props.forEach((prop) => {
+    if (pills.length >= 3) return;
+    const val = String(propertyShown(prop) || "").trim();
+    if (val && val !== "-" && val.length <= 28 && !val.startsWith("+ Позитив")) {
+      pills.push(el("span", { className: "crm-field-pill is-custom", title: `${prop.name}: ${val}` }, [
+        `${prop.name}: ${val}`,
+      ]));
+    }
+  });
+  const openBtn = el("button", {
+    type: "button",
+    className: "lead-open-card-btn",
+    onclick: (ev) => {
+      ev.stopPropagation();
+      state.selectedLeadId = lead.id;
+      renderCard();
+      renderBoard();
+      if (state.viewMode === "sheet") openSheetPopup("card");
+    },
+  }, ["Карточка →"]);
+  pills.push(openBtn);
+  return el("div", { className: "lead-crm-pills-row" }, pills);
+}
+
 function renderLeadTable() {
   const body = document.querySelector("#lead-rows");
+  if (!body) return;
   body.replaceChildren();
   const { status, folderId, channel, followup } = pipelineFilters();
+  const quickSearchInput = document.querySelector("#leads-quick-search");
+  const quickQ = quickSearchInput ? String(quickSearchInput.value || "").trim().toLowerCase() : "";
   const filteredLeads = state.leads.filter((lead) => {
     if (status && lead.status !== status) return false;
     if (folderId && String(lead.folder_id || "") !== String(folderId)) return false;
     if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
     if (!matchFollowupFilter(lead, followup)) return false;
+    if (quickQ) {
+      const hay = [
+        lead.name,
+        lead.username,
+        lead.company,
+        lead.niche,
+        lead.note,
+        lead.next_step,
+        lead.phone,
+      ].filter(Boolean).join(" ").toLowerCase();
+      if (!hay.includes(quickQ)) return false;
+    }
     return true;
   });
   filteredLeads.forEach((lead) => {
@@ -3824,10 +4001,10 @@ function renderLeadTable() {
       trackingPills.push(el("span", { className: "hint" }, [`Касание: ${formatShortTime(lastTouchRaw)}`]));
     }
     if (tr.isReplied) {
-      trackingPills.push(el("span", { className: "badge b-won" }, ["Ответил — агент остановлен"]));
+      trackingPills.push(el("span", { className: "badge b-won" }, ["💬 Ответил"]));
     } else if (tr.campaignStatus === "in_progress") {
       trackingPills.push(el("span", { className: "badge b-talk" }, [
-        `Шаг ${tr.campaignStep || 1}${tr.nextFollowupAt ? ` · фоллоу-ап ${formatShortTime(tr.nextFollowupAt)}` : ""}`,
+        `Шаг ${tr.campaignStep || 1}${tr.nextFollowupAt ? ` · ${formatShortTime(tr.nextFollowupAt)}` : ""}`,
       ]));
     } else if (tr.campaignStatus === "completed") {
       trackingPills.push(el("span", { className: "badge b-ok" }, [`Шаг ${tr.campaignStep || 1}`]));
@@ -3840,6 +4017,35 @@ function renderLeadTable() {
     const bulkCell = typeof createLeadBulkCell === "function"
       ? createLeadBulkCell(lead)
       : el("td", { className: "bulk-check-col" }, []);
+    const crmPillsNode = buildLeadCrmPills(lead);
+    const structuredNoteNode = formatStructuredNoteNode(lead.note, { compact: true });
+    const structuredStepNode = formatStructuredStepNode(lead.next_step);
+    const noteInput = textField(lead, "note", "Заметка", {
+      className: "table-inline-input table-note-input",
+      placeholder: "+ Добавить заметку...",
+    });
+    if (structuredNoteNode) {
+      noteInput.hidden = true;
+      structuredNoteNode.addEventListener("click", (ev) => ev.stopPropagation());
+      structuredNoteNode.addEventListener("dblclick", (ev) => {
+        ev.stopPropagation();
+        noteInput.hidden = !noteInput.hidden;
+        if (!noteInput.hidden) noteInput.focus();
+      });
+    }
+    const stepInput = textField(lead, "next_step", "Следующий шаг", {
+      className: "table-inline-input table-step-input",
+      placeholder: "+ Следующий шаг...",
+    });
+    if (structuredStepNode) {
+      stepInput.hidden = true;
+      structuredStepNode.addEventListener("click", (ev) => ev.stopPropagation());
+      structuredStepNode.addEventListener("dblclick", (ev) => {
+        ev.stopPropagation();
+        stepInput.hidden = !stepInput.hidden;
+        if (!stepInput.hidden) stepInput.focus();
+      });
+    }
     const row = el("tr", {
       "data-lead-id": String(lead.id),
       onclick: (ev) => {
@@ -3851,22 +4057,35 @@ function renderLeadTable() {
       },
     }, [
       bulkCell,
-      el("td", {}, [
-        el("div", { className: "lead-name-cell" }, [
-          channelBadgeEl(provider),
-          textField(lead, "name", "Имя"),
-        ]),
+      el("td", { className: "col-lead-name" }, [
+        el("div", { className: "lead-name-stack" }, [
+          el("div", { className: "lead-name-cell" }, [
+            channelBadgeEl(provider),
+            textField(lead, "name", "Имя", { className: "table-inline-input table-name-input" }),
+          ]),
+          crmPillsNode,
+        ].filter(Boolean)),
       ]),
-      el("td", {}, [contactText]),
-      el("td", { className: "num" }, [lead.telegram_user_id ?? ""]),
-      el("td", { className: "num" }, [lead.phone || ""]),
-      el("td", {}, [
+      el("td", { className: "col-lead-user" }, [contactText]),
+      el("td", { className: "num col-tg-id" }, [lead.telegram_user_id ?? ""]),
+      el("td", { className: "num col-lead-phone" }, [lead.phone || ""]),
+      el("td", { className: "col-lead-status" }, [
         statusSelect(lead),
         trackingPills.length ? el("div", { className: "lead-tracking-meta" }, trackingPills) : null,
       ].filter(Boolean)),
-      el("td", {}, [textField(lead, "note", "Заметка")]),
-      el("td", {}, [textField(lead, "next_step", "Следующий шаг")]),
-      el("td", {}, [
+      el("td", { className: "col-lead-note" }, [
+        el("div", { className: "lead-cell-rich" }, [
+          structuredNoteNode,
+          noteInput,
+        ].filter(Boolean)),
+      ]),
+      el("td", { className: "col-lead-step" }, [
+        el("div", { className: "lead-cell-rich" }, [
+          structuredStepNode,
+          stepInput,
+        ].filter(Boolean)),
+      ]),
+      el("td", { className: "col-lead-rem" }, [
         ...openRemNodes,
         reminderForm(lead),
         el("button", {
@@ -6435,27 +6654,52 @@ if (toolParserSubmitBtn) {
 }
 
 /* CRM Properties & AI Agent */
+const SYSTEM_CRM_FIELDS = [
+  { name: "Компания", type: "text", place: "Карточка лида · Таблица Лиды · Канбан" },
+  { name: "Ниша", type: "text", place: "Карточка лида · Таблица Лиды" },
+  { name: "Бюджет сделки ($)", type: "amount", place: "Карточка лида · Таблица Лиды · Канбан" },
+  { name: "MRR / Monthly ($)", type: "amount", place: "Карточка лида · Airtable" },
+  { name: "Следующий шаг", type: "text", place: "Карточка лида · Таблица Лиды · Канбан" },
+  { name: "Следующий Follow-up (дата)", type: "text", place: "Карточка лида · Календарь" },
+  { name: "Источник", type: "single_select", place: "Карточка лида · Таблица Лиды · Аналитика" },
+  { name: "Формат оффера", type: "multi_select", place: "Карточка лида · Таблица Лиды" },
+  { name: "Детали оффера", type: "text", place: "Карточка лида · Airtable" },
+];
+
 function renderCrmProperties() {
   const host = document.querySelector("#crm-properties-list");
   const badge = document.querySelector("#crm-properties-count-badge");
   if (!host) return;
   host.replaceChildren();
-  const defs = (state.propertyDefs && state.propertyDefs.length)
-    ? state.propertyDefs
-    : [
-      { id: "sys-company", name: "Компания / Бренд", type: "text" },
-      { id: "sys-budget", name: "Бюджет сделки, ₽", type: "amount" },
-      { id: "sys-source", name: "Источник трафика", type: "single_select" },
-    ];
-  if (badge) badge.textContent = `${defs.length} полей`;
-  defs.forEach((def) => {
+  const customDefs = Array.isArray(state.propertyDefs) ? state.propertyDefs : [];
+  const totalCount = SYSTEM_CRM_FIELDS.length + customDefs.length;
+  if (badge) badge.textContent = `${totalCount} полей (${customDefs.length} своих)`;
+
+  customDefs.forEach((def) => {
     const typeLabel = (PROPERTY_TYPES.find(([k]) => k === def.type) || [def.type, def.type])[1];
     host.append(el("div", { className: "tool-result-item" }, [
       el("div", { className: "tool-result-main" }, [
         el("strong", {}, [def.name]),
-        el("span", { className: "hint" }, [`Доступно в карточке лида и фильтрах CRM`]),
+        el("span", { className: "hint" }, ["Пользовательское поле · В карточке лида («Поля CRM и сделка») и таблице «Лиды»"]),
       ]),
-      el("span", { className: "badge b-new" }, [typeLabel]),
+      el("div", { className: "row" }, [
+        el("span", { className: "badge b-talk" }, ["Своё поле"]),
+        el("span", { className: "badge b-new" }, [typeLabel]),
+      ]),
+    ]));
+  });
+
+  SYSTEM_CRM_FIELDS.forEach((sysField) => {
+    const typeLabel = (PROPERTY_TYPES.find(([k]) => k === sysField.type) || [sysField.type, sysField.type])[1];
+    host.append(el("div", { className: "tool-result-item" }, [
+      el("div", { className: "tool-result-main" }, [
+        el("strong", {}, [sysField.name]),
+        el("span", { className: "hint" }, [`Системное поле · ${sysField.place}`]),
+      ]),
+      el("div", { className: "row" }, [
+        el("span", { className: "badge b-ok" }, ["Встроено"]),
+        el("span", { className: "badge b-new" }, [typeLabel]),
+      ]),
     ]));
   });
 }
@@ -7162,8 +7406,24 @@ function renderDeepOutreachAnalytics(summary) {
   }
   const outreachBox = document.querySelector("#outreach-deep-stats-box");
   if (outreachBox) {
-    outreachBox.replaceChildren(buildDeepOutreachNode(data.deep_outreach, "out_deep"));
+    const deepDetails = el("details", { className: "surface-subcard outreach-audit-details" }, [
+      el("summary", { className: "subcard-head outreach-audit-summary" }, [
+        el("strong", {}, ["📊 Подробная аналитика касаний, ответов и конверсии по рассылкам"]),
+        el("span", { className: "badge b-new" }, ["Развернуть отчёт"]),
+      ]),
+      el("div", { className: "outreach-audit-body stack" }, [
+        buildDeepOutreachNode(data.deep_outreach, "out_deep"),
+      ]),
+    ]);
+    outreachBox.replaceChildren(deepDetails);
   }
+}
+
+const leadsQuickSearchInput = document.querySelector("#leads-quick-search");
+if (leadsQuickSearchInput) {
+  leadsQuickSearchInput.addEventListener("input", () => {
+    renderLeadTable();
+  });
 }
 
 const quickWaitingOurAnswerBtn = document.querySelector("#quick-waiting-our-answer-btn");
@@ -7522,11 +7782,22 @@ async function boot() {
   await loadPipelineStages();
   if (mySeq !== bootSeq) return;
 
+  setView("#board-view", "loading");
+  setView("#leads-view", "loading");
   setView("#accounts-view", "loading");
   setView("#inbox-view", "empty");
   setView("#thread-view", "empty");
   setView("#side-view", "empty");
   setView("#card-view", "empty");
+  try {
+    await loadLeads("");
+  } catch (error) {
+    if (mySeq !== bootSeq) return;
+    failRegion("#leads-view", "#leads-error", error);
+    document.querySelector("#board-error").textContent = error.message;
+    setView("#board-view", "error");
+  }
+  if (mySeq !== bootSeq) return;
   try {
     await loadOperator();
   } catch (error) {
@@ -7537,7 +7808,7 @@ async function boot() {
   try {
     await loadAccounts();
     if (mySeq !== bootSeq) return;
-    await loadPipelineFolders();
+    loadPipelineFolders().catch(() => {});
   } catch (error) {
     if (mySeq !== bootSeq) return;
     failRegion("#accounts-view", "#accounts-error", error);
@@ -8305,14 +8576,51 @@ function renderSoftUgcDealSection(lead) {
     },
   }, ["Пуш в Airtable"]);
 
+  const customPropNodes = (state.propertyDefs || []).map((def) => {
+    const existing = ((lead.properties || []).find((p) => Number(p.property_id || p.id) === Number(def.id) || p.name === def.name));
+    const currentVal = existing ? (existing.value_text || (existing.value_int != null ? String(existing.value_int) : "")) : "";
+    const propInput = el("input", {
+      type: def.type === "amount" ? "number" : "text",
+      value: currentVal,
+      placeholder: def.name,
+      "aria-label": def.name,
+      onchange: async (e) => {
+        const val = e.target.value.trim();
+        try {
+          await api(`/api/leads/${lead.id}/properties/${def.id}`, {
+            method: "PUT",
+            body: { value: val },
+          });
+          delete state.cards[lead.id];
+          await renderCard();
+          renderLeadTable();
+          toast(`Поле «${def.name}» сохранено`, "ok");
+        } catch (err) {
+          toast(err.message || "Ошибка сохранения поля", "error");
+        }
+      },
+    });
+    return el("label", {}, [`${def.name}`, propInput]);
+  });
+
+  const openPropsBtn = el("button", {
+    type: "button",
+    className: "btn ghost sm",
+    onclick: () => {
+      closeSheetPopup();
+      activateSheet("crm-properties");
+    },
+  }, ["⚙️ Настроить поля"]);
+
   return el("section", {
     className: "softugc-deal-box surface-subcard stack",
     "aria-label": "Параметры сделки (SoftUGC / Airtable)",
   }, [
     el("div", { className: "row subcard-head" }, [
-      el("h4", {}, ["Параметры сделки (SoftUGC / Airtable)"]),
+      el("h4", {}, ["Поля CRM и параметры сделки"]),
       el("div", { className: "row" }, [
         el("span", { className: "badge b-talk" }, [`Airtable: ${airtableStage}`]),
+        openPropsBtn,
         pushBtn,
       ]),
     ]),
@@ -8324,6 +8632,7 @@ function renderSoftUgcDealSection(lead) {
       el("label", {}, ["Источник", sourceInput]),
       el("label", {}, ["Формат оффера", offerTypeInput]),
       el("label", { className: "softugc-field-wide" }, ["Детали оффера", offerDetailsInput]),
+      ...customPropNodes,
     ]),
   ]);
 }

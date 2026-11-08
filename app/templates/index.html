@@ -6,7 +6,7 @@
   <title>Foldesk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261108v5">
+  <link rel="stylesheet" href="/static/app.css?v=20261108v10">
 </head>
 <body>
   <a class="skip" href="#s04">К списку разговоров</a>
@@ -155,15 +155,15 @@
         <div class="topbar-stats" id="workspace-stats" aria-label="Сводка">
           <span class="stat-chip stat-chip-money">В работе: <strong id="stat-pipeline-value">$0</strong></span>
           <span class="stat-chip stat-chip-won">Выиграно: <strong id="stat-won-value">$0</strong></span>
-          <span class="stat-chip">Win Rate: <strong id="stat-win-rate">0%</strong></span>
-          <span class="stat-chip">Reply Rate: <strong id="stat-reply-rate">0%</strong></span>
+          <span class="stat-chip stat-chip-secondary">Win Rate: <strong id="stat-win-rate">0%</strong></span>
+          <span class="stat-chip stat-chip-secondary">Reply Rate: <strong id="stat-reply-rate">0%</strong></span>
           <span class="stat-chip">Сделки: <strong id="stat-leads">0</strong></span>
           <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
-          <span class="stat-chip">Рассылки: <strong id="stat-campaigns">0</strong></span>
-          <span class="stat-chip">Напоминания: <strong id="stat-reminders">0</strong></span>
-          <button type="button" id="crm-user-btn" class="btn secondary sm" title="Сменить аккаунт или зарегистрировать пользователя">👤 Войти / Регистрация</button>
-          <button type="button" id="open-mcp-modal-btn" class="btn secondary sm" title="Подключить AI-агента по MCP">MCP для агентов</button>
-          <button type="button" id="toggle-view-mode" class="btn secondary sm">Все блоки</button>
+          <span class="stat-chip stat-chip-secondary">Рассылки: <strong id="stat-campaigns">0</strong></span>
+          <span class="stat-chip stat-chip-secondary">Напоминания: <strong id="stat-reminders">0</strong></span>
+          <button type="button" id="crm-user-btn" class="btn secondary sm topbar-duplicate-btn" title="Сменить аккаунт или зарегистрировать пользователя">👤 Войти / Регистрация</button>
+          <button type="button" id="open-mcp-modal-btn" class="btn ghost sm" title="Подключить AI-агента по MCP">MCP</button>
+          <button type="button" id="toggle-view-mode" class="btn ghost sm">Все блоки</button>
         </div>
       </div>
 
@@ -328,15 +328,20 @@
                 <option value="due_followup">Пора фоллоу-апить</option>
               </select>
             </label>
-            <button type="button" class="btn secondary sm" id="quick-waiting-our-answer-btn" title="Показать 129 лидов, которые написали последними и ждут нашего ответа">🔥 Ждут ответа: <strong id="quick-waiting-count">129</strong></button>
-            <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
-            <button type="button" class="btn secondary sm" id="board-select-all-btn">Выбрать все</button>
-            <button type="button" class="btn secondary sm" id="board-export-csv-btn">Экспорт CSV</button>
-            <button type="button" class="btn secondary sm" id="board-merge-dups-btn">Слияние дублей</button>
-            <button type="button" class="btn secondary sm" id="board-airtable-sync-btn">Синхронизировать с Airtable</button>
+            <button type="button" class="btn secondary sm" id="quick-waiting-our-answer-btn" title="Показать лидов, которые написали последними и ждут нашего ответа">🔥 Ждут ответа: <strong id="quick-waiting-count">129</strong></button>
             <button type="button" class="btn secondary sm" id="add-stage-btn">+ Стадия</button>
-            <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Виды</button>
             <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
+            <details class="toolbar-more-menu" id="board-more-menu">
+              <summary class="btn secondary sm">⋯ Ещё</summary>
+              <div class="toolbar-more-popover">
+                <button type="button" class="btn secondary sm" id="board-airtable-sync-btn">Синхронизировать с Airtable</button>
+                <button type="button" class="btn secondary sm sheet-only-btn" id="open-views-popup" aria-expanded="false">Сохранённые виды</button>
+                <button type="button" class="btn secondary sm" id="board-select-all-btn">Выбрать все</button>
+                <button type="button" class="btn secondary sm" id="board-export-csv-btn">Экспорт CSV</button>
+                <button type="button" class="btn secondary sm" id="board-merge-dups-btn">Слияние дублей</button>
+                <button type="button" class="btn ghost sm" id="reset-view">Сбросить</button>
+              </div>
+            </details>
             <div id="views-popup-box" class="views-popup-box" data-popup-box="views">
               <div class="popup-box-head sheet-only-flex">
                 <strong>Сохранённые виды</strong>
@@ -1045,10 +1050,17 @@
             <span id="airtable-status-badge" class="badge b-new">Airtable · SoftUGC</span>
           </div>
           <div class="row leads-toolbar-actions">
+            <input type="search" id="leads-quick-search" class="leads-quick-search" placeholder="Поиск по имени, @username, компании, заметке..." aria-label="Быстрый фильтр лидов">
+            <a href="#crm-properties" data-sheet-link="crm-properties" class="btn secondary sm">Поля CRM</a>
             <button type="button" id="airtable-sync-btn" class="btn secondary sm">Синхронизировать с Airtable</button>
-            <button type="button" id="leads-select-all-btn" class="btn secondary sm">Выбрать все в фильтре</button>
-            <button type="button" id="leads-export-csv-btn" class="btn secondary sm">Экспорт CSV</button>
-            <button type="button" id="leads-merge-dups-btn" class="btn secondary sm">Слияние дублей</button>
+            <details class="toolbar-more-menu" id="leads-more-menu">
+              <summary class="btn secondary sm">⋯ Действия</summary>
+              <div class="toolbar-more-popover">
+                <button type="button" id="leads-select-all-btn" class="btn secondary sm">Выбрать все в фильтре</button>
+                <button type="button" id="leads-export-csv-btn" class="btn secondary sm">Экспорт CSV</button>
+                <button type="button" id="leads-merge-dups-btn" class="btn secondary sm">Слияние дублей</button>
+              </div>
+            </details>
             <button type="button" id="open-lead-popup" class="btn primary sm sheet-only-btn">+ Завести карточку</button>
           </div>
         </div>
@@ -1146,14 +1158,14 @@
               <thead>
                 <tr>
                   <th class="bulk-check-col"><input type="checkbox" id="leads-select-all-checkbox" aria-label="Выбрать все лиды"></th>
-                  <th>Имя</th>
-                  <th>Username</th>
-                  <th class="num">Telegram id</th>
-                  <th class="num">Телефон</th>
-                  <th>Статус</th>
-                  <th>Заметка</th>
-                  <th>Следующий шаг</th>
-                  <th>Напоминание</th>
+                  <th class="col-lead-name">Лид и поля CRM</th>
+                  <th class="col-lead-user">Контакт</th>
+                  <th class="num col-tg-id">Telegram id</th>
+                  <th class="num col-lead-phone">Телефон</th>
+                  <th class="col-lead-status">Статус и касание</th>
+                  <th class="col-lead-note">Заметка / Контекст</th>
+                  <th class="col-lead-step">Следующий шаг</th>
+                  <th class="col-lead-rem">Напоминание</th>
                 </tr>
               </thead>
               <tbody id="lead-rows"></tbody>
@@ -1651,16 +1663,19 @@
         <div class="pane-head">
           <div class="pipeline-title-row">
             <h2 id="crm-properties-title">Поля CRM: Лиды</h2>
-            <span class="badge b-new">Кастомные атрибуты карточек</span>
+            <span class="badge b-new">В карточке лида и таблице «Лиды»</span>
+          </div>
+          <div class="row">
+            <a href="#leads" data-sheet-link="leads" class="btn secondary sm">← К таблице Лиды</a>
           </div>
         </div>
         <div class="tool-card-layout">
           <div class="surface-subcard stack">
-            <h3>Создать новое поле (New property)</h3>
-            <p class="hint">Кастомные поля доступны во всех карточках лидов, фильтрах воронки и переменных рассылки.</p>
+            <h3>Добавить своё поле CRM</h3>
+            <p class="hint">Любое созданное здесь поле сразу появляется внутри карточки каждого лида (раздел «Поля CRM и сделка»), отображается в колонке «Лид и поля CRM» в таблице и доступно как переменная в рассылках.</p>
             <form id="crm-property-create-form" class="stack">
               <label for="crm-prop-name">Название поля
-                <input id="crm-prop-name" type="text" autocomplete="off" placeholder="Например: MRR, Ссылка на Pitch Deck, Индустрия">
+                <input id="crm-prop-name" type="text" autocomplete="off" placeholder="Например: Ссылка на Pitch Deck, Индустрия, Telegram-канал">
               </label>
               <label for="crm-prop-type">Тип поля
                 <select id="crm-prop-type">
@@ -1680,7 +1695,7 @@
           </div>
           <div class="surface-subcard stack">
             <div class="subcard-head">
-              <h3>Активные поля воркспейса</h3>
+              <h3>Все поля карточки лида (Системные и Кастомные)</h3>
               <span id="crm-properties-count-badge" class="badge b-ok">0 полей</span>
             </div>
             <div id="crm-properties-list" class="tool-results-list"></div>
@@ -1988,6 +2003,6 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261108v5"></script>
+  <script src="/static/app.js?v=20261108v10"></script>
 </body>
 </html>
