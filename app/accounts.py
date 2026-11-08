@@ -210,9 +210,13 @@ def delete_account(conn, account_id: int) -> dict:
             if abs_p.exists() and abs_p.is_file():
                 if _inspect_telethon_session(session_path) is not None:
                     backup_p = abs_p.parent / f"backup_{abs_p.name}"
-                    shutil.copy2(abs_p, backup_p)
+                    shutil.move(str(abs_p), str(backup_p))
                 else:
                     abs_p.unlink()
+            for suffix in ("-journal", "-wal", "-shm"):
+                sidecar = abs_p.with_name(abs_p.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
         except Exception:
             pass
     return {"deleted": True, "id": int(account_id)}
@@ -427,25 +431,16 @@ def restore_disk_sessions(conn) -> int:
                     )
             except Exception:
                 pass
-            if row.get("status") != "connected":
+            if row.get("status") != "connected" and row.get("health") not in (
+                "unauthorized",
+                "banned",
+                "frozen",
+            ):
                 conn.execute(
                     """
                     UPDATE accounts
                     SET status = 'connected', health = COALESCE(health, 'active'),
                         last_error = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now, account_id),
-                )
-                restored += 1
-            elif (
-                row.get("health") == "offline"
-                and "InvokeWithLayerRequest" in str(row.get("last_error") or "")
-            ):
-                conn.execute(
-                    """
-                    UPDATE accounts
-                    SET health = 'active', last_error = NULL, updated_at = ?
                     WHERE id = ?
                     """,
                     (now, account_id),
@@ -563,18 +558,36 @@ async def start_login(
         account_id = int(existing_connected["id"])
         old_sess_rel = existing_connected["session_path"] or f"data/sessions/{account_id}.session"
         old_sess = resolve_session(old_sess_rel)
-        has_live_sess = (
+        is_dead_health = str(existing_connected.get("health") or "") in (
+            "unauthorized",
+            "banned",
+            "frozen",
+        )
+        has_live_sess = not is_dead_health and (
             _inspect_telethon_session(old_sess_rel) is not None
             or _inspect_whatsmeow_db(old_sess_rel) is not None
         )
+        if gateway is not None and hasattr(gateway, "_close"):
+            try:
+                await gateway._close(old_sess_rel)
+            except Exception:
+                pass
         if old_sess.exists() and not has_live_sess:
             try:
-                old_sess.unlink()
+                if _inspect_telethon_session(old_sess_rel) is not None:
+                    backup_p = old_sess.parent / f"backup_{old_sess.name}"
+                    shutil.move(str(old_sess), str(backup_p))
+                else:
+                    old_sess.unlink()
+                for suffix in ("-journal", "-wal", "-shm"):
+                    sidecar = old_sess.with_name(old_sess.name + suffix)
+                    if sidecar.exists():
+                        sidecar.unlink()
             except Exception:
                 pass
         if not has_live_sess:
             conn.execute(
-                "UPDATE accounts SET session_blob = NULL WHERE id = ?",
+                "UPDATE accounts SET session_blob = NULL, health = NULL, last_error = NULL WHERE id = ?",
                 (account_id,),
             )
     else:

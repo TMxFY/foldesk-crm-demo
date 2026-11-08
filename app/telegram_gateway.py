@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
@@ -706,15 +707,16 @@ class TelethonGateway(TelegramGateway):
         first_country = "kz" if primary_country == "ru" else primary_country
         stem = Path(str(session_path or "")).stem or "acc"
         candidates: list[str] = []
-        for idx, iso in enumerate((first_country, "kz", "nl", "de"), start=1):
+        # Rotate sticky session IDs within the SAME country so Telegram never sees cross-country IP jumps
+        for idx in (1, 2):
             fb_sid = make_nodemaven_sid(f"{stem}fb{idx}")
             if "-country-" in primary_url and "-sid-" in primary_url:
-                fb = re.sub(r"-country-[a-z]{2}-", f"-country-{iso}-", primary_url)
+                fb = re.sub(r"-country-[a-z]{2}-", f"-country-{first_country}-", primary_url)
                 fb = re.sub(r"-sid-[a-zA-Z0-9_]+", f"-sid-{fb_sid}", fb)
             else:
                 fb = build_nodemaven_proxy_url(
                     account_key=f"{stem}fb{idx}",
-                    preset=iso,
+                    preset=first_country,
                 )
             if fb and fb != primary_url and fb not in candidates:
                 candidates.append(fb)
@@ -744,10 +746,16 @@ class TelethonGateway(TelegramGateway):
 
         for idx, candidate_url in enumerate(candidate_urls):
             proxy_tuple = _parse_proxy_for_telethon(candidate_url)
-            kwargs: dict = {}
+            kwargs: dict = {
+                "device_model": "MacBookPro18,3",
+                "system_version": "macOS 14.5",
+                "app_version": "10.12",
+                "lang_code": "en",
+                "system_lang_code": "en-US",
+            }
             if proxy_tuple:
                 kwargs["proxy"] = proxy_tuple
-                kwargs["timeout"] = 6
+                kwargs["timeout"] = 15
                 kwargs["connection_retries"] = 2
                 kwargs["retry_delay"] = 1
             client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
@@ -763,6 +771,9 @@ class TelethonGateway(TelegramGateway):
                     await client.disconnect()
                 except Exception:
                     pass
+                # Never retry across fallback proxies when the session auth_key itself is rejected by Telegram
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned"):
+                    break
 
         if last_exc is not None:
             raise last_exc
@@ -780,17 +791,34 @@ class TelethonGateway(TelegramGateway):
             except Exception:
                 pass
 
+    def _reset_corrupted_session_file(self, session_path: str) -> None:
+        try:
+            abs_p = resolve_session(session_path)
+            if abs_p.exists() and abs_p.is_file():
+                backup_p = abs_p.parent / f"backup_{abs_p.name}"
+                shutil.move(str(abs_p), str(backup_p))
+            for suffix in ("-journal", "-wal", "-shm"):
+                sidecar = abs_p.with_name(abs_p.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+        except Exception:
+            pass
+
     async def request_code(self, phone: str, session_path: str) -> str:
         async with self._session_lock(session_path):
-            client, _owned = await self._open(session_path)
-            try:
-                sent = await client.send_code_request(phone)
-                return sent.phone_code_hash
-            except GatewayError:
-                raise
-            except Exception as exc:
-                await self._close(session_path)
-                raise GatewayError(str(exc) or "Не удалось отправить код") from exc
+            for attempt in range(2):
+                try:
+                    client, _owned = await self._open(session_path)
+                    sent = await client.send_code_request(phone)
+                    return sent.phone_code_hash
+                except GatewayError:
+                    raise
+                except Exception as exc:
+                    await self._close(session_path)
+                    if attempt == 0 and _classify_session_error(exc).get("health") == "unauthorized":
+                        self._reset_corrupted_session_file(session_path)
+                        continue
+                    raise GatewayError(str(exc) or "Не удалось отправить код") from exc
 
     async def confirm_code(
         self, phone: str, code: str, phone_code_hash: str, session_path: str
