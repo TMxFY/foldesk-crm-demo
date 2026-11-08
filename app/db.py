@@ -674,11 +674,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_peer ON dialogs(peer_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_lead ON dialogs(lead_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_uname ON dialogs(username COLLATE NOCASE)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_user_lead ON dialogs(lead_id) WHERE peer_type = 'user'")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_user_peer ON dialogs(peer_id) WHERE peer_type = 'user'")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_user_uname ON dialogs(lower(username)) WHERE peer_type = 'user' AND username IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_user_phone ON dialogs(phone) WHERE peer_type = 'user' AND phone IS NOT NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_dlg_dir ON messages(dialog_id, direction, sent_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_camp ON campaign_recipients(campaign_id, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_lead ON campaign_recipients(lead_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_tg ON campaign_recipients(telegram_user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_uname ON campaign_recipients(username COLLATE NOCASE)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_lower_uname_nn ON campaign_recipients(lower(username)) WHERE username IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_phone_nn ON campaign_recipients(phone) WHERE phone IS NOT NULL")
     snippets_count = conn.execute("SELECT COUNT(*) FROM snippets").fetchone()[0]
     if snippets_count == 0:
         user_mod = conn.execute(

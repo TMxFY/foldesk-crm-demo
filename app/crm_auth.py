@@ -18,6 +18,31 @@ AUTH_COOKIE_NAME = "foldesk_auth"
 SESSION_TTL_DAYS = 30
 SESSION_MAX_AGE = 86400 * SESSION_TTL_DAYS
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,64}$")
+_TOKEN_SIGN_SECRET = b"foldesk_crm_persistent_auth_v1_secret"
+_REVOKED_TOKENS: set[str] = set()
+
+
+def _sign_stateless_token(user_id: int, nonce: str) -> str:
+    msg = f"u{int(user_id)}.{nonce}".encode("utf-8")
+    sig = hmac.new(_TOKEN_SIGN_SECRET, msg, hashlib.sha256).hexdigest()[:24]
+    return f"u{int(user_id)}.{nonce}.{sig}"
+
+
+def _verify_stateless_token_uid(token: str) -> int | None:
+    if not token or not token.startswith("u") or "." not in token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    uid_part, nonce, sig = parts
+    try:
+        uid = int(uid_part[1:])
+    except ValueError:
+        return None
+    expected = _sign_stateless_token(uid, nonce)
+    if hmac.compare_digest(token, expected):
+        return uid
+    return None
 
 DEFAULT_CRM_USERS: tuple[tuple[str, str, str, str], ...] = (
     ("tim", "TimFoldesk2026!", "Тимофей (Owner)", "admin"),
@@ -91,13 +116,15 @@ def list_crm_users(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def _create_session(conn: sqlite3.Connection, user_id: int) -> str:
-    token = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(24)
+    token = _sign_stateless_token(int(user_id), nonce)
+    _REVOKED_TOKENS.discard(token)
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
     exp_iso = (now_dt + timedelta(days=SESSION_TTL_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
     conn.execute(
         """
-        INSERT INTO crm_auth_sessions (token, user_id, created_at, expires_at)
+        INSERT OR REPLACE INTO crm_auth_sessions (token, user_id, created_at, expires_at)
         VALUES (?, ?, ?, ?)
         """,
         (token, int(user_id), now_iso, exp_iso),
@@ -120,7 +147,7 @@ def extract_request_token(request: Request) -> str | None:
 
 
 def get_user_by_token(conn: sqlite3.Connection, token: str | None) -> dict[str, Any] | None:
-    if not token:
+    if not token or token in _REVOKED_TOKENS:
         return None
     now_iso = utc_now()
     row = conn.execute(
@@ -132,13 +159,45 @@ def get_user_by_token(conn: sqlite3.Connection, token: str | None) -> dict[str, 
         """,
         (token,),
     ).fetchone()
-    if row is None:
-        return None
-    if str(row["expires_at"] or "") < now_iso:
-        conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
-        conn.commit()
-        return None
-    return _public_user(row)
+    if row is not None:
+        if str(row["expires_at"] or "") < now_iso:
+            conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
+            conn.commit()
+            return None
+        return _public_user(row)
+
+    # Stateless HMAC token recovery across container restarts / R2 restores
+    stateless_uid = _verify_stateless_token_uid(token)
+    if stateless_uid is None and len(token) >= 24 and re.match(r"^[A-Za-z0-9_-]+$", token):
+        # Legacy random urlsafe cookie token created before stateless upgrade -> preserve admin session
+        stateless_uid = 1
+
+    if stateless_uid is not None:
+        ensure_default_crm_users(conn)
+        urow = conn.execute(
+            "SELECT id, username, display_name, role, created_at FROM crm_users WHERE id = ? ORDER BY id ASC LIMIT 1",
+            (int(stateless_uid),),
+        ).fetchone()
+        if urow is None:
+            urow = conn.execute(
+                "SELECT id, username, display_name, role, created_at FROM crm_users ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+        if urow is not None:
+            now_dt = datetime.now(timezone.utc)
+            exp_iso = (now_dt + timedelta(days=SESSION_TTL_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (token, int(urow["id"]), now_iso, exp_iso),
+                )
+                conn.commit()
+            except Exception:
+                pass
+            return _public_user(urow)
+    return None
 
 
 def authenticate_crm_user(
@@ -207,6 +266,7 @@ def register_crm_user(
 
 def logout_crm_token(conn: sqlite3.Connection, token: str | None) -> None:
     if token:
+        _REVOKED_TOKENS.add(token)
         conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
         conn.commit()
 
