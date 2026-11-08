@@ -69,7 +69,7 @@ def test_ten_accounts_get_unique_sticky_nodemaven_sessions(tmp_path):
         "+31612345109",
         "+14155550110",
     ]
-    expected_countries = ["us", "ru", "kz", "gb", "de", "ua", "ae", "fr", "nl", "us"]
+    expected_countries = ["us", "kz", "kz", "gb", "de", "ua", "ae", "fr", "nl", "us"]
 
     urls = []
     sids = set()
@@ -139,3 +139,48 @@ def test_gateway_resolves_nodemaven_and_api_endpoints(tmp_path):
         assert "sid-foldeskacc1" in p1
         assert "sid-foldeskacc2" in p2
         assert mask_proxy_url(p1).endswith("***@gate.nodemaven.com:1080")
+
+
+def test_telethon_open_falls_back_when_primary_nodemaven_peer_times_out(monkeypatch, tmp_path):
+    import asyncio
+    import telethon
+
+    gw = TelethonGateway()
+    sess_path = str(tmp_path / "25.session")
+    dead_ru_url = "socks5://nmuser-country-ru-sid-foldeskacc25-ttl-24h-filter-medium:secret@gate.nodemaven.com:1080"
+    gw.set_proxy(sess_path, dead_ru_url)
+
+    monkeypatch.setenv("NODEMAVEN_USER", "nmuser")
+    monkeypatch.setenv("NODEMAVEN_PASS", "secret")
+    monkeypatch.setenv("TG_API_ID", "2040")
+    monkeypatch.setenv("TG_API_HASH", "b18441a1ff607e10a989891a5462e627")
+
+    attempts = []
+
+    class DummyTelegramClient:
+        def __init__(self, session_name, api_id, api_hash, **kwargs):
+            self.proxy = kwargs.get("proxy")
+            self.connected = False
+
+        async def connect(self):
+            proxy_user = self.proxy[4] if self.proxy else ""
+            attempts.append(proxy_user)
+            if "-country-ru-" in proxy_user:
+                raise ConnectionError("Connection to Telegram failed 2 time(s)")
+            self.connected = True
+
+        def is_connected(self):
+            return self.connected
+
+        async def disconnect(self):
+            self.connected = False
+
+    monkeypatch.setattr(telethon, "TelegramClient", DummyTelegramClient)
+
+    client, _ = asyncio.run(gw._open(sess_path))
+    assert client.is_connected() is True
+    assert len(attempts) == 2
+    assert "-country-ru-" in attempts[0]
+    assert "-country-kz-" in attempts[1]
+    assert "-country-kz-" in gw._proxies[sess_path]
+

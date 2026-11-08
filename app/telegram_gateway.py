@@ -210,7 +210,9 @@ _PHONE_PREFIX_COUNTRIES = (
     ("995", "ge"),
     ("971", "ae"),
     ("77", "kz"),
-    ("7", "ru"),
+    # Direct MTProto TCP to Telegram DCs is blocked/throttled by TSPU on Russian residential ISPs;
+    # route +7 numbers via CIS Kazakhstan residential nodes by default.
+    ("7", "kz"),
     ("44", "gb"),
     ("49", "de"),
     ("33", "fr"),
@@ -696,28 +698,75 @@ class TelethonGateway(TelegramGateway):
             )
         return int(api_id), api_hash
 
+    def _fallback_nodemaven_urls(self, session_path: str, primary_url: str | None) -> list[str]:
+        if not primary_url or "nodemaven.com" not in primary_url:
+            return []
+        m = re.search(r"-country-([a-z]{2})-", primary_url)
+        primary_country = m.group(1) if m else "kz"
+        first_country = "kz" if primary_country == "ru" else primary_country
+        stem = Path(str(session_path or "")).stem or "acc"
+        candidates: list[str] = []
+        for idx, iso in enumerate((first_country, "kz", "nl", "de"), start=1):
+            fb_sid = make_nodemaven_sid(f"{stem}fb{idx}")
+            if "-country-" in primary_url and "-sid-" in primary_url:
+                fb = re.sub(r"-country-[a-z]{2}-", f"-country-{iso}-", primary_url)
+                fb = re.sub(r"-sid-[a-zA-Z0-9_]+", f"-sid-{fb_sid}", fb)
+            else:
+                fb = build_nodemaven_proxy_url(
+                    account_key=f"{stem}fb{idx}",
+                    preset=iso,
+                )
+            if fb and fb != primary_url and fb not in candidates:
+                candidates.append(fb)
+        return candidates
+
     async def _open(self, session_path: str):
         client = self._clients.get(session_path)
         if client is not None:
-            if not client.is_connected():
+            if client.is_connected():
+                return client, False
+            try:
                 await client.connect()
-            return client, False
+                return client, False
+            except Exception:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                self._clients.pop(session_path, None)
+                self._proxies.pop(session_path, None)
         from telethon import TelegramClient
 
         api_id, api_hash = self._credentials(session_path)
-        proxy_tuple = _parse_proxy_for_telethon(self._resolve_proxy(session_path))
-        kwargs = {"proxy": proxy_tuple} if proxy_tuple else {}
-        client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
-        try:
-            await client.connect()
-        except Exception:
+        primary_url = self._resolve_proxy(session_path)
+        candidate_urls = [primary_url] + self._fallback_nodemaven_urls(session_path, primary_url)
+        last_exc: Exception | None = None
+
+        for idx, candidate_url in enumerate(candidate_urls):
+            proxy_tuple = _parse_proxy_for_telethon(candidate_url)
+            kwargs: dict = {}
+            if proxy_tuple:
+                kwargs["proxy"] = proxy_tuple
+                kwargs["timeout"] = 6
+                kwargs["connection_retries"] = 2
+                kwargs["retry_delay"] = 1
+            client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
             try:
-                await client.disconnect()
-            except Exception:
-                pass
-            raise
-        self._clients[session_path] = client
-        return client, False
+                await client.connect()
+                if candidate_url and idx > 0:
+                    self._proxies[session_path] = candidate_url
+                self._clients[session_path] = client
+                return client, False
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+        if last_exc is not None:
+            raise last_exc
+        raise GatewayError("Не удалось подключиться к Telegram")
 
     async def _close(self, session_path: str) -> None:
         client = self._clients.pop(session_path, None)
