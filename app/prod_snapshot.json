@@ -13,10 +13,22 @@
       "color": "#38bdf8"
     },
     {
+      "key": "call_scheduled",
+      "label": "Созвон назначен",
+      "position": 3,
+      "color": "#a855f7"
+    },
+    {
       "key": "waiting",
       "label": "Ждём",
       "position": 4,
       "color": "#fbbf24"
+    },
+    {
+      "key": "on_hold",
+      "label": "На паузе",
+      "position": 5,
+      "color": "#64748b"
     },
     {
       "key": "won",
@@ -29,18 +41,6 @@
       "label": "Проигран",
       "position": 7,
       "color": "#f87171"
-    },
-    {
-      "key": "call_scheduled",
-      "label": "Созвон назначен",
-      "position": 3,
-      "color": "#a855f7"
-    },
-    {
-      "key": "on_hold",
-      "label": "На паузе",
-      "position": 5,
-      "color": "#64748b"
     }
   ],
   "accounts": [
@@ -193,31 +193,31 @@
       "note": null,
       "next_step": "Запустить публикацию",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://coinstats.app/",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 700,
       "currency": "USD",
       "company": "CoinStats",
       "niche": "Crypto",
       "offer_type": null,
       "offer_details": null,
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-30",
       "last_contacted": null,
       "airtable_record_id": "rec0qLWWkbGyLlIdw",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 13,
       "account_id": null,
-      "telegram_user_id": null,
+      "telegram_user_id": 312727500,
       "username": "tizswa",
       "name": "Lorenzo",
       "phone": null,
@@ -225,26 +225,26 @@
       "note": "Head of Growth в Denaria. Аутрич ушёл кофаундеру (@tizswa), тот переслал Lorenzo. Lorenzo сам предложил слот и встречу офлайн на connect event; не срослось. Созвон на субботу 10:00 GMT не подошёл: он в отпуске.\n\n10.10 попросил напомнить, чем мы занимаемся, 11.10 попросил примеры. Отправлены кейс XPLabs (80M views, 1.2M clicks, 400K installs, 170K connected wallets), сеть спикера (100M views/mo) и модель работы. Переписка на английском.",
       "next_step": "Им не подходит модель с фиксой и хоят просто за процент",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://denaria.app/",
-      "dialog_id": null,
+      "dialog_id": 1602,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1000,
       "currency": "USD",
       "company": "Denaria",
-      "niche": null,
+      "niche": "DeFi · Web3 / Crypto / TON",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Performance, no per-clip fee: клиент покрывает production cost, мы зарабатываем на CPA/revshare с трекинговой ссылки (депозиты). Min launch: 1,000 clips on a 10-account grid, первые ролики через 2 недели. Цена запуска ему не называлась.",
-      "monthly_value": 0,
+      "monthly_value": 800,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": "2026-10-11",
       "airtable_record_id": "rec1ulkQHvc5pl6ZP",
       "airtable_status": "Cancelled",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 14,
@@ -257,31 +257,31 @@
       "note": "Старый лид: оффер озвучивали ещё до нового прайсинга. CEO хорошо разбирается в трафике (gambling). ИИ обучали 1,5 года в закрытом контуре, результаты проверяют живые люди.\n\nПродукты: тень ~$20, астропрогноз $49, отношения $30+; плюс большой продукт.\n\nУчастники со стороны клиента: Виктория Чернова, Амелія Поплавко, Артём.\n\nВозражения: у нас нет кейсов в астрологии/нумерологии; Амелія опасается, что $700 уйдут впустую. Виктория считает, что подойдёт формат креатора, продвигающего продукт через себя (как в wellness).\n\nДоговор на ИП (РФ или Грузия). Аккаунты отдельные под клиента, при расторжении передаются клиенту вместе с данными и видео.",
       "next_step": "Запустить публикацию",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1200,
       "currency": "USD",
       "company": "Animus",
       "niche": "Астрология, нумерология, проработка тени (AI-продукты)",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Минимальный запуск: 500 видео/мес на 5 аккаунтов. $1,000 первый месяц, далее $800/мес. Плюс revshare 15% с продаж по UTM либо CPA (Артём предпочитает revshare). 2 недели подготовки не входят в месяц. Площадки: Instagram, только органика.",
-      "monthly_value": 0,
+      "monthly_value": 1245,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": null,
       "airtable_record_id": "rec3ipCI8zqYnXSJS",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 15,
-      "account_id": null,
-      "telegram_user_id": null,
+      "account_id": 33,
+      "telegram_user_id": 1073398750,
       "username": "T8moNNNaco",
       "name": "Thomas",
       "phone": null,
@@ -289,26 +289,26 @@
       "note": "Переписка на английском. Отвечает очень долго и невнятно. Запросил сайт и референсы, затем proposal. 17.09 спросил «so what do you suggest for us», ему предложили минимальный запуск и группу с фаундерами. После паузы 10.10 ответил: «I dont know yet, Too tired now sorry».\n\nСозвона не было.",
       "next_step": "Дожать ответ по офферу, предложить группу с фаундерами",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://www.guardiannn.ai",
-      "dialog_id": null,
+      "dialog_id": 1392,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 700,
       "currency": "USD",
       "company": "Guardiannn",
-      "niche": null,
+      "niche": "DeFi · Web3 / Crypto / TON",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Performance, no per-clip fee. Min launch: 1,000 clips on a 10-account grid, $700 first month, $535 from the second. Плюс CPA/revshare с трекинговой ссылки (депозиты). Первые ролики через 2 недели.",
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": "2026-10-10",
       "airtable_record_id": "rec4rUM8oVJ1kl752",
       "airtable_status": "In conversation",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 16,
@@ -321,26 +321,26 @@
       "note": null,
       "next_step": "Публиковать видео",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "Sumex.io",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 500,
       "currency": "USD",
       "company": "Sumex.io",
       "niche": "Crypto",
       "offer_type": null,
       "offer_details": null,
-      "monthly_value": 0,
+      "monthly_value": 500,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": null,
       "airtable_record_id": "rec8czxtWte8hRDUm",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 17,
@@ -353,7 +353,7 @@
       "note": "Нужно развивать YouTube, RuTube, Instagram, VK, TikTok и построить контент-завод. Изначально искали человека на должность за 80к + % с продаж.\n\nЕго ответ: «Ок. У меня сейчас рекламный бюджет более 2кк/мес, но я не горю желанием сливать бюджет на тесты. Какой минимальный бюджет нужен, чтобы протестировать ваш способ?»\n\nСозвона ещё не было.",
       "next_step": "Ждем обратную связь от него",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
@@ -372,7 +372,7 @@
       "last_contacted": null,
       "airtable_record_id": "rec9HSQ5RtUPtb4db",
       "airtable_status": "Offer sent",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 18,
@@ -385,14 +385,14 @@
       "note": null,
       "next_step": "Запустить публикацию",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://trysasha.ru/",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1200,
       "currency": "USD",
       "company": "Sasha AI",
       "niche": null,
@@ -404,7 +404,7 @@
       "last_contacted": null,
       "airtable_record_id": "recFmiVdQQCP7VaUc",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 19,
@@ -417,14 +417,14 @@
       "note": null,
       "next_step": "Запустить публикацию",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 700,
       "currency": "USD",
       "company": "Sumi Studio",
       "niche": null,
@@ -436,7 +436,7 @@
       "last_contacted": null,
       "airtable_record_id": "recGRjjhyQye3EhsL",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 20,
@@ -449,7 +449,7 @@
       "note": "Русская, живёт в США, гражданка США. Свои клиники и СПА в Нью-Йорке, сейчас закрывает их. Хочет запускать и продвигать beauty-продукты через social media и UGC. Instagram по ссылке ей ведут для продажи оборудования (для контекста).\n\nСозвона не было: общение в WhatsApp, в основном голосовыми.\n\nОткрытый вопрос от Влада: что с неё просить. Здесь и обычная услуга, и ведение аффилиат-проекта с нуля, и потенциал white-label продукта.",
       "next_step": "Показать рентабельность вложений",
       "created_at": "2026-11-05T04:25:03",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://www.instagram.com/irina_aesthetica_usa/reels/",
@@ -468,7 +468,7 @@
       "last_contacted": null,
       "airtable_record_id": "recH3qfnVuScK81fm",
       "airtable_status": "Cancelled",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 21,
@@ -481,26 +481,26 @@
       "note": "Отложил из-за бюджета: сначала 2 недели тестирует контент-завод с другим подрядчиком.\n\nПлатный трафик в Facebook подорожал, переходят на УБТ. Площадки: Reels, Shorts, TikTok. Планируют около 20 аккаунтов, потом оставить работающие. Сам предложил модель: оплата расходов на генерацию плюс процент от чистой прибыли. Аккаунты создают на айфонах, уникализация и автопостинг через сервис.\n\nПредупредили: Instagram ограничивает аккаунты, подключённые к автопостингу. Его аккаунты можно подключить к софту, но тогда за блокировки не отвечаем.",
       "next_step": "Сделать 2 видео с его продуктом",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1000,
       "currency": "USD",
       "company": null,
       "niche": "Дропшиппинг на Shopify",
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Минимальный запуск: 500 видео/мес на 5 аккаунтов, около $1000 первый месяц, далее $535/мес. Альтернатива: $2.5 за оригинальное видео 45–60 сек, уникализация около 30 центов; 100 видео в месяц = $250, отдаём в Telegram или на диск.",
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": null,
       "next_follow_up": "2026-10-24",
       "last_contacted": null,
       "airtable_record_id": "recJrrVVDHY2KBo55",
       "airtable_status": "On hold",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 22,
@@ -513,14 +513,14 @@
       "note": null,
       "next_step": "Доделать ему софт",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "Olympost.io",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 4000,
       "currency": "USD",
       "company": "Olympost",
       "niche": "AI UGC",
@@ -532,7 +532,7 @@
       "last_contacted": null,
       "airtable_record_id": "recQdDVQDqLCf0Y54",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 23,
@@ -545,26 +545,26 @@
       "note": "Через 7 дней после созвона написал: «Мы точно будем использовать, придем немного позднее, в данный момент у нас немного другая задача - отладить отдел продаж. После этого будем делать маркетинг».\n\nСейчас тестирует Яндекс.Директ, продажи через заявку и продажника. Целевая стоимость лида 500–600 ₽, 1000 ₽ уже не укладывается в экономику. У нас нет данных по таким чекам.\n\nКонтент: один реалистичный AI-аватар, говорящая голова, кейсы и бесплатный урок за контакт через кодовое слово. Нельзя обещать доход, реальные кейсы только с согласия покупателей.\n\nВторой его проект (menclub.ai, дейтинг) не берём как 18+.",
       "next_step": "Написал, что сейчас не актуально",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://real-business.pro",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1000,
       "currency": "USD",
       "company": "Real-business.pro",
       "niche": "Инфопродукт: курс 30 000 ₽ (позже 50 000 ₽)",
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Минимальный запуск: 500 видео на 5 аккаунтов, $1000 первый месяц, далее $535/мес. Revshare 10–15–20% или CPA (пример: $5 за забронированный звонок). Альтернатива: поштучно $2.5 за видео, от 100 в месяц, публикует сам. Предложен тест: 100 видео на один аккаунт за $250.",
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": null,
       "next_follow_up": "2026-10-27",
       "last_contacted": null,
       "airtable_record_id": "recRefK6gMP2GJg5r",
       "airtable_status": "Cancelled",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 24,
@@ -577,26 +577,26 @@
       "note": "С первого сообщения согласился на созвон и прислал календарь. На первый созвон не пришёл («Sorry mate just saw it»), попросил перебронировать на неделе. Новый слот забронирован. Переписка на английском.\n\nUPD: Француз, сейчас в Нью-Йорке. Он сказал, что мы начнем работать, но сейчас у них в продукте есть только Arbitrum и Robinhood, и к декабрю-январю будут все chains и тогда можно будет начинать запускать маркетинг. Они таргетят LP, finance людей и им нужен Twitter и LinkedIn как основные каналы дистрибуции. Еще он сказал, если нужна помощь сейчас, то он может помочь продвинуть нас в большое коммьюнити FR дропшипперов, ecom, affiliate, online marketing, сказал им понравится продукт наш. Также я создам группу с ним и скину все материалы, договор и КП туда",
       "next_step": "Фоллоу апнуть в декабре-январе",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://t3tris.finance",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1000,
       "currency": "USD",
       "company": "T3tris",
       "niche": "Crypto",
       "offer_type": "[\"Performance\"]",
       "offer_details": null,
-      "monthly_value": 0,
+      "monthly_value": 600,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-12-01",
       "last_contacted": null,
       "airtable_record_id": "recSZ6irsL2LlH1kI",
       "airtable_status": "On hold",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 25,
@@ -609,7 +609,7 @@
       "note": "Сначала отказался («мне живые надо»), 08.10 вернулся сам: сомневается, получится ли через ИИ и можно ли вообще рекламировать пептиды. На вопрос, легальны ли и протестированы ли они, ответил: «ну у меня не такие». Категорию продукта (БАД, косметика, исследовательское вещество) не уточнил.\n\n09.10: интересно, но не понимает, как это будет выглядеть. 10.10 пообещали сделать тестовые видео за сегодня-завтра, он ответил «Ок».\n\nСозвона не было.",
       "next_step": "Сделать и отправить несколько тестовых видео",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://getpeptides.ru/",
@@ -628,7 +628,7 @@
       "last_contacted": "2026-10-10",
       "airtable_record_id": "recVfkYmtXGceK3Ee",
       "airtable_status": "In conversation",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 26,
@@ -641,7 +641,7 @@
       "note": null,
       "next_step": "Дать ответ по цене за видео",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://www.instagram.com/boostlinee/",
@@ -660,7 +660,7 @@
       "last_contacted": null,
       "airtable_record_id": "recWdxn8m3gEIUYjg",
       "airtable_status": "Offer sent",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 27,
@@ -673,26 +673,26 @@
       "note": "11.10 написал: пока сам тестит товары, с прежними товарами работать прекратил, дать в работу и описать ТЗ нечего. «Я обращусь».\n\nСозвон 30.09 сорвался, перенесли на 01.10. 08.10 прислал референс-рилс и спросил про уровни видео; ответили, что форматы с физическими товарами собираем. Товар для демо так и не прислал.",
       "next_step": "Ждать, пока сам определится с товаром; напомнить о себе позже",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 100,
       "currency": "USD",
       "company": null,
       "niche": "Дропшиппинг, физические товары",
       "offer_type": "[\"Per-video\"]",
       "offer_details": "Поштучно: ролики до 15 сек, около 100 шт в месяц, примерно $1 за ролик. Хотел сначала тест на 20 роликов. Изначально озвучены и $2 за 60 сек, и performance (500 видео, 5 аккаунтов, $1000 / $535).",
-      "monthly_value": 0,
+      "monthly_value": 100,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-27",
       "last_contacted": "2026-10-11",
       "airtable_record_id": "recXpCOIHM7L8FtS3",
       "airtable_status": "On hold",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 28,
@@ -705,14 +705,14 @@
       "note": null,
       "next_step": "Ждем решения команды",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "qrme.su",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 2000,
       "currency": "USD",
       "company": "QRME",
       "niche": "AI платофрма",
@@ -724,7 +724,7 @@
       "last_contacted": null,
       "airtable_record_id": "recblLOt6ox63VDRY",
       "airtable_status": "Offer sent",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 29,
@@ -737,26 +737,26 @@
       "note": "Очень быстрый и хороший",
       "next_step": "Ждем оплату по договору",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1200,
       "currency": "USD",
       "company": "STIRALITI",
       "niche": "Пятновыводитель",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Минимальный запуск: 500 видео/мес на 5 аккаунтов. $1000 первый месяц, далее $800/мес. Плюс $150 CPA за каждые 1000 брендовых запросов поверх 15000. Площадки: Instagram",
-      "monthly_value": 0,
+      "monthly_value": 1245,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-30",
       "last_contacted": null,
       "airtable_record_id": "reccUWJWveKMyjMB2",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 30,
@@ -769,7 +769,7 @@
       "note": "КП отправлено 01.10, ответил «посмотрю» и с тех пор молчит.\n\nСъёмок сейчас нет. Нужна контент-воронка: UGC или до/после (ремонт, комната с мебелью). Ориентир 200–300 видео в месяц, комфортно до 500–1000. В первые месяцы продаж не ждёт, задача — охваты.\n\nДоговорённости с созвона: старт с поштучной модели, минимум 5 аккаунтов, заливку делаем мы со своего IP, аккаунты принадлежат клиенту. 3–4 рилса в день в основной профиль, остальное в триал-рилсы. Успешный аккаунт можно сделать основным аккаунтом компании.",
       "next_step": "Сделать пару видео с его продуктом",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
@@ -788,7 +788,7 @@
       "last_contacted": "2026-10-01",
       "airtable_record_id": "receqmutlIsxd1RpM",
       "airtable_status": "Offer sent",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 31,
@@ -801,26 +801,26 @@
       "note": "Фаундер crmchat.ai, через который мы сами делаем рассылку. 23.09: докручивают продукт для Web3-аудитории (ИИ для поиска Web3-лидов), ориентир готовности — середина октября, тогда можно вернуться. Просил ещё примеры.\n\nВозражения: у них B2B, сомневается в релевантности опыта с consumer-приложениями. Низкий trust: нет публичной информации о команде. Просил ссылки на аккаунты клиентов из кейсов (аккаунты под NDA, отправляли сами видео).\n\nСозвона не было, всё в переписке.",
       "next_step": "Отправить ещё примеры и вернуться после релиза продукта",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://crmchat.ai",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 700,
       "currency": "USD",
       "company": "CRMchat",
       "niche": "B2B SaaS: CRM для Telegram, Web3-аудитория",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Performance без оплаты за ролик. Минимальный запуск: 1000 роликов на сетке из 10 аккаунтов, $700 первый месяц, далее $535/мес, плюс CPA/revshare по UTM. Запуск через 2 недели после договора.",
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-18",
       "last_contacted": "2026-09-23",
       "airtable_record_id": "recgBfqdRneQ2N9ui",
       "airtable_status": "On hold",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 32,
@@ -833,26 +833,26 @@
       "note": "28.09 написал: «Вернусь к Вам. Сейчас акцент на другом. Этот вариант интересен будет под подготовку текстовых рилсов. Сейчас занимаюсь подготовкой презентационных роликов».\n\nНа странице один продукт, готовится запуск рекламы. Спрашивал, что входит в $2.5, что входит в себестоимость, когда оплата и какие гарантии, как отслеживать клиентов с наших роликов. Созвон предлагали, не состоялся.\n\nВ заметке Влада дата указана как 25.08, в переписке 28.09.",
       "next_step": "Вернуться, когда закончит презентационные ролики",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://neohive.net",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 735,
       "currency": "USD",
       "company": "Neohive",
       "niche": null,
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Вариант 1: поштучно от 100 видео/мес по $2.5 за 60 сек (готовое видео с субтитрами). Вариант 2: performance, 500 видео/мес на 5 аккаунтов, $735 первый месяц, далее $535/мес, плюс revshare 15–20% или CPA. Трекинг через UTM-ссылку.",
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-27",
       "last_contacted": "2026-09-28",
       "airtable_record_id": "reclVUf8JmLQKoQGz",
       "airtable_status": "On hold",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 33,
@@ -865,26 +865,26 @@
       "note": "05.10 написал: «Через 2-3 недели можно будет потестить».\n\nСпрашивал, делаем ли мы персон (да: и случайных людей, и фиксированных персон). Сразу отсёк «абуз с уникализацией на 100 акков за $0.6»: ему нужны оригинальные видео. Спросил про опыт в health and beauty, кейсы отправлены.\n\nСозвона не было, всё в переписке.",
       "next_step": "Написал, что пока не актуально",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 1000,
       "currency": "USD",
       "company": null,
       "niche": "Health & beauty",
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Вариант 1: поштучно от 100 видео/мес по $2 за 60 сек. Вариант 2: performance, 500 видео/мес на 5 аккаунтов, $1000 первый месяц, далее $535/мес, плюс revshare 10–20% или CPA.",
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-11-15",
       "last_contacted": "2026-10-05",
       "airtable_record_id": "recoeCK3R2I3ijpXu",
       "airtable_status": "On hold",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 34,
@@ -897,26 +897,26 @@
       "note": null,
       "next_step": "Запустить публикацию",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "From-China.pro",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 700,
       "currency": "USD",
       "company": "From-China.pro",
       "niche": "Импорт товаров из Китая",
       "offer_type": null,
       "offer_details": null,
-      "monthly_value": 0,
+      "monthly_value": 535,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": null,
       "airtable_record_id": "recogBYONCCpqJdOw",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 35,
@@ -929,7 +929,7 @@
       "note": null,
       "next_step": "Улучшить мокапы для его продукта",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": null,
@@ -948,7 +948,7 @@
       "last_contacted": null,
       "airtable_record_id": "recu2rST157qTXfcy",
       "airtable_status": "In conversation",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     },
     {
       "id": 36,
@@ -961,26 +961,26 @@
       "note": null,
       "next_step": "Показать 10+10 тестовых видео",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50.1",
+      "updated_at": "2026-11-09T09:41:16",
       "description": null,
       "email": null,
       "url": "https://www.indg.vc/",
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 0,
+      "amount": 4394,
       "currency": "USD",
       "company": "Indigo VC",
       "niche": "Gaming",
       "offer_type": "[\"Custom project\"]",
       "offer_details": "Мы делаем им видео на их игры в двух форматах (реальный стример с летсплеем, летсплей с озвучкой) на TikTok, Instagram, YouTube.",
-      "monthly_value": 0,
+      "monthly_value": 4090,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-30",
       "last_contacted": null,
       "airtable_record_id": "recvDbKpkSrikbnnn",
       "airtable_status": "Signed",
-      "airtable_synced_at": "2026-11-05T04:26:50"
+      "airtable_synced_at": "2026-11-09T09:41:16"
     }
   ],
   "calendar_events": [
@@ -998,7 +998,7 @@
       "source": "airtable_task",
       "external_id": "rec4Fa3rKDLkdMQu9",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 2,
@@ -1014,7 +1014,7 @@
       "source": "airtable_task",
       "external_id": "rec4OhEVFaNmxCz5Q",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 3,
@@ -1030,7 +1030,7 @@
       "source": "airtable_task",
       "external_id": "rec53UESNP2BFkTx1",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 4,
@@ -1046,7 +1046,7 @@
       "source": "airtable_task",
       "external_id": "rec74xqoVrEZ3P4Ss",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 5,
@@ -1062,7 +1062,7 @@
       "source": "airtable_task",
       "external_id": "rec8ajpXseuC1zJoP",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 6,
@@ -1078,7 +1078,7 @@
       "source": "airtable_task",
       "external_id": "recAOS75i3l7u2p9c",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 7,
@@ -1094,7 +1094,7 @@
       "source": "airtable_task",
       "external_id": "recEgRo9PMcCIYm4v",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 8,
@@ -1110,7 +1110,7 @@
       "source": "airtable_task",
       "external_id": "recI2U48xeHQ3daLC",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 9,
@@ -1126,7 +1126,7 @@
       "source": "airtable_task",
       "external_id": "recLtqEtpGiXTC3Xv",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 10,
@@ -1142,7 +1142,7 @@
       "source": "airtable_task",
       "external_id": "recPHyCVRlrGkulKQ",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 11,
@@ -1158,7 +1158,7 @@
       "source": "airtable_task",
       "external_id": "recSIcdLZEjpTKNIb",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 12,
@@ -1174,7 +1174,7 @@
       "source": "airtable_task",
       "external_id": "recVSkG3UWrWBEwzX",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 13,
@@ -1190,7 +1190,7 @@
       "source": "airtable_task",
       "external_id": "recWOw2rIvXSIKh1r",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 14,
@@ -1206,7 +1206,7 @@
       "source": "airtable_task",
       "external_id": "recXOkVj3ogm2Nr4Q",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 15,
@@ -1222,7 +1222,7 @@
       "source": "airtable_task",
       "external_id": "recdnpZE788I8O7xR",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 16,
@@ -1238,7 +1238,7 @@
       "source": "airtable_task",
       "external_id": "recenUS5p3OMYoNqZ",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 17,
@@ -1254,7 +1254,7 @@
       "source": "airtable_task",
       "external_id": "rech7nE7JJaPMUJwQ",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 18,
@@ -1270,7 +1270,7 @@
       "source": "airtable_task",
       "external_id": "reclS833QwHYXfOYf",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 19,
@@ -1286,7 +1286,7 @@
       "source": "airtable_task",
       "external_id": "recmfGJQsptSlSGcN",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 20,
@@ -1302,7 +1302,7 @@
       "source": "airtable_task",
       "external_id": "recr1YSOPuVXxHTRe",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 21,
@@ -1318,7 +1318,7 @@
       "source": "airtable_task",
       "external_id": "recvBsAoVXH1sCVyk",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 22,
@@ -1334,7 +1334,7 @@
       "source": "airtable_task",
       "external_id": "recxTNgG7FczBoI8L",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 23,
@@ -1350,7 +1350,7 @@
       "source": "airtable_task",
       "external_id": "recyNWmNYQcocbm1W",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     },
     {
       "id": 24,
@@ -1366,7 +1366,7 @@
       "source": "airtable_project",
       "external_id": "recSeYKnRmFc736CH",
       "created_at": "2026-11-05T04:26:50",
-      "updated_at": "2026-11-05T04:26:50"
+      "updated_at": "2026-11-09T09:41:16"
     }
   ],
   "dialogs": [],
@@ -1954,6 +1954,390 @@
       "title": "Импортирован из Airtable (Signed)",
       "meta_json": "{\"airtable_record_id\": \"recvDbKpkSrikbnnn\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
       "created_at": "2026-11-05T04:26:50"
+    },
+    {
+      "id": 596,
+      "lead_id": 22,
+      "event_type": "reply_received",
+      "title": "Входящее сообщение от клиента: «Влаааааад»",
+      "meta_json": "{\"account_id\": 27, \"peer_id\": 1029830708, \"username\": \"Dangerousmictor3000\", \"stopped_recipients\": 0, \"campaign_ids\": [], \"old_status\": \"won\", \"new_status\": \"won\", \"preview\": \"Влаааааад\"}",
+      "created_at": "2026-11-08T13:58:30"
+    },
+    {
+      "id": 598,
+      "lead_id": 12,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 700 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 599,
+      "lead_id": 12,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"rec0qLWWkbGyLlIdw\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 600,
+      "lead_id": 13,
+      "event_type": "status_changed",
+      "title": "Стадия изменена: talking → lost",
+      "meta_json": "{\"old_status\": \"talking\", \"new_status\": \"lost\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 601,
+      "lead_id": 13,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 602,
+      "lead_id": 13,
+      "event_type": "note_added",
+      "title": "Обновлена заметка в карточке",
+      "meta_json": "{\"body\": \"Head of Growth в Denaria. Аутрич ушёл кофаундеру (@tizswa), тот переслал Lorenzo. Lorenzo сам предложил слот и встречу офлайн на connect event; не срослось. Созвон на субботу 10:00 GMT не подошёл: он \", \"source\": \"lead_field\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 603,
+      "lead_id": 13,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Cancelled)",
+      "meta_json": "{\"airtable_record_id\": \"rec1ulkQHvc5pl6ZP\", \"airtable_status\": \"Cancelled\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 604,
+      "lead_id": 14,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1200 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1200, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 605,
+      "lead_id": 14,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"rec3ipCI8zqYnXSJS\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 606,
+      "lead_id": 15,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 700 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 607,
+      "lead_id": 15,
+      "event_type": "note_added",
+      "title": "Обновлена заметка в карточке",
+      "meta_json": "{\"body\": \"Переписка на английском. Отвечает очень долго и невнятно. Запросил сайт и референсы, затем proposal. 17.09 спросил «so what do you suggest for us», ему предложили минимальный запуск и группу с фаундер\", \"source\": \"lead_field\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 608,
+      "lead_id": 15,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (In conversation)",
+      "meta_json": "{\"airtable_record_id\": \"rec4rUM8oVJ1kl752\", \"airtable_status\": \"In conversation\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 609,
+      "lead_id": 16,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 500 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 500, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 610,
+      "lead_id": 16,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"rec8czxtWte8hRDUm\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 611,
+      "lead_id": 17,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Offer sent)",
+      "meta_json": "{\"airtable_record_id\": \"rec9HSQ5RtUPtb4db\", \"airtable_status\": \"Offer sent\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 612,
+      "lead_id": 18,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1200 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1200, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 613,
+      "lead_id": 18,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"recFmiVdQQCP7VaUc\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 614,
+      "lead_id": 19,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 700 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 615,
+      "lead_id": 19,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"recGRjjhyQye3EhsL\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 616,
+      "lead_id": 20,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Cancelled)",
+      "meta_json": "{\"airtable_record_id\": \"recH3qfnVuScK81fm\", \"airtable_status\": \"Cancelled\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 617,
+      "lead_id": 21,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 618,
+      "lead_id": 21,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (On hold)",
+      "meta_json": "{\"airtable_record_id\": \"recJrrVVDHY2KBo55\", \"airtable_status\": \"On hold\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 619,
+      "lead_id": 22,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 4000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 4000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 620,
+      "lead_id": 22,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"recQdDVQDqLCf0Y54\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 621,
+      "lead_id": 23,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 622,
+      "lead_id": 23,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Cancelled)",
+      "meta_json": "{\"airtable_record_id\": \"recRefK6gMP2GJg5r\", \"airtable_status\": \"Cancelled\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 623,
+      "lead_id": 24,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 624,
+      "lead_id": 24,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (On hold)",
+      "meta_json": "{\"airtable_record_id\": \"recSZ6irsL2LlH1kI\", \"airtable_status\": \"On hold\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 625,
+      "lead_id": 25,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (In conversation)",
+      "meta_json": "{\"airtable_record_id\": \"recVfkYmtXGceK3Ee\", \"airtable_status\": \"In conversation\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 626,
+      "lead_id": 26,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Offer sent)",
+      "meta_json": "{\"airtable_record_id\": \"recWdxn8m3gEIUYjg\", \"airtable_status\": \"Offer sent\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 627,
+      "lead_id": 27,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 100 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 100, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 628,
+      "lead_id": 27,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (On hold)",
+      "meta_json": "{\"airtable_record_id\": \"recXpCOIHM7L8FtS3\", \"airtable_status\": \"On hold\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 629,
+      "lead_id": 28,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 2000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 2000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 630,
+      "lead_id": 28,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Offer sent)",
+      "meta_json": "{\"airtable_record_id\": \"recblLOt6ox63VDRY\", \"airtable_status\": \"Offer sent\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 631,
+      "lead_id": 29,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1200 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1200, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 632,
+      "lead_id": 29,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"reccUWJWveKMyjMB2\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 633,
+      "lead_id": 30,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Offer sent)",
+      "meta_json": "{\"airtable_record_id\": \"receqmutlIsxd1RpM\", \"airtable_status\": \"Offer sent\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 634,
+      "lead_id": 31,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 700 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 635,
+      "lead_id": 31,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (On hold)",
+      "meta_json": "{\"airtable_record_id\": \"recgBfqdRneQ2N9ui\", \"airtable_status\": \"On hold\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 636,
+      "lead_id": 32,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 735 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 735, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 637,
+      "lead_id": 32,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (On hold)",
+      "meta_json": "{\"airtable_record_id\": \"reclVUf8JmLQKoQGz\", \"airtable_status\": \"On hold\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 638,
+      "lead_id": 33,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 1000 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 639,
+      "lead_id": 33,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (On hold)",
+      "meta_json": "{\"airtable_record_id\": \"recoeCK3R2I3ijpXu\", \"airtable_status\": \"On hold\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 640,
+      "lead_id": 34,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 700 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 641,
+      "lead_id": 34,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"recogBYONCCpqJdOw\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 642,
+      "lead_id": 35,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (In conversation)",
+      "meta_json": "{\"airtable_record_id\": \"recu2rST157qTXfcy\", \"airtable_status\": \"In conversation\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 643,
+      "lead_id": 36,
+      "event_type": "amount_changed",
+      "title": "Бюджет изменён: 0 → 4394 USD",
+      "meta_json": "{\"old_amount\": 0, \"new_amount\": 4394, \"currency\": \"USD\"}",
+      "created_at": "2026-11-09T09:41:16"
+    },
+    {
+      "id": 644,
+      "lead_id": 36,
+      "event_type": "airtable_synced",
+      "title": "Синхронизирован с Airtable (Signed)",
+      "meta_json": "{\"airtable_record_id\": \"recvDbKpkSrikbnnn\", \"airtable_status\": \"Signed\", \"direction\": \"pull\"}",
+      "created_at": "2026-11-09T09:41:16"
     }
   ],
   "property_defs": [

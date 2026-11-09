@@ -139,6 +139,15 @@ def test_autopilot_tick_respects_toggle_schedule_limits_and_jitter(tmp_path):
         assert camp_resp.status_code == 200
         camp_id = camp_resp.json()["id"]
 
+        for uname, nm, ph, co in [
+            ("user_one", "Анна", "+79991000001", "Alpha"),
+            ("user_two", "Борис", "+79991000002", "Beta"),
+            ("user_three", "Виктор", "+79991000003", "Gamma"),
+        ]:
+            client.post(
+                "/api/leads",
+                json={"username": uname, "name": nm, "phone": ph, "company": co},
+            )
         csv_text = (
             "username,name,phone,company\n"
             "@user_one,Анна,+79991000001,Alpha\n"
@@ -258,6 +267,15 @@ def test_auto_stop_on_reply_updates_recipient_lead_status_and_lead_events(tmp_pa
         assert camp_resp.status_code == 200
         camp_id = camp_resp.json()["id"]
 
+        for uname, nm, ph, co in [
+            ("client_webhook", "Клиент Вебхук", "+79995550101", "WebCorp"),
+            ("client_sync", "Клиент Синк", "+79995550102", "SyncCorp"),
+            ("client_dialog", "Клиент Диалог", "+79995550103", "DialogCorp"),
+        ]:
+            client.post(
+                "/api/leads",
+                json={"username": uname, "name": nm, "phone": ph, "company": co},
+            )
         csv_text = (
             "username,name,phone,company\n"
             "@client_webhook,Клиент Вебхук,+79995550101,WebCorp\n"

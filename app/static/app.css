@@ -1470,7 +1470,7 @@ section {
 
 .campaign-kpis {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: var(--space-2);
   padding: var(--space-2);
   background: var(--sunken);
@@ -4219,10 +4219,6 @@ tr.bulk-selected,
 }
 
 /* 2. Clean Pipeline Header & Board (#s07) */
-.workspace[data-view-mode="sheet"] #s07 #pipeline-analytics-bar {
-  display: none;
-}
-
 .pipeline-header {
   display: flex;
   flex-wrap: wrap;
@@ -4772,14 +4768,59 @@ tr.bulk-selected,
   white-space: nowrap;
 }
 
-/* 6.3 Pipeline (#s07) — Remove Fake $240,000 Money Clutter & Add 1-Line Counter Strip */
-.stat-chip-money,
-.stat-chip-won,
-#pipeline-analytics-bar,
-#s07 .col-sum,
-#s07 .col-sep-sum,
-#s07 .card-amount {
+/* 6.3 Pipeline (#s07) — Compact Won/Pipeline KPI Bar & Hide Only $0 Card Amounts */
+#s07 .card-amount[data-card-amount="0"] {
   display: none !important;
+}
+
+#pipeline-analytics-bar {
+  display: grid;
+  gap: 8px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  background: var(--surface-soft);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+#pipeline-analytics-bar .pipeline-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+#pipeline-analytics-bar .pipeline-kpi-card {
+  display: grid;
+  gap: 2px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border: var(--line) solid var(--border);
+  border-radius: var(--radius-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+#pipeline-analytics-bar .pipeline-kpi-label {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+#pipeline-analytics-bar .pipeline-kpi-value {
+  font-size: 15px;
+  line-height: 1.3;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+#pipeline-analytics-bar .pipeline-kpi-value.is-won {
+  color: var(--success, #10b981);
+}
+
+#pipeline-analytics-bar .pipeline-kpi-card .hint {
+  font-size: 11px;
+  line-height: 1.25;
 }
 
 .pipeline-quick-search-wrap {

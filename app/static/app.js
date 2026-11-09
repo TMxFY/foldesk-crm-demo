@@ -2482,12 +2482,16 @@ function renderCampaigns() {
           el("strong", {}, [String(camp.total_recipients || 0)]),
         ]),
         el("div", { className: "campaign-kpi" }, [
-          el("span", {}, ["В очереди"]),
-          el("strong", {}, [String((camp.pending_count || 0) + (camp.in_progress_count || 0))]),
-        ]),
-        el("div", { className: "campaign-kpi" }, [
           el("span", {}, ["Отправлено"]),
           el("strong", {}, [String((camp.in_progress_count || 0) + (camp.completed_count || 0) + (camp.replied_count || 0))]),
+        ]),
+        el("div", { className: "campaign-kpi" }, [
+          el("span", {}, ["В очереди (новые)"]),
+          el("strong", {}, [String(camp.pending_count || 0)]),
+        ]),
+        el("div", { className: "campaign-kpi" }, [
+          el("span", {}, ["Ждут фоллоу-ап (шаг 2–3)"]),
+          el("strong", {}, [String(camp.in_progress_count || 0)]),
         ]),
         el("div", { className: "campaign-kpi" }, [
           el("span", {}, ["Ответили"]),
@@ -4108,18 +4112,56 @@ function renderBoard() {
   board.replaceChildren();
   board.style.setProperty("--stage-cols", String(Math.max(1, STATUSES.length)));
 
+  const allLeads = state.leads || [];
+  let waitingCount = 0;
+  let positiveCount = 0;
+  let talkingCount = 0;
+  let pipelineAmt = 0;
+  let wonAmt = 0;
+  let lostAmt = 0;
+  let activeLeadsCount = 0;
+  let wonLeadsCount = 0;
+  allLeads.forEach((lead) => {
+    const tr = resolveLeadTracking(lead);
+    if (tr.isWaitingOurAnswer) waitingCount += 1;
+    if (tr.isPositiveReply) positiveCount += 1;
+    if (lead.status === "talk" || lead.status === "talking" || lead.status === "call" || lead.status === "call_scheduled" || tr.isReplied) {
+      talkingCount += 1;
+    }
+    const amt = leadAmount(lead);
+    if (lead.status === "won") {
+      wonLeadsCount += 1;
+      wonAmt += amt;
+    } else if (lead.status === "lost") {
+      lostAmt += amt;
+    } else {
+      activeLeadsCount += 1;
+      pipelineAmt += amt;
+    }
+  });
+  const totalLeadsCount = allLeads.length;
+  const boardPipelineVal = formatMoneyUsd(pipelineAmt);
+  const boardWonVal = formatMoneyUsd(wonAmt);
+  const boardTotalVal = formatMoneyUsd(pipelineAmt + wonAmt + lostAmt);
+  const boardWinRate = `${(totalLeadsCount > 0 ? (wonLeadsCount / totalLeadsCount) * 100 : 0).toFixed(1).replace(/\.0$/, "")}%`;
+  const setBoardKpi = (sel, text) => {
+    const node = document.querySelector(sel);
+    if (node) node.textContent = text;
+  };
+  setBoardKpi("#stat-pipeline-value", boardPipelineVal);
+  setBoardKpi("#stat-won-value", boardWonVal);
+  setBoardKpi("#stat-win-rate", boardWinRate);
+  setBoardKpi("#analytics-kpi-pipeline", boardPipelineVal);
+  setBoardKpi("#analytics-kpi-pipeline-sub", `${activeLeadsCount} активных сделок`);
+  setBoardKpi("#analytics-kpi-won", boardWonVal);
+  setBoardKpi("#analytics-kpi-won-sub", `${wonLeadsCount} выиграно · всего ${totalLeadsCount}`);
+  setBoardKpi("#analytics-kpi-win-rate", boardWinRate);
+  setBoardKpi("#analytics-kpi-win-rate-sub", `Общий объём: ${boardTotalVal}`);
+  setBoardKpi("#quick-waiting-count", String(waitingCount));
+
   const counterStrip = document.querySelector("#pipeline-counter-strip");
   if (counterStrip) {
-    const allLeads = state.leads || [];
-    let waitingCount = 0;
-    let positiveCount = 0;
-    let talkingCount = 0;
-    allLeads.forEach((lead) => {
-      const tr = resolveLeadTracking(lead);
-      if (tr.isWaitingOurAnswer) waitingCount += 1;
-      if (tr.isPositiveReply) positiveCount += 1;
-      if (lead.status === "talk" || lead.status === "call" || tr.isReplied) talkingCount += 1;
-    });
+    counterStrip.hidden = true;
     counterStrip.replaceChildren(
       el("span", { className: "pipeline-stat-pill" }, [
         "Всего: ",
@@ -7467,7 +7509,7 @@ function renderAnalytics(data) {
               el("span", { className: `badge ${stBadge}` }, [stLabel]),
             ]),
             el("span", { className: "hint" }, [
-              `Получателей: ${camp.total_recipients} · Отправлено: ${camp.sent} · Ответили: ${camp.replied} · В очереди: ${camp.pending}`,
+              `Получателей: ${camp.total_recipients} · Отправлено: ${camp.sent} · В очереди (новые): ${camp.pending} · Ждут фоллоу-ап (шаг 2–3): ${camp.in_progress || 0} · Ответили: ${camp.replied}`,
             ]),
           ]),
           el("div", { className: "analytics-item-right" }, [
@@ -7585,7 +7627,7 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
       el("div", { className: "analytics-mini-kpi" }, [
         el("span", { className: "hint" }, ["Написали (из 2 174)"]),
         el("strong", {}, [`${s.contacted || 0}`]),
-        el("span", { className: "hint" }, [`В очереди: ${s.pending_queue || 0}`]),
+        el("span", { className: "hint" }, [`В очереди (новые): ${s.pending_queue || 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
         el("span", { className: "hint" }, ["Прочитали (2 галочки)"]),
@@ -7613,9 +7655,9 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
         el("span", { className: "hint" }, [`Нужен пинг · Не прочит.: ${s.unseen_our_answer || 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
-        el("span", { className: "hint" }, ["👀 Ждут Шаг 2 / Шаг 3"]),
-        el("strong", {}, [`${(s.need_step2 || 0) + (s.need_step3 || 0)}`]),
-        el("span", { className: "hint" }, [`Шаг 2: ${s.need_step2 || 0} · Шаг 3: ${s.need_step3 || 0}`]),
+        el("span", { className: "hint" }, ["👀 Ждут фоллоу-ап (в цепочке)"]),
+        el("strong", {}, [`${s.in_progress_followup ?? ((s.need_step2 || 0) + (s.need_step3 || 0))}`]),
+        el("span", { className: "hint" }, [`Прочитали Шаг 1/2: ${(s.need_step2 || 0) + (s.need_step3 || 0)} (Ш2: ${s.need_step2 || 0} · Ш3: ${s.need_step3 || 0})`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
         el("span", { className: "hint" }, ["Отказы (-) / Позже"]),

@@ -934,6 +934,16 @@ def pull_from_airtable(
                 )
             )
             if preserve_dirty and is_dirty:
+                amt_patch: dict[str, Any] = {}
+                if int(existing.get("amount") or 0) == 0 and int(mapped.get("amount") or 0) > 0:
+                    amt_patch["amount"] = int(mapped["amount"])
+                if int(existing.get("monthly_value") or 0) == 0 and int(mapped.get("monthly_value") or 0) > 0:
+                    amt_patch["monthly_value"] = int(mapped["monthly_value"])
+                if not existing.get("airtable_record_id") and mapped.get("airtable_record_id"):
+                    amt_patch["airtable_record_id"] = mapped["airtable_record_id"]
+                if amt_patch:
+                    update_lead(conn, lead_id, **amt_patch)
+                    updated_in_crm += 1
                 continue
 
             raw_fields = record.get("fields") or {}
@@ -1038,6 +1048,59 @@ def pull_from_airtable(
                 created_at=now,
             )
             created_in_crm += 1
+
+    remote_rec_ids = {
+        str(r.get("id") or "").strip()
+        for r in (records or [])
+        if isinstance(r, dict) and str(r.get("id") or "").strip()
+    }
+    if (
+        remote_rec_ids
+        and "PYTEST_CURRENT_TEST" not in os.environ
+        and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        cutoff_5m = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        all_local = conn.execute(
+            "SELECT id, airtable_record_id, folder_id, created_at FROM leads"
+        ).fetchall()
+        stale_ids = []
+        for lrow in all_local:
+            lid = int(lrow["id"])
+            rec_id = str(lrow["airtable_record_id"] or "").strip()
+            if rec_id:
+                if rec_id not in remote_rec_ids:
+                    stale_ids.append(lid)
+            else:
+                if lrow["folder_id"] is None and str(lrow["created_at"] or "") < cutoff_5m:
+                    stale_ids.append(lid)
+        if stale_ids:
+            ph = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"UPDATE campaign_recipients SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({ph})",
+                [now, *stale_ids],
+            )
+            conn.execute(
+                f"UPDATE dialogs SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({ph})",
+                [now, *stale_ids],
+            )
+            conn.execute(
+                f"UPDATE calendar_events SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({ph})",
+                [now, *stale_ids],
+            )
+            conn.execute(
+                f"UPDATE bot_seen_updates SET lead_id = NULL WHERE lead_id IN ({ph})",
+                stale_ids,
+            )
+            conn.execute(f"DELETE FROM reminders WHERE lead_id IN ({ph})", stale_ids)
+            conn.execute(f"DELETE FROM notes WHERE lead_id IN ({ph})", stale_ids)
+            conn.execute(f"DELETE FROM tasks WHERE lead_id IN ({ph})", stale_ids)
+            conn.execute(f"DELETE FROM property_values WHERE lead_id IN ({ph})", stale_ids)
+            conn.execute(f"DELETE FROM lead_events WHERE lead_id IN ({ph})", stale_ids)
+            conn.execute(f"DELETE FROM leads WHERE id IN ({ph})", stale_ids)
 
     synced_tasks, synced_projects = _sync_tasks_and_projects(conn, client, now)
     conn.commit()

@@ -1541,6 +1541,7 @@ async def start_direct_dialog(
                     lead_row = cand
                     break
 
+    display_name = resolved_name or (f"@{username}" if username else phone) or clean_raw
     if lead_row is not None:
         lead_id = int(lead_row["id"])
         if resolved_tg_id is not None and not lead_row["telegram_user_id"]:
@@ -1551,40 +1552,28 @@ async def start_direct_dialog(
                 )
             except sqlite3.IntegrityError:
                 pass
-    else:
-        display_name = resolved_name or (f"@{username}" if username else phone) or clean_raw
-        cur = conn.execute(
-            """
-            INSERT INTO leads (
-                account_id, telegram_user_id, username, name, phone,
-                status, note, next_step, created_at, updated_at, provider
-            ) VALUES (?, ?, ?, ?, ?, 'talking', ?, ?, ?, ?, ?)
-            """,
-            (
-                acc_id,
-                resolved_tg_id,
-                username,
-                display_name,
-                phone,
-                "Открыт прямой чат в Telegram Web",
-                "Написать сообщение в чате",
-                now,
-                now,
-                provider,
-            ),
-        )
-        lead_id = int(cur.lastrowid)
-        if resolved_tg_id is None:
-            resolved_tg_id = int(digits[-12:]) if (provider == "whatsapp" and digits and len(digits) >= 7) else (900000 + lead_id)
-            try:
-                conn.execute(
-                    "UPDATE leads SET telegram_user_id = ? WHERE id = ?",
-                    (resolved_tg_id, lead_id),
-                )
-            except sqlite3.IntegrityError:
-                pass
         conn.commit()
-
-    dialog = open_dialog_by_lead(conn, lead_id, acc_id)
-    updated_lead = as_dict(conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone())
+        dialog = open_dialog_by_lead(conn, lead_id, acc_id)
+        updated_lead = as_dict(conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone())
+    else:
+        dialog = open_dialog_by_lead(
+            conn,
+            None,
+            acc_id,
+            telegram_user_id=resolved_tg_id,
+            username=username,
+            phone=phone,
+            name=display_name,
+        )
+        updated_lead = {
+            "id": None,
+            "account_id": acc_id,
+            "telegram_user_id": dialog.get("telegram_user_id"),
+            "username": username,
+            "name": display_name,
+            "phone": phone,
+            "status": "talking",
+            "provider": provider,
+            "dialog_id": dialog.get("id"),
+        }
     return {"dialog": dialog, "lead": updated_lead}

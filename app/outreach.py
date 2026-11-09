@@ -1480,40 +1480,12 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
             conn.execute("UPDATE leads SET note = ?, updated_at = ? WHERE id = ?", (combined_note, now, lead_id))
         return lead_id, int(existing_tg_id)
 
-    cur = conn.execute(
-        """
-        INSERT INTO leads (
-            account_id, telegram_user_id, username, name, phone,
-            status, note, next_step, created_at, updated_at, description, company, url, provider
-        ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            account_id,
-            tg_id,
-            username,
-            display_name,
-            phone,
-            combined_note,
-            "Отправить цепочку рассылки",
-            now,
-            now,
-            company,
-            company,
-            url_val,
-            provider,
-        ),
-    )
-    lead_id = int(cur.lastrowid)
     if tg_id is None:
-        tg_id = 900000 + lead_id
-        try:
-            conn.execute(
-                "UPDATE leads SET telegram_user_id = ? WHERE id = ?",
-                (tg_id, lead_id),
-            )
-        except sqlite3.IntegrityError:
-            pass
-    return lead_id, int(tg_id)
+        import zlib
+
+        seed_str = str(username or phone or display_name or now).lower()
+        tg_id = 900000 + (zlib.crc32(seed_str.encode("utf-8")) % 89999) + 10000
+    return None, int(tg_id)
 
 
 def import_campaign_csv(
@@ -1578,7 +1550,7 @@ def import_campaign_csv(
         lead_item["company"] = company
         lead_item["name"] = name
         lead_id, tg_id = _resolve_or_create_lead(conn, account_id, lead_item, now)
-        if lead_id in seen_leads:
+        if lead_id is not None and lead_id in seen_leads:
             continue
 
         extra_fields = item.get("extra_fields")
@@ -1625,7 +1597,8 @@ def import_campaign_csv(
             seen_usernames.add(username.lower())
         if phone:
             seen_phones.add(phone)
-        seen_leads.add(lead_id)
+        if lead_id is not None:
+            seen_leads.add(lead_id)
         imported += 1
 
     if has_step2 or has_step3:

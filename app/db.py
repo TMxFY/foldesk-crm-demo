@@ -727,18 +727,39 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "PYTEST_CURRENT_TEST" not in os.environ
         and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
     ):
-        purged = conn.execute(
-            "SELECT 1 FROM kv_settings WHERE key = 'purge_synthetic_amounts_v1'"
+        strict_airtable_done = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'strict_airtable_leads_only_v1'"
         ).fetchone()
-        if purged is None:
+        if strict_airtable_done is None:
             now_ts = utc_now()
+            non_airtable_subquery = (
+                "SELECT id FROM leads WHERE airtable_record_id IS NULL OR trim(airtable_record_id) = ''"
+            )
             conn.execute(
-                "UPDATE leads SET amount = 0, monthly_value = 0, updated_at = ? WHERE COALESCE(amount, 0) != 0 OR COALESCE(monthly_value, 0) != 0",
+                f"UPDATE campaign_recipients SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({non_airtable_subquery})",
                 (now_ts,),
             )
-            conn.execute("DELETE FROM lead_events WHERE event_type = 'amount_changed'")
             conn.execute(
-                "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_synthetic_amounts_v1', '1', ?)",
+                f"UPDATE dialogs SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({non_airtable_subquery})",
+                (now_ts,),
+            )
+            conn.execute(
+                f"UPDATE calendar_events SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({non_airtable_subquery})",
+                (now_ts,),
+            )
+            conn.execute(
+                f"UPDATE bot_seen_updates SET lead_id = NULL WHERE lead_id IN ({non_airtable_subquery})"
+            )
+            conn.execute(f"DELETE FROM reminders WHERE lead_id IN ({non_airtable_subquery})")
+            conn.execute(f"DELETE FROM notes WHERE lead_id IN ({non_airtable_subquery})")
+            conn.execute(f"DELETE FROM tasks WHERE lead_id IN ({non_airtable_subquery})")
+            conn.execute(f"DELETE FROM property_values WHERE lead_id IN ({non_airtable_subquery})")
+            conn.execute(f"DELETE FROM lead_events WHERE lead_id IN ({non_airtable_subquery})")
+            conn.execute(
+                "DELETE FROM leads WHERE airtable_record_id IS NULL OR trim(airtable_record_id) = ''"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('strict_airtable_leads_only_v1', '1', ?)",
                 (now_ts,),
             )
         dead_sessions_fixed = conn.execute(

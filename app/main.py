@@ -636,6 +636,110 @@ async def stop_autopilot_loop(app: FastAPI) -> None:
         app.state.autopilot_task = None
 
 
+def _schedule_airtable_push_lead(app: FastAPI, lead_id: int) -> None:
+    if (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+    ):
+        return
+    try:
+        from app.airtable_sync import get_airtable_config, push_lead_to_airtable
+
+        cfg = get_airtable_config(getattr(app.state, "conn", None))
+        if not cfg.get("configured"):
+            return
+    except Exception:
+        return
+
+    def _worker() -> None:
+        bg_conn = connect()
+        try:
+            client = getattr(app.state, "airtable_client", None)
+            push_lead_to_airtable(bg_conn, int(lead_id), client=client)
+        except Exception:
+            pass
+        finally:
+            try:
+                bg_conn.close()
+            except Exception:
+                pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(asyncio.to_thread(_worker))
+    except RuntimeError:
+        import threading
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+def _run_airtable_sync_once(app: FastAPI) -> None:
+    if (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+    ):
+        return
+    from app.airtable_sync import get_airtable_config, sync_airtable
+
+    bg_conn = connect()
+    try:
+        cfg = get_airtable_config(bg_conn)
+        if not cfg.get("configured"):
+            return
+        client = getattr(app.state, "airtable_client", None)
+        sync_airtable(bg_conn, direction="both", client=client)
+    except Exception:
+        pass
+    finally:
+        try:
+            bg_conn.close()
+        except Exception:
+            pass
+
+
+async def airtable_sync_loop(app: FastAPI, interval_seconds: float = 180.0) -> None:
+    try:
+        await asyncio.to_thread(_run_airtable_sync_once, app)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            await asyncio.to_thread(_run_airtable_sync_once, app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+
+async def start_airtable_sync_loop(app: FastAPI) -> None:
+    if (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+    ):
+        return
+    existing = getattr(app.state, "airtable_sync_task", None)
+    if existing is not None and not existing.done():
+        return
+    interval = float(getattr(app.state, "airtable_sync_interval", 180.0) or 180.0)
+    app.state.airtable_sync_task = asyncio.create_task(
+        airtable_sync_loop(app, interval)
+    )
+
+
+async def stop_airtable_sync_loop(app: FastAPI) -> None:
+    task = getattr(app.state, "airtable_sync_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        app.state.airtable_sync_task = None
+
+
 def create_app(conn=None, gateway=None) -> FastAPI:
     load_env_file()
 
@@ -647,9 +751,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             else:
                 asyncio.create_task(start_connected_watches(app))
             await start_autopilot_loop(app)
+        await start_airtable_sync_loop(app)
         try:
             yield
         finally:
+            await stop_airtable_sync_loop(app)
             await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
 
@@ -927,10 +1033,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return remember_dialogs(request.app.state.conn, account_id, found[:30])
 
     @app.post("/api/leads")
-    def leads_create(body: LeadIn, request: Request):
+    async def leads_create(body: LeadIn, request: Request):
         conn = request.app.state.conn
         if body.telegram_user_id is not None and body.account_id is not None:
-            return _call(
+            created = _call(
                 add_lead_from_dialog,
                 conn,
                 body.account_id,
@@ -957,36 +1063,40 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 last_contacted=body.last_contacted,
                 airtable_record_id=body.airtable_record_id,
             )
-        return _call(
-            create_lead,
-            conn,
-            account_id=body.account_id,
-            telegram_user_id=body.telegram_user_id,
-            username=body.username,
-            name=body.name,
-            phone=body.phone,
-            status=body.status,
-            note=body.note,
-            next_step=body.next_step,
-            description=body.description,
-            email=body.email,
-            url=body.url,
-            provider=body.provider,
-            amount=body.amount,
-            currency=body.currency,
-            company=body.company,
-            niche=body.niche,
-            offer_type=body.offer_type,
-            offer_details=body.offer_details,
-            monthly_value=body.monthly_value,
-            lead_source=body.lead_source,
-            next_follow_up=body.next_follow_up,
-            last_contacted=body.last_contacted,
-            airtable_record_id=body.airtable_record_id,
-        )
+        else:
+            created = _call(
+                create_lead,
+                conn,
+                account_id=body.account_id,
+                telegram_user_id=body.telegram_user_id,
+                username=body.username,
+                name=body.name,
+                phone=body.phone,
+                status=body.status,
+                note=body.note,
+                next_step=body.next_step,
+                description=body.description,
+                email=body.email,
+                url=body.url,
+                provider=body.provider,
+                amount=body.amount,
+                currency=body.currency,
+                company=body.company,
+                niche=body.niche,
+                offer_type=body.offer_type,
+                offer_details=body.offer_details,
+                monthly_value=body.monthly_value,
+                lead_source=body.lead_source,
+                next_follow_up=body.next_follow_up,
+                last_contacted=body.last_contacted,
+                airtable_record_id=body.airtable_record_id,
+            )
+        if isinstance(created, dict) and created.get("id"):
+            _schedule_airtable_push_lead(request.app, int(created["id"]))
+        return created
 
     @app.get("/api/leads")
-    def leads_search(
+    async def leads_search(
         request: Request,
         q: str = "",
         status: str = "",
@@ -1115,15 +1225,15 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(delete_snippet, request.app.state.conn, snippet_id)
 
     @app.get("/api/leads/{lead_id}")
-    def leads_get(lead_id: int, request: Request):
+    async def leads_get(lead_id: int, request: Request):
         return _call(get_lead, request.app.state.conn, lead_id)
 
     @app.get("/api/leads/{lead_id}/card")
-    def leads_card(lead_id: int, request: Request):
+    async def leads_card(lead_id: int, request: Request):
         return _call(lead_card, request.app.state.conn, lead_id)
 
     @app.get("/api/leads/{lead_id}/events")
-    def leads_events_list(lead_id: int, request: Request, limit: int = 200):
+    async def leads_events_list(lead_id: int, request: Request, limit: int = 200):
         from app.events import list_lead_events
 
         _call(get_lead, request.app.state.conn, lead_id)
@@ -1172,9 +1282,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
     @app.patch("/api/leads/{lead_id}")
-    def leads_patch(lead_id: int, body: LeadPatch, request: Request):
+    async def leads_patch(lead_id: int, body: LeadPatch, request: Request):
         fields = body.model_dump(exclude_unset=True)
-        return _call(update_lead, request.app.state.conn, lead_id, **fields)
+        updated = _call(update_lead, request.app.state.conn, lead_id, **fields)
+        if isinstance(updated, dict) and updated.get("id"):
+            _schedule_airtable_push_lead(request.app, int(updated["id"]))
+        return updated
 
     @app.get("/api/pipeline/stages")
     def pipeline_stages_list(request: Request):

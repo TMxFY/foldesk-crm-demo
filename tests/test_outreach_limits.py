@@ -118,8 +118,7 @@ def test_outreach_campaign_csv_import_and_multistep_sequence_respects_limits(tmp
         assert imp_data["total_recipients"] == 3
 
         leads = client.get("/api/leads").json()
-        assert len(leads) == 3
-        assert {l["username"] for l in leads} == {"ivan_saas", "olga_cloud", "dmitry_ai"}
+        assert len(leads) == 0
 
         run1 = client.post(f"/api/campaigns/{camp_id}/run", json={})
         assert run1.status_code == 200
@@ -403,6 +402,15 @@ def test_auto_stop_on_reply_prevents_followup_and_moves_lead_to_talking(tmp_path
         assert create_resp.status_code == 200
         camp_id = create_resp.json()["id"]
 
+        client.post(
+            "/api/leads",
+            json={
+                "name": "Алексей Ответов",
+                "username": "alex_reply",
+                "phone": "+79995550011",
+                "company": "ReplyTech",
+            },
+        )
         csv_payload = (
             "username,name,phone,company\n"
             "@alex_reply,Алексей Ответов,+79995550011,ReplyTech\n"

@@ -6,7 +6,7 @@
   <title>Foldesk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261109v4">
+  <link rel="stylesheet" href="/static/app.css?v=20261109v5">
 </head>
 <body>
   <a class="skip" href="#s04">К списку разговоров</a>
@@ -329,7 +329,7 @@
                 <option value="due_followup">Пора фоллоу-апить</option>
               </select>
             </label>
-            <button type="button" class="btn secondary sm" id="quick-waiting-our-answer-btn" title="Показать лидов, которые написали последними и ждут нашего ответа">🔥 Ждут ответа: <strong id="quick-waiting-count">129</strong></button>
+            <button type="button" class="btn secondary sm" id="quick-waiting-our-answer-btn" title="Показать лидов, которые написали последними и ждут нашего ответа">🔥 Ждут ответа: <strong id="quick-waiting-count">0</strong></button>
             <button type="button" class="btn secondary sm" id="add-stage-btn">+ Стадия</button>
             <button type="button" class="btn primary sm sheet-only-btn" id="open-lead-popup-board">+ Сделка</button>
             <details class="toolbar-more-menu" id="board-more-menu">
@@ -373,7 +373,7 @@
           <span>В диалоге: <strong id="pipeline-cnt-talking">0</strong></span>
         </div>
 
-        <div id="pipeline-analytics-bar" class="pipeline-analytics-bar" aria-label="Сквозная сводка воронки и денег" hidden>
+        <div id="pipeline-analytics-bar" class="pipeline-analytics-bar" aria-label="Сквозная сводка воронки и денег">
           <div class="pipeline-kpi-grid">
             <div class="pipeline-kpi-card">
               <span class="pipeline-kpi-label">В работе (Pipeline)</span>
@@ -1946,6 +1946,6 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261109v4"></script>
+  <script src="/static/app.js?v=20261109v5"></script>
 </body>
 </html>
