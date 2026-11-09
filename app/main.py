@@ -91,7 +91,9 @@ KEYS_DETAIL = "Нужны ключи TG_API_ID и TG_API_HASH с https://my.tele
 
 
 def load_env_file() -> None:
-    if "PYTEST_CURRENT_TEST" in os.environ:
+    import sys
+
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
         return
     path = ROOT / ".env"
     if not path.exists():
@@ -492,11 +494,13 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if str(account.get("session_path") or "").startswith("data/sessions/demo"):
             synced.add(account_id)
             return
-        if "PYTEST_CURRENT_TEST" not in os.environ:
-            existing_dlg_cnt = app.state.conn.execute(
-                "SELECT COUNT(*) FROM dialogs WHERE account_id = ?", (account_id,)
+        if "PYTEST_CURRENT_TEST" not in os.environ and isinstance(
+            getattr(app.state, "gateway", None), (type(None), TelethonGateway)
+        ):
+            total_dlg_cnt = app.state.conn.execute(
+                "SELECT COUNT(*) FROM dialogs"
             ).fetchone()[0]
-            if int(existing_dlg_cnt or 0) > 5:
+            if int(total_dlg_cnt or 0) > 0:
                 synced.add(account_id)
                 return
         provider = str(account.get("provider") or "telegram").strip().lower()
@@ -525,6 +529,12 @@ async def start_account_watch(app, account_id: int) -> None:
         return
     if str(account.get("session_path") or "").startswith("data/sessions/demo") and isinstance(
         getattr(app.state, "gateway", None), (type(None), TelethonGateway)
+    ):
+        return
+    if (
+        "PYTEST_CURRENT_TEST" not in os.environ
+        and os.getenv("ENABLE_TG_PERSISTENT_WATCHES") != "1"
+        and isinstance(getattr(app.state, "gateway", None), (type(None), TelethonGateway))
     ):
         return
     provider = str(account.get("provider") or "telegram").strip().lower()
@@ -1524,6 +1534,107 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             respect_delays=respect_delays,
             force=force,
         )
+
+    @app.post("/api/outreach/upload-image")
+    @app.post("/api/outreach/media")
+    async def outreach_upload_image(request: Request):
+        import base64
+        import hashlib
+        import re
+        from app.db import OUTREACH_MEDIA_DIR
+
+        content_type = str(request.headers.get("content-type") or "").lower()
+        raw_bytes: bytes = b""
+        filename_in = "image.png"
+        mime_ext = ""
+
+        if "multipart/form-data" in content_type:
+            raw_body = await request.body()
+            # Simple RFC2046 boundary parser so python-multipart is optional
+            boundary = ""
+            for part_kv in content_type.split(";"):
+                part_kv = part_kv.strip()
+                if part_kv.startswith("boundary="):
+                    boundary = part_kv.split("=", 1)[1].strip('"')
+                    break
+            if boundary:
+                delim = f"--{boundary}".encode("latin-1")
+                for chunk in raw_body.split(delim):
+                    if b"Content-Disposition:" not in chunk:
+                        continue
+                    head_bytes, sep, body_bytes = chunk.partition(b"\r\n\r\n")
+                    if not sep:
+                        continue
+                    if body_bytes.endswith(b"\r\n"):
+                        body_bytes = body_bytes[:-2]
+                    head_text = head_bytes.decode("utf-8", errors="ignore")
+                    m_fn = re.search(r'filename="([^"]+)"', head_text)
+                    if m_fn:
+                        filename_in = m_fn.group(1).strip() or "image.png"
+                    raw_bytes = body_bytes
+                    break
+        else:
+            try:
+                payload = await request.json()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=400, detail="Ожидается объект JSON")
+            raw_data = str(payload.get("data_url") or payload.get("base64") or "").strip()
+            filename_in = str(payload.get("filename") or "image.png").strip()
+            if not raw_data:
+                raise HTTPException(status_code=400, detail="Передайте файл картинки")
+            if raw_data.startswith("data:"):
+                header, _, b64_part = raw_data.partition(",")
+                raw_data = b64_part.strip()
+                if "image/jpeg" in header or "image/jpg" in header:
+                    mime_ext = ".jpg"
+                elif "image/png" in header:
+                    mime_ext = ".png"
+                elif "image/webp" in header:
+                    mime_ext = ".webp"
+                elif "image/gif" in header:
+                    mime_ext = ".gif"
+            try:
+                raw_bytes = base64.b64decode(raw_data, validate=False)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="Некорректные данные изображения") from exc
+
+        ext = Path(filename_in).suffix.lower() or mime_ext or ".png"
+        if ext == ".jpeg":
+            ext = ".jpg"
+        if ext not in {".png", ".jpg", ".webp", ".gif"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Поддерживаются форматы PNG, JPG, WEBP и GIF",
+            )
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail="Пустой файл изображения")
+        if len(raw_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Размер картинки не должен превышать 10 МБ")
+        digest = hashlib.sha1(raw_bytes).hexdigest()[:16]
+        out_name = f"{digest}{ext}"
+        OUTREACH_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = OUTREACH_MEDIA_DIR / out_name
+        out_path.write_bytes(raw_bytes)
+        media_url = f"/media/outreach/{out_name}"
+        return {
+            "ok": True,
+            "image_url": media_url,
+            "url": media_url,
+            "filename": filename_in,
+            "size": len(raw_bytes),
+        }
+
+    @app.get("/media/outreach/{filename}")
+    def outreach_media_get(filename: str):
+        from app.db import OUTREACH_MEDIA_DIR
+
+        safe_name = Path(filename).name
+        target = OUTREACH_MEDIA_DIR / safe_name
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="Картинка не найдена")
+        return FileResponse(target)
 
     @app.post("/api/campaigns/preview-csv")
     def campaigns_preview_csv(body: CampaignCsvIn):

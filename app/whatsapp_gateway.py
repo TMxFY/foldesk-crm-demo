@@ -727,6 +727,7 @@ class WhatsAppGateway(TelegramGateway):
         text: str,
         reply_to=None,
         simulate_typing: bool = True,
+        image_path: str | None = None,
     ) -> dict:
         body = (text or "").strip()
         if not body:

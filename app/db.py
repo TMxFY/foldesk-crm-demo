@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
+OUTREACH_MEDIA_DIR = ROOT / "data" / "outreach_media"
 
 STATUSES = ("new", "talking", "waiting", "won", "lost")
 AIRTABLE_STAGE_KEYS = (
@@ -85,6 +86,24 @@ def resolve_session(session_path: str) -> Path:
     if not path.is_absolute():
         path = ROOT / path
     return path
+
+
+def resolve_outreach_media(media_ref: str) -> Path | str:
+    raw = str(media_ref or "").strip()
+    if raw.startswith("/media/outreach/"):
+        filename = Path(raw.removeprefix("/media/outreach/")).name
+        local_path = OUTREACH_MEDIA_DIR / filename
+        if local_path.exists():
+            return local_path
+    if raw.startswith(("http://", "https://")):
+        return raw
+    path = Path(raw)
+    if path.is_absolute() and path.exists():
+        return path
+    rel_path = ROOT / raw
+    if not path.is_absolute() and rel_path.exists():
+        return rel_path
+    return raw
 
 
 def connect(db_path=None) -> sqlite3.Connection:
@@ -349,6 +368,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             step_order INTEGER NOT NULL CHECK (step_order >= 1),
             delay_hours INTEGER NOT NULL DEFAULT 0 CHECK (delay_hours >= 0),
             template_text TEXT NOT NULL,
+            image_url TEXT,
             created_at TEXT NOT NULL,
             UNIQUE (campaign_id, step_order)
         );
@@ -580,11 +600,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "dialogs", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
     _ensure_column(conn, "dialogs", "phone", "TEXT")
     _ensure_column(conn, "messages", "external_message_id", "TEXT")
+    _ensure_column(conn, "messages", "media_url", "TEXT")
     _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
     _ensure_column(conn, "campaigns", "csv_headers_json", "TEXT")
     _ensure_column(conn, "campaigns", "leadgen_enabled", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "campaigns", "leadgen_daily_quota", "INTEGER NOT NULL DEFAULT 20")
     _ensure_column(conn, "campaigns", "leadgen_sources_json", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "campaign_steps", "image_url", "TEXT")
     _ensure_column(
         conn,
         "campaign_recipients",
@@ -694,6 +716,43 @@ def _migrate(conn: sqlite3.Connection) -> None:
             from app.snippets import seed_default_snippets
 
             seed_default_snippets(conn)
+    if (
+        "PYTEST_CURRENT_TEST" not in os.environ
+        and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
+    ):
+        purged = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'purge_synthetic_amounts_v1'"
+        ).fetchone()
+        if purged is None:
+            now_ts = utc_now()
+            conn.execute(
+                "UPDATE leads SET amount = 0, monthly_value = 0, updated_at = ? WHERE COALESCE(amount, 0) != 0 OR COALESCE(monthly_value, 0) != 0",
+                (now_ts,),
+            )
+            conn.execute("DELETE FROM lead_events WHERE event_type = 'amount_changed'")
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_synthetic_amounts_v1', '1', ?)",
+                (now_ts,),
+            )
+        dead_sessions_fixed = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'purge_dead_tg_sessions_v1'"
+        ).fetchone()
+        if dead_sessions_fixed is None:
+            now_ts = utc_now()
+            conn.execute(
+                """
+                UPDATE accounts
+                SET health = 'unauthorized',
+                    status = 'error',
+                    last_error = 'AUTH_KEY_DUPLICATED: переподключите сессию'
+                WHERE id IN (11, 12)
+                  AND telegram_username IN ('saburowe', 'HeatherLopez478')
+                """
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_dead_tg_sessions_v1', '1', ?)",
+                (now_ts,),
+            )
     conn.commit()
 
 

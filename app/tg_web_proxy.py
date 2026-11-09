@@ -307,6 +307,34 @@ def build_session_init_js(
       localStorage.removeItem("tt-global-state");
       localStorage.setItem("foldesk_tg_session_sig", sig);
     }}
+    if (!window.__foldeskDupGuardInstalled && allSessions.length > 1) {{
+      window.__foldeskDupGuardInstalled = true;
+      var origError = console.error;
+      console.error = function() {{
+        try {{
+          var msg = Array.prototype.map.call(arguments, function(a) {{
+            return a && a.message ? a.message : String(a || "");
+          }}).join(" ");
+          if (msg.indexOf("AUTH_KEY_DUPLICATED") !== -1 || msg.indexOf("AUTH_KEY_UNREGISTERED") !== -1) {{
+            var deadRaw = localStorage.getItem("foldesk_tg_dead_accs") || "[]";
+            var deadList = [];
+            try {{ deadList = JSON.parse(deadRaw) || []; }} catch (e) {{}}
+            if (deadList.indexOf(String(accId)) === -1) {{
+              deadList.push(String(accId));
+              localStorage.setItem("foldesk_tg_dead_accs", JSON.stringify(deadList));
+            }}
+            for (var z = 0; z < allSessions.length; z++) {{
+              var cand = allSessions[z];
+              if (deadList.indexOf(String(cand.account_id)) === -1 && String(cand.account_id) !== String(accId)) {{
+                window.location.replace("/a/?account=" + cand.slot + "&account_id=" + cand.account_id);
+                break;
+              }}
+            }}
+          }}
+        }} catch (e) {{}}
+        return origError.apply(console, arguments);
+      }};
+    }}
   }} catch (e) {{
     console.error("Foldesk TG Web session init error:", e);
   }}
@@ -399,6 +427,33 @@ def register_tg_web_routes(app) -> None:
             return Response(status_code=exc.code, content=b"")
         except Exception:
             return Response(status_code=502, content=b"")
+
+        if clean.startswith("worker-") and clean.endswith(".js"):
+            text = data.decode("utf-8", errors="replace")
+            old_fn = "async createTempAuthKey(e){"
+            new_fn = (
+                "async createTempAuthKey(e){"
+                "if(!e.isMediaDc&&this.authKey&&this.authKey.getKey()){"
+                "let n=this._state.getServerTime();"
+                "this.authKey.createdAt??=n;"
+                "this.authKey.expiresAt=n+86400;"
+                "await this.tempAuthKey.setKey(this.authKey);"
+                "this._state.resetForNewAuthKey();"
+                "try{await this.invokeDuringConnect(e,()=>this.initConnection(new U.help.GetNearestDc))}"
+                "catch(err){await this.tempAuthKey.setKey(void 0);throw err}"
+                "return this.authKey}"
+            )
+            if old_fn in text and new_fn not in text:
+                text = text.replace(old_fn, new_fn, 1)
+                data = text.encode("utf-8")
+            return Response(
+                content=data,
+                media_type=mime,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Access-Control-Allow-Origin": "*",
+                },
+            )
 
         return Response(
             content=data,

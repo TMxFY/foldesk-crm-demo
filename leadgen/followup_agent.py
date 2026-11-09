@@ -46,17 +46,19 @@ CACHE_PATH = _DEFAULT_STATE_DIR / "followups_cache.json"
 BATCH_SIZE = 10
 TIMEOUT = 90
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(ROOT / ".env")
-except ImportError:
-    env_p = ROOT / ".env"
-    if env_p.exists():
-        for _line in env_p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+import sys
+if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(ROOT / ".env")
+    except ImportError:
+        env_p = ROOT / ".env"
+        if env_p.exists():
+            for _line in env_p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
 SYSTEM_PROMPT = """You write short, human Telegram / LinkedIn follow-up DMs (followup_1 on Day 3, followup_2 on Day 7) for a short-form video growth team.
 

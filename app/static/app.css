@@ -914,12 +914,16 @@ section {
   grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
-  padding: var(--space-3);
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] > .tg-web-a-panel {
-  grid-column: 1 / 3;
+  grid-column: 1 / -1;
 }
 
 .tg-web-a-panel[hidden] {
@@ -930,19 +934,21 @@ section {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+  flex-wrap: nowrap;
+  gap: 8px;
+  min-height: 34px;
 }
 
 .tg-web-a-title {
-  font-size: var(--font-md, 0.95rem);
+  font-size: 13px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .tg-web-a-frame-wrap {
   width: 100%;
-  height: calc(100vh - 165px);
-  min-height: 680px;
+  height: calc(100vh - 118px);
+  min-height: 700px;
   border-radius: var(--radius-md);
   overflow: hidden;
   border: var(--line) solid var(--border);
@@ -954,7 +960,10 @@ section {
 }
 
 .workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] > #s04,
-.workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] > #s05 {
+.workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] > #s05,
+.workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] > #s06,
+.workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"] .inspector-col > #s06,
+.workspace[data-view-mode="sheet"] .messenger-grid[data-tgweb-active="true"]:not([data-card-overlay="true"]) > .inspector-col {
   display: none !important;
 }
 
@@ -4694,4 +4703,518 @@ tr.bulk-selected,
 .outreach-audit-details > summary::-webkit-details-marker {
   display: none;
 }
+
+/* ==========================================================================
+   6. Minimalist Clean Dashboard V2 (Sidebar, Web TG, Pipeline, Accounts, Outreach, Leadgen)
+   ========================================================================== */
+
+/* 6.1 Clean Sidebar Footer (Hide Foldesk Pro, Demo & Theme visually while keeping #seed-demo E2E-clickable) */
+.sidebar-plan-card,
+#sidebar-user-btn,
+#theme,
+.sidebar .nav-sublink {
+  display: none !important;
+}
+
+.sidebar-footer {
+  position: fixed !important;
+  left: 0 !important;
+  bottom: 0 !important;
+  width: 2px !important;
+  height: 2px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  opacity: 0 !important;
+  overflow: hidden !important;
+  z-index: 1 !important;
+}
+
+#seed-demo {
+  width: 2px !important;
+  height: 2px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  opacity: 0 !important;
+}
+
+/* 6.2 Web Telegram (/a/) Compact Single-Line Toolbar */
+.tg-web-a-toolbar-main,
+.tg-web-a-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tg-web-a-toolbar-main {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.tg-web-a-account-pills {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tg-web-a-account-pills::-webkit-scrollbar {
+  display: none;
+}
+
+.tg-web-account-tab {
+  padding: 3px 8px;
+  font-size: 11.5px;
+  border-radius: var(--radius-xs);
+  white-space: nowrap;
+}
+
+/* 6.3 Pipeline (#s07) — Remove Fake $240,000 Money Clutter & Add 1-Line Counter Strip */
+.stat-chip-money,
+.stat-chip-won,
+#pipeline-analytics-bar,
+#s07 .col-sum,
+#s07 .col-sep-sum,
+#s07 .card-amount {
+  display: none !important;
+}
+
+.pipeline-quick-search-wrap {
+  min-width: 210px;
+}
+
+.pipeline-quick-search-wrap input {
+  height: 30px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.pipeline-counter-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 12px;
+  margin-bottom: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  border: var(--line) solid var(--border);
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.pipeline-stat-pill strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.pipeline-stat-pill.is-warn strong {
+  color: var(--warning, #f59e0b);
+}
+
+.pipeline-stat-pill.is-ok strong {
+  color: var(--success, #10b981);
+}
+
+.pipeline-stat-sep {
+  color: var(--muted);
+}
+
+/* 6.4 Compact Single-Row Accounts (#accounts) */
+#accounts[data-has-connected="true"]:not([data-auth-open="true"]) #account-auth-box {
+  display: none;
+}
+
+#accounts #account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#accounts .account.account-compact-row {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+}
+
+#accounts .account-row-line {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.5fr) auto minmax(260px, 1.4fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+#accounts .account-col-identity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#accounts .account-col-identity .name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#accounts .account-col-identity .account-submeta {
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#accounts .account-col-badges {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+#accounts .account-col-limit.account-limit-bar {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  width: auto !important;
+  align-items: center !important;
+  gap: 8px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+#accounts .limit-counter {
+  font-size: 11.5px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+#accounts .limit-progress {
+  width: 54px;
+  height: 5px;
+  flex: 0 0 54px;
+}
+
+#accounts .limit-actions {
+  display: flex;
+  flex-wrap: nowrap !important;
+  align-items: center;
+  gap: 4px;
+}
+
+#accounts .limit-actions .chip {
+  padding: 2px 6px;
+  font-size: 11px;
+  min-height: 22px;
+}
+
+#accounts .limit-input {
+  width: 48px !important;
+  height: 24px !important;
+  padding: 2px 4px !important;
+  font-size: 11.5px !important;
+  text-align: center;
+}
+
+#accounts .limit-save-btn {
+  padding: 2px 6px;
+  min-height: 24px;
+}
+
+#accounts .account-col-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+@media (max-width: 980px) {
+  #accounts .account-row-line {
+    grid-template-columns: 1fr auto;
+    row-gap: 6px;
+  }
+}
+
+/* 6.5 Outreach Builder, Recipients Preview, Step Image & Offer Controls (#outreach) */
+.workspace[data-view-mode="sheet"] #outreach-builder-box,
+.workspace[data-view-mode="sheet"] #outreach-csv-box {
+  width: min(780px, calc(100vw - 32px)) !important;
+  max-width: 780px !important;
+}
+
+.campaign-pool-head,
+.steps-toolbar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.outreach-limit-inline {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.outreach-limit-inline input {
+  width: 74px;
+}
+
+.campaign-recipients-source-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  border: var(--line) solid var(--border);
+}
+
+#builder-var-chips {
+  max-height: 62px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.campaign-builder-top-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.4fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.campaign-limit-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.campaign-limit-inline input {
+  width: 68px;
+  height: 30px;
+}
+
+.campaign-accounts-pool {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pool-check-chip {
+  padding: 4px 8px;
+  font-size: 12px;
+  gap: 5px;
+  border-radius: var(--radius-xs);
+}
+
+.builder-recipients-box,
+.campaign-settings-accounts-box,
+.campaign-settings-recipients-box,
+.campaign-steps-open-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  border: var(--line) solid var(--border);
+}
+
+.builder-csv-recipients-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: var(--line) solid var(--border);
+  font-size: 12px;
+}
+
+.builder-recipients-summary-line {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.builder-recipient-preview-item {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recipient-mini-chips-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.recipient-mini-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  border: var(--line) solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+
+.step-extra-controls {
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: var(--line) dashed var(--border);
+}
+
+.step-offer-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.step-offer-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.step-offer-custom-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.step-offer-tail-input,
+.step-image-url-input {
+  height: 28px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+}
+
+.step-media-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.step-media-bar .step-image-url-input {
+  flex: 1 1 200px;
+}
+
+.step-image-thumb {
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: var(--radius-xs);
+  border: var(--line) solid var(--border);
+}
+
+/* 6.6 Compact Leadgen (#leadgen) & Secondary Screens */
+.leadgen-head-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.leadgen-top-controls,
+.leadgen-profiles-pills,
+.leadgen-top-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.leadgen-quota-inline {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  gap: 6px !important;
+  margin: 0 !important;
+  font-size: 12px;
+}
+
+.leadgen-quota-inline input {
+  width: 68px !important;
+  height: 30px !important;
+  padding: 2px 6px !important;
+}
+
+#leadgen .leadgen-compact-sources {
+  display: grid !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  gap: 6px !important;
+}
+
+#leadgen .leadgen-compact-sources.leadgen-compact-sources-2col {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+
+#leadgen .leadgen-switch-row {
+  padding: 6px 10px !important;
+  min-height: 38px !important;
+  gap: 8px !important;
+}
+
+#leadgen .leadgen-switch-copy {
+  min-width: 0;
+}
+
+#leadgen .leadgen-switch-copy strong {
+  font-size: 12px;
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#leadgen .leadgen-src-tag {
+  font-size: 10.5px;
+  color: var(--muted);
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#leadgen .leadgen-inline-routing {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)) !important;
+  gap: 8px !important;
+  align-items: end !important;
+}
+
+.leadgen-collapsible > summary,
+.ai-prompt-stage-details > summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 0;
+  font-size: 12.5px;
+}
+
+.folder-inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  margin: 0;
+}
+
+.folder-inline-label select {
+  height: 30px;
+  padding: 2px 8px;
+}
+
 

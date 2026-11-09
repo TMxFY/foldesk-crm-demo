@@ -697,3 +697,80 @@ def test_tg_web_a_session_init_js_and_persistence(tmp_path):
         assert [a["id"] for a in deduped] == [acc_id, acc_id_2]
 
 
+def test_outreach_step_image_upload_and_revshare_offer_tail(tmp_path):
+    """Uploading an outreach image and attaching it + RevShare/CPA offer tail sends image_path and full text."""
+    conn = connect(tmp_path / "crm_img.db")
+    init_db(conn)
+    gateway = FakeGateway(
+        code="11111",
+        dialogs=[{"telegram_user_id": 501, "username": "alex_founder", "name": "Alex Founder"}],
+    )
+    app = create_app(conn=conn, gateway=gateway)
+
+    with TestClient(app) as client:
+        start_resp = client.post("/api/accounts/start", json={"phone": "+79990007788"})
+        assert start_resp.status_code == 200
+        acc_id = start_resp.json()["id"]
+        code_resp = client.post(f"/api/accounts/{acc_id}/code", json={"code": "11111"})
+        assert code_resp.status_code == 200
+
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+            b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        up_res = client.post(
+            "/api/outreach/upload-image",
+            files={"file": ("offer_card.png", png_bytes, "image/png")},
+        )
+        assert up_res.status_code == 200
+        image_url = up_res.json()["image_url"]
+        assert image_url.startswith("/media/outreach/")
+
+        media_get = client.get(image_url)
+        assert media_get.status_code == 200
+        assert media_get.content == png_bytes
+
+        offer_tail = (
+            "We work on revshare or CPA and you only cover the production costs. "
+            "Want to see 3 example reels for your brand, to check how it could work for you?"
+        )
+        step1_template = f"{{step1_text}}\n\n{offer_tail}"
+        csv_text = (
+            "name,username,company,first_touch\n"
+            "Alex Founder,@alex_founder,AcmeAI,Hey Alex! Saw AcmeAI scaling fast."
+        )
+        create_res = client.post(
+            "/api/campaigns",
+            json={
+                "name": "Image + RevShare Offer Campaign",
+                "account_id": acc_id,
+                "account_ids": [acc_id],
+                "daily_limit": 20,
+                "steps": [
+                    {"step_order": 1, "delay_hours": 0, "template_text": step1_template, "image_url": image_url},
+                    {"step_order": 2, "delay_hours": 24, "template_text": "Quick follow up, {name}!", "image_url": ""},
+                ],
+            },
+        )
+        assert create_res.status_code == 200
+        camp = create_res.json()
+        assert camp["steps"][0]["image_url"] == image_url
+
+        csv_res = client.post(f"/api/campaigns/{camp['id']}/csv", json={"csv_text": csv_text})
+        assert csv_res.status_code == 200
+        assert csv_res.json()["imported"] == 1
+
+        run_res = client.post(f"/api/campaigns/{camp['id']}/run", json={})
+        assert run_res.status_code == 200
+        body = run_res.json()
+        assert body["sent"] == 1
+        assert len(gateway.sent) == 1
+        sent_item = gateway.sent[0]
+        assert "Hey Alex! Saw AcmeAI scaling fast." in sent_item["text"]
+        assert offer_tail in sent_item["text"]
+        assert sent_item["image_path"] is not None
+        assert str(sent_item["image_path"]).endswith(".png")
+
+
+

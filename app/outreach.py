@@ -612,14 +612,7 @@ def get_campaign(conn, campaign_id: int) -> dict:
             last_sent_text = out_by_phone.get(str(rd["phone"]).strip())
         if last_sent_text is None and cur_step >= 1 and cur_step - 1 < len(steps):
             prev_idx = cur_step - 1
-            if prev_idx == 0 and (rd.get("step1_text") or "").strip():
-                last_sent_text = render_template(rd["step1_text"], rd)
-            elif prev_idx == 1 and (rd.get("step2_text") or "").strip():
-                last_sent_text = render_template(rd["step2_text"], rd)
-            elif prev_idx == 2 and (rd.get("step3_text") or "").strip():
-                last_sent_text = render_template(rd["step3_text"], rd)
-            else:
-                last_sent_text = render_template(steps[prev_idx]["template_text"], rd)
+            last_sent_text = _render_step_text(steps[prev_idx], prev_idx, rd)
         rd["last_sent_text"] = last_sent_text
 
         recipients.append(rd)
@@ -677,6 +670,42 @@ def list_campaigns(conn) -> list:
     return [get_campaign(conn, row["id"]) for row in rows]
 
 
+def _render_step_text(step: dict, step_idx: int, rec: dict) -> str:
+    tmpl = str(step.get("template_text") or "").strip()
+    tmpl_low = tmpl.lower()
+    csv_step_val = ""
+    if step_idx == 0:
+        csv_step_val = (rec.get("step1_text") or "").strip()
+        has_csv_token = any(
+            tok in tmpl_low
+            for tok in ("{step1_text}", "{first_touch}", "{первое касание}", "{первое_касание}")
+        )
+    elif step_idx == 1:
+        csv_step_val = (rec.get("step2_text") or "").strip()
+        has_csv_token = any(
+            tok in tmpl_low
+            for tok in ("{step2_text}", "{followup_1}", "{фоллоуап 1}", "{фоллоуап_1}")
+        )
+    elif step_idx == 2:
+        csv_step_val = (rec.get("step3_text") or "").strip()
+        has_csv_token = any(
+            tok in tmpl_low
+            for tok in ("{step3_text}", "{followup_2}", "{фоллоуап 2}", "{фоллоуап_2}")
+        )
+    else:
+        has_csv_token = False
+
+    if csv_step_val and not has_csv_token:
+        base = render_template(csv_step_val, rec)
+        offer_tail = str(step.get("offer_tail") or "").strip()
+        if offer_tail:
+            tail_rendered = render_template(offer_tail, rec)
+            if tail_rendered and tail_rendered not in base:
+                return f"{base}\n\n{tail_rendered}".strip()
+        return base
+    return render_template(tmpl, rec)
+
+
 def _normalize_steps(steps: list | None) -> list[dict]:
     if not steps:
         return [
@@ -684,6 +713,7 @@ def _normalize_steps(steps: list | None) -> list[dict]:
                 "step_order": 1,
                 "delay_hours": 0,
                 "template_text": "Привет, {name}! Пишу по поводу сотрудничества.",
+                "image_url": None,
             }
         ]
     normalized = []
@@ -691,7 +721,8 @@ def _normalize_steps(steps: list | None) -> list[dict]:
         if not isinstance(step, dict):
             raise ValueError("Некорректный формат шага цепочки")
         text = str(step.get("template_text") or "").strip()
-        if not text:
+        image_url = str(step.get("image_url") or "").strip() or None
+        if not text and not image_url:
             raise ValueError("Укажите текст сообщения для каждого шага")
         delay_raw = step.get("delay_hours", 0 if idx == 1 else 24)
         try:
@@ -703,6 +734,7 @@ def _normalize_steps(steps: list | None) -> list[dict]:
                 "step_order": idx,
                 "delay_hours": delay_hours,
                 "template_text": text,
+                "image_url": image_url,
             }
         )
     return normalized
@@ -785,14 +817,15 @@ def create_campaign(
     for step in norm_steps:
         conn.execute(
             """
-            INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, image_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 campaign_id,
                 step["step_order"],
                 step["delay_hours"],
                 step["template_text"],
+                step.get("image_url"),
                 now,
             ),
         )
@@ -889,14 +922,15 @@ def update_campaign(
         for step in norm_steps:
             conn.execute(
                 """
-                INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, image_url, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     campaign_id,
                     step["step_order"],
                     step["delay_hours"],
                     step["template_text"],
+                    step.get("image_url"),
                     now,
                 ),
             )
@@ -2064,14 +2098,8 @@ async def run_campaign_batch(
         active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
         use_gateway = active_gw is not None and not session_path.startswith("data/sessions/demo")
 
-        if step_idx == 0 and (rec.get("step1_text") or "").strip():
-            rendered_text = render_template(rec["step1_text"], rec)
-        elif step_idx == 1 and (rec.get("step2_text") or "").strip():
-            rendered_text = render_template(rec["step2_text"], rec)
-        elif step_idx == 2 and (rec.get("step3_text") or "").strip():
-            rendered_text = render_template(rec["step3_text"], rec)
-        else:
-            rendered_text = render_template(step["template_text"], rec)
+        rendered_text = _render_step_text(step, step_idx, rec)
+        step_image_url = (step.get("image_url") or "").strip() or None
 
         try:
             if acc_provider == "whatsapp":
@@ -2166,9 +2194,23 @@ async def run_campaign_batch(
                         )
                         if client is not None:
                             await prewarm_recipient_stories(client, target_entity)
-                    sent = await active_gw.send_message(
-                        session_path, peer_target, rendered_text, None
-                    )
+                    if step_image_url:
+                        try:
+                            sent = await active_gw.send_message(
+                                session_path,
+                                peer_target,
+                                rendered_text,
+                                None,
+                                image_path=step_image_url,
+                            )
+                        except TypeError:
+                            sent = await active_gw.send_message(
+                                session_path, peer_target, rendered_text, None
+                            )
+                    else:
+                        sent = await active_gw.send_message(
+                            session_path, peer_target, rendered_text, None
+                        )
                     tg_mid = int(sent["telegram_message_id"])
                     sent_at = str(sent.get("sent_at") or now)
                 else:
@@ -2192,11 +2234,11 @@ async def run_campaign_batch(
         conn.execute(
             """
             INSERT INTO messages (
-                dialog_id, telegram_message_id, direction, text, sent_at,
+                dialog_id, telegram_message_id, direction, text, media_url, sent_at,
                 reply_to_telegram_message_id, created_at, updated_at
-            ) VALUES (?, ?, 'out', ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, 'out', ?, ?, ?, NULL, ?, ?)
             """,
-            (dialog["id"], tg_mid, rendered_text, sent_at, now, now),
+            (dialog["id"], tg_mid, rendered_text, step_image_url, sent_at, now, now),
         )
         conn.execute(
             """

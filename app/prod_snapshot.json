@@ -200,13 +200,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 700,
+      "amount": 0,
       "currency": "USD",
       "company": "CoinStats",
       "niche": "Crypto",
       "offer_type": null,
       "offer_details": null,
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-30",
       "last_contacted": null,
@@ -232,13 +232,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1000,
+      "amount": 0,
       "currency": "USD",
       "company": "Denaria",
       "niche": null,
       "offer_type": "[\"Performance\"]",
       "offer_details": "Performance, no per-clip fee: клиент покрывает production cost, мы зарабатываем на CPA/revshare с трекинговой ссылки (депозиты). Min launch: 1,000 clips on a 10-account grid, первые ролики через 2 недели. Цена запуска ему не называлась.",
-      "monthly_value": 800,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": "2026-10-11",
@@ -264,13 +264,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1200,
+      "amount": 0,
       "currency": "USD",
       "company": "Animus",
       "niche": "Астрология, нумерология, проработка тени (AI-продукты)",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Минимальный запуск: 500 видео/мес на 5 аккаунтов. $1,000 первый месяц, далее $800/мес. Плюс revshare 15% с продаж по UTM либо CPA (Артём предпочитает revshare). 2 недели подготовки не входят в месяц. Площадки: Instagram, только органика.",
-      "monthly_value": 1245,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": null,
@@ -296,13 +296,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 700,
+      "amount": 0,
       "currency": "USD",
       "company": "Guardiannn",
       "niche": null,
       "offer_type": "[\"Performance\"]",
       "offer_details": "Performance, no per-clip fee. Min launch: 1,000 clips on a 10-account grid, $700 first month, $535 from the second. Плюс CPA/revshare с трекинговой ссылки (депозиты). Первые ролики через 2 недели.",
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": "2026-10-10",
@@ -328,13 +328,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 500,
+      "amount": 0,
       "currency": "USD",
       "company": "Sumex.io",
       "niche": "Crypto",
       "offer_type": null,
       "offer_details": null,
-      "monthly_value": 500,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": null,
@@ -392,7 +392,7 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1200,
+      "amount": 0,
       "currency": "USD",
       "company": "Sasha AI",
       "niche": null,
@@ -424,7 +424,7 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 700,
+      "amount": 0,
       "currency": "USD",
       "company": "Sumi Studio",
       "niche": null,
@@ -488,13 +488,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1000,
+      "amount": 0,
       "currency": "USD",
       "company": null,
       "niche": "Дропшиппинг на Shopify",
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Минимальный запуск: 500 видео/мес на 5 аккаунтов, около $1000 первый месяц, далее $535/мес. Альтернатива: $2.5 за оригинальное видео 45–60 сек, уникализация около 30 центов; 100 видео в месяц = $250, отдаём в Telegram или на диск.",
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": null,
       "next_follow_up": "2026-10-24",
       "last_contacted": null,
@@ -520,7 +520,7 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 4000,
+      "amount": 0,
       "currency": "USD",
       "company": "Olympost",
       "niche": "AI UGC",
@@ -552,13 +552,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1000,
+      "amount": 0,
       "currency": "USD",
       "company": "Real-business.pro",
       "niche": "Инфопродукт: курс 30 000 ₽ (позже 50 000 ₽)",
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Минимальный запуск: 500 видео на 5 аккаунтов, $1000 первый месяц, далее $535/мес. Revshare 10–15–20% или CPA (пример: $5 за забронированный звонок). Альтернатива: поштучно $2.5 за видео, от 100 в месяц, публикует сам. Предложен тест: 100 видео на один аккаунт за $250.",
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": null,
       "next_follow_up": "2026-10-27",
       "last_contacted": null,
@@ -584,13 +584,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1000,
+      "amount": 0,
       "currency": "USD",
       "company": "T3tris",
       "niche": "Crypto",
       "offer_type": "[\"Performance\"]",
       "offer_details": null,
-      "monthly_value": 600,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-12-01",
       "last_contacted": null,
@@ -680,13 +680,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 100,
+      "amount": 0,
       "currency": "USD",
       "company": null,
       "niche": "Дропшиппинг, физические товары",
       "offer_type": "[\"Per-video\"]",
       "offer_details": "Поштучно: ролики до 15 сек, около 100 шт в месяц, примерно $1 за ролик. Хотел сначала тест на 20 роликов. Изначально озвучены и $2 за 60 сек, и performance (500 видео, 5 аккаунтов, $1000 / $535).",
-      "monthly_value": 100,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-27",
       "last_contacted": "2026-10-11",
@@ -712,7 +712,7 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 2000,
+      "amount": 0,
       "currency": "USD",
       "company": "QRME",
       "niche": "AI платофрма",
@@ -744,13 +744,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1200,
+      "amount": 0,
       "currency": "USD",
       "company": "STIRALITI",
       "niche": "Пятновыводитель",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Минимальный запуск: 500 видео/мес на 5 аккаунтов. $1000 первый месяц, далее $800/мес. Плюс $150 CPA за каждые 1000 брендовых запросов поверх 15000. Площадки: Instagram",
-      "monthly_value": 1245,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-30",
       "last_contacted": null,
@@ -808,13 +808,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 700,
+      "amount": 0,
       "currency": "USD",
       "company": "CRMchat",
       "niche": "B2B SaaS: CRM для Telegram, Web3-аудитория",
       "offer_type": "[\"Performance\"]",
       "offer_details": "Performance без оплаты за ролик. Минимальный запуск: 1000 роликов на сетке из 10 аккаунтов, $700 первый месяц, далее $535/мес, плюс CPA/revshare по UTM. Запуск через 2 недели после договора.",
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-18",
       "last_contacted": "2026-09-23",
@@ -840,13 +840,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 735,
+      "amount": 0,
       "currency": "USD",
       "company": "Neohive",
       "niche": null,
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Вариант 1: поштучно от 100 видео/мес по $2.5 за 60 сек (готовое видео с субтитрами). Вариант 2: performance, 500 видео/мес на 5 аккаунтов, $735 первый месяц, далее $535/мес, плюс revshare 15–20% или CPA. Трекинг через UTM-ссылку.",
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-27",
       "last_contacted": "2026-09-28",
@@ -872,13 +872,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 1000,
+      "amount": 0,
       "currency": "USD",
       "company": null,
       "niche": "Health & beauty",
       "offer_type": "[\"Performance\", \"Per-video\"]",
       "offer_details": "Вариант 1: поштучно от 100 видео/мес по $2 за 60 сек. Вариант 2: performance, 500 видео/мес на 5 аккаунтов, $1000 первый месяц, далее $535/мес, плюс revshare 10–20% или CPA.",
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-11-15",
       "last_contacted": "2026-10-05",
@@ -904,13 +904,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 700,
+      "amount": 0,
       "currency": "USD",
       "company": "From-China.pro",
       "niche": "Импорт товаров из Китая",
       "offer_type": null,
       "offer_details": null,
-      "monthly_value": 535,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": null,
       "last_contacted": null,
@@ -968,13 +968,13 @@
       "dialog_id": null,
       "provider": "telegram",
       "folder_id": null,
-      "amount": 4394,
+      "amount": 0,
       "currency": "USD",
       "company": "Indigo VC",
       "niche": "Gaming",
       "offer_type": "[\"Custom project\"]",
       "offer_details": "Мы делаем им видео на их игры в двух форматах (реальный стример с летсплеем, летсплей с озвучкой) на TikTok, Instagram, YouTube.",
-      "monthly_value": 4090,
+      "monthly_value": 0,
       "lead_source": "Cold outreach",
       "next_follow_up": "2026-10-30",
       "last_contacted": null,
@@ -1380,14 +1380,6 @@
       "created_at": "2026-11-05T04:25:03"
     },
     {
-      "id": 59,
-      "lead_id": 12,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 700 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
       "id": 60,
       "lead_id": 12,
       "event_type": "airtable_synced",
@@ -1401,14 +1393,6 @@
       "event_type": "created",
       "title": "Создан лид Lorenzo",
       "meta_json": "{\"status\": \"lost\", \"provider\": \"telegram\", \"amount\": 1000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
-      "id": 62,
-      "lead_id": 13,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:25:03"
     },
     {
@@ -1436,14 +1420,6 @@
       "created_at": "2026-11-05T04:25:03"
     },
     {
-      "id": 66,
-      "lead_id": 14,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1200 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1200, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
       "id": 67,
       "lead_id": 14,
       "event_type": "note_added",
@@ -1468,14 +1444,6 @@
       "created_at": "2026-11-05T04:25:03"
     },
     {
-      "id": 70,
-      "lead_id": 15,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 700 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
       "id": 71,
       "lead_id": 15,
       "event_type": "note_added",
@@ -1497,14 +1465,6 @@
       "event_type": "created",
       "title": "Создан лид Tony",
       "meta_json": "{\"status\": \"won\", \"provider\": \"telegram\", \"amount\": 500, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
-      "id": 74,
-      "lead_id": 16,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 500 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 500, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:25:03"
     },
     {
@@ -1548,14 +1508,6 @@
       "created_at": "2026-11-05T04:25:03"
     },
     {
-      "id": 80,
-      "lead_id": 18,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1200 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1200, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
       "id": 81,
       "lead_id": 18,
       "event_type": "airtable_synced",
@@ -1569,14 +1521,6 @@
       "event_type": "created",
       "title": "Создан лид Max Tolmachev",
       "meta_json": "{\"status\": \"won\", \"provider\": \"telegram\", \"amount\": 700, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:25:03"
-    },
-    {
-      "id": 83,
-      "lead_id": 19,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 700 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:25:03"
     },
     {
@@ -1684,14 +1628,6 @@
       "created_at": "2026-11-05T04:26:50"
     },
     {
-      "id": 97,
-      "lead_id": 21,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
       "id": 98,
       "lead_id": 21,
       "event_type": "note_added",
@@ -1716,14 +1652,6 @@
       "created_at": "2026-11-05T04:26:50"
     },
     {
-      "id": 101,
-      "lead_id": 22,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 4000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 4000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
       "id": 102,
       "lead_id": 22,
       "event_type": "airtable_synced",
@@ -1737,14 +1665,6 @@
       "event_type": "created",
       "title": "Создан лид Константин",
       "meta_json": "{\"status\": \"lost\", \"provider\": \"telegram\", \"amount\": 1000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
-      "id": 104,
-      "lead_id": 23,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:26:50"
     },
     {
@@ -1769,14 +1689,6 @@
       "event_type": "created",
       "title": "Создан лид Romain",
       "meta_json": "{\"status\": \"on_hold\", \"provider\": \"telegram\", \"amount\": 1000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
-      "id": 108,
-      "lead_id": 24,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:26:50"
     },
     {
@@ -1844,14 +1756,6 @@
       "created_at": "2026-11-05T04:26:50"
     },
     {
-      "id": 117,
-      "lead_id": 27,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 100 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 100, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
       "id": 118,
       "lead_id": 27,
       "event_type": "note_added",
@@ -1876,14 +1780,6 @@
       "created_at": "2026-11-05T04:26:50"
     },
     {
-      "id": 121,
-      "lead_id": 28,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 2000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 2000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
       "id": 122,
       "lead_id": 28,
       "event_type": "airtable_synced",
@@ -1897,14 +1793,6 @@
       "event_type": "created",
       "title": "Создан лид Сергей",
       "meta_json": "{\"status\": \"won\", \"provider\": \"telegram\", \"amount\": 1200, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
-      "id": 124,
-      "lead_id": 29,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1200 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1200, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:26:50"
     },
     {
@@ -1956,14 +1844,6 @@
       "created_at": "2026-11-05T04:26:50"
     },
     {
-      "id": 131,
-      "lead_id": 31,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 700 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
       "id": 132,
       "lead_id": 31,
       "event_type": "note_added",
@@ -1985,14 +1865,6 @@
       "event_type": "created",
       "title": "Создан лид Shemi",
       "meta_json": "{\"status\": \"on_hold\", \"provider\": \"telegram\", \"amount\": 735, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
-      "id": 135,
-      "lead_id": 32,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 735 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 735, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:26:50"
     },
     {
@@ -2020,14 +1892,6 @@
       "created_at": "2026-11-05T04:26:50"
     },
     {
-      "id": 139,
-      "lead_id": 33,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 1000 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 1000, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
       "id": 140,
       "lead_id": 33,
       "event_type": "note_added",
@@ -2049,14 +1913,6 @@
       "event_type": "created",
       "title": "Создан лид Леонид",
       "meta_json": "{\"status\": \"won\", \"provider\": \"telegram\", \"amount\": 700, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
-      "id": 143,
-      "lead_id": 34,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 700 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 700, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:26:50"
     },
     {
@@ -2089,14 +1945,6 @@
       "event_type": "created",
       "title": "Создан лид Роблокс",
       "meta_json": "{\"status\": \"won\", \"provider\": \"telegram\", \"amount\": 4394, \"currency\": \"USD\"}",
-      "created_at": "2026-11-05T04:26:50"
-    },
-    {
-      "id": 148,
-      "lead_id": 36,
-      "event_type": "amount_changed",
-      "title": "Установлен бюджет: 4394 USD",
-      "meta_json": "{\"old_amount\": 0, \"new_amount\": 4394, \"currency\": \"USD\"}",
       "created_at": "2026-11-05T04:26:50"
     },
     {

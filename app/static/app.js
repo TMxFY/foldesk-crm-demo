@@ -114,6 +114,7 @@ const state = {
   leadQuery: "",
   inbox: "empty",
   inboxChatMode: "crm",
+  inboxChatModeExplicit: false,
   inboxSessionFilter: "all",
   selectedDialog: null,
   selectedLeadId: null,
@@ -205,14 +206,6 @@ function sheetFromHash(hash) {
 function triggerSheetEntrance(section) {
   if (!section) return;
   section.classList.remove("sheet-entering");
-  void section.offsetWidth;
-  section.classList.add("sheet-entering");
-  const children = section.querySelectorAll(
-    ".col, .campaign-card, .account, .pane-col, #s06, .reminder, .surface-subcard"
-  );
-  children.forEach((item, idx) => {
-    item.style.setProperty("--stagger-i", String(Math.min(idx, 10)));
-  });
 }
 
 function syncPopupState() {
@@ -243,6 +236,10 @@ function syncPopupState() {
 }
 
 function openSheetPopup(kind) {
+  const accountsSection = document.querySelector("#accounts");
+  if (kind === "login" && accountsSection) {
+    accountsSection.dataset.authOpen = "true";
+  }
   if (state.viewMode !== "sheet") return;
   state.activePopup = kind || null;
   syncSheetVisibility();
@@ -257,6 +254,10 @@ function openSheetPopup(kind) {
 }
 
 function closeSheetPopup() {
+  const accountsSection = document.querySelector("#accounts");
+  if (accountsSection) {
+    delete accountsSection.dataset.authOpen;
+  }
   const scheduleBox = document.querySelector("#outreach-schedule-box");
   const fromLeadsBox = document.querySelector("#outreach-from-leads-box");
   if (state.viewMode !== "sheet") {
@@ -393,6 +394,11 @@ function syncSheetVisibility() {
     state.bulkHostTarget = active;
   }
   if (typeof syncBulkHostContainer === "function") syncBulkHostContainer();
+
+  if (active === "inbox") {
+    const connected = (state.accounts || []).filter((account) => account.status === "connected");
+    syncTelegramWebAPanel(connected);
+  }
 
   const activeNode = active === "inbox" ? messengerGrid : document.querySelector(`#${active}`);
   triggerSheetEntrance(activeNode);
@@ -1127,6 +1133,17 @@ async function checkAllAccounts(button) {
   }
 }
 
+function shortProxyLabel(account) {
+  const raw = String(account.proxy_location || account.proxy_url || account.proxy || "Auto").trim();
+  if (!raw || raw.toLowerCase() === "auto") return "Auto";
+  try {
+    const parsed = new URL(raw.includes("://") ? raw : `socks5://${raw}`);
+    return parsed.hostname ? `Proxy: ${parsed.hostname.slice(0, 15)}` : "Proxy";
+  } catch {
+    return raw.length > 18 ? `${raw.slice(0, 16)}…` : raw;
+  }
+}
+
 function renderAccounts() {
   const list = document.querySelector("#account-list");
   const accountsSection = document.querySelector("#accounts");
@@ -1155,78 +1172,30 @@ function renderAccounts() {
     const connLabel = accountConnectionLabel(account);
     const connBadgeClass = connState === "ok" ? "b-ok" : (connState === "warn" ? "b-login" : "b-bad");
     const subParts = [];
-    if (account.phone && account.phone !== label) subParts.push(account.phone);
     if (account.telegram_username && `@${account.telegram_username}` !== label) {
       subParts.push(`@${account.telegram_username}`);
     }
-    const proxyLabel = account.proxy_location || account.proxy_url || account.proxy || "Auto";
-    const isPersonal = (account.access_scope || account.access) === "personal";
-    const accessLabel = isPersonal ? "Personal" : "Workspace";
-    const identityBlock = el("div", { className: "account-identity" }, [
-      el("div", { className: "account-title-line" }, [
-        el("span", { className: "conn-dot", "data-conn": connState, "aria-hidden": "true" }, []),
-        channelBadgeEl(account.provider),
-        el("span", { className: "name" }, [label]),
-        subParts.length ? el("span", { className: "hint" }, [subParts.join(" · ")]) : null,
-      ].filter(Boolean)),
-      el("div", { className: "account-badges-line" }, [
-        el("span", { className: `badge ${connBadgeClass}` }, [connLabel]),
-        el("span", { className: `badge ${pair[1]}` }, [pair[0]]),
-        el("span", { className: "badge b-new" }, [proxyLabel]),
-        el("span", { className: "badge b-new" }, [accessLabel]),
-      ]),
-    ]);
-    if (account.health) {
+    if (account.phone && account.phone !== label) subParts.push(account.phone);
+    const proxyFull = String(account.proxy_location || account.proxy_url || account.proxy || "Auto");
+    const proxyShort = shortProxyLabel(account);
+
+    const identityCol = el("div", { className: "account-col-identity" }, [
+      el("span", { className: "conn-dot", "data-conn": connState, "aria-hidden": "true" }, []),
+      channelBadgeEl(account.provider),
+      el("span", { className: "name", title: label }, [label]),
+      subParts.length ? el("span", { className: "hint account-submeta", title: subParts.join(" · ") }, [subParts.join(" · ")]) : null,
+    ].filter(Boolean));
+
+    const badgeChildren = [
+      el("span", { className: `badge ${connBadgeClass}` }, [connLabel]),
+      account.status !== "connected" ? el("span", { className: `badge ${pair[1]}` }, [pair[0]]) : null,
+      proxyShort !== "Auto" ? el("span", { className: "badge b-new", title: proxyFull }, [proxyShort]) : null,
+    ].filter(Boolean);
+    if (account.health && account.health !== "ok") {
       const healthPair = ACCOUNT_HEALTH[account.health] || [account.health, "b-off"];
-      identityBlock.querySelector(".account-badges-line").append(
-        el("span", { className: `badge ${healthPair[1]}` }, [healthPair[0]]),
-      );
+      badgeChildren.push(el("span", { className: `badge ${healthPair[1]}` }, [healthPair[0]]));
     }
-    const actionsWrap = el("div", { className: "row" }, []);
-    if (account.status === "pending_code" || account.status === "pending_password") {
-      pending = account;
-      const caption = account.status === "pending_password" ? "Ввести пароль" : "Ввести код";
-      actionsWrap.append(el("button", { type: "button", className: "btn ghost sm", onclick: () => resumeLogin(account) }, [caption]));
-    }
-    if (account.status === "connected") {
-      if (account.tg_web_ready) {
-        actionsWrap.append(
-          el("button", {
-            type: "button",
-            className: "btn primary sm",
-            onclick: async () => {
-              state.inboxChatMode = "tgweb";
-              await switchInboxSession(String(account.id));
-              activateSheet("inbox");
-              const panel = document.querySelector("#tg-web-a-panel");
-              if (panel && state.viewMode !== "sheet") panel.scrollIntoView({ block: "nearest" });
-            },
-          }, ["Telegram Web (/a/)"]),
-        );
-      }
-      actionsWrap.append(
-        el("button", {
-          type: "button",
-          className: "btn secondary sm",
-          onclick: async () => {
-            state.inboxChatMode = "crm";
-            await switchInboxSession(String(account.id));
-            activateSheet("inbox");
-            const s04 = document.querySelector("#s04");
-            if (s04 && state.viewMode !== "sheet") s04.scrollIntoView({ block: "nearest" });
-            const matched = state.dialogs.filter(passChips);
-            if (matched.length && !state.selectedDialog) {
-              selectDialog(matched[0]).catch(() => {});
-            }
-          },
-        }, ["Открыть чаты"]),
-        el("button", { type: "button", className: "btn ghost sm", onclick: () => reconnectAccount(account) }, ["Переподключить"]),
-      );
-    }
-    const mainRow = el("div", { className: "account-main" }, [
-      identityBlock,
-      actionsWrap,
-    ]);
+    const badgesCol = el("div", { className: "account-col-badges" }, badgeChildren);
 
     const dailyLimit = Number(account.daily_limit) || 20;
     const sentToday = Number(account.sent_today) || 0;
@@ -1240,8 +1209,11 @@ function renderAccounts() {
       className: "limit-input",
       "aria-label": "Суточный лимит",
     });
-    const limitBar = el("div", { className: "account-limit-bar" }, [
-      el("span", { className: "limit-counter" }, [`Сегодня: ${sentToday} / ${dailyLimit}`]),
+
+    const limitCol = el("div", { className: "account-col-limit account-limit-bar" }, [
+      el("span", { className: "limit-counter", title: `Отправлено сегодня: ${sentToday} из ${dailyLimit}` }, [
+        `Сегодня: ${sentToday} / ${dailyLimit}`,
+      ]),
       el("div", { className: "limit-progress", "data-state": limitState, "aria-hidden": "true" }, [
         el("span", { className: "limit-fill", style: `width: ${pct}%` }, []),
       ]),
@@ -1250,26 +1222,89 @@ function renderAccounts() {
           type: "button",
           className: "chip",
           "data-limit-preset": "10",
+          "aria-label": "10 / сут",
           "aria-pressed": dailyLimit === 10 ? "true" : "false",
           onclick: () => updateAccountLimit(account.id, 10),
-        }, ["10 / сут"]),
+        }, ["10"]),
         el("button", {
           type: "button",
           className: "chip",
           "data-limit-preset": "20",
+          "aria-label": "20 / сут",
           "aria-pressed": dailyLimit === 20 ? "true" : "false",
           onclick: () => updateAccountLimit(account.id, 20),
-        }, ["20 / сут"]),
+        }, ["20"]),
         limitInput,
         el("button", {
           type: "button",
-          className: "btn secondary sm",
+          className: "btn ghost sm limit-save-btn",
+          title: "Сохранить лимит",
+          "aria-label": "Сохранить лимит",
           onclick: () => updateAccountLimit(account.id, limitInput.value),
-        }, ["Сохранить лимит"]),
+        }, ["✓"]),
       ]),
     ]);
 
-    const row = el("li", { className: "account" }, [mainRow, limitBar]);
+    const actionsWrap = el("div", { className: "account-col-actions row" }, []);
+    if (account.status === "pending_code" || account.status === "pending_password") {
+      pending = account;
+      const caption = account.status === "pending_password" ? "Пароль" : "Код";
+      actionsWrap.append(el("button", { type: "button", className: "btn primary sm", onclick: () => resumeLogin(account) }, [caption]));
+    }
+    if (account.status === "connected") {
+      if (account.tg_web_ready) {
+        actionsWrap.append(
+          el("button", {
+            type: "button",
+            className: "btn primary sm",
+            title: "Открыть Telegram Web (/a/)",
+            onclick: async () => {
+              state.inboxChatMode = "tgweb";
+              state.inboxChatModeExplicit = true;
+              await switchInboxSession(String(account.id));
+              activateSheet("inbox");
+              const panel = document.querySelector("#tg-web-a-panel");
+              if (panel && state.viewMode !== "sheet") panel.scrollIntoView({ block: "nearest" });
+            },
+          }, ["Web TG ↗"]),
+        );
+      }
+      actionsWrap.append(
+        el("button", {
+          type: "button",
+          className: "btn secondary sm",
+          title: "Открыть диалоги в CRM",
+          onclick: async () => {
+            state.inboxChatMode = "crm";
+            state.inboxChatModeExplicit = true;
+            await switchInboxSession(String(account.id));
+            activateSheet("inbox");
+            const s04 = document.querySelector("#s04");
+            if (s04 && state.viewMode !== "sheet") s04.scrollIntoView({ block: "nearest" });
+            const matched = state.dialogs.filter(passChips);
+            if (matched.length && !state.selectedDialog) {
+              selectDialog(matched[0]).catch(() => {});
+            }
+          },
+        }, ["Чаты"]),
+        el("button", {
+          type: "button",
+          className: "btn ghost sm account-reconnect-btn",
+          title: "Переподключить сессию",
+          "aria-label": "Переподключить",
+          onclick: () => reconnectAccount(account),
+        }, ["↻"]),
+      );
+    }
+
+    const row = el("li", { className: "account account-compact-row" }, [
+      el("div", { className: "account-row-line" }, [
+        identityCol,
+        badgesCol,
+        limitCol,
+        actionsWrap,
+      ]),
+    ]);
     list.append(row);
   });
   if (pending && state.loginId == null && connected.length === 0) resumeLogin(pending);
@@ -1343,12 +1378,221 @@ function updateCampaignPoolSummary() {
   summaryNode.textContent = `Пул: ${connected.length} ${accountWord(connected.length)} · до ${totalLimit} сообщ./сутки суммарно`;
 }
 
+const REVSHARE_OFFER_TEXT = "We work on revshare or CPA and you only cover the production costs. Want to see 3 example reels for your brand, to check how it could work for you?";
+
+function dedupeConnectedAccounts(accounts) {
+  const seen = new Set();
+  const out = [];
+  (accounts || []).forEach((acc) => {
+    if (!acc || acc.status !== "connected") return;
+    const key = String(acc.phone || acc.telegram_username || acc.id || "").trim().toLowerCase();
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    out.push(acc);
+  });
+  return out;
+}
+
+function formatCompactAccountName(account) {
+  const rawName = String(account.telegram_name || account.telegram_username || account.phone || "").trim();
+  const cleanName = rawName.replace(/^\[(TG|WA)\]\s*/i, "");
+  const uname = String(account.telegram_username || "").trim().replace(/^@/, "");
+  if (uname && cleanName.toLowerCase() !== uname.toLowerCase() && !cleanName.includes(`@${uname}`)) {
+    const duplicateNameCount = (state.accounts || []).filter(
+      (a) => a.status === "connected" && String(a.telegram_name || "").trim().toLowerCase() === cleanName.toLowerCase(),
+    ).length;
+    if (duplicateNameCount > 1) {
+      return `${cleanName} (@${uname})`;
+    }
+  }
+  return cleanName;
+}
+
+async function uploadOutreachImageFile(file) {
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Не удалось прочитать файл картинки"));
+    reader.readAsDataURL(file);
+  });
+  const resp = await fetch("/api/outreach/upload-image", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name || "image.png",
+      data_url: dataUrl,
+    }),
+    credentials: "same-origin",
+  });
+  let payload = null;
+  try {
+    payload = await resp.json();
+  } catch (_err) {
+    payload = null;
+  }
+  if (!resp.ok) {
+    throw new Error((payload && payload.detail) || "Не удалось загрузить картинку");
+  }
+  return (payload && payload.image_url) || "";
+}
+
+function buildStepMediaAndOfferControls(step, idx, onUpdate) {
+  const wrap = el("div", { className: "step-extra-controls stack" }, []);
+
+  if (idx === 0) {
+    const appendOfferToStep = (offerText) => {
+      const cleanOffer = String(offerText || "").trim();
+      if (!cleanOffer) return;
+      const cur = String(step.template_text || "").trim();
+      if (cur.includes(cleanOffer)) {
+        toast("Этот оффер уже добавлен в сообщение", "ok");
+        return;
+      }
+      const base = cur || "{step1_text}";
+      step.template_text = `${base}\n\n${cleanOffer}`;
+      onUpdate(step.template_text);
+    };
+
+    const customOfferInput = el("input", {
+      type: "text",
+      className: "step-offer-tail-input",
+      value: REVSHARE_OFFER_TEXT,
+      "aria-label": "Дополнительный текст оффера к первому сообщению",
+      placeholder: "Текст оффера в конец 1-го сообщения...",
+    });
+
+    const offerRow = el("div", { className: "step-offer-bar" }, [
+      el("div", { className: "step-offer-actions row" }, [
+        el("span", { className: "hint" }, ["Режим Шага 1:"]),
+        el("button", {
+          type: "button",
+          className: "chip step-mode-chip",
+          title: "Использовать индивидуальное первое сообщение из колонки CSV + добавить оффер",
+          onclick: () => {
+            step.template_text = `{step1_text}\n\n${customOfferInput.value.trim() || REVSHARE_OFFER_TEXT}`;
+            onUpdate(step.template_text);
+          },
+        }, ["📄 {step1_text} из CSV + Оффер"]),
+        el("button", {
+          type: "button",
+          className: "chip step-offer-preset-btn",
+          "data-offer-preset": "revshare_cpa",
+          title: "Добавить в конец Шага 1 оффер про RevShare / CPA и 3 примера рилсов",
+          onclick: () => {
+            customOfferInput.value = REVSHARE_OFFER_TEXT;
+            appendOfferToStep(REVSHARE_OFFER_TEXT);
+          },
+        }, ["+ Оффер RevShare / CPA (3 reels)"]),
+      ]),
+      el("div", { className: "step-offer-custom-row row" }, [
+        customOfferInput,
+        el("button", {
+          type: "button",
+          className: "btn secondary sm",
+          onclick: () => appendOfferToStep(customOfferInput.value),
+        }, ["+ В конец Шага 1"]),
+      ]),
+    ]);
+    wrap.append(offerRow);
+  }
+
+  const fileInput = el("input", {
+    type: "file",
+    accept: "image/png,image/jpeg,image/webp,image/gif",
+    className: "step-image-file-input",
+    hidden: "hidden",
+  });
+
+  const urlInput = el("input", {
+    type: "text",
+    className: "step-image-url-input",
+    value: String(step.image_url || ""),
+    "aria-label": `Картинка шага ${idx + 1}`,
+    placeholder: "URL картинки или загрузите файл (опционально)...",
+    oninput: () => {
+      step.image_url = urlInput.value.trim() || null;
+      syncPreview();
+    },
+  });
+
+  const previewThumb = el("img", {
+    className: "step-image-thumb",
+    alt: "",
+    role: "presentation",
+    hidden: !step.image_url ? "hidden" : undefined,
+    src: step.image_url || "",
+  });
+
+  const clearImgBtn = el("button", {
+    type: "button",
+    className: "btn ghost sm",
+    hidden: !step.image_url ? "hidden" : undefined,
+    onclick: () => {
+      step.image_url = null;
+      urlInput.value = "";
+      syncPreview();
+    },
+  }, ["Убрать ×"]);
+
+  function syncPreview() {
+    const val = String(step.image_url || "").trim();
+    if (val) {
+      previewThumb.src = val;
+      previewThumb.hidden = false;
+      clearImgBtn.hidden = false;
+    } else {
+      previewThumb.removeAttribute("src");
+      previewThumb.hidden = true;
+      clearImgBtn.hidden = true;
+    }
+  }
+
+  const uploadBtn = el("button", {
+    type: "button",
+    className: "btn secondary sm step-upload-image-btn",
+    onclick: () => fileInput.click(),
+  }, ["🖼 Прикрепить картинку"]);
+
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = "Загрузка...";
+    try {
+      const uploadedUrl = await uploadOutreachImageFile(file);
+      step.image_url = uploadedUrl;
+      urlInput.value = uploadedUrl;
+      syncPreview();
+      toast(`Картинка прикреплена к шагу ${idx + 1}`, "ok");
+    } catch (error) {
+      toast(error.message || "Ошибка загрузки картинки", "error");
+    } finally {
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = "🖼 Прикрепить картинку";
+      fileInput.value = "";
+    }
+  });
+
+  wrap.append(
+    el("div", { className: "step-media-bar row" }, [
+      fileInput,
+      uploadBtn,
+      urlInput,
+      previewThumb,
+      clearImgBtn,
+    ]),
+  );
+
+  return wrap;
+}
+
 function fillCampaignAccounts() {
   const select = document.querySelector("#campaign-account");
   const poolHost = document.querySelector("#campaign-accounts-pool");
   if (!select) return;
   const previous = select.value;
-  const connected = state.accounts.filter((account) => account.status === "connected");
+  const rawConnected = state.accounts.filter((account) => account.status === "connected");
+  const connected = dedupeConnectedAccounts(rawConnected);
   select.replaceChildren();
   if (poolHost) poolHost.replaceChildren();
   if (!connected.length) {
@@ -1359,14 +1603,12 @@ function fillCampaignAccounts() {
     updateCampaignPoolSummary();
     return;
   }
-  connected.forEach((account) => {
-    const isWa = normalizeProvider(account.provider) === "whatsapp";
-    const prefix = isWa ? "[WA]" : "[TG]";
-    const label = account.telegram_name || account.telegram_username || account.phone;
+  rawConnected.forEach((account) => {
+    const label = formatCompactAccountName(account);
     const sent = Number(account.sent_today) || 0;
     const limit = Number(account.daily_limit) || 20;
     select.append(
-      el("option", { value: String(account.id) }, [`${prefix} ${label} (${sent}/${limit} сегодня)`]),
+      el("option", { value: String(account.id) }, [`${label} (${sent}/${limit})`]),
     );
   });
   if (previous && [...select.options].some((opt) => opt.value === previous)) {
@@ -1387,9 +1629,7 @@ function fillCampaignAccounts() {
   if (poolHost) {
     connected.forEach((account) => {
       const accId = Number(account.id);
-      const isWa = normalizeProvider(account.provider) === "whatsapp";
-      const prefix = isWa ? "[WA]" : "[TG]";
-      const label = account.telegram_name || account.telegram_username || account.phone;
+      const label = formatCompactAccountName(account);
       const sent = Number(account.sent_today) || 0;
       const limit = Number(account.daily_limit) || 20;
       const checkbox = el("input", {
@@ -1410,7 +1650,7 @@ function fillCampaignAccounts() {
         el("label", { className: "pool-check-chip" }, [
           checkbox,
           channelBadgeEl(account.provider),
-          el("span", { className: "pool-check-name" }, [`${prefix} ${label}`]),
+          el("span", { className: "pool-check-name" }, [label]),
           el("span", { className: "pool-check-meta" }, [`${sent}/${limit}`]),
         ]),
       );
@@ -1427,7 +1667,7 @@ function renderBuilderSteps() {
     const delayVal = step.delay_hours ?? (idx === 0 ? 0 : 24);
     const titleSpan = el("span", { className: "step-title-badge" }, [
       idx === 0
-        ? "Шаг 1 · Сразу"
+        ? "Шаг 1 · Сразу (первое касание)"
         : `Шаг ${idx + 1} · Через ${delayVal} ч без ответа`,
     ]);
     const delayInput = el("input", {
@@ -1465,13 +1705,19 @@ function renderBuilderSteps() {
       );
     }
     const area = el("textarea", {
-      rows: "2",
+      rows: idx === 0 ? "4" : "3",
       "data-step-index": String(idx),
       "aria-label": `Шаблон сообщения шага ${idx + 1}`,
-      placeholder: "Привет, {name}! Пишу по проекту {company}...",
+      placeholder: idx === 0
+        ? "Вставьте готовое сообщение целиком ИЛИ используйте {step1_text} из CSV..."
+        : "Текст фоллоу-апа или {step2_text} из CSV...",
       onfocus: () => { state.activeStepIndex = idx; },
       oninput: (event) => { step.template_text = event.target.value; },
     }, [step.template_text || ""]);
+
+    const extraControls = buildStepMediaAndOfferControls(step, idx, (newText) => {
+      area.value = newText;
+    });
 
     host.append(
       el("div", { className: "campaign-step-card" }, [
@@ -1480,6 +1726,7 @@ function renderBuilderSteps() {
           el("div", { className: "row" }, headRight),
         ]),
         area,
+        extraControls,
       ]),
     );
   });
@@ -1635,6 +1882,34 @@ function buildCampaignSettingsPanel(camp, opts) {
     el("button", { type: "button", className: "btn ghost sm", onclick: () => bumpLgQuota(5) }, ["+5"]),
   ]);
 
+  const connectedAccounts = dedupeConnectedAccounts(state.accounts.filter((a) => a.status === "connected"));
+  const attachedIds = new Set(resolveCampaignAccounts(camp).map((a) => Number(a.id)));
+  const accountBoxes = [];
+  const accountChipsNodes = connectedAccounts.map((acc) => {
+    const accId = Number(acc.id);
+    const cb = el("input", {
+      type: "checkbox",
+      "data-settings-acc-id": String(accId),
+    });
+    cb.checked = attachedIds.has(accId);
+    accountBoxes.push(cb);
+    return el("label", { className: "pool-check-chip" }, [
+      cb,
+      channelBadgeEl(acc.provider),
+      el("span", { className: "pool-check-name" }, [formatCompactAccountName(acc)]),
+      el("span", { className: "pool-check-meta" }, [`${Number(acc.sent_today) || 0}/${Number(acc.daily_limit) || 20}`]),
+    ]);
+  });
+
+  const recipients = Array.isArray(camp.recipients) ? camp.recipients : [];
+  const recipientPreviewChips = recipients.slice(0, 5).map((r) => {
+    const rName = r.name || r.company || r.username || r.phone || "Контакт";
+    const rHandle = r.username ? `@${String(r.username).replace(/^@/, "")}` : "";
+    return el("span", { className: "recipient-mini-chip" }, [
+      rHandle ? `${rName} (${rHandle})` : rName,
+    ]);
+  });
+
   const sourceBoxes = [];
   const sourceChecksNodes = CAMPAIGN_LEADGEN_SOURCE_OPTIONS.map(([code, label]) => {
     const isChecked = leadgenSourcesList.includes(code);
@@ -1667,20 +1942,17 @@ function buildCampaignSettingsPanel(camp, opts) {
 
   const editableSteps = (Array.isArray(steps) && steps.length
     ? steps
-    : [{ step_order: 1, delay_hours: 0, template_text: "Привет, {name}!" }]
+    : [{ step_order: 1, delay_hours: 0, template_text: "Привет, {name}!", image_url: null }]
   ).map((st) => ({
     delay_hours: Number(st.delay_hours) || 0,
     template_text: String(st.template_text || ""),
+    image_url: st.image_url ? String(st.image_url) : null,
   }));
 
   const stepsHost = el("div", { className: "stack camp-edit-steps-host" }, []);
-  const stepsSummaryNode = el("summary", { className: "campaign-steps-summary" }, [
-    `Редактировать тексты шагов цепочки (${editableSteps.length})`,
-  ]);
 
   const renderEditableSteps = () => {
     stepsHost.replaceChildren();
-    stepsSummaryNode.textContent = `Редактировать тексты шагов цепочки (${editableSteps.length})`;
     editableSteps.forEach((st, idx) => {
       const delayInput = el("input", {
         type: "number",
@@ -1692,13 +1964,19 @@ function buildCampaignSettingsPanel(camp, opts) {
         },
       });
       const textInput = el("textarea", {
-        rows: "2",
-        placeholder: "Текст сообщения шага...",
+        rows: "3",
+        placeholder: idx === 0
+          ? "Вставьте готовое сообщение целиком ИЛИ используйте {step1_text} из CSV..."
+          : "Текст сообщения шага...",
         oninput: () => {
           st.template_text = textInput.value;
         },
       });
       textInput.value = st.template_text;
+
+      const extraControls = buildStepMediaAndOfferControls(st, idx, (newText) => {
+        textInput.value = newText;
+      });
 
       const removeStepBtn = editableSteps.length > 1
         ? el("button", {
@@ -1714,16 +1992,17 @@ function buildCampaignSettingsPanel(camp, opts) {
       stepsHost.append(
         el("div", { className: "step-card stack" }, [
           el("div", { className: "subcard-head" }, [
-            el("strong", {}, [`Шаг ${idx + 1}`]),
+            el("strong", {}, [idx === 0 ? "Шаг 1 · Первое сообщение" : `Шаг ${idx + 1}`]),
             el("div", { className: "row" }, [
               el("label", { className: "inline" }, [
-                "Через (ч):",
+                idx === 0 ? "Пауза (ч):" : "Через (ч):",
                 delayInput,
               ]),
               removeStepBtn,
             ].filter(Boolean)),
           ]),
           textInput,
+          extraControls,
         ]),
       );
     });
@@ -1737,6 +2016,7 @@ function buildCampaignSettingsPanel(camp, opts) {
       editableSteps.push({
         delay_hours: 24,
         template_text: "{name}, возвращаюсь к вопросу выше — актуально обсудить?",
+        image_url: null,
       });
       renderEditableSteps();
     },
@@ -1751,8 +2031,9 @@ function buildCampaignSettingsPanel(camp, opts) {
           step_order: idx + 1,
           delay_hours: Math.max(0, Number(st.delay_hours) || 0),
           template_text: String(st.template_text || "").trim(),
+          image_url: st.image_url ? String(st.image_url).trim() : null,
         }))
-        .filter((st) => st.template_text);
+        .filter((st) => st.template_text || st.image_url);
       if (!cleanSteps.length) {
         toast("Добавьте хотя бы один непустой шаг рассылки", "error");
         return;
@@ -1761,19 +2042,28 @@ function buildCampaignSettingsPanel(camp, opts) {
         .filter((cb) => cb.checked)
         .map((cb) => cb.getAttribute("data-camp-leadgen-source"))
         .filter(Boolean);
+      const selectedAccIds = accountBoxes
+        .filter((cb) => cb.checked)
+        .map((cb) => Number(cb.getAttribute("data-settings-acc-id")))
+        .filter((id) => Number.isFinite(id) && id > 0);
 
       saveSettingsBtn.disabled = true;
       try {
+        const bodyPayload = {
+          name: nameInput.value.trim() || camp.name,
+          daily_limit: Math.max(1, Math.min(500, Number(limitInput.value) || dailyLimit)),
+          leadgen_enabled: Boolean(lgEnabledCheck.checked),
+          leadgen_daily_quota: Math.max(0, Math.min(500, Number(lgQuotaInput.value) || 0)),
+          leadgen_sources: selectedSources,
+          steps: cleanSteps,
+        };
+        if (selectedAccIds.length) {
+          bodyPayload.account_id = selectedAccIds[0];
+          bodyPayload.account_ids = selectedAccIds;
+        }
         await api(`/api/campaigns/${camp.id}`, {
           method: "PUT",
-          body: {
-            name: nameInput.value.trim() || camp.name,
-            daily_limit: Math.max(1, Math.min(500, Number(limitInput.value) || dailyLimit)),
-            leadgen_enabled: Boolean(lgEnabledCheck.checked),
-            leadgen_daily_quota: Math.max(0, Math.min(500, Number(lgQuotaInput.value) || 0)),
-            leadgen_sources: selectedSources,
-            steps: cleanSteps,
-          },
+          body: bodyPayload,
         });
         await loadCampaigns();
         toast(`Настройки рассылки «${nameInput.value.trim() || camp.name}» сохранены`, "ok");
@@ -1790,7 +2080,7 @@ function buildCampaignSettingsPanel(camp, opts) {
     hidden: !settingsOpen ? "hidden" : undefined,
   }, [
     el("div", { className: "subcard-head" }, [
-      el("strong", {}, ["Настройки рассылки и автоподачи Лидгена"]),
+      el("strong", {}, ["Настройка рассылки: Отправители · Получатели · Сообщения и Картинка"]),
       el("div", { className: "row" }, [
         saveSettingsBtn,
         el("button", {
@@ -1818,18 +2108,61 @@ function buildCampaignSettingsPanel(camp, opts) {
         ]),
       ]),
     ]),
+    accountChipsNodes.length ? el("div", { className: "campaign-settings-accounts-box stack" }, [
+      el("div", { className: "subcard-head" }, [
+        el("span", { className: "steps-caption" }, ["1. С каких аккаунтов отправляем (ротация):"]),
+        el("button", {
+          type: "button",
+          className: "btn ghost sm",
+          onclick: () => {
+            accountBoxes.forEach((cb) => { cb.checked = true; });
+          },
+        }, ["Выбрать все"]),
+      ]),
+      el("div", { className: "campaign-accounts-pool" }, accountChipsNodes),
+    ]) : null,
+    el("div", { className: "campaign-settings-recipients-box stack" }, [
+      el("div", { className: "subcard-head" }, [
+        el("span", { className: "steps-caption" }, [
+          `2. Кому отправляем (база получателей): ${camp.total_recipients || recipients.length || 0} контактов`,
+        ]),
+        el("div", { className: "row" }, [
+          el("button", {
+            type: "button",
+            className: "btn secondary sm",
+            onclick: () => {
+              const select = document.querySelector("#csv-campaign-select");
+              if (select) select.value = String(camp.id);
+              if (state.viewMode === "sheet") openSheetPopup("csv");
+            },
+          }, ["+ Загрузить CSV"]),
+          el("button", {
+            type: "button",
+            className: "btn ghost sm",
+            onclick: () => {
+              const select = document.querySelector("#from-leads-campaign-select");
+              if (select) select.value = String(camp.id);
+              if (state.viewMode === "sheet") openSheetPopup("from-leads");
+            },
+          }, ["+ Из лидов CRM"]),
+        ]),
+      ]),
+      recipientPreviewChips.length
+        ? el("div", { className: "recipient-mini-chips-row" }, recipientPreviewChips)
+        : el("p", { className: "hint" }, ["В базе пока нет получателей — загрузите CSV с клиентами или включите поток из Лидгена ниже."]),
+    ]),
     el("div", { className: "campaign-leadgen-box stack" }, [
-      el("span", { className: "hint" }, ["Откуда брать новых получателей для этой рассылки (кликните, чтобы включить или выключить):"]),
+      el("span", { className: "hint" }, ["Автопополнение получателей из Лидгена (кликните источник):"]),
       el("div", { className: "campaign-sources-chips-row" }, sourceChecksNodes),
     ]),
-    el("details", { className: "campaign-steps-details" }, [
-      stepsSummaryNode,
-      el("div", { className: "stack campaign-steps-details-body" }, [
-        stepsHost,
-        el("div", { className: "row" }, [addStepBtn]),
+    el("div", { className: "campaign-steps-open-box stack" }, [
+      el("div", { className: "subcard-head" }, [
+        el("strong", {}, [`3. Сообщения, оффер и картинка (${editableSteps.length})`]),
+        addStepBtn,
       ]),
+      stepsHost,
     ]),
-  ]);
+  ].filter(Boolean));
 }
 
 async function updateCampaignAccounts(campaignId, accountIds) {
@@ -1859,13 +2192,13 @@ function renderCampaigns() {
     setView("#campaigns-view", "empty");
     return;
   }
-  const connectedAccounts = state.accounts.filter((item) => item.status === "connected");
+  const connectedAccounts = dedupeConnectedAccounts(state.accounts.filter((item) => item.status === "connected"));
   state.campaigns.forEach((camp) => {
     const statusPair = CAMPAIGN_STATUS_LABEL[camp.status] || [camp.status, "b-new"];
     const attachedAccounts = resolveCampaignAccounts(camp);
     const attachedIds = attachedAccounts.map((item) => Number(item.id));
     const attachedNames = attachedAccounts.map(
-      (item) => item.telegram_name || item.telegram_username || item.phone,
+      (item) => formatCompactAccountName(item),
     );
     const poolCapacity = attachedAccounts.reduce((sum, item) => sum + (Number(item.daily_limit) || 20), 0);
     const poolSummaryLabel = attachedAccounts.length > 1
@@ -1879,8 +2212,9 @@ function renderCampaigns() {
     const stepPills = steps.map((step) => {
       const when = Number(step.delay_hours) === 0 ? "сразу" : `через ${step.delay_hours} ч`;
       const preview = String(step.template_text || "").slice(0, 64);
+      const mediaBadge = step.image_url ? "🖼 " : "";
       return el("span", { className: "sequence-step-pill" }, [
-        `Шаг ${step.step_order} (${when}): ${preview}${step.template_text && step.template_text.length > 64 ? "…" : ""}`,
+        `Шаг ${step.step_order} (${when}): ${mediaBadge}${preview}${step.template_text && step.template_text.length > 64 ? "…" : ""}`,
       ]);
     });
 
@@ -1918,9 +2252,7 @@ function renderCampaigns() {
 
     const poolChecks = connectedAccounts.map((account) => {
       const accId = Number(account.id);
-      const isWa = normalizeProvider(account.provider) === "whatsapp";
-      const prefix = isWa ? "[WA]" : "[TG]";
-      const accLabel = account.telegram_name || account.telegram_username || account.phone;
+      const accLabel = formatCompactAccountName(account);
       const box = el("input", {
         type: "checkbox",
         "data-camp-account-id": String(accId),
@@ -1935,7 +2267,7 @@ function renderCampaigns() {
       return el("label", { className: "pool-check-chip" }, [
         box,
         channelBadgeEl(account.provider),
-        el("span", { className: "pool-check-name" }, [`${prefix} ${accLabel}`]),
+        el("span", { className: "pool-check-name" }, [accLabel]),
         el("span", { className: "pool-check-meta" }, [`${Number(account.sent_today) || 0}/${Number(account.daily_limit) || 20}`]),
       ]);
     });
@@ -2476,6 +2808,7 @@ function renderInboxSessionSwitcher() {
 
 function setInboxChatMode(mode) {
   state.inboxChatMode = mode === "crm" ? "crm" : "tgweb";
+  state.inboxChatModeExplicit = true;
   const connected = (state.accounts || []).filter((account) => account.status === "connected");
   syncTelegramWebAPanel(connected);
 }
@@ -2499,6 +2832,10 @@ function syncTelegramWebAPanel(connected) {
   }
 
   panel.hidden = false;
+  const hasDemo = (connected || []).some((acc) => Boolean(acc.is_demo));
+  if (!hasDemo && !state.inboxChatModeExplicit) {
+    state.inboxChatMode = "tgweb";
+  }
   const mode = state.inboxChatMode === "tgweb" ? "tgweb" : "crm";
   panel.dataset.chatMode = mode;
   if (grid) grid.dataset.tgwebActive = mode === "tgweb" ? "true" : "false";
@@ -2527,26 +2864,22 @@ function syncTelegramWebAPanel(connected) {
       const slot = idx + 1;
       const key = String(acc.id);
       const isSelected = String(target.id) === key;
-      const uname = acc.telegram_username ? `@${acc.telegram_username}` : acc.phone;
-      const dname = acc.telegram_name || uname;
-      const sent = Number(acc.sent_today) || 0;
-      const limit = Number(acc.daily_limit) || 20;
+      const uname = acc.telegram_username ? `@${acc.telegram_username}` : (acc.telegram_name || acc.phone);
       const tabBtn = el("button", {
         type: "button",
         className: `tg-web-account-tab${isSelected ? " is-active" : ""}`,
         "data-tgweb-account-id": key,
         "data-tgweb-slot": String(slot),
         "aria-pressed": isSelected ? "true" : "false",
+        title: `${acc.telegram_name || ""} ${uname}`.trim(),
         onclick: () => {
           switchInboxSession(key);
         },
       }, [
         el("span", { className: "conn-dot", "data-conn": "ok", "aria-hidden": "true" }, []),
         el("span", { className: "tg-web-tab-slot" }, [`#${slot}`]),
-        el("span", { className: "tg-web-tab-name" }, [dname]),
-        acc.telegram_username ? el("span", { className: "tg-web-tab-handle" }, [`@${acc.telegram_username}`]) : null,
-        el("span", { className: "tg-web-tab-quota" }, [`${sent}/${limit}`]),
-      ].filter(Boolean));
+        el("span", { className: "tg-web-tab-name" }, [uname]),
+      ]);
       pillsHost.append(tabBtn);
     });
     const addAccBtn = el("button", {
@@ -2579,7 +2912,8 @@ function syncTelegramWebAPanel(connected) {
   }
   frameWrap.hidden = mode === "crm";
 
-  if (mode === "tgweb") {
+  const inboxVisible = state.viewMode !== "sheet" || state.activeSheet === "inbox";
+  if (mode === "tgweb" && inboxVisible) {
     // Remove initial placeholder iframe without data-account-id if present
     const placeholder = frameWrap.querySelector("iframe#tg-web-a-frame:not([data-account-id])");
     if (placeholder) {
@@ -3685,9 +4019,47 @@ function updateWorkspaceStats() {
 function renderBoard() {
   if (state.draggedLeadId) return;
   const { status: stage, folderId, channel, followup } = pipelineFilters();
+  const quickSearchEl = document.querySelector("#pipeline-quick-search");
+  const quickQuery = quickSearchEl ? String(quickSearchEl.value || "").trim().toLowerCase() : "";
   const board = document.querySelector("#board");
   board.replaceChildren();
   board.style.setProperty("--stage-cols", String(Math.max(1, STATUSES.length)));
+
+  const counterStrip = document.querySelector("#pipeline-counter-strip");
+  if (counterStrip) {
+    const allLeads = state.leads || [];
+    let waitingCount = 0;
+    let positiveCount = 0;
+    let talkingCount = 0;
+    allLeads.forEach((lead) => {
+      const tr = resolveLeadTracking(lead);
+      if (tr.isWaitingOurAnswer) waitingCount += 1;
+      if (tr.isPositiveReply) positiveCount += 1;
+      if (lead.status === "talk" || lead.status === "call" || tr.isReplied) talkingCount += 1;
+    });
+    counterStrip.replaceChildren(
+      el("span", { className: "pipeline-stat-pill" }, [
+        "Всего: ",
+        el("strong", {}, [String(allLeads.length)]),
+      ]),
+      el("span", { className: "pipeline-stat-sep", "aria-hidden": "true" }, ["·"]),
+      el("span", { className: "pipeline-stat-pill is-warn" }, [
+        "🔥 Ждут нашего ответа: ",
+        el("strong", {}, [String(waitingCount)]),
+      ]),
+      el("span", { className: "pipeline-stat-sep", "aria-hidden": "true" }, ["·"]),
+      el("span", { className: "pipeline-stat-pill is-ok" }, [
+        "+ Позитив: ",
+        el("strong", {}, [String(positiveCount)]),
+      ]),
+      el("span", { className: "pipeline-stat-sep", "aria-hidden": "true" }, ["·"]),
+      el("span", { className: "pipeline-stat-pill" }, [
+        "💬 В диалоге: ",
+        el("strong", {}, [String(talkingCount)]),
+      ]),
+    );
+  }
+
   STATUSES.forEach(([value, label]) => {
     const cards = state.leads.filter((lead) => {
       if (lead.status !== value) return false;
@@ -3695,6 +4067,10 @@ function renderBoard() {
       if (folderId && String(lead.folder_id || "") !== folderId) return false;
       if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
       if (!matchFollowupFilter(lead, followup)) return false;
+      if (quickQuery) {
+        const hay = `${lead.name || ""} ${lead.username || ""} ${lead.company || ""} ${lead.phone || ""}`.toLowerCase();
+        if (!hay.includes(quickQuery)) return false;
+      }
       return true;
     }).sort((a, b) => {
       const ta = resolveLeadTracking(a);
@@ -3813,7 +4189,7 @@ function renderBoard() {
     }, [label]);
     const sep1 = el("span", { className: "col-sep", "aria-hidden": "true" }, [" · "]);
     const count = el("span", { className: "meta col-count", "data-col-count": String(cards.length) }, [String(cards.length)]);
-    const sep2 = el("span", { className: "col-sep", "aria-hidden": "true" }, [" · "]);
+    const sep2 = el("span", { className: "col-sep col-sep-sum", "aria-hidden": "true" }, [" · "]);
     const activeCurrencies = [...new Set(
       (cards.filter((item) => leadAmount(item) > 0).length ? cards.filter((item) => leadAmount(item) > 0) : cards)
         .map((item) => String(item.currency || "USD").toUpperCase())
@@ -5031,6 +5407,7 @@ bindBusy(document.querySelector("#code-form"), async (event) => {
   const result = await api(`/api/accounts/${state.loginId}/code`, { method: "POST", body: { code } });
   document.querySelector("#password-form").hidden = result.status !== "pending_password";
   if (result.status === "connected") {
+    state.loginId = null;
     document.querySelector("#code-form").hidden = true;
     closeSheetPopup();
   }
@@ -5041,6 +5418,7 @@ bindBusy(document.querySelector("#code-form"), async (event) => {
 bindBusy(document.querySelector("#password-form"), async (event) => {
   const password = new FormData(event.target).get("password");
   await api(`/api/accounts/${state.loginId}/password`, { method: "POST", body: { password } });
+  state.loginId = null;
   document.querySelector("#password-form").hidden = true;
   document.querySelector("#code-form").hidden = true;
   closeSheetPopup();
@@ -5445,6 +5823,35 @@ function renderCsvPreview(data) {
     rowNodes.push(line);
   });
   wrap.replaceChildren(...rowNodes);
+
+  const builderRecBadge = document.querySelector("#builder-recipients-badge");
+  const builderRecPreview = document.querySelector("#builder-csv-recipients-preview");
+  if (builderRecBadge) {
+    builderRecBadge.textContent = `${totalRows} клиентов из CSV`;
+    builderRecBadge.className = "badge b-ok";
+  }
+  if (builderRecPreview) {
+    builderRecPreview.hidden = false;
+    const previewItems = rows.slice(0, 4).map((r) => {
+      const getVal = (idx) => (idx >= 0 ? String((Array.isArray(r) ? r[idx] : (r[headers[idx]] ?? "")) || "").trim() : "");
+      const uIdx = headers.findIndex((h) => /telegram|username|handle|ник|контакт/i.test(h));
+      const cIdx = headers.findIndex((h) => /company|компания|бренд|проект|name|имя/i.test(h));
+      const s1Idx = headers.findIndex((h) => /первое касание|step_1|step1_text|message|first_touch/i.test(h));
+      const handle = getVal(uIdx >= 0 ? uIdx : 0);
+      const comp = cIdx >= 0 && cIdx !== uIdx ? getVal(cIdx) : "";
+      const s1 = getVal(s1Idx);
+      return el("div", { className: "builder-recipient-preview-item" }, [
+        el("strong", {}, [comp ? `${comp} (${handle})` : handle]),
+        s1 ? el("span", { className: "hint" }, [` — ${s1.slice(0, 90)}${s1.length > 90 ? "…" : ""}`]) : null,
+      ].filter(Boolean));
+    });
+    builderRecPreview.replaceChildren(
+      el("div", { className: "builder-recipients-summary-line" }, [
+        `Загружено из CSV: ${totalRows} клиентов · колонки: ${headers.slice(0, 5).map((h) => `{${h}}`).join(", ")}`,
+      ]),
+      ...previewItems,
+    );
+  }
 }
 
 async function updateCsvPreview(csvText) {
@@ -5485,6 +5892,20 @@ if (fillSampleCsvBtn) {
     }
     updateCsvPreview(area.value);
     toast("Загружен пример таблицы SoftUGC (39 лидов с Первым касанием и 2 фоллоуапами)", "ok");
+  });
+}
+
+const builderSampleCsvBtn = document.querySelector("#builder-sample-csv-btn");
+if (builderSampleCsvBtn) {
+  builderSampleCsvBtn.addEventListener("click", () => {
+    if (fillSampleCsvBtn) fillSampleCsvBtn.click();
+  });
+}
+
+const builderFromLeadsBtn = document.querySelector("#builder-from-leads-btn");
+if (builderFromLeadsBtn) {
+  builderFromLeadsBtn.addEventListener("click", () => {
+    openSheetPopup("from-leads");
   });
 }
 
@@ -7402,7 +7823,17 @@ function renderDeepOutreachAnalytics(summary) {
   if (!data || !data.deep_outreach) return;
   const analyticsBox = document.querySelector("#analytics-deep-outreach-box");
   if (analyticsBox) {
-    analyticsBox.replaceChildren(buildDeepOutreachNode(data.deep_outreach, "an_deep"));
+    analyticsBox.replaceChildren(
+      el("details", { className: "surface-subcard outreach-audit-details" }, [
+        el("summary", { className: "subcard-head outreach-audit-summary" }, [
+          el("strong", {}, ["Детальный аудит рассылок"]),
+          el("span", { className: "badge b-new" }, ["Развернуть"]),
+        ]),
+        el("div", { className: "outreach-audit-body stack" }, [
+          buildDeepOutreachNode(data.deep_outreach, "an_deep"),
+        ]),
+      ]),
+    );
   }
   const outreachBox = document.querySelector("#outreach-deep-stats-box");
   if (outreachBox) {
@@ -7417,6 +7848,13 @@ function renderDeepOutreachAnalytics(summary) {
     ]);
     outreachBox.replaceChildren(deepDetails);
   }
+}
+
+const pipelineQuickSearchInput = document.querySelector("#pipeline-quick-search");
+if (pipelineQuickSearchInput) {
+  pipelineQuickSearchInput.addEventListener("input", () => {
+    renderBoard();
+  });
 }
 
 const leadsQuickSearchInput = document.querySelector("#leads-quick-search");
@@ -9612,8 +10050,8 @@ function bindV5Events() {
   const mcpModal = document.querySelector("#mcp-modal-box");
   if (openMcpBtn && mcpModal) {
     openMcpBtn.addEventListener("click", async () => {
-      mcpModal.hidden = false;
       await loadMcpInfo();
+      mcpModal.hidden = false;
       mcpModal.scrollIntoView({ block: "nearest" });
     });
   }
@@ -9921,14 +10359,14 @@ function syncLeadgenSwitchBadges() {
 
   syncPill("#leadgen-enabled-toggle", "leadgen-enabled", "ВКЛ", "ПАУЗА");
   syncPill("#leadgen-autopush-toggle", "leadgen-autopush", "ВКЛ", "ВЫКЛ");
-  syncPill("#leadgen-b2b-enabled", "b2b-enabled", "Поток ВКЛ", "Поток ВЫКЛ");
-  syncPill("#leadgen-vacancies-enabled", "vac-enabled", "Поток ВКЛ", "Поток ВЫКЛ");
+  syncPill("#leadgen-b2b-enabled", "b2b-enabled", "ВКЛ", "ВЫКЛ");
+  syncPill("#leadgen-vacancies-enabled", "vac-enabled", "ВКЛ", "ВЫКЛ");
 
   const b2bBoxes = [...document.querySelectorAll("[data-b2b-source]")];
   const b2bOn = b2bBoxes.filter((cb) => cb.checked).length;
   const b2bCountBadge = document.querySelector("#b2b-active-count-badge");
   if (b2bCountBadge && b2bBoxes.length) {
-    b2bCountBadge.textContent = `Включено: ${b2bOn} из ${b2bBoxes.length}`;
+    b2bCountBadge.textContent = `${b2bOn}/${b2bBoxes.length}`;
     b2bCountBadge.className = `badge ${b2bOn > 0 ? "b-ok" : "b-off"}`;
   }
 
@@ -9936,7 +10374,7 @@ function syncLeadgenSwitchBadges() {
   const vacOn = vacBoxes.filter((cb) => cb.checked).length;
   const vacCountBadge = document.querySelector("#vac-active-count-badge");
   if (vacCountBadge && vacBoxes.length) {
-    vacCountBadge.textContent = `Включено: ${vacOn} из ${vacBoxes.length}`;
+    vacCountBadge.textContent = `${vacOn}/${vacBoxes.length}`;
     vacCountBadge.className = `badge ${vacOn > 0 ? "b-ok" : "b-off"}`;
   }
 

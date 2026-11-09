@@ -86,6 +86,8 @@ def log(*a):
 
 
 def load_env():
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return
     # project .env (FIRECRAWL_API_KEY, LLM keys)
     try:
         for line in open(os.path.join(ROOT, ".env")):

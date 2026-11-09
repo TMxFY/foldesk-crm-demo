@@ -994,9 +994,17 @@ class TelethonGateway(TelegramGateway):
                 break
         return found
 
-    async def send_message(self, session_path: str, peer_id, text: str, reply_to=None) -> dict:
+    async def send_message(
+        self,
+        session_path: str,
+        peer_id,
+        text: str,
+        reply_to=None,
+        image_path: str | None = None,
+    ) -> dict:
         body = (text or "").strip()
-        if not body:
+        clean_img = (image_path or "").strip() or None
+        if not body and not clean_img:
             raise GatewayError("Напишите сообщение")
         async with self._session_lock(session_path):
             client, owned = await self._open(session_path)
@@ -1006,7 +1014,18 @@ class TelethonGateway(TelegramGateway):
                     target = int(peer_id)
                 else:
                     target = str(peer_id).strip()
-                msg = await client.send_message(target, body, **kwargs)
+                if clean_img:
+                    from app.db import resolve_outreach_media
+
+                    media_target = resolve_outreach_media(clean_img)
+                    msg = await client.send_file(
+                        target,
+                        str(media_target),
+                        caption=body or None,
+                        **kwargs,
+                    )
+                else:
+                    msg = await client.send_message(target, body, **kwargs)
             except GatewayError:
                 raise
             except Exception as exc:
@@ -1017,6 +1036,7 @@ class TelethonGateway(TelegramGateway):
             return {
                 "telegram_message_id": int(msg.id),
                 "text": getattr(msg, "message", None) or body,
+                "image_url": clean_img,
                 "sent_at": _stamp(getattr(msg, "date", None)),
                 "direction": "out",
             }
@@ -1515,9 +1535,17 @@ class FakeGateway(TelegramGateway):
                 break
         return matched
 
-    async def send_message(self, session_path: str, peer_id, text: str, reply_to=None) -> dict:
+    async def send_message(
+        self,
+        session_path: str,
+        peer_id,
+        text: str,
+        reply_to=None,
+        image_path: str | None = None,
+    ) -> dict:
         body = (text or "").strip()
-        if not body:
+        clean_img = (image_path or "").strip() or None
+        if not body and not clean_img:
             raise GatewayError("Напишите сообщение")
         if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit():
             peer_key = int(peer_id)
@@ -1530,10 +1558,20 @@ class FakeGateway(TelegramGateway):
         }
         while self._message_seq in used:
             self._message_seq += 1
-        self.sent.append({"peer_id": peer_key, "text": body, "reply_to": reply_to, "session_path": session_path})
+        self.sent.append(
+            {
+                "peer_id": peer_key,
+                "text": body,
+                "image_url": clean_img,
+                "image_path": clean_img,
+                "reply_to": reply_to,
+                "session_path": session_path,
+            }
+        )
         record = {
             "telegram_message_id": self._message_seq,
             "text": body,
+            "image_url": clean_img,
             "sent_at": utc_now(),
             "direction": "out",
             "reply_to_telegram_message_id": int(reply_to) if reply_to else None,

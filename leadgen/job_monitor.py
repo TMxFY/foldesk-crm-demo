@@ -214,6 +214,8 @@ EXTRACT = """Из вакансии ниже вытащи поля. Она уже
 
 
 def load_env():
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return
     candidates = [
         WORKTREE_ROOT / ".env",
         Path("/Users/timofei/dev/Python/new era/crmtg/.env"),

@@ -49,18 +49,19 @@ except ImportError:
     except ImportError:
         from scripts.supply_side import supply_reason
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
-except ImportError:
-    # minimal .env parse fallback
-    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-    if os.path.exists(env_path):
-        for line in open(env_path):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+    except ImportError:
+        # minimal .env parse fallback
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        if os.path.exists(env_path):
+            for line in open(env_path):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 BASE_URL = (os.getenv("LLM_BASE_URL") or "https://relay.fast/v1").rstrip("/")
 API_KEY = os.getenv("RELAYFAST_API_KEY") or os.getenv("LLM_API_KEY") or ""
