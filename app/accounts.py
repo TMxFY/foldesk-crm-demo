@@ -117,7 +117,10 @@ def _public(row: dict) -> dict:
     out["is_demo"] = is_demo
     out["session_exists"] = session_exists
     out["tg_web_ready"] = bool(
-        provider == "telegram" and _inspect_telethon_session(session_path) is not None
+        provider == "telegram"
+        and status == "connected"
+        and health not in ("unauthorized", "offline", "banned", "frozen")
+        and _inspect_telethon_session(session_path) is not None
     )
     out["connection_label"] = connection_label
     return out
@@ -193,12 +196,66 @@ def _unlink_account_refs(conn, account_ids: list[int]) -> None:
             pass
 
 
+def _get_deleted_sessions(conn) -> set[str]:
+    try:
+        row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'deleted_sessions_v1'"
+        ).fetchone()
+        if row and row[0]:
+            items = json.loads(str(row[0]))
+            if isinstance(items, list):
+                return {str(x).strip() for x in items if x}
+    except Exception:
+        pass
+    return set()
+
+
+def _record_deleted_session(conn, session_path: str | None = None, phone: str | None = None) -> None:
+    try:
+        items = _get_deleted_sessions(conn)
+        if session_path:
+            items.add(str(session_path).strip())
+            items.add(Path(str(session_path).strip()).name)
+        digits = _phone_digits(phone)
+        if digits and len(digits) >= 7:
+            items.add(f"phone:{digits}")
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('deleted_sessions_v1', ?, ?)",
+            (json.dumps(sorted(items), ensure_ascii=False), utc_now()),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _clear_deleted_session(conn, session_path: str | None = None, phone: str | None = None) -> None:
+    try:
+        items = _get_deleted_sessions(conn)
+        if not items:
+            return
+        if session_path:
+            items.discard(str(session_path).strip())
+            items.discard(Path(str(session_path).strip()).name)
+        digits = _phone_digits(phone)
+        if digits:
+            items.discard(f"phone:{digits}")
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('deleted_sessions_v1', ?, ?)",
+            (json.dumps(sorted(items), ensure_ascii=False), utc_now()),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
 def delete_account(conn, account_id: int) -> dict:
     current = _load(conn, account_id)
     session_path = str(current.get("session_path") or "").strip()
+    phone = str(current.get("phone") or "").strip()
     _unlink_account_refs(conn, [int(account_id)])
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     conn.commit()
+    _record_deleted_session(conn, session_path=session_path, phone=phone)
     if (
         session_path
         and not session_path.startswith("data/sessions/demo")
@@ -213,13 +270,45 @@ def delete_account(conn, account_id: int) -> dict:
                     shutil.move(str(abs_p), str(backup_p))
                 else:
                     abs_p.unlink()
+            if abs_p.name == "1.session":
+                tim_backup = abs_p.parent / "backup_tim_cros.session"
+                if tim_backup.exists():
+                    shutil.move(str(tim_backup), str(abs_p.parent / "backup_deleted_tim_cros.session"))
             for suffix in ("-journal", "-wal", "-shm"):
                 sidecar = abs_p.with_name(abs_p.name + suffix)
                 if sidecar.exists():
                     sidecar.unlink()
         except Exception:
             pass
-    return {"deleted": True, "id": int(account_id)}
+    return {"deleted": True, "id": int(account_id), "session_path": session_path}
+
+
+def purge_dead_accounts(conn) -> dict:
+    rows = conn.execute(
+        """
+        SELECT id FROM accounts
+        WHERE status != 'connected'
+           OR health IN ('unauthorized', 'banned', 'frozen')
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    deleted_ids: list[int] = []
+    deleted_paths: list[str] = []
+    for row in rows:
+        aid = int(row[0])
+        try:
+            res = delete_account(conn, aid)
+            deleted_ids.append(aid)
+            if res.get("session_path"):
+                deleted_paths.append(str(res["session_path"]))
+        except Exception:
+            continue
+    return {
+        "deleted_ids": deleted_ids,
+        "deleted_paths": deleted_paths,
+        "count": len(deleted_ids),
+        "accounts": list_accounts(conn),
+    }
 
 
 def check_daily_limit(conn, account_id: int) -> tuple[int, int]:
@@ -381,20 +470,48 @@ def restore_disk_sessions(conn) -> int:
     """Ensure authorized Telethon .session files and DB rows stay synchronized across restarts."""
     sessions_dir = resolve_session("data/sessions")
     sessions_dir.mkdir(parents=True, exist_ok=True)
+    deleted_registry = _get_deleted_sessions(conn)
     primary_sess = sessions_dir / "1.session"
     backup_sess = sessions_dir / "backup_tim_cros.session"
 
-    if not primary_sess.exists() and backup_sess.exists():
-        try:
-            shutil.copy2(backup_sess, primary_sess)
-        except Exception:
-            pass
-    elif primary_sess.exists() and not backup_sess.exists():
-        if _inspect_telethon_session("data/sessions/1.session") is not None:
+    tim_deleted = (
+        "data/sessions/1.session" in deleted_registry
+        or "1.session" in deleted_registry
+        or "phone:905346380943" in deleted_registry
+    )
+    if not tim_deleted:
+        if not primary_sess.exists() and backup_sess.exists():
             try:
-                shutil.copy2(primary_sess, backup_sess)
+                shutil.copy2(backup_sess, primary_sess)
             except Exception:
                 pass
+        elif primary_sess.exists() and not backup_sess.exists():
+            if _inspect_telethon_session("data/sessions/1.session") is not None:
+                try:
+                    shutil.copy2(primary_sess, backup_sess)
+                except Exception:
+                    pass
+
+    # Clean up phantom accounts created from numeric ID session files (e.g. "+2", "+3")
+    phantom_rows = conn.execute(
+        """
+        SELECT id, phone, session_path, telegram_username
+        FROM accounts
+        WHERE status != 'pending_code'
+        """
+    ).fetchall()
+    phantom_ids = [
+        int(r[0])
+        for r in phantom_rows
+        if len(_phone_digits(r[1])) < 7
+        and not str(r[2] or "").startswith("data/sessions/demo")
+        and not r[3]
+    ]
+    if phantom_ids:
+        _unlink_account_refs(conn, phantom_ids)
+        for pid in phantom_ids:
+            conn.execute("DELETE FROM accounts WHERE id = ?", (pid,))
+        conn.commit()
 
     restored = 0
     now = utc_now()
@@ -407,6 +524,14 @@ def restore_disk_sessions(conn) -> int:
         account_id = int(row["id"])
         session_path = str(row.get("session_path") or "").strip()
         if not session_path:
+            continue
+        p_digits = _phone_digits(str(row.get("phone") or ""))
+        if (
+            session_path in deleted_registry
+            or Path(session_path).name in deleted_registry
+            or (p_digits and f"phone:{p_digits}" in deleted_registry)
+        ):
+            conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
             continue
         known_paths.add(session_path)
         abs_p = resolve_session(session_path)
@@ -448,7 +573,7 @@ def restore_disk_sessions(conn) -> int:
                 restored += 1
             connected_phones.add(str(row.get("phone") or "").strip())
 
-    # Register any authorized .session files on disk that are missing from accounts table
+    # Register any authorized phone-named .session files on disk that are missing from accounts table
     for sess_file in sorted(sessions_dir.glob("*.session")):
         name = sess_file.name
         if (
@@ -461,10 +586,18 @@ def restore_disk_sessions(conn) -> int:
         rel_path = f"data/sessions/{name}"
         if rel_path in known_paths:
             continue
-        if _inspect_telethon_session(rel_path) is None:
+        if rel_path in deleted_registry or name in deleted_registry:
             continue
         is_tim = name == "1.session"
-        phone = "+905346380943" if is_tim else f"+{sess_file.stem.lstrip('+')}"
+        stem_digits = _phone_digits(sess_file.stem)
+        # Never auto-register numeric row-ID files like 2.session, 3.session, 11.session
+        if not is_tim and len(stem_digits) < 7:
+            continue
+        phone = "+905346380943" if is_tim else f"+{stem_digits}"
+        if f"phone:{_phone_digits(phone)}" in deleted_registry:
+            continue
+        if _inspect_telethon_session(rel_path) is None:
+            continue
         tg_uid = 5680938518 if is_tim else None
         tg_user = "tim_cros" if is_tim else None
         tg_name = "Tim Korznikov" if is_tim else f"Telegram ({sess_file.stem})"
@@ -604,6 +737,7 @@ async def start_login(
     else:
         session_path = f"data/sessions/{account_id}.session"
     resolve_session(session_path).parent.mkdir(parents=True, exist_ok=True)
+    _clear_deleted_session(conn, session_path=session_path, phone=phone)
     conn.execute(
         "UPDATE accounts SET session_path = ? WHERE id = ?",
         (session_path, account_id),
@@ -953,11 +1087,63 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             or payload.get("app_hash")
             or payload.get("api_hash")
         )
+        device_model = str(
+            entry.get("device")
+            or entry.get("device_model")
+            or jdata.get("device")
+            or jdata.get("device_model")
+            or ""
+        ).strip() or None
+        system_version = str(
+            entry.get("sdk")
+            or entry.get("system_version")
+            or jdata.get("sdk")
+            or jdata.get("system_version")
+            or ""
+        ).strip() or None
+        app_version = str(
+            entry.get("app_version")
+            or jdata.get("app_version")
+            or ""
+        ).strip() or None
+        lang_code = str(
+            entry.get("lang_code")
+            or entry.get("lang_pack")
+            or jdata.get("lang_code")
+            or jdata.get("lang_pack")
+            or ""
+        ).strip() or None
+        system_lang_code = str(
+            entry.get("system_lang_code")
+            or entry.get("system_lang_pack")
+            or jdata.get("system_lang_code")
+            or jdata.get("system_lang_pack")
+            or ""
+        ).strip() or None
+        parsed_api_id = None
+        if app_id_val is not None and str(app_id_val).strip():
+            try:
+                parsed_api_id = int(str(app_id_val).strip())
+            except ValueError:
+                parsed_api_id = None
+        parsed_api_hash = str(app_hash_val).strip() if app_hash_val else None
+
         if gateway is not None:
             if hasattr(gateway, "set_proxy"):
                 gateway.set_proxy(session_path, proxy_url)
-            if hasattr(gateway, "set_app_credentials") and app_id_val and app_hash_val:
-                gateway.set_app_credentials(session_path, app_id_val, app_hash_val)
+            if hasattr(gateway, "set_app_credentials") and parsed_api_id and parsed_api_hash:
+                gateway.set_app_credentials(session_path, parsed_api_id, parsed_api_hash)
+            if hasattr(gateway, "set_device_profile"):
+                gateway.set_device_profile(
+                    session_path,
+                    device_model=device_model,
+                    system_version=system_version,
+                    app_version=app_version,
+                    lang_code=lang_code,
+                    system_lang_code=system_lang_code,
+                )
+
+        _clear_deleted_session(conn, session_path=session_path, phone=phone)
 
         dup_connected = _find_duplicate_account(
             conn,
@@ -988,7 +1174,11 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 SET session_path = ?, status = 'connected', telegram_user_id = ?,
                     telegram_username = ?, telegram_name = ?, health = 'active',
                     last_error = NULL, updated_at = ?, daily_limit = ?,
-                    proxy_url = ?, access_scope = ?, provider = ?, wa_jid = ?
+                    proxy_url = ?, access_scope = ?, provider = ?, wa_jid = ?,
+                    api_id = COALESCE(?, api_id), api_hash = COALESCE(?, api_hash),
+                    device_model = COALESCE(?, device_model), system_version = COALESCE(?, system_version),
+                    app_version = COALESCE(?, app_version), lang_code = COALESCE(?, lang_code),
+                    system_lang_code = COALESCE(?, system_lang_code)
                 WHERE id = ?
                 """,
                 (
@@ -1002,6 +1192,13 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     access_scope,
                     provider,
                     wa_jid,
+                    parsed_api_id,
+                    parsed_api_hash,
+                    device_model,
+                    system_version,
+                    app_version,
+                    lang_code,
+                    system_lang_code,
                     account_id,
                 ),
             )
@@ -1013,8 +1210,9 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     telegram_username, telegram_name, created_at,
                     health, last_error, updated_at, daily_limit,
                     sent_today, sent_date, proxy_url, access_scope,
-                    provider, wa_jid
-                ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, ?, 0, ?, ?, ?, ?, ?)
+                    provider, wa_jid, api_id, api_hash,
+                    device_model, system_version, app_version, lang_code, system_lang_code
+                ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     phone,
@@ -1030,6 +1228,13 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     access_scope,
                     provider,
                     wa_jid,
+                    parsed_api_id,
+                    parsed_api_hash,
+                    device_model,
+                    system_version,
+                    app_version,
+                    lang_code,
+                    system_lang_code,
                 ),
             )
             account_id = int(cur.lastrowid)

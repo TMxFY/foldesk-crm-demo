@@ -588,6 +588,7 @@ class TelethonGateway(TelegramGateway):
         self._locks = {}
         self._proxies = {}
         self._app_credentials = {}
+        self._device_profiles = {}
 
     def set_proxy(self, session_path: str, proxy_url: str | None) -> None:
         if not session_path:
@@ -616,6 +617,73 @@ class TelethonGateway(TelegramGateway):
             self._app_credentials[session_path] = (int(app_id), str(app_hash).strip())
         except (TypeError, ValueError):
             pass
+
+    def set_device_profile(
+        self,
+        session_path: str,
+        *,
+        device_model: str | None = None,
+        system_version: str | None = None,
+        app_version: str | None = None,
+        lang_code: str | None = None,
+        system_lang_code: str | None = None,
+    ) -> None:
+        if not session_path:
+            return
+        prof = {
+            k: v
+            for k, v in {
+                "device_model": (device_model or "").strip() or None,
+                "system_version": (system_version or "").strip() or None,
+                "app_version": (app_version or "").strip() or None,
+                "lang_code": (lang_code or "").strip() or None,
+                "system_lang_code": (system_lang_code or "").strip() or None,
+            }.items()
+            if v is not None
+        }
+        if prof:
+            self._device_profiles[session_path] = prof
+
+    def _resolve_device_profile(self, session_path: str | None = None) -> dict[str, str]:
+        defaults = {
+            "device_model": "MacBookPro18,3",
+            "system_version": "macOS 14.5",
+            "app_version": "5.12.3 macOS",
+            "lang_code": "en",
+            "system_lang_code": "en-US",
+        }
+        if not session_path:
+            return defaults
+        cached = self._device_profiles.get(session_path)
+        if cached:
+            return {**defaults, **cached}
+        if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+            try:
+                with sqlite3.connect(DEFAULT_DB) as c:
+                    row = c.execute(
+                        """
+                        SELECT device_model, system_version, app_version, lang_code, system_lang_code
+                        FROM accounts
+                        WHERE session_path = ?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (session_path,),
+                    ).fetchone()
+                    if row:
+                        db_prof = {
+                            k: str(v).strip()
+                            for k, v in zip(
+                                ("device_model", "system_version", "app_version", "lang_code", "system_lang_code"),
+                                row,
+                            )
+                            if v and str(v).strip()
+                        }
+                        if db_prof:
+                            self._device_profiles[session_path] = db_prof
+                            return {**defaults, **db_prof}
+            except Exception:
+                pass
+        return defaults
 
     def _resolve_proxy(self, session_path: str, conn=None) -> str | None:
         cached = self._proxies.get(session_path)
@@ -675,6 +743,19 @@ class TelethonGateway(TelegramGateway):
     def _credentials(self, session_path: str | None = None):
         if session_path and session_path in self._app_credentials:
             return self._app_credentials[session_path]
+        if session_path and "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+            try:
+                with sqlite3.connect(DEFAULT_DB) as conn:
+                    acc_row = conn.execute(
+                        "SELECT api_id, api_hash FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
+                        (session_path,),
+                    ).fetchone()
+                    if acc_row and acc_row[0] and acc_row[1]:
+                        creds = (int(acc_row[0]), str(acc_row[1]).strip())
+                        self._app_credentials[session_path] = creds
+                        return creds
+            except Exception:
+                pass
         api_id = os.getenv("TG_API_ID", "").strip()
         api_hash = os.getenv("TG_API_HASH", "").strip()
         if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
@@ -744,14 +825,13 @@ class TelethonGateway(TelegramGateway):
         candidate_urls = [primary_url] + self._fallback_nodemaven_urls(session_path, primary_url)
         last_exc: Exception | None = None
 
+        dev_profile = self._resolve_device_profile(session_path)
         for idx, candidate_url in enumerate(candidate_urls):
             proxy_tuple = _parse_proxy_for_telethon(candidate_url)
             kwargs: dict = {
-                "device_model": "MacBookPro18,3",
-                "system_version": "macOS 14.5",
-                "app_version": "10.12",
-                "lang_code": "en",
-                "system_lang_code": "en-US",
+                **dev_profile,
+                "use_ipv6": False,
+                "sequential_updates": True,
             }
             if proxy_tuple:
                 kwargs["proxy"] = proxy_tuple
@@ -780,9 +860,23 @@ class TelethonGateway(TelegramGateway):
         raise GatewayError("Не удалось подключиться к Telegram")
 
     async def _close(self, session_path: str) -> None:
-        client = self._clients.pop(session_path, None)
-        if client is not None and client.is_connected():
-            await client.disconnect()
+        async with self._session_lock(session_path):
+            client = self._clients.pop(session_path, None)
+            self._proxies.pop(session_path, None)
+            self._app_credentials.pop(session_path, None)
+            self._device_profiles.pop(session_path, None)
+            if client is not None:
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                except Exception:
+                    pass
+                try:
+                    sess = getattr(client, "session", None)
+                    if sess is not None and hasattr(sess, "close"):
+                        sess.close()
+                except Exception:
+                    pass
 
     async def close_all(self) -> None:
         for path in list(self._clients.keys()):

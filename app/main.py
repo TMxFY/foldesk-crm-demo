@@ -17,6 +17,7 @@ from app.accounts import (
     delete_account,
     import_session_accounts,
     list_accounts,
+    purge_dead_accounts,
     reconnect_account,
     restore_disk_sessions,
     set_daily_limit,
@@ -802,9 +803,48 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def accounts_list(request: Request):
         return list_accounts(request.app.state.conn)
 
+    async def _cleanup_deleted_account_runtime(app, account_id: int, session_path: str | None) -> None:
+        task = app.state.inbox_tasks.pop(account_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        app.state.inbox_synced.discard(account_id)
+        if session_path:
+            for gw in (getattr(app.state, "gateway", None), getattr(app.state, "wa_gateway", None)):
+                if gw is not None and hasattr(gw, "_close"):
+                    try:
+                        await gw._close(session_path)
+                    except Exception:
+                        pass
+
     @app.delete("/api/accounts/{account_id}")
-    def accounts_delete(account_id: int, request: Request):
-        return _call(delete_account, request.app.state.conn, account_id)
+    async def accounts_delete(account_id: int, request: Request):
+        row = request.app.state.conn.execute(
+            "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        pre_path = row["session_path"] if row else None
+        await _cleanup_deleted_account_runtime(request.app, account_id, pre_path)
+        res = _call(delete_account, request.app.state.conn, account_id)
+        return res
+
+    @app.post("/api/accounts/purge-dead")
+    async def accounts_purge_dead(request: Request):
+        dead_rows = request.app.state.conn.execute(
+            """
+            SELECT id, session_path FROM accounts
+            WHERE status != 'connected'
+               OR COALESCE(health, 'active') IN ('unauthorized', 'banned', 'frozen')
+            """
+        ).fetchall()
+        for r in dead_rows:
+            await _cleanup_deleted_account_runtime(
+                request.app, int(r["id"]), r["session_path"]
+            )
+        res = _call(purge_dead_accounts, request.app.state.conn)
+        return res
 
     @app.post("/api/accounts/check-all")
     async def accounts_check_all(request: Request):

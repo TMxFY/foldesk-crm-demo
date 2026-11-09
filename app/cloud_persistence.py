@@ -168,6 +168,7 @@ def backup_to_cloud(
         tmp_path = Path(tmp.name)
 
     sessions_map: dict[str, str] = {}
+    active_session_names: set[str] = set()
     try:
         src_conn = (
             sqlite3.connect(db_path, timeout=30.0)
@@ -179,12 +180,13 @@ def backup_to_cloud(
             src_conn.backup(dst_conn)
             try:
                 rows = src_conn.execute(
-                    "SELECT session_path, session_blob FROM accounts WHERE session_blob IS NOT NULL"
+                    "SELECT session_path, session_blob FROM accounts WHERE session_path IS NOT NULL"
                 ).fetchall()
                 for s_path, s_blob in rows:
-                    if s_path and s_blob and len(bytes(s_blob)) > 100:
-                        fname = Path(str(s_path)).name
-                        if fname.endswith(".session"):
+                    fname = Path(str(s_path)).name
+                    if fname.endswith(".session"):
+                        active_session_names.add(fname)
+                        if s_blob and len(bytes(s_blob)) > 100:
                             sessions_map[fname] = base64.b64encode(bytes(s_blob)).decode("ascii")
             except Exception:
                 pass
@@ -200,7 +202,7 @@ def backup_to_cloud(
     sessions_dir = ROOT / "data" / "sessions"
     if sessions_dir.exists():
         for sf in sorted(sessions_dir.glob("*.session")):
-            if sf.is_file() and sf.stat().st_size > 100:
+            if sf.name in active_session_names and sf.is_file() and sf.stat().st_size > 100:
                 sessions_map[sf.name] = base64.b64encode(sf.read_bytes()).decode("ascii")
 
     saved_at = utc_now()
@@ -267,7 +269,13 @@ def restore_from_cloud(
             local_conn = sqlite3.connect(db_path, timeout=5.0)
             try:
                 local_max = ""
-                for tbl, col in (("leads", "updated_at"), ("dialogs", "updated_at"), ("messages", "sent_at")):
+                for tbl, col in (
+                    ("leads", "updated_at"),
+                    ("dialogs", "updated_at"),
+                    ("messages", "sent_at"),
+                    ("kv_settings", "updated_at"),
+                    ("accounts", "created_at"),
+                ):
                     try:
                         row = local_conn.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()
                         if row and row[0] and str(row[0]) > local_max:
@@ -347,10 +355,25 @@ def restore_from_cloud(
     sessions_dir = ROOT / "data" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     restored_sessions = 0
+    allowed_session_names: set[str] | None = None
+    try:
+        chk_c = live_conn if live_conn is not None else (sqlite3.connect(db_path, timeout=5.0) if db_path.exists() else None)
+        if chk_c is not None:
+            try:
+                rows = chk_c.execute("SELECT session_path FROM accounts WHERE session_path IS NOT NULL").fetchall()
+                allowed_session_names = {Path(str(r[0])).name for r in rows if r[0]}
+            finally:
+                if live_conn is None:
+                    chk_c.close()
+    except Exception:
+        allowed_session_names = None
+
     if isinstance(sessions_map, dict):
         for fname, b64_data in sessions_map.items():
             clean_name = Path(str(fname)).name
             if not clean_name.endswith(".session") or not b64_data:
+                continue
+            if allowed_session_names is not None and clean_name not in allowed_session_names:
                 continue
             (sessions_dir / clean_name).write_bytes(base64.b64decode(b64_data))
             restored_sessions += 1

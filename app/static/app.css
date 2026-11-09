@@ -4935,6 +4935,25 @@ tr.bulk-selected,
   flex-wrap: nowrap;
 }
 
+#accounts .account-col-actions .chip {
+  padding: 2px 7px;
+  font-size: 11px;
+  min-height: 24px;
+  white-space: nowrap;
+}
+
+.danger-text,
+.account-delete-btn {
+  color: var(--danger, #ef4444) !important;
+  border-color: rgba(239, 68, 68, 0.28) !important;
+}
+
+.danger-text:hover,
+.account-delete-btn:hover {
+  background: rgba(239, 68, 68, 0.14) !important;
+  border-color: rgba(239, 68, 68, 0.55) !important;
+}
+
 @media (max-width: 980px) {
   #accounts .account-row-line {
     grid-template-columns: 1fr auto;

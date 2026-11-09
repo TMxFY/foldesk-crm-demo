@@ -186,21 +186,7 @@ def _fetch_upstream_asset(rel_path: str) -> tuple[bytes, str]:
 def build_session_init_js(
     session_info: dict | None, all_sessions: list[dict] | None = None
 ) -> str:
-    multitab_guard = """
-    if (typeof window.BroadcastChannel === "function" && !window.__foldeskBcPatched) {
-      var NativeBC = window.BroadcastChannel;
-      var tabUid = Math.random().toString(36).slice(2, 10);
-      window.BroadcastChannel = function(name) {
-        var n = String(name || "");
-        if (n.indexOf("tt-establish") === 0 || n.indexOf("tt-multitab") === 0) {
-          return new NativeBC(n + "_" + tabUid);
-        }
-        return new NativeBC(n);
-      };
-      window.BroadcastChannel.prototype = NativeBC.prototype;
-      window.__foldeskBcPatched = true;
-    }
-"""
+    multitab_guard = ""
     if not session_info:
         return f"""(function() {{
   try {{{multitab_guard}
@@ -208,7 +194,9 @@ def build_session_init_js(
       localStorage.removeItem("foldesk_tg_session_sig");
       localStorage.removeItem("foldesk_tg_failed_sig");
       localStorage.removeItem("user_auth");
-      localStorage.removeItem("account1");
+      for (var sIdx = 1; sIdx <= 20; sIdx++) {{
+        localStorage.removeItem("account" + sIdx);
+      }}
       localStorage.removeItem("tt-global-state");
       for (var i = 1; i <= 5; i++) {{
         localStorage.removeItem("dc" + i + "_auth_key");
@@ -259,12 +247,24 @@ def build_session_init_js(
       if (s.phone) slotObj.phone = s.phone;
       localStorage.setItem(slotKey, JSON.stringify(slotObj));
     }}
+    for (var extraSlot = allSessions.length + 1; extraSlot <= 20; extraSlot++) {{
+      localStorage.removeItem("account" + extraSlot);
+    }}
 
     var urlParams = new URLSearchParams(window.location.search || "");
+    var urlAccId = urlParams.get("account_id");
     var rawSlot = urlParams.get("account");
     var slotParam = rawSlot ? Number(rawSlot) : 0;
     var active = null;
-    if (slotParam >= 1) {{
+    if (urlAccId) {{
+      for (var uIdx = 0; uIdx < allSessions.length; uIdx++) {{
+        if (String(allSessions[uIdx].account_id) === String(urlAccId)) {{
+          active = allSessions[uIdx];
+          break;
+        }}
+      }}
+    }}
+    if (!active && slotParam >= 1) {{
       for (var m = 0; m < allSessions.length; m++) {{
         if (Number(allSessions[m].slot) === slotParam) {{
           active = allSessions[m];

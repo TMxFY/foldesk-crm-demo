@@ -2189,11 +2189,20 @@ async def run_campaign_batch(
                     )
                     if next_step_order == 1:
                         target_entity = peer_target
-                        client = await _resolve_telethon_client_for_prewarm(
-                            active_gw, session_path
-                        )
-                        if client is not None:
-                            await prewarm_recipient_stories(client, target_entity)
+                        lock_fn = getattr(active_gw, "_session_lock", None)
+                        if callable(lock_fn):
+                            async with lock_fn(session_path):
+                                client = await _resolve_telethon_client_for_prewarm(
+                                    active_gw, session_path
+                                )
+                                if client is not None:
+                                    await prewarm_recipient_stories(client, target_entity)
+                        else:
+                            client = await _resolve_telethon_client_for_prewarm(
+                                active_gw, session_path
+                            )
+                            if client is not None:
+                                await prewarm_recipient_stories(client, target_entity)
                     if step_image_url:
                         try:
                             sent = await active_gw.send_message(

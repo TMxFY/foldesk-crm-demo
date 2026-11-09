@@ -1060,6 +1060,56 @@ async function reconnectAccount(account) {
   }
 }
 
+async function deleteAccount(account, button) {
+  if (!account || account.id == null) return;
+  const label = account.telegram_username
+    ? `@${account.telegram_username}`
+    : (account.telegram_name || account.phone || `#${account.id}`);
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  try {
+    await api(`/api/accounts/${account.id}`, { method: "DELETE" });
+    if (String(state.inboxSessionFilter) === String(account.id)) {
+      state.inboxSessionFilter = "all";
+    }
+    if (String(state.loginId) === String(account.id)) {
+      state.loginId = null;
+    }
+    await loadAccounts();
+    await loadCampaigns();
+    toast(`Сессия ${label} удалена`, "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось удалить сессию", "error");
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
+}
+
+async function purgeDeadAccounts(button) {
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  try {
+    const res = await api("/api/accounts/purge-dead", { method: "POST" });
+    await loadAccounts();
+    await loadCampaigns();
+    toast(`Удалено слетевших сессий: ${(res && res.count) || 0}`, "ok");
+  } catch (error) {
+    toast(error.message || "Не удалось очистить сессии", "error");
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
+}
+
 async function updateAccountLimit(accountId, rawLimit) {
   const limit = Number(rawLimit);
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
@@ -1148,12 +1198,24 @@ function renderAccounts() {
   const list = document.querySelector("#account-list");
   const accountsSection = document.querySelector("#accounts");
   const summaryBar = document.querySelector("#accounts-summary-bar");
+  const purgeBtn = document.querySelector("#purge-dead-accounts-btn");
   list.replaceChildren();
   const connected = state.accounts.filter((account) => account.status === "connected");
-  const disconnectedCount = Math.max(0, state.accounts.length - connected.length);
+  const deadAccounts = state.accounts.filter(
+    (account) => account.status !== "connected" || ["unauthorized", "banned", "frozen"].includes(String(account.health || "")),
+  );
+  const disconnectedCount = deadAccounts.length;
   const totalDailyPool = connected.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
   if (summaryBar) {
     summaryBar.textContent = `Подключено: ${connected.length} · Не подключено: ${disconnectedCount} · Суточный пул: ${totalDailyPool} сообщ./сут`;
+  }
+  if (purgeBtn) {
+    purgeBtn.hidden = deadAccounts.length === 0;
+    purgeBtn.textContent = deadAccounts.length > 0 ? `Удалить слетевшие (${deadAccounts.length})` : "Удалить слетевшие";
+    if (!purgeBtn.dataset.bound) {
+      purgeBtn.dataset.bound = "1";
+      purgeBtn.addEventListener("click", (e) => purgeDeadAccounts(e.currentTarget));
+    }
   }
   if (!state.accounts.length) {
     if (accountsSection) accountsSection.dataset.hasConnected = "false";
@@ -1296,6 +1358,16 @@ function renderAccounts() {
         }, ["↻"]),
       );
     }
+    actionsWrap.append(
+      el("button", {
+        type: "button",
+        className: "btn ghost sm danger-text account-delete-btn",
+        "data-delete-account-id": String(account.id),
+        title: "Удалить сессию",
+        "aria-label": "Удалить сессию",
+        onclick: (e) => deleteAccount(account, e.currentTarget),
+      }, ["✕ Удалить"]),
+    );
 
     const row = el("li", { className: "account account-compact-row" }, [
       el("div", { className: "account-row-line" }, [
@@ -2826,6 +2898,10 @@ function syncTelegramWebAPanel(connected) {
   const grid = document.querySelector(".messenger-grid");
   const webReady = (connected || []).filter((acc) => Boolean(acc.tg_web_ready));
   if (!webReady.length) {
+    [...frameWrap.querySelectorAll("iframe")].forEach((node) => {
+      try { node.src = "about:blank"; } catch (_e) {}
+      node.remove();
+    });
     panel.hidden = true;
     if (grid) grid.dataset.tgwebActive = "false";
     return;
@@ -2894,7 +2970,15 @@ function syncTelegramWebAPanel(connected) {
         if (phoneInput) phoneInput.focus();
       },
     }, ["+ Аккаунт"]);
-    pillsHost.append(addAccBtn);
+    const delAccBtn = el("button", {
+      type: "button",
+      id: "tg-web-delete-session-btn",
+      className: "btn ghost sm danger-text tg-web-del-acc-btn",
+      title: `Удалить сессию ${target.telegram_username ? `@${target.telegram_username}` : target.phone}`,
+      "aria-label": "Удалить текущую сессию",
+      onclick: (e) => deleteAccount(target, e.currentTarget),
+    }, ["✕ Удалить"]);
+    pillsHost.append(addAccBtn, delAccBtn);
   }
   if (btnTgWeb && btnCrm) {
     btnTgWeb.className = mode === "tgweb" ? "btn secondary sm" : "btn ghost sm";
@@ -2911,51 +2995,50 @@ function syncTelegramWebAPanel(connected) {
     }
   }
   frameWrap.hidden = mode === "crm";
+  if (mode !== "tgweb") {
+    [...frameWrap.querySelectorAll("iframe")].forEach((node) => {
+      try { node.src = "about:blank"; } catch (_e) {}
+      node.remove();
+    });
+  }
 
   const inboxVisible = state.viewMode !== "sheet" || state.activeSheet === "inbox";
   if (mode === "tgweb" && inboxVisible) {
-    // Remove initial placeholder iframe without data-account-id if present
+    const targetKey = String(target.id);
     const placeholder = frameWrap.querySelector("iframe#tg-web-a-frame:not([data-account-id])");
     if (placeholder) {
-      placeholder.dataset.accountId = String(target.id);
+      placeholder.dataset.accountId = targetKey;
       placeholder.dataset.slot = String(targetSlot);
     }
 
-    const validIds = new Set(webReady.map((acc) => String(acc.id)));
-    [...frameWrap.querySelectorAll("iframe[data-account-id]")].forEach((node) => {
-      if (!validIds.has(String(node.dataset.accountId))) {
+    // Strictly 1 active iframe at a time: terminate background WebWorkers before switching shared localStorage
+    [...frameWrap.querySelectorAll("iframe")].forEach((node) => {
+      if (String(node.dataset.accountId || "") !== targetKey) {
+        try { node.src = "about:blank"; } catch (_e) {}
         node.remove();
       }
     });
 
-    webReady.forEach((acc, idx) => {
-      const slot = idx + 1;
-      const key = String(acc.id);
-      const isSelected = String(target.id) === key;
-      const slotUrl = slot === 1
-        ? `/a/?account_id=${encodeURIComponent(key)}`
-        : `/a/?account=${slot}&account_id=${encodeURIComponent(key)}`;
-      let accFrame = frameWrap.querySelector(`iframe[data-account-id="${key}"]`);
-      if (!accFrame && isSelected) {
-        accFrame = el("iframe", {
-          className: "tg-web-a-frame",
-          "data-account-id": key,
-          "data-slot": String(slot),
-          title: `Telegram Web A (${acc.telegram_username || acc.phone})`,
-          src: slotUrl,
-          allow: "clipboard-read; clipboard-write",
-        }, []);
-        accFrame.dataset.loadedUrl = slotUrl;
-        frameWrap.append(accFrame);
+    let accFrame = frameWrap.querySelector(`iframe[data-account-id="${targetKey}"]`);
+    if (!accFrame) {
+      accFrame = el("iframe", {
+        className: "tg-web-a-frame",
+        "data-account-id": targetKey,
+        "data-slot": String(targetSlot),
+        title: `Telegram Web A (${target.telegram_username || target.phone})`,
+        src: targetUrl,
+        allow: "clipboard-read; clipboard-write",
+      }, []);
+      accFrame.dataset.loadedUrl = targetUrl;
+      frameWrap.append(accFrame);
+    } else {
+      accFrame.hidden = false;
+      accFrame.dataset.slot = String(targetSlot);
+      if (accFrame.dataset.loadedUrl !== targetUrl) {
+        accFrame.dataset.loadedUrl = targetUrl;
+        accFrame.src = targetUrl;
       }
-      if (accFrame) {
-        accFrame.hidden = !isSelected;
-        if (isSelected && accFrame.dataset.loadedUrl !== slotUrl) {
-          accFrame.dataset.loadedUrl = slotUrl;
-          accFrame.src = slotUrl;
-        }
-      }
-    });
+    }
   }
 }
 
