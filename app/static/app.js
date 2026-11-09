@@ -2022,6 +2022,7 @@ function buildCampaignSettingsPanel(camp, opts) {
   }));
 
   const stepsHost = el("div", { className: "stack camp-edit-steps-host" }, []);
+  let activeEditStepIdx = Math.max(0, editableSteps.length - 1);
 
   const renderEditableSteps = () => {
     stepsHost.replaceChildren();
@@ -2037,10 +2038,15 @@ function buildCampaignSettingsPanel(camp, opts) {
       });
       const textInput = el("textarea", {
         rows: "3",
+        "data-edit-step-index": String(idx),
         placeholder: idx === 0
           ? "Вставьте готовое сообщение целиком ИЛИ используйте {step1_text} из CSV..."
           : "Текст сообщения шага...",
+        onfocus: () => {
+          activeEditStepIdx = idx;
+        },
         oninput: () => {
+          activeEditStepIdx = idx;
           st.template_text = textInput.value;
         },
       });
@@ -2056,6 +2062,7 @@ function buildCampaignSettingsPanel(camp, opts) {
           className: "btn ghost sm",
           onclick: () => {
             editableSteps.splice(idx, 1);
+            activeEditStepIdx = Math.min(activeEditStepIdx, Math.max(0, editableSteps.length - 1));
             renderEditableSteps();
           },
         }, ["Удалить шаг ×"])
@@ -2090,6 +2097,7 @@ function buildCampaignSettingsPanel(camp, opts) {
         template_text: "{name}, возвращаюсь к вопросу выше — актуально обсудить?",
         image_url: null,
       });
+      activeEditStepIdx = editableSteps.length - 1;
       renderEditableSteps();
     },
   }, ["+ Добавить шаг"]);
@@ -2232,6 +2240,34 @@ function buildCampaignSettingsPanel(camp, opts) {
         el("strong", {}, [`3. Сообщения, оффер и картинка (${editableSteps.length})`]),
         addStepBtn,
       ]),
+      el("div", { className: "var-chips", role: "group", "aria-label": "Переменные шага рассылки" }, [
+        ["{audience}", "+ {audience} (buyers / students / users / players / listeners)"],
+        ["{name}", "+ {name}"],
+        ["{company}", "+ {company}"],
+        ["{first_touch}", "+ {first_touch}"],
+        ["{followup_1}", "+ {followup_1}"],
+        ["{followup_2}", "+ {followup_2}"],
+      ].map(([token, label]) => el("button", {
+        type: "button",
+        className: "chip var-chip",
+        onclick: () => {
+          const targetIdx = Math.min(Math.max(0, activeEditStepIdx), editableSteps.length - 1);
+          const area = stepsHost.querySelector(`textarea[data-edit-step-index="${targetIdx}"]`)
+            || stepsHost.querySelector("textarea");
+          if (!area) return;
+          const actualIdx = Number(area.dataset.editStepIndex) || 0;
+          if (!editableSteps[actualIdx]) return;
+          const start = area.selectionStart ?? area.value.length;
+          const end = area.selectionEnd ?? area.value.length;
+          const next = `${area.value.slice(0, start)}${token}${area.value.slice(end)}`;
+          area.value = next;
+          editableSteps[actualIdx].template_text = next;
+          activeEditStepIdx = actualIdx;
+          area.focus();
+          const pos = start + token.length;
+          area.setSelectionRange(pos, pos);
+        },
+      }, [label]))),
       stepsHost,
     ]),
   ].filter(Boolean));

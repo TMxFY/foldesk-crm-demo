@@ -55,6 +55,7 @@ TARGET_CSV_FIELDS = (
     "their_angle",
     "our_angle",
     "category",
+    "audience",
     "website",
     "hook",
     "note",
@@ -96,6 +97,12 @@ HEADER_ALIASES = {
     "категория": "category",
     "category": "category",
     "ниша": "category",
+    "niche": "category",
+    "audience": "audience",
+    "target_audience": "audience",
+    "целевая аудитория": "audience",
+    "целевая_аудитория": "audience",
+    "ца": "audience",
     "их угол": "their_angle",
     "their_angle": "their_angle",
     "описание": "their_angle",
@@ -231,6 +238,160 @@ def expand_spintax(text: str, rng: random.Random | None = None) -> str:
     return out
 
 
+_SOFTWARE_CATEGORIES = frozenset(
+    {
+        "saas",
+        "b2b saas",
+        "ai",
+        "cex",
+        "defi",
+        "токен",
+        "финтех",
+        "fintech",
+        "финансы / трейдинг",
+        "инфра",
+        "проп",
+        "web3",
+        "crypto",
+    }
+)
+
+_ML_TRAINING_NOISE_RE = re.compile(
+    r"(?:машинн\w*\s+обучен\w*|обучен\w*\s+с\s+подкреплен\w*|дообучен\w*|"
+    r"обучен\w*\s+(?:модел\w*|нейросет\w*|llm|ии|агент\w*)|"
+    r"обучен\w*,\s*тонк\w*\s+настройк\w*|тонк\w*\s+настройк\w*|"
+    r"образовательн\w*\s+(?:клип\w*|контент\w*|ролик\w*|видео|шортс\w*)|"
+    r"\bof\s+course\b|\b(?:ai|ии)[\-\s]?коуч\w*|\bai[\-\s]?coach\w*|"
+    r"курс(?:ы|а|ов|ам|ах)?\s+(?:валют\w*|крипт\w*|биткоин\w*|доллар\w*|рубл\w*|акци\w*|обмен\w*)|"
+    r"бирж\w*,\s*курс\w*|"
+    r"machine\s+learning|reinforcement\s+learning|model\s+training|fine[\-\s]?tun\w*)",
+    re.IGNORECASE,
+)
+
+_AUDIENCE_EDTECH_RE = re.compile(
+    r"(?:\b(?:edtech|education|educational|course|courses|academy|bootcamp|tutor|tutoring|"
+    r"e-learning|coaching|mentorship|masterclass)\b|"
+    r"\bобучен|(?<!\w)курс(?:ы|ов|ам|ах|\b)|инфопродукт|онлайн[\-\s]?школ|(?<!\w)школ[аыуе]|"
+    r"академи|ментор|(?<!\w)коуч|репетитор|студент|ученик|образоват)",
+    re.IGNORECASE,
+)
+
+_AUDIENCE_GAMING_NICHE_RE = re.compile(
+    r"(?:\b(?:gaming|igaming|gamedev|game|games|esports|casino)\b|"
+    r"\bигр|(?<!\w)гейм|казино|гемблинг|беттинг)",
+    re.IGNORECASE,
+)
+
+_AUDIENCE_GAMING_DESC_RE = re.compile(
+    r"(?:\b(?:game|games|gaming|gamedev|igaming|gameplay|multiplayer|shooter|puzzle|"
+    r"rpg|mmorpg|roguelike|arcade|casino|slots|betting|esports|roblox)\b|"
+    r"\bигр(?:а|ы|у|ой|овой|овые|оков)\b|геймдев|казино|гемблинг|беттинг|шутер|головоломк)",
+    re.IGNORECASE,
+)
+
+_AUDIENCE_AUDIO_RE = re.compile(
+    r"(?:\b(?:podcast|podcasts|podcaster|music|musician|audio|audiobook|radio|"
+    r"spotify|soundcloud|playlist|playlists|listeners)\b|"
+    r"подкаст|музык|аудио|радио|слушател)",
+    re.IGNORECASE,
+)
+
+_AUDIENCE_ECOM_NICHE_RE = re.compile(
+    r"(?:\b(?:e-com|ecom|ecommerce|e-commerce|d2c|retail|shopify|dropship|dropshipping|"
+    r"agency|agencies|beauty|skincare|cosmetics|supplement|supplements|furniture|apparel|clothing|consulting)\b|"
+    r"агентств|маркетплейс|дропшип|товар|косметик|пептид|мебел|пятновыводит|импорт|консалтинг)",
+    re.IGNORECASE,
+)
+
+_AUDIENCE_ECOM_DESC_RE = re.compile(
+    r"(?:\b(?:shopify|dropshipping|ecommerce|e-commerce|d2c|skincare|cosmetics|merch)\b|"
+    r"интернет[\-\s]?магазин|дропшиппинг|маркетплейс|физическ\w*\s+товар)",
+    re.IGNORECASE,
+)
+
+
+def _is_software_niche(cat_low: str, lead_niche_low: str) -> bool:
+    if cat_low in _SOFTWARE_CATEGORIES or lead_niche_low in _SOFTWARE_CATEGORIES:
+        return True
+    if not cat_low and lead_niche_low:
+        return bool(re.search(r"\b(?:saas|defi|web3|crypto|fintech|ai|crm)\b", lead_niche_low))
+    return False
+
+
+def infer_recipient_audience(recipient: dict) -> str:
+    """Возвращает целевое слово ЦА ({buyers|students|users|players|listeners}) по нише и полям лида."""
+    extra_fields = _extract_extra_fields(recipient)
+    norm_extra: dict[str, str] = {}
+    for k, v in extra_fields.items():
+        ck = str(k or "").strip().lstrip("\ufeff").lower()
+        if ck:
+            norm_extra[ck] = str(v or "").strip()
+            norm_extra[re.sub(r"[\s_\-]+", "_", ck)] = str(v or "").strip()
+
+    for override_key in ("audience", "target_audience", "целевая аудитория", "целевая_аудитория", "ца"):
+        raw_override = str(
+            norm_extra.get(override_key)
+            or recipient.get(override_key)
+            or ""
+        ).strip()
+        if raw_override and "/" not in raw_override and "|" not in raw_override:
+            return raw_override
+
+    cat = str(
+        recipient.get("category")
+        or norm_extra.get("category")
+        or norm_extra.get("категория")
+        or ""
+    ).strip()
+    cat_low = cat.lower()
+    lead_niche = str(recipient.get("lead_niche") or recipient.get("niche") or "").strip()
+    lead_niche_low = lead_niche.lower()
+    extra_niche = str(norm_extra.get("niche") or norm_extra.get("ниша") or "").strip()
+    is_software = _is_software_niche(cat_low, lead_niche_low)
+
+    company = str(recipient.get("company") or "").strip()
+    their_angle = str(recipient.get("their_angle") or "").strip()
+    raw_note = str(recipient.get("note") or "").strip()
+    if "Наш угол:" in raw_note:
+        raw_note = raw_note.split("Наш угол:", 1)[0].strip()
+
+    product_text = f"{company} {their_angle}" if their_angle else f"{company} {raw_note}"
+    clean_niche_and_desc = _ML_TRAINING_NOISE_RE.sub(
+        " ", f"{cat} {lead_niche} {extra_niche} {product_text}"
+    )
+    clean_desc = _ML_TRAINING_NOISE_RE.sub(" ", product_text)
+
+    if _AUDIENCE_EDTECH_RE.search(clean_niche_and_desc):
+        return "students"
+
+    if _AUDIENCE_GAMING_NICHE_RE.search(f"{cat_low} {lead_niche_low}"):
+        return "players"
+    if _AUDIENCE_GAMING_DESC_RE.search(clean_desc):
+        return "players"
+    if (
+        "gaming" in extra_niche.lower()
+        and not is_software
+        and cat_low not in {"агентство", "медиа"}
+    ):
+        return "players"
+
+    if cat_low in {"podcast", "music", "audio", "подкаст", "музыка", "аудио"}:
+        return "listeners"
+    if not is_software and _AUDIENCE_AUDIO_RE.search(clean_niche_and_desc):
+        return "listeners"
+
+    if cat_low in {"агентство", "agency", "agencies", "e-com", "ecom", "ecommerce", "d2c", "retail"}:
+        return "buyers"
+    if _AUDIENCE_ECOM_NICHE_RE.search(f"{cat_low} {lead_niche_low}"):
+        return "buyers"
+    if extra_niche.lower().startswith(("e-com", "agencies")) and not is_software:
+        return "buyers"
+    if not is_software and _AUDIENCE_ECOM_DESC_RE.search(clean_desc):
+        return "buyers"
+
+    return "users"
+
+
 def render_template(
     template_text: str,
     recipient: dict,
@@ -248,13 +409,16 @@ def render_template(
     note_val = (recipient.get("note") or recipient.get("their_angle") or "").strip()
     phone_val = (recipient.get("phone") or "").strip()
     website_val = (recipient.get("website") or "").strip()
-    category_val = (recipient.get("category") or "").strip()
+    category_val = (
+        (recipient.get("category") or recipient.get("lead_niche") or recipient.get("niche") or "").strip()
+    )
     their_angle_val = (recipient.get("their_angle") or "").strip()
     our_angle_val = (recipient.get("our_angle") or "").strip()
     hook_val = (recipient.get("hook") or "").strip()
     step1_val = (recipient.get("step1_text") or "").strip()
     step2_val = (recipient.get("step2_text") or "").strip()
     step3_val = (recipient.get("step3_text") or "").strip()
+    audience_val = infer_recipient_audience(recipient)
 
     extra_fields = _extract_extra_fields(recipient)
     lookup_by_norm: dict[str, str] = {}
@@ -267,6 +431,12 @@ def render_template(
         lookup_by_norm[re.sub(r"[\s_\-]+", "_", clean_k.lower())] = val_str
 
     replacements = {
+        "{first_touch}": step1_val,
+        "{followup_1}": step2_val,
+        "{followup_2}": step3_val,
+        "{step1_text}": step1_val,
+        "{step2_text}": step2_val,
+        "{step3_text}": step3_val,
         "{name}": name_val,
         "{username}": username_val,
         "{company}": company_val,
@@ -277,12 +447,8 @@ def render_template(
         "{their_angle}": their_angle_val,
         "{our_angle}": our_angle_val,
         "{hook}": hook_val,
-        "{first_touch}": step1_val,
-        "{followup_1}": step2_val,
-        "{followup_2}": step3_val,
-        "{step1_text}": step1_val,
-        "{step2_text}": step2_val,
-        "{step3_text}": step3_val,
+        "{audience}": audience_val,
+        "{target_audience}": audience_val,
     }
     for col_key, col_val in extra_fields.items():
         token = f"{{{col_key}}}"
@@ -498,7 +664,13 @@ def get_campaign(conn, campaign_id: int) -> dict:
     steps = [as_dict(s) for s in steps_rows]
 
     rec_rows = conn.execute(
-        "SELECT * FROM campaign_recipients WHERE campaign_id = ? ORDER BY id",
+        """
+        SELECT cr.*, l.niche AS lead_niche
+        FROM campaign_recipients cr
+        LEFT JOIN leads l ON l.id = cr.lead_id
+        WHERE cr.campaign_id = ?
+        ORDER BY cr.id
+        """,
         (campaign_id,),
     ).fetchall()
     now_iso = utc_now()
@@ -670,6 +842,18 @@ def list_campaigns(conn) -> list:
     return [get_campaign(conn, row["id"]) for row in rows]
 
 
+_DEFAULT_BOILERPLATE_TEMPLATES = frozenset(
+    {
+        "привет, {name}! пишу по поводу сотрудничества.",
+        "привет, {name}!",
+        "привет, {name}! увидел ваш проект {company}, хотел предложить короткий обмен опытом по росту продаж в telegram.",
+        "{name}, возвращаюсь к письму по {company}. будет удобно созвониться на 10 минут на этой неделе?",
+        "{name}, пишу финальный раз: дайте знать, если тема актуальна для {company}.",
+        "{name}, возвращаюсь к вопросу выше — актуально обсудить?",
+    }
+)
+
+
 def _render_step_text(step: dict, step_idx: int, rec: dict) -> str:
     tmpl = str(step.get("template_text") or "").strip()
     tmpl_low = tmpl.lower()
@@ -695,15 +879,18 @@ def _render_step_text(step: dict, step_idx: int, rec: dict) -> str:
     else:
         has_csv_token = False
 
-    if csv_step_val and not has_csv_token:
+    is_default_placeholder = (not tmpl) or (tmpl_low in _DEFAULT_BOILERPLATE_TEMPLATES)
+    if csv_step_val and not has_csv_token and is_default_placeholder:
         base = render_template(csv_step_val, rec)
-        offer_tail = str(step.get("offer_tail") or "").strip()
-        if offer_tail:
-            tail_rendered = render_template(offer_tail, rec)
-            if tail_rendered and tail_rendered not in base:
-                return f"{base}\n\n{tail_rendered}".strip()
-        return base
-    return render_template(tmpl, rec)
+    else:
+        base = render_template(tmpl, rec)
+
+    offer_tail = str(step.get("offer_tail") or "").strip()
+    if offer_tail:
+        tail_rendered = render_template(offer_tail, rec)
+        if tail_rendered and tail_rendered not in base:
+            return f"{base}\n\n{tail_rendered}".strip()
+    return base
 
 
 def _normalize_steps(steps: list | None) -> list[dict]:
@@ -1553,10 +1740,14 @@ def import_campaign_csv(
         if lead_id is not None and lead_id in seen_leads:
             continue
 
-        extra_fields = item.get("extra_fields")
+        raw_extra = item.get("extra_fields")
+        extra_fields = dict(raw_extra) if isinstance(raw_extra, dict) else {}
+        mapped_audience = (item.get("audience") or "").strip()
+        if mapped_audience:
+            extra_fields["audience"] = mapped_audience
         extra_json = (
             json.dumps(extra_fields, ensure_ascii=False)
-            if isinstance(extra_fields, dict) and extra_fields
+            if extra_fields
             else None
         )
         rec_status = "failed" if error_reason else "pending"
@@ -1755,14 +1946,15 @@ def enroll_leads_from_crm(
             )
         note = (lead.get("note") or "").strip() or None
         website = (lead.get("url") or "").strip() or None
+        category = (lead.get("niche") or "").strip() or None
 
         conn.execute(
             """
             INSERT INTO campaign_recipients (
                 campaign_id, lead_id, telegram_user_id, username, name,
-                phone, company, note, website, current_step, status,
+                phone, company, note, website, category, current_step, status,
                 last_sent_at, error_text, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)
             """,
             (
                 campaign_id,
@@ -1774,6 +1966,7 @@ def enroll_leads_from_crm(
                 company,
                 note,
                 website,
+                category,
                 now,
                 now,
             ),
@@ -2001,11 +2194,13 @@ async def run_campaign_batch(
 
     eligible_rows = conn.execute(
         """
-        SELECT * FROM campaign_recipients
-        WHERE campaign_id = ?
-          AND status IN ('pending', 'in_progress')
-          AND current_step < ?
-        ORDER BY id
+        SELECT cr.*, l.niche AS lead_niche
+        FROM campaign_recipients cr
+        LEFT JOIN leads l ON l.id = cr.lead_id
+        WHERE cr.campaign_id = ?
+          AND cr.status IN ('pending', 'in_progress')
+          AND cr.current_step < ?
+        ORDER BY cr.id
         """,
         (campaign_id, len(steps)),
     ).fetchall()

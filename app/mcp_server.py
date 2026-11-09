@@ -330,6 +330,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                             "url": {"type": ["string", "null"]},
                             "category": {"type": ["string", "null"]},
                             "niche": {"type": ["string", "null"]},
+                            "audience": {"type": ["string", "null"]},
                             "their_angle": {"type": ["string", "null"]},
                             "our_angle": {"type": ["string", "null"]},
                             "hook": {"type": ["string", "null"]},
@@ -1317,6 +1318,12 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             step3_text = (str(item.get("step3_text") or item.get("followup_2") or "").strip()) or None
             rec_status = "failed" if error_reason else "pending"
             rec_note = raw_note or their_angle
+            explicit_audience = (str(item.get("audience") or item.get("target_audience") or "").strip())
+            mcp_extra_json = (
+                json.dumps({"audience": explicit_audience}, ensure_ascii=False)
+                if explicit_audience
+                else None
+            )
 
             conn.execute(
                 """
@@ -1325,7 +1332,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     phone, company, note, website, category, their_angle,
                     our_angle, hook, step1_text, step2_text, step3_text,
                     extra_json, current_step, status, last_sent_at, error_text, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -1344,6 +1351,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     step1_text,
                     step2_text,
                     step3_text,
+                    mcp_extra_json,
                     rec_status,
                     error_reason,
                     now,
