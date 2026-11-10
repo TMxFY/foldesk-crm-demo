@@ -121,7 +121,13 @@ def _classify_session_error(exc: Exception) -> dict:
         ),
     ):
         return {"health": "unauthorized", "last_error": text}
-    if "auth_key_unregistered" in blob or "connectionlayerinvaliderror" in blob or "invokeWithLayer" in text:
+    if (
+        "auth_key_unregistered" in blob
+        or "connectionlayerinvalid" in blob
+        or "invokewithlayer" in blob
+        or "authorization key" in blob
+        or "two different ip addresses" in blob
+    ):
         return {"health": "unauthorized", "last_error": "Сессия сброшена Telegram — войдите заново"}
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
         return {"health": "offline", "last_error": text or "Нет связи"}
@@ -969,6 +975,21 @@ class TelethonGateway(TelegramGateway):
                 if owned:
                     await self._close(session_path)
 
+    async def _evict_client_unlocked(self, session_path: str) -> None:
+        client = self._clients.pop(session_path, None)
+        if client is not None:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
+            try:
+                sess = getattr(client, "session", None)
+                if sess is not None and hasattr(sess, "close"):
+                    sess.close()
+            except Exception:
+                pass
+
     async def session_health(self, session_path: str) -> dict:
         async with self._session_lock(session_path):
             try:
@@ -979,15 +1000,20 @@ class TelethonGateway(TelegramGateway):
                 return _classify_session_error(exc)
             try:
                 if not await client.is_user_authorized():
+                    await self._evict_client_unlocked(session_path)
                     return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
                 me = await client.get_me()
                 if me is None:
+                    await self._evict_client_unlocked(session_path)
                     return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
                 return {"health": "active", "last_error": None}
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return _classify_session_error(exc)
+                classified = _classify_session_error(exc)
+                if classified.get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
+                return classified
             finally:
                 if owned:
                     try:
@@ -1005,6 +1031,8 @@ class TelethonGateway(TelegramGateway):
             except GatewayError:
                 raise
             except Exception as exc:
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
                 raise GatewayError(str(exc) or "Не удалось прочитать диалоги") from exc
             finally:
                 if owned:
@@ -1123,6 +1151,8 @@ class TelethonGateway(TelegramGateway):
             except GatewayError:
                 raise
             except Exception as exc:
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
                 raise GatewayError(str(exc) or "Не удалось отправить") from exc
             finally:
                 if owned:
@@ -1270,7 +1300,13 @@ class TelethonGateway(TelegramGateway):
 
         try:
             entity = await client.get_entity(query)
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                raise
+            if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+                raise
             return []
         if not isinstance(entity, User):
             return []

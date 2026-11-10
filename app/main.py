@@ -606,11 +606,15 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
     while True:
         try:
             await asyncio.sleep(interval_seconds)
-            await run_autopilot_tick(
+            tick_res = await run_autopilot_tick(
                 app.state.conn,
                 gateway=getattr(app.state, "gateway", None),
                 wa_gateway=getattr(app.state, "wa_gateway", None),
             )
+            if isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0:
+                from app.cloud_persistence import schedule_cloud_backup
+
+                schedule_cloud_backup(app)
         except asyncio.CancelledError:
             raise
         except Exception:
