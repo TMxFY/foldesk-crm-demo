@@ -1,3 +1,30 @@
+(function scrubLegacyTgWebLocalStorage() {
+  try {
+    if (
+      !localStorage.getItem("foldesk_tg_scrub_v2") ||
+      localStorage.getItem("foldesk_tg_session_sig") ||
+      localStorage.getItem("foldesk_tg_dead_accs")
+    ) {
+      localStorage.removeItem("foldesk_tg_session_sig");
+      localStorage.removeItem("foldesk_tg_failed_sig");
+      localStorage.removeItem("foldesk_tg_dead_accs");
+      localStorage.removeItem("user_auth");
+      localStorage.removeItem("tt-global-state");
+      localStorage.removeItem("dc");
+      localStorage.removeItem("auth_key_fingerprint");
+      for (let sIdx = 1; sIdx <= 20; sIdx++) {
+        localStorage.removeItem("account" + sIdx);
+      }
+      for (let i = 1; i <= 5; i++) {
+        localStorage.removeItem("dc" + i + "_auth_key");
+        localStorage.removeItem("dc" + i + "_server_salt");
+        localStorage.removeItem("dc" + i + "_hash");
+      }
+      localStorage.setItem("foldesk_tg_scrub_v2", "1");
+    }
+  } catch (_e) {}
+})();
+
 const STATUSES = [
   ["new", "Лид"],
   ["talking", "Разговор"],
@@ -2948,11 +2975,8 @@ function syncTelegramWebAPanel(connected) {
   }
 
   panel.hidden = false;
-  const hasDemo = (connected || []).some((acc) => Boolean(acc.is_demo));
-  if (!hasDemo && !state.inboxChatModeExplicit) {
-    state.inboxChatMode = "tgweb";
-  }
-  const mode = state.inboxChatMode === "tgweb" ? "tgweb" : "crm";
+  state.inboxChatMode = "crm";
+  const mode = "crm";
   panel.dataset.chatMode = mode;
   if (grid) grid.dataset.tgwebActive = mode === "tgweb" ? "true" : "false";
   const snippetsBar = document.querySelector("#tg-web-snippets-bar");

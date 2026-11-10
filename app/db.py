@@ -152,7 +152,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             wa_jid TEXT,
             pairing_code TEXT,
             qr_code TEXT,
-            session_blob BLOB
+            session_blob BLOB,
+            session_string TEXT
         );
 
         CREATE TABLE IF NOT EXISTS leads (
@@ -597,6 +598,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "accounts", "pairing_code", "TEXT")
     _ensure_column(conn, "accounts", "qr_code", "TEXT")
     _ensure_column(conn, "accounts", "session_blob", "BLOB")
+    _ensure_column(conn, "accounts", "session_string", "TEXT")
     _ensure_column(conn, "accounts", "api_id", "INTEGER")
     _ensure_column(conn, "accounts", "api_hash", "TEXT")
     _ensure_column(conn, "accounts", "device_model", "TEXT")

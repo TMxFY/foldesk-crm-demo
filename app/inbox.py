@@ -1328,7 +1328,16 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
     if _is_synthetic_peer_id(peer_id) or gateway is None:
         return list_messages(conn, dialog_id, cap)
     try:
-        fetched = await gateway.fetch_messages(account["session_path"], peer_id, cap)
+        try:
+            fetched = await gateway.fetch_messages(account["session_path"], peer_id, cap)
+        except Exception as exc:
+            uname = str(dialog.get("username") or "").strip().lstrip("@")
+            if uname and "could not find the input entity" in str(exc).casefold():
+                fetched = await gateway.fetch_messages(
+                    account["session_path"], f"@{uname}", cap
+                )
+            else:
+                raise
     except Exception:
         cached = list_messages(conn, dialog_id, cap)
         if cached:
@@ -1398,9 +1407,22 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
                     pass
             if isinstance(peer_target, int) and _is_synthetic_peer_id(peer_target):
                 peer_target = f"@{dialog['username']}"
-        sent = await gateway.send_message(
-            account["session_path"], peer_target, body, reply_to
-        )
+        try:
+            sent = await gateway.send_message(
+                account["session_path"], peer_target, body, reply_to
+            )
+        except Exception as exc:
+            uname = str(dialog.get("username") or "").strip().lstrip("@")
+            if (
+                uname
+                and peer_target != f"@{uname}"
+                and "could not find the input entity" in str(exc).casefold()
+            ):
+                sent = await gateway.send_message(
+                    account["session_path"], f"@{uname}", body, reply_to
+                )
+            else:
+                raise
     if not isinstance(sent, dict) or sent.get("telegram_message_id") is None:
         raise GatewayError("Ответ без номера сообщения")
     now = utc_now()

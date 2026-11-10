@@ -129,12 +129,9 @@ def test_fallback_nodemaven_stays_in_same_country_and_skips_retry_on_unauthorize
     from app.telegram_gateway import TelethonGateway
 
     gw = TelethonGateway()
-    uz_url = "socks5://nmuser-country-uz-sid-foldeskacc8-ttl-86400-filter-medium:secret@gate.nodemaven.com:1080"
-    fallbacks = gw._fallback_nodemaven_urls("data/sessions/8.session", uz_url)
-    assert len(fallbacks) == 2
-    assert all("-country-uz-" in u for u in fallbacks)
-    assert all("-country-nl-" not in u and "-country-de-" not in u for u in fallbacks)
+    assert not hasattr(gw, "_fallback_nodemaven_urls")
 
+    uz_url = "socks5://nmuser-country-uz-sid-foldeskacc8-ttl-86400-filter-medium:secret@gate.nodemaven.com:1080"
     sess_path = str(tmp_path / "8.session")
     gw.set_proxy(sess_path, uz_url)
     monkeypatch.setenv("TG_API_ID", "2040")

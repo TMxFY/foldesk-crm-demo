@@ -136,13 +136,64 @@ def _classify_session_error(exc: Exception) -> dict:
     return {"health": "offline", "last_error": text or "Не удалось проверить сессию"}
 
 
-def _session_name(session_path: str) -> str:
-    # Telethon appends .session itself. The stored path already has the suffix.
-    path = resolve_session(session_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.suffix == ".session":
-        return str(path.with_suffix(""))
-    return str(path)
+_TELEGRAM_DC_IPV4: dict[int, tuple[str, int]] = {
+    1: ("149.154.175.53", 443),
+    2: ("149.154.167.50", 443),
+    3: ("149.154.175.100", 443),
+    4: ("149.154.167.91", 443),
+    5: ("91.108.56.130", 443),
+}
+
+
+def extract_string_session_from_sqlite(path: Path) -> str | None:
+    if not path:
+        return None
+    try:
+        import ipaddress
+        from telethon.crypto import AuthKey
+        from telethon.sessions import StringSession
+
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+        with sqlite3.connect(p) as sconn:
+            cols = {str(r[1]) for r in sconn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "dc_id" not in cols or "auth_key" not in cols:
+                return None
+            if "server_address" in cols and "port" in cols:
+                row = sconn.execute(
+                    "SELECT dc_id, server_address, port, auth_key FROM sessions WHERE auth_key IS NOT NULL AND length(auth_key) = 256 LIMIT 1"
+                ).fetchone()
+            else:
+                row = sconn.execute(
+                    "SELECT dc_id, NULL, NULL, auth_key FROM sessions WHERE auth_key IS NOT NULL AND length(auth_key) = 256 LIMIT 1"
+                ).fetchone()
+            if not row or not row[3]:
+                return None
+            key_bytes = bytes(row[3])
+            if len(key_bytes) != 256:
+                return None
+            dc_id = int(row[0] or 2)
+            default_ip, default_port = _TELEGRAM_DC_IPV4.get(dc_id, ("149.154.167.50", 443))
+            raw_ip = str(row[1] or "").strip()
+            ip = default_ip
+            if raw_ip:
+                try:
+                    if isinstance(ipaddress.ip_address(raw_ip), ipaddress.IPv4Address):
+                        ip = raw_ip
+                except ValueError:
+                    ip = default_ip
+            try:
+                port = int(row[2]) if row[2] else default_port
+            except (TypeError, ValueError):
+                port = default_port
+            ss = StringSession()
+            ss.set_dc(dc_id, ip, port)
+            ss.auth_key = AuthKey(key_bytes)
+            saved = ss.save()
+            return saved or None
+    except Exception:
+        return None
 
 
 def _person_name(user) -> str:
@@ -379,7 +430,7 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
         _read_kv(conn)
     elif (not user or not password) and "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
         try:
-            with sqlite3.connect(DEFAULT_DB) as c:
+            with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                 _read_kv(c)
         except Exception:
             pass
@@ -595,6 +646,76 @@ class TelethonGateway(TelegramGateway):
         self._proxies = {}
         self._app_credentials = {}
         self._device_profiles = {}
+        self._session_strings: dict[str, str] = {}
+        self._warmed_dialogs: set[str] = set()
+
+    def set_session_string(self, session_path: str, session_string: str | None) -> None:
+        if not session_path:
+            return
+        clean = (session_string or "").strip() or None
+        if clean:
+            self._session_strings[session_path] = clean
+        else:
+            self._session_strings.pop(session_path, None)
+
+    def get_session_string(self, session_path: str) -> str | None:
+        if not session_path:
+            return None
+        return self._session_strings.get(session_path)
+
+    def clear_session(self, session_path: str) -> None:
+        if not session_path:
+            return
+        self._session_strings.pop(session_path, None)
+        self._warmed_dialogs.discard(session_path)
+
+    def _resolve_session_string(self, session_path: str) -> str | None:
+        if not session_path:
+            return None
+        cached = self._session_strings.get(session_path)
+        if cached:
+            return cached
+        if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+            try:
+                with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
+                    row = conn.execute(
+                        "SELECT session_string FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
+                        (session_path,),
+                    ).fetchone()
+                    if row and row[0] and str(row[0]).strip():
+                        val = str(row[0]).strip()
+                        try:
+                            from telethon.sessions import StringSession
+
+                            parsed_ss = StringSession(val)
+                            ak = getattr(parsed_ss, "auth_key", None)
+                            key = getattr(ak, "key", None) if ak is not None else None
+                            if key and len(bytes(key)) == 256:
+                                self._session_strings[session_path] = val
+                                return val
+                        except Exception:
+                            pass
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if "no such table" not in msg and "no such column" not in msg:
+                    raise GatewayError("БД временно заблокирована при чтении сессии") from exc
+            except Exception:
+                pass
+        extracted = extract_string_session_from_sqlite(resolve_session(session_path))
+        if extracted:
+            self._session_strings[session_path] = extracted
+            if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+                try:
+                    with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
+                        conn.execute(
+                            "UPDATE accounts SET session_string = ? WHERE session_path = ? AND (session_string IS NULL OR session_string = '')",
+                            (extracted, session_path),
+                        )
+                        conn.commit()
+                except Exception:
+                    pass
+            return extracted
+        return None
 
     def set_proxy(self, session_path: str, proxy_url: str | None) -> None:
         if not session_path:
@@ -665,7 +786,7 @@ class TelethonGateway(TelegramGateway):
             return {**defaults, **cached}
         if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
             try:
-                with sqlite3.connect(DEFAULT_DB) as c:
+                with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                     row = c.execute(
                         """
                         SELECT device_model, system_version, app_version, lang_code, system_lang_code
@@ -708,7 +829,7 @@ class TelethonGateway(TelegramGateway):
                 if row:
                     acc_id, phone, db_proxy = row[0], row[1], db_proxy or row[2]
             elif DEFAULT_DB.exists():
-                with sqlite3.connect(DEFAULT_DB) as c:
+                with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                     row = c.execute(
                         "SELECT id, phone, proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
                         (session_path,),
@@ -751,7 +872,7 @@ class TelethonGateway(TelegramGateway):
             return self._app_credentials[session_path]
         if session_path and "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
             try:
-                with sqlite3.connect(DEFAULT_DB) as conn:
+                with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
                     acc_row = conn.execute(
                         "SELECT api_id, api_hash FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
                         (session_path,),
@@ -767,7 +888,7 @@ class TelethonGateway(TelegramGateway):
         if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
             try:
                 if DEFAULT_DB.exists():
-                    with sqlite3.connect(DEFAULT_DB) as conn:
+                    with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
                         rows = dict(
                             conn.execute(
                                 "SELECT key, value FROM kv_settings WHERE key IN ('tg_api_id', 'tg_api_hash')"
@@ -786,29 +907,6 @@ class TelethonGateway(TelegramGateway):
             )
         return int(api_id), api_hash
 
-    def _fallback_nodemaven_urls(self, session_path: str, primary_url: str | None) -> list[str]:
-        if not primary_url or "nodemaven.com" not in primary_url:
-            return []
-        m = re.search(r"-country-([a-z]{2})-", primary_url)
-        primary_country = m.group(1) if m else "kz"
-        first_country = "kz" if primary_country == "ru" else primary_country
-        stem = Path(str(session_path or "")).stem or "acc"
-        candidates: list[str] = []
-        # Rotate sticky session IDs within the SAME country so Telegram never sees cross-country IP jumps
-        for idx in (1, 2):
-            fb_sid = make_nodemaven_sid(f"{stem}fb{idx}")
-            if "-country-" in primary_url and "-sid-" in primary_url:
-                fb = re.sub(r"-country-[a-z]{2}-", f"-country-{first_country}-", primary_url)
-                fb = re.sub(r"-sid-[a-zA-Z0-9_]+", f"-sid-{fb_sid}", fb)
-            else:
-                fb = build_nodemaven_proxy_url(
-                    account_key=f"{stem}fb{idx}",
-                    preset=first_country,
-                )
-            if fb and fb != primary_url and fb not in candidates:
-                candidates.append(fb)
-        return candidates
-
     async def _open(self, session_path: str):
         client = self._clients.get(session_path)
         if client is not None:
@@ -823,17 +921,25 @@ class TelethonGateway(TelegramGateway):
                 except Exception:
                     pass
                 self._clients.pop(session_path, None)
-                self._proxies.pop(session_path, None)
+                self._warmed_dialogs.discard(session_path)
         from telethon import TelegramClient
+        from telethon.sessions import StringSession
 
         api_id, api_hash = self._credentials(session_path)
         primary_url = self._resolve_proxy(session_path)
-        candidate_urls = [primary_url] + self._fallback_nodemaven_urls(session_path, primary_url)
+        dev_profile = self._resolve_device_profile(session_path)
+        sess_str = self._resolve_session_string(session_path)
+        proxy_tuple = _parse_proxy_for_telethon(primary_url)
         last_exc: Exception | None = None
 
-        dev_profile = self._resolve_device_profile(session_path)
-        for idx, candidate_url in enumerate(candidate_urls):
-            proxy_tuple = _parse_proxy_for_telethon(candidate_url)
+        for attempt in range(2):
+            if sess_str:
+                try:
+                    session_obj = StringSession(sess_str)
+                except Exception:
+                    session_obj = StringSession()
+            else:
+                session_obj = StringSession()
             kwargs: dict = {
                 **dev_profile,
                 "use_ipv6": False,
@@ -842,13 +948,11 @@ class TelethonGateway(TelegramGateway):
             if proxy_tuple:
                 kwargs["proxy"] = proxy_tuple
                 kwargs["timeout"] = 15
-                kwargs["connection_retries"] = 2
+                kwargs["connection_retries"] = 1
                 kwargs["retry_delay"] = 1
-            client = TelegramClient(_session_name(session_path), api_id, api_hash, **kwargs)
+            client = TelegramClient(session_obj, api_id, api_hash, **kwargs)
             try:
                 await client.connect()
-                if candidate_url and idx > 0:
-                    self._proxies[session_path] = candidate_url
                 self._clients[session_path] = client
                 return client, False
             except Exception as exc:
@@ -857,9 +961,10 @@ class TelethonGateway(TelegramGateway):
                     await client.disconnect()
                 except Exception:
                     pass
-                # Never retry across fallback proxies when the session auth_key itself is rejected by Telegram
-                if _classify_session_error(exc).get("health") in ("unauthorized", "banned"):
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
                     break
+                if attempt == 0:
+                    await asyncio.sleep(0.01 if "PYTEST_CURRENT_TEST" in os.environ else 2.0)
 
         if last_exc is not None:
             raise last_exc
@@ -871,6 +976,7 @@ class TelethonGateway(TelegramGateway):
             self._proxies.pop(session_path, None)
             self._app_credentials.pop(session_path, None)
             self._device_profiles.pop(session_path, None)
+            self._warmed_dialogs.discard(session_path)
             if client is not None:
                 try:
                     if client.is_connected():
@@ -905,17 +1011,28 @@ class TelethonGateway(TelegramGateway):
             pass
 
     async def request_code(self, phone: str, session_path: str) -> str:
+        from telethon.sessions import StringSession
+
         async with self._session_lock(session_path):
             for attempt in range(2):
                 try:
                     client, _owned = await self._open(session_path)
                     sent = await client.send_code_request(phone)
+                    sess = getattr(client, "session", None)
+                    if sess is not None and getattr(sess, "auth_key", None):
+                        try:
+                            interm = StringSession.save(sess) or None
+                        except Exception:
+                            interm = None
+                        if interm:
+                            self._session_strings[session_path] = interm
                     return sent.phone_code_hash
                 except GatewayError:
                     raise
                 except Exception as exc:
                     await self._close(session_path)
                     if attempt == 0 and _classify_session_error(exc).get("health") == "unauthorized":
+                        self.clear_session(session_path)
                         self._reset_corrupted_session_file(session_path)
                         continue
                     raise GatewayError(str(exc) or "Не удалось отправить код") from exc
@@ -924,6 +1041,7 @@ class TelethonGateway(TelegramGateway):
         self, phone: str, code: str, phone_code_hash: str, session_path: str
     ) -> dict:
         from telethon import errors
+        from telethon.sessions import StringSession
 
         async with self._session_lock(session_path):
             client, owned = await self._open(session_path)
@@ -931,13 +1049,33 @@ class TelethonGateway(TelegramGateway):
                 user = await client.sign_in(
                     phone=phone, code=code, phone_code_hash=phone_code_hash
                 )
+                saved_str = None
+                sess = getattr(client, "session", None)
+                if sess is not None and getattr(sess, "auth_key", None):
+                    try:
+                        saved_str = StringSession.save(sess) or None
+                    except Exception:
+                        saved_str = None
+                if saved_str:
+                    self._session_strings[session_path] = saved_str
                 return {
                     "status": "connected",
                     "telegram_user_id": user.id,
                     "telegram_username": getattr(user, "username", None),
                     "telegram_name": _person_name(user),
+                    "session_string": saved_str,
                 }
             except errors.SessionPasswordNeededError:
+                interm = None
+                sess = getattr(client, "session", None)
+                if sess is not None and getattr(sess, "auth_key", None):
+                    try:
+                        interm = StringSession.save(sess) or None
+                    except Exception:
+                        interm = None
+                if interm:
+                    self._session_strings[session_path] = interm
+                    return {"status": "pending_password", "session_string": interm}
                 return {"status": "pending_password"}
             except errors.PhoneCodeInvalidError as exc:
                 raise GatewayError("Неверный код") from exc
@@ -953,17 +1091,28 @@ class TelethonGateway(TelegramGateway):
 
     async def confirm_password(self, password: str, session_path: str) -> dict:
         from telethon import errors
+        from telethon.sessions import StringSession
 
         async with self._session_lock(session_path):
             owned = False
             try:
                 client, owned = await self._open(session_path)
                 user = await client.sign_in(password=password)
+                saved_str = None
+                sess = getattr(client, "session", None)
+                if sess is not None and getattr(sess, "auth_key", None):
+                    try:
+                        saved_str = StringSession.save(sess) or None
+                    except Exception:
+                        saved_str = None
+                if saved_str:
+                    self._session_strings[session_path] = saved_str
                 return {
                     "status": "connected",
                     "telegram_user_id": user.id,
                     "telegram_username": getattr(user, "username", None),
                     "telegram_name": _person_name(user),
+                    "session_string": saved_str,
                 }
             except errors.PasswordHashInvalidError as exc:
                 raise GatewayError("Неверный пароль") from exc
@@ -977,6 +1126,8 @@ class TelethonGateway(TelegramGateway):
 
     async def _evict_client_unlocked(self, session_path: str) -> None:
         client = self._clients.pop(session_path, None)
+        self._warmed_dialogs.discard(session_path)
+        self._session_strings.pop(session_path, None)
         if client is not None:
             try:
                 if client.is_connected():
@@ -1136,18 +1287,35 @@ class TelethonGateway(TelegramGateway):
                     target = int(peer_id)
                 else:
                     target = str(peer_id).strip()
-                if clean_img:
-                    from app.db import resolve_outreach_media
+                async def _do_send():
+                    if clean_img:
+                        from app.db import resolve_outreach_media
 
-                    media_target = resolve_outreach_media(clean_img)
-                    msg = await client.send_file(
-                        target,
-                        str(media_target),
-                        caption=body or None,
-                        **kwargs,
-                    )
-                else:
-                    msg = await client.send_message(target, body, **kwargs)
+                        media_target = resolve_outreach_media(clean_img)
+                        return await client.send_file(
+                            target,
+                            str(media_target),
+                            caption=body or None,
+                            **kwargs,
+                        )
+                    return await client.send_message(target, body, **kwargs)
+
+                try:
+                    msg = await _do_send()
+                except Exception as first_exc:
+                    if (
+                        isinstance(target, int)
+                        and "could not find the input entity" in str(first_exc).casefold()
+                        and session_path not in self._warmed_dialogs
+                    ):
+                        try:
+                            await client.get_dialogs(limit=150)
+                            self._warmed_dialogs.add(session_path)
+                        except Exception:
+                            pass
+                        msg = await _do_send()
+                    else:
+                        raise
             except GatewayError:
                 raise
             except Exception as exc:
@@ -1165,11 +1333,11 @@ class TelethonGateway(TelegramGateway):
                 "direction": "out",
             }
 
-    async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
+    async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         async with self._session_lock(session_path):
             client, owned = await self._open(session_path)
             try:
-                return await self._history(client, peer_id, limit)
+                return await self._history(client, peer_id, limit, session_path=session_path)
             except GatewayError:
                 raise
             except Exception as exc:
@@ -1178,18 +1346,34 @@ class TelethonGateway(TelegramGateway):
                 if owned:
                     await self._close(session_path)
 
-    async def _history(self, client, peer_id: int, limit: int) -> list:
+    async def _history(self, client, peer_id, limit: int, session_path: str | None = None) -> list:
         # get_messages is newest-first. A channel or chat id is not a personal dialog.
         from telethon.tl.types import User
 
         cap = _history_limit(limit)
+        warm_key = session_path or f"client:{id(client)}"
         try:
             target = (
                 int(peer_id)
                 if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
                 else str(peer_id).strip()
             )
-            entity = await client.get_entity(target)
+            try:
+                entity = await client.get_entity(target)
+            except Exception as first_exc:
+                if (
+                    isinstance(target, int)
+                    and "could not find the input entity" in str(first_exc).casefold()
+                    and warm_key not in self._warmed_dialogs
+                ):
+                    try:
+                        await client.get_dialogs(limit=150)
+                        self._warmed_dialogs.add(warm_key)
+                    except Exception:
+                        pass
+                    entity = await client.get_entity(target)
+                else:
+                    raise
         except GatewayError:
             raise
         except Exception as exc:
@@ -1709,9 +1893,14 @@ class FakeGateway(TelegramGateway):
         self.history.setdefault(peer_key, []).append(dict(record))
         return record
 
-    async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
+    async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         cap = _history_limit(limit)
-        rows = self.history.get(int(peer_id), [])
+        peer_key = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id).strip()
+        )
+        rows = self.history.get(peer_key, [])
         return [dict(row) for row in rows[-cap:]]
 
     async def list_folders(self, session_path: str) -> list:

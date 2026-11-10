@@ -10,9 +10,12 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import sqlite3
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,8 @@ import httpx
 from app.db import DEFAULT_DB, ROOT, utc_now
 
 R2_OBJECT_KEY = "foldesk-crm/crm_state.bundle.json.gz"
+R2_LEASE_KEY = "foldesk-crm/tg_runtime_lease.json"
+INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def _read_dotenv() -> dict[str, str]:
@@ -275,6 +280,7 @@ def restore_from_cloud(
                     ("messages", "sent_at"),
                     ("kv_settings", "updated_at"),
                     ("accounts", "created_at"),
+                    ("accounts", "updated_at"),
                 ):
                     try:
                         row = local_conn.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()
@@ -394,6 +400,124 @@ def get_cloud_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         "bucket": cfg["bucket"] if cfg else None,
         "object_key": R2_OBJECT_KEY,
     }
+
+
+def read_tg_runtime_lease(
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any] | None:
+    cfg = _resolve_r2_config(conn)
+    if not cfg:
+        return None
+    url, headers = _sigv4_headers("GET", cfg, R2_LEASE_KEY, b"")
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(url, headers=headers)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 200:
+                if not resp.content:
+                    return None
+                try:
+                    parsed = json.loads(resp.content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+            return {"_read_error": True, "status_code": resp.status_code}
+    except Exception:
+        return {"_read_error": True}
+
+
+def check_tg_runtime_lease_owned(
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    cfg = _resolve_r2_config(conn)
+    if not cfg:
+        return True
+    lease = read_tg_runtime_lease(conn)
+    if lease is None or lease.get("_read_error"):
+        return True
+    owner = lease.get("instance_id")
+    if owner and owner != INSTANCE_ID and bool(lease.get("released")) is False:
+        return False
+    return True
+
+
+def write_tg_runtime_lease(
+    *,
+    released: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    cfg = _resolve_r2_config(conn)
+    if not cfg:
+        return False
+    payload = json.dumps(
+        {
+            "instance_id": INSTANCE_ID,
+            "heartbeat_epoch": time.time(),
+            "updated_at": utc_now(),
+            "released": bool(released),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    url, headers = _sigv4_headers("PUT", cfg, R2_LEASE_KEY, payload)
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.put(url, content=payload, headers=headers)
+            return resp.status_code in (200, 201, 204)
+    except Exception:
+        return False
+
+
+def wait_and_acquire_tg_runtime_lease(
+    conn: sqlite3.Connection | None = None,
+    *,
+    max_wait_seconds: float = 45.0,
+    poll_interval: float = 2.5,
+    lease_ttl_seconds: float = 45.0,
+) -> bool:
+    cfg = _resolve_r2_config(conn)
+    if not cfg:
+        return True
+    started = time.monotonic()
+    while time.monotonic() - started < max_wait_seconds:
+        lease = read_tg_runtime_lease(conn)
+        free = False
+        if lease is None:
+            free = True
+        elif lease.get("_read_error"):
+            free = False
+        elif lease.get("instance_id") == INSTANCE_ID:
+            free = True
+        elif bool(lease.get("released")) is True:
+            free = True
+        else:
+            try:
+                hb_epoch = float(lease.get("heartbeat_epoch") or 0)
+            except (TypeError, ValueError):
+                hb_epoch = 0.0
+            if time.time() - hb_epoch >= lease_ttl_seconds:
+                free = True
+        if free:
+            write_tg_runtime_lease(released=False, conn=conn)
+            return True
+        remaining = max_wait_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, max(0.01, remaining)))
+    write_tg_runtime_lease(released=False, conn=conn)
+    return True
+
+
+def release_tg_runtime_lease(conn: sqlite3.Connection | None = None) -> bool:
+    cfg = _resolve_r2_config(conn)
+    if not cfg:
+        return True
+    cur = read_tg_runtime_lease(conn)
+    if cur and cur.get("_read_error"):
+        return False
+    if cur and cur.get("instance_id") not in (None, INSTANCE_ID):
+        return False
+    return write_tg_runtime_lease(released=True, conn=conn)
 
 
 def schedule_cloud_backup(app: Any, delay_seconds: float = 1.5) -> None:

@@ -2410,6 +2410,17 @@ async def run_campaign_batch(
             if chosen_state is None:
                 break
 
+            chosen_account_id = chosen_state["id"]
+            account_raw = chosen_state["raw"]
+            acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
+            session_path = str(account_raw.get("session_path") or "")
+            is_demo_session = session_path.startswith("data/sessions/demo")
+            active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
+            if not is_demo_session and active_gw is None:
+                chosen_state["disabled"] = True
+                continue
+            use_gateway = active_gw is not None and not is_demo_session
+
             if not jitter_applied and jitter_range is not None and len(jitter_range) == 2:
                 jitter_applied = True
                 j_min = max(0.0, float(jitter_range[0]))
@@ -2418,13 +2429,6 @@ async def run_campaign_batch(
                 jitter_delays_ms.append(int(round(j_sec * 1000)))
                 if j_sec > 0:
                     await asyncio.sleep(j_sec)
-
-            chosen_account_id = chosen_state["id"]
-            account_raw = chosen_state["raw"]
-            acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
-            session_path = str(account_raw.get("session_path") or "")
-            active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
-            use_gateway = active_gw is not None and not session_path.startswith("data/sessions/demo")
 
             replied_skipped = False
             try:

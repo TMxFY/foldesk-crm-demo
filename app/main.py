@@ -367,6 +367,41 @@ def _resolve_tg_creds(conn=None) -> tuple[str, str]:
     return api_id, api_hash
 
 
+def should_enable_live_tg_runtime(conn=None, gateway=None) -> bool:
+    if os.getenv("DISABLE_TG_WATCHES") == "1":
+        return False
+    if gateway is not None:
+        return True
+    if (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or os.getenv("BOT_TOKEN") == "e2e-not-a-secret"
+    ):
+        return False
+    if os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes") or os.getenv(
+        "ALLOW_LOCAL_TG_SESSIONS", ""
+    ).strip().lower() in ("1", "true", "yes"):
+        return True
+    from app.cloud_persistence import _resolve_r2_config
+
+    if _resolve_r2_config(conn) is not None:
+        return False
+    return True
+
+
+def _seed_gateway_session_strings(conn, gateway) -> None:
+    if conn is None or gateway is None or not hasattr(gateway, "set_session_string"):
+        return
+    try:
+        rows = conn.execute(
+            "SELECT session_path, session_string FROM accounts WHERE session_path IS NOT NULL AND session_string IS NOT NULL"
+        ).fetchall()
+        for s_path, s_str in rows:
+            if s_path and s_str:
+                gateway.set_session_string(str(s_path), str(s_str))
+    except Exception:
+        pass
+
+
 def _resolve_app_gateway(app, provider: str = "telegram"):
     norm = str(provider or "telegram").strip().lower()
     if norm == "whatsapp":
@@ -377,12 +412,16 @@ def _resolve_app_gateway(app, provider: str = "telegram"):
         return wa_gw
     if app.state.gateway is not None:
         return app.state.gateway
-    if "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("DISABLE_TG_WATCHES") == "1":
+    if not getattr(app.state, "tg_lease_ready", True):
         return None
-    api_id, api_hash = _resolve_tg_creds(getattr(app.state, "conn", None))
+    conn = getattr(app.state, "conn", None)
+    if not should_enable_live_tg_runtime(conn, None):
+        return None
+    api_id, api_hash = _resolve_tg_creds(conn)
     if not api_id or not api_hash:
         return None
     gateway = TelethonGateway()
+    _seed_gateway_session_strings(conn, gateway)
     app.state.gateway = gateway
     return gateway
 
@@ -391,10 +430,25 @@ def _gateway(request: Request):
     gateway = request.app.state.gateway
     if gateway is not None:
         return gateway
-    api_id, api_hash = _resolve_tg_creds(getattr(request.app.state, "conn", None))
+    if not getattr(request.app.state, "tg_lease_ready", True):
+        raise HTTPException(
+            status_code=503,
+            detail="Переключение релиза Telegram-сессий, повторите через 5 сек",
+        )
+    conn = getattr(request.app.state, "conn", None)
+    if (
+        not should_enable_live_tg_runtime(conn, None)
+        and "PYTEST_CURRENT_TEST" not in os.environ
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Локальное подключение Telegram отключено для защиты прод-сессий на Render от AUTH_KEY_DUPLICATED. Задайте ALLOW_LOCAL_TG_SESSIONS=1 для явного локального входа.",
+        )
+    api_id, api_hash = _resolve_tg_creds(conn)
     if not api_id or not api_hash:
         raise HTTPException(status_code=400, detail=KEYS_DETAIL)
     gateway = TelethonGateway()
+    _seed_gateway_session_strings(conn, gateway)
     request.app.state.gateway = gateway
     return gateway
 
@@ -608,8 +662,8 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
             await asyncio.sleep(interval_seconds)
             tick_res = await run_autopilot_tick(
                 app.state.conn,
-                gateway=getattr(app.state, "gateway", None),
-                wa_gateway=getattr(app.state, "wa_gateway", None),
+                gateway=_resolve_app_gateway(app, "telegram"),
+                wa_gateway=_resolve_app_gateway(app, "whatsapp"),
             )
             if isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0:
                 from app.cloud_persistence import schedule_cloud_backup
@@ -622,6 +676,13 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
 
 
 async def start_autopilot_loop(app: FastAPI) -> None:
+    if (
+        not should_enable_live_tg_runtime(
+            getattr(app.state, "conn", None), getattr(app.state, "gateway", None)
+        )
+        and "PYTEST_CURRENT_TEST" not in os.environ
+    ):
+        return
     existing = getattr(app.state, "autopilot_task", None)
     if existing is not None and not existing.done():
         return
@@ -747,21 +808,110 @@ async def stop_airtable_sync_loop(app: FastAPI) -> None:
 def create_app(conn=None, gateway=None) -> FastAPI:
     load_env_file()
 
+    async def _tg_lease_heartbeat_loop(app: FastAPI) -> None:
+        from app.cloud_persistence import (
+            check_tg_runtime_lease_owned,
+            write_tg_runtime_lease,
+        )
+
+        while True:
+            try:
+                await asyncio.sleep(20.0)
+                owned = await asyncio.to_thread(check_tg_runtime_lease_owned, None)
+                if not owned:
+                    app.state.tg_lease_ready = False
+                    await stop_autopilot_loop(app)
+                    await stop_inbox_watches(app)
+                    return
+                await asyncio.to_thread(
+                    write_tg_runtime_lease, released=False, conn=None
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+
+    async def _leased_tg_runtime_boot(app: FastAPI) -> None:
+        from app.cloud_persistence import wait_and_acquire_tg_runtime_lease
+
+        try:
+            await asyncio.to_thread(wait_and_acquire_tg_runtime_lease, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        app.state.tg_lease_ready = True
+        app.state.tg_lease_heartbeat_task = asyncio.create_task(
+            _tg_lease_heartbeat_loop(app)
+        )
+        await start_connected_watches(app)
+        await start_autopilot_loop(app)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if os.getenv("DISABLE_TG_WATCHES") != "1":
-            if "PYTEST_CURRENT_TEST" in os.environ:
-                await start_connected_watches(app)
-            else:
-                asyncio.create_task(start_connected_watches(app))
-            await start_autopilot_loop(app)
+        if getattr(app.state, "_needs_initial_session_backup", False):
+            app.state._needs_initial_session_backup = False
+            from app.cloud_persistence import schedule_cloud_backup
+
+            schedule_cloud_backup(app, delay_seconds=3.0)
+        live_tg_enabled = False
+        if "PYTEST_CURRENT_TEST" in os.environ or gateway is not None:
+            if os.getenv("DISABLE_TG_WATCHES") != "1":
+                if "PYTEST_CURRENT_TEST" in os.environ:
+                    await start_connected_watches(app)
+                else:
+                    asyncio.create_task(start_connected_watches(app))
+                await start_autopilot_loop(app)
+        elif should_enable_live_tg_runtime(app.state.conn, gateway):
+            from app.cloud_persistence import _resolve_r2_config
+
+            live_tg_enabled = True
+            if _resolve_r2_config(app.state.conn) is not None:
+                app.state.tg_lease_ready = False
+            app.state.tg_lease_boot_task = asyncio.create_task(
+                _leased_tg_runtime_boot(app)
+            )
         await start_airtable_sync_loop(app)
         try:
             yield
         finally:
+            boot_t = getattr(app.state, "tg_lease_boot_task", None)
+            if boot_t is not None:
+                boot_t.cancel()
+                try:
+                    await boot_t
+                except (asyncio.CancelledError, Exception):
+                    pass
+                app.state.tg_lease_boot_task = None
             await stop_airtable_sync_loop(app)
             await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
+            hb_t = getattr(app.state, "tg_lease_heartbeat_task", None)
+            if hb_t is not None:
+                hb_t.cancel()
+                try:
+                    await hb_t
+                except (asyncio.CancelledError, Exception):
+                    pass
+                app.state.tg_lease_heartbeat_task = None
+            for b_attr in ("_cloud_backup_task", "cloud_backup_task"):
+                bt = getattr(app.state, b_attr, None)
+                if bt is not None and not bt.done():
+                    try:
+                        await asyncio.wait_for(bt, timeout=10.0)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            if (
+                live_tg_enabled
+                and "PYTEST_CURRENT_TEST" not in os.environ
+                and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+            ):
+                try:
+                    from app.cloud_persistence import release_tg_runtime_lease
+
+                    await asyncio.to_thread(release_tg_runtime_lease, None)
+                except Exception:
+                    pass
 
     app = FastAPI(title="CRM Telegram", lifespan=lifespan)
     if (
@@ -778,6 +928,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     if conn is None:
         conn = connect()
     init_db(conn)
+    needs_initial_session_backup = False
     if (
         "PYTEST_CURRENT_TEST" not in os.environ
         and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
@@ -787,6 +938,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             from app.db import bootstrap_prod_snapshot
 
             bootstrap_prod_snapshot(conn)
+        try:
+            from app.cloud_persistence import _resolve_r2_config
+
+            if _resolve_r2_config(conn) is not None:
+                has_str = conn.execute(
+                    "SELECT 1 FROM accounts WHERE session_string IS NOT NULL LIMIT 1"
+                ).fetchone()
+                if has_str is not None:
+                    needs_initial_session_backup = True
+        except Exception:
+            pass
     app.state.conn = conn
     app.state.gateway = gateway
     app.state.wa_gateway = WhatsAppGateway()
@@ -794,6 +956,14 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     app.state.inbox_tasks = {}
     app.state.inbox_synced = set()
     app.state.inbox_sync_lock = asyncio.Lock()
+    app.state.tg_lease_ready = True
+    app.state.tg_lease_boot_task = None
+    app.state.tg_lease_heartbeat_task = None
+    app.state._needs_initial_session_backup = needs_initial_session_backup
+    if needs_initial_session_backup:
+        from app.cloud_persistence import schedule_cloud_backup
+
+        schedule_cloud_backup(app, delay_seconds=3.0)
 
     @app.middleware("http")
     async def _cloud_persistence_middleware(request: Request, call_next):
@@ -937,7 +1107,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         ).fetchone()
         pre_path = row["session_path"] if row else None
         await _cleanup_deleted_account_runtime(request.app, account_id, pre_path)
-        res = _call(delete_account, request.app.state.conn, account_id)
+        res = _call(
+            delete_account,
+            request.app.state.conn,
+            account_id,
+            request.app.state.gateway,
+        )
         return res
 
     @app.post("/api/accounts/purge-dead")
@@ -953,7 +1128,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             await _cleanup_deleted_account_runtime(
                 request.app, int(r["id"]), r["session_path"]
             )
-        res = _call(purge_dead_accounts, request.app.state.conn)
+        res = _call(
+            purge_dead_accounts,
+            request.app.state.conn,
+            request.app.state.gateway,
+        )
         return res
 
     @app.post("/api/accounts/check-all")
@@ -961,8 +1140,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return await _call_async(
             check_all_accounts,
             request.app.state.conn,
-            request.app.state.gateway,
-            request.app.state.wa_gateway,
+            _resolve_app_gateway(request.app, "telegram"),
+            _resolve_app_gateway(request.app, "whatsapp"),
         )
 
     @app.patch("/api/accounts/{account_id}/limit")
@@ -1685,8 +1864,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return await _call_async(
             run_autopilot_tick,
             request.app.state.conn,
-            gateway=getattr(request.app.state, "gateway", None),
-            wa_gateway=getattr(request.app.state, "wa_gateway", None),
+            gateway=_resolve_app_gateway(request.app, "telegram"),
+            wa_gateway=_resolve_app_gateway(request.app, "whatsapp"),
             max_send_per_campaign=max_send,
             respect_delays=respect_delays,
             force=force,
@@ -2020,12 +2199,20 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(backup_to_cloud, request.app.state.conn)
 
     @app.post("/api/cloud/restore")
-    def cloud_restore_run(request: Request):
+    async def cloud_restore_run(request: Request):
         from app.cloud_persistence import restore_from_cloud
 
-        return _call(
+        res = _call(
             lambda: restore_from_cloud(force=True, live_conn=request.app.state.conn)
         )
+        if isinstance(res, dict) and res.get("restored"):
+            init_db(request.app.state.conn)
+            restore_disk_sessions(request.app.state.conn)
+            gw = getattr(request.app.state, "gateway", None)
+            if gw is not None and hasattr(gw, "_session_strings"):
+                gw._session_strings.clear()
+                _seed_gateway_session_strings(request.app.state.conn, gw)
+        return res
 
     @app.post("/api/cloud/credentials")
     def cloud_credentials_set(body: CloudCredentialsIn, request: Request):

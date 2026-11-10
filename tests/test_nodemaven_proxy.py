@@ -147,8 +147,8 @@ def test_telethon_open_falls_back_when_primary_nodemaven_peer_times_out(monkeypa
 
     gw = TelethonGateway()
     sess_path = str(tmp_path / "25.session")
-    dead_ru_url = "socks5://nmuser-country-ru-sid-foldeskacc25-ttl-24h-filter-medium:secret@gate.nodemaven.com:1080"
-    gw.set_proxy(sess_path, dead_ru_url)
+    sticky_ru_url = "socks5://nmuser-country-ru-sid-foldeskacc25-ttl-24h-filter-medium:secret@gate.nodemaven.com:1080"
+    gw.set_proxy(sess_path, sticky_ru_url)
 
     monkeypatch.setenv("NODEMAVEN_USER", "nmuser")
     monkeypatch.setenv("NODEMAVEN_PASS", "secret")
@@ -165,7 +165,7 @@ def test_telethon_open_falls_back_when_primary_nodemaven_peer_times_out(monkeypa
         async def connect(self):
             proxy_user = self.proxy[4] if self.proxy else ""
             attempts.append(proxy_user)
-            if "-country-ru-" in proxy_user:
+            if len(attempts) == 1:
                 raise ConnectionError("Connection to Telegram failed 2 time(s)")
             self.connected = True
 
@@ -180,7 +180,8 @@ def test_telethon_open_falls_back_when_primary_nodemaven_peer_times_out(monkeypa
     client, _ = asyncio.run(gw._open(sess_path))
     assert client.is_connected() is True
     assert len(attempts) == 2
-    assert "-country-ru-" in attempts[0]
-    assert "-country-kz-" in attempts[1]
-    assert "-country-kz-" in gw._proxies[sess_path]
+    assert attempts[0] == attempts[1]
+    assert "country-ru-sid-foldeskacc25-" in attempts[0]
+    assert gw._proxies[sess_path] == sticky_ru_url
+
 

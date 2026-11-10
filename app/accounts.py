@@ -10,13 +10,31 @@ import sqlite3
 import zipfile
 
 from app.db import as_dict, resolve_session, utc_now, utc_today
-from app.telegram_gateway import SESSION_HEALTH, GatewayError
+from app.telegram_gateway import (
+    SESSION_HEALTH,
+    GatewayError,
+    extract_string_session_from_sqlite,
+)
 from app.whatsapp_gateway import (
     WhatsAppGateway,
     _inspect_whatsmeow_db,
     generate_pairing_code,
     generate_qr_svg,
 )
+
+
+def _is_valid_string_session(val: str | None) -> bool:
+    if not val or not str(val).strip():
+        return False
+    try:
+        from telethon.sessions import StringSession
+
+        sess = StringSession(str(val).strip())
+        ak = getattr(sess, "auth_key", None)
+        key = getattr(ak, "key", None) if ak is not None else None
+        return bool(key and len(bytes(key)) == 256)
+    except Exception:
+        return False
 
 
 def _inspect_telethon_session(session_path: str) -> tuple[int, bytes] | None:
@@ -66,7 +84,8 @@ def _public(row: dict) -> dict:
     sent_today = int(row.get("sent_today") or 0) if row.get("sent_date") == today else 0
     session_path = str(row.get("session_path") or "")
     is_demo = session_path.startswith("data/sessions/demo")
-    session_exists = bool(session_path and resolve_session(session_path).exists())
+    has_str_sess = bool(row.get("session_string") and str(row.get("session_string")).strip())
+    session_exists = bool(has_str_sess or (session_path and resolve_session(session_path).exists()))
     provider = str(row.get("provider") or "telegram").strip().lower()
     if provider not in ("telegram", "whatsapp"):
         provider = "telegram"
@@ -116,12 +135,7 @@ def _public(row: dict) -> dict:
     out["health_status"] = health
     out["is_demo"] = is_demo
     out["session_exists"] = session_exists
-    out["tg_web_ready"] = bool(
-        provider == "telegram"
-        and status == "connected"
-        and health not in ("unauthorized", "offline", "banned", "frozen")
-        and _inspect_telethon_session(session_path) is not None
-    )
+    out["tg_web_ready"] = False
     out["connection_label"] = connection_label
     return out
 
@@ -248,10 +262,16 @@ def _clear_deleted_session(conn, session_path: str | None = None, phone: str | N
         pass
 
 
-def delete_account(conn, account_id: int) -> dict:
+def delete_account(conn, account_id: int, gateway=None) -> dict:
     current = _load(conn, account_id)
     session_path = str(current.get("session_path") or "").strip()
     phone = str(current.get("phone") or "").strip()
+    conn.execute(
+        "UPDATE accounts SET session_blob = NULL, session_string = NULL WHERE id = ?",
+        (account_id,),
+    )
+    if gateway is not None and session_path and hasattr(gateway, "clear_session"):
+        gateway.clear_session(session_path)
     _unlink_account_refs(conn, [int(account_id)])
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     conn.commit()
@@ -283,7 +303,7 @@ def delete_account(conn, account_id: int) -> dict:
     return {"deleted": True, "id": int(account_id), "session_path": session_path}
 
 
-def purge_dead_accounts(conn) -> dict:
+def purge_dead_accounts(conn, gateway=None) -> dict:
     rows = conn.execute(
         """
         SELECT id FROM accounts
@@ -297,7 +317,7 @@ def purge_dead_accounts(conn) -> dict:
     for row in rows:
         aid = int(row[0])
         try:
-            res = delete_account(conn, aid)
+            res = delete_account(conn, aid, gateway=gateway)
             deleted_ids.append(aid)
             if res.get("session_path"):
                 deleted_paths.append(str(res["session_path"]))
@@ -445,17 +465,28 @@ def list_accounts(conn) -> list:
 def _sync_session_blob(conn, account_id: int) -> None:
     try:
         row = conn.execute(
-            "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+            "SELECT session_path, session_string, provider FROM accounts WHERE id = ?",
+            (account_id,),
         ).fetchone()
         if not row or not row[0]:
             return
         session_path = str(row[0]).strip()
+        existing_str = str(row[1] or "").strip()
+        prov = str(row[2] or "telegram").strip().lower()
+        abs_p = resolve_session(session_path)
+        if prov != "whatsapp" and not existing_str:
+            extracted = extract_string_session_from_sqlite(abs_p)
+            if extracted:
+                conn.execute(
+                    "UPDATE accounts SET session_string = ? WHERE id = ?",
+                    (extracted, account_id),
+                )
+                conn.commit()
         if (
             _inspect_telethon_session(session_path) is None
             and _inspect_whatsmeow_db(session_path) is None
         ):
             return
-        abs_p = resolve_session(session_path)
         blob = abs_p.read_bytes()
         conn.execute(
             "UPDATE accounts SET session_blob = ? WHERE id = ?",
@@ -543,19 +574,31 @@ def restore_disk_sessions(conn) -> int:
                 restored += 1
             except Exception:
                 pass
-        if (
+        prov = str(row.get("provider") or "telegram").strip().lower()
+        if prov != "whatsapp" and not row.get("session_string"):
+            extracted = extract_string_session_from_sqlite(abs_p)
+            if extracted:
+                conn.execute(
+                    "UPDATE accounts SET session_string = ? WHERE id = ?",
+                    (extracted, account_id),
+                )
+                row["session_string"] = extracted
+        has_disk_sess = (
             _inspect_telethon_session(session_path) is not None
             or _inspect_whatsmeow_db(session_path) is not None
-        ):
-            try:
-                current_bytes = abs_p.read_bytes()
-                if not blob or bytes(blob) != current_bytes:
-                    conn.execute(
-                        "UPDATE accounts SET session_blob = ? WHERE id = ?",
-                        (current_bytes, account_id),
-                    )
-            except Exception:
-                pass
+        )
+        has_str_sess = prov != "whatsapp" and _is_valid_string_session(row.get("session_string"))
+        if has_disk_sess or has_str_sess:
+            if has_disk_sess and abs_p.exists():
+                try:
+                    current_bytes = abs_p.read_bytes()
+                    if not blob or bytes(blob) != current_bytes:
+                        conn.execute(
+                            "UPDATE accounts SET session_blob = ? WHERE id = ?",
+                            (current_bytes, account_id),
+                        )
+                except Exception:
+                    pass
             if row.get("status") != "connected" and row.get("health") not in (
                 "unauthorized",
                 "banned",
@@ -607,16 +650,17 @@ def restore_disk_sessions(conn) -> int:
             blob = sess_file.read_bytes()
         except Exception:
             blob = None
+        extracted_str = extract_string_session_from_sqlite(sess_file)
         conn.execute(
             """
             INSERT INTO accounts (
                 phone, session_path, status, telegram_user_id,
                 telegram_username, telegram_name, created_at,
                 health, last_error, updated_at, daily_limit,
-                sent_today, sent_date, access_scope, provider, session_blob
-            ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, 25, 0, ?, 'workspace', 'telegram', ?)
+                sent_today, sent_date, access_scope, provider, session_blob, session_string
+            ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, 25, 0, ?, 'workspace', 'telegram', ?, ?)
             """,
-            (phone, rel_path, tg_uid, tg_user, tg_name, now, now, utc_today(), blob),
+            (phone, rel_path, tg_uid, tg_user, tg_name, now, now, utc_today(), blob, extracted_str),
         )
         connected_phones.add(phone)
         restored += 1
@@ -672,17 +716,22 @@ async def start_login(
     target_digits = _phone_digits(phone)
     all_pending = conn.execute(
         """
-        SELECT id, phone FROM accounts
+        SELECT id, phone, session_path FROM accounts
         WHERE COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
         """,
         (norm_provider,),
     ).fetchall()
-    stale_ids = [
-        int(r[0])
+    stale_rows = [
+        r
         for r in all_pending
         if str(r[1] or "").strip() == phone or (target_digits and _phone_digits(r[1]) == target_digits)
     ]
+    stale_ids = [int(r[0]) for r in stale_rows]
     if stale_ids:
+        if gateway is not None and hasattr(gateway, "clear_session"):
+            for r in stale_rows:
+                old_path = str(r[2] or "").strip() or f"data/sessions/{int(r[0])}.session"
+                gateway.clear_session(old_path)
         _unlink_account_refs(conn, stale_ids)
         for sid in stale_ids:
             conn.execute("DELETE FROM accounts WHERE id = ?", (sid,))
@@ -697,7 +746,8 @@ async def start_login(
             "frozen",
         )
         has_live_sess = not is_dead_health and (
-            _inspect_telethon_session(old_sess_rel) is not None
+            _is_valid_string_session(existing_connected.get("session_string"))
+            or _inspect_telethon_session(old_sess_rel) is not None
             or _inspect_whatsmeow_db(old_sess_rel) is not None
         )
         if gateway is not None and hasattr(gateway, "_close"):
@@ -705,6 +755,8 @@ async def start_login(
                 await gateway._close(old_sess_rel)
             except Exception:
                 pass
+        if not has_live_sess and gateway is not None and hasattr(gateway, "clear_session"):
+            gateway.clear_session(old_sess_rel)
         if old_sess.exists() and not has_live_sess:
             try:
                 if _inspect_telethon_session(old_sess_rel) is not None:
@@ -720,7 +772,7 @@ async def start_login(
                 pass
         if not has_live_sess:
             conn.execute(
-                "UPDATE accounts SET session_blob = NULL, health = NULL, last_error = NULL WHERE id = ?",
+                "UPDATE accounts SET session_blob = NULL, session_string = NULL, health = NULL, last_error = NULL WHERE id = ?",
                 (account_id,),
             )
     else:
@@ -750,11 +802,12 @@ async def start_login(
         pairing_code = generate_pairing_code(phone)
         qr_code = generate_qr_svg(session_path, phone)
 
+    req_sess_str: str | None = None
     try:
         if gateway is not None and hasattr(gateway, "set_proxy"):
             gateway.set_proxy(session_path, clean_proxy)
         if norm_provider == "whatsapp" and isinstance(gateway, WhatsAppGateway):
-            phone_code_hash = await gateway.request_code(
+            sent_res = await gateway.request_code(
                 phone, session_path, auth_mode=norm_mode
             )
             p_info = (gateway._pending or {}).get(session_path) or {}
@@ -763,19 +816,29 @@ async def start_login(
             if p_info.get("qr_code"):
                 qr_code = p_info["qr_code"]
         else:
-            phone_code_hash = await gateway.request_code(phone, session_path)
+            sent_res = await gateway.request_code(phone, session_path)
+        if isinstance(sent_res, dict):
+            phone_code_hash = str(sent_res.get("phone_code_hash") or sent_res.get("code_hash") or "")
+            req_sess_str = (sent_res.get("session_string") or "").strip() or None
+        else:
+            phone_code_hash = str(sent_res or "")
+            if gateway is not None and hasattr(gateway, "get_session_string"):
+                req_sess_str = (gateway.get_session_string(session_path) or "").strip() or None
     except Exception as exc:
         _mark_error(conn, account_id)
         if isinstance(exc, GatewayError):
             raise
         raise GatewayError(str(exc) or "Не удалось отправить код") from exc
+    if req_sess_str and gateway is not None and hasattr(gateway, "set_session_string"):
+        gateway.set_session_string(session_path, req_sess_str)
     conn.execute(
         """
         UPDATE accounts
-        SET phone_code_hash = ?, status = 'pending_code', pairing_code = ?, qr_code = ?, provider = ?
+        SET phone_code_hash = ?, status = 'pending_code', pairing_code = ?, qr_code = ?,
+            provider = ?, session_string = COALESCE(?, session_string)
         WHERE id = ?
         """,
-        (phone_code_hash, pairing_code, qr_code, norm_provider, account_id),
+        (phone_code_hash, pairing_code, qr_code, norm_provider, req_sess_str, account_id),
     )
     conn.commit()
     return {
@@ -1024,6 +1087,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 sess_bytes = None
 
         wrote_session = False
+        saved_session_str: str | None = None
         if sess_bytes:
             abs_session_path.write_bytes(sess_bytes)
             wrote_session = True
@@ -1036,40 +1100,20 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             )
             if raw_session_str and str(raw_session_str).strip():
                 s_val = str(raw_session_str).strip()
-                converted = False
                 if provider == "telegram":
-                    try:
-                        from telethon.sessions import SQLiteSession, StringSession
+                    saved_session_str = s_val
 
-                        str_sess = StringSession(s_val)
-                        if getattr(str_sess, "auth_key", None):
-                            if abs_session_path.exists():
-                                abs_session_path.unlink()
-                            sql_sess = SQLiteSession(str(abs_session_path.with_suffix("")))
-                            sql_sess.set_dc(
-                                str_sess.dc_id,
-                                str_sess.server_address,
-                                str_sess.port,
-                            )
-                            sql_sess.auth_key = str_sess.auth_key
-                            sql_sess.save()
-                            sql_sess.close()
-                            converted = True
-                            wrote_session = True
-                    except Exception:
-                        converted = False
-                if not converted:
-                    if not (abs_session_path.exists() and abs_session_path.stat().st_size > 100):
-                        abs_session_path.write_bytes(s_val.encode("utf-8"))
-                        wrote_session = True
-
-        if not wrote_session:
+        if not wrote_session and not saved_session_str:
             if not (abs_session_path.exists() and abs_session_path.stat().st_size > 100):
                 if provider == "whatsapp":
                     stub_bytes = f"SQLite format 3\x00whatsapp:{phone}".encode("utf-8")
+                    abs_session_path.write_bytes(stub_bytes)
                 else:
                     stub_bytes = f"SQLite format 3\x00{phone}:{tg_id}".encode("utf-8")
-                abs_session_path.write_bytes(stub_bytes)
+                    abs_session_path.write_bytes(stub_bytes)
+
+        if provider == "telegram" and not saved_session_str and abs_session_path.exists():
+            saved_session_str = extract_string_session_from_sqlite(abs_session_path)
 
         app_id_val = (
             entry.get("app_id")
@@ -1131,6 +1175,8 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         if gateway is not None:
             if hasattr(gateway, "set_proxy"):
                 gateway.set_proxy(session_path, proxy_url)
+            if hasattr(gateway, "set_session_string") and _is_valid_string_session(saved_session_str):
+                gateway.set_session_string(session_path, saved_session_str)
             if hasattr(gateway, "set_app_credentials") and parsed_api_id and parsed_api_hash:
                 gateway.set_app_credentials(session_path, parsed_api_id, parsed_api_hash)
             if hasattr(gateway, "set_device_profile"):
@@ -1168,6 +1214,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         )
         if existing:
             account_id = int(existing["id"])
+            updated_sess_str = saved_session_str if saved_session_str else existing.get("session_string")
             conn.execute(
                 """
                 UPDATE accounts
@@ -1178,7 +1225,8 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     api_id = COALESCE(?, api_id), api_hash = COALESCE(?, api_hash),
                     device_model = COALESCE(?, device_model), system_version = COALESCE(?, system_version),
                     app_version = COALESCE(?, app_version), lang_code = COALESCE(?, lang_code),
-                    system_lang_code = COALESCE(?, system_lang_code)
+                    system_lang_code = COALESCE(?, system_lang_code),
+                    session_string = ?
                 WHERE id = ?
                 """,
                 (
@@ -1199,6 +1247,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     app_version,
                     lang_code,
                     system_lang_code,
+                    updated_sess_str,
                     account_id,
                 ),
             )
@@ -1211,8 +1260,9 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     health, last_error, updated_at, daily_limit,
                     sent_today, sent_date, proxy_url, access_scope,
                     provider, wa_jid, api_id, api_hash,
-                    device_model, system_version, app_version, lang_code, system_lang_code
-                ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    device_model, system_version, app_version, lang_code, system_lang_code,
+                    session_string
+                ) VALUES (?, ?, 'connected', ?, ?, ?, ?, 'active', NULL, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     phone,
@@ -1235,6 +1285,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     app_version,
                     lang_code,
                     system_lang_code,
+                    saved_session_str,
                 ),
             )
             account_id = int(cur.lastrowid)
@@ -1355,6 +1406,17 @@ async def _finish_login(conn, account_id: int, result: dict, gateway) -> dict:
     _apply_result(conn, account_id, result)
     if result.get("status") == "connected":
         account = _load(conn, account_id)
+        sess_str = (result.get("session_string") or "").strip() or (account.get("session_string") or "").strip() or None
+        if not sess_str and account.get("session_path"):
+            sess_str = extract_string_session_from_sqlite(resolve_session(account["session_path"]))
+        if sess_str:
+            conn.execute(
+                "UPDATE accounts SET session_string = COALESCE(?, session_string) WHERE id = ?",
+                (sess_str, account_id),
+            )
+            conn.commit()
+            if gateway is not None and hasattr(gateway, "set_session_string"):
+                gateway.set_session_string(account["session_path"], sess_str)
         probe = await _probe_health(gateway, account["session_path"])
         _write_health(conn, account_id, probe["health"], probe["last_error"])
     return {"status": result["status"]}
@@ -1423,11 +1485,12 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
             conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
             conn.commit()
             raise ValueError(f"Аккаунт {dup['phone']} уже добавлен")
+        sess_str = (result.get("session_string") or "").strip() or None
         conn.execute(
             """
             UPDATE accounts
             SET status = ?, telegram_user_id = ?, telegram_username = ?, telegram_name = ?,
-                wa_jid = COALESCE(?, wa_jid)
+                wa_jid = COALESCE(?, wa_jid), session_string = COALESCE(?, session_string)
             WHERE id = ?
             """,
             (
@@ -1436,14 +1499,16 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
                 result.get("telegram_username"),
                 result.get("telegram_name"),
                 result.get("wa_jid"),
+                sess_str,
                 account_id,
             ),
         )
         conn.commit()
         _sync_session_blob(conn, account_id)
     else:
+        sess_str = (result.get("session_string") or "").strip() or None
         conn.execute(
-            "UPDATE accounts SET status = ? WHERE id = ?",
-            (status, account_id),
+            "UPDATE accounts SET status = ?, session_string = COALESCE(?, session_string) WHERE id = ?",
+            (status, sess_str, account_id),
         )
         conn.commit()
