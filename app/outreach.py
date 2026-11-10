@@ -634,10 +634,103 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
     return replied_now
 
 
+def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> int:
+    now = utc_now()
+    where_camp = "AND campaign_id = ?" if campaign_id is not None else ""
+    params: tuple = (now, int(campaign_id)) if campaign_id is not None else (now,)
+    cur = conn.execute(
+        f"""
+        UPDATE campaign_recipients
+        SET status = CASE WHEN COALESCE(current_step, 0) >= 1 THEN 'in_progress' ELSE 'pending' END,
+            error_text = NULL,
+            updated_at = ?
+        WHERE status = 'failed'
+          {where_camp}
+          AND (
+              error_text LIKE '%InvokeWithLayerRequest%'
+              OR error_text LIKE '%ConnectionLayerInvalid%'
+              OR error_text LIKE '%authorization key%'
+              OR error_text LIKE '%two different IP addresses%'
+              OR error_text LIKE '%AuthKey%'
+              OR error_text LIKE '%Could not find the input entity%'
+              OR error_text LIKE '%PeerUser%'
+              OR error_text LIKE '%Сессия %'
+              OR error_text LIKE '%Нет связи%'
+              OR error_text LIKE '%TimedOut%'
+              OR error_text LIKE '%A wait of %'
+          )
+        """,
+        params,
+    )
+    healed = int(cur.rowcount or 0)
+    if healed > 0:
+        conn.execute(
+            f"""
+            UPDATE campaigns
+            SET status = 'running', updated_at = ?
+            WHERE status = 'completed'
+              {"AND id = ?" if campaign_id is not None else ""}
+              AND EXISTS (
+                  SELECT 1 FROM campaign_recipients cr
+                  WHERE cr.campaign_id = campaigns.id
+                    AND cr.status IN ('pending', 'in_progress')
+              )
+            """,
+            params,
+        )
+        conn.commit()
+    return healed
+
+
+def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
+    text = str(exc or "").strip()
+    blob = f"{exc.__class__.__name__} {text}".casefold()
+    if "frozen" in blob:
+        return ("account_dead", "frozen")
+    if "userdeactivatedban" in blob or "phonenumberbanned" in blob:
+        return ("account_dead", "banned")
+    if any(
+        marker in blob
+        for marker in (
+            "invokewithlayer",
+            "connectionlayerinvalid",
+            "authorization key",
+            "two different ip addresses",
+            "auth_key",
+            "authkey",
+            "unauthorized",
+            "userdeactivated",
+            "сессия не авторизована",
+            "сессия сброшена",
+        )
+    ):
+        return ("account_dead", "unauthorized")
+    if any(
+        marker in blob
+        for marker in (
+            "floodwait",
+            "a wait of ",
+            "too many requests",
+            "peerflood",
+            "нет связи",
+            "timedout",
+            "timed out",
+            "timeout",
+            "connectionerror",
+            "connection reset",
+            "socks",
+            "proxy",
+        )
+    ):
+        return ("account_transient", "offline")
+    return ("recipient_error", "active")
+
+
 def get_campaign(conn, campaign_id: int) -> dict:
     row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
     if row is None:
         raise LookupError("campaign")
+    heal_transient_failed_recipients(conn, int(campaign_id))
     camp = as_dict(row)
     account_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
     _sync_campaign_replies(conn, campaign_id, account_ids[0] if len(account_ids) == 1 else None)
@@ -2153,6 +2246,8 @@ async def run_campaign_batch(
             continue
         if acc_raw.get("status") != "connected":
             continue
+        if str(acc_raw.get("health") or "active") in ("unauthorized", "banned", "frozen"):
+            continue
         acc_pub = public_account(acc_raw)
         connected_states.append(
             {
@@ -2162,6 +2257,7 @@ async def run_campaign_batch(
                 "daily_limit": int(acc_pub["daily_limit"]),
                 "sent_today": int(acc_pub["sent_today"]),
                 "sent_in_batch": 0,
+                "disabled": False,
             }
         )
 
@@ -2191,6 +2287,7 @@ async def run_campaign_batch(
 
     cap = int(max_send) if max_send is not None and int(max_send) > 0 else 500
     effective_quota = min(total_account_remaining, campaign_remaining, cap)
+    max_failed_in_batch = max(5, effective_quota * 3)
 
     eligible_rows = conn.execute(
         """
@@ -2206,12 +2303,56 @@ async def run_campaign_batch(
     ).fetchall()
 
     sent_count = 0
+    failed_in_batch = 0
     sent_by_account: dict[str, int] = {}
     jitter_delays_ms: list[int] = []
     state_by_id = {st["id"]: st for st in connected_states}
 
+    async def _tg_send_with_username_fallback(
+        active_gw,
+        session_path: str,
+        peer_target,
+        rendered_text: str,
+        step_image_url: str | None,
+        username: str | None,
+    ) -> dict:
+        async def _do_send(target_val):
+            if step_image_url:
+                try:
+                    return await active_gw.send_message(
+                        session_path,
+                        target_val,
+                        rendered_text,
+                        None,
+                        image_path=step_image_url,
+                    )
+                except TypeError:
+                    return await active_gw.send_message(
+                        session_path, target_val, rendered_text, None
+                    )
+            return await active_gw.send_message(
+                session_path, target_val, rendered_text, None
+            )
+
+        try:
+            return await _do_send(peer_target)
+        except Exception as send_exc:
+            err_blob = str(send_exc or "").casefold()
+            clean_uname = str(username or "").strip().lstrip("@")
+            if (
+                clean_uname
+                and ("could not find the input entity" in err_blob or "peeruser" in err_blob)
+            ):
+                if hasattr(active_gw, "search_dialogs"):
+                    try:
+                        await active_gw.search_dialogs(session_path, f"@{clean_uname}", limit=1)
+                    except Exception:
+                        pass
+                return await _do_send(f"@{clean_uname}")
+            raise
+
     for row in eligible_rows:
-        if sent_count >= effective_quota:
+        if sent_count >= effective_quota or failed_in_batch >= max_failed_in_batch:
             break
         rec = as_dict(row)
         step_idx = int(rec.get("current_step") or 0)
@@ -2227,185 +2368,238 @@ async def run_campaign_batch(
                 if due_iso and due_iso > now:
                     continue
 
-        available = [
-            st for st in connected_states if st["sent_today"] < st["daily_limit"]
-        ]
-        if not available:
-            break
+        rendered_text = _render_step_text(step, step_idx, rec)
+        step_image_url = (step.get("image_url") or "").strip() or None
 
-        assigned_id = rec.get("assigned_account_id")
-        if assigned_id is not None and int(assigned_id) in state_by_id:
-            pinned_state = state_by_id[int(assigned_id)]
-            if pinned_state["sent_today"] < pinned_state["daily_limit"]:
-                chosen_state = pinned_state
-            elif step_idx >= 1:
-                continue
+        sent_this_recipient = False
+        no_accounts_left = False
+        jitter_applied = False
+        while True:
+            available = [
+                st
+                for st in connected_states
+                if not st.get("disabled") and st["sent_today"] < st["daily_limit"]
+            ]
+            if not available:
+                no_accounts_left = True
+                break
+
+            assigned_id = rec.get("assigned_account_id")
+            if assigned_id is not None and int(assigned_id) in state_by_id:
+                pinned_state = state_by_id[int(assigned_id)]
+                if not pinned_state.get("disabled") and pinned_state["sent_today"] < pinned_state["daily_limit"]:
+                    chosen_state = pinned_state
+                elif pinned_state.get("dead"):
+                    chosen_state = min(
+                        available,
+                        key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
+                    )
+                elif step_idx >= 1:
+                    chosen_state = None
+                else:
+                    chosen_state = min(
+                        available,
+                        key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
+                    )
             else:
                 chosen_state = min(
                     available,
                     key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
                 )
-        else:
-            chosen_state = min(
-                available,
-                key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
-            )
 
-        if jitter_range is not None and len(jitter_range) == 2:
-            j_min = max(0.0, float(jitter_range[0]))
-            j_max = max(j_min, float(jitter_range[1]))
-            j_sec = random.uniform(j_min, j_max)
-            jitter_delays_ms.append(int(round(j_sec * 1000)))
-            if j_sec > 0:
-                await asyncio.sleep(j_sec)
+            if chosen_state is None:
+                break
 
-        chosen_account_id = chosen_state["id"]
-        account_raw = chosen_state["raw"]
-        acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
-        session_path = str(account_raw.get("session_path") or "")
-        active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
-        use_gateway = active_gw is not None and not session_path.startswith("data/sessions/demo")
+            if not jitter_applied and jitter_range is not None and len(jitter_range) == 2:
+                jitter_applied = True
+                j_min = max(0.0, float(jitter_range[0]))
+                j_max = max(j_min, float(jitter_range[1]))
+                j_sec = random.uniform(j_min, j_max)
+                jitter_delays_ms.append(int(round(j_sec * 1000)))
+                if j_sec > 0:
+                    await asyncio.sleep(j_sec)
 
-        rendered_text = _render_step_text(step, step_idx, rec)
-        step_image_url = (step.get("image_url") or "").strip() or None
+            chosen_account_id = chosen_state["id"]
+            account_raw = chosen_state["raw"]
+            acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
+            session_path = str(account_raw.get("session_path") or "")
+            active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
+            use_gateway = active_gw is not None and not session_path.startswith("data/sessions/demo")
 
-        try:
-            if acc_provider == "whatsapp":
-                dialog = _ensure_recipient_dialog(
-                    conn, chosen_account_id, rec, now, provider="whatsapp"
-                )
-            else:
-                if use_gateway and rec.get("username") and (not rec.get("telegram_user_id") or _is_synthetic_peer_id(rec["telegram_user_id"])):
-                    found = await active_gw.search_dialogs(session_path, f"@{rec['username']}", limit=1)
-                    if found and found[0].get("telegram_user_id"):
-                        real_tg_id = int(found[0]["telegram_user_id"])
-                        rec["telegram_user_id"] = real_tg_id
-                        conn.execute(
-                            "UPDATE campaign_recipients SET telegram_user_id = ? WHERE id = ?",
-                            (real_tg_id, rec["id"]),
-                        )
-                        if rec.get("lead_id"):
-                            try:
-                                conn.execute(
-                                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
-                                    (real_tg_id, now, rec["lead_id"]),
-                                )
-                            except sqlite3.IntegrityError:
-                                pass
-
-                dialog = _ensure_recipient_dialog(
-                    conn, chosen_account_id, rec, now, provider="telegram"
-                )
-
-            # Before sending follow-up (step_idx >= 1), check live and cached messages for reply
-            if step_idx >= 1 and dialog:
-                if use_gateway and hasattr(active_gw, "fetch_messages"):
-                    try:
-                        fetched_msgs = await active_gw.fetch_messages(
-                            session_path, dialog["peer_id"], 5
-                        )
-                        if isinstance(fetched_msgs, list) and fetched_msgs:
-                            _cache_messages(conn, int(dialog["id"]), fetched_msgs)
-                    except Exception:
-                        pass
-                refreshed_dlg_row = conn.execute(
-                    "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
-                ).fetchone()
-                if refreshed_dlg_row is not None:
-                    dialog = as_dict(refreshed_dlg_row)
-                if _dialog_has_client_reply(conn, dialog, rec):
-                    conn.execute(
-                        "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
-                        (now, rec["id"]),
+            replied_skipped = False
+            try:
+                if acc_provider == "whatsapp":
+                    dialog = _ensure_recipient_dialog(
+                        conn, chosen_account_id, rec, now, provider="whatsapp"
                     )
-                    stop_outreach_on_reply(
-                        conn,
-                        account_id=chosen_account_id,
-                        peer_id=dialog.get("peer_id") or rec.get("telegram_user_id"),
-                        username=dialog.get("username") or rec.get("username"),
-                        phone=dialog.get("phone") or rec.get("phone"),
-                        lead_id=dialog.get("lead_id") or rec.get("lead_id"),
-                    )
-                    conn.commit()
-                    continue
-
-            if acc_provider == "whatsapp":
-                phone_digits = re.sub(
-                    r"\D", "", str(rec.get("phone") or dialog.get("phone") or "")
-                )
-                peer_target = phone_digits or rec.get("telegram_user_id") or dialog["peer_id"]
-                if use_gateway:
-                    sent = await active_gw.send_message(
-                        session_path, peer_target, rendered_text
-                    )
-                    tg_mid = int(sent["telegram_message_id"])
-                    sent_at = str(sent.get("sent_at") or now)
                 else:
-                    next_row = conn.execute(
-                        "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
-                        (dialog["id"],),
-                    ).fetchone()
-                    tg_mid = int(next_row["next_id"])
-                    sent_at = now
-            else:
-                next_step_order = step_idx + 1
-                if use_gateway:
-                    peer_target = (
-                        f"@{rec['username']}"
-                        if (_is_synthetic_peer_id(dialog["peer_id"]) and rec.get("username"))
-                        else dialog["peer_id"]
+                    need_username_resolve = (
+                        not rec.get("telegram_user_id")
+                        or _is_synthetic_peer_id(rec["telegram_user_id"])
+                        or (
+                            rec.get("assigned_account_id") is not None
+                            and int(rec["assigned_account_id"]) != chosen_account_id
+                        )
                     )
-                    if next_step_order == 1:
-                        target_entity = peer_target
-                        lock_fn = getattr(active_gw, "_session_lock", None)
-                        if callable(lock_fn):
-                            async with lock_fn(session_path):
+                    if use_gateway and rec.get("username") and need_username_resolve:
+                        found = await active_gw.search_dialogs(session_path, f"@{rec['username']}", limit=1)
+                        if found and found[0].get("telegram_user_id"):
+                            real_tg_id = int(found[0]["telegram_user_id"])
+                            rec["telegram_user_id"] = real_tg_id
+                            conn.execute(
+                                "UPDATE campaign_recipients SET telegram_user_id = ? WHERE id = ?",
+                                (real_tg_id, rec["id"]),
+                            )
+                            if rec.get("lead_id"):
+                                try:
+                                    conn.execute(
+                                        "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                                        (real_tg_id, now, rec["lead_id"]),
+                                    )
+                                except sqlite3.IntegrityError:
+                                    pass
+
+                    dialog = _ensure_recipient_dialog(
+                        conn, chosen_account_id, rec, now, provider="telegram"
+                    )
+
+                # Before sending follow-up (step_idx >= 1), check live and cached messages for reply
+                if step_idx >= 1 and dialog:
+                    if use_gateway and hasattr(active_gw, "fetch_messages"):
+                        try:
+                            fetched_msgs = await active_gw.fetch_messages(
+                                session_path, dialog["peer_id"], 5
+                            )
+                            if isinstance(fetched_msgs, list) and fetched_msgs:
+                                _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                        except Exception as fetch_exc:
+                            f_blob = str(fetch_exc or "").casefold()
+                            clean_un = str(rec.get("username") or "").strip().lstrip("@")
+                            if clean_un and ("could not find the input entity" in f_blob or "peeruser" in f_blob):
+                                try:
+                                    await active_gw.search_dialogs(session_path, f"@{clean_un}", limit=1)
+                                    fetched_msgs = await active_gw.fetch_messages(
+                                        session_path, dialog["peer_id"], 5
+                                    )
+                                    if isinstance(fetched_msgs, list) and fetched_msgs:
+                                        _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                                except Exception:
+                                    pass
+                    refreshed_dlg_row = conn.execute(
+                        "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
+                    ).fetchone()
+                    if refreshed_dlg_row is not None:
+                        dialog = as_dict(refreshed_dlg_row)
+                    if _dialog_has_client_reply(conn, dialog, rec):
+                        conn.execute(
+                            "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
+                            (now, rec["id"]),
+                        )
+                        stop_outreach_on_reply(
+                            conn,
+                            account_id=chosen_account_id,
+                            peer_id=dialog.get("peer_id") or rec.get("telegram_user_id"),
+                            username=dialog.get("username") or rec.get("username"),
+                            phone=dialog.get("phone") or rec.get("phone"),
+                            lead_id=dialog.get("lead_id") or rec.get("lead_id"),
+                        )
+                        conn.commit()
+                        replied_skipped = True
+                        break
+
+                if acc_provider == "whatsapp":
+                    phone_digits = re.sub(
+                        r"\D", "", str(rec.get("phone") or dialog.get("phone") or "")
+                    )
+                    peer_target = phone_digits or rec.get("telegram_user_id") or dialog["peer_id"]
+                    if use_gateway:
+                        sent = await active_gw.send_message(
+                            session_path, peer_target, rendered_text
+                        )
+                        tg_mid = int(sent["telegram_message_id"])
+                        sent_at = str(sent.get("sent_at") or now)
+                    else:
+                        next_row = conn.execute(
+                            "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+                            (dialog["id"],),
+                        ).fetchone()
+                        tg_mid = int(next_row["next_id"])
+                        sent_at = now
+                else:
+                    next_step_order = step_idx + 1
+                    if use_gateway:
+                        peer_target = (
+                            f"@{rec['username']}"
+                            if (_is_synthetic_peer_id(dialog["peer_id"]) and rec.get("username"))
+                            else dialog["peer_id"]
+                        )
+                        if next_step_order == 1:
+                            target_entity = peer_target
+                            lock_fn = getattr(active_gw, "_session_lock", None)
+                            if callable(lock_fn):
+                                async with lock_fn(session_path):
+                                    client = await _resolve_telethon_client_for_prewarm(
+                                        active_gw, session_path
+                                    )
+                                    if client is not None:
+                                        await prewarm_recipient_stories(client, target_entity)
+                            else:
                                 client = await _resolve_telethon_client_for_prewarm(
                                     active_gw, session_path
                                 )
                                 if client is not None:
                                     await prewarm_recipient_stories(client, target_entity)
-                        else:
-                            client = await _resolve_telethon_client_for_prewarm(
-                                active_gw, session_path
-                            )
-                            if client is not None:
-                                await prewarm_recipient_stories(client, target_entity)
-                    if step_image_url:
-                        try:
-                            sent = await active_gw.send_message(
-                                session_path,
-                                peer_target,
-                                rendered_text,
-                                None,
-                                image_path=step_image_url,
-                            )
-                        except TypeError:
-                            sent = await active_gw.send_message(
-                                session_path, peer_target, rendered_text, None
-                            )
-                    else:
-                        sent = await active_gw.send_message(
-                            session_path, peer_target, rendered_text, None
+                        sent = await _tg_send_with_username_fallback(
+                            active_gw,
+                            session_path,
+                            peer_target,
+                            rendered_text,
+                            step_image_url,
+                            rec.get("username"),
                         )
-                    tg_mid = int(sent["telegram_message_id"])
-                    sent_at = str(sent.get("sent_at") or now)
-                else:
-                    next_row = conn.execute(
-                        "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
-                        (dialog["id"],),
-                    ).fetchone()
-                    tg_mid = int(next_row["next_id"])
-                    sent_at = now
-        except Exception as exc:
-            conn.execute(
-                """
-                UPDATE campaign_recipients
-                SET status = 'failed', error_text = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (str(exc)[:300], now, rec["id"]),
-            )
+                        tg_mid = int(sent["telegram_message_id"])
+                        sent_at = str(sent.get("sent_at") or now)
+                    else:
+                        next_row = conn.execute(
+                            "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+                            (dialog["id"],),
+                        ).fetchone()
+                        tg_mid = int(next_row["next_id"])
+                        sent_at = now
+                sent_this_recipient = True
+                break
+            except Exception as exc:
+                err_kind, err_health = _classify_outreach_send_error(exc)
+                if err_kind in ("account_dead", "account_transient"):
+                    chosen_state["disabled"] = True
+                    if err_kind == "account_dead":
+                        chosen_state["dead"] = True
+                        conn.execute(
+                            "UPDATE accounts SET health = ?, last_error = ?, updated_at = ? WHERE id = ?",
+                            (err_health, str(exc)[:300], now, chosen_account_id),
+                        )
+                        conn.commit()
+                        if active_gw is not None and hasattr(active_gw, "_close"):
+                            try:
+                                await active_gw._close(session_path)
+                            except Exception:
+                                pass
+                    continue
+
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'failed', error_text = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(exc)[:300], now, rec["id"]),
+                )
+                failed_in_batch += 1
+                break
+
+        if no_accounts_left:
+            break
+        if replied_skipped or not sent_this_recipient:
             continue
 
         conn.execute(
@@ -2451,13 +2645,21 @@ async def run_campaign_batch(
                     """
                     UPDATE leads
                     SET account_id = ?,
-                        dialog_id = COALESCE(dialog_id, ?),
+                        dialog_id = CASE WHEN account_id IS NULL OR account_id != ? THEN ? ELSE COALESCE(dialog_id, ?) END,
                         status = CASE WHEN status = 'new' THEN 'waiting' ELSE status END,
                         next_step = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (chosen_account_id, dialog["id"], lead_next_step, now, int(rec["lead_id"])),
+                    (
+                        chosen_account_id,
+                        chosen_account_id,
+                        dialog["id"],
+                        dialog["id"],
+                        lead_next_step,
+                        now,
+                        int(rec["lead_id"]),
+                    ),
                 )
             except sqlite3.IntegrityError:
                 conn.execute(
@@ -2577,6 +2779,7 @@ async def run_autopilot_tick(
             "status": get_autopilot_status(conn, now_dt=effective_now),
         }
 
+    heal_transient_failed_recipients(conn)
     running_rows = conn.execute(
         "SELECT id, name FROM campaigns WHERE status = 'running' ORDER BY id"
     ).fetchall()
