@@ -383,6 +383,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
             lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
             assigned_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+            sent_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
             telegram_user_id INTEGER,
             username TEXT,
             name TEXT,
@@ -626,6 +627,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "assigned_account_id",
         "INTEGER REFERENCES accounts(id) ON DELETE SET NULL",
     )
+    _ensure_column(
+        conn,
+        "campaign_recipients",
+        "sent_account_id",
+        "INTEGER REFERENCES accounts(id) ON DELETE SET NULL",
+    )
     _ensure_column(conn, "campaign_recipients", "website", "TEXT")
     _ensure_column(conn, "campaign_recipients", "category", "TEXT")
     _ensure_column(conn, "campaign_recipients", "their_angle", "TEXT")
@@ -715,6 +722,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_user_phone ON dialogs(phone) WHERE peer_type = 'user' AND phone IS NOT NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_dlg_dir ON messages(dialog_id, direction, sent_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_camp ON campaign_recipients(campaign_id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_sent_acc ON campaign_recipients(sent_account_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_lead ON campaign_recipients(lead_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_tg ON campaign_recipients(telegram_user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_camp_rec_uname ON campaign_recipients(username COLLATE NOCASE)")
@@ -807,6 +815,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if vlad_canonical_v4 is None:
             apply_canonical_vlad_outreach_v4(conn)
+        vlad_canonical_v5 = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'canonical_vlad_outreach_v5'"
+        ).fetchone()
+        if vlad_canonical_v5 is None:
+            apply_canonical_vlad_outreach_v5(conn)
     conn.commit()
 
 
@@ -1270,6 +1283,268 @@ def apply_canonical_vlad_outreach_v4(conn: sqlite3.Connection) -> dict:
         "healed_spambot": healed_spambot,
         "deleted_non_icp_or_phantom": len(deleted_ids),
         "upgraded_drafts": upgraded_drafts,
+    }
+
+
+def apply_canonical_vlad_outreach_v5(conn: sqlite3.Connection, *, force: bool = False) -> dict:
+    import json as _json
+    import re as _re
+    from app.outreach import _clean_handle, _fix_mojibake, is_offline_non_icp_contact
+    from leadgen.outreach_copy import REVSHARE_OFFER_TEXT, upgrade_to_vlad_step1
+
+    if not force:
+        already = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'canonical_vlad_outreach_v5'"
+        ).fetchone()
+        if already is not None:
+            return {
+                "already_applied": True,
+                "closed_in_progress": 0,
+                "backfilled_sent_account": 0,
+                "moved_to_vse2": 0,
+                "dedup_deleted_from_auto": 0,
+            }
+
+    now_ts = utc_now()
+    all_camps = conn.execute("SELECT id, name FROM campaigns ORDER BY id ASC").fetchall()
+    b2b_cids = [
+        int(r[0])
+        for r in all_camps
+        if not any(k in str(r[1] or "").lower() for k in ("ваканс", "vacanc"))
+    ]
+
+    # (a) Close all old in_progress recipients with current_step >= 1 in B2B campaigns
+    closed_in_progress = 0
+    if b2b_cids:
+        ph_cids = ",".join("?" for _ in b2b_cids)
+        old_inprog_rows = conn.execute(
+            f"""
+            SELECT id, extra_json
+            FROM campaign_recipients
+            WHERE campaign_id IN ({ph_cids})
+              AND COALESCE(current_step, 0) >= 1
+              AND status = 'in_progress'
+            """,
+            tuple(b2b_cids),
+        ).fetchall()
+        for r in old_inprog_rows:
+            rid = int(r[0])
+            raw_extra = r[1]
+            new_extra = raw_extra
+            if raw_extra and "fine_status" in str(raw_extra):
+                try:
+                    parsed = _json.loads(raw_extra)
+                    if isinstance(parsed, dict) and str(parsed.get("fine_status") or "").startswith("need_step"):
+                        parsed["fine_status"] = "completed"
+                        new_extra = _json.dumps(parsed, ensure_ascii=False)
+                except Exception:
+                    pass
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET status = 'completed',
+                    extra_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (new_extra, now_ts, rid),
+            )
+            closed_in_progress += 1
+
+    # (b) Backfill sent_account_id on historical campaign_recipients (current_step >= 1) via dialogs + messages(direction='out')
+    backfilled_sent_account = 0
+    hist_rows = conn.execute(
+        """
+        SELECT id, telegram_user_id, username, phone, lead_id
+        FROM campaign_recipients
+        WHERE COALESCE(current_step, 0) >= 1
+          AND sent_account_id IS NULL
+        """
+    ).fetchall()
+    for r in hist_rows:
+        rid = int(r[0])
+        raw_tg_id = r[1]
+        real_peer_id: int | None = None
+        if raw_tg_id is not None:
+            try:
+                cand_pid = int(raw_tg_id)
+                if not (900000 <= cand_pid <= 999999):
+                    real_peer_id = cand_pid
+            except (TypeError, ValueError):
+                real_peer_id = None
+        clean_u = (_clean_handle(r[2]) or "").lower()
+        clean_ph = str(r[3] or "").strip()
+        lead_id_val = int(r[4]) if r[4] is not None else None
+        peer_str = str(real_peer_id) if real_peer_id is not None else ""
+
+        if not (clean_u or peer_str or clean_ph or lead_id_val is not None):
+            continue
+
+        found_acc = conn.execute(
+            """
+            SELECT d.account_id
+            FROM dialogs d
+            JOIN messages m ON m.dialog_id = d.id
+            WHERE m.direction = 'out'
+              AND (
+                  (? != '' AND lower(trim(coalesce(d.username, ''), '@')) = lower(?))
+                  OR (? != '' AND d.peer_id = ?)
+                  OR (? != '' AND coalesce(d.phone, '') = ?)
+                  OR (? IS NOT NULL AND d.lead_id = ?)
+              )
+            ORDER BY m.sent_at DESC, m.id DESC
+            LIMIT 1
+            """,
+            (
+                clean_u,
+                clean_u,
+                peer_str,
+                real_peer_id,
+                clean_ph,
+                clean_ph,
+                lead_id_val,
+                lead_id_val,
+            ),
+        ).fetchone()
+        if found_acc is not None and found_acc[0] is not None:
+            acc_id_val = int(found_acc[0])
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET sent_account_id = ?,
+                    assigned_account_id = COALESCE(assigned_account_id, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (acc_id_val, acc_id_val, now_ts, rid),
+            )
+            backfilled_sent_account += 1
+
+    # (c) Consolidate untouched clean TG leads (step=0, pending) from Leadgen Auto (TG) into SoftUGC — База Все2%
+    moved_to_vse2 = 0
+    dedup_deleted_from_auto = 0
+    vse2_cid: int | None = None
+    auto_tg_cid: int | None = None
+    for r in all_camps:
+        cid = int(r[0])
+        cname = str(r[1] or "").strip()
+        cname_low = cname.lower()
+        if (
+            vse2_cid is None
+            and cname_low.startswith("softugc — база все2")
+            and "(wa)" not in cname_low
+            and "whatsapp" not in cname_low
+        ):
+            vse2_cid = cid
+        elif auto_tg_cid is None and cname_low == "leadgen auto (tg)":
+            auto_tg_cid = cid
+
+    if vse2_cid is not None and auto_tg_cid is not None and vse2_cid != auto_tg_cid:
+        existing_vse2_unames = {
+            (_clean_handle(r[0]) or "").lower()
+            for r in conn.execute(
+                "SELECT username FROM campaign_recipients WHERE campaign_id = ?",
+                (vse2_cid,),
+            ).fetchall()
+            if _clean_handle(r[0])
+        }
+        auto_pending_rows = conn.execute(
+            """
+            SELECT id, username, name, company, website, category, their_angle, note, step1_text
+            FROM campaign_recipients
+            WHERE campaign_id = ?
+              AND COALESCE(current_step, 0) = 0
+              AND status = 'pending'
+            ORDER BY id ASC
+            """,
+            (auto_tg_cid,),
+        ).fetchall()
+        for r in auto_pending_rows:
+            rid = int(r[0])
+            clean_u = _clean_handle(r[1])
+            if not clean_u or not _re.fullmatch(r"[A-Za-z0-9_]{3,32}", clean_u):
+                continue
+            name_val = str(r[2] or "").strip()
+            comp_val = str(r[3] or "").strip()
+            site_val = str(r[4] or "").strip()
+            cat_val = str(r[5] or "").strip()
+            angle_val = _fix_mojibake(r[6] or r[7] or "")
+            raw_s1 = str(r[8] or "").strip()
+            if is_offline_non_icp_contact(
+                username=clean_u,
+                name=name_val,
+                company=comp_val,
+                website=site_val,
+                their_angle=f"{angle_val} {raw_s1}",
+            ):
+                continue
+            uname_key = clean_u.lower()
+            if uname_key in existing_vse2_unames:
+                conn.execute("DELETE FROM campaign_recipients WHERE id = ?", (rid,))
+                dedup_deleted_from_auto += 1
+            else:
+                new_s1 = raw_s1
+                if not new_s1 or "SoftUGC" not in new_s1 or REVSHARE_OFFER_TEXT not in new_s1:
+                    new_s1 = upgrade_to_vlad_step1(
+                        raw_s1,
+                        company=comp_val,
+                        name=name_val,
+                        site=site_val,
+                        category=cat_val,
+                        their_angle=angle_val,
+                    )
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET campaign_id = ?,
+                        username = ?,
+                        step1_text = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (vse2_cid, clean_u, new_s1, now_ts, rid),
+                )
+                existing_vse2_unames.add(uname_key)
+                moved_to_vse2 += 1
+
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET status = 'paused',
+                leadgen_enabled = 0,
+                updated_at = ?
+            WHERE id IN (?, ?)
+            """,
+            (now_ts, vse2_cid, auto_tg_cid),
+        )
+        crow_vse2 = conn.execute("SELECT name FROM campaigns WHERE id = ?", (vse2_cid,)).fetchone()
+        if crow_vse2 and "База Все2 (" in str(crow_vse2[0]):
+            total_now = conn.execute(
+                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ?",
+                (vse2_cid,),
+            ).fetchone()[0]
+            formatted_total = f"{int(total_now):,}".replace(",", " ")
+            new_name = _re.sub(
+                r"\(\d[\d\s]*\s*лида?(?:ов)?\)|\(\d[\d\s]*\s*лидов\)",
+                f"({formatted_total} лидов)",
+                str(crow_vse2[0]),
+            )
+            conn.execute(
+                "UPDATE campaigns SET name = ?, updated_at = ? WHERE id = ?",
+                (new_name, now_ts, vse2_cid),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('canonical_vlad_outreach_v5', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {
+        "already_applied": False,
+        "closed_in_progress": closed_in_progress,
+        "backfilled_sent_account": backfilled_sent_account,
+        "moved_to_vse2": moved_to_vse2,
+        "dedup_deleted_from_auto": dedup_deleted_from_auto,
     }
 
 

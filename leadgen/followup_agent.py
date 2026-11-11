@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""LLM Follow-up Agent + Humanizer + Quality Validator for CreatorOS CSV exports.
+"""LLM Follow-up Agent + Humanizer + Quality Validator for SoftUGC CSV exports.
+
+Read-only copy generator: never sends messages directly and never bypasses CRM outreach guards.
 
 Pipeline for each batch of leads:
 1. Draft (`_call_llm_batch`): Generates product-specific `followup_1` (concrete
@@ -44,11 +46,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_STATE_DIR = Path(
     os.environ.get("LEADGEN_STATE_DIR")
-    or (
-        "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-        if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-        else str(ROOT / "data" / "leadgen_state")
-    )
+    or str(ROOT / "data" / "leadgen_state")
 )
 CACHE_PATH = _DEFAULT_STATE_DIR / "followups_cache.json"
 BATCH_SIZE = 10
@@ -105,7 +103,7 @@ Rules for EACH lead in the input JSON array:
 5. STRICT BANS:
    - NO dashes of any kind: no em-dash (—), no en-dash (–), no double dash (--), no spaced hyphen ( - ). Use commas or periods only.
    - NO AI clichés: ban "sharp hook", "strong hook", "tight demo", "high-retention", "concrete video angles", "wondering if", "curious if", "happy to", "teardown", "on your roadmap", "plug into", "walk you through how we can get that", "organic promotion of".
-   - Do NOT repeat "183.5M" or "SoftUGC".
+   - Do NOT repeat "183.5M", "SoftUGC", or legacy "CreatorOS".
 
 Respond with STRICT JSON only:
 [{"i": 0, "followup_1": "...", "followup_2": "..."}, ...]"""
@@ -168,7 +166,7 @@ def _sanitize_followup(text: str, raw_name: str = "", clean_name: str = "") -> s
     text = re.sub(r"\s*(?:[—–]|--)\s*", ", ", text)
     text = re.sub(r"\s+-\s+", ", ", text)
     # Remove banned case / brand repeats
-    text = re.sub(r"\bSoftUGC\b", "our team", text, flags=re.I)
+    text = re.sub(r"\b(?:SoftUGC|CreatorOS)\b", "our team", text, flags=re.I)
     text = re.sub(r"183[.,]5\s*M\+?", "high-volume", text, flags=re.I)
     # Clean up double punctuation and extra whitespace
     text = re.sub(r",\s*,", ",", text)
@@ -198,7 +196,12 @@ def validate_followup_pair(
             problems.append(f"{label}_has_dash")
         if _AI_SLOP_RE.search(txt):
             problems.append(f"{label}_has_ai_slop:{_AI_SLOP_RE.search(txt).group(0)}")
-        if "183.5" in txt or "183,5" in txt or "softugc" in txt.casefold():
+        if (
+            "183.5" in txt
+            or "183,5" in txt
+            or "softugc" in txt.casefold()
+            or "creatoros" in txt.casefold()
+        ):
             problems.append(f"{label}_repeats_case_or_brand")
         if re.search(r"\[(?:name|product|founder|company)\]", txt, re.I):
             problems.append(f"{label}_has_placeholder")

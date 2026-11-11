@@ -42,12 +42,14 @@ try:
     )
     from lead_market import market_of, segment_of
     from outreach_copy import (
+        REVSHARE_OFFER_TEXT,
         VLAD_STEP2_TEMPLATE,
         VLAD_STEP3_IMAGE_URL,
         VLAD_STEP3_TEXT,
         _extract_personal_first_name,
         followup_one,
         followup_two,
+        generate_vlad_sonnet_batch,
         infer_lead_audience,
         micro_ping_first_touch,
         upgrade_to_vlad_step1,
@@ -60,12 +62,14 @@ except ImportError:
     )
     from leadgen.lead_market import market_of, segment_of
     from leadgen.outreach_copy import (
+        REVSHARE_OFFER_TEXT,
         VLAD_STEP2_TEMPLATE,
         VLAD_STEP3_IMAGE_URL,
         VLAD_STEP3_TEXT,
         _extract_personal_first_name,
         followup_one,
         followup_two,
+        generate_vlad_sonnet_batch,
         infer_lead_audience,
         micro_ping_first_touch,
         upgrade_to_vlad_step1,
@@ -224,6 +228,97 @@ def _extract_contact_fields(contact_str: str, tg_col: str = "", email_col: str =
     return out
 
 
+def _has_canonical_vlad_copy(text: str | None) -> bool:
+    s = str(text or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if (
+        "creatoros" in low
+        or "if your user growth has hit a ceiling" in low
+        or "plug-and-play growth arm" in low
+    ):
+        return False
+    return "SoftUGC" in s and REVSHARE_OFFER_TEXT in s
+
+
+def _is_vacancy_source_or_cat(source: str | None, category: str | None) -> bool:
+    s_low = str(source or "").lower()
+    c_low = str(category or "").lower()
+    return any(k in s_low for k in ("ваканс", "vacanc", "job_monitor")) or any(
+        k in c_low for k in ("ваканс", "vacanc")
+    )
+
+
+def _should_auto_sonnet() -> bool:
+    key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
+    if not key:
+        return False
+    if "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("FORCE_AUTO_SONNET_IN_TEST") != "1":
+        return False
+    return True
+
+
+def _apply_sonnet_batch_to_records(records: list[dict[str, Any]]) -> None:
+    """In-place generate first_touch + followup_1 ({audience}) + followup_2 via claude-sonnet-5 for B2B records lacking canonical Vlad copy."""
+    if not records or not _should_auto_sonnet():
+        return
+    need_idx: list[int] = []
+    need_inputs: list[dict[str, Any]] = []
+    for idx, rec in enumerate(records):
+        src = str(rec.get("lead_source") or rec.get("source") or "")
+        cat = str(rec.get("category") or rec.get("niche") or "")
+        if _is_vacancy_source_or_cat(src, cat):
+            continue
+        raw_ft = str(rec.get("first_touch") or rec.get("step1_text") or "").strip()
+        if _has_canonical_vlad_copy(raw_ft):
+            continue
+        need_idx.append(idx)
+        need_inputs.append(
+            {
+                "company": rec.get("company") or rec.get("project") or rec.get("product") or rec.get("name") or "",
+                "name": rec.get("founder_name") or rec.get("name") or "",
+                "website": rec.get("website") or rec.get("site") or rec.get("project_url") or rec.get("url") or "",
+                "category": cat,
+                "their_angle": rec.get("their_angle") or rec.get("one_liner") or rec.get("bio") or rec.get("description") or "",
+                "source": src,
+            }
+        )
+    if not need_inputs:
+        return
+
+    for start in range(0, len(need_inputs), 15):
+        chunk_i = need_idx[start : start + 15]
+        chunk_in = need_inputs[start : start + 15]
+        try:
+            gen = generate_vlad_sonnet_batch(chunk_in, model="claude-sonnet-5")
+        except Exception:
+            continue
+        for rec_i, g, inp in zip(chunk_i, gen, chunk_in):
+            if not isinstance(g, dict):
+                continue
+            s1 = str(g.get("step1_text") or "").strip()
+            aud = str(g.get("audience") or "").strip().lower()
+            if not s1:
+                continue
+            target = records[rec_i]
+            target["first_touch"] = s1
+            target["step1_text"] = s1
+            if aud:
+                target["audience"] = aud
+            f1 = followup_one(
+                str(inp.get("company") or inp.get("name") or ""),
+                str(inp.get("their_angle") or ""),
+                audience=aud,
+                category=str(inp.get("category") or ""),
+                site=str(inp.get("website") or ""),
+            )
+            target["followup_1"] = f1
+            target["step2_text"] = f1
+            target["followup_2"] = VLAD_STEP3_TEXT
+            target["step3_text"] = VLAD_STEP3_TEXT
+
+
 def _ensure_full_case_pitch(
     raw_first_touch: str,
     *,
@@ -275,6 +370,31 @@ def build_lead_payload_from_sheet_row(
         their_angle=their_angle,
         site=site,
     )
+
+    if (
+        mode != "micro_ping"
+        and not _is_vacancy_source_or_cat(lead_source, category)
+        and not _has_canonical_vlad_copy(raw_first_touch)
+        and _should_auto_sonnet()
+    ):
+        tmp_rec: dict[str, Any] = {
+            "company": clean_comp or raw_name,
+            "name": raw_name,
+            "website": site,
+            "category": category,
+            "their_angle": their_angle,
+            "lead_source": lead_source,
+            "first_touch": raw_first_touch,
+        }
+        _apply_sonnet_batch_to_records([tmp_rec])
+        if _has_canonical_vlad_copy(tmp_rec.get("first_touch")):
+            raw_first_touch = str(tmp_rec["first_touch"])
+            if tmp_rec.get("audience"):
+                audience = str(tmp_rec["audience"])
+            followups = (
+                str(tmp_rec.get("followup_1") or followup_one(clean_comp or raw_name, their_angle, audience=audience, category=category, site=site)),
+                VLAD_STEP3_TEXT,
+            )
 
     full_pitch = _ensure_full_case_pitch(
         raw_first_touch,
@@ -405,6 +525,34 @@ def build_lead_payload_from_dict(
         site=site,
     )
 
+    if (
+        mode != "micro_ping"
+        and not _is_vacancy_source_or_cat(source, category)
+        and not _has_canonical_vlad_copy(raw_first_touch)
+        and _should_auto_sonnet()
+    ):
+        tmp_rec_d: dict[str, Any] = {
+            "company": clean_comp or raw_company,
+            "name": raw_name,
+            "website": site,
+            "category": category,
+            "their_angle": their_angle,
+            "lead_source": source,
+            "first_touch": raw_first_touch,
+        }
+        _apply_sonnet_batch_to_records([tmp_rec_d])
+        if _has_canonical_vlad_copy(tmp_rec_d.get("first_touch")):
+            raw_first_touch = str(tmp_rec_d["first_touch"])
+            if tmp_rec_d.get("audience"):
+                audience = str(tmp_rec_d["audience"])
+            record = dict(record)
+            record["first_touch"] = raw_first_touch
+            record["step1_text"] = raw_first_touch
+            record["followup_1"] = tmp_rec_d.get("followup_1")
+            record["step2_text"] = tmp_rec_d.get("step2_text")
+            record["followup_2"] = VLAD_STEP3_TEXT
+            record["step3_text"] = VLAD_STEP3_TEXT
+
     full_pitch = _ensure_full_case_pitch(
         raw_first_touch,
         company=clean_comp or raw_company,
@@ -496,8 +644,48 @@ def pack_tab_leads_for_mcp(
     if not bases:
         return []
 
-    followups_list = generate_followups_for_rows(bases, use_llm=use_llm)
     lead_source = f"Google Sheet ({tab})"
+    mode_resolved = _resolve_b2b_touch_mode(touch_mode)
+    if mode_resolved != "micro_ping" and _should_auto_sonnet():
+        sheet_sonnet_recs: list[dict[str, Any]] = []
+        sheet_sonnet_pos: list[int] = []
+        for idx_b, b in enumerate(bases):
+            raw_ft_b = _cell(b, 10)
+            if not _has_canonical_vlad_copy(raw_ft_b):
+                sheet_sonnet_pos.append(idx_b)
+                sheet_sonnet_recs.append(
+                    {
+                        "company": clean_product_name(_cell(b, 4), _cell(b, 5), _cell(b, 7)) or _cell(b, 4),
+                        "name": _cell(b, 4),
+                        "website": _cell(b, 5),
+                        "category": _cell(b, 3),
+                        "their_angle": _cell(b, 7),
+                        "lead_source": lead_source,
+                        "first_touch": raw_ft_b,
+                    }
+                )
+        if sheet_sonnet_recs:
+            _apply_sonnet_batch_to_records(sheet_sonnet_recs)
+            followups_list = generate_followups_for_rows(bases, use_llm=use_llm)
+            sonnet_by_pos = dict(zip(sheet_sonnet_pos, sheet_sonnet_recs))
+            for pos_i, srec in sonnet_by_pos.items():
+                if _has_canonical_vlad_copy(srec.get("first_touch")):
+                    bases[pos_i][10] = str(srec["first_touch"])
+                    followups_list[pos_i] = (
+                        str(srec.get("followup_1") or followups_list[pos_i][0]),
+                        VLAD_STEP3_TEXT,
+                    )
+            return [
+                build_lead_payload_from_sheet_row(
+                    base,
+                    followups=fpair,
+                    touch_mode=touch_mode,
+                    lead_source=lead_source,
+                )
+                for base, fpair in zip(bases, followups_list)
+            ]
+
+    followups_list = generate_followups_for_rows(bases, use_llm=use_llm)
     return [
         build_lead_payload_from_sheet_row(
             base,
@@ -520,6 +708,7 @@ def load_leads_from_jsonl(
     if not path.exists():
         return []
     sheet_like_rows: list[list[Any]] = []
+    raw_dict_items: list[dict[str, Any]] = []
     dict_leads: list[dict[str, Any]] = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -534,9 +723,15 @@ def load_leads_from_jsonl(
             site = str(item.get("website") or item.get("site") or item.get("project_url") or "")
             if market_of(site, f"{name} {angle}") == "ru":
                 continue
-            built = build_lead_payload_from_dict(item, touch_mode=touch_mode)
-            if any(built.get(k) for k in ("username", "name", "company", "phone", "telegram_user_id")):
-                dict_leads.append(built)
+            raw_dict_items.append(dict(item))
+
+    if raw_dict_items and _resolve_b2b_touch_mode(touch_mode) != "micro_ping":
+        _apply_sonnet_batch_to_records(raw_dict_items)
+
+    for item in raw_dict_items:
+        built = build_lead_payload_from_dict(item, touch_mode=touch_mode)
+        if any(built.get(k) for k in ("username", "name", "company", "phone", "telegram_user_id")):
+            dict_leads.append(built)
 
     if sheet_like_rows:
         dict_leads.extend(
@@ -646,13 +841,30 @@ def push_leads_via_mcp(
             "lead_ids": [],
         }
 
+    resolved_camp_name = str(campaign_name or "").strip() or "Leadgen Auto (TG)"
+    if (
+        campaign_id is None
+        and conn is not None
+        and resolved_camp_name.lower() in ("leadgen auto (tg)", "leadgen autopilot")
+    ):
+        try:
+            from app.leadgen_settings import resolve_target_b2b_tg_campaign_name
+
+            resolved_camp_name = resolve_target_b2b_tg_campaign_name(
+                conn,
+                resolved_camp_name,
+                fallback_default=resolved_camp_name,
+            )
+        except Exception:
+            pass
+
     resp = _call_mcp_jsonrpc(
         "ingest_discovered_leads",
         {
             "leads": leads,
             "enroll_in_campaign": enroll_in_campaign,
             "campaign_id": campaign_id,
-            "campaign_name": campaign_name,
+            "campaign_name": resolved_camp_name,
         },
         mcp_url=mcp_url,
         api_key=api_key,
@@ -718,14 +930,15 @@ def push_leads_via_mcp(
     if enroll_in_campaign and conn is not None:
         from app.outreach import create_campaign, import_campaign_csv
 
-        crow = conn.execute(
-            "SELECT id FROM campaigns WHERE lower(name) = lower(?) ORDER BY id ASC LIMIT 1",
-            (campaign_name,),
-        ).fetchone()
-        if crow is not None:
-            cid = int(crow["id"])
+        all_camps = conn.execute("SELECT id, name FROM campaigns ORDER BY id ASC").fetchall()
+        matched_crow = next(
+            (r for r in all_camps if str(r["name"] or "").strip().lower() == resolved_camp_name.strip().lower()),
+            None,
+        )
+        if matched_crow is not None:
+            cid = int(matched_crow["id"])
         else:
-            is_vac = any(k in campaign_name.lower() for k in ("ваканс", "vacanc", "job"))
+            is_vac = any(k in resolved_camp_name.lower() for k in ("ваканс", "vacanc", "job"))
             fallback_steps = (
                 [
                     {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
@@ -741,7 +954,7 @@ def push_leads_via_mcp(
             )
             created_c = create_campaign(
                 conn,
-                name=campaign_name,
+                name=resolved_camp_name,
                 status="draft",
                 steps=fallback_steps,
             )

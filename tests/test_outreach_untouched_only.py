@@ -1,4 +1,10 @@
 import asyncio
+from pathlib import Path
+import sys
+
+_WORKTREE_ROOT = str(Path(__file__).resolve().parents[1])
+if _WORKTREE_ROOT not in sys.path:
+    sys.path.insert(0, _WORKTREE_ROOT)
 
 from app.db import apply_legacy_outreach_cleanup, connect, init_db, utc_now
 from app.outreach import (
@@ -349,11 +355,13 @@ def test_step1_repair_v2_restores_truncated_ceiling_and_skips_llm_stubs(tmp_path
     assert stats == {"closed_yesterday": 1, "repaired": 3, "skipped_broken": 2}
 
     by_u = {r["username"]: r for r in get_campaign(conn, camp["id"])["recipients"]}
-    assert by_u["vaibhavsharda"]["step1_text"].endswith(
-        "Saw fabric. Want to see how it's set up for a product like yours?"
-    )
+    assert "If your user growth has hit a ceiling" not in by_u["vaibhavsharda"]["step1_text"]
+    assert "saw fabric." in by_u["vaibhavsharda"]["step1_text"].lower()
+    assert "SoftUGC" in by_u["vaibhavsharda"]["step1_text"]
     assert by_u["gd_on"]["step1_text"] == "Hey,\n\nWe run SoftUGC for Steno. Interested?"
-    assert by_u["brandon35"]["step1_text"].endswith("Want me to show how this would work for Cue?")
+    assert "saw cue." in by_u["brandon35"]["step1_text"].lower()
+    assert "SoftUGC" in by_u["brandon35"]["step1_text"]
+    assert not by_u["brandon35"]["step1_text"].endswith("Want me to show how")
     assert by_u["hukid"]["status"] == "completed"
     assert by_u["davidhwang"]["status"] == "completed"
     assert by_u["blockblanc"]["status"] == "completed"

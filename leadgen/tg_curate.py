@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Curate enriched TG leads into CreatorOS ЦА categories with project research
+"""Curate enriched TG leads into SoftUGC ЦА categories with project research
 + a personalized outreach hook per lead.
 
 Override map is hand-authored from bios + known projects. Leads not in the map
@@ -7,6 +7,7 @@ keep their auto-classified values.
 """
 import argparse
 import json
+import os
 import re
 import sys
 
@@ -243,21 +244,23 @@ def key_of(r):
     return f"id:{r.get('id')}"
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
+def curate_rows(rows: list[dict]) -> list[dict]:
+    try:
+        from tg_enrich_leads import apply_vlad_sonnet_or_fallback
+    except ImportError:
+        from leadgen.tg_enrich_leads import apply_vlad_sonnet_or_fallback
 
-    rows = [json.loads(l) for l in open(args.input) if l.strip()]
     out = []
     for r in rows:
         k = key_of(r)
         ov = OVERRIDES.get(k)
+        r2 = dict(r)
         if ov:
             cat, proj, url, what = ov
+            # Override changed product research -> regenerate copy via claude-sonnet-5
+            r2.pop("first_touch", None)
+            r2.pop("step1_text", None)
         else:
-            # keep enrich-classified category; only fall back to low-priority if truly generic
             cat = r.get("category") or "Низкий приоритет"
             if cat in ("Web3 (общее)", ""):
                 cat = "Низкий приоритет"
@@ -267,15 +270,21 @@ def main():
         proj = proj or (r.get("project") or "")
         url = url or (r.get("project_url") or "")
         what = what or (r.get("what_they_do") or "")
-        try:
-            from outreach_copy import first_touch as _vlad_first_touch
-        except ImportError:
-            from leadgen.outreach_copy import first_touch as _vlad_first_touch
-        hook = _vlad_first_touch(proj or "", what or "", russian=False, category=cat, site=url)
-        r2 = dict(r)
-        r2.update({"category": cat, "project": proj, "project_url": url,
-                   "what_they_do": what, "hook": hook})
+        r2.update({"category": cat, "project": proj, "project_url": url, "what_they_do": what})
         out.append(r2)
+
+    apply_vlad_sonnet_or_fallback(out)
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    args = p.parse_args()
+
+    rows = [json.loads(l) for l in open(args.input) if l.strip()]
+    out = curate_rows(rows)
 
     role_rank = {"Founder": 0, "Marketing": 1, "Community": 2, "Creator/KOL": 3,
                  "Dev": 4, "Project/Web3": 5, "Trader": 6}

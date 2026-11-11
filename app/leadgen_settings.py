@@ -245,6 +245,50 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def find_existing_softugc_tg_campaign(conn: sqlite3.Connection | None) -> dict[str, Any] | None:
+    """Find existing non-vacancy, non-WA SoftUGC TG B2B campaign (preferring 'SoftUGC — База Все2*')."""
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
+    except Exception:
+        return None
+
+    fallback_softugc: dict[str, Any] | None = None
+    for row in rows:
+        cdict = as_dict(row)
+        cname = str(cdict.get("name") or "").strip()
+        cname_low = cname.lower()
+        if not cname_low:
+            continue
+        if any(k in cname_low for k in ("ваканс", "vacanc", "job")):
+            continue
+        if "(wa)" in cname_low or "whatsapp" in cname_low:
+            continue
+        if cname_low.startswith("softugc — база все2"):
+            return cdict
+        if fallback_softugc is None and "softugc" in cname_low:
+            fallback_softugc = cdict
+    return fallback_softugc
+
+
+def resolve_target_b2b_tg_campaign_name(
+    conn: sqlite3.Connection | None,
+    requested_name: str | None = None,
+    *,
+    fallback_default: str = "Leadgen Auto (TG)",
+) -> str:
+    """Resolve TG B2B campaign name: if empty/default, prefer existing 'SoftUGC — База Все2*' / 'SoftUGC*' in DB."""
+    clean_req = str(requested_name or "").strip()
+    req_low = clean_req.lower()
+    if clean_req and req_low not in ("leadgen auto (tg)", "leadgen autopilot"):
+        return clean_req
+    found = find_existing_softugc_tg_campaign(conn)
+    if found is not None and str(found.get("name") or "").strip():
+        return str(found["name"]).strip()
+    return clean_req or fallback_default
+
+
 def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     stored: dict[str, Any] = {}
     json_path = _resolve_config_json_path()
@@ -269,6 +313,12 @@ def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]
             pass
 
     cfg = _normalize_config(stored)
+    if conn is not None:
+        cfg["b2b"]["target_campaign_tg"] = resolve_target_b2b_tg_campaign_name(
+            conn,
+            cfg["b2b"].get("target_campaign_tg"),
+            fallback_default="Leadgen Auto (TG)",
+        )
     disk_bank = _read_cases_bank()
     if disk_bank and not stored.get("cases_bank_md"):
         cfg["cases_bank_md"] = disk_bank
@@ -464,7 +514,11 @@ def sync_leadgen_campaigns(
     if b2b.get("enabled", True):
         daily_lim = max(1, min(500, int(b2b.get("campaign_daily_limit") or 30)))
         quota = max(0, min(500, int(b2b.get("campaign_daily_limit") or 30)))
-        tg_name = str(b2b.get("target_campaign_tg") or "Leadgen Auto (TG)").strip()
+        tg_name = resolve_target_b2b_tg_campaign_name(
+            conn,
+            b2b.get("target_campaign_tg"),
+            fallback_default="Leadgen Auto (TG)",
+        )
         wa_name = str(b2b.get("target_campaign_wa") or "Leadgen Auto (WA)").strip()
         if tg_name:
             targets.append(
@@ -505,19 +559,29 @@ def sync_leadgen_campaigns(
                 }
             )
 
+    all_existing_camps = [
+        as_dict(r)
+        for r in conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
+    ]
     synced_campaigns: list[dict[str, Any]] = []
     for spec in targets:
-        row = conn.execute(
-            "SELECT id FROM campaigns WHERE lower(name) = lower(?) ORDER BY id ASC LIMIT 1",
-            (spec["name"],),
-        ).fetchone()
-        if row is not None:
-            cid = int(row["id"])
+        spec_name_low = str(spec["name"] or "").strip().lower()
+        matched_existing = next(
+            (c for c in all_existing_camps if str(c.get("name") or "").strip().lower() == spec_name_low),
+            None,
+        )
+        if matched_existing is not None:
+            cid = int(matched_existing["id"])
+            keep_paused_disabled = (
+                "softugc" in spec_name_low
+                and str(matched_existing.get("status") or "") == "paused"
+                and int(matched_existing.get("leadgen_enabled") or 0) == 0
+            )
             updated = update_campaign(
                 conn,
                 cid,
                 daily_limit=spec["daily_limit"],
-                leadgen_enabled=True,
+                leadgen_enabled=(False if keep_paused_disabled else True),
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
             )
@@ -684,13 +748,18 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 tg_leads = [l for l in batch if str(l.get("provider") or "telegram") != "whatsapp"]
                 wa_leads = [l for l in batch if str(l.get("provider") or "") == "whatsapp"]
                 if tg_leads:
+                    target_tg_camp = resolve_target_b2b_tg_campaign_name(
+                        conn,
+                        b2b_cfg.get("target_campaign_tg"),
+                        fallback_default="Leadgen Auto (TG)",
+                    )
                     res_tg = call_mcp_tool_handler(
                         conn,
                         "ingest_discovered_leads",
                         {
                             "leads": tg_leads,
                             "enroll_in_campaign": bool(cfg.get("auto_push_to_crm", True)),
-                            "campaign_name": str(b2b_cfg.get("target_campaign_tg") or "Leadgen Auto (TG)"),
+                            "campaign_name": target_tg_camp,
                         },
                     )
                     ingested_total += int(res_tg.get("enrolled_in_campaign") or res_tg.get("created_leads") or 0)

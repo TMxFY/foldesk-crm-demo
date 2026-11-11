@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enrich scraped TG leads: classify into CreatorOS ЦА categories, extract
+"""Enrich scraped TG leads: classify into SoftUGC ЦА categories, extract
 project name/url, fetch project site description, draft a personalization hook.
 
 Input: JSONL from tg_scrape_posters.py
@@ -7,6 +7,7 @@ Output: enriched JSONL with extra fields.
 """
 import argparse
 import json
+import os
 import re
 import sys
 from urllib.parse import urlparse
@@ -194,6 +195,135 @@ def merge_social_fields(row, extracted):
 LINK_STRIP = re.compile(r"(https?://[^\s]+|t\.me/[^\s]+|www\.[^\s]+)")
 
 
+def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
+    """Populate first_touch, followup_1 ({audience}), and followup_2 = VLAD_STEP3_TEXT via claude-sonnet-5 when configured."""
+    try:
+        from outreach_copy import (
+            REVSHARE_OFFER_TEXT,
+            VLAD_STEP3_TEXT,
+            first_touch as _vlad_first_touch,
+            followup_one,
+            generate_vlad_sonnet_batch,
+            infer_lead_audience,
+        )
+    except ImportError:
+        from leadgen.outreach_copy import (
+            REVSHARE_OFFER_TEXT,
+            VLAD_STEP3_TEXT,
+            first_touch as _vlad_first_touch,
+            followup_one,
+            generate_vlad_sonnet_batch,
+            infer_lead_audience,
+        )
+
+    api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
+    allow_sonnet = bool(api_key) and (
+        "PYTEST_CURRENT_TEST" not in os.environ or os.environ.get("FORCE_AUTO_SONNET_IN_TEST") == "1"
+    )
+
+    need_idx: list[int] = []
+    need_payloads: list[dict] = []
+    for idx, r in enumerate(rows):
+        cat_low = str(r.get("category") or "").lower()
+        src_low = str(r.get("lead_source") or r.get("source") or "").lower()
+        if any(k in cat_low or k in src_low for k in ("ваканс", "vacanc", "job_monitor")):
+            continue
+        raw_ft = str(r.get("first_touch") or r.get("step1_text") or "").strip()
+        already_canonical = (
+            bool(raw_ft)
+            and "SoftUGC" in raw_ft
+            and REVSHARE_OFFER_TEXT in raw_ft
+            and "creatoros" not in raw_ft.lower()
+            and "if your user growth has hit a ceiling" not in raw_ft.lower()
+            and "plug-and-play growth arm" not in raw_ft.lower()
+        )
+        if already_canonical:
+            aud = str(r.get("audience") or "").strip().lower() or infer_lead_audience(
+                category=str(r.get("category") or ""),
+                company=str(r.get("project") or r.get("company") or ""),
+                their_angle=str(r.get("what_they_do") or r.get("their_angle") or ""),
+                site=str(r.get("project_url") or r.get("website") or ""),
+            )
+            r["first_touch"] = raw_ft
+            r["step1_text"] = raw_ft
+            r["hook"] = raw_ft
+            r["audience"] = aud
+            r["followup_1"] = followup_one(
+                str(r.get("project") or r.get("company") or ""),
+                str(r.get("what_they_do") or ""),
+                audience=aud,
+                category=str(r.get("category") or ""),
+                site=str(r.get("project_url") or ""),
+            )
+            r["followup_2"] = VLAD_STEP3_TEXT
+            continue
+
+        if allow_sonnet:
+            need_idx.append(idx)
+            need_payloads.append(
+                {
+                    "company": r.get("project") or r.get("company") or r.get("name") or "",
+                    "name": r.get("name") or "",
+                    "website": r.get("project_url") or r.get("website") or "",
+                    "category": r.get("category") or "",
+                    "their_angle": r.get("what_they_do") or r.get("bio") or "",
+                    "source": r.get("lead_source") or r.get("source") or "",
+                }
+            )
+
+    sonnet_done: set[int] = set()
+    if allow_sonnet and need_payloads:
+        for start in range(0, len(need_payloads), 15):
+            chunk_i = need_idx[start : start + 15]
+            chunk_p = need_payloads[start : start + 15]
+            try:
+                gen_list = generate_vlad_sonnet_batch(chunk_p, model="claude-sonnet-5")
+            except Exception:
+                continue
+            for row_i, gen_obj, pay in zip(chunk_i, gen_list, chunk_p):
+                if not isinstance(gen_obj, dict):
+                    continue
+                s1 = str(gen_obj.get("step1_text") or "").strip()
+                aud = str(gen_obj.get("audience") or "").strip().lower()
+                if not s1:
+                    continue
+                target = rows[row_i]
+                target["first_touch"] = s1
+                target["step1_text"] = s1
+                target["hook"] = s1
+                target["audience"] = aud
+                target["followup_1"] = followup_one(
+                    str(pay.get("company") or ""),
+                    str(pay.get("their_angle") or ""),
+                    audience=aud,
+                    category=str(pay.get("category") or ""),
+                    site=str(pay.get("website") or ""),
+                )
+                target["followup_2"] = VLAD_STEP3_TEXT
+                sonnet_done.add(row_i)
+
+    for idx, r in enumerate(rows):
+        if idx in sonnet_done:
+            continue
+        raw_ft = str(r.get("first_touch") or r.get("step1_text") or "").strip()
+        if raw_ft and "SoftUGC" in raw_ft and REVSHARE_OFFER_TEXT in raw_ft:
+            continue
+        pname = str(r.get("project") or "")
+        what = str(r.get("what_they_do") or "")
+        cat = str(r.get("category") or "")
+        purl = str(r.get("project_url") or "")
+        aud = infer_lead_audience(category=cat, company=pname, their_angle=what, site=purl)
+        ft = _vlad_first_touch(pname, what, russian=False, category=cat, site=purl)
+        r["first_touch"] = ft
+        r["step1_text"] = ft
+        r["hook"] = ft
+        r["audience"] = aud
+        r["followup_1"] = followup_one(pname, what, audience=aud, category=cat, site=purl)
+        r["followup_2"] = VLAD_STEP3_TEXT
+
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
@@ -220,11 +350,6 @@ def main():
         desc = fetch_desc(purl) if (args.fetch and purl) else ""
         what = desc or bio_detail(bio)
         detail = bio_detail(bio)
-        try:
-            from outreach_copy import first_touch as _vlad_first_touch
-        except ImportError:
-            from leadgen.outreach_copy import first_touch as _vlad_first_touch
-        hook = _vlad_first_touch(pname or "", what or detail or "", russian=False, category=cat, site=purl)
         r2 = dict(r)
         role, roles = merge_roles(r, bio)
         r2.update({
@@ -233,13 +358,14 @@ def main():
             "roles": roles,
             "project": pname,
             "project_url": norm_url(purl) or norm_url(r.get("project_url") or ""),
-            "what_they_do": what or (r.get("what_they_do") or ""),
-            "hook": hook,
+            "what_they_do": what or detail or (r.get("what_they_do") or ""),
         })
         r2.update(merge_social_fields(r2, extract_social_contacts(r.get("links") or [])))
         out.append(r2)
         tag = f"[{i}/{len(rows)}]"
         print(f"{tag} {r.get('name')} | {cat} | {pname or '-'} | {purl or '-'}", file=sys.stderr)
+
+    apply_vlad_sonnet_or_fallback(out)
 
     with open(args.output, "w") as f:
         for r in out:
