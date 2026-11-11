@@ -3,6 +3,8 @@ import csv
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
+from pathlib import Path
 import random
 import re
 import sqlite3
@@ -190,6 +192,10 @@ def _clean_company_title(raw: str | None) -> str | None:
 
 
 _LEGACY_CREATOROS_RE = re.compile(r"\bCreatorOS\b", re.IGNORECASE)
+_LEGACY_STEP1_UPGRADE_RE = re.compile(
+    r"(?:\bCreatorOS\b|If your user growth has hit a ceiling|plug-and-play growth arm|Want me to show how\s*$)",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_legacy_brand(text: str | None) -> str:
@@ -198,16 +204,29 @@ def _sanitize_legacy_brand(text: str | None) -> str:
     return _LEGACY_CREATOROS_RE.sub("SoftUGC", str(text))
 
 
-def _clean_step1_text(raw: str | None, company: str | None = None) -> tuple[str | None, str | None]:
+def _needs_legacy_vlad_step1_upgrade(text: str | None) -> bool:
+    return bool(text and _LEGACY_STEP1_UPGRADE_RE.search(str(text)))
+
+
+def _is_b2b_campaign_name(name: str | None) -> bool:
+    return not any(k in str(name or "").lower() for k in ("ваканс", "vacanc"))
+
+
+def _clean_step1_text(
+    raw: str | None,
+    company: str | None = None,
+    *,
+    is_b2b: bool = True,
+) -> tuple[str | None, str | None]:
     if raw is None:
         return None, None
-    text = _sanitize_legacy_brand(raw).strip()
-    if not text:
+    raw_str = str(raw).strip()
+    if not raw_str:
         return None, None
     marker = "Actually, here's the rewrite based on what you gave me:"
-    if marker in text:
-        text = text.split(marker, 1)[1].strip()
-    low = text.lower()
+    if marker in raw_str:
+        raw_str = raw_str.split(marker, 1)[1].strip()
+    low = raw_str.lower()
     if (
         low.startswith("i can't write this one")
         or low.startswith("i cannot write")
@@ -218,25 +237,12 @@ def _clean_step1_text(raw: str | None, company: str | None = None) -> tuple[str 
         or bool(re.fullmatch(r"(?:yc\s+[swf]\d{2}|hi,?|hey,?)", low))
     ):
         return None, "Пропущен: в CSV ошибка генерации текста (Cloudflare/пустое описание)"
-    if (
-        text.startswith("If your user growth has hit a ceiling")
-        and text[-1] not in ".?!)\"'"
-    ):
-        m = re.search(r"zero live shoots\.\s*Saw\s+([^.]+)\.", text)
-        proj = (
-            m.group(1).strip()
-            if m
-            else (re.sub(r"^\d+\.\s*", "", str(company or "")).strip() or "your project")
-        )
-        text = (
-            "If your user growth has hit a ceiling, it's usually not the product - it's the cost of reach. "
-            "We built an organic distribution system: in-house short-video production + a network of accounts. "
-            f"183.5M views in 90 days on our last project, zero live shoots. Saw {proj}. "
-            "Want to see how it's set up for a product like yours?"
-        )
-    elif text.endswith("Want me to show how"):
-        clean_comp = re.sub(r"^\d+\.\s*", "", str(company or "")).strip()
-        text = f"{text} this would work for {clean_comp}?" if clean_comp else f"{text} this would work for you?"
+    if is_b2b and _needs_legacy_vlad_step1_upgrade(raw_str):
+        from leadgen.outreach_copy import upgrade_to_vlad_step1
+
+        upgraded = upgrade_to_vlad_step1(raw_str, company=str(company or ""))
+        return (upgraded.strip() or None), None
+    text = _sanitize_legacy_brand(raw_str).strip()
     return (text or None), None
 
 
@@ -516,6 +522,8 @@ def render_template(
     template_text: str,
     recipient: dict,
     rng: random.Random | None = None,
+    *,
+    sanitize_brand: bool = True,
 ) -> str:
     text = str(template_text or "")
     name_val = (
@@ -600,7 +608,8 @@ def render_template(
     text = expand_spintax(text, rng=rng)
 
     lines = []
-    norm_text = _sanitize_legacy_brand(text).replace("\u2028\n", "\n").replace("\u2028", "\n")
+    brand_checked = _sanitize_legacy_brand(text) if sanitize_brand else text
+    norm_text = brand_checked.replace("\u2028\n", "\n").replace("\u2028", "\n")
     for line in norm_text.splitlines():
         cleaned = re.sub(r"[ \t]{2,}", " ", line).strip()
         cleaned = re.sub(r"\s+([,!?.:;])", r"\1", cleaned)
@@ -953,7 +962,8 @@ def get_campaign(conn, campaign_id: int) -> dict:
             if hks and hks not in seen_csv_headers_set:
                 seen_csv_headers_set.add(hks)
                 seen_csv_headers.append(hks)
-        assigned_id = rd.get("assigned_account_id")
+        assigned_id = rd.get("sent_account_id") or rd.get("assigned_account_id")
+        rd["error"] = rd.get("error_text")
         if assigned_id is not None:
             assigned_id_int = int(assigned_id)
             if assigned_id_int not in acc_name_map:
@@ -1010,7 +1020,9 @@ def get_campaign(conn, campaign_id: int) -> dict:
             last_sent_text = out_by_phone.get(str(rd["phone"]).strip())
         if last_sent_text is None and cur_step >= 1 and cur_step - 1 < len(steps):
             prev_idx = cur_step - 1
-            last_sent_text = _render_step_text(steps[prev_idx], prev_idx, rd)
+            last_sent_text = _render_step_text(
+                steps[prev_idx], prev_idx, rd, campaign_name=camp.get("name")
+            )
         rd["last_sent_text"] = last_sent_text
 
         recipients.append(rd)
@@ -1080,7 +1092,13 @@ _DEFAULT_BOILERPLATE_TEMPLATES = frozenset(
 )
 
 
-def _render_step_text(step: dict, step_idx: int, rec: dict) -> str:
+def _render_step_text(
+    step: dict,
+    step_idx: int,
+    rec: dict,
+    *,
+    campaign_name: str | None = None,
+) -> str:
     tmpl = str(step.get("template_text") or "").strip()
     tmpl_low = tmpl.lower()
     csv_step_val = ""
@@ -1105,17 +1123,34 @@ def _render_step_text(step: dict, step_idx: int, rec: dict) -> str:
     else:
         has_csv_token = False
 
+    is_b2b_step0 = step_idx == 0 and _is_b2b_campaign_name(campaign_name)
+    sanitize_now = not is_b2b_step0
+
     is_default_placeholder = (not tmpl) or (tmpl_low in _DEFAULT_BOILERPLATE_TEMPLATES)
     if csv_step_val and not has_csv_token and is_default_placeholder:
-        base = render_template(csv_step_val, rec)
+        base = render_template(csv_step_val, rec, sanitize_brand=sanitize_now)
     else:
-        base = render_template(tmpl, rec)
+        base = render_template(tmpl, rec, sanitize_brand=sanitize_now)
 
     offer_tail = str(step.get("offer_tail") or "").strip()
     if offer_tail:
-        tail_rendered = render_template(offer_tail, rec)
+        tail_rendered = render_template(offer_tail, rec, sanitize_brand=sanitize_now)
         if tail_rendered and tail_rendered not in base:
-            return f"{base}\n\n{tail_rendered}".strip()
+            base = f"{base}\n\n{tail_rendered}".strip()
+
+    if is_b2b_step0:
+        if _needs_legacy_vlad_step1_upgrade(base):
+            from leadgen.outreach_copy import upgrade_to_vlad_step1
+
+            return upgrade_to_vlad_step1(
+                base,
+                company=str(rec.get("company") or ""),
+                name=str(rec.get("name") or ""),
+                site=str(rec.get("website") or ""),
+                category=str(rec.get("category") or rec.get("lead_niche") or ""),
+                their_angle=str(rec.get("their_angle") or rec.get("note") or ""),
+            )
+        return _sanitize_legacy_brand(base)
     return base
 
 
@@ -1944,7 +1979,11 @@ def import_campaign_csv(
         our_angle = (item.get("our_angle") or "").strip() or None
         hook = (item.get("hook") or "").strip() or None
         note = (item.get("note") or "").strip() or their_angle
-        step1_text, error_reason = _clean_step1_text(item.get("step1_text"), company)
+        step1_text, error_reason = _clean_step1_text(
+            item.get("step1_text"),
+            company,
+            is_b2b=_is_b2b_campaign_name(camp.get("name")),
+        )
         step2_text = _sanitize_legacy_brand(item.get("step2_text")).strip() or None
         step3_text = _sanitize_legacy_brand(item.get("step3_text")).strip() or None
         if step2_text:
@@ -2357,6 +2396,138 @@ async def _resolve_telethon_client_for_prewarm(gateway, session_path: str):
     return None
 
 
+_CLOUD_BACKUP_BG_TASK: asyncio.Task | None = None
+_CLOUD_BACKUP_RERUN: bool = False
+
+
+def _mark_cloud_persistence_dirty(conn, now_iso: str | None = None) -> None:
+    """Commit checkpoint timestamp to kv_settings and schedule non-blocking cloud backup if R2 is configured."""
+    global _CLOUD_BACKUP_BG_TASK, _CLOUD_BACKUP_RERUN
+    ts = now_iso or utc_now()
+    conn.execute(
+        """
+        INSERT INTO kv_settings (key, value, updated_at)
+        VALUES ('cloud_persistence_dirty_at', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (ts, ts),
+    )
+    conn.commit()
+    if (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+    ):
+        return
+    try:
+        from app.cloud_persistence import DEFAULT_DB, _resolve_r2_config, backup_to_cloud
+
+        if not _resolve_r2_config(conn):
+            return
+        db_file = DEFAULT_DB
+        try:
+            db_rows = conn.execute("PRAGMA database_list").fetchall()
+            for r in db_rows:
+                if str(r[1] or "") == "main" and str(r[2] or "").strip():
+                    db_file = Path(str(r[2]))
+                    break
+        except Exception:
+            pass
+
+        loop = asyncio.get_running_loop()
+        if _CLOUD_BACKUP_BG_TASK is not None and not _CLOUD_BACKUP_BG_TASK.done():
+            _CLOUD_BACKUP_RERUN = True
+            return
+
+        async def _flush_worker(target_db: Path) -> None:
+            global _CLOUD_BACKUP_RERUN
+            while True:
+                _CLOUD_BACKUP_RERUN = False
+                await asyncio.sleep(0.5)
+                try:
+                    await asyncio.to_thread(backup_to_cloud, None, target_db)
+                except Exception:
+                    pass
+                if not _CLOUD_BACKUP_RERUN:
+                    break
+
+        _CLOUD_BACKUP_BG_TASK = loop.create_task(_flush_worker(db_file))
+    except Exception:
+        pass
+
+
+def _lookup_prior_outgoing_account(
+    conn,
+    *,
+    clean_uname: str,
+    real_peer_id: int | None,
+    clean_phone: str,
+    lead_id_val: int | None,
+    required_account_id: int | None = None,
+) -> int | None:
+    """Return d.account_id of the most recent outgoing message to this recipient (or verify required_account_id)."""
+    peer_str = str(real_peer_id) if real_peer_id is not None else ""
+    if not (clean_uname or peer_str or clean_phone or lead_id_val is not None):
+        return None
+    if required_account_id is not None:
+        row = conn.execute(
+            """
+            SELECT d.account_id
+            FROM dialogs d
+            JOIN messages m ON m.dialog_id = d.id
+            WHERE d.account_id = ?
+              AND m.direction = 'out'
+              AND (
+                  (? != '' AND lower(trim(coalesce(d.username, ''), '@')) = lower(?))
+                  OR (? != '' AND d.peer_id = ?)
+                  OR (? != '' AND coalesce(d.phone, '') = ?)
+                  OR (? IS NOT NULL AND d.lead_id = ?)
+              )
+            ORDER BY m.sent_at DESC, m.id DESC
+            LIMIT 1
+            """,
+            (
+                int(required_account_id),
+                clean_uname,
+                clean_uname,
+                peer_str,
+                real_peer_id,
+                clean_phone,
+                clean_phone,
+                lead_id_val,
+                lead_id_val,
+            ),
+        ).fetchone()
+        return int(row["account_id"]) if row is not None and row["account_id"] is not None else None
+
+    row = conn.execute(
+        """
+        SELECT d.account_id
+        FROM dialogs d
+        JOIN messages m ON m.dialog_id = d.id
+        WHERE m.direction = 'out'
+          AND (
+              (? != '' AND lower(trim(coalesce(d.username, ''), '@')) = lower(?))
+              OR (? != '' AND d.peer_id = ?)
+              OR (? != '' AND coalesce(d.phone, '') = ?)
+              OR (? IS NOT NULL AND d.lead_id = ?)
+          )
+        ORDER BY m.sent_at DESC, m.id DESC
+        LIMIT 1
+        """,
+        (
+            clean_uname,
+            clean_uname,
+            peer_str,
+            real_peer_id,
+            clean_phone,
+            clean_phone,
+            lead_id_val,
+            lead_id_val,
+        ),
+    ).fetchone()
+    return int(row["account_id"]) if row is not None and row["account_id"] is not None else None
+
+
 async def run_campaign_batch(
     conn,
     campaign_id: int,
@@ -2484,6 +2655,16 @@ async def run_campaign_batch(
                 return await _do_send(f"@{clean_uname}")
             raise
 
+    is_b2b_camp = _is_b2b_campaign_name(camp.get("name"))
+    if is_b2b_camp:
+        dedup_scope_cids = [
+            int(r["id"])
+            for r in conn.execute("SELECT id, name FROM campaigns").fetchall()
+            if _is_b2b_campaign_name(r["name"])
+        ]
+    else:
+        dedup_scope_cids = [int(campaign_id)]
+
     for row in eligible_rows:
         if sent_count >= effective_quota or failed_in_batch >= max_failed_in_batch:
             break
@@ -2501,8 +2682,185 @@ async def run_campaign_batch(
                 if due_iso and due_iso > now:
                     continue
 
-        rendered_text = _render_step_text(step, step_idx, rec)
+        clean_rec_uname = (_clean_handle(rec.get("username")) or "").lower()
+        clean_rec_phone = str(rec.get("phone") or "").strip()
+        raw_rec_tg_id = rec.get("telegram_user_id")
+        real_rec_peer_id = (
+            int(raw_rec_tg_id)
+            if raw_rec_tg_id is not None and not _is_synthetic_peer_id(raw_rec_tg_id)
+            else None
+        )
+        rec_peer_str = str(real_rec_peer_id) if real_rec_peer_id is not None else ""
+        rec_lead_id = int(rec["lead_id"]) if rec.get("lead_id") is not None else None
+
+        rendered_text = _render_step_text(
+            step, step_idx, rec, campaign_name=camp.get("name")
+        )
         step_image_url = (step.get("image_url") or "").strip() or None
+
+        if step_idx == 0:
+            # Guard 3a: Anti-duplicate across campaign_recipients (normalized username or phone)
+            has_already_contacted_dup = False
+            if dedup_scope_cids and (clean_rec_uname or clean_rec_phone):
+                ph_scope = ",".join("?" for _ in dedup_scope_cids)
+                cand_rows = conn.execute(
+                    f"""
+                    SELECT id, username, phone
+                    FROM campaign_recipients
+                    WHERE id != ?
+                      AND campaign_id IN ({ph_scope})
+                      AND (
+                          COALESCE(current_step, 0) >= 1
+                          OR status IN ('in_progress', 'completed', 'replied')
+                      )
+                      AND (
+                          (? != '' AND username IS NOT NULL AND trim(username) != '')
+                          OR (? != '' AND coalesce(phone, '') = ?)
+                      )
+                    """,
+                    (
+                        int(rec["id"]),
+                        *dedup_scope_cids,
+                        clean_rec_uname,
+                        clean_rec_phone,
+                        clean_rec_phone,
+                    ),
+                ).fetchall()
+                for crow in cand_rows:
+                    other_u = (_clean_handle(crow["username"]) or "").lower()
+                    other_p = str(crow["phone"] or "").strip()
+                    if (clean_rec_uname and other_u == clean_rec_uname) or (
+                        clean_rec_phone and other_p == clean_rec_phone
+                    ):
+                        has_already_contacted_dup = True
+                        break
+            if has_already_contacted_dup:
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = 'Пропущен дубль: контакт уже получал аутрич',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, rec["id"]),
+                )
+                conn.commit()
+                continue
+
+            # Guard 3b: Anti-duplicate identical outgoing text already in messages
+            stripped_rendered = rendered_text.strip()
+            if stripped_rendered and (clean_rec_uname or rec_peer_str or clean_rec_phone):
+                cand_msgs = conn.execute(
+                    """
+                    SELECT d.account_id, m.sent_at, m.text
+                    FROM dialogs d
+                    JOIN messages m ON m.dialog_id = d.id
+                    WHERE m.direction = 'out'
+                      AND (
+                          (? != '' AND lower(trim(coalesce(d.username, ''), '@')) = lower(?))
+                          OR (? != '' AND d.peer_id = ?)
+                          OR (? != '' AND coalesce(d.phone, '') = ?)
+                      )
+                    ORDER BY m.sent_at DESC, m.id DESC
+                    """,
+                    (
+                        clean_rec_uname,
+                        clean_rec_uname,
+                        rec_peer_str,
+                        real_rec_peer_id,
+                        clean_rec_phone,
+                        clean_rec_phone,
+                    ),
+                ).fetchall()
+                dup_msg = next(
+                    (m for m in cand_msgs if str(m["text"] or "").strip() == stripped_rendered),
+                    None,
+                )
+                if dup_msg is not None:
+                    dup_acc = (
+                        int(dup_msg["account_id"])
+                        if dup_msg["account_id"] is not None
+                        else rec.get("assigned_account_id")
+                    )
+                    dup_sent_at = str(dup_msg["sent_at"] or now)
+                    synced_step = max(int(rec.get("current_step") or 0), 1)
+                    synced_status = "completed" if synced_step >= len(steps) else "in_progress"
+                    conn.execute(
+                        """
+                        UPDATE campaign_recipients
+                        SET current_step = ?,
+                            status = ?,
+                            sent_account_id = COALESCE(sent_account_id, ?),
+                            assigned_account_id = COALESCE(assigned_account_id, ?),
+                            last_sent_at = COALESCE(last_sent_at, ?),
+                            error_text = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            synced_step,
+                            synced_status,
+                            dup_acc,
+                            dup_acc,
+                            dup_sent_at,
+                            now,
+                            rec["id"],
+                        ),
+                    )
+                    conn.commit()
+                    continue
+
+        pinned_followup_acc_id: int | None = None
+        if step_idx >= 1:
+            # Guard 2a & 2b: Resolve sent_account_id strictly and require real prior outgoing message in messages
+            raw_sent_acc = rec.get("sent_account_id")
+            if raw_sent_acc is not None:
+                verified_acc = _lookup_prior_outgoing_account(
+                    conn,
+                    clean_uname=clean_rec_uname,
+                    real_peer_id=real_rec_peer_id,
+                    clean_phone=clean_rec_phone,
+                    lead_id_val=rec_lead_id,
+                    required_account_id=int(raw_sent_acc),
+                )
+                if verified_acc is not None:
+                    pinned_followup_acc_id = verified_acc
+            if pinned_followup_acc_id is None:
+                found_hist_acc = _lookup_prior_outgoing_account(
+                    conn,
+                    clean_uname=clean_rec_uname,
+                    real_peer_id=real_rec_peer_id,
+                    clean_phone=clean_rec_phone,
+                    lead_id_val=rec_lead_id,
+                )
+                if found_hist_acc is not None:
+                    pinned_followup_acc_id = found_hist_acc
+                    rec["sent_account_id"] = found_hist_acc
+                    conn.execute(
+                        """
+                        UPDATE campaign_recipients
+                        SET sent_account_id = ?,
+                            assigned_account_id = COALESCE(assigned_account_id, ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (found_hist_acc, found_hist_acc, now, rec["id"]),
+                    )
+                    conn.commit()
+            if pinned_followup_acc_id is None:
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = 'Фоллоу-ап заблокирован: нет предыдущего сообщения в чате',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, rec["id"]),
+                )
+                conn.commit()
+                continue
 
         sent_this_recipient = False
         no_accounts_left = False
@@ -2521,10 +2879,11 @@ async def run_campaign_batch(
 
             assigned_id = rec.get("assigned_account_id")
             if step_idx >= 1:
-                if assigned_id is None or int(assigned_id) not in state_by_id:
+                # Guard 2c: Strictly use sent_account_id ONLY — NEVER rotate follow-up to another account
+                if pinned_followup_acc_id is None or int(pinned_followup_acc_id) not in state_by_id:
                     chosen_state = None
                 else:
-                    pinned_state = state_by_id[int(assigned_id)]
+                    pinned_state = state_by_id[int(pinned_followup_acc_id)]
                     if (
                         not pinned_state.get("disabled")
                         and not pinned_state.get("dead")
@@ -2680,7 +3039,13 @@ async def run_campaign_batch(
                         break
                     if live_history_checked and not live_has_out:
                         conn.execute(
-                            "UPDATE campaign_recipients SET status = 'completed', updated_at = ? WHERE id = ?",
+                            """
+                            UPDATE campaign_recipients
+                            SET status = 'completed',
+                                error_text = 'Фоллоу-ап заблокирован: нет предыдущего сообщения в чате',
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
                             (now, rec["id"]),
                         )
                         conn.commit()
@@ -2777,6 +3142,8 @@ async def run_campaign_batch(
                                 await active_gw._close(session_path)
                             except Exception:
                                 pass
+                    if step_idx >= 1:
+                        break
                     continue
 
                 conn.execute(
@@ -2820,14 +3187,35 @@ async def run_campaign_batch(
 
         next_step = step_idx + 1
         next_status = "completed" if next_step >= len(steps) else "in_progress"
+        pinned_sent_acc = (
+            chosen_account_id
+            if step_idx == 0
+            else int(rec.get("sent_account_id") or chosen_account_id)
+        )
         conn.execute(
             """
             UPDATE campaign_recipients
-            SET current_step = ?, status = ?, assigned_account_id = ?, last_sent_at = ?, error_text = NULL, updated_at = ?
+            SET current_step = ?,
+                status = ?,
+                assigned_account_id = ?,
+                sent_account_id = ?,
+                last_sent_at = ?,
+                error_text = NULL,
+                updated_at = ?
             WHERE id = ?
             """,
-            (next_step, next_status, chosen_account_id, sent_at, now, rec["id"]),
+            (
+                next_step,
+                next_status,
+                chosen_account_id,
+                pinned_sent_acc,
+                sent_at,
+                now,
+                rec["id"],
+            ),
         )
+        # Immediate commit & cloud persistence dirty marker right after Step 0 (and every step) before any next-tick/jitter sleep
+        _mark_cloud_persistence_dirty(conn, now)
         if rec.get("lead_id"):
             if next_step < len(steps):
                 next_delay_h = int(steps[next_step].get("delay_hours") or 0)

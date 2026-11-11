@@ -1,4 +1,11 @@
 import asyncio
+from pathlib import Path
+import sys
+
+_WORKTREE_ROOT = str(Path(__file__).resolve().parents[1])
+if _WORKTREE_ROOT not in sys.path:
+    sys.path.insert(0, _WORKTREE_ROOT)
+
 from app.db import init_db, connect, utc_now
 from app.outreach import (
     create_campaign,
@@ -175,12 +182,27 @@ def test_followup_missing_input_entity_falls_back_to_username(tmp_path):
         "username,name,category,step1_text\n@dariusiv,Darius,Gaming,Initial hello\n",
     )
     # Put recipient at step 1 (waiting for step 2 follow-up) with real telegram_user_id not in Telethon entity cache
+    # Seed prior Step 1 outgoing message on account 33 so empty-chat follow-up guard recognizes legitimate prior touch
+    cur_d = conn.execute(
+        """
+        INSERT INTO dialogs (account_id, peer_type, peer_id, username, title, created_at, updated_at)
+        VALUES (33, 'user', 109693549, 'dariusiv', 'Darius', '2026-10-01T10:00:00', '2026-10-01T10:00:00')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO messages (dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at)
+        VALUES (?, 1, 'out', 'Initial hello', '2026-10-01T10:00:00', '2026-10-01T10:00:00', '2026-10-01T10:00:00')
+        """,
+        (int(cur_d.lastrowid),),
+    )
     conn.execute(
         """
         UPDATE campaign_recipients
         SET current_step = 1,
             status = 'in_progress',
             assigned_account_id = 33,
+            sent_account_id = 33,
             telegram_user_id = 109693549,
             last_sent_at = '2026-10-01T10:00:00'
         WHERE campaign_id = ?

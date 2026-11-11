@@ -1090,42 +1090,148 @@ def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict |
     raise KeyError(f"Неизвестный MCP-инструмент: {name}")
 
 
+def _is_vacancy_lead_item(item: dict) -> bool:
+    src_low = str(item.get("lead_source") or item.get("source") or "").lower()
+    cat_low = str(item.get("category") or item.get("niche") or "").lower()
+    return any(k in src_low for k in ("ваканс", "vacanc", "job_monitor")) or any(
+        k in cat_low for k in ("ваканс", "vacanc")
+    )
+
+
+def _auto_enrich_b2b_items_with_sonnet(items: list[dict]) -> list[dict]:
+    """Ensure every B2B item without canonical Vlad SoftUGC+revshare copy is drafted via claude-sonnet-5 when API key is configured."""
+    from leadgen.outreach_copy import (
+        REVSHARE_OFFER_TEXT,
+        VLAD_STEP3_TEXT,
+        followup_one,
+        generate_vlad_sonnet_batch,
+    )
+
+    api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
+    if not api_key:
+        return items
+    if "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("FORCE_AUTO_SONNET_IN_TEST") != "1":
+        return items
+
+    out_items = [dict(it) if isinstance(it, dict) else it for it in items]
+    need_indices: list[int] = []
+    need_payloads: list[dict] = []
+    for idx, it in enumerate(out_items):
+        if not isinstance(it, dict) or _is_vacancy_lead_item(it):
+            continue
+        raw_s1 = str(it.get("step1_text") or it.get("first_touch") or "").strip()
+        raw_low = raw_s1.lower()
+        already_canonical = (
+            bool(raw_s1)
+            and "SoftUGC" in raw_s1
+            and REVSHARE_OFFER_TEXT in raw_s1
+            and "creatoros" not in raw_low
+            and "if your user growth has hit a ceiling" not in raw_low
+            and "plug-and-play growth arm" not in raw_low
+        )
+        if already_canonical:
+            continue
+        need_indices.append(idx)
+        need_payloads.append(
+            {
+                "company": it.get("company") or it.get("project") or it.get("name") or "",
+                "name": it.get("name") or "",
+                "website": it.get("website") or it.get("url") or "",
+                "category": it.get("category") or it.get("niche") or "",
+                "their_angle": it.get("their_angle") or it.get("note") or "",
+                "source": it.get("lead_source") or it.get("source") or "",
+            }
+        )
+
+    if not need_payloads:
+        return out_items
+
+    for chunk_start in range(0, len(need_payloads), 15):
+        chunk_idx = need_indices[chunk_start : chunk_start + 15]
+        chunk_pay = need_payloads[chunk_start : chunk_start + 15]
+        try:
+            gen_list = generate_vlad_sonnet_batch(chunk_pay, model="claude-sonnet-5")
+        except Exception:
+            continue
+        for item_i, gen_res, pay in zip(chunk_idx, gen_list, chunk_pay):
+            if not isinstance(gen_res, dict):
+                continue
+            s1 = str(gen_res.get("step1_text") or "").strip()
+            aud = str(gen_res.get("audience") or "").strip().lower()
+            if not s1:
+                continue
+            target = out_items[item_i]
+            target["first_touch"] = s1
+            target["step1_text"] = s1
+            if aud:
+                target["audience"] = aud
+            f1 = followup_one(
+                str(pay.get("company") or pay.get("name") or ""),
+                str(pay.get("their_angle") or ""),
+                audience=aud,
+                category=str(pay.get("category") or ""),
+                site=str(pay.get("website") or ""),
+            )
+            target["followup_1"] = f1
+            target["step2_text"] = f1
+            target["followup_2"] = VLAD_STEP3_TEXT
+            target["step3_text"] = VLAD_STEP3_TEXT
+    return out_items
+
+
 def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dict:
-    raw_leads = args.get("leads")
+    raw_leads = args.get("leads") if args.get("leads") is not None else args.get("items")
     if not isinstance(raw_leads, list):
         raise ValueError("Параметр leads должен быть списком объектов")
 
     enroll_in_campaign = bool(args.get("enroll_in_campaign", True))
     raw_cid = args.get("campaign_id")
     campaign_id: int | None = int(raw_cid) if raw_cid is not None else None
-    campaign_name = str(args.get("campaign_name") or "Leadgen Autopilot").strip() or "Leadgen Autopilot"
+    raw_camp_arg = str(args.get("campaign_name") or "").strip()
+    fallback_camp_name = raw_camp_arg or "Leadgen Autopilot"
 
-    account_id: int | None = None
-    seen_usernames: set[str] = set()
-    seen_phones: set[str] = set()
-    seen_leads: set[int] = set()
-    seen_tg_ids: set[int] = set()
+    dict_items = [it for it in raw_leads if isinstance(it, dict)]
+    all_vacancies = bool(dict_items) and all(_is_vacancy_lead_item(it) for it in dict_items)
 
-    if enroll_in_campaign:
-        if campaign_id is not None:
-            crow = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
-            if crow is None:
-                raise LookupError(f"Кампания #{campaign_id} не найдена")
-            camp_dict = as_dict(crow)
+    if campaign_id is None:
+        raw_low = raw_camp_arg.lower()
+        if any(k in raw_low for k in ("ваканс", "vacanc", "job")) or "(wa)" in raw_low or "whatsapp" in raw_low:
+            campaign_name = raw_camp_arg
+        elif all_vacancies and raw_low in ("", "leadgen auto (tg)", "leadgen autopilot"):
+            campaign_name = "TG Вакансии"
         else:
-            crow = conn.execute(
-                "SELECT * FROM campaigns WHERE lower(name) = lower(?) ORDER BY id ASC LIMIT 1",
-                (campaign_name,),
-            ).fetchone()
-            if crow is not None:
-                camp_dict = as_dict(crow)
-                campaign_id = int(camp_dict["id"])
+            from app.leadgen_settings import resolve_target_b2b_tg_campaign_name
+
+            campaign_name = resolve_target_b2b_tg_campaign_name(
+                conn,
+                raw_camp_arg,
+                fallback_default=fallback_camp_name,
+            )
+    else:
+        campaign_name = fallback_camp_name
+
+    def _get_or_create_camp_state(target_cid: int | None, target_cname: str) -> dict[str, Any]:
+        if target_cid is not None:
+            crow = conn.execute("SELECT * FROM campaigns WHERE id = ?", (target_cid,)).fetchone()
+            if crow is None:
+                raise LookupError(f"Кампания #{target_cid} не найдена")
+            c_dict = as_dict(crow)
+            resolved_cid = int(c_dict["id"])
+        else:
+            all_c = [as_dict(r) for r in conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()]
+            matched = next(
+                (c for c in all_c if str(c.get("name") or "").strip().lower() == target_cname.strip().lower()),
+                None,
+            )
+            if matched is not None:
+                c_dict = matched
+                resolved_cid = int(c_dict["id"])
             else:
                 from app.db import CANONICAL_STEP3_IMAGE_URL
                 from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
 
-                is_vacancy_camp = any(k in campaign_name.lower() for k in ("ваканс", "vacanc", "job"))
-                is_wa_camp = "(wa)" in campaign_name.lower() or "whatsapp" in campaign_name.lower()
+                is_vacancy_camp = any(k in target_cname.lower() for k in ("ваканс", "vacanc", "job"))
+                is_wa_camp = "(wa)" in target_cname.lower() or "whatsapp" in target_cname.lower()
                 default_steps = (
                     [
                         {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
@@ -1146,24 +1252,48 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 )
                 created_camp = create_campaign(
                     conn,
-                    name=campaign_name,
+                    name=target_cname,
                     status="draft",
                     steps=default_steps,
                 )
-                campaign_id = int(created_camp["id"])
-                camp_dict = created_camp
+                resolved_cid = int(created_camp["id"])
+                c_dict = created_camp
 
-        acc_ids = _parse_account_ids(camp_dict.get("account_id"), camp_dict.get("account_ids_json"))
-        account_id = acc_ids[0] if acc_ids else camp_dict.get("account_id")
-
+        acc_ids = _parse_account_ids(c_dict.get("account_id"), c_dict.get("account_ids_json"))
+        acc_id = acc_ids[0] if acc_ids else c_dict.get("account_id")
         existing_rows = conn.execute(
             "SELECT username, phone, lead_id, telegram_user_id FROM campaign_recipients WHERE campaign_id = ?",
-            (campaign_id,),
+            (resolved_cid,),
         ).fetchall()
-        seen_usernames = {str(r["username"]).lower() for r in existing_rows if r["username"]}
-        seen_phones = {str(r["phone"]) for r in existing_rows if r["phone"]}
-        seen_leads = {int(r["lead_id"]) for r in existing_rows if r["lead_id"]}
-        seen_tg_ids = {int(r["telegram_user_id"]) for r in existing_rows if r["telegram_user_id"]}
+        return {
+            "campaign_id": resolved_cid,
+            "camp_dict": c_dict,
+            "account_id": acc_id,
+            "seen_usernames": {str(r["username"]).lower() for r in existing_rows if r["username"]},
+            "seen_phones": {str(r["phone"]) for r in existing_rows if r["phone"]},
+            "seen_leads": {int(r["lead_id"]) for r in existing_rows if r["lead_id"]},
+            "seen_tg_ids": {int(r["telegram_user_id"]) for r in existing_rows if r["telegram_user_id"]},
+        }
+
+    camp_cache: dict[str, dict[str, Any]] = {}
+    primary_state: dict[str, Any] | None = None
+    camp_dict: dict[str, Any] | None = None
+    account_id: int | None = None
+    explicit_cid_requested = campaign_id is not None
+
+    if enroll_in_campaign:
+        primary_state = _get_or_create_camp_state(campaign_id, campaign_name)
+        campaign_id = int(primary_state["campaign_id"])
+        camp_dict = primary_state["camp_dict"]
+        account_id = primary_state["account_id"]
+        camp_cache[str(camp_dict.get("name") or "").strip().lower()] = primary_state
+
+    is_primary_vacancy = bool(
+        camp_dict is not None
+        and any(k in str(camp_dict.get("name") or "").lower() for k in ("ваканс", "vacanc", "job"))
+    )
+    if not is_primary_vacancy:
+        raw_leads = _auto_enrich_b2b_items_with_sonnet(raw_leads)
 
     processed = 0
     created_leads = 0
@@ -1325,9 +1455,23 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
 
         lead_ids.append(lid)
 
+        active_state = primary_state
+        if (
+            enroll_in_campaign
+            and not explicit_cid_requested
+            and _is_vacancy_lead_item(item)
+            and not is_primary_vacancy
+        ):
+            vac_key = "tg вакансии"
+            if vac_key not in camp_cache:
+                camp_cache[vac_key] = _get_or_create_camp_state(None, "TG Вакансии")
+            active_state = camp_cache[vac_key]
+
+        target_camp_dict = active_state["camp_dict"] if active_state is not None else camp_dict
+        target_campaign_id = int(active_state["campaign_id"]) if active_state is not None else campaign_id
         is_b2b_camp = bool(
-            camp_dict is not None
-            and not any(k in str(camp_dict.get("name") or "").lower() for k in ("ваканс", "vacanc", "job"))
+            target_camp_dict is not None
+            and not any(k in str(target_camp_dict.get("name") or "").lower() for k in ("ваканс", "vacanc", "job"))
         )
         if is_b2b_camp and is_offline_non_icp_contact(
             username=username,
@@ -1338,7 +1482,11 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         ):
             continue
 
-        if enroll_in_campaign and campaign_id is not None and has_direct_messenger_handle:
+        if enroll_in_campaign and active_state is not None and target_campaign_id is not None and has_direct_messenger_handle:
+            seen_leads = active_state["seen_leads"]
+            seen_tg_ids = active_state["seen_tg_ids"]
+            seen_usernames = active_state["seen_usernames"]
+            seen_phones = active_state["seen_phones"]
             is_dup = (
                 lid in seen_leads
                 or (tg_id and int(tg_id) in seen_tg_ids)
@@ -1352,6 +1500,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             step1_text, error_reason = _clean_step1_text(
                 item.get("step1_text") or item.get("first_touch"),
                 item.get("company"),
+                is_b2b=is_b2b_camp,
             )
             step2_text = (str(item.get("step2_text") or item.get("followup_1") or "").strip()) or None
             step3_text = (str(item.get("step3_text") or item.get("followup_2") or "").strip()) or None
@@ -1374,7 +1523,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?)
                 """,
                 (
-                    campaign_id,
+                    target_campaign_id,
                     lid,
                     tg_id,
                     username,
@@ -1406,8 +1555,9 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 seen_phones.add(phone)
             enrolled_in_campaign += 1
 
-    if enroll_in_campaign and campaign_id is not None:
-        conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
+    if enroll_in_campaign:
+        for st in camp_cache.values():
+            conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, int(st["campaign_id"])))
     conn.commit()
 
     return {
