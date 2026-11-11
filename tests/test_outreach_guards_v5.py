@@ -900,3 +900,140 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
 
     assert len(sonnet_calls) >= 4
     assert all(c["model"] == "claude-sonnet-5" for c in sonnet_calls)
+
+
+def test_qa_ring_campaign_self_send_guard_and_2h_delays(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "qa_ring.db")
+    init_db(conn)
+    now_holder = {"val": "2026-11-11T12:00:00"}
+    import sys
+    import app.outreach as outreach_mod
+
+    monkeypatch.setattr(outreach_mod, "utc_now", lambda: now_holder["val"])
+    monkeypatch.setattr(sys.modules[__name__], "utc_now", lambda: now_holder["val"])
+
+    ring_accounts = [
+        (21, "tim_cros", 5680938518),
+        (30, "subscale", 6181048768),
+        (27, "vladwilhelm", 978069541),
+        (31, "make1tlo", 6805655381),
+    ]
+    for aid, uname, tid in ring_accounts:
+        conn.execute(
+            """
+            INSERT INTO accounts (
+                id, phone, session_path, status, telegram_user_id, telegram_username,
+                telegram_name, created_at, health, updated_at, daily_limit, sent_today, provider
+            ) VALUES (?, ?, ?, 'connected', ?, ?, ?, ?, 'active', ?, 20, 0, 'telegram')
+            """,
+            (aid, f"+1000000{aid}", f"data/sessions/acc{aid}.session", tid, uname, uname, now_holder["val"], now_holder["val"]),
+        )
+
+    # Seed old completed row for make1tlo in B2B campaign #5 — QA campaign must NOT be blocked by it
+    b2b_camp = create_campaign(
+        conn,
+        name="SoftUGC — База Все2",
+        account_ids=[21, 30, 27, 31],
+        status="paused",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, telegram_user_id, username, name, company, step1_text,
+            current_step, status, created_at, updated_at
+        ) VALUES (?, 6805655381, 'make1tlo', 'Sergey', 'SoftUGC', 'old pitch', 3, 'completed', ?, ?)
+        """,
+        (b2b_camp["id"], now_holder["val"], now_holder["val"]),
+    )
+
+    qa_camp = create_campaign(
+        conn,
+        name="[QA ТЕСТ] SoftUGC — Свои аккаунты (интервал 2ч)",
+        account_ids=[21, 30, 27, 31],
+        daily_limit=50,
+        status="running",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+            {"step_order": 2, "delay_hours": 2, "template_text": VLAD_STEP2_TEMPLATE},
+            {
+                "step_order": 3,
+                "delay_hours": 2,
+                "template_text": VLAD_STEP3_TEXT,
+                "image_url": "/media/outreach/4fa85f083f9e2911.jpg",
+            },
+        ],
+    )
+
+    # Deliberately set assigned_account_id=21 on recipient tim_cros (id=21) to prove self-send guard rotates to non-self!
+    for idx, (aid, uname, tid) in enumerate(ring_accounts):
+        sender_id = 21 if aid == 21 else ring_accounts[(idx - 1) % len(ring_accounts)][0]
+        pitch = f"Hey,\n\nSaw {uname} Studio.\n\n{SOFTUGC_PITCH_TEXT}\n\n{REVSHARE_OFFER_TEXT}"
+        conn.execute(
+            """
+            INSERT INTO campaign_recipients (
+                campaign_id, assigned_account_id, telegram_user_id, username, name, company,
+                category, step1_text, current_step, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'SaaS', ?, 0, 'pending', ?, ?)
+            """,
+            (qa_camp["id"], sender_id, tid, uname, uname, f"{uname} Studio", pitch, now_holder["val"], now_holder["val"]),
+        )
+    conn.commit()
+
+    def _record_live(entry: dict) -> None:
+        pid = entry["peer_id"]
+        if isinstance(pid, int):
+            gw.live_messages_by_session_peer.setdefault((entry["session_path"], pid), []).append(
+                {
+                    "telegram_message_id": len(gw.sent) + 100,
+                    "direction": "out",
+                    "text": entry["text"],
+                    "sent_at": now_holder["val"],
+                }
+            )
+
+    gw = RecordingGateway(on_after_send=_record_live)
+    # T+0h: Step 1 sends to all 4, and tim_cros NEVER receives from itself (acc21)!
+    res1 = asyncio.run(run_campaign_batch(conn, qa_camp["id"], gateway=gw, max_send=10, respect_delays=True))
+    assert res1["sent"] == 4
+    for s in gw.sent:
+        peer_val = s.get("peer_id") or s.get("peer")
+        if peer_val == 5680938518 or peer_val == "@tim_cros":
+            assert s.get("session_path", s.get("session")) != "data/sessions/acc21.session"
+
+    pinned_by_uname = {
+        r["username"]: int(r["sent_account_id"])
+        for r in conn.execute(
+            "SELECT username, sent_account_id FROM campaign_recipients WHERE campaign_id = ?",
+            (qa_camp["id"],),
+        ).fetchall()
+    }
+    assert pinned_by_uname["tim_cros"] != 21
+
+    # T+1h30m (< 2 hours): 0 follow-ups sent!
+    now_holder["val"] = "2026-11-11T13:30:00"
+    prev_len = len(gw.sent)
+    res_early = asyncio.run(run_campaign_batch(conn, qa_camp["id"], gateway=gw, max_send=10, respect_delays=True))
+    assert res_early["sent"] == 0
+    assert len(gw.sent) == prev_len
+
+    # T+2h05m: Step 2 sends strictly from each recipient's pinned sent_account_id!
+    now_holder["val"] = "2026-11-11T14:05:00"
+    prev_len = len(gw.sent)
+    res2 = asyncio.run(run_campaign_batch(conn, qa_camp["id"], gateway=gw, max_send=10, respect_delays=True))
+    assert res2["sent"] == 4
+    for s in gw.sent[prev_len:]:
+        assert "500K-2M reach" in s["text"]
+
+    # T+4h10m: Step 3 sends Kermit + 'You’re doing me dirty mate... :(((' strictly from pinned sent_account_id!
+    now_holder["val"] = "2026-11-11T16:10:00"
+    prev_len = len(gw.sent)
+    res3 = asyncio.run(run_campaign_batch(conn, qa_camp["id"], gateway=gw, max_send=10, respect_delays=True))
+    assert res3["sent"] == 4
+    for s in gw.sent[prev_len:]:
+        assert s["text"] == VLAD_STEP3_TEXT
+        assert s["image_path"] == "/media/outreach/4fa85f083f9e2911.jpg"
+
+    # B2B campaign #5 remained paused with 0 sends!
+    c5_state = conn.execute("SELECT status FROM campaigns WHERE id = ?", (b2b_camp["id"],)).fetchone()
+    assert c5_state["status"] == "paused"

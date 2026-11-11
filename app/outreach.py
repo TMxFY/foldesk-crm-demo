@@ -208,8 +208,33 @@ def _needs_legacy_vlad_step1_upgrade(text: str | None) -> bool:
     return bool(text and _LEGACY_STEP1_UPGRADE_RE.search(str(text)))
 
 
+def _is_qa_campaign_name(name: str | None) -> bool:
+    low = str(name or "").lower()
+    return "[qa" in low or "qa тест" in low or "тест своих" in low
+
+
 def _is_b2b_campaign_name(name: str | None) -> bool:
     return not any(k in str(name or "").lower() for k in ("ваканс", "vacanc"))
+
+
+def _is_same_tg_identity(
+    acc_raw: dict | None,
+    clean_rec_uname: str,
+    real_rec_peer_id: int | None,
+) -> bool:
+    if not acc_raw:
+        return False
+    acc_tid = acc_raw.get("telegram_user_id")
+    if real_rec_peer_id is not None and acc_tid is not None:
+        try:
+            if int(acc_tid) == int(real_rec_peer_id):
+                return True
+        except (TypeError, ValueError):
+            pass
+    acc_u = (_clean_handle(acc_raw.get("telegram_username")) or "").lower()
+    if clean_rec_uname and acc_u and acc_u == clean_rec_uname:
+        return True
+    return False
 
 
 def _clean_step1_text(
@@ -612,7 +637,7 @@ def render_template(
     norm_text = brand_checked.replace("\u2028\n", "\n").replace("\u2028", "\n")
     for line in norm_text.splitlines():
         cleaned = re.sub(r"[ \t]{2,}", " ", line).strip()
-        cleaned = re.sub(r"\s+([,!?.:;])", r"\1", cleaned)
+        cleaned = re.sub(r"\s+([,!?.]|:(?![()DPp/\\|3])|;(?![()DPp]))", r"\1", cleaned)
         lines.append(cleaned)
     return "\n".join(lines).strip()
 
@@ -2663,12 +2688,13 @@ async def run_campaign_batch(
                 return await _do_send(f"@{clean_uname}")
             raise
 
+    is_qa_camp = _is_qa_campaign_name(camp.get("name"))
     is_b2b_camp = _is_b2b_campaign_name(camp.get("name"))
-    if is_b2b_camp:
+    if is_b2b_camp and not is_qa_camp:
         dedup_scope_cids = [
             int(r["id"])
             for r in conn.execute("SELECT id, name FROM campaigns").fetchall()
-            if _is_b2b_campaign_name(r["name"])
+            if _is_b2b_campaign_name(r["name"]) and not _is_qa_campaign_name(r["name"])
         ]
     else:
         dedup_scope_cids = [int(campaign_id)]
@@ -2904,6 +2930,7 @@ async def run_campaign_batch(
                 if not st.get("disabled")
                 and st["sent_today"] < st["daily_limit"]
                 and (step_idx >= 1 or not st.get("spambot_warm_only"))
+                and not _is_same_tg_identity(st["raw"], clean_rec_uname, real_rec_peer_id)
             ]
             if not available:
                 no_accounts_left = True
@@ -2920,6 +2947,9 @@ async def run_campaign_batch(
                         not pinned_state.get("disabled")
                         and not pinned_state.get("dead")
                         and pinned_state["sent_today"] < pinned_state["daily_limit"]
+                        and not _is_same_tg_identity(
+                            pinned_state["raw"], clean_rec_uname, real_rec_peer_id
+                        )
                     ):
                         chosen_state = pinned_state
                     else:
@@ -2930,6 +2960,9 @@ async def run_campaign_batch(
                     not pinned_state.get("disabled")
                     and not pinned_state.get("spambot_warm_only")
                     and pinned_state["sent_today"] < pinned_state["daily_limit"]
+                    and not _is_same_tg_identity(
+                        pinned_state["raw"], clean_rec_uname, real_rec_peer_id
+                    )
                 ):
                     chosen_state = pinned_state
                 else:
