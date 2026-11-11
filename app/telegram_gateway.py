@@ -44,7 +44,7 @@ class TelegramGateway(ABC):
         """Last personal-dialog messages, oldest first. Not groups or channels."""
         raise GatewayError("История не подключена")
 
-    async def watch_private(self, session_path: str, on_message) -> None:
+    async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
         """Listen until cancelled. Deliver incoming private messages to on_message."""
         raise GatewayError("Живые входящие не подключены")
 
@@ -1224,6 +1224,9 @@ class TelethonGateway(TelegramGateway):
                 preview = "" if text is None else str(text)[:120]
                 sent_at = _stamp(getattr(message, "date", None))
                 last_from = 0 if getattr(message, "out", False) else 1
+            read_outbox_max_id = int(
+                getattr(getattr(dialog, "dialog", None), "read_outbox_max_id", 0) or 0
+            )
             found.append(
                 {
                     "telegram_user_id": int(entity.id),
@@ -1234,6 +1237,7 @@ class TelethonGateway(TelegramGateway):
                     "last_message_preview": preview,
                     "last_message_at": sent_at,
                     "last_from_peer": last_from,
+                    "read_outbox_max_id": read_outbox_max_id,
                 }
             )
             if len(found) >= cap:
@@ -1256,11 +1260,15 @@ class TelethonGateway(TelegramGateway):
                 blob = " ".join((name, username or "", str(entity.id))).casefold()
                 if needle not in blob:
                     continue
+            read_outbox_max_id = int(
+                getattr(getattr(dialog, "dialog", None), "read_outbox_max_id", 0) or 0
+            )
             found.append(
                 {
                     "telegram_user_id": entity.id,
                     "username": username,
                     "name": name,
+                    "read_outbox_max_id": read_outbox_max_id,
                 }
             )
             if len(found) >= limit:
@@ -1435,8 +1443,13 @@ class TelethonGateway(TelegramGateway):
             "peer_type": "user",
         }
 
-    async def watch_private(self, session_path: str, on_message) -> None:
+    async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
         from telethon import events
+
+        try:
+            from telethon import tl
+        except Exception:
+            tl = None
 
         async with self._session_lock(session_path):
             client, _owned = await self._open(session_path)
@@ -1448,7 +1461,33 @@ class TelethonGateway(TelegramGateway):
                     return
                 await on_message(payload)
 
+            async def raw_handler(event):
+                if on_read is None or event is None:
+                    return
+                outbox_cls = getattr(getattr(tl, "types", None), "UpdateReadHistoryOutbox", None)
+                is_outbox_read = (
+                    isinstance(event, outbox_cls)
+                    if outbox_cls is not None
+                    else event.__class__.__name__ == "UpdateReadHistoryOutbox"
+                )
+                if not is_outbox_read:
+                    return
+                peer = getattr(event, "peer", None)
+                user_id = getattr(peer, "user_id", None)
+                max_id = int(getattr(event, "max_id", 0) or 0)
+                if user_id is None or max_id <= 0:
+                    return
+                res = on_read(
+                    {
+                        "telegram_user_id": int(user_id),
+                        "read_outbox_max_id": max_id,
+                    }
+                )
+                if asyncio.iscoroutine(res):
+                    await res
+
             client.add_event_handler(handler, events.NewMessage(incoming=True))
+            client.add_event_handler(raw_handler, events.Raw)
             try:
                 # Difference only: a long outage can miss updates Telegram already dropped.
                 try:
@@ -1460,6 +1499,7 @@ class TelethonGateway(TelegramGateway):
                 listening_event(self, session_path).set()
             except Exception:
                 client.remove_event_handler(handler)
+                client.remove_event_handler(raw_handler)
                 self._clients.pop(session_path, None)
                 try:
                     if client.is_connected():
@@ -1472,6 +1512,7 @@ class TelethonGateway(TelegramGateway):
             await client.run_until_disconnected()
         finally:
             client.remove_event_handler(handler)
+            client.remove_event_handler(raw_handler)
             self._clients.pop(session_path, None)
             try:
                 if client.is_connected():
@@ -1692,7 +1733,9 @@ class FakeGateway(TelegramGateway):
         self._message_seq = 0
         self._lock = threading.Lock()
         self._listeners = {}
+        self._read_listeners = {}
         self._backlog = {}
+        self._read_backlog = {}
         self._loop = None
 
     def push_private(self, session_path: str, message: dict) -> None:
@@ -1715,20 +1758,47 @@ class FakeGateway(TelegramGateway):
             return
         asyncio.run_coroutine_threadsafe(listener(item), loop).result(timeout=5)
 
-    async def watch_private(self, session_path: str, on_message) -> None:
+    def push_read_outbox(self, session_path: str, peer_id: int, max_id: int) -> None:
+        item = {"telegram_user_id": int(peer_id), "read_outbox_max_id": int(max_id)}
+        with self._lock:
+            listener = self._read_listeners.get(session_path)
+            loop = self._loop
+            if listener is None or loop is None:
+                self._read_backlog.setdefault(session_path, []).append(item)
+                return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            loop.create_task(listener(item))
+            return
+        asyncio.run_coroutine_threadsafe(listener(item), loop).result(timeout=5)
+
+    async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
         self._loop = asyncio.get_running_loop()
         with self._lock:
             self._listeners[session_path] = on_message
+            if on_read is not None:
+                self._read_listeners[session_path] = on_read
             batch = self._backlog.pop(session_path, [])
+            read_batch = self._read_backlog.pop(session_path, []) if on_read is not None else []
         try:
             for item in batch:
                 await on_message(dict(item))
+            if on_read is not None:
+                for r_item in read_batch:
+                    res = on_read(dict(r_item))
+                    if asyncio.iscoroutine(res):
+                        await res
             listening_event(self, session_path).set()
             await asyncio.Future()
         finally:
             with self._lock:
                 if self._listeners.get(session_path) is on_message:
                     self._listeners.pop(session_path, None)
+                if on_read is not None and self._read_listeners.get(session_path) is on_read:
+                    self._read_listeners.pop(session_path, None)
 
     async def session_health(self, session_path: str) -> dict:
         forced = self.health
@@ -1817,6 +1887,8 @@ class FakeGateway(TelegramGateway):
                 row["last_message_at"] = str(item["last_message_at"])
             if "last_from_peer" in item and item.get("last_from_peer") is not None:
                 row["last_from_peer"] = 1 if item.get("last_from_peer") else 0
+            if "read_outbox_max_id" in item and item.get("read_outbox_max_id") is not None:
+                row["read_outbox_max_id"] = max(0, int(item["read_outbox_max_id"]))
             found.append(row)
             if len(found) >= cap:
                 break

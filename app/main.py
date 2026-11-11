@@ -36,6 +36,12 @@ from app.db import (
     utc_now,
 )
 from app.demo import DEMO_SESSION, seed_demo
+from app.funnel_analytics import (
+    apply_read_outbox_update,
+    ensure_funnel_columns,
+    get_outreach_funnel,
+    sync_dialog_read_receipts,
+)
 from app.inbox import (
     apply_incoming,
     get_inbox_counts,
@@ -570,6 +576,7 @@ async def ensure_private_inbox(app, account_id: int) -> None:
             return
         try:
             sync_inbox(app.state.conn, account_id, people[:30])
+            sync_dialog_read_receipts(app.state.conn, account_id, people[:30])
         except (LookupError, ValueError):
             return
         synced.add(account_id)
@@ -611,9 +618,24 @@ async def start_account_watch(app, account_id: int) -> None:
             return
         app.state.inbox_hub.publish(account_id, dialog)
 
+    async def on_read(payload):
+        if not isinstance(payload, dict):
+            return
+        peer_id = payload.get("telegram_user_id")
+        max_id = payload.get("read_outbox_max_id")
+        if peer_id is None or max_id is None:
+            return
+        try:
+            apply_read_outbox_update(app.state.conn, account_id, int(peer_id), int(max_id))
+        except Exception:
+            return
+
     async def runner():
         try:
-            await gateway.watch_private(session_path, on_message)
+            try:
+                await gateway.watch_private(session_path, on_message, on_read=on_read)
+            except TypeError:
+                await gateway.watch_private(session_path, on_message)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -928,6 +950,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     if conn is None:
         conn = connect()
     init_db(conn)
+    ensure_funnel_columns(conn)
     needs_initial_session_backup = False
     if (
         "PYTEST_CURRENT_TEST" not in os.environ
@@ -1216,7 +1239,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             found = await gateway.search_dialogs(account["session_path"], q, limit=30)
         except GatewayError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return remember_dialogs(request.app.state.conn, account_id, found[:30])
+        saved = remember_dialogs(request.app.state.conn, account_id, found[:30])
+        sync_dialog_read_receipts(request.app.state.conn, account_id, found[:30])
+        return saved
 
     @app.post("/api/leads")
     async def leads_create(body: LeadIn, request: Request):
@@ -2146,6 +2171,27 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def analytics_summary(request: Request, period: str = "30d"):
         return _call(get_analytics_summary, request.app.state.conn, period=period)
 
+    @app.get("/api/analytics/outreach-funnel")
+    def analytics_outreach_funnel(
+        request: Request,
+        campaign_id: int | None = None,
+        days: int = 14,
+        stage: str = "all",
+        variant: str = "all",
+        q: str = "",
+        limit: int = 150,
+    ):
+        return _call(
+            get_outreach_funnel,
+            request.app.state.conn,
+            campaign_id=campaign_id,
+            days=days,
+            stage=stage,
+            variant=variant,
+            q=q,
+            limit=limit,
+        )
+
     class AirtableSyncIn(BaseModel):
         direction: str = "both"
 
@@ -2211,6 +2257,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
         if isinstance(res, dict) and res.get("restored"):
             init_db(request.app.state.conn)
+            ensure_funnel_columns(request.app.state.conn)
             restore_disk_sessions(request.app.state.conn)
             gw = getattr(request.app.state, "gateway", None)
             if gw is not None and hasattr(gw, "_session_strings"):

@@ -89,6 +89,7 @@ const SHEET_LABELS = {
   "tool-parser": "Парсер групп",
   calendar: "Календарь",
   analytics: "Аналитика",
+  funnel: "Воронка и Лидген",
 };
 
 const SCHEDULE_DAYS = [
@@ -184,6 +185,14 @@ const state = {
   leadgenStatus: null,
   selectedBuilderAccountIds: null,
   csvHeaders: [],
+  funnelData: null,
+  funnelFilters: {
+    campaignId: "",
+    stage: "all",
+    variant: "all",
+    days: 14,
+    q: "",
+  },
 };
 
 let modalSubmit = null;
@@ -227,6 +236,7 @@ function sheetFromHash(hash) {
   if (clean === "tool-parser") return "tool-parser";
   if (clean === "calendar") return "calendar";
   if (clean === "analytics") return "analytics";
+  if (clean === "funnel") return "funnel";
   return "";
 }
 
@@ -351,6 +361,7 @@ function syncSheetVisibility() {
   const aiBot = document.querySelector("#ai-bot");
   const calendarSec = document.querySelector("#calendar");
   const analyticsSec = document.querySelector("#analytics");
+  const funnelSec = document.querySelector("#funnel");
 
   if (state.viewMode !== "sheet") {
     if (s07) s07.hidden = false;
@@ -375,6 +386,10 @@ function syncSheetVisibility() {
     if (toolParser) toolParser.hidden = active !== "tool-parser";
     if (crmProps) crmProps.hidden = active !== "crm-properties";
     if (aiBot) aiBot.hidden = active !== "ai-bot";
+    if (funnelSec) funnelSec.hidden = active !== "funnel";
+    if (active === "funnel" && typeof loadOutreachFunnel === "function" && !state.funnelData) {
+      loadOutreachFunnel().catch(() => {});
+    }
     return;
   }
 
@@ -416,6 +431,10 @@ function syncSheetVisibility() {
   if (aiBot) aiBot.hidden = active !== "ai-bot";
   if (calendarSec) calendarSec.hidden = active !== "calendar";
   if (analyticsSec) analyticsSec.hidden = active !== "analytics";
+  if (funnelSec) funnelSec.hidden = active !== "funnel";
+  if (active === "funnel" && typeof loadOutreachFunnel === "function" && !state.funnelData) {
+    loadOutreachFunnel().catch(() => {});
+  }
 
   if (active === "s07" || active === "leads") {
     state.bulkHostTarget = active;
@@ -11182,8 +11201,550 @@ function bindCrmAuthEvents() {
   }
 }
 
+const FUNNEL_STAGE_META = [
+  { key: "queued", label: "В очереди", badge: "b-new" },
+  { key: "sent_unread", label: "Отправлено · Не прочитано", badge: "b-wait" },
+  { key: "read_no_reply", label: "Прочитано · Без ответа", badge: "b-talk" },
+  { key: "replied_no_call", label: "Ответил · Без созвона", badge: "b-ok" },
+  { key: "positive_or_call", label: "Интерес / Созвон", badge: "b-won" },
+];
+
+const FUNNEL_STAGE_BADGE_BY_KEY = {
+  queued: "b-new",
+  sent_unread: "b-wait",
+  read_no_reply: "b-talk",
+  replied_no_call: "b-ok",
+  positive_or_call: "b-won",
+};
+
+const FUNNEL_TIER_BADGE = {
+  A: "b-won",
+  B: "b-talk",
+  C: "b-wait",
+};
+
+let funnelSearchTimer = 0;
+
+function normalizeExternalUrl(rawSite) {
+  const clean = String(rawSite || "").trim();
+  if (!clean || !clean.includes(".")) return "";
+  if (/^https?:\/\//i.test(clean)) return clean;
+  return `https://${clean}`;
+}
+
+async function openFunnelLeadDialog(row) {
+  if (!row) return;
+  const dialogId = Number(row.dialog_id || 0);
+  if (dialogId > 0) {
+    const existing = (state.dialogs || []).find((d) => Number(d.id) === dialogId);
+    if (existing) {
+      if (state.inboxChatMode !== "crm") {
+        setInboxChatMode("crm");
+      }
+      activateSheet("inbox");
+      await selectDialog(existing);
+      return;
+    }
+  }
+  await openChat({
+    id: row.lead_id || null,
+    username: row.username || "",
+    name: row.company || row.name || row.username || "Контакт",
+  });
+}
+
+async function loadOutreachFunnel() {
+  const f = state.funnelFilters || {};
+  const params = new URLSearchParams();
+  if (f.campaignId) params.set("campaign_id", String(f.campaignId));
+  params.set("days", String(f.days || 14));
+  params.set("stage", f.stage || "all");
+  params.set("variant", f.variant || "all");
+  if (f.q) params.set("q", f.q);
+  params.set("limit", "150");
+
+  try {
+    const data = await api(`/api/analytics/outreach-funnel?${params.toString()}`);
+    if (data && typeof data === "object") {
+      state.funnelData = data;
+      renderOutreachFunnel(data);
+    }
+    return data;
+  } catch (err) {
+    toast((err && err.message) || "Не удалось загрузить аналитику воронки", "error");
+    return null;
+  }
+}
+
+function renderOutreachFunnel(data) {
+  if (!data || typeof data !== "object") return;
+  const summary = data.summary || {};
+  const stages = summary.stages || {};
+  const tiers = summary.quality_tiers || { A: 0, B: 0, C: 0 };
+  const totalLeads = Number(summary.total_leads || 0);
+  const contactedTotal = Number(summary.contacted_total || 0);
+  const readTotal = Number(summary.read_total || 0);
+  const repliedTotal = Number(summary.replied_total || 0);
+  const positiveTotal = Number(summary.positive_or_call_total || 0);
+  const tierAPct = totalLeads > 0 ? Math.round((Number(tiers.A || 0) / totalLeads) * 100) : 0;
+
+  // Sync campaign dropdown options
+  const campSel = document.querySelector("#funnel-campaign-filter");
+  if (campSel && Array.isArray(data.campaigns)) {
+    const currentVal = String(state.funnelFilters.campaignId || "");
+    const opts = [el("option", { value: "" }, ["Все B2B кампании"])];
+    data.campaigns.forEach((c) => {
+      const suffix = c.is_b2b ? "" : " (вакансии)";
+      opts.push(el("option", { value: String(c.id) }, [`${c.name}${suffix}`]));
+    });
+    campSel.replaceChildren(...opts);
+    campSel.value = currentVal;
+  }
+
+  // Sync variant dropdown options
+  const varSel = document.querySelector("#funnel-variant-filter");
+  if (varSel && Array.isArray(data.variant_stats)) {
+    const currentVar = String(state.funnelFilters.variant || "all");
+    const vOpts = [el("option", { value: "all" }, ["Все варианты"])];
+    data.variant_stats.forEach((v) => {
+      vOpts.push(el("option", { value: v.variant_key }, [`${v.label} (${v.total_leads})`]));
+    });
+    varSel.replaceChildren(...vOpts);
+    if ([...varSel.options].some((o) => o.value === currentVar)) {
+      varSel.value = currentVar;
+    } else {
+      varSel.value = "all";
+    }
+  }
+
+  const stageSel = document.querySelector("#funnel-stage-filter");
+  if (stageSel) {
+    stageSel.value = state.funnelFilters.stage || "all";
+  }
+
+  // SSOT badge
+  const ssotBadge = document.querySelector("#funnel-ssot-badge");
+  if (ssotBadge) {
+    const sumStages = FUNNEL_STAGE_META.reduce((acc, m) => acc + Number(stages[m.key] || 0), 0);
+    ssotBadge.textContent = `Всего в воронке: ${totalLeads} (сумма этапов: ${sumStages})`;
+  }
+
+  // Top 5 KPI cards
+  const setText = (sel, val) => {
+    const n = document.querySelector(sel);
+    if (n) n.textContent = val;
+  };
+  setText("#funnel-kpi-added", `+${summary.added_today || 0} / +${summary.added_7d || 0}`);
+  setText("#funnel-kpi-added-sub", `Сегодня / за 7д · всего ${totalLeads}`);
+
+  setText("#funnel-kpi-quality", `${summary.avg_quality_score ?? 0} / 100`);
+  setText(
+    "#funnel-kpi-quality-sub",
+    `Tier A: ${tiers.A || 0} (${tierAPct}%) · B: ${tiers.B || 0} · C: ${tiers.C || 0}`,
+  );
+
+  setText("#funnel-kpi-read", `${summary.read_rate_pct ?? 0}%`);
+  setText("#funnel-kpi-read-sub", `Прочитали ${readTotal} из ${contactedTotal} отправленных`);
+
+  setText("#funnel-kpi-reply", `${summary.reply_rate_pct ?? 0}%`);
+  setText("#funnel-kpi-reply-sub", `Ответили ${repliedTotal} из ${contactedTotal} отправленных`);
+
+  setText("#funnel-kpi-positive", `${summary.positive_rate_pct ?? 0}%`);
+  setText("#funnel-kpi-positive-sub", `Интерес / созвон: ${positiveTotal} лидов`);
+
+  // Interactive 5-stage bar
+  const stagesBar = document.querySelector("#funnel-stages-bar");
+  if (stagesBar) {
+    const activeStage = state.funnelFilters.stage || "all";
+    const allBtn = el(
+      "button",
+      {
+        type: "button",
+        className: `funnel-stage-pill ${activeStage === "all" ? "is-active" : ""}`,
+        "aria-pressed": activeStage === "all" ? "true" : "false",
+        onclick: () => {
+          state.funnelFilters.stage = "all";
+          loadOutreachFunnel();
+        },
+      },
+      [
+        el("span", { className: "funnel-stage-pill-title" }, ["Все лиды"]),
+        el("strong", { className: "funnel-stage-pill-count" }, [String(totalLeads)]),
+      ],
+    );
+    const pills = [allBtn];
+    FUNNEL_STAGE_META.forEach((m) => {
+      const cnt = Number(stages[m.key] || 0);
+      const pct = totalLeads > 0 ? Math.round((cnt / totalLeads) * 100) : 0;
+      const isAct = activeStage === m.key;
+      pills.push(
+        el(
+          "button",
+          {
+            type: "button",
+            className: `funnel-stage-pill ${isAct ? "is-active" : ""}`,
+            "data-funnel-stage": m.key,
+            "aria-pressed": isAct ? "true" : "false",
+            onclick: () => {
+              state.funnelFilters.stage = isAct ? "all" : m.key;
+              loadOutreachFunnel();
+            },
+          },
+          [
+            el("span", { className: "funnel-stage-pill-title" }, [m.label]),
+            el("div", { className: "funnel-stage-pill-metrics" }, [
+              el("strong", { className: "funnel-stage-pill-count" }, [String(cnt)]),
+              el("span", { className: `badge ${m.badge}` }, [`${pct}%`]),
+            ]),
+          ],
+        ),
+      );
+    });
+    stagesBar.replaceChildren(...pills);
+  }
+
+  // Left block: Daily intake
+  const intakeTbody = document.querySelector("#funnel-daily-intake-tbody");
+  const intakeBadge = document.querySelector("#funnel-intake-badge");
+  const dailyRows = Array.isArray(data.daily_intake) ? data.daily_intake : [];
+  if (intakeBadge) {
+    const sumWindow = dailyRows.reduce((a, r) => a + Number(r.added_count || 0), 0);
+    intakeBadge.textContent = `${dailyRows.length} дн. · +${sumWindow} лидов`;
+  }
+  if (intakeTbody) {
+    if (!dailyRows.length) {
+      intakeTbody.replaceChildren(
+        el("tr", {}, [el("td", { colspan: "4", className: "hint" }, ["Нет добавленных лидов за выбранный срез"])]),
+      );
+    } else {
+      intakeTbody.replaceChildren(
+        ...dailyRows.map((d) => {
+          const srcEntries = Object.entries(d.sources || {}).sort((a, b) => b[1] - a[1]);
+          const srcNodes = srcEntries.slice(0, 3).map(([srcName, cnt]) =>
+            el("span", { className: "funnel-source-chip", title: `${srcName}: ${cnt}` }, [`${srcName}: ${cnt}`]),
+          );
+          return el("tr", {}, [
+            el("td", { className: "funnel-mono" }, [d.date || "—"]),
+            el("td", {}, [el("strong", {}, [String(d.added_count || 0)])]),
+            el("td", {}, [
+              el("span", { className: "badge b-ok" }, [`${d.avg_quality ?? 0}`]),
+              el("span", { className: "hint", style: "margin-left: 6px;" }, [`Tier A: ${d.tier_a_count || 0}`]),
+            ]),
+            el("td", {}, [el("div", { className: "funnel-sources-wrap" }, srcNodes)]),
+          ]);
+        }),
+      );
+    }
+  }
+
+  // Right top block: Step conversion & Drop-off reasons
+  const stepStats = data.step_stats || {};
+  const stepsStrip = document.querySelector("#funnel-steps-strip");
+  if (stepsStrip) {
+    const stepItems = Array.isArray(stepStats.steps) ? stepStats.steps : [];
+    stepsStrip.replaceChildren(
+      ...stepItems.map((s) =>
+        el("div", { className: "funnel-step-chip" }, [
+          el("span", { className: "funnel-step-chip-label" }, [s.label]),
+          el("div", { className: "funnel-step-chip-stats" }, [
+            el("strong", {}, [`Дошли: ${s.reached || 0}`]),
+            el("span", { className: "hint" }, [`Прочит: ${s.read || 0} · Ответы: ${s.replied || 0} (${s.reply_rate_pct ?? 0}%)`]),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  const dropoffHost = document.querySelector("#funnel-dropoff-list");
+  const dropoffBadge = document.querySelector("#funnel-dropoff-badge");
+  const reasons = Array.isArray(stepStats.dropoff_reasons) ? stepStats.dropoff_reasons : [];
+  if (dropoffBadge) {
+    const totalStopped = reasons.reduce((a, r) => a + Number(r.count || 0), 0);
+    dropoffBadge.textContent = `Узких мест: ${totalStopped}`;
+  }
+  if (dropoffHost) {
+    if (!reasons.length) {
+      dropoffHost.replaceChildren(
+        el("p", { className: "hint" }, ["Потерь в активной отправке пока нет (лиды ожидают старта рассылки или уже в целевом статусе)."]),
+      );
+    } else {
+      dropoffHost.replaceChildren(
+        ...reasons.slice(0, 7).map((r) => {
+          const widthPct = Math.max(3, Math.min(100, Number(r.share_pct || 0)));
+          const stBadge = FUNNEL_STAGE_BADGE_BY_KEY[r.stage] || "b-wait";
+          return el(
+            "div",
+            {
+              className: "funnel-dropoff-row",
+              onclick: () => {
+                if (r.stage) {
+                  state.funnelFilters.stage = r.stage;
+                  loadOutreachFunnel();
+                }
+              },
+            },
+            [
+              el("div", { className: "funnel-dropoff-top" }, [
+                el("span", { className: "funnel-dropoff-label" }, [r.reason_label]),
+                el("div", { className: "funnel-dropoff-meta" }, [
+                  el("strong", {}, [String(r.count)]),
+                  el("span", { className: `badge ${stBadge}` }, [`${r.share_pct ?? 0}%`]),
+                ]),
+              ]),
+              el("div", { className: "funnel-dropoff-bar" }, [
+                el("span", { className: "funnel-dropoff-bar-fill", style: `width: ${widthPct}%` }),
+              ]),
+            ],
+          );
+        }),
+      );
+    }
+  }
+
+  // Right bottom block: Variant A/B stats
+  const varTbody = document.querySelector("#funnel-variants-tbody");
+  const variants = Array.isArray(data.variant_stats) ? data.variant_stats : [];
+  if (varTbody) {
+    if (!variants.length) {
+      varTbody.replaceChildren(
+        el("tr", {}, [el("td", { colspan: "6", className: "hint" }, ["Нет вариантов сообщений"])]),
+      );
+    } else {
+      varTbody.replaceChildren(
+        ...variants.map((v) => {
+          const isSelected = state.funnelFilters.variant === v.variant_key;
+          return el(
+            "tr",
+            {
+              className: isSelected ? "funnel-row-active" : "",
+              style: "cursor: pointer;",
+              onclick: () => {
+                state.funnelFilters.variant = isSelected ? "all" : v.variant_key;
+                loadOutreachFunnel();
+              },
+            },
+            [
+              el("td", {}, [
+                el("strong", {}, [v.label]),
+                el("div", { className: "hint funnel-mono" }, [v.variant_key]),
+              ]),
+              el("td", {}, [String(v.queued || 0)]),
+              el("td", {}, [String(v.sent || 0)]),
+              el("td", {}, [`${v.read_rate_pct ?? 0}% (${v.read || 0})`]),
+              el("td", {}, [`${v.reply_rate_pct ?? 0}% (${v.replied || 0})`]),
+              el("td", {}, [
+                el("span", { className: `badge ${v.positive_or_call > 0 ? "b-won" : "b-new"}` }, [
+                  `${v.positive_rate_pct ?? 0}% (${v.positive_or_call || 0})`,
+                ]),
+              ]),
+            ],
+          );
+        }),
+      );
+    }
+  }
+
+  // Detailed Leads Table
+  const leadsTbody = document.querySelector("#funnel-leads-tbody");
+  const leadsBadge = document.querySelector("#funnel-leads-count-badge");
+  const resetBtn = document.querySelector("#funnel-reset-filters-btn");
+  const rows = Array.isArray(data.leads) ? data.leads : [];
+  const filteredTotal = Number(data.filtered_total ?? rows.length);
+
+  if (leadsBadge) {
+    leadsBadge.textContent = `Показано ${rows.length} из ${filteredTotal}`;
+  }
+  if (resetBtn) {
+    const f = state.funnelFilters;
+    const hasFilter = Boolean(f.campaignId || (f.stage && f.stage !== "all") || (f.variant && f.variant !== "all") || f.q);
+    resetBtn.hidden = !hasFilter;
+  }
+
+  if (leadsTbody) {
+    if (!rows.length) {
+      leadsTbody.replaceChildren(
+        el("tr", {}, [
+          el("td", { colspan: "7", className: "hint" }, ["По текущим фильтрам лидов не найдено"]),
+        ]),
+      );
+    } else {
+      leadsTbody.replaceChildren(
+        ...rows.map((item) => {
+          const siteHref = normalizeExternalUrl(item.website);
+          const handleStr = item.username ? `@${item.username}` : "Без @username";
+          const stBadge = FUNNEL_STAGE_BADGE_BY_KEY[item.stage] || "b-new";
+          const tierBadge = FUNNEL_TIER_BADGE[item.quality_tier] || "b-wait";
+
+          const leadCellChildren = [
+            el("div", { className: "funnel-lead-title" }, [
+              el("strong", {}, [item.company || item.name || handleStr]),
+              item.category ? el("span", { className: "funnel-cat-tag" }, [item.category]) : null,
+            ].filter(Boolean)),
+            el("div", { className: "funnel-lead-sub" }, [
+              el("code", { className: "funnel-handle" }, [handleStr]),
+              siteHref
+                ? el(
+                    "a",
+                    {
+                      href: siteHref,
+                      target: "_blank",
+                      rel: "noopener noreferrer",
+                      className: "funnel-site-link",
+                    },
+                    [item.website],
+                  )
+                : null,
+            ].filter(Boolean)),
+          ];
+
+          const variantChildren = [
+            el("div", { className: "funnel-variant-title" }, [item.variant_label || item.variant_key]),
+            item.pain_angle ? el("div", { className: "hint funnel-pain-line" }, [item.pain_angle]) : null,
+          ].filter(Boolean);
+          if (item.step1_preview) {
+            variantChildren.push(
+              el("details", { className: "funnel-step1-details" }, [
+                el("summary", {}, ["Текст Step 1"]),
+                el("div", { className: "funnel-step1-body" }, [item.step1_preview]),
+              ]),
+            );
+          }
+
+          const diagChildren = [
+            el("div", { className: "funnel-reason-text" }, [item.reason_label || "—"]),
+          ];
+          if (item.last_inbound_text) {
+            diagChildren.push(
+              el("blockquote", { className: "funnel-inbound-quote" }, [`«${item.last_inbound_text}»`]),
+            );
+          }
+
+          const actionBtns = [];
+          if (item.dialog_id) {
+            actionBtns.push(
+              el(
+                "button",
+                {
+                  type: "button",
+                  className: "btn primary sm",
+                  onclick: () => openFunnelLeadDialog(item),
+                },
+                ["Диалог →"],
+              ),
+            );
+          } else if (item.username || item.lead_id) {
+            actionBtns.push(
+              el(
+                "button",
+                {
+                  type: "button",
+                  className: "btn secondary sm",
+                  onclick: () => openFunnelLeadDialog(item),
+                },
+                ["Чат"],
+              ),
+            );
+          }
+
+          return el("tr", { "data-funnel-lead-id": String(item.id) }, [
+            el("td", { className: "funnel-col-lead" }, leadCellChildren),
+            el("td", { className: "funnel-col-source" }, [
+              el("div", { className: "funnel-mono" }, [item.added_date || "—"]),
+              el("div", { className: "hint" }, [item.source || "—"]),
+            ]),
+            el("td", { className: "funnel-col-icp" }, [
+              el("div", { className: "funnel-icp-wrap" }, [
+                el("strong", {}, [String(item.quality_score ?? 0)]),
+                el("span", { className: `badge ${tierBadge}` }, [`Tier ${item.quality_tier || "C"}`]),
+              ]),
+            ]),
+            el("td", { className: "funnel-col-variant" }, variantChildren),
+            el("td", { className: "funnel-col-stage" }, [
+              el("span", { className: `badge ${stBadge}` }, [item.stage_label || item.stage]),
+              el("div", { className: "hint", style: "margin-top: 4px;" }, [
+                item.current_step > 0 ? `Касание: Step ${item.current_step}` : "До отправки",
+              ]),
+            ]),
+            el("td", { className: "funnel-col-reason" }, diagChildren),
+            el("td", { className: "funnel-col-action" }, actionBtns.length ? actionBtns : [el("span", { className: "hint" }, ["—"])]),
+          ]);
+        }),
+      );
+    }
+  }
+}
+
+function bindFunnelEvents() {
+  const campSel = document.querySelector("#funnel-campaign-filter");
+  const stageSel = document.querySelector("#funnel-stage-filter");
+  const varSel = document.querySelector("#funnel-variant-filter");
+  const daysSel = document.querySelector("#funnel-days-filter");
+  const searchInput = document.querySelector("#funnel-search-input");
+  const refreshBtn = document.querySelector("#funnel-refresh-btn");
+  const resetBtn = document.querySelector("#funnel-reset-filters-btn");
+
+  if (campSel) {
+    campSel.addEventListener("change", () => {
+      state.funnelFilters.campaignId = campSel.value || "";
+      loadOutreachFunnel();
+    });
+  }
+  if (stageSel) {
+    stageSel.addEventListener("change", () => {
+      state.funnelFilters.stage = stageSel.value || "all";
+      loadOutreachFunnel();
+    });
+  }
+  if (varSel) {
+    varSel.addEventListener("change", () => {
+      state.funnelFilters.variant = varSel.value || "all";
+      loadOutreachFunnel();
+    });
+  }
+  if (daysSel) {
+    daysSel.addEventListener("change", () => {
+      state.funnelFilters.days = Number(daysSel.value || 14);
+      loadOutreachFunnel();
+    });
+  }
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      window.clearTimeout(funnelSearchTimer);
+      funnelSearchTimer = window.setTimeout(() => {
+        state.funnelFilters.q = searchInput.value.trim();
+        loadOutreachFunnel();
+      }, 220);
+    });
+  }
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", async () => {
+      refreshBtn.disabled = true;
+      try {
+        await loadOutreachFunnel();
+        toast("Воронка и метрики лидгена обновлены", "ok");
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    });
+  }
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      state.funnelFilters = {
+        campaignId: "",
+        stage: "all",
+        variant: "all",
+        days: Number(daysSel ? daysSel.value : 14) || 14,
+        q: "",
+      };
+      if (searchInput) searchInput.value = "";
+      loadOutreachFunnel();
+    });
+  }
+}
+
 bindV5Events();
 bindLeadgenEvents();
+bindFunnelEvents();
 bindCrmAuthEvents();
 
 boot();

@@ -64,6 +64,10 @@
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
             Рассылки
           </a>
+          <a href="#funnel" data-sheet-link="funnel" data-sheet="funnel" data-view="funnel">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/></svg>
+            Воронка и Лидген
+          </a>
           <a href="#accounts" data-sheet-link="accounts" data-sheet="accounts">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/></svg>
             Аккаунт
@@ -1934,6 +1938,174 @@
         </div>
 
         <div id="analytics-deep-outreach-box" class="stack" style="margin-top: 16px;"></div>
+      </section>
+
+      <section id="funnel" data-sheet="funnel" data-view="funnel" class="surface-box funnel-section stack" aria-labelledby="funnel-title" hidden>
+        <div class="pane-head funnel-head-bar">
+          <div class="pipeline-title-row">
+            <h2 id="funnel-title">Воронка и Лидген</h2>
+            <span class="badge b-ok">SSOT · Прочтения · A/B Варианты</span>
+            <span id="funnel-ssot-badge" class="badge b-new">Загрузка…</span>
+          </div>
+          <div class="funnel-filters-bar">
+            <label class="funnel-filter-field" for="funnel-campaign-filter">
+              <span class="funnel-filter-caption">Кампания</span>
+              <select id="funnel-campaign-filter" aria-label="Кампания рассылки">
+                <option value="">Все B2B кампании</option>
+              </select>
+            </label>
+            <label class="funnel-filter-field" for="funnel-stage-filter">
+              <span class="funnel-filter-caption">Этап воронки</span>
+              <select id="funnel-stage-filter" aria-label="Этап воронки">
+                <option value="all">Все этапы</option>
+                <option value="queued">В очереди / Не отправлено</option>
+                <option value="sent_unread">Отправлено · Не прочитано</option>
+                <option value="read_no_reply">Прочитано · Без ответа</option>
+                <option value="replied_no_call">Ответил · Без созвона</option>
+                <option value="positive_or_call">Интерес / Созвон / Сделка</option>
+              </select>
+            </label>
+            <label class="funnel-filter-field" for="funnel-variant-filter">
+              <span class="funnel-filter-caption">Вариант сообщения</span>
+              <select id="funnel-variant-filter" aria-label="Вариант сообщения">
+                <option value="all">Все варианты</option>
+              </select>
+            </label>
+            <label class="funnel-filter-field funnel-filter-days" for="funnel-days-filter">
+              <span class="funnel-filter-caption">Окно дней</span>
+              <select id="funnel-days-filter" aria-label="Период притока лидов">
+                <option value="7">7 дней</option>
+                <option value="14" selected>14 дней</option>
+                <option value="30">30 дней</option>
+                <option value="90">90 дней</option>
+              </select>
+            </label>
+            <label class="funnel-filter-field funnel-filter-search" for="funnel-search-input">
+              <span class="funnel-filter-caption">Поиск</span>
+              <input id="funnel-search-input" type="search" autocomplete="off" placeholder="@username, бренд, сайт…">
+            </label>
+            <button type="button" id="funnel-refresh-btn" class="btn secondary sm funnel-refresh-btn">Обновить</button>
+          </div>
+        </div>
+
+        <div id="funnel-kpi-grid" class="funnel-kpi-grid" aria-label="Ключевые показатели воронки">
+          <div class="surface-subcard funnel-kpi-card">
+            <span class="funnel-kpi-label">Добавлено (сегодня / 7д)</span>
+            <strong id="funnel-kpi-added" class="funnel-kpi-value">—</strong>
+            <span id="funnel-kpi-added-sub" class="hint">—</span>
+          </div>
+          <div class="surface-subcard funnel-kpi-card">
+            <span class="funnel-kpi-label">Качество базы ICP</span>
+            <strong id="funnel-kpi-quality" class="funnel-kpi-value">—</strong>
+            <span id="funnel-kpi-quality-sub" class="hint">—</span>
+          </div>
+          <div class="surface-subcard funnel-kpi-card">
+            <span class="funnel-kpi-label">Отправлено → Прочитано</span>
+            <strong id="funnel-kpi-read" class="funnel-kpi-value">—</strong>
+            <span id="funnel-kpi-read-sub" class="hint">—</span>
+          </div>
+          <div class="surface-subcard funnel-kpi-card">
+            <span class="funnel-kpi-label">Ответили (Reply %)</span>
+            <strong id="funnel-kpi-reply" class="funnel-kpi-value">—</strong>
+            <span id="funnel-kpi-reply-sub" class="hint">—</span>
+          </div>
+          <div class="surface-subcard funnel-kpi-card">
+            <span class="funnel-kpi-label">Интерес / Созвоны</span>
+            <strong id="funnel-kpi-positive" class="funnel-kpi-value">—</strong>
+            <span id="funnel-kpi-positive-sub" class="hint">—</span>
+          </div>
+        </div>
+
+        <div id="funnel-stages-bar" class="funnel-stages-bar" role="group" aria-label="Распределение по 5 этапам воронки"></div>
+
+        <div class="funnel-analytics-split">
+          <div class="surface-subcard funnel-panel stack">
+            <div class="subcard-head">
+              <h3>Ежедневный приток и качество лидов</h3>
+              <span id="funnel-intake-badge" class="badge b-new">—</span>
+            </div>
+            <div class="funnel-table-wrap">
+              <table class="funnel-table funnel-compact-table">
+                <thead>
+                  <tr>
+                    <th>Дата</th>
+                    <th>Добавлено</th>
+                    <th>Ср. ICP балл</th>
+                    <th>Источники</th>
+                  </tr>
+                </thead>
+                <tbody id="funnel-daily-intake-tbody">
+                  <tr><td colspan="4" class="hint">Загрузка данных…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="funnel-right-stack stack">
+            <div class="surface-subcard funnel-panel stack">
+              <div class="subcard-head">
+                <h3>Причины остановки в воронке (Обратная связь)</h3>
+                <span id="funnel-dropoff-badge" class="badge b-talk">Диагностика</span>
+              </div>
+              <div id="funnel-steps-strip" class="funnel-steps-strip"></div>
+              <div id="funnel-dropoff-list" class="funnel-dropoff-list">
+                <p class="hint">Загрузка причин…</p>
+              </div>
+            </div>
+
+            <div class="surface-subcard funnel-panel stack">
+              <div class="subcard-head">
+                <h3>Сравнение сообщений и A/B вариантов</h3>
+                <span id="funnel-variants-badge" class="badge b-ok">Конверсия шаблонов</span>
+              </div>
+              <div class="funnel-table-wrap">
+                <table class="funnel-table funnel-compact-table">
+                  <thead>
+                    <tr>
+                      <th>Вариант</th>
+                      <th>В очереди</th>
+                      <th>Отправлено</th>
+                      <th>Прочитано %</th>
+                      <th>Ответили %</th>
+                      <th>Интерес/Созвон %</th>
+                    </tr>
+                  </thead>
+                  <tbody id="funnel-variants-tbody">
+                    <tr><td colspan="6" class="hint">Загрузка вариантов…</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="funnel-leads-card" class="surface-subcard funnel-panel stack">
+          <div class="subcard-head">
+            <div class="row">
+              <h3>Детальный трекинг каждого лида</h3>
+              <span id="funnel-leads-count-badge" class="badge b-new">—</span>
+            </div>
+            <button type="button" id="funnel-reset-filters-btn" class="btn ghost sm" hidden>Сбросить фильтры</button>
+          </div>
+          <div class="funnel-table-wrap">
+            <table class="funnel-table funnel-leads-table">
+              <thead>
+                <tr>
+                  <th>Лид / Продукт</th>
+                  <th>Добавлен / Источник</th>
+                  <th>ICP Качество</th>
+                  <th>Вариант &amp; Текст</th>
+                  <th>Этап воронки</th>
+                  <th>Почему / Диагноз</th>
+                  <th>Действие</th>
+                </tr>
+              </thead>
+              <tbody id="funnel-leads-tbody">
+                <tr><td colspan="7" class="hint">Загрузка списка лидов…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
     </main>
   </div>
