@@ -40,6 +40,7 @@ from leadgen.outreach_copy import (
     first_touch,
     followup_one,
     followup_two,
+    generate_vlad_sonnet_batch,
     infer_lead_audience,
     upgrade_to_vlad_step1,
 )
@@ -467,4 +468,69 @@ def test_ingest_discovered_leads_skips_phantom_email_only_from_campaign_recipien
     assert res["enrolled_in_campaign"] == 0
     rec_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM campaign_recipients").fetchone()["cnt"]
     assert rec_cnt == 0
+
+
+def test_generate_vlad_sonnet_batch_calls_claude_sonnet_5_and_enforces_vlad_format(monkeypatch):
+    import urllib.request
+
+    captured = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "model": "claude-sonnet-5",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    [
+                                        {
+                                            "i": 0,
+                                            "pain": "Saw ReScreen. Native Mac utilities struggle to scale organic reach once launch buzz fades — paid ads eat margin fast. (generated)",
+                                            "pitch": "We run SoftUGC. It's organic distribution using AI short-form video and a network of accounts we own — 183.5M views in 90 days, no shoots, traffic costs 13 to 40x less than standard clippers.",
+                                            "audience": "users",
+                                        }
+                                    ]
+                                )
+                            }
+                        }
+                    ],
+                }
+            ).encode("utf-8")
+
+    def _fake_urlopen(req, context=None, timeout=90):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResp()
+
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-relay-key")
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    out = generate_vlad_sonnet_batch(
+        [
+            {
+                "company": "ReScreen",
+                "category": "Медиа",
+                "website": "rescreen.app",
+                "their_angle": "Native Mac screen recorder for creators",
+            }
+        ]
+    )
+    assert captured["body"]["model"] == "claude-sonnet-5"
+    assert len(out) == 1
+    s1 = out[0]["step1_text"]
+    assert s1.startswith("Hey,\n\nSaw ReScreen.")
+    assert "SoftUGC" in s1 and "183.5M views in 90 days" in s1
+    assert s1.endswith(REVSHARE_OFFER_TEXT)
+    assert "(generated)" not in s1
+    assert "—" not in s1 and "–" not in s1
+    assert out[0]["audience"] == "users"
+
 

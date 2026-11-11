@@ -1011,31 +1011,40 @@ def _first_touch_prompt(lead, russian):
 
 
 def llm_first_touch(lead):
-    """Canonical Vlad first touch (uses Relay Fast LLM only when LEADGEN_FIRST_TOUCH_LLM=1 is explicitly set)."""
+    """Canonical Vlad first touch via claude-sonnet-5 on Relay Fast (falls back to sub-niche template only offline/in tests)."""
     name = (lead.get("name") or "").strip()
     niche = (lead.get("one_liner") or "").strip() or (lead.get("their_angle") or "").strip()
     src = (lead.get("source") or "").strip()
     cat = (lead.get("category") or "").strip()
     site = (lead.get("site") or lead.get("url") or lead.get("project_url") or "").strip()
     ru = wants_russian(lead)
+    llm_disabled = os.environ.get("LEADGEN_FIRST_TOUCH_LLM", "").strip().lower() in {"0", "false", "no"}
     if (
         not ru
-        and os.environ.get("LEADGEN_FIRST_TOUCH_LLM", "").strip().lower() in {"1", "true", "yes"}
+        and not llm_disabled
+        and "PYTEST_CURRENT_TEST" not in os.environ
         and (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY"))
     ):
-        prompt, retry_line = _first_touch_prompt(lead, russian=False)
-        raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=450).strip().strip('"')
-        if re.search(r"[А-Яа-яЁё]", raw):
-            raw = llm_chat([{"role": "user", "content": prompt + retry_line}], max_tokens=450).strip().strip('"')
-        return upgrade_to_vlad_step1(
-            raw,
-            company=name,
-            name=lead.get("founder_name") or name,
-            site=site,
-            category=cat,
-            their_angle=niche,
-            source=src,
+        try:
+            from outreach_copy import generate_vlad_sonnet_batch
+        except ImportError:
+            from leadgen.outreach_copy import generate_vlad_sonnet_batch
+        res = generate_vlad_sonnet_batch(
+            [
+                {
+                    "company": name,
+                    "name": lead.get("founder_name") or name,
+                    "category": cat,
+                    "website": site,
+                    "their_angle": (lead.get("site_text") or niche)[:700],
+                    "source": src,
+                }
+            ]
         )
+        if res and res[0].get("step1_text"):
+            if res[0].get("audience"):
+                lead["audience"] = res[0]["audience"]
+            return res[0]["step1_text"]
     return template_first_touch(
         name,
         niche,

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Canonical B2B SoftUGC outreach templates (Vlad's 3-step sequence). No model calls and no site links."""
+"""Canonical B2B SoftUGC outreach generator (Vlad's 3-step sequence via claude-sonnet-5 + deterministic fallback)."""
 from __future__ import annotations
 
+import json
+import os
 import re
 from urllib.parse import urlparse
 
@@ -692,6 +694,138 @@ def scenario_message(scenario: str, product: str, niche: str = "", russian: bool
     if scenario == "price":
         return _price(product, russian)
     raise ValueError(f"unknown scenario: {scenario}")
+
+
+VLAD_SONNET_SYSTEM_PROMPT = (
+    "You write B2B cold Telegram DMs for SoftUGC in natural founder-to-founder English.\n"
+    "Reference gold-standard example approved by Vlad:\n"
+    "Paragraph 2 (pain):\n"
+    "\"Saw Crypto Executives. You're probably running into the same thing most agencies hit: "
+    "every new client means more manual BD, and outreach just scales 1:1 with your hours. "
+    "Makes it tough to get consistent deal flow when you're always starting from scratch.\"\n"
+    "Paragraph 3 (SoftUGC pitch):\n"
+    "\"We run SoftUGC. It's organic distribution using AI short-form video and a network of accounts we own. "
+    "Works as a growth arm that runs itself: 183.5M views in 90 days, no shoots, traffic costs 13 to 40x less than standard clippers.\"\n\n"
+    "Hard rules for EVERY item:\n"
+    "1. \"pain\": 2 short, concrete sentences in English. If \"brand\" is non-empty, start with \"Saw <brand>.\" "
+    "(if \"brand\" is empty, start with \"Came across what you're building.\"). Diagnose the REAL acquisition/distribution "
+    "bottleneck specific to THIS exact product (from what_they_do & website) - never paste their bio/slogan back verbatim, "
+    "never compliment them, NO em-dashes (— or –), NO placeholders, NO \"(generated)\" label, ZERO Cyrillic.\n"
+    "2. \"pitch\": 2 short sentences in English presenting SoftUGC lightly tailored to how organic AI short-form video + "
+    "our owned account network drives their specific funnel. MUST keep exact facts: \"SoftUGC\", \"183.5M views in 90 days\", "
+    "\"no shoots\", \"13 to 40x less than standard clippers\". NO em-dashes (— or –).\n"
+    "3. \"audience\": pick the single most accurate noun for their end customers from STRICTLY "
+    "[\"buyers\", \"students\", \"users\", \"players\", \"listeners\"].\n\n"
+    "Return ONLY a valid JSON array: [{\"i\": 0, \"pain\": \"...\", \"pitch\": \"...\", \"audience\": \"users\"}, ...]"
+)
+
+
+def generate_vlad_sonnet_batch(
+    leads: list[dict],
+    *,
+    model: str = "claude-sonnet-5",
+    timeout: int = 90,
+) -> list[dict[str, str]]:
+    """Generate individualized Vlad Step 1 + Step 2 {audience} for a batch of leads via claude-sonnet-5 on Relay Fast."""
+    import urllib.request
+
+    if not leads:
+        return []
+
+    key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
+    base = (os.environ.get("LLM_BASE_URL") or "https://relay.fast/v1").rstrip("/")
+    if not key:
+        raise RuntimeError("RELAYFAST_API_KEY not set")
+
+    items = []
+    brands = []
+    for idx, l in enumerate(leads):
+        raw_comp = str(l.get("company") or l.get("name") or "").strip()
+        site = str(l.get("website") or l.get("site") or "").strip()
+        angle = str(l.get("their_angle") or l.get("one_liner") or "").strip()
+        brand = clean_brand_name(raw_comp, site=site, their_angle=angle)
+        brands.append(brand)
+        items.append(
+            {
+                "i": idx,
+                "brand": brand,
+                "category": str(l.get("category") or "").strip(),
+                "website": site,
+                "what_they_do": angle[:600],
+            }
+        )
+
+    try:
+        from leadgen import relay_route
+    except ImportError:
+        import relay_route  # type: ignore[no-redef]
+
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": VLAD_SONNET_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+            ],
+            "temperature": 0.4,
+            "max_tokens": max(600, 380 * len(items)),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, context=relay_route._ssl_context(), timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    content = str(payload["choices"][0]["message"]["content"] or "").strip()
+    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.MULTILINE).strip()
+    m = re.search(r"\[.*\]", content, flags=re.DOTALL)
+    if not m:
+        raise RuntimeError(f"claude-sonnet-5 returned non-JSON: {content[:200]}")
+    parsed = json.loads(m.group(0))
+    by_i = {int(obj.get("i", -1)): obj for obj in parsed if isinstance(obj, dict)}
+
+    out: list[dict[str, str]] = []
+    for idx, l in enumerate(leads):
+        obj = by_i.get(idx) or {}
+        pain = re.sub(r"\s*[—–]\s*", ": ", str(obj.get("pain") or "").strip())
+        pitch = re.sub(r"\s*[—–]\s*", ": ", str(obj.get("pitch") or "").strip())
+        pain = re.sub(r"\s*\(generated\)\s*", "", pain, flags=re.I).strip()
+        pitch = re.sub(r"\s*\(generated\)\s*", "", pitch, flags=re.I).strip()
+        aud = str(obj.get("audience") or "").strip().lower()
+        if aud not in VALID_AUDIENCES:
+            aud = infer_lead_audience(
+                category=str(l.get("category") or ""),
+                company=brands[idx] or str(l.get("company") or ""),
+                their_angle=str(l.get("their_angle") or ""),
+                site=str(l.get("website") or ""),
+            )
+
+        if (
+            pain
+            and pitch
+            and "183.5" in pitch
+            and "softugc" in pitch.lower()
+            and not _CYRILLIC_RE.search(pain + " " + pitch)
+            and not _PLACEHOLDER_RE.search(pain + " " + pitch)
+        ):
+            step1_text = f"Hey,\n\n{pain}\n\n{pitch}\n\n{REVSHARE_OFFER_TEXT}"
+        else:
+            step1_text = first_touch(
+                brands[idx] or str(l.get("company") or l.get("name") or ""),
+                str(l.get("their_angle") or ""),
+                russian=False,
+                source=str(l.get("source") or ""),
+                category=str(l.get("category") or ""),
+                site=str(l.get("website") or ""),
+            )
+        out.append({"step1_text": step1_text, "audience": aud})
+    return out
 
 
 def big_client_offer() -> str:
