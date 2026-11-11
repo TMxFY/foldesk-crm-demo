@@ -746,8 +746,12 @@ def get_outreach_funnel(
             str(rd.get("created_at") or "")[:10],
         ) or today_str
 
-        # Match linked dialogs (deduplicated, prioritizing assigned/campaign account)
-        pref_acc = rd.get("assigned_account_id") or camp_info.get("account_id")
+        # Match linked dialogs (deduplicated, prioritizing sent/assigned/campaign account)
+        pref_acc = (
+            rd.get("sent_account_id")
+            or rd.get("assigned_account_id")
+            or camp_info.get("account_id")
+        )
         candidate_dlgs: list[dict] = []
         seen_dids: set[int] = set()
 
@@ -765,7 +769,9 @@ def get_outreach_funnel(
         if rd.get("lead_id") is not None:
             _add_dlgs(dialogs_by_lead_id.get(int(rd["lead_id"])))
         if rd.get("telegram_user_id") is not None:
-            _add_dlgs(dialogs_by_peer_id.get(int(rd["telegram_user_id"])))
+            tid_int = int(rd["telegram_user_id"])
+            if tid_int > 0 and not (900000 <= tid_int <= 999999):
+                _add_dlgs(dialogs_by_peer_id.get(tid_int))
         if username:
             _add_dlgs(dialogs_by_uname.get(username.lower()))
         if rd.get("phone"):
@@ -1240,12 +1246,17 @@ def sync_untouched_recipient_drafts(
     updated_ids: set[int] = set()
     skipped = 0
 
+    from app.outreach import _clean_step1_text
+
     for obj in items:
         if not isinstance(obj, dict):
             skipped += 1
             continue
-        step1_text = str(obj.get("step1_text") or "").strip()
-        if not step1_text:
+        comp_hint = str(obj.get("company") or "").strip()
+        raw_s1 = str(obj.get("step1_text") or "").strip()
+        step1_clean, s1_err = _clean_step1_text(raw_s1, comp_hint)
+        step1_text = (step1_clean or "").strip()
+        if not step1_text or s1_err:
             skipped += 1
             continue
 
@@ -1271,7 +1282,6 @@ def sync_untouched_recipient_drafts(
         aud = str(obj.get("audience") or "").strip().lower() or "users"
         vkey = str(obj.get("variant_key") or "sonnet5_vlad_v1").strip()
         pangle = str(obj.get("pain_angle") or "").strip() or None
-        f1_text = str(obj.get("followup1_text") or "").strip() or None
 
         for target in targets:
             tid = int(target["id"])
@@ -1297,7 +1307,7 @@ def sync_untouched_recipient_drafts(
                     their_angle = ?,
                     hook = NULL,
                     step1_text = ?,
-                    step2_text = ?,
+                    step2_text = NULL,
                     step3_text = NULL,
                     variant_key = ?,
                     pain_angle = ?,
@@ -1314,7 +1324,6 @@ def sync_untouched_recipient_drafts(
                     comp,
                     t_angle,
                     step1_text,
-                    f1_text,
                     vkey,
                     pangle,
                     json.dumps(extra, ensure_ascii=False),

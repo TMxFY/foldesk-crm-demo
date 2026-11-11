@@ -455,7 +455,13 @@ def main() -> int:
         gen = results_by_key.get(hk) or {"step1_text": "", "audience": ""}
         step1_text = gen["step1_text"]
         aud = gen["audience"]
-        f1_text = followup_one({"category": item.get("category") or ""}, audience=aud)
+        f1_text = followup_one(
+            item.get("company") or "",
+            item.get("clean_angle") or "",
+            audience=aud,
+            category=item.get("category") or "",
+            site=item.get("website") or "",
+        )
         f2_text = VLAD_STEP3_TEXT
         brand = clean_brand_name(
             item.get("company") or item.get("name") or "",
@@ -529,29 +535,63 @@ def main() -> int:
             extra["audience"] = obj["audience"]
             extra["variant_key"] = obj["variant_key"]
             extra["pain_angle"] = obj["pain_angle"]
-            conn.execute(
-                """
-                UPDATE campaign_recipients
-                SET company = ?,
-                    their_angle = ?,
-                    step1_text = ?,
-                    step2_text = NULL,
-                    step3_text = NULL,
-                    extra_json = ?,
-                    status = 'pending',
-                    error_text = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    obj["company"] or item.get("company"),
-                    obj["their_angle"] or None,
-                    obj["step1_text"],
-                    json.dumps(extra, ensure_ascii=False),
-                    now,
-                    rid,
-                ),
-            )
+            rec_cols = {
+                str(r[1]) for r in conn.execute("PRAGMA table_info(campaign_recipients)").fetchall()
+            }
+            if "variant_key" in rec_cols and "pain_angle" in rec_cols:
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET company = ?,
+                        their_angle = ?,
+                        hook = NULL,
+                        step1_text = ?,
+                        step2_text = NULL,
+                        step3_text = NULL,
+                        variant_key = ?,
+                        pain_angle = ?,
+                        extra_json = ?,
+                        status = 'pending',
+                        error_text = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        obj["company"] or item.get("company"),
+                        obj["their_angle"] or None,
+                        obj["step1_text"],
+                        obj["variant_key"],
+                        obj["pain_angle"],
+                        json.dumps(extra, ensure_ascii=False),
+                        now,
+                        rid,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET company = ?,
+                        their_angle = ?,
+                        hook = NULL,
+                        step1_text = ?,
+                        step2_text = NULL,
+                        step3_text = NULL,
+                        extra_json = ?,
+                        status = 'pending',
+                        error_text = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        obj["company"] or item.get("company"),
+                        obj["their_angle"] or None,
+                        obj["step1_text"],
+                        json.dumps(extra, ensure_ascii=False),
+                        now,
+                        rid,
+                    ),
+                )
         conn.commit()
         print(f"Saved {len(items_out)} claude-sonnet-5 drafts into {args.db} (campaign pause state untouched).")
     else:

@@ -678,16 +678,85 @@ async def stop_inbox_watches(app) -> None:
             pass
 
 
+async def sync_live_tg_read_receipts_once(
+    app: FastAPI, *, account_id: int | None = None, limit: int = 60
+) -> dict:
+    gateway = _resolve_app_gateway(app, "telegram")
+    if gateway is None or not hasattr(gateway, "load_inbox"):
+        return {"ok": False, "synced_accounts": 0, "updated_recipients": 0}
+    conn = app.state.conn
+    if account_id is not None:
+        acc_rows = conn.execute(
+            "SELECT id, session_path, provider, status FROM accounts WHERE id = ? AND status = 'connected'",
+            (int(account_id),),
+        ).fetchall()
+    else:
+        acc_rows = conn.execute(
+            "SELECT id, session_path, provider, status FROM accounts WHERE status = 'connected' ORDER BY id"
+        ).fetchall()
+    tg_accs = [
+        r
+        for r in acc_rows
+        if str(r["provider"] or "telegram").strip().lower() == "telegram"
+        and not str(r["session_path"] or "").startswith("data/sessions/demo")
+    ]
+    synced_accs = 0
+    updated_recs = 0
+    for acc in tg_accs:
+        aid = int(acc["id"])
+        try:
+            people = await gateway.load_inbox(acc["session_path"], limit=limit)
+        except Exception:
+            continue
+        if not isinstance(people, list):
+            continue
+        try:
+            sync_inbox(conn, aid, people[:limit])
+            res = sync_dialog_read_receipts(conn, aid, people[:limit])
+            synced_accs += 1
+            if isinstance(res, dict):
+                updated_recs += int(res.get("updated_recipients") or 0)
+            else:
+                updated_recs += int(res or 0)
+        except Exception:
+            continue
+    return {
+        "ok": True,
+        "synced_accounts": synced_accs,
+        "updated_recipients": updated_recs,
+    }
+
+
 async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
+    tick_counter = 0
+    read_cursor = 0
     while True:
         try:
             await asyncio.sleep(interval_seconds)
+            tick_counter += 1
             tick_res = await run_autopilot_tick(
                 app.state.conn,
                 gateway=_resolve_app_gateway(app, "telegram"),
                 wa_gateway=_resolve_app_gateway(app, "whatsapp"),
             )
-            if isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0:
+            dirty = isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
+            if tick_counter % 8 == 0 and "PYTEST_CURRENT_TEST" not in os.environ:
+                tg_rows = app.state.conn.execute(
+                    "SELECT id, session_path, provider FROM accounts WHERE status = 'connected' ORDER BY id"
+                ).fetchall()
+                tg_ids = [
+                    int(r["id"])
+                    for r in tg_rows
+                    if str(r["provider"] or "telegram").strip().lower() == "telegram"
+                    and not str(r["session_path"] or "").startswith("data/sessions/demo")
+                ]
+                if tg_ids:
+                    aid = tg_ids[read_cursor % len(tg_ids)]
+                    read_cursor += 1
+                    rr = await sync_live_tg_read_receipts_once(app, account_id=aid, limit=60)
+                    if int(rr.get("updated_recipients") or 0) > 0:
+                        dirty = True
+            if dirty:
                 from app.cloud_persistence import schedule_cloud_backup
 
                 schedule_cloud_backup(app)
@@ -923,6 +992,14 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         await asyncio.wait_for(bt, timeout=10.0)
                     except (asyncio.CancelledError, Exception):
                         pass
+            try:
+                from app import outreach as _outreach_mod
+
+                obt = getattr(_outreach_mod, "_CLOUD_BACKUP_BG_TASK", None)
+                if obt is not None and not obt.done():
+                    await asyncio.wait_for(obt, timeout=10.0)
+            except (asyncio.CancelledError, Exception):
+                pass
             if (
                 live_tg_enabled
                 and "PYTEST_CURRENT_TEST" not in os.environ
@@ -2192,15 +2269,48 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             limit=limit,
         )
 
+    def _require_admin_or_mcp_auth(request: Request) -> None:
+        import hmac as _hmac
+        from app.crm_auth import extract_request_token, get_user_by_token
+
+        auth_hdr = (request.headers.get("authorization") or "").strip()
+        mcp_key = (os.environ.get("MCP_API_KEY") or "").strip()
+        if mcp_key and auth_hdr.lower().startswith("bearer "):
+            provided = auth_hdr[7:].strip()
+            if provided and _hmac.compare_digest(provided, mcp_key):
+                return
+        tok = extract_request_token(request)
+        if tok and get_user_by_token(request.app.state.conn, tok) is not None:
+            return
+        raise HTTPException(status_code=401, detail="Требуется авторизация CRM или MCP_API_KEY")
+
+    @app.post("/api/analytics/sync-read-receipts")
+    async def analytics_sync_read_receipts(request: Request, account_id: int | None = None):
+        _require_admin_or_mcp_auth(request)
+        res = await sync_live_tg_read_receipts_once(
+            request.app, account_id=account_id, limit=80
+        )
+        if int(res.get("updated_recipients") or 0) > 0:
+            from app.cloud_persistence import schedule_cloud_backup
+
+            schedule_cloud_backup(request.app)
+        return res
+
     @app.post("/api/campaigns/sync-recipient-drafts")
     async def campaigns_sync_recipient_drafts(request: Request):
         from app.funnel_analytics import sync_untouched_recipient_drafts
 
+        _require_admin_or_mcp_auth(request)
         payload = await request.json()
         items = payload.get("items") if isinstance(payload, dict) else None
         if not isinstance(items, list):
             raise HTTPException(status_code=400, detail="items list is required")
-        return _call(sync_untouched_recipient_drafts, request.app.state.conn, items)
+        res = _call(sync_untouched_recipient_drafts, request.app.state.conn, items)
+        if int(res.get("updated") or 0) > 0 and "PYTEST_CURRENT_TEST" not in os.environ:
+            from app.cloud_persistence import schedule_cloud_backup
+
+            schedule_cloud_backup(request.app)
+        return res
 
     class AirtableSyncIn(BaseModel):
         direction: str = "both"

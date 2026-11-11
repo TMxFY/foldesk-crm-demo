@@ -2550,7 +2550,14 @@ async def run_campaign_batch(
             continue
         if acc_raw.get("status") != "connected":
             continue
-        if str(acc_raw.get("health") or "active") in ("unauthorized", "banned", "frozen"):
+        health_val = str(acc_raw.get("health") or "active")
+        is_spambot_warm_only = (
+            health_val == "frozen"
+            and "@spambot" in str(acc_raw.get("last_error") or "").lower()
+        )
+        if health_val in ("unauthorized", "banned") or (
+            health_val == "frozen" and not is_spambot_warm_only
+        ):
             continue
         acc_pub = public_account(acc_raw)
         connected_states.append(
@@ -2562,6 +2569,7 @@ async def run_campaign_batch(
                 "sent_today": int(acc_pub["sent_today"]),
                 "sent_in_batch": 0,
                 "disabled": False,
+                "spambot_warm_only": is_spambot_warm_only,
             }
         )
 
@@ -2699,13 +2707,19 @@ async def run_campaign_batch(
         step_image_url = (step.get("image_url") or "").strip() or None
 
         if step_idx == 0:
-            # Guard 3a: Anti-duplicate across campaign_recipients (normalized username or phone)
+            # Guard 3a: Anti-duplicate across campaign_recipients (username, real telegram_user_id, lead_id, or normalized phone)
             has_already_contacted_dup = False
-            if dedup_scope_cids and (clean_rec_uname or clean_rec_phone):
+            norm_rec_phone_digits = re.sub(r"\D+", "", clean_rec_phone)
+            if dedup_scope_cids and (
+                clean_rec_uname
+                or norm_rec_phone_digits
+                or real_rec_peer_id is not None
+                or rec_lead_id is not None
+            ):
                 ph_scope = ",".join("?" for _ in dedup_scope_cids)
                 cand_rows = conn.execute(
                     f"""
-                    SELECT id, username, phone
+                    SELECT id, username, phone, telegram_user_id, lead_id
                     FROM campaign_recipients
                     WHERE id != ?
                       AND campaign_id IN ({ph_scope})
@@ -2713,24 +2727,27 @@ async def run_campaign_batch(
                           COALESCE(current_step, 0) >= 1
                           OR status IN ('in_progress', 'completed', 'replied')
                       )
-                      AND (
-                          (? != '' AND username IS NOT NULL AND trim(username) != '')
-                          OR (? != '' AND coalesce(phone, '') = ?)
-                      )
                     """,
                     (
                         int(rec["id"]),
                         *dedup_scope_cids,
-                        clean_rec_uname,
-                        clean_rec_phone,
-                        clean_rec_phone,
                     ),
                 ).fetchall()
                 for crow in cand_rows:
                     other_u = (_clean_handle(crow["username"]) or "").lower()
-                    other_p = str(crow["phone"] or "").strip()
-                    if (clean_rec_uname and other_u == clean_rec_uname) or (
-                        clean_rec_phone and other_p == clean_rec_phone
+                    other_p_digits = re.sub(r"\D+", "", str(crow["phone"] or ""))
+                    other_tid = crow["telegram_user_id"]
+                    other_real_tid = (
+                        int(other_tid)
+                        if other_tid is not None and not _is_synthetic_peer_id(other_tid)
+                        else None
+                    )
+                    other_lid = int(crow["lead_id"]) if crow["lead_id"] is not None else None
+                    if (
+                        (clean_rec_uname and other_u == clean_rec_uname)
+                        or (len(norm_rec_phone_digits) >= 7 and other_p_digits == norm_rec_phone_digits)
+                        or (real_rec_peer_id is not None and other_real_tid == real_rec_peer_id)
+                        or (rec_lead_id is not None and other_lid == rec_lead_id)
                     ):
                         has_already_contacted_dup = True
                         break
@@ -2748,19 +2765,19 @@ async def run_campaign_batch(
                 conn.commit()
                 continue
 
-            # Guard 3b: Anti-duplicate identical outgoing text already in messages
+            # Guard 3b: Anti-duplicate outgoing outreach message already in messages
             stripped_rendered = rendered_text.strip()
-            if stripped_rendered and (clean_rec_uname or rec_peer_str or clean_rec_phone):
+            if stripped_rendered and (clean_rec_uname or rec_peer_str or norm_rec_phone_digits):
                 cand_msgs = conn.execute(
                     """
-                    SELECT d.account_id, m.sent_at, m.text
+                    SELECT d.account_id, d.phone, m.sent_at, m.text
                     FROM dialogs d
                     JOIN messages m ON m.dialog_id = d.id
                     WHERE m.direction = 'out'
                       AND (
                           (? != '' AND lower(trim(coalesce(d.username, ''), '@')) = lower(?))
                           OR (? != '' AND d.peer_id = ?)
-                          OR (? != '' AND coalesce(d.phone, '') = ?)
+                          OR (? != '' AND replace(replace(replace(coalesce(d.phone, ''), '+', ''), ' ', ''), '-', '') = ?)
                       )
                     ORDER BY m.sent_at DESC, m.id DESC
                     """,
@@ -2769,12 +2786,25 @@ async def run_campaign_batch(
                         clean_rec_uname,
                         rec_peer_str,
                         real_rec_peer_id,
-                        clean_rec_phone,
-                        clean_rec_phone,
+                        norm_rec_phone_digits,
+                        norm_rec_phone_digits,
                     ),
                 ).fetchall()
+                camp_low = str(camp.get("name") or "").lower()
+                is_vac_camp = "ваканс" in camp_low or "vacanc" in camp_low
                 dup_msg = next(
-                    (m for m in cand_msgs if str(m["text"] or "").strip() == stripped_rendered),
+                    (
+                        m
+                        for m in cand_msgs
+                        if str(m["text"] or "").strip() == stripped_rendered
+                        or (
+                            not is_vac_camp
+                            and any(
+                                marker in str(m["text"] or "").lower()
+                                for marker in ("softugc", "183.5m", "creatoros", "revshare or cpa")
+                            )
+                        )
+                    ),
                     None,
                 )
                 if dup_msg is not None:
@@ -2871,7 +2901,9 @@ async def run_campaign_batch(
             available = [
                 st
                 for st in connected_states
-                if not st.get("disabled") and st["sent_today"] < st["daily_limit"]
+                if not st.get("disabled")
+                and st["sent_today"] < st["daily_limit"]
+                and (step_idx >= 1 or not st.get("spambot_warm_only"))
             ]
             if not available:
                 no_accounts_left = True
@@ -2894,7 +2926,11 @@ async def run_campaign_batch(
                         chosen_state = None
             elif assigned_id is not None and int(assigned_id) in state_by_id:
                 pinned_state = state_by_id[int(assigned_id)]
-                if not pinned_state.get("disabled") and pinned_state["sent_today"] < pinned_state["daily_limit"]:
+                if (
+                    not pinned_state.get("disabled")
+                    and not pinned_state.get("spambot_warm_only")
+                    and pinned_state["sent_today"] < pinned_state["daily_limit"]
+                ):
                     chosen_state = pinned_state
                 else:
                     chosen_state = min(

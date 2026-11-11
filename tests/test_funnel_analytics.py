@@ -597,3 +597,86 @@ def test_live_watch_and_sync_dialog_read_receipts(tmp_path):
     assert sync_cnt == 0  # already stamped read_at above
     d_row = conn.execute("SELECT read_outbox_max_id FROM dialogs WHERE id = ?", (did,)).fetchone()
     assert int(d_row["read_outbox_max_id"]) == 60
+
+
+def test_sync_recipient_drafts_requires_auth_and_protects_contacted_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_API_KEY", "test-mcp-secret-999")
+    conn = connect(tmp_path / "draft_sync.db")
+    init_db(conn)
+    ensure_funnel_columns(conn)
+    now = utc_now()
+
+    acc_id = _seed_account(conn)
+    cid = _seed_campaign(conn, acc_id, name="SoftUGC — База Все2")
+
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (campaign_id, username, company, current_step, status, created_at, updated_at)
+        VALUES (?, 'fresh_founder', 'FreshCo', 0, 'pending', ?, ?)
+        """,
+        (cid, now, now),
+    )
+    fresh_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (campaign_id, username, company, step1_text, current_step, status, last_sent_at, created_at, updated_at)
+        VALUES (?, 'already_replied', 'OldCo', 'Original sent text', 1, 'replied', ?, ?, ?)
+        """,
+        (cid, now, now, now),
+    )
+    old_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    conn.commit()
+
+    app = create_app(conn=conn)
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        unauth = client.post(
+            "/api/campaigns/sync-recipient-drafts",
+            json={"items": [{"recipient_id": fresh_id, "step1_text": "Hey,\n\nTest"}]},
+        )
+        assert unauth.status_code == 401
+
+        auth_res = client.post(
+            "/api/campaigns/sync-recipient-drafts",
+            headers={"Authorization": "Bearer test-mcp-secret-999"},
+            json={
+                "items": [
+                    {
+                        "recipient_id": fresh_id,
+                        "username": "fresh_founder",
+                        "company": "FreshCo",
+                        "step1_text": "Hey,\n\nSaw FreshCo.\n\nWe run SoftUGC: 183.5M views.\n\nWe work on revshare or CPA and you only cover the production costs. Want to see 3 example reels for your brand, to check how it could work for you?",
+                        "audience": "buyers",
+                        "variant_key": "sonnet5_vlad_v1",
+                        "pain_angle": "ecom_creative_fatigue",
+                    },
+                    {
+                        "recipient_id": old_id,
+                        "username": "already_replied",
+                        "step1_text": "SHOULD NOT OVERWRITE",
+                    },
+                ]
+            },
+        )
+        assert auth_res.status_code == 200
+        body = auth_res.json()
+        assert body["updated"] == 1
+        assert body["skipped"] == 1
+
+    fresh_row = conn.execute(
+        "SELECT step1_text, step2_text, variant_key, pain_angle, status FROM campaign_recipients WHERE id = ?",
+        (fresh_id,),
+    ).fetchone()
+    assert "SoftUGC" in fresh_row["step1_text"]
+    assert fresh_row["step2_text"] is None
+    assert fresh_row["variant_key"] == "sonnet5_vlad_v1"
+    assert fresh_row["pain_angle"] == "ecom_creative_fatigue"
+
+    old_row = conn.execute(
+        "SELECT step1_text, status FROM campaign_recipients WHERE id = ?",
+        (old_id,),
+    ).fetchone()
+    assert old_row["step1_text"] == "Original sent text"
+    assert old_row["status"] == "replied"
