@@ -8,9 +8,11 @@ from pathlib import Path
 import random
 import re
 import sqlite3
+import time
 from zoneinfo import ZoneInfo
 from typing import Any
 
+from app.accounts import _is_spambot_restriction_error
 from app.accounts import _load as load_account
 from app.accounts import _public as public_account
 from app.accounts import increment_daily_sent
@@ -840,6 +842,53 @@ def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> in
     return healed
 
 
+_SPAMBOT_PROBE_CACHE: dict[tuple[str, int, str], tuple[float, dict]] = {}
+_SPAMBOT_PROBE_COOLDOWN_SEC = 600.0
+_SPAMBOT_UNKNOWN_COOLDOWN_SEC = 120.0
+_SPAMBOT_WARM_RECHECK_SEC = 3600.0
+
+
+def _spambot_cache_key(conn, account_id: int, session_path: str) -> tuple[str, int, str]:
+    try:
+        db_row = conn.execute("PRAGMA database_list").fetchone()
+        db_ident = str(db_row[2] or id(conn)) if db_row is not None else str(id(conn))
+    except Exception:
+        db_ident = str(id(conn))
+    return (db_ident, int(account_id), str(session_path))
+
+
+def _cleanup_empty_step0_dialog(conn, step_idx: int, dialog: dict | None) -> None:
+    if step_idx != 0 or dialog is None or dialog.get("last_message_at"):
+        return
+    msg_cnt = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE dialog_id = ?",
+        (dialog["id"],),
+    ).fetchone()[0]
+    if int(msg_cnt or 0) == 0:
+        conn.execute("UPDATE leads SET dialog_id = NULL WHERE dialog_id = ?", (dialog["id"],))
+        conn.execute("DELETE FROM dialogs WHERE id = ?", (dialog["id"],))
+
+
+def _is_spambot_or_peerflood_error(exc: Exception) -> bool:
+    cause = getattr(exc, "__cause__", None)
+    blob = (
+        f"{exc.__class__.__name__} "
+        f"{cause.__class__.__name__ if cause is not None else ''} "
+        f"{cause or ''} {exc}"
+    ).casefold()
+    return any(
+        marker in blob
+        for marker in (
+            "spambot",
+            "spam-reported",
+            "cannot message non-contacts",
+            "peerspam",
+            "peerflood",
+            "peer_flood",
+        )
+    )
+
+
 def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
     text = str(exc or "").strip()
     blob = f"{exc.__class__.__name__} {text}".casefold()
@@ -1409,6 +1458,23 @@ def update_campaign(
             )
     conn.commit()
     return get_campaign(conn, campaign_id)
+
+
+def delete_campaign(conn, campaign_id: int) -> dict:
+    row = conn.execute(
+        "SELECT id, name, status FROM campaigns WHERE id = ?",
+        (int(campaign_id),),
+    ).fetchone()
+    if row is None:
+        raise LookupError("campaign")
+    if str(row["status"] or "") == "running":
+        raise ValueError("Сначала поставьте рассылку на паузу перед удалением")
+    cid = int(campaign_id)
+    conn.execute("DELETE FROM campaign_steps WHERE campaign_id = ?", (cid,))
+    conn.execute("DELETE FROM campaign_recipients WHERE campaign_id = ?", (cid,))
+    conn.execute("DELETE FROM campaigns WHERE id = ?", (cid,))
+    conn.commit()
+    return {"deleted": True, "id": cid, "name": row["name"]}
 
 
 def _parse_hhmm(raw: str | None, default_minutes: int = 540) -> int:
@@ -2578,8 +2644,38 @@ async def run_campaign_batch(
         health_val = str(acc_raw.get("health") or "active")
         is_spambot_warm_only = (
             health_val == "frozen"
-            and "@spambot" in str(acc_raw.get("last_error") or "").lower()
+            and _is_spambot_restriction_error(acc_raw.get("last_error"))
         )
+        acc_sess_path = str(acc_raw.get("session_path") or "")
+        if (
+            is_spambot_warm_only
+            and gateway is not None
+            and hasattr(gateway, "probe_spambot")
+            and not acc_sess_path.startswith("data/sessions/demo")
+            and str(acc_raw.get("provider") or "telegram").strip().lower() == "telegram"
+        ):
+            cache_key = _spambot_cache_key(conn, int(acc_raw["id"]), acc_sess_path)
+            cached = _SPAMBOT_PROBE_CACHE.get(cache_key)
+            now_mono = time.monotonic()
+            if cached is None or (now_mono - cached[0]) >= _SPAMBOT_WARM_RECHECK_SEC:
+                sb_res = await gateway.probe_spambot(acc_sess_path)
+                if sb_res.get("limited") is not None:
+                    _SPAMBOT_PROBE_CACHE[cache_key] = (now_mono, sb_res)
+                else:
+                    _SPAMBOT_PROBE_CACHE[cache_key] = (
+                        now_mono - (_SPAMBOT_WARM_RECHECK_SEC - _SPAMBOT_UNKNOWN_COOLDOWN_SEC),
+                        sb_res,
+                    )
+                if sb_res.get("limited") is False:
+                    conn.execute(
+                        "UPDATE accounts SET health = 'active', last_error = NULL, updated_at = ? WHERE id = ?",
+                        (utc_now(), int(acc_raw["id"])),
+                    )
+                    conn.commit()
+                    acc_raw["health"] = "active"
+                    acc_raw["last_error"] = None
+                    health_val = "active"
+                    is_spambot_warm_only = False
         if health_val in ("unauthorized", "banned") or (
             health_val == "frozen" and not is_spambot_warm_only
         ):
@@ -2923,17 +3019,45 @@ async def run_campaign_batch(
         jitter_applied = False
         replied_skipped = False
         rotated_after_failure = False
+        recipient_excluded_accounts: set[int] = set()
+        spambot_retried_accounts: set[int] = set()
         while True:
-            available = [
+            any_quota_left = any(
+                not st.get("disabled") and st["sent_today"] < st["daily_limit"]
+                for st in connected_states
+            )
+            if not any_quota_left:
+                no_accounts_left = True
+                break
+            globally_available = [
                 st
                 for st in connected_states
                 if not st.get("disabled")
                 and st["sent_today"] < st["daily_limit"]
                 and (step_idx >= 1 or not st.get("spambot_warm_only"))
+            ]
+            if not globally_available:
+                break
+            available = [
+                st
+                for st in globally_available
+                if st["id"] not in recipient_excluded_accounts
                 and not _is_same_tg_identity(st["raw"], clean_rec_uname, real_rec_peer_id)
             ]
             if not available:
-                no_accounts_left = True
+                if step_idx == 0 and recipient_excluded_accounts:
+                    conn.execute(
+                        """
+                        UPDATE campaign_recipients
+                        SET status = 'failed',
+                            error_text = 'Telegram отклонил холодный контакт со всех аккаунтов (региональное ограничение)',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, rec["id"]),
+                    )
+                    conn.commit()
+                    failed_in_batch += 1
                 break
 
             assigned_id = rec.get("assigned_account_id")
@@ -2946,6 +3070,7 @@ async def run_campaign_batch(
                     if (
                         not pinned_state.get("disabled")
                         and not pinned_state.get("dead")
+                        and pinned_state["id"] not in recipient_excluded_accounts
                         and pinned_state["sent_today"] < pinned_state["daily_limit"]
                         and not _is_same_tg_identity(
                             pinned_state["raw"], clean_rec_uname, real_rec_peer_id
@@ -2959,6 +3084,7 @@ async def run_campaign_batch(
                 if (
                     not pinned_state.get("disabled")
                     and not pinned_state.get("spambot_warm_only")
+                    and pinned_state["id"] not in recipient_excluded_accounts
                     and pinned_state["sent_today"] < pinned_state["daily_limit"]
                     and not _is_same_tg_identity(
                         pinned_state["raw"], clean_rec_uname, real_rec_peer_id
@@ -3183,17 +3309,72 @@ async def run_campaign_batch(
                 sent_this_recipient = True
                 break
             except Exception as exc:
+                if (
+                    acc_provider == "telegram"
+                    and use_gateway
+                    and hasattr(active_gw, "probe_spambot")
+                    and _is_spambot_or_peerflood_error(exc)
+                ):
+                    cache_key = _spambot_cache_key(conn, chosen_account_id, session_path)
+                    now_mono = time.monotonic()
+                    cached_sb = _SPAMBOT_PROBE_CACHE.get(cache_key)
+                    if cached_sb is not None and (now_mono - cached_sb[0]) < _SPAMBOT_PROBE_COOLDOWN_SEC:
+                        sb_probe = cached_sb[1]
+                        fresh_probe = False
+                    else:
+                        sb_probe = await active_gw.probe_spambot(session_path)
+                        if sb_probe.get("limited") is not None:
+                            _SPAMBOT_PROBE_CACHE[cache_key] = (now_mono, sb_probe)
+                        else:
+                            _SPAMBOT_PROBE_CACHE[cache_key] = (
+                                now_mono - (_SPAMBOT_PROBE_COOLDOWN_SEC - _SPAMBOT_UNKNOWN_COOLDOWN_SEC),
+                                sb_probe,
+                            )
+                        fresh_probe = True
+
+                    if sb_probe.get("limited") is False:
+                        if str(account_raw.get("health") or "") == "frozen":
+                            conn.execute(
+                                "UPDATE accounts SET health = 'active', last_error = NULL, updated_at = ? WHERE id = ?",
+                                (now, chosen_account_id),
+                            )
+                            conn.commit()
+                            account_raw["health"] = "active"
+                            account_raw["last_error"] = None
+                            chosen_state["spambot_warm_only"] = False
+                        if fresh_probe and chosen_account_id not in spambot_retried_accounts:
+                            spambot_retried_accounts.add(chosen_account_id)
+                            continue
+                        _cleanup_empty_step0_dialog(conn, step_idx, dialog)
+                        recipient_excluded_accounts.add(chosen_account_id)
+                        rotated_after_failure = True
+                        if step_idx >= 1:
+                            break
+                        continue
+
+                    if sb_probe.get("limited") is True:
+                        _cleanup_empty_step0_dialog(conn, step_idx, dialog)
+                        chosen_state["spambot_warm_only"] = True
+                        if step_idx >= 1:
+                            chosen_state["disabled"] = True
+                            chosen_state["dead"] = True
+                        rotated_after_failure = True
+                        reply_snip = str(sb_probe.get("reply_text") or "").strip()
+                        err_str = f"@SpamBot: {reply_snip or str(exc)}"[:300]
+                        conn.execute(
+                            "UPDATE accounts SET health = 'frozen', last_error = ?, updated_at = ? WHERE id = ?",
+                            (err_str, now, chosen_account_id),
+                        )
+                        conn.commit()
+                        if step_idx >= 1:
+                            break
+                        continue
+
                 err_kind, err_health = _classify_outreach_send_error(exc)
                 if err_kind in ("account_dead", "account_transient"):
                     chosen_state["disabled"] = True
                     rotated_after_failure = True
-                    if step_idx == 0 and dialog is not None and not dialog.get("last_message_at"):
-                        msg_cnt = conn.execute(
-                            "SELECT COUNT(*) FROM messages WHERE dialog_id = ?",
-                            (dialog["id"],),
-                        ).fetchone()[0]
-                        if int(msg_cnt or 0) == 0:
-                            conn.execute("DELETE FROM dialogs WHERE id = ?", (dialog["id"],))
+                    _cleanup_empty_step0_dialog(conn, step_idx, dialog)
                     if err_kind == "account_dead":
                         chosen_state["dead"] = True
                         err_str = str(exc)[:300]

@@ -56,6 +56,10 @@ class TelegramGateway(ABC):
         """Probe a saved session. Return health and last_error. Do not log in again."""
         raise GatewayError("Проверка сессии не подключена")
 
+    async def probe_spambot(self, session_path: str) -> dict:
+        """Send /start to @SpamBot to lift expired soft limits and check restriction state."""
+        return {"ok": False, "limited": None, "reply_text": ""}
+
     async def list_folders(self, session_path: str) -> list:
         """Own Telegram folders. Not members of groups or channels."""
         raise GatewayError("Папки не подключены")
@@ -96,6 +100,48 @@ SESSION_HEALTH = ("active", "offline", "unauthorized", "banned", "frozen")
 def _clip_error(exc) -> str:
     text = str(exc).strip() or exc.__class__.__name__
     return text[:500]
+
+
+def _parse_spambot_reply(text: str | None) -> bool | None:
+    blob = (text or "").strip().casefold()
+    if not blob:
+        return None
+    if any(
+        phrase in blob
+        for phrase in (
+            "your account is now limited",
+            "while the account is limited",
+            "limited until",
+            "currently limited",
+            "only send messages to mutual contacts",
+            "account was blocked for violations",
+            "наложены ограничения",
+            "пока действуют ограничения",
+            "писать первым вы пока не можете",
+            "ваш аккаунт временно ограничен",
+            "аккаунт ограничен",
+            "ограничения будут сняты",
+            "обліковий запис обмежено",
+            "hesabınız şu anda sınırlandırılmıştır",
+        )
+    ):
+        return True
+    if any(
+        phrase in blob
+        for phrase in (
+            "no limits are currently applied",
+            "free as a bird",
+            "аккаунт свободен",
+            "свободен от каких-либо ограничений",
+            "ограничений на ваш аккаунт сейчас нет",
+            "свободны как птица",
+            "обліковий запис вільний",
+            "обмежень немає",
+            "вільні як птах",
+        )
+    ):
+        return False
+    return None
 
 
 def _classify_session_error(exc: Exception) -> dict:
@@ -1174,6 +1220,49 @@ class TelethonGateway(TelegramGateway):
                     except Exception:
                         pass
 
+    async def probe_spambot(self, session_path: str) -> dict:
+        async with self._session_lock(session_path):
+            try:
+                client, owned = await self._open(session_path)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
+            try:
+                sent_msg = await client.send_message("SpamBot", "/start")
+                sent_id = int(getattr(sent_msg, "id", 0) or 0)
+                reply_text = ""
+                for _ in range(6):
+                    await asyncio.sleep(0.8)
+                    msgs = await client.get_messages("SpamBot", limit=4)
+                    for m in msgs or []:
+                        if getattr(m, "out", False):
+                            continue
+                        mid = int(getattr(m, "id", 0) or 0)
+                        txt = str(getattr(m, "message", None) or "").strip()
+                        if txt and (mid > sent_id or sent_id == 0):
+                            reply_text = txt
+                            break
+                    if reply_text:
+                        break
+                return {
+                    "ok": bool(reply_text),
+                    "limited": _parse_spambot_reply(reply_text),
+                    "reply_text": reply_text,
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
+            finally:
+                if owned:
+                    try:
+                        await self._close(session_path)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
     async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
         async with self._session_lock(session_path):
             client, owned = await self._open(session_path)
@@ -1214,6 +1303,8 @@ class TelethonGateway(TelegramGateway):
                 continue
             entity = getattr(dialog, "entity", None)
             if not isinstance(entity, User):
+                continue
+            if int(getattr(entity, "id", 0) or 0) == 178220800 or str(getattr(entity, "username", "") or "").lower() == "spambot":
                 continue
             message = getattr(dialog, "message", None)
             preview = None
@@ -1425,6 +1516,8 @@ class TelethonGateway(TelegramGateway):
         from telethon.tl.types import User
 
         if not isinstance(sender, User):
+            return None
+        if int(getattr(sender, "id", 0) or 0) == 178220800 or str(getattr(sender, "username", "") or "").lower() == "spambot":
             return None
         message = getattr(event, "message", None)
         if message is None or getattr(message, "id", None) is None:
@@ -1816,6 +1909,29 @@ class FakeGateway(TelegramGateway):
         if pending.get("state") == "connected":
             return {"health": "active", "last_error": None}
         return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+
+    async def probe_spambot(self, session_path: str) -> dict:
+        starts = getattr(self, "spambot_starts", None)
+        if starts is None:
+            self.spambot_starts = []
+            starts = self.spambot_starts
+        starts.append(session_path)
+        replies = getattr(self, "spambot_replies", None) or {}
+        reply_text = str(
+            replies.get(
+                session_path,
+                replies.get(
+                    "*",
+                    "Good news, no limits are currently applied to your account. You’re free as a bird!",
+                ),
+            )
+            or ""
+        ).strip()
+        return {
+            "ok": bool(reply_text),
+            "limited": _parse_spambot_reply(reply_text),
+            "reply_text": reply_text,
+        }
 
     async def request_code(self, phone: str, session_path: str) -> str:
         phone_code_hash = "hash-" + phone

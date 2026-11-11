@@ -661,7 +661,11 @@ def _query_inbox_rows(
     provider: str | None = None,
     status: str | None = None,
 ) -> list[dict]:
-    where_clauses = ["(d.peer_type = 'user' OR d.is_group = 1)"]
+    where_clauses = [
+        "(d.peer_type = 'user' OR d.is_group = 1)",
+        "COALESCE(d.peer_id, 0) != 178220800",
+        "lower(COALESCE(d.username, '')) != 'spambot'",
+    ]
     params: list = []
 
     if account_id is not None and int(account_id) != 0:

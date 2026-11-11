@@ -97,6 +97,8 @@ def _public(row: dict) -> dict:
             connection_label = "Не подключён · ждёт Pairing-код / QR"
         elif status != "connected":
             connection_label = "Не подключён · ошибка входа"
+        elif health == "frozen" and _is_spambot_restriction_error(row.get("last_error")):
+            connection_label = "Ограничен @SpamBot · только тёплые чаты"
         elif health in ("unauthorized", "banned", "frozen"):
             connection_label = "Сессия слетела · нужен вход"
         elif health == "offline":
@@ -114,6 +116,8 @@ def _public(row: dict) -> dict:
             connection_label = "Не подключён · ждёт 2FA пароль"
         elif status != "connected":
             connection_label = "Не подключён · ошибка входа"
+        elif health == "frozen" and _is_spambot_restriction_error(row.get("last_error")):
+            connection_label = "Ограничен @SpamBot · только тёплые чаты"
         elif health in ("unauthorized", "banned", "frozen"):
             connection_label = "Сессия слетела · нужен вход"
         elif health == "offline":
@@ -1434,6 +1438,33 @@ async def probe_account(conn, account_id: int, gateway) -> dict:
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
     probe = await _probe_health(gateway, account["session_path"])
+    if (
+        probe["health"] == "active"
+        and str(account.get("health") or "") == "frozen"
+        and _is_spambot_restriction_error(account.get("last_error"))
+    ):
+        if gateway is not None and hasattr(gateway, "probe_spambot"):
+            sb = await gateway.probe_spambot(account["session_path"])
+            try:
+                from app.outreach import _SPAMBOT_PROBE_CACHE, _spambot_cache_key
+
+                _SPAMBOT_PROBE_CACHE.pop(
+                    _spambot_cache_key(conn, account_id, account["session_path"]),
+                    None,
+                )
+            except Exception:
+                pass
+            if sb.get("limited") is False:
+                probe = {"health": "active", "last_error": None}
+            elif sb.get("limited") is True:
+                probe = {
+                    "health": "frozen",
+                    "last_error": f"@SpamBot: {sb.get('reply_text') or ''}".strip()[:500],
+                }
+            else:
+                probe = {"health": "frozen", "last_error": account.get("last_error")}
+        else:
+            probe = {"health": "frozen", "last_error": account.get("last_error")}
     _write_health(conn, account_id, probe["health"], probe["last_error"])
     return {
         "status": account["status"],
@@ -1461,12 +1492,7 @@ async def check_all_accounts(conn, gateway=None, wa_gateway=None) -> dict:
         elif is_demo and gateway is None:
             _write_health(conn, account_id, "active", None)
         elif gateway is not None:
-            if str(d.get("health") or "") == "frozen" and _is_spambot_restriction_error(d.get("last_error")):
-                probe = await _probe_health(gateway, session_path)
-                if probe["health"] != "active":
-                    _write_health(conn, account_id, probe["health"], probe["last_error"])
-            else:
-                await probe_account(conn, account_id, gateway)
+            await probe_account(conn, account_id, gateway)
     mtproto_ready = bool(
         os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
     )

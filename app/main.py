@@ -61,6 +61,7 @@ from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, se
 from app.notes import add_note
 from app.outreach import (
     create_campaign,
+    delete_campaign,
     enroll_leads_from_crm,
     get_autopilot_status,
     get_campaign,
@@ -2138,6 +2139,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/campaigns/{campaign_id}")
     def campaigns_get(campaign_id: int, request: Request):
         return _call(get_campaign, request.app.state.conn, campaign_id)
+
+    @app.delete("/api/campaigns/{campaign_id}")
+    def campaigns_delete(campaign_id: int, request: Request):
+        _require_admin_or_mcp_auth(request)
+        return _call(delete_campaign, request.app.state.conn, campaign_id)
 
     @app.put("/api/campaigns/{campaign_id}")
     def campaigns_update(campaign_id: int, body: CampaignUpdateIn, request: Request):

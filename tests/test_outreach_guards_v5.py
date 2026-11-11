@@ -1037,3 +1037,298 @@ def test_qa_ring_campaign_self_send_guard_and_2h_delays(tmp_path, monkeypatch):
     # B2B campaign #5 remained paused with 0 sends!
     c5_state = conn.execute("SELECT status FROM campaigns WHERE id = ?", (b2b_camp["id"],)).fetchone()
     assert c5_state["status"] == "paused"
+
+
+# ---------------------------------------------------------------------------
+# 8) @SpamBot /start self-healing & campaign cleanup
+# ---------------------------------------------------------------------------
+def test_spambot_auto_start_clears_expired_limit_and_retries_immediately(tmp_path):
+    conn = connect(tmp_path / "spambot_clear.db")
+    init_db(conn)
+    _seed_two_accounts(conn)
+
+    camp = create_campaign(
+        conn,
+        name="[QA] SpamBot Clear Retry",
+        account_ids=[21],
+        status="running",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    now = "2026-11-11T17:20:00"
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, telegram_user_id, username, name, company, category,
+            step1_text, current_step, status, created_at, updated_at
+        ) VALUES (?, 88001, 'fresh_founder', 'Fresh', 'FreshAI', 'AI', 'Hey — quick check', 0, 'pending', ?, ?)
+        """,
+        (camp["id"], now, now),
+    )
+    conn.commit()
+
+    class _SoftLimitedGateway:
+        def __init__(self):
+            self.spambot_started = False
+            self.send_attempts = 0
+
+        async def search_dialogs(self, session_path, query, limit=1):
+            return [{"telegram_user_id": 88001, "username": "fresh_founder"}]
+
+        async def probe_spambot(self, session_path):
+            self.spambot_started = True
+            return {
+                "ok": True,
+                "limited": False,
+                "reply_text": "Good news, no limits are currently applied to your account. You’re free as a bird!",
+            }
+
+        async def send_message(self, session_path, peer_id, text, reply_to=None, image_path=None):
+            self.send_attempts += 1
+            if not self.spambot_started:
+                raise RuntimeError(
+                    "The account is limited (spam-reported) and cannot message non-contacts. Check @SpamBot"
+                )
+            return {"telegram_message_id": 7001, "sent_at": now}
+
+    gw = _SoftLimitedGateway()
+    res = asyncio.run(run_campaign_batch(conn, camp["id"], gateway=gw, max_send=5))
+    assert gw.spambot_started is True
+    assert gw.send_attempts == 2
+    assert res["sent"] == 1
+    acc = conn.execute("SELECT health, last_error FROM accounts WHERE id = 21").fetchone()
+    assert acc["health"] == "active"
+    assert acc["last_error"] is None
+    from app.telegram_gateway import _parse_spambot_reply
+    assert _parse_spambot_reply("Ваш аккаунт свободен от каких-либо ограничений.") is False
+
+
+def test_spambot_auto_start_distinguishes_regional_peerflood_from_account_freeze(tmp_path):
+    conn = connect(tmp_path / "spambot_geo.db")
+    init_db(conn)
+    _seed_two_accounts(conn)
+
+    camp = create_campaign(
+        conn,
+        name="[QA] SpamBot Regional PeerFlood",
+        account_ids=[21, 31],
+        status="running",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    now = "2026-11-11T17:25:00"
+    conn.executemany(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, telegram_user_id, username, name, company, category,
+            step1_text, assigned_account_id, current_step, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'GeoCo', 'SaaS', 'Hey — geo check', 21, 0, 'pending', ?, ?)
+        """,
+        [
+            (camp["id"], 99001, "cis_target", "CIS Target", now, now),
+            (camp["id"], 99002, "us_target", "US Target", now, now),
+        ],
+    )
+    conn.commit()
+
+    class _RegionalPeerFloodGateway:
+        def __init__(self):
+            self.probes = []
+            self.deliveries = []
+
+        async def search_dialogs(self, session_path, query, limit=1):
+            uname = query.lstrip("@")
+            return [{"telegram_user_id": 99001 if uname == "cis_target" else 99002, "username": uname}]
+
+        async def probe_spambot(self, session_path):
+            self.probes.append(session_path)
+            return {
+                "ok": True,
+                "limited": False,
+                "reply_text": "Good news, no limits are currently applied to your account. You’re free as a bird!",
+            }
+
+        async def send_message(self, session_path, peer_id, text, reply_to=None, image_path=None):
+            if "acc21" in str(session_path) and peer_id in (99001, "@cis_target"):
+                raise RuntimeError(
+                    "The account is limited (spam-reported) and cannot message non-contacts. Check @SpamBot"
+                )
+            self.deliveries.append((str(session_path), peer_id))
+            return {"telegram_message_id": 8100 + len(self.deliveries), "sent_at": now}
+
+    gw = _RegionalPeerFloodGateway()
+    res = asyncio.run(run_campaign_batch(conn, camp["id"], gateway=gw, max_send=5))
+    assert res["sent"] == 2
+    # acc21 was probed once via @SpamBot, NOT frozen globally, rotated cis_target to acc31, AND still sent us_target!
+    assert len(gw.probes) == 1
+    assert conn.execute("SELECT health FROM accounts WHERE id = 21").fetchone()["health"] == "active"
+    assert ("data/sessions/acc31.session", 99001) in gw.deliveries
+    assert ("data/sessions/acc21.session", 99002) in gw.deliveries
+
+
+def test_spambot_active_restriction_freezes_warm_only_then_auto_heals_when_lifted(tmp_path):
+    from app.accounts import check_all_accounts, list_accounts
+    import app.outreach as outreach_mod
+
+    conn = connect(tmp_path / "spambot_timer.db")
+    init_db(conn)
+    _seed_two_accounts(conn)
+
+    camp = create_campaign(
+        conn,
+        name="[QA] SpamBot Active Timer",
+        account_ids=[21, 31],
+        status="running",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    now = "2026-11-11T17:30:00"
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, telegram_user_id, username, name, company, category,
+            step1_text, assigned_account_id, current_step, status, created_at, updated_at
+        ) VALUES (?, 77001, 'lead_one', 'Lead One', 'OneCo', 'SaaS', 'Hey there', 21, 0, 'pending', ?, ?)
+        """,
+        (camp["id"], now, now),
+    )
+    conn.commit()
+
+    spambot_state = {
+        "reply": "The moderators have confirmed the report and your account is now limited until 3 Dec 2026, 11:04 UTC.",
+        "limited": True,
+    }
+
+    class _TimerGateway:
+        async def session_health(self, session_path):
+            return {"health": "active", "last_error": None}
+
+        async def search_dialogs(self, session_path, query, limit=1):
+            return [{"telegram_user_id": 77001, "username": "lead_one"}]
+
+        async def probe_spambot(self, session_path):
+            return {
+                "ok": True,
+                "limited": spambot_state["limited"],
+                "reply_text": spambot_state["reply"],
+            }
+
+        async def send_message(self, session_path, peer_id, text, reply_to=None, image_path=None):
+            if "acc21" in str(session_path) and spambot_state["limited"]:
+                raise RuntimeError("PeerFloodError: Check @SpamBot")
+            return {"telegram_message_id": 9501, "sent_at": now}
+
+    gw = _TimerGateway()
+    res = asyncio.run(run_campaign_batch(conn, camp["id"], gateway=gw, max_send=5))
+    assert res["sent"] == 1
+    acc21 = conn.execute("SELECT health, last_error FROM accounts WHERE id = 21").fetchone()
+    assert acc21["health"] == "frozen"
+    assert acc21["last_error"].startswith("@SpamBot: The moderators have confirmed")
+    accs_pub = {a["id"]: a for a in list_accounts(conn)}
+    assert accs_pub[21]["connection_label"] == "Ограничен @SpamBot · только тёплые чаты"
+
+    # Once Dec 3 passes and @SpamBot replies "free as a bird", check_all_accounts heals acc21 AND clears cache!
+    spambot_state["limited"] = False
+    spambot_state["reply"] = "Good news, no limits are currently applied to your account. You’re free as a bird!"
+    asyncio.run(check_all_accounts(conn, gateway=gw))
+    acc21_after = conn.execute("SELECT health, last_error FROM accounts WHERE id = 21").fetchone()
+    assert acc21_after["health"] == "active"
+    assert acc21_after["last_error"] is None
+
+    from app.telegram_gateway import _parse_spambot_reply
+    assert _parse_spambot_reply(
+        "На ваш аккаунт наложены ограничения до 3 декабря. После этой даты никаких ограничений не останется."
+    ) is True
+
+
+def test_spambot_warm_only_does_not_starve_followups_behind_cold_row(tmp_path):
+    conn = connect(tmp_path / "warm_nostarve.db")
+    init_db(conn)
+    _seed_two_accounts(conn)
+    conn.execute(
+        "UPDATE accounts SET health = 'frozen', last_error = 'Check @SpamBot' WHERE id IN (21, 31)"
+    )
+    _seed_prior_outgoing_msg(
+        conn,
+        account_id=21,
+        peer_id=65002,
+        username="warm_peer",
+        text="Step 1 warm",
+        sent_at="2026-11-10T10:00:00",
+    )
+    camp = create_campaign(
+        conn,
+        name="[QA] Warm Followup Queue",
+        account_ids=[21],
+        status="running",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+            {"step_order": 2, "delay_hours": 1, "template_text": "Warm followup step 2"},
+        ],
+    )
+    now = "2026-11-11T18:00:00"
+    # Row 1: cold step 0 (must be skipped because acc21 is spambot_warm_only)
+    # Row 2: warm step 1 (MUST STILL SEND in the same batch!)
+    conn.executemany(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, telegram_user_id, username, name, company, category,
+            step1_text, sent_account_id, current_step, status, last_sent_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'WarmCo', 'SaaS', 'Cold text', ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (camp["id"], 65001, "cold_peer", "Cold", None, 0, "pending", None, now, now),
+            (camp["id"], 65002, "warm_peer", "Warm", 21, 1, "in_progress", "2026-11-10T10:00:00", now, now),
+        ],
+    )
+    conn.commit()
+
+    gw = RecordingGateway(
+        live_messages_by_session_peer={
+            ("data/sessions/acc21.session", 65002): [
+                {"telegram_message_id": 101, "direction": "out", "text": "Step 1 warm", "sent_at": "2026-11-10T10:00:00"}
+            ]
+        }
+    )
+    res = asyncio.run(run_campaign_batch(conn, camp["id"], gateway=gw, max_send=5, respect_delays=True))
+    assert res["sent"] == 1
+    assert len(gw.sent) == 1
+    assert gw.sent[0]["peer_id"] == 65002
+    cold_st = conn.execute("SELECT status, current_step FROM campaign_recipients WHERE username = 'cold_peer'").fetchone()
+    warm_st = conn.execute("SELECT status, current_step FROM campaign_recipients WHERE username = 'warm_peer'").fetchone()
+    assert cold_st["status"] == "pending" and cold_st["current_step"] == 0
+    assert warm_st["status"] == "completed" and warm_st["current_step"] == 2
+
+
+def test_delete_campaign_endpoint_blocks_running_and_deletes_completed(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    monkeypatch.setenv("MCP_API_KEY", "test-mcp-secret-key")
+    conn = connect(tmp_path / "del_camp.db")
+    init_db(conn)
+    _seed_two_accounts(conn)
+    c_run = create_campaign(
+        conn,
+        name="[QA] Running",
+        account_ids=[21],
+        status="running",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "Hi"}],
+    )
+    c_done = create_campaign(
+        conn,
+        name="[QA] Completed",
+        account_ids=[21],
+        status="completed",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "Hi"}],
+    )
+    app = create_app(conn=conn)
+    hdrs = {"Authorization": "Bearer test-mcp-secret-key"}
+    with TestClient(app) as client:
+        r_unauth = client.delete(f"/api/campaigns/{c_done['id']}")
+        assert r_unauth.status_code == 401
+        r_block = client.delete(f"/api/campaigns/{c_run['id']}", headers=hdrs)
+        assert r_block.status_code == 400
+        r_ok = client.delete(f"/api/campaigns/{c_done['id']}", headers=hdrs)
+        assert r_ok.status_code == 200
+        assert r_ok.json()["deleted"] is True
+        ids_left = [c["id"] for c in client.get("/api/campaigns", headers=hdrs).json()]
+        assert c_done["id"] not in ids_left
+        assert c_run["id"] in ids_left
