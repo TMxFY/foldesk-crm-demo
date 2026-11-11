@@ -273,7 +273,10 @@ _OFFLINE_NON_ICP_RE = re.compile(
     r"вселенной\s+«хронограф»|маркетинг\s*-\s*в\s+бан|"
     r"скачать\s+с\s+яндекс|404\s+ошибка|заблокирован\s+хостинг|"
     r"служб\w*\s+поддержк|техника\s+по\s+выгодным\s+ценам|ивент-агентств\w*\s+с\s+барной|"
-    r"co-owner\s+@mol_bar|залов\s+для\s+тренировок|здоровье\s+без\s+аптек"
+    r"co-owner\s+@mol_bar|залов\s+для\s+тренировок|здоровье\s+без\s+аптек|"
+    r"i\s+can['’]?t\s+write\s+this\s+one|cloudflare\s+anti-bot\s+interstitial|"
+    r"tgcenterapp\.ru|1024ai\.ru|bugbounty\.bi\.zone/profile/|"
+    r"запуск\w*\s+контент-завод|усиливать\s+бренд\s+через\s+видеоконтент"
     r")",
     re.I,
 )
@@ -285,6 +288,7 @@ _OFFLINE_JUNK_USERNAMES = frozenset(
         "valery_leon", "chereshnevaya_masha", "financial_designer", "uncle_kekos",
         "yuliya_yukhta", "super_taco", "jwmw85", "abiiii0707", "vkrupnov",
         "ofmninja", "praamzius", "bychef", "itrecruit", "khibinite",
+        "tgsoft_oleg", "tgsoft_roman", "chatgpt985", "pusik34", "igornaumov_ai", "frixeee",
     }
 )
 
@@ -373,13 +377,14 @@ _SOFTWARE_CATEGORIES = frozenset(
 
 _ML_TRAINING_NOISE_RE = re.compile(
     r"(?:машинн\w*\s+обучен\w*|обучен\w*\s+с\s+подкреплен\w*|дообучен\w*|"
-    r"обучен\w*\s+(?:модел\w*|нейросет\w*|llm|ии|агент\w*)|"
+    r"обучен\w*\s+(?:модел\w*|нейросет\w*|llm|ии|агент\w*|робот\w*)|"
     r"обучен\w*,\s*тонк\w*\s+настройк\w*|тонк\w*\s+настройк\w*|"
     r"образовательн\w*\s+(?:клип\w*|контент\w*|ролик\w*|видео|шортс\w*)|"
+    r"игров\w*\s+механик\w*|геймификац\w*|gamification|"
     r"\bof\s+course\b|\b(?:ai|ии)[\-\s]?коуч\w*|\bai[\-\s]?coach\w*|"
     r"курс(?:ы|а|ов|ам|ах)?\s+(?:валют\w*|крипт\w*|биткоин\w*|доллар\w*|рубл\w*|акци\w*|обмен\w*)|"
     r"бирж\w*,\s*курс\w*|"
-    r"machine\s+learning|reinforcement\s+learning|model\s+training|fine[\-\s]?tun\w*)",
+    r"machine\s+learning|reinforcement\s+learning|model\s+training|robot\w*\s+training|training\s+robot\w*|fine[\-\s]?tun\w*)",
     re.IGNORECASE,
 )
 
@@ -773,6 +778,9 @@ def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> in
               OR error_text LIKE '%Нет связи%'
               OR error_text LIKE '%TimedOut%'
               OR error_text LIKE '%A wait of %'
+              OR error_text LIKE '%SpamBot%'
+              OR error_text LIKE '%cannot message non-contacts%'
+              OR error_text LIKE '%spam-reported%'
           )
         """,
         params,
@@ -800,7 +808,16 @@ def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> in
 def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
     text = str(exc or "").strip()
     blob = f"{exc.__class__.__name__} {text}".casefold()
-    if "frozen" in blob:
+    if any(
+        marker in blob
+        for marker in (
+            "frozen",
+            "spambot",
+            "spam-reported",
+            "cannot message non-contacts",
+            "peerspam",
+        )
+    ):
         return ("account_dead", "frozen")
     if "userdeactivatedban" in blob or "phonenumberbanned" in blob:
         return ("account_dead", "banned")

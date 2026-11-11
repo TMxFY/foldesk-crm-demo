@@ -50,55 +50,22 @@ OUR_ANGLE = {
     "Низкий приоритет": "Направление 3 (клиппинг). Общий web3 — клиппинг по 10 аккаунтам.",
 }
 
-PAIN_BY_CATEGORY = {
-    "CEX / биржа": "Acquiring qualified traders through paid KOLs and affiliates gets expensive, and organic reach is hard to scale.",
-    "Проп трейдинг": "Prop firms need a steady flow of qualified traders, but paid acquisition makes every challenge sale more expensive.",
-    "Медиа / контент": "A deep content library still struggles to reach new audiences when short-form distribution is inconsistent.",
-    "DeFi / DEX": "DeFi products often have strong technical content but an expensive, inconsistent path from attention to new users and TVL.",
-    "Токен / мемкоин": "Token launches have a short attention window, and teams usually cannot produce enough native content before it closes.",
-    "Gaming / AI": "Gaming and AI launches need a high volume of native short-form content, while manual production is too slow to scale.",
-    "SaaS / AI app": "Growth usually hits a ceiling when customer acquisition is expensive and organic reach is inconsistent.",
-    "Платёжки / финтех": "Consumer fintech growth depends on efficient registrations, but paid channels keep pushing acquisition costs up.",
-    "Инфраструктура / dev": "Developer tools are difficult to distribute beyond their existing network when organic reach is inconsistent.",
-    "Сервис / агентство": "Agencies need a repeatable distribution layer for clients without adding another expensive production team.",
-    "Низкий приоритет": "Reaching qualified buyers consistently is expensive when short-form production and distribution are handled manually.",
-}
-
-
-def first_touch_for(category, project, their_angle="", source=""):
-    """Build the agreed greeting -> pain -> case -> CTA structure locally.
-
-    The angle is included in the pain paragraph so TG rows do not collapse to
-    one category-only template when the LLM is unavailable.
-    """
-    if source in {"linkedin_jobs", "meta_ads"}:
+def first_touch_for(category, project, their_angle="", source="", site=""):
+    """Build Vlad's canonical 3-paragraph SoftUGC first touch."""
+    try:
+        from outreach_copy import first_touch
+    except ImportError:
         try:
-            from outreach_copy import first_touch
+            from leadgen.outreach_copy import first_touch
         except ImportError:
-            try:
-                from leadgen.outreach_copy import first_touch
-            except ImportError:
-                from scripts.outreach_copy import first_touch
-        return first_touch(project, their_angle, russian=False, source=source)
-    pain = PAIN_BY_CATEGORY.get(category, PAIN_BY_CATEGORY["Низкий приоритет"])
-    project = project or "your project"
-    context = (their_angle or "").strip().rstrip(".")
-    # Convert role-style angles ("Chief Marketing Officer at X", "Founder of Y")
-    # into a natural product/business phrase; non-Latin bios fall back to the
-    # category pain rather than producing mixed-language outreach.
-    if not re.search(r"[A-Za-z]{3}", context):
-        context = ""
-    context = re.sub(r"^[^.!?]{1,80}\s+(?:at|of)\s+", "", context, flags=re.I)
-    if context:
-        context = context[:180]
-        pain = f"Scaling reach for {context} often means expensive initial reach and inconsistent organic growth."
-    return (
-        "Hey,\n\n"
-        f"{pain}\n\n"
-        "We built SoftUGC as a plug-and-play organic distribution arm: AI short-form production "
-        "plus a network of owned accounts. We drove 183.5M views in 90 days with zero live shoots, "
-        "at 13-40x lower cost than standard clipper services.\n\n"
-        f"Want me to show how this could work for {project}?"
+            from scripts.outreach_copy import first_touch
+    return first_touch(
+        project or "",
+        their_angle or "",
+        russian=False,
+        source=source,
+        category=category or "",
+        site=site or "",
     )
 
 
@@ -1141,6 +1108,7 @@ def main():
         ])
         tasks.append((len(values) - 1, {
             "name": proj, "source": r.get("source") or "sheet", "founder_name": "",
+            "category": cat, "site": r.get("project_url") or "",
             "one_liner": what or r.get("fit") or "",
             "site_text": what or r.get("fit") or "",
         }, cat, proj))
@@ -1155,7 +1123,13 @@ def main():
                 values[row_index][10] = text
             else:
                 templated += 1
-                values[row_index][10] = first_touch_for(cat, proj, "", source=_lead.get("source") or "")
+                values[row_index][10] = first_touch_for(
+                    cat,
+                    proj,
+                    _lead.get("one_liner") or "",
+                    source=_lead.get("source") or "",
+                    site=_lead.get("site") or "",
+                )
         if templated:
             print(f"first_touch: {templated}/{len(tasks)} fell back to template "
                   f"after retries", file=sys.stderr)

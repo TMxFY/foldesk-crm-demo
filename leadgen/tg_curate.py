@@ -231,20 +231,6 @@ OVERRIDES = {
 # username aliases with tricky case
 ALIASES = {"hitsahuja_bdm": "hiteshahuja_bdm"}
 
-HOOKS = {
-    "CEX / биржа": "You're already paying KOLs and affiliates for signups - we get the same registrations from organic short-form at a fraction of the cost, production on our own software. We run quality signals into a TG channel and overflow to the exchange. Saw {proj}. Want the numbers on one campaign?",
-    "Проп трейдинг": "Prop firms live and die by challenge sales. We run clip networks that send qualified traders straight to {proj}'s checkout - organic, not paid. Want me to show one funnel?",
-    "Медиа / контент": "You have a deep content archive but none of it reaches short-form. We cut your episodes/AMAs into a daily clip stream across 10 accounts. Want me to cut one episode of {proj} as a demo?",
-    "DeFi / DEX": "Your spaces/AMAs never make it to short-form, and TVL needs new users. We cut them into daily clips across 10 accounts pointing to {proj}. Want a demo cut?",
-    "Токен / мемкоин": "Memecoin hype windows last about two days, and most teams can't produce content fast enough to catch them. We run clip production in-house and manage the account network, so a wave goes out the same day. Saw {proj}. Interested to see how it works?",
-    "Gaming / AI": "Your users live in short video, but you can't produce at that speed by hand. We run AI UGC volume for launches like {proj}. Want examples from your niche?",
-    "SaaS / AI app": "If your user growth has hit a ceiling, it's usually not the product - it's the cost of reach. We built an organic distribution system: in-house short-video production + a network of accounts. 183.5M views in 90 days on our last project, zero live shoots. Saw {proj}. Want to see how it's set up for a product like yours?",
-    "Платёжки / финтех": "Organic short-form is the lowest CAC channel for consumer fintech right now. We produce 1000+ clips a month and post across a 10-account network, traffic through your referral link. Saw {proj}. Want a quick look?",
-    "Инфраструктура / dev": "Short-form is where developers and projects discover tools now. We produce volume clips and post across a 10-account network. Saw {proj} - want examples from your niche?",
-    "Сервис / агентство": "We run clip production and a 10-account posting network - could be a clean add-on for your clients at {proj}. Open to a quick partner chat?",
-    "Низкий приоритет": "Short-form is the cheapest way to put {proj} in front of buyers right now. We produce 1000+ clips a month across a 10-account network. Want examples?",
-}
-
 CAT_PRIORITY = ["Проп трейдинг", "CEX / биржа", "Медиа / контент", "DeFi / DEX",
                  "Токен / мемкоин", "Gaming / AI", "SaaS / AI app", "Платёжки / финтех",
                  "Инфраструктура / dev", "Сервис / агентство", "Низкий приоритет"]
@@ -281,10 +267,14 @@ def main():
         proj = proj or (r.get("project") or "")
         url = url or (r.get("project_url") or "")
         what = what or (r.get("what_they_do") or "")
-        hook = HOOKS.get(cat, HOOKS["Низкий приоритет"]).format(proj=(proj or "your project"))
+        try:
+            from outreach_copy import first_touch as _vlad_first_touch
+        except ImportError:
+            from leadgen.outreach_copy import first_touch as _vlad_first_touch
+        hook = _vlad_first_touch(proj or "", what or "", russian=False, category=cat, site=url)
         r2 = dict(r)
         r2.update({"category": cat, "project": proj, "project_url": url,
-                   "what_they_do": what, "hook": " ".join(hook.split())})
+                   "what_they_do": what, "hook": hook})
         out.append(r2)
 
     role_rank = {"Founder": 0, "Marketing": 1, "Community": 2, "Creator/KOL": 3,

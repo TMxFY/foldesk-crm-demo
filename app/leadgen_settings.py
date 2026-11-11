@@ -9,8 +9,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from app.db import ROOT, as_dict, utc_now, utc_today
+from app.db import CANONICAL_STEP3_IMAGE_URL, ROOT, as_dict, utc_now, utc_today
 from app.outreach import create_campaign, get_campaign, update_campaign
+from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
 
 CASES_BANK_PATH = ROOT / "leadgen" / "job_cases_bank.md"
 
@@ -47,7 +48,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
     "total_daily_quota": 50,
     "b2b": {
         "enabled": True,
-        "touch_mode": "micro_ping",  # "micro_ping" | "direct"
+        "touch_mode": "direct",  # "direct" | "micro_ping"
         "target_campaign_tg": "Leadgen Auto (TG)",
         "target_campaign_wa": "Leadgen Auto (WA)",
         "campaign_daily_limit": 30,
@@ -148,7 +149,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
     b2b = merged.get("b2b") or {}
     b2b["enabled"] = bool(b2b.get("enabled", True))
-    b2b_mode = str(b2b.get("touch_mode") or "micro_ping").strip().lower()
+    b2b_mode = str(b2b.get("touch_mode") or "direct").strip().lower()
     if b2b_mode == "full":
         b2b_mode = "direct"
     if b2b_mode not in ("micro_ping", "direct"):
@@ -419,11 +420,22 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
     }
 
 
-DEFAULT_LEADGEN_STEPS = [
+DEFAULT_B2B_STEPS = [
+    {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+    {"step_order": 2, "delay_hours": 24, "template_text": VLAD_STEP2_TEMPLATE},
+    {
+        "step_order": 3,
+        "delay_hours": 24,
+        "template_text": VLAD_STEP3_TEXT,
+        "image_url": CANONICAL_STEP3_IMAGE_URL,
+    },
+]
+DEFAULT_VACANCY_STEPS = [
     {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
     {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
     {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
 ]
+DEFAULT_LEADGEN_STEPS = DEFAULT_B2B_STEPS
 
 
 def sync_leadgen_campaigns(
@@ -452,6 +464,7 @@ def sync_leadgen_campaigns(
                     "daily_limit": daily_lim,
                     "leadgen_daily_quota": quota,
                     "leadgen_sources": b2b_enabled_sources,
+                    "default_steps": DEFAULT_B2B_STEPS,
                 }
             )
         if wa_name and wa_name.lower() != tg_name.lower():
@@ -461,6 +474,7 @@ def sync_leadgen_campaigns(
                     "daily_limit": daily_lim,
                     "leadgen_daily_quota": quota,
                     "leadgen_sources": b2b_enabled_sources,
+                    "default_steps": DEFAULT_B2B_STEPS,
                 }
             )
 
@@ -475,6 +489,7 @@ def sync_leadgen_campaigns(
                     "daily_limit": vac_lim,
                     "leadgen_daily_quota": vac_quota,
                     "leadgen_sources": vac_enabled_layers,
+                    "default_steps": DEFAULT_VACANCY_STEPS,
                 }
             )
 
@@ -495,7 +510,7 @@ def sync_leadgen_campaigns(
                 leadgen_sources=spec["leadgen_sources"],
             )
             if not updated.get("steps"):
-                updated = update_campaign(conn, cid, steps=DEFAULT_LEADGEN_STEPS)
+                updated = update_campaign(conn, cid, steps=spec["default_steps"])
             synced_campaigns.append(updated)
         else:
             created = create_campaign(
@@ -503,7 +518,7 @@ def sync_leadgen_campaigns(
                 name=spec["name"],
                 daily_limit=spec["daily_limit"],
                 status="draft",
-                steps=DEFAULT_LEADGEN_STEPS,
+                steps=spec["default_steps"],
                 leadgen_enabled=True,
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
@@ -639,7 +654,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             latest_jsonl = Path(jsonl_candidates[-1])
             leads = load_leads_from_jsonl(
                 latest_jsonl,
-                touch_mode=str(b2b_cfg.get("touch_mode") or "micro_ping"),
+                touch_mode=str(b2b_cfg.get("touch_mode") or "direct"),
                 use_llm=False,
             )
             b2b_limit = min(remaining_quota, int(b2b_cfg.get("campaign_daily_limit") or 30))

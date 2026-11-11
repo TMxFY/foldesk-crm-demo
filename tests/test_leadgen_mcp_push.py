@@ -83,28 +83,27 @@ def test_build_lead_payload_micro_ping_vs_full_mode():
         "https://linkedin.com/in/alex",       # O: Founder LinkedIn
     ]
 
-    # Default mode: micro_ping
+    # Explicit micro_ping mode still supported when requested
     payload_ping = build_lead_payload_from_sheet_row(sheet_row, touch_mode="micro_ping")
     assert payload_ping["username"] == "alex_founder"
     assert payload_ping["company"] == "ScreenStudio"
     assert len(payload_ping["step1_text"]) <= 120
     assert payload_ping["step1_text"].startswith("Hey, saw ScreenStudio —")
     assert "183.5M" not in payload_ping["step1_text"]
-    # Step 2 + hook + our_angle preserve the full 183.5M case offer
     assert "183.5M" in payload_ping["step2_text"]
-    assert "13-40x" in payload_ping["step2_text"]
+    assert "13 to 40x" in payload_ping["step2_text"] or "13-40x" in payload_ping["step2_text"]
     assert "183.5M" in payload_ping["hook"]
     assert "183.5M" in payload_ping["our_angle"]
-    # Step 3 is the niche proof / video angle follow-up
-    assert payload_ping["step3_text"]
-    assert "ScreenStudio" in payload_ping["step3_text"]
-    assert "183.5M" not in payload_ping["step3_text"]
+    assert "500K-2M reach" in payload_ping["step3_text"]
+    assert "highly qualified users" in payload_ping["step3_text"]
 
-    # Full mode: step1_text has the 183.5M pitch
-    payload_full = build_lead_payload_from_sheet_row(sheet_row, touch_mode="full")
+    # Default mode (direct): Vlad's canonical 3-step sequence
+    payload_full = build_lead_payload_from_sheet_row(sheet_row)
     assert "183.5M" in payload_full["step1_text"]
-    assert "ScreenStudio" in payload_full["step2_text"]
-    assert payload_full["step3_text"]
+    assert "We work on revshare or CPA and you only cover the production costs." in payload_full["step1_text"]
+    assert "Want to see 3 example reels for your brand, to check how it could work for you?" in payload_full["step1_text"]
+    assert "500K-2M reach to your targeted audience (which equals highly qualified users)" in payload_full["step2_text"]
+    assert payload_full["step3_text"] == "You’re doing me dirty mate... :((("
 
 
 def test_load_leads_from_jsonl_and_pack_tab_filters_ru(tmp_path):

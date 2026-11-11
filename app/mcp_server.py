@@ -1120,15 +1120,33 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 camp_dict = as_dict(crow)
                 campaign_id = int(camp_dict["id"])
             else:
+                from app.db import CANONICAL_STEP3_IMAGE_URL
+                from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
+
+                is_vacancy_camp = any(k in campaign_name.lower() for k in ("ваканс", "vacanc", "job"))
+                default_steps = (
+                    [
+                        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+                        {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
+                        {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
+                    ]
+                    if is_vacancy_camp
+                    else [
+                        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+                        {"step_order": 2, "delay_hours": 24, "template_text": VLAD_STEP2_TEMPLATE},
+                        {
+                            "step_order": 3,
+                            "delay_hours": 24,
+                            "template_text": VLAD_STEP3_TEXT,
+                            "image_url": CANONICAL_STEP3_IMAGE_URL,
+                        },
+                    ]
+                )
                 created_camp = create_campaign(
                     conn,
                     name=campaign_name,
                     status="draft",
-                    steps=[
-                        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
-                        {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
-                        {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
-                    ],
+                    steps=default_steps,
                 )
                 campaign_id = int(created_camp["id"])
                 camp_dict = created_camp
@@ -1184,6 +1202,9 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 tg_id = int(str(tg_id_raw).strip())
             except ValueError:
                 tg_id = None
+        has_direct_messenger_handle = bool(
+            username or phone or (tg_id is not None and not (900000 <= tg_id <= 999999))
+        )
 
         display_name = explicit_name or company or (f"{username} · {company}" if username and company else username) or phone
         if not any((display_name, username, phone, tg_id)):
@@ -1302,7 +1323,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
 
         lead_ids.append(lid)
 
-        if enroll_in_campaign and campaign_id is not None:
+        if enroll_in_campaign and campaign_id is not None and has_direct_messenger_handle:
             is_dup = (
                 lid in seen_leads
                 or (tg_id and int(tg_id) in seen_tg_ids)

@@ -7,6 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
 OUTREACH_MEDIA_DIR = ROOT / "data" / "outreach_media"
+CANONICAL_STEP3_IMAGE_URL = "/media/outreach/4fa85f083f9e2911.jpg"
+_STATIC_KERMIT_PATH = ROOT / "app" / "static" / "outreach-kermit.jpg"
 
 STATUSES = ("new", "talking", "waiting", "won", "lost")
 AIRTABLE_STAGE_KEYS = (
@@ -95,6 +97,8 @@ def resolve_outreach_media(media_ref: str) -> Path | str:
         local_path = OUTREACH_MEDIA_DIR / filename
         if local_path.exists():
             return local_path
+        if filename in {"4fa85f083f9e2911.jpg", "outreach-kermit.jpg"} and _STATIC_KERMIT_PATH.exists():
+            return _STATIC_KERMIT_PATH
     if raw.startswith(("http://", "https://")):
         return raw
     path = Path(raw)

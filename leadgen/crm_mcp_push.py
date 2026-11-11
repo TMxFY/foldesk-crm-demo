@@ -42,11 +42,16 @@ try:
     )
     from lead_market import market_of, segment_of
     from outreach_copy import (
+        VLAD_STEP2_TEMPLATE,
+        VLAD_STEP3_IMAGE_URL,
+        VLAD_STEP3_TEXT,
         _extract_personal_first_name,
-        first_touch,
+        followup_one,
+        followup_two,
+        infer_lead_audience,
         micro_ping_first_touch,
+        upgrade_to_vlad_step1,
     )
-    from tg_to_gsheet import first_touch_for
 except ImportError:
     from leadgen.followup_agent import (
         clean_product_name,
@@ -55,11 +60,16 @@ except ImportError:
     )
     from leadgen.lead_market import market_of, segment_of
     from leadgen.outreach_copy import (
+        VLAD_STEP2_TEMPLATE,
+        VLAD_STEP3_IMAGE_URL,
+        VLAD_STEP3_TEXT,
         _extract_personal_first_name,
-        first_touch,
+        followup_one,
+        followup_two,
+        infer_lead_audience,
         micro_ping_first_touch,
+        upgrade_to_vlad_step1,
     )
-    from leadgen.tg_to_gsheet import first_touch_for
 
 SHEET_ID = "1Z4KwmUMNuA9Q562y3Vvxa40AFcqGaMyAXAqr7QlbmOQ"
 TAB = "Все2"
@@ -105,8 +115,8 @@ def _resolve_b2b_touch_mode(explicit: str | None = None) -> str:
         mode = os.environ["LEADGEN_TOUCH_MODE"].strip().lower()
     else:
         b2b = (_load_ui_leadgen_config().get("b2b") or {})
-        mode = str(b2b.get("touch_mode") or "micro_ping").strip().lower()
-    return "direct" if mode in ("direct", "full") else "micro_ping"
+        mode = str(b2b.get("touch_mode") or "direct").strip().lower()
+    return "micro_ping" if mode == "micro_ping" else "direct"
 
 
 def log(*args: Any) -> None:
@@ -218,17 +228,22 @@ def _ensure_full_case_pitch(
     raw_first_touch: str,
     *,
     company: str,
+    name: str = "",
+    site: str = "",
     category: str,
     their_angle: str,
     source: str = "",
 ) -> str:
-    """Guarantee a full pitch containing the 183.5M views / 90 days / 13-40x case study."""
-    text = (raw_first_touch or "").strip()
-    if text and "183.5" in text:
-        return text
-    if category:
-        return first_touch_for(category, company or "your product", their_angle, source=source)
-    return first_touch(company or "your product", their_angle, russian=False, source=source)
+    """Guarantee Vlad's canonical 3-paragraph SoftUGC pitch (183.5M views / 90 days / 13-40x + revshare/CPA CTA)."""
+    return upgrade_to_vlad_step1(
+        raw_first_touch,
+        company=company,
+        name=name,
+        site=site,
+        category=category,
+        their_angle=their_angle,
+        source=source,
+    )
 
 
 def build_lead_payload_from_sheet_row(
@@ -251,13 +266,21 @@ def build_lead_payload_from_sheet_row(
     raw_first_touch = _cell(row, 10)
     email_col = _cell(row, 15)
 
-    clean_comp = clean_product_name(raw_name, site, their_angle) or raw_name
+    clean_comp = clean_product_name(raw_name, site, their_angle)
     personal_first = _extract_personal_first_name(raw_name, clean_comp)
     contact_info = _extract_contact_fields(contact, tg_col=tg_col, email_col=email_col)
+    audience = infer_lead_audience(
+        category=category,
+        company=clean_comp or raw_name,
+        their_angle=their_angle,
+        site=site,
+    )
 
     full_pitch = _ensure_full_case_pitch(
         raw_first_touch,
         company=clean_comp,
+        name=raw_name,
+        site=site,
         category=category,
         their_angle=their_angle,
         source=lead_source,
@@ -265,13 +288,12 @@ def build_lead_payload_from_sheet_row(
     if followups is not None:
         f1, f2 = followups
     else:
-        f1, f2 = smart_fallback_followups(
-            raw_name, site, category, their_angle, raw_our_angle, full_pitch
-        )
+        f1 = followup_one(clean_comp or raw_name, their_angle, audience=audience, category=category, site=site)
+        f2 = followup_two(clean_comp or raw_name)
 
     ping_text = micro_ping_first_touch(
         name=personal_first,
-        company=clean_comp,
+        company=clean_comp or raw_name,
         category=category,
         site=site,
         angle=their_angle,
@@ -304,7 +326,7 @@ def build_lead_payload_from_sheet_row(
     return {
         "username": contact_info["username"] or None,
         "name": raw_name or clean_comp or contact_info["username"] or None,
-        "company": clean_comp or None,
+        "company": clean_comp or raw_name or None,
         "phone": contact_info["phone"] or None,
         "email": contact_info["email"] or None,
         "website": site or None,
@@ -312,6 +334,7 @@ def build_lead_payload_from_sheet_row(
         "their_angle": their_angle or None,
         "our_angle": our_angle or None,
         "hook": hook or None,
+        "audience": audience,
         "step1_text": step1_text,
         "step2_text": step2_text,
         "step3_text": step3_text,
@@ -372,30 +395,33 @@ def build_lead_payload_from_dict(
     contact_info = _extract_contact_fields(username_raw, tg_col=username_raw, email_col=email_raw)
     phone = str(record.get("phone") or record.get("whatsapp") or contact_info["phone"] or "").strip()
 
-    clean_comp = clean_product_name(raw_company, site, their_angle) or raw_company or raw_name
-    personal_first = _extract_personal_first_name(raw_name, clean_comp)
+    clean_comp = clean_product_name(raw_company, site, their_angle)
+    personal_first = _extract_personal_first_name(raw_name, clean_comp or raw_company)
+    explicit_aud = str(record.get("audience") or record.get("target_audience") or "").strip().lower()
+    audience = explicit_aud if explicit_aud in {"buyers", "students", "users", "players", "listeners"} else infer_lead_audience(
+        category=category,
+        company=clean_comp or raw_company,
+        their_angle=their_angle,
+        site=site,
+    )
 
     full_pitch = _ensure_full_case_pitch(
         raw_first_touch,
-        company=clean_comp,
+        company=clean_comp or raw_company,
+        name=raw_name,
+        site=site,
         category=category,
         their_angle=their_angle,
         source=source,
     )
-    f1_default, f2_default = smart_fallback_followups(
-        clean_comp or raw_name,
-        site,
-        category,
-        their_angle,
-        raw_our_angle,
-        full_pitch,
-    )
+    f1_default = followup_one(clean_comp or raw_company, their_angle, audience=audience, category=category, site=site)
+    f2_default = followup_two(clean_comp or raw_company)
     f1 = str(record.get("followup_1") or record.get("step2_text") or f1_default).strip()
     f2 = str(record.get("followup_2") or record.get("step3_text") or f2_default).strip()
 
     ping_text = micro_ping_first_touch(
         name=personal_first or raw_name,
-        company=clean_comp,
+        company=clean_comp or raw_company,
         category=category,
         site=site,
         angle=their_angle,
@@ -419,8 +445,8 @@ def build_lead_payload_from_dict(
 
     return {
         "username": contact_info["username"] or None,
-        "name": raw_name or clean_comp or contact_info["username"] or None,
-        "company": clean_comp or None,
+        "name": raw_name or clean_comp or raw_company or contact_info["username"] or None,
+        "company": clean_comp or raw_company or None,
         "phone": phone or None,
         "email": contact_info["email"] or None,
         "website": site or None,
@@ -428,6 +454,7 @@ def build_lead_payload_from_dict(
         "their_angle": their_angle or None,
         "our_angle": our_angle or None,
         "hook": hook or None,
+        "audience": audience,
         "step1_text": step1_text,
         "step2_text": step2_text,
         "step3_text": step3_text,
@@ -698,15 +725,25 @@ def push_leads_via_mcp(
         if crow is not None:
             cid = int(crow["id"])
         else:
+            is_vac = any(k in campaign_name.lower() for k in ("ваканс", "vacanc", "job"))
+            fallback_steps = (
+                [
+                    {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+                    {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
+                    {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
+                ]
+                if is_vac
+                else [
+                    {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+                    {"step_order": 2, "delay_hours": 24, "template_text": VLAD_STEP2_TEMPLATE},
+                    {"step_order": 3, "delay_hours": 24, "template_text": VLAD_STEP3_TEXT, "image_url": VLAD_STEP3_IMAGE_URL},
+                ]
+            )
             created_c = create_campaign(
                 conn,
                 name=campaign_name,
                 status="draft",
-                steps=[
-                    {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
-                    {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
-                    {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
-                ],
+                steps=fallback_steps,
             )
             cid = int(created_c["id"])
         imp = import_campaign_csv(conn, cid, _leads_to_campaign_csv(leads))
@@ -729,7 +766,7 @@ def push_leads_via_mcp(
 def main() -> int:
     ui_cfg = _load_ui_leadgen_config()
     b2b_cfg = ui_cfg.get("b2b") or {}
-    default_touch = os.environ.get("LEADGEN_TOUCH_MODE") or str(b2b_cfg.get("touch_mode") or "micro_ping")
+    default_touch = os.environ.get("LEADGEN_TOUCH_MODE") or str(b2b_cfg.get("touch_mode") or "direct")
     default_camp_tg = os.environ.get("LEADGEN_CAMPAIGN_NAME") or str(
         b2b_cfg.get("target_campaign_tg") or "Leadgen Auto (TG)"
     )
@@ -825,14 +862,46 @@ def main() -> int:
             continue
 
         batch = leads[:remaining_quota]
-        target_camp = args.campaign_name_wa if tab == "Direct" and any(l.get("provider") == "whatsapp" for l in batch) else args.campaign_name
-        res = push_leads_via_mcp(
-            batch,
-            enroll_in_campaign=enroll,
-            campaign_id=args.campaign_id,
-            campaign_name=target_camp,
-            mcp_url=args.mcp_url or None,
-        )
+        if tab == "X":
+            res = push_leads_via_mcp(
+                batch,
+                enroll_in_campaign=False,
+                campaign_id=None,
+                campaign_name=args.campaign_name,
+                mcp_url=args.mcp_url or None,
+            )
+        elif tab == "Direct":
+            wa_batch = [l for l in batch if l.get("provider") == "whatsapp" and l.get("phone")]
+            other_batch = [l for l in batch if not (l.get("provider") == "whatsapp" and l.get("phone"))]
+            res = {"created_leads": 0, "updated_leads": 0, "enrolled_in_campaign": 0}
+            if wa_batch:
+                r_wa = push_leads_via_mcp(
+                    wa_batch,
+                    enroll_in_campaign=enroll,
+                    campaign_id=args.campaign_id,
+                    campaign_name=args.campaign_name_wa,
+                    mcp_url=args.mcp_url or None,
+                )
+                for k in ("created_leads", "updated_leads", "enrolled_in_campaign"):
+                    res[k] += int(r_wa.get(k, 0))
+            if other_batch:
+                r_oth = push_leads_via_mcp(
+                    other_batch,
+                    enroll_in_campaign=False,
+                    campaign_id=None,
+                    campaign_name=args.campaign_name,
+                    mcp_url=args.mcp_url or None,
+                )
+                for k in ("created_leads", "updated_leads"):
+                    res[k] += int(r_oth.get(k, 0))
+        else:
+            res = push_leads_via_mcp(
+                batch,
+                enroll_in_campaign=enroll,
+                campaign_id=args.campaign_id,
+                campaign_name=args.campaign_name,
+                mcp_url=args.mcp_url or None,
+            )
         state[state_key] = total
         write_state(state)
         remaining_quota = max(0, remaining_quota - len(batch))

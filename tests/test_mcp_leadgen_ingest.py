@@ -99,12 +99,11 @@ def test_mcp_ingest_discovered_leads_creates_leads_campaign_and_deduplicates(db_
     assert camp["name"] == "Leadgen Autopilot"
     assert camp["status"] == "draft"
     assert len(camp["steps"]) == 3
-    assert [s["template_text"] for s in camp["steps"]] == [
-        "{step1_text}",
-        "{followup_1}",
-        "{followup_2}",
-    ]
-    assert [s["delay_hours"] for s in camp["steps"]] == [0, 24, 72]
+    assert camp["steps"][0]["template_text"] == "{step1_text}"
+    assert "500K-2M reach to your targeted audience (which equals highly qualified {audience})" in camp["steps"][1]["template_text"]
+    assert camp["steps"][2]["template_text"] == "You’re doing me dirty mate... :((("
+    assert camp["steps"][2]["image_url"] == "/media/outreach/4fa85f083f9e2911.jpg"
+    assert [s["delay_hours"] for s in camp["steps"]] == [0, 24, 24]
 
     recs = {r["username"]: r for r in camp["recipients"]}
     assert set(recs.keys()) == {"founder_alpha", "bob_beta"}

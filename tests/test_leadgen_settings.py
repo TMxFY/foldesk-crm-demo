@@ -46,7 +46,7 @@ def test_get_and_put_leadgen_config_persists_to_db_and_json(test_env):
     cfg = data["config"]
     assert cfg["enabled"] is True
     assert cfg["total_daily_quota"] == 50
-    assert cfg["b2b"]["touch_mode"] == "micro_ping"
+    assert cfg["b2b"]["touch_mode"] == "direct"
     assert cfg["vacancies"]["touch_mode"] == "direct"
     assert "gutz156" in cfg["cases_bank_md"]
 
@@ -126,6 +126,12 @@ def test_sync_leadgen_campaigns_and_push_now(test_env):
     assert "tg_groups" in tg_camp["leadgen_sources"]
     assert len(tg_camp["steps"]) == 3
     assert tg_camp["steps"][0]["template_text"] == "{first_touch}"
+    assert "{audience}" in tg_camp["steps"][1]["template_text"]
+    assert tg_camp["steps"][2]["template_text"] == "You’re doing me dirty mate... :((("
+    assert tg_camp["steps"][2]["image_url"] == "/media/outreach/4fa85f083f9e2911.jpg"
+    assert [s["delay_hours"] for s in tg_camp["steps"]] == [0, 24, 24]
+    vac_camp = names["TG Вакансии"]
+    assert [s["template_text"] for s in vac_camp["steps"]] == ["{first_touch}", "{followup_1}", "{followup_2}"]
 
     # Write local ready vacancy monitor & replies to state_dir and test push-now without LLM
     mon_path = state_dir / "job_monitor_2026-11-06.json"

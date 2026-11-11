@@ -35,12 +35,27 @@ except ImportError:
         from scripts.relay_route import chain, note_failure
 
 try:
-    from outreach_copy import first_touch as template_first_touch
+    from outreach_copy import (
+        REVSHARE_OFFER_TEXT,
+        SOFTUGC_PITCH_TEXT,
+        first_touch as template_first_touch,
+        upgrade_to_vlad_step1,
+    )
 except ImportError:
     try:
-        from leadgen.outreach_copy import first_touch as template_first_touch
+        from leadgen.outreach_copy import (
+            REVSHARE_OFFER_TEXT,
+            SOFTUGC_PITCH_TEXT,
+            first_touch as template_first_touch,
+            upgrade_to_vlad_step1,
+        )
     except ImportError:
-        from scripts.outreach_copy import first_touch as template_first_touch
+        from scripts.outreach_copy import (
+            REVSHARE_OFFER_TEXT,
+            SOFTUGC_PITCH_TEXT,
+            first_touch as template_first_touch,
+            upgrade_to_vlad_step1,
+        )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or (
@@ -64,20 +79,10 @@ YC_BATCHES = ["Winter 2027", "Fall 2026", "Summer 2026", "Winter 2026", "Fall 20
 CATEGORY = "SaaS / AI app"
 CAT_LABEL = "SaaS"
 
-CREATOROS_PRODUCT = (
-    "CreatorOS — organic distribution of short-form video: in-house AI video production + "
-    "a network of owned accounts. Works as a plug-and-play growth arm for early-stage startups. "
-    "Case: 183.5M views in 90 days with zero live shoots. Traffic 13-40x cheaper than standard "
-    "clipper services. We work on revshare/CPA. "
-    "We also promote physical products and run paid short-form ads."
-)
-
 SOFTUGC_PRODUCT = (
-    "SoftUGC — organic distribution of short-form video: in-house AI video production + "
-    "a network of owned accounts. Works as a plug-and-play growth arm for early-stage startups. "
-    "Case: 183.5M views in 90 days with zero live shoots. Traffic 13-40x cheaper than standard "
-    "clipper services. We work on revshare/CPA. "
-    "We also promote physical products and run paid short-form ads."
+    "SoftUGC — organic distribution using AI short-form video and a network of accounts we own. "
+    "Works as a growth arm that runs itself: 183.5M views in 90 days, no shoots, traffic costs "
+    "13 to 40x less than standard clippers. We work on revshare or CPA and clients only cover production costs."
 )
 
 
@@ -850,7 +855,7 @@ def llm_angles_batch(leads):
         '1. "their_angle": 1-2 konkretnyh predlozhenija — CHTO imenno delaet produkt, DLJA KOGO, '
         "kakaja u nih model (podpiska/usage/marketplace itd). Tolko po dannomu kontekstu, bez obschih fraz "
         'vrode "innovacionnaja platforma" i bez vydumyvanija detalej, kotoryh net v kontekste.\n'
-        '2. "our_angle": 1-2 predlozhenija — kak im zajdet CreatorOS. My: ' + CREATOROS_PRODUCT + "\n"
+        '2. "our_angle": 1-2 predlozhenija — kak im zajdet SoftUGC. My: ' + SOFTUGC_PRODUCT + "\n"
         "Vyberi podhodjaschee napravlenie pod ih produkt: klipping arhiva kontenta / AI UGC pod zapusk / "
         "klipping pod instally i podpiski / klipping pod referalov / "
         "prodvizhenie fizicheskih tovarov / platnaja reklama (pokupnoj trafik na korotkoe video). "
@@ -984,40 +989,61 @@ def _first_touch_prompt(lead, russian):
             "Rewrite the ENTIRE message in English only, translating every non-English idea."
         )
     prompt = (
-        "Write a short personalized first outreach message (Telegram DM) to the founder of a startup. "
-        "STRICT structure, " + lang_line +
-        "1. GREETING ONLY — just 'Hey,' or 'Hi [normal English first name],' ('Привет, Илья,' if Russian). "
-        "Optionally one short clause on where we saw them" + (f" — e.g. '{seen.strip(' ()')}';" if seen else ";") +
-        " then go STRAIGHT to the pain. Do NOT compliment their product, do NOT describe what their "
-        "product does, no 'looks sharp/intriguing/great' — skip all of that.\n"
-        "2. Pressure on the pain — infer it from their product/niche (typical: growth hit a ceiling "
-        "because of customer acquisition cost / expensive initial reach / organic reach is inconsistent "
-        "and hard to scale).\n"
-        "3. Close the pain with our self-presentation + case: our organic distribution (AI production "
-        "+ network of accounts) as a plug-and-play growth arm; case: 183.5M views in 90 days with zero "
-        "live shoots; traffic 13-40x cheaper than standard clipper services. "
-        "If the product is a physical good or they need bought traffic, in this same paragraph you may "
-        "also name paid short-form ads or physical-product promotion; otherwise stay on organic AI UGC / clipping. "
-        "Do not drop the 183.5M case. End with a soft CTA like "
-        "'want me to show how this would work for you?' ('показать, как это сработает для вас?')\n\n"
+        "Write a short personalized first outreach message (Telegram DM) to the founder/team of a company. "
+        "STRICT 4-paragraph structure, " + lang_line +
+        "1. Paragraph 1: ONLY 'Hey,' ('Привет,' if Russian).\n"
+        "2. Paragraph 2: Start with 'Saw " + name + ".' and go STRAIGHT to the individualized growth/acquisition pain "
+        "inferred from their product/category (e.g. 'You're probably running into the same thing most [agencies / AI teams / "
+        "Web3 teams / consumer brands / trading platforms] hit: ...'). 2 short natural sentences. "
+        "Do NOT compliment their product, do NOT paste their bio back to them, NO em-dashes (—).\n"
+        "3. Paragraph 3 (our SoftUGC presentation + 183.5M case): "
+        f"'{SOFTUGC_PITCH_TEXT}' (you may lightly adapt 2-3 words to fit their category, keeping SoftUGC, 183.5M views in 90 days, no shoots, 13 to 40x less).\n"
+        "4. Paragraph 4 (EXACT closing offer & CTA): "
+        f"'{REVSHARE_OFFER_TEXT}'\n\n"
         + lang_rules + "\n"
         f"Startup/product name: {name}\n"
-        f"Founder first name (use ONLY if appropriate for the language, else ignore): {(lead.get('founder_name') or '').strip()}\n"
+        f"Category: {(lead.get('category') or '').strip()}\n"
         f"What they do (use ONLY to infer the pain, do NOT describe it back to them): {(lead.get('site_text') or lead.get('one_liner') or '')[:900]}\n"
         f"Our product: {SOFTUGC_PRODUCT}\n\n"
-        "Output ONLY the message text, no quotes, no commentary."
+        "Output ONLY the message text, no quotes, no '(generated)' markers, no commentary."
     )
     return prompt, retry_line
 
 
 def llm_first_touch(lead):
-    """Fixed first touch for the product name and niche. No model call."""
+    """Canonical Vlad first touch (uses Relay Fast LLM only when LEADGEN_FIRST_TOUCH_LLM=1 is explicitly set)."""
     name = (lead.get("name") or "").strip()
     niche = (lead.get("one_liner") or "").strip() or (lead.get("their_angle") or "").strip()
     src = (lead.get("source") or "").strip()
-    if src in {"linkedin_jobs", "meta_ads"}:
-        return template_first_touch(name, niche, russian=wants_russian(lead), source=src)
-    return template_first_touch(name, niche, russian=wants_russian(lead))
+    cat = (lead.get("category") or "").strip()
+    site = (lead.get("site") or lead.get("url") or lead.get("project_url") or "").strip()
+    ru = wants_russian(lead)
+    if (
+        not ru
+        and os.environ.get("LEADGEN_FIRST_TOUCH_LLM", "").strip().lower() in {"1", "true", "yes"}
+        and (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY"))
+    ):
+        prompt, retry_line = _first_touch_prompt(lead, russian=False)
+        raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=450).strip().strip('"')
+        if re.search(r"[А-Яа-яЁё]", raw):
+            raw = llm_chat([{"role": "user", "content": prompt + retry_line}], max_tokens=450).strip().strip('"')
+        return upgrade_to_vlad_step1(
+            raw,
+            company=name,
+            name=lead.get("founder_name") or name,
+            site=site,
+            category=cat,
+            their_angle=niche,
+            source=src,
+        )
+    return template_first_touch(
+        name,
+        niche,
+        russian=ru,
+        source=src,
+        category=cat,
+        site=site,
+    )
 
 
 def _humanize_prompt(russian):

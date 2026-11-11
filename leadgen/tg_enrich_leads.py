@@ -55,16 +55,6 @@ def classify_role(bio):
             return name
     return ""
 
-HOOKS = {
-    "CEX / биржа": "You're already paying KOLs and affiliates for signups - we get the same registrations from organic short-form at a fraction of the cost, production on our own software. Saw {proj}. Want the numbers on one campaign?",
-    "Prop trading": "Prop firms live and die by challenge sales. We run clip networks that send qualified traders straight to {proj}'s checkout - organic, not paid. {detail} Want me to show one funnel?",
-    "Медиа / контент": "You have a deep archive ({detail}) but none of it reaches short-form. We cut your episodes/AMAs into a daily clip stream across 10 accounts. Want me to cut one episode of {proj} as a demo?",
-    "DeFi / DEX": "Your spaces/AMAs never make it to short-form, and TVL needs new users. We cut them into daily clips across 10 accounts pointing to {proj}. Want a demo cut?",
-    "Gaming / AI": "Your users live in short video, but you can't produce at that speed by hand. We run AI UGC volume for launches like {proj}. Want examples from your niche?",
-    "SaaS / AI app": "If your user growth has hit a ceiling, it's usually not the product - it's the cost of reach. We built an organic distribution system: in-house short-video production + a network of accounts. 183.5M views in 90 days on our last project, zero live shoots. Saw {proj}. Want to see how it's set up for a product like yours?",
-    "Web3 (общее)": "Short-form is the cheapest way to put {proj} in front of buyers right now. We produce 1000+ clips a month and post across a 10-account network. {detail} Want examples from your niche?",
-}
-
 
 def classify_cat(bio):
     if not bio:
@@ -230,9 +220,11 @@ def main():
         desc = fetch_desc(purl) if (args.fetch and purl) else ""
         what = desc or bio_detail(bio)
         detail = bio_detail(bio)
-        hook = HOOKS.get(cat, HOOKS["Web3 (общее)"]).format(
-            proj=(pname or "your project"), detail=(detail or ""))
-        hook = " ".join(hook.split())
+        try:
+            from outreach_copy import first_touch as _vlad_first_touch
+        except ImportError:
+            from leadgen.outreach_copy import first_touch as _vlad_first_touch
+        hook = _vlad_first_touch(pname or "", what or detail or "", russian=False, category=cat, site=purl)
         r2 = dict(r)
         role, roles = merge_roles(r, bio)
         r2.update({

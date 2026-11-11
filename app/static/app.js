@@ -10404,7 +10404,7 @@ function ensureLeadgenState() {
       total_daily_quota: 50,
       b2b: {
         enabled: true,
-        touch_mode: "micro_ping",
+        touch_mode: "direct",
         target_campaign_tg: "Leadgen Auto (TG)",
         target_campaign_wa: "Leadgen Auto (WA)",
         campaign_daily_limit: 30,
@@ -10655,7 +10655,7 @@ function renderLeadgenConfig() {
   setVal("#leadgen-total-quota", cfg.total_daily_quota ?? 50);
 
   setCheck("#leadgen-b2b-enabled", b2b.enabled !== false);
-  setVal("#leadgen-b2b-touch-mode", b2b.touch_mode || "micro_ping");
+  setVal("#leadgen-b2b-touch-mode", b2b.touch_mode || "direct");
   setVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Leadgen Auto (TG)");
   setVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Leadgen Auto (WA)");
   setVal("#leadgen-b2b-daily-limit", b2b.campaign_daily_limit ?? 30);
@@ -10732,7 +10732,7 @@ function collectLeadgenFormPayload() {
     total_daily_quota: getNum("#leadgen-total-quota", 50, 0, 500),
     b2b: {
       enabled: getCheck("#leadgen-b2b-enabled", true),
-      touch_mode: getVal("#leadgen-b2b-touch-mode", "micro_ping"),
+      touch_mode: getVal("#leadgen-b2b-touch-mode", "direct"),
       target_campaign_tg: getVal("#leadgen-b2b-campaign-tg", "Leadgen Auto (TG)"),
       target_campaign_wa: getVal("#leadgen-b2b-campaign-wa", "Leadgen Auto (WA)"),
       campaign_daily_limit: getNum("#leadgen-b2b-daily-limit", 30, 1, 500),

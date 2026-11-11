@@ -1967,11 +1967,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/media/outreach/{filename}")
     def outreach_media_get(filename: str):
-        from app.db import OUTREACH_MEDIA_DIR
+        from app.db import resolve_outreach_media
 
         safe_name = Path(filename).name
-        target = OUTREACH_MEDIA_DIR / safe_name
-        if not target.exists() or not target.is_file():
+        resolved = resolve_outreach_media(f"/media/outreach/{safe_name}")
+        target = resolved if isinstance(resolved, Path) else None
+        if target is None or not target.exists() or not target.is_file():
             raise HTTPException(status_code=404, detail="Картинка не найдена")
         return FileResponse(target)
 

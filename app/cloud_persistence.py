@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-from app.db import DEFAULT_DB, ROOT, utc_now
+from app.db import DEFAULT_DB, OUTREACH_MEDIA_DIR, ROOT, utc_now
 
 R2_OBJECT_KEY = "foldesk-crm/crm_state.bundle.json.gz"
 R2_LEASE_KEY = "foldesk-crm/tg_runtime_lease.json"
@@ -210,12 +210,23 @@ def backup_to_cloud(
             if sf.name in active_session_names and sf.is_file() and sf.stat().st_size > 100:
                 sessions_map[sf.name] = base64.b64encode(sf.read_bytes()).decode("ascii")
 
+    media_map: dict[str, str] = {}
+    if OUTREACH_MEDIA_DIR.exists():
+        for mf in sorted(OUTREACH_MEDIA_DIR.iterdir()):
+            if (
+                mf.is_file()
+                and mf.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+                and 0 < mf.stat().st_size <= 2 * 1024 * 1024
+            ):
+                media_map[mf.name] = base64.b64encode(mf.read_bytes()).decode("ascii")
+
     saved_at = utc_now()
     bundle = {
         "version": 1,
         "saved_at": saved_at,
         "db_b64": base64.b64encode(db_bytes).decode("ascii"),
         "sessions": sessions_map,
+        "outreach_media": media_map,
     }
     compressed = gzip.compress(
         json.dumps(bundle, ensure_ascii=False).encode("utf-8"), compresslevel=6
@@ -384,12 +395,24 @@ def restore_from_cloud(
             (sessions_dir / clean_name).write_bytes(base64.b64decode(b64_data))
             restored_sessions += 1
 
+    media_map = bundle.get("outreach_media") or {}
+    restored_media = 0
+    if isinstance(media_map, dict) and media_map:
+        OUTREACH_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        for fname, b64_data in media_map.items():
+            clean_name = Path(str(fname)).name
+            if Path(clean_name).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"} or not b64_data:
+                continue
+            (OUTREACH_MEDIA_DIR / clean_name).write_bytes(base64.b64decode(b64_data))
+            restored_media += 1
+
     return {
         "ok": True,
         "restored": True,
         "configured": True,
         "saved_at": bundle.get("saved_at"),
         "restored_sessions": restored_sessions,
+        "restored_media": restored_media,
     }
 
 

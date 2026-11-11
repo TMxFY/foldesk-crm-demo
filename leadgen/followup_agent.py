@@ -26,6 +26,14 @@ from urllib.parse import urlparse
 import requests
 
 try:
+    from outreach_copy import clean_brand_name, followup_one, followup_two
+except ImportError:
+    try:
+        from leadgen.outreach_copy import clean_brand_name, followup_one, followup_two
+    except ImportError:
+        from scripts.outreach_copy import clean_brand_name, followup_one, followup_two
+
+try:
     from relay_route import chain, note_failure
 except ImportError:
     try:
@@ -132,28 +140,7 @@ _NUMBERED_PREFIX_RE = re.compile(r"\b\d+\.\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-
 
 def clean_product_name(raw_name: str, site: str = "", their_angle: str = "") -> str:
     """Turn raw sheet 'Название' ('7. Calendarly', 'gielinorsurvivors', '@user') into a clean product name."""
-    name = (raw_name or "").strip()
-    name = re.sub(r"^\d+[\.\)]\s*", "", name).strip()
-    name = re.sub(r"\s*[\(\|].*$", "", name).strip()
-
-    if name and name == name.lower() and " " not in name:
-        angle_head = (their_angle or "").strip()[:80]
-        m = re.match(r"^([A-Z][A-Za-z0-9\.\-]+(?:\s+[A-Z][A-Za-z0-9\.\-]+)?)\b", angle_head)
-        if m:
-            candidate = m.group(1).strip()
-            if re.sub(r"[^a-z0-9]", "", candidate.lower()) == re.sub(r"[^a-z0-9]", "", name.lower()):
-                return candidate
-        if len(name) <= 18:
-            return name[:1].upper() + name[1:]
-
-    if not name or name.startswith("@") or len(name) > 45:
-        if site:
-            host = (urlparse(site if "://" in site else f"https://{site}").hostname or "").lower().removeprefix("www.")
-            base = host.split(".")[0] if host else ""
-            if base and base not in {"t", "x", "twitter", "linkedin", "itunes", "apps", "play"}:
-                return base[:1].upper() + base[1:]
-        return ""
-    return name
+    return clean_brand_name(raw_name, site=site, their_angle=their_angle)
 
 
 def _is_russian_lead(name: str, first_touch: str) -> bool:
@@ -271,49 +258,10 @@ def smart_fallback_followups(
         )
         return _sanitize_followup(f1, raw_name, prod), _sanitize_followup(f2, raw_name, prod)
 
-    target = f"for {prod}" if prod else "for your product"
-    prod_ref = prod if prod else "your product"
-
-    if "hiring" in (first_touch or "").lower() or ("creator" in angle_l and ("new york" in angle_l or "remote" in angle_l or "united states" in angle_l)):
-        f1 = (
-            f"Since you're hiring on the content side, we could run 20+ short-form variations a week "
-            f"across our account network {target} while you fill the role. Want to see 2 examples from your niche?"
-        )
-    elif "active meta video ads" in angle_l or "running active video ads" in (first_touch or "").lower():
-        f1 = (
-            f"Saw the video ads you're running right now. We could spin up fresh AI UGC variations and "
-            f"organic clips across 10 pages {target} so your winning angles don't burn out. Open to seeing 2 examples?"
-        )
-    elif "медиа" in cat_l or "podcast" in angle_l or "youtube" in angle_l or "episode" in angle_l:
-        f1 = (
-            f"Quick idea {target}: we can take your existing long-form episodes and turn them into a daily "
-            f"clip stream across 10 dedicated Shorts and Reels accounts. Want me to cut one sample clip as a demo?"
-        )
-    elif "проп" in cat_l or "prop" in angle_l or "cex" in cat_l or "defi" in cat_l or "trading" in angle_l or "wallet" in angle_l:
-        f1 = (
-            f"One format working really well in trading and fintech right now is short breakdown clips "
-            f"posted across a 10-account network pointing straight to {prod_ref}. Want to see 2 examples?"
-        )
-    elif "game" in angle_l or "gaming" in cat_l or "roblox" in angle_l or "fivem" in angle_l or "browser" in angle_l:
-        f1 = (
-            f"Quick idea {target}: daily gameplay moments and build clips across TikTok and Shorts "
-            f"usually bring in the cheapest organic players. Want me to send over 2 reference accounts?"
-        )
-    else:
-        openers = (
-            f"Quick idea {target}: 15-second workflow demos posted across 10 niche TikTok and Reels pages pointing straight to {prod_ref}. Want to see 2 examples?",
-            f"Was looking at {prod_ref} again. Short problem-to-solution clips across a 10-account network would convert super cleanly here, want me to send 2 sample angles?",
-            f"One format that works really well for products like {prod_ref} is short daily screen demos across dedicated Shorts and Reels pages. Worth testing a batch?",
-        )
-        f1 = openers[seed % len(openers)]
-
-    f2_options = (
-        f"Are you guys testing any new acquisition channels {target} this month, or mostly heads-down on product right now?",
-        f"Let me know if getting more short-form volume {target} is a priority right now, we can spin up a test batch pretty quickly.",
-        f"Open to a quick 10-minute chat this week to see how the account network would work {target}, or bad timing?",
+    return (
+        followup_one(prod or raw_name, their_angle, russian=False, category=category, site=site),
+        followup_two(prod or raw_name, russian=False),
     )
-    f2 = f2_options[seed % len(f2_options)]
-    return _sanitize_followup(f1, raw_name, prod), _sanitize_followup(f2, raw_name, prod)
 
 
 def _cache_key(name: str, site: str, their_angle: str, first_touch: str) -> str:
@@ -465,80 +413,17 @@ def generate_followups_for_rows(
     use_llm: bool | None = None,
     cache_path: Path = CACHE_PATH,
 ) -> list[tuple[str, str]]:
-    """Return validated, humanized [(followup_1, followup_2), ...] for 15-col sheet rows."""
+    """Return canonical Vlad B2B follow-ups [(followup_1, followup_2), ...] for 15-col sheet rows."""
+    del use_llm, cache_path
     if not rows:
         return []
-    if use_llm is None:
-        use_llm = os.environ.get("CSV_NOTIFY_LLM", "1").lower() not in {"0", "false", "no"} and bool(
-            os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY")
-        )
-
-    cache = _load_cache(cache_path) if use_llm else {}
-    results: list[tuple[str, str] | None] = [None] * len(rows)
-    uncached_indices: list[int] = []
-    uncached_items: list[dict] = []
-
-    for idx, row in enumerate(rows):
+    out: list[tuple[str, str]] = []
+    for row in rows:
         cat = str(row[3] if len(row) > 3 else "")
         name = str(row[4] if len(row) > 4 else "")
         site = str(row[5] if len(row) > 5 else "")
         their_angle = str(row[7] if len(row) > 7 else "")
         our_angle = str(row[8] if len(row) > 8 else "")
         first_touch = str(row[10] if len(row) > 10 else "")
-        clean_name = clean_product_name(name, site, their_angle)
-        ck = _cache_key(name, site, their_angle, first_touch)
-        if use_llm and ck in cache:
-            f1 = _sanitize_followup(cache[ck][0], name, clean_name)
-            f2 = _sanitize_followup(cache[ck][1], name, clean_name)
-            if not validate_followup_pair(f1, f2, raw_name=name, first_touch=first_touch):
-                results[idx] = (f1, f2)
-                continue
-        if use_llm:
-            uncached_indices.append(idx)
-            uncached_items.append({
-                "i": idx,
-                "name": name,
-                "clean_name": clean_name,
-                "site": site,
-                "category": cat,
-                "their_angle": their_angle[:350],
-                "our_angle": our_angle[:250],
-                "first_touch": first_touch[:350],
-            })
-        else:
-            results[idx] = smart_fallback_followups(name, site, cat, their_angle, our_angle, first_touch)
-
-    if use_llm and uncached_items:
-        batches = [
-            uncached_items[start : start + BATCH_SIZE]
-            for start in range(0, len(uncached_items), BATCH_SIZE)
-        ]
-        workers = min(len(batches), 4)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            batch_maps = list(ex.map(_call_llm_batch, batches))
-        merged: dict[int, tuple[str, str]] = {}
-        for bm in batch_maps:
-            merged.update(bm)
-        cache_dirty = False
-        for idx in uncached_indices:
-            row = rows[idx]
-            cat = str(row[3] if len(row) > 3 else "")
-            name = str(row[4] if len(row) > 4 else "")
-            site = str(row[5] if len(row) > 5 else "")
-            their_angle = str(row[7] if len(row) > 7 else "")
-            our_angle = str(row[8] if len(row) > 8 else "")
-            first_touch = str(row[10] if len(row) > 10 else "")
-            if idx in merged:
-                results[idx] = merged[idx]
-                ck = _cache_key(name, site, their_angle, first_touch)
-                cache[ck] = [merged[idx][0], merged[idx][1]]
-                cache_dirty = True
-            else:
-                results[idx] = smart_fallback_followups(name, site, cat, their_angle, our_angle, first_touch)
-        if cache_dirty:
-            _save_cache(cache, cache_path)
-
-    return [
-        r if r is not None else ("", "")
-        for r in results
-    ]
+        out.append(smart_fallback_followups(name, site, cat, their_angle, our_angle, first_touch))
+    return out
