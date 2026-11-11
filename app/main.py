@@ -945,7 +945,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 has_str = conn.execute(
                     "SELECT 1 FROM accounts WHERE session_string IS NOT NULL LIMIT 1"
                 ).fetchone()
-                if has_str is not None:
+                has_mig = conn.execute(
+                    "SELECT 1 FROM kv_settings WHERE key = 'freeze_legacy_1300_and_scrub_creatoros_v1' LIMIT 1"
+                ).fetchone()
+                if has_str is not None or has_mig is not None:
                     needs_initial_session_backup = True
         except Exception:
             pass

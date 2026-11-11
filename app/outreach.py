@@ -189,10 +189,19 @@ def _clean_company_title(raw: str | None) -> str | None:
     return s or None
 
 
+_LEGACY_CREATOROS_RE = re.compile(r"\bCreatorOS\b", re.IGNORECASE)
+
+
+def _sanitize_legacy_brand(text: str | None) -> str:
+    if not text:
+        return ""
+    return _LEGACY_CREATOROS_RE.sub("SoftUGC", str(text))
+
+
 def _clean_step1_text(raw: str | None) -> tuple[str | None, str | None]:
     if raw is None:
         return None, None
-    text = str(raw).strip()
+    text = _sanitize_legacy_brand(raw).strip()
     if not text:
         return None, None
     marker = "Actually, here's the rewrite based on what you gave me:"
@@ -480,7 +489,7 @@ def render_template(
     text = expand_spintax(text, rng=rng)
 
     lines = []
-    for line in text.splitlines():
+    for line in _sanitize_legacy_brand(text).splitlines():
         cleaned = re.sub(r"[ \t]{2,}", " ", line).strip()
         cleaned = re.sub(r"\s+([,!?.:;])", r"\1", cleaned)
         lines.append(cleaned)
@@ -1812,8 +1821,8 @@ def import_campaign_csv(
         hook = (item.get("hook") or "").strip() or None
         note = (item.get("note") or "").strip() or their_angle
         step1_text, error_reason = _clean_step1_text(item.get("step1_text"))
-        step2_text = (item.get("step2_text") or "").strip() or None
-        step3_text = (item.get("step3_text") or "").strip() or None
+        step2_text = _sanitize_legacy_brand(item.get("step2_text")).strip() or None
+        step3_text = _sanitize_legacy_brand(item.get("step3_text")).strip() or None
         if step2_text:
             has_step2 = True
         if step3_text:
@@ -2374,6 +2383,7 @@ async def run_campaign_batch(
         sent_this_recipient = False
         no_accounts_left = False
         jitter_applied = False
+        replied_skipped = False
         while True:
             available = [
                 st
@@ -2385,17 +2395,23 @@ async def run_campaign_batch(
                 break
 
             assigned_id = rec.get("assigned_account_id")
-            if assigned_id is not None and int(assigned_id) in state_by_id:
+            if step_idx >= 1:
+                if assigned_id is None or int(assigned_id) not in state_by_id:
+                    chosen_state = None
+                else:
+                    pinned_state = state_by_id[int(assigned_id)]
+                    if (
+                        not pinned_state.get("disabled")
+                        and not pinned_state.get("dead")
+                        and pinned_state["sent_today"] < pinned_state["daily_limit"]
+                    ):
+                        chosen_state = pinned_state
+                    else:
+                        chosen_state = None
+            elif assigned_id is not None and int(assigned_id) in state_by_id:
                 pinned_state = state_by_id[int(assigned_id)]
                 if not pinned_state.get("disabled") and pinned_state["sent_today"] < pinned_state["daily_limit"]:
                     chosen_state = pinned_state
-                elif pinned_state.get("dead"):
-                    chosen_state = min(
-                        available,
-                        key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
-                    )
-                elif step_idx >= 1:
-                    chosen_state = None
                 else:
                     chosen_state = min(
                         available,
@@ -2469,14 +2485,26 @@ async def run_campaign_batch(
 
                 # Before sending follow-up (step_idx >= 1), check live and cached messages for reply
                 if step_idx >= 1 and dialog:
+                    live_history_checked = False
+                    live_has_out = False
                     if use_gateway and hasattr(active_gw, "fetch_messages"):
                         try:
                             fetched_msgs = await active_gw.fetch_messages(
                                 session_path, dialog["peer_id"], 5
                             )
-                            if isinstance(fetched_msgs, list) and fetched_msgs:
-                                _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                            if isinstance(fetched_msgs, list):
+                                live_history_checked = True
+                                live_has_out = any(
+                                    str(m.get("direction") or "") == "out"
+                                    for m in fetched_msgs
+                                    if isinstance(m, dict)
+                                )
+                                if fetched_msgs:
+                                    _cache_messages(conn, int(dialog["id"]), fetched_msgs)
                         except Exception as fetch_exc:
+                            f_kind, _ = _classify_outreach_send_error(fetch_exc)
+                            if f_kind in ("account_dead", "account_transient"):
+                                raise
                             f_blob = str(fetch_exc or "").casefold()
                             clean_un = str(rec.get("username") or "").strip().lstrip("@")
                             if clean_un and ("could not find the input entity" in f_blob or "peeruser" in f_blob):
@@ -2485,10 +2513,18 @@ async def run_campaign_batch(
                                     fetched_msgs = await active_gw.fetch_messages(
                                         session_path, dialog["peer_id"], 5
                                     )
-                                    if isinstance(fetched_msgs, list) and fetched_msgs:
-                                        _cache_messages(conn, int(dialog["id"]), fetched_msgs)
-                                except Exception:
-                                    pass
+                                    if isinstance(fetched_msgs, list):
+                                        live_history_checked = True
+                                        live_has_out = any(
+                                            str(m.get("direction") or "") == "out"
+                                            for m in fetched_msgs
+                                            if isinstance(m, dict)
+                                        )
+                                        if fetched_msgs:
+                                            _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                                except Exception as inner_exc:
+                                    if _classify_outreach_send_error(inner_exc)[0] in ("account_dead", "account_transient"):
+                                        raise
                     refreshed_dlg_row = conn.execute(
                         "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
                     ).fetchone()
@@ -2506,6 +2542,14 @@ async def run_campaign_batch(
                             username=dialog.get("username") or rec.get("username"),
                             phone=dialog.get("phone") or rec.get("phone"),
                             lead_id=dialog.get("lead_id") or rec.get("lead_id"),
+                        )
+                        conn.commit()
+                        replied_skipped = True
+                        break
+                    if live_history_checked and not live_has_out:
+                        conn.execute(
+                            "UPDATE campaign_recipients SET status = 'completed', updated_at = ? WHERE id = ?",
+                            (now, rec["id"]),
                         )
                         conn.commit()
                         replied_skipped = True

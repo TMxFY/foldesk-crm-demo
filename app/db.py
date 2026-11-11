@@ -783,7 +783,158 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_dead_tg_sessions_v1', '1', ?)",
                 (now_ts,),
             )
+        legacy_outreach_fixed = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'freeze_legacy_1300_and_scrub_creatoros_v1'"
+        ).fetchone()
+        if legacy_outreach_fixed is None:
+            apply_legacy_outreach_cleanup(conn)
     conn.commit()
+
+
+def apply_legacy_outreach_cleanup(conn: sqlite3.Connection) -> dict:
+    import json
+    import re
+
+    now_ts = utc_now()
+    creatoros_re = re.compile(r"\bCreatorOS\b", re.IGNORECASE)
+
+    # 1. Close all legacy in_progress/failed step>=1 recipients (sent before 2026-11-10, mis-sent step>=2 on 2026-11-10, or orphaned on dead/missing accounts)
+    legacy_ids = [
+        int(r[0])
+        for r in conn.execute(
+            """
+            SELECT id FROM campaign_recipients
+            WHERE (
+                status = 'in_progress'
+                OR (status = 'failed' AND COALESCE(current_step, 0) >= 1)
+            )
+              AND (
+                  last_sent_at IS NULL
+                  OR last_sent_at < '2026-11-10'
+                  OR (COALESCE(current_step, 0) >= 2 AND last_sent_at < '2026-11-11')
+                  OR assigned_account_id IS NULL
+                  OR assigned_account_id NOT IN (
+                      SELECT id FROM accounts
+                      WHERE COALESCE(health, 'active') NOT IN ('unauthorized', 'banned', 'frozen')
+                  )
+              )
+            """
+        ).fetchall()
+    ]
+    closed_in_progress = len(legacy_ids)
+    if legacy_ids:
+        for chunk_start in range(0, len(legacy_ids), 400):
+            chunk = legacy_ids[chunk_start : chunk_start + 400]
+            ph = ",".join("?" for _ in chunk)
+            for rid, raw_extra in conn.execute(
+                f"SELECT id, extra_json FROM campaign_recipients WHERE id IN ({ph})",
+                chunk,
+            ).fetchall():
+                new_extra = raw_extra
+                if raw_extra and "fine_status" in str(raw_extra):
+                    try:
+                        parsed = json.loads(raw_extra)
+                        if isinstance(parsed, dict) and str(parsed.get("fine_status") or "").startswith("need_step"):
+                            parsed["fine_status"] = "completed"
+                            new_extra = json.dumps(parsed, ensure_ascii=False)
+                    except Exception:
+                        pass
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = NULL,
+                        extra_json = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (new_extra, now_ts, int(rid)),
+                )
+
+    # 2. Scrub CreatorOS -> SoftUGC in recipient step texts, campaign_steps, and campaign names
+    rec_rows = conn.execute(
+        """
+        SELECT id, step1_text, step2_text, step3_text
+        FROM campaign_recipients
+        WHERE lower(COALESCE(step1_text, '')) LIKE '%creatoros%'
+           OR lower(COALESCE(step2_text, '')) LIKE '%creatoros%'
+           OR lower(COALESCE(step3_text, '')) LIKE '%creatoros%'
+        """
+    ).fetchall()
+    scrubbed_recipients = 0
+    for r in rec_rows:
+        rid = int(r[0])
+        s1 = creatoros_re.sub("SoftUGC", r[1]) if r[1] else r[1]
+        s2 = creatoros_re.sub("SoftUGC", r[2]) if r[2] else r[2]
+        s3 = creatoros_re.sub("SoftUGC", r[3]) if r[3] else r[3]
+        conn.execute(
+            """
+            UPDATE campaign_recipients
+            SET step1_text = ?, step2_text = ?, step3_text = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (s1, s2, s3, now_ts, rid),
+        )
+        scrubbed_recipients += 1
+
+    for srow in conn.execute(
+        "SELECT id, template_text FROM campaign_steps WHERE lower(COALESCE(template_text, '')) LIKE '%creatoros%'"
+    ).fetchall():
+        conn.execute(
+            "UPDATE campaign_steps SET template_text = ? WHERE id = ?",
+            (creatoros_re.sub("SoftUGC", srow[1]), int(srow[0])),
+        )
+
+    for crow in conn.execute(
+        "SELECT id, name FROM campaigns WHERE lower(COALESCE(name, '')) LIKE '%creatoros%'"
+    ).fetchall():
+        clean_cname = re.sub(r"\s*/\s*CreatorOS\b", "", str(crow[1]), flags=re.IGNORECASE)
+        clean_cname = creatoros_re.sub("SoftUGC", clean_cname).strip()
+        conn.execute(
+            "UPDATE campaigns SET name = ?, updated_at = ? WHERE id = ?",
+            (clean_cname, now_ts, int(crow[0])),
+        )
+
+    # 3. Re-order untouched pending recipients in Все2 campaigns so newest appended leads go first
+    reordered_pending = 0
+    vse2_camps = [
+        int(c_row[0])
+        for c_row in conn.execute("SELECT id, name FROM campaigns").fetchall()
+        if "все2" in str(c_row[1] or "").casefold()
+    ]
+    for cid in vse2_camps:
+        pending_ids = [
+            int(r[0])
+            for r in conn.execute(
+                "SELECT id FROM campaign_recipients WHERE campaign_id = ? AND status = 'pending' ORDER BY id ASC",
+                (cid,),
+            ).fetchall()
+        ]
+        if len(pending_ids) >= 2:
+            max_id_row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM campaign_recipients").fetchone()
+            offset = int(max_id_row[0] or 0) + 100000
+            for old_id in pending_ids:
+                conn.execute(
+                    "UPDATE campaign_recipients SET id = ? WHERE id = ?",
+                    (old_id + offset, old_id),
+                )
+            for src_old_id, dst_new_id in zip(reversed(pending_ids), pending_ids):
+                conn.execute(
+                    "UPDATE campaign_recipients SET id = ? WHERE id = ?",
+                    (dst_new_id, src_old_id + offset),
+                )
+            reordered_pending += len(pending_ids)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('freeze_legacy_1300_and_scrub_creatoros_v1', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {
+        "closed_in_progress": closed_in_progress,
+        "scrubbed_recipients": scrubbed_recipients,
+        "reordered_pending": reordered_pending,
+    }
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
