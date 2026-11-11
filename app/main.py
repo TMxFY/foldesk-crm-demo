@@ -2192,6 +2192,16 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             limit=limit,
         )
 
+    @app.post("/api/campaigns/sync-recipient-drafts")
+    async def campaigns_sync_recipient_drafts(request: Request):
+        from app.funnel_analytics import sync_untouched_recipient_drafts
+
+        payload = await request.json()
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise HTTPException(status_code=400, detail="items list is required")
+        return _call(sync_untouched_recipient_drafts, request.app.state.conn, items)
+
     class AirtableSyncIn(BaseModel):
         direction: str = "both"
 

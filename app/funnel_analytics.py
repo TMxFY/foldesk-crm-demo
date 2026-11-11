@@ -1194,3 +1194,133 @@ def get_outreach_funnel(
         "filtered_total": len(filtered),
         "campaigns": campaigns_meta,
     }
+
+
+def sync_untouched_recipient_drafts(
+    conn: sqlite3.Connection, items: list[dict]
+) -> dict:
+    """Bulk-apply generated claude-sonnet-5 drafts ONLY to untouched step=0 B2B recipients."""
+    ensure_funnel_columns(conn)
+    now = utc_now()
+
+    camp_rows = conn.execute("SELECT id, name FROM campaigns").fetchall()
+    b2b_cids = {
+        int(c["id"])
+        for c in camp_rows
+        if "ваканс" not in str(c["name"] or "").casefold()
+        and "vacanc" not in str(c["name"] or "").casefold()
+    }
+    if not b2b_cids or not items:
+        return {"ok": True, "updated": 0, "skipped": len(items or [])}
+
+    placeholders = ",".join("?" for _ in b2b_cids)
+    untouched_rows = conn.execute(
+        f"""
+        SELECT id, campaign_id, username, company, their_angle, extra_json, current_step, status, last_sent_at
+        FROM campaign_recipients
+        WHERE campaign_id IN ({placeholders})
+          AND COALESCE(current_step, 0) = 0
+          AND last_sent_at IS NULL
+          AND status NOT IN ('in_progress', 'completed', 'replied')
+        """,
+        tuple(sorted(b2b_cids)),
+    ).fetchall()
+
+    by_id: dict[int, dict] = {}
+    by_uname: dict[str, list[dict]] = {}
+    for row in untouched_rows:
+        d = dict(row)
+        by_id[int(d["id"])] = d
+        u = str(d.get("username") or "").strip().lstrip("@").lower()
+        if u:
+            by_uname.setdefault(u, []).append(d)
+
+    updated_ids: set[int] = set()
+    skipped = 0
+
+    for obj in items:
+        if not isinstance(obj, dict):
+            skipped += 1
+            continue
+        step1_text = str(obj.get("step1_text") or "").strip()
+        if not step1_text:
+            skipped += 1
+            continue
+
+        targets: list[dict] = []
+        rid_raw = obj.get("recipient_id")
+        if rid_raw is not None:
+            try:
+                rid = int(rid_raw)
+                if rid in by_id:
+                    targets.append(by_id[rid])
+            except (TypeError, ValueError):
+                pass
+        u = str(obj.get("username") or "").strip().lstrip("@").lower()
+        if u and u in by_uname:
+            for cand in by_uname[u]:
+                if int(cand["id"]) not in {int(t["id"]) for t in targets}:
+                    targets.append(cand)
+
+        if not targets:
+            skipped += 1
+            continue
+
+        aud = str(obj.get("audience") or "").strip().lower() or "users"
+        vkey = str(obj.get("variant_key") or "sonnet5_vlad_v1").strip()
+        pangle = str(obj.get("pain_angle") or "").strip() or None
+        f1_text = str(obj.get("followup1_text") or "").strip() or None
+
+        for target in targets:
+            tid = int(target["id"])
+            extra: dict = {}
+            if target.get("extra_json"):
+                try:
+                    parsed = json.loads(target["extra_json"])
+                    if isinstance(parsed, dict):
+                        extra = parsed
+                except Exception:
+                    extra = {}
+            extra["audience"] = aud
+            extra["variant_key"] = vkey
+            if pangle:
+                extra["pain_angle"] = pangle
+
+            comp = str(obj.get("company") or "").strip() or target.get("company")
+            t_angle = str(obj.get("their_angle") or "").strip() or target.get("their_angle")
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET company = ?,
+                    their_angle = ?,
+                    hook = NULL,
+                    step1_text = ?,
+                    step2_text = ?,
+                    step3_text = NULL,
+                    variant_key = ?,
+                    pain_angle = ?,
+                    extra_json = ?,
+                    status = 'pending',
+                    error_text = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND COALESCE(current_step, 0) = 0
+                  AND last_sent_at IS NULL
+                  AND status NOT IN ('in_progress', 'completed', 'replied')
+                """,
+                (
+                    comp,
+                    t_angle,
+                    step1_text,
+                    f1_text,
+                    vkey,
+                    pangle,
+                    json.dumps(extra, ensure_ascii=False),
+                    now,
+                    tid,
+                ),
+            )
+            updated_ids.add(tid)
+
+    conn.commit()
+    return {"ok": True, "updated": len(updated_ids), "skipped": skipped}
