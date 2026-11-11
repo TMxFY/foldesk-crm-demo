@@ -357,3 +357,38 @@ def test_step1_repair_v2_restores_truncated_ceiling_and_skips_llm_stubs(tmp_path
     assert by_u["hukid"]["status"] == "completed"
     assert by_u["davidhwang"]["status"] == "completed"
     assert by_u["blockblanc"]["status"] == "completed"
+
+
+def test_purge_offline_non_icp_v3_deletes_pools_playgrounds_and_keeps_saas(tmp_path):
+    from app.db import apply_purge_offline_non_icp_v3
+
+    conn = connect(tmp_path / "test_v3_purge.db")
+    init_db(conn)
+    _seed_accounts(conn)
+
+    camp = create_campaign(
+        conn,
+        name="SoftUGC — База Все2 (4 лида)",
+        account_ids=[30],
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    now = "2026-11-11T09:00:00"
+    conn.executemany(
+        """
+        INSERT INTO campaign_recipients (campaign_id, username, name, company, website, their_angle, status, current_step, step1_text, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 'Test pitch.', ?, ?)
+        """,
+        [
+            (camp["id"], "loba4eva08", "Simple Pools", "simple-pools", "simple-pools.ru", "Cтроительство бассейнов и spa помещений", now, now),
+            (camp["id"], "fkoshelev", "Федор", "silver-town", "silver-town.ru", "Детские уличные игровые комплексы", now, now),
+            (camp["id"], "raketa_in_spaces", "Spaces", "spaces", "spaces.expert", "ВЕСM МАРКЕТИНГ - В БАН Сооснователь АБ SPACES", now, now),
+            (camp["id"], "mshpakov", "Михаил Шпаков", "Statuser", "", "Руководитель разработки Timeweb Cloud. Основатель Statuser", now, now),
+            (camp["id"], "anna23vm", "Анна", "MiniApp", "", "Архитектор Mini App и чат-ботов", now, now),
+        ],
+    )
+    conn.commit()
+
+    res = apply_purge_offline_non_icp_v3(conn)
+    assert res["deleted"] == 3
+    remaining = [r["username"] for r in get_campaign(conn, camp["id"])["recipients"]]
+    assert remaining == ["mshpakov", "anna23vm"]

@@ -793,6 +793,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if step1_truncation_fixed is None:
             apply_outreach_step1_repair_v2(conn)
+        offline_junk_purged = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'purge_offline_non_icp_contacts_v3'"
+        ).fetchone()
+        if offline_junk_purged is None:
+            apply_purge_offline_non_icp_v3(conn)
     conn.commit()
 
 
@@ -1006,6 +1011,74 @@ def apply_outreach_step1_repair_v2(conn: sqlite3.Connection) -> dict:
         "repaired": repaired,
         "skipped_broken": skipped_broken,
     }
+
+
+def apply_purge_offline_non_icp_v3(conn: sqlite3.Connection) -> dict:
+    from app.outreach import _fix_mojibake, is_offline_non_icp_contact
+
+    now_ts = utc_now()
+    rows = conn.execute(
+        """
+        SELECT id, campaign_id, username, name, company, website, their_angle
+        FROM campaign_recipients
+        WHERE status = 'pending'
+          AND COALESCE(current_step, 0) = 0
+          AND last_sent_at IS NULL
+        """
+    ).fetchall()
+
+    delete_ids: list[int] = []
+    fixed_mojibake = 0
+    touched_campaigns: set[int] = set()
+    for r in rows:
+        rid = int(r[0])
+        cid = int(r[1])
+        uname, name, comp, web, angle = r[2], r[3], r[4], r[5], r[6]
+        if is_offline_non_icp_contact(
+            username=uname,
+            name=name,
+            company=comp,
+            website=web,
+            their_angle=angle,
+        ):
+            delete_ids.append(rid)
+            touched_campaigns.add(cid)
+        elif angle and ("Ð" in str(angle) or "Ñ" in str(angle)):
+            clean_angle = _fix_mojibake(angle)
+            if clean_angle != angle:
+                conn.execute(
+                    "UPDATE campaign_recipients SET their_angle = ?, note = ?, updated_at = ? WHERE id = ?",
+                    (clean_angle, clean_angle, now_ts, rid),
+                )
+                fixed_mojibake += 1
+
+    if delete_ids:
+        for start in range(0, len(delete_ids), 400):
+            chunk = delete_ids[start : start + 400]
+            ph = ",".join("?" for _ in chunk)
+            conn.execute(f"DELETE FROM campaign_recipients WHERE id IN ({ph})", chunk)
+
+    for cid in touched_campaigns:
+        crow = conn.execute("SELECT name FROM campaigns WHERE id = ?", (cid,)).fetchone()
+        if crow and "База Все2 (" in str(crow[0]):
+            total_now = conn.execute(
+                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ?", (cid,)
+            ).fetchone()[0]
+            formatted_total = f"{int(total_now):,}".replace(",", " ")
+            import re as _re
+
+            new_name = _re.sub(r"\(\d[\d\s]*\s*лида?\)", f"({formatted_total} лидов)", str(crow[0]))
+            conn.execute(
+                "UPDATE campaigns SET name = ?, updated_at = ? WHERE id = ?",
+                (new_name, now_ts, cid),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_offline_non_icp_contacts_v3', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {"deleted": len(delete_ids), "fixed_mojibake": fixed_mojibake}
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:

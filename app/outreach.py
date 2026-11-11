@@ -240,6 +240,85 @@ def _clean_step1_text(raw: str | None, company: str | None = None) -> tuple[str 
     return (text or None), None
 
 
+_OFFLINE_NON_ICP_RE = re.compile(
+    r"(?:"
+    r"архитектур\w*\s+(?:бюро|визуал|фасад|дизайн|и\s+дизайн)|ведущий\s+архитектор|"
+    r"архитектор,\s*исследовател|архитекторы\.рф|арх\.рф|zaharov\s+architect|abd\s+architects|"
+    r"archbutik|archivibe|archblago|karst\.studio|architectural\s+(?:bureau|visualization)|"
+    r"3d\s+renderings\s+of\s+residential|благоустройств|застройщик|жилых\s+комплекс|новостро|"
+    r"брокер\s+по\s+недвижимост|клуб\s+недвижимост|недвижимый\s+подкаст|"
+    r"федеральный\s+девелопер|школа\s+девелопера|девелоперы\.рф|девелоперских\s+проектов|"
+    r"девелопер\s+создаю|девелопмент\s+и\s+маркетинг|девелопмент\s+на\s+карте|"
+    r"городской\s+ландшафт|территор\w*\s+и\s+проект|маркетолог\s+пространств|"
+    r"городской\s+среды|общественных\s+пространств|земельных\s+участков|квадратного\s+метра|"
+    r"диалоги\s+о\s+городе|проектирую\s+красивые\s+дома|urban\s+mobility|"
+    r"дизайн[а-я]*\s+(?:интерьер|ресторан)|дизайн-бюро|текстильн\w*\s+дизайн|decor\s+bonjour|"
+    r"механизац\w*\s+декор|стеклофибробетон|квартирный\s+ответ|"
+    r"детск\w*\s+(?:уличн|игров|площад|и\s+спортивн)|igratex|silver-town|"
+    r"уличн\w*\s+мебел|беседк\w*\s+из|клееного\s+бруса|мебел\w*\s+для\s+ресторан|"
+    r"[cс]троительств\w*\s+бассейн|simple-pools|люки\s+и\s+двери|индустриальн\w*\s+парк|"
+    r"площадк\w*\s+для\s+собак|жизни\s+с\s+собаками|"
+    r"производств\w*\s+брюк|джинс|косметическ\w*\s+бренд|feelnature|эфирн\w*\s+масл|"
+    r"психолог|нумеролог|психосоматик|гештальт|бизнес-коуч|аудит\s+коммуникации|"
+    r"экскурси|проводник.*пхукет|phuket.*проводник|передержк\w*.*животн|выгул|"
+    r"певиц|вокал|говорить\s+или\s+петь|сонграйтинг|музыкальн\w*\s+(?:лейбл|издательств)|"
+    r"звукорежиссер|музыка\s+для\s+кино|слушай\s+мои\s+песни|трэк\s+|концерт\w*,\s+спектакл|"
+    r"площадок\s+под\s+концерт|медиа\s+о\s+концерт|услуг\w*\s+для\s+артистов|артистов\s+слушали|"
+    r"kassy\.ru|организатор\s+мероприятий|elenaetlesgarcons|erphymusic|"
+    r"аренда\s+звука|открытые\s+микрофон|dance\s+school|аудиокнига\s+о\s+смысле|"
+    r"бухгалтерск\w*\s+компани|бухгалтер\s+пр|налогов\w*\s+помощь|"
+    r"внедрени\w*\s+1[cс]|менеджер\s+1[cс]|вокруг\s+1[cс]|"
+    r"торговое\s+оборудован|подбор\w*\s+кадр|профессия\s+hr|обучение\s+тм\s+в|"
+    r"огэ/егэ|школа\s+искусств|научн\w*\s+клуб|филантропи|общественн\w*\s+деятел|"
+    r"вселенной\s+«хронограф»|маркетинг\s*-\s*в\s+бан|"
+    r"скачать\s+с\s+яндекс|404\s+ошибка|заблокирован\s+хостинг|"
+    r"служб\w*\s+поддержк|техника\s+по\s+выгодным\s+ценам|ивент-агентств\w*\s+с\s+барной|"
+    r"co-owner\s+@mol_bar|залов\s+для\s+тренировок|здоровье\s+без\s+аптек"
+    r")",
+    re.I,
+)
+
+_OFFLINE_JUNK_USERNAMES = frozenset(
+    {
+        "valentinsko", "stnslvlbnv", "igorgorbulev", "khasan_ow", "dimosbarbos",
+        "skewer74", "radovssky", "katya_volkova16", "damelkin", "zyuk05",
+        "valery_leon", "chereshnevaya_masha", "financial_designer", "uncle_kekos",
+        "yuliya_yukhta", "super_taco", "jwmw85", "abiiii0707", "vkrupnov",
+        "ofmninja", "praamzius", "bychef", "itrecruit", "khibinite",
+    }
+)
+
+
+def _fix_mojibake(s: str | None) -> str:
+    txt = str(s or "")
+    if "Ð" in txt or "Ñ" in txt:
+        try:
+            return txt.encode("latin1").decode("utf-8")
+        except Exception:
+            return txt
+    return txt
+
+
+def is_offline_non_icp_contact(
+    *,
+    username: str | None = None,
+    name: str | None = None,
+    company: str | None = None,
+    website: str | None = None,
+    their_angle: str | None = None,
+) -> bool:
+    uname = (username or "").strip().lstrip("@").lower()
+    if uname in _OFFLINE_JUNK_USERNAMES:
+        return True
+    angle_fixed = _fix_mojibake(their_angle)
+    blob = " ".join(
+        part for part in (_fix_mojibake(name), _fix_mojibake(company), str(website or ""), angle_fixed) if part
+    )
+    if _OFFLINE_NON_ICP_RE.search(blob):
+        return True
+    return False
+
+
 def _extract_extra_fields(recipient: dict) -> dict[str, str]:
     for dict_key in ("extra_fields", "custom_vars"):
         raw_extra = recipient.get(dict_key)
