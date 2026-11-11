@@ -785,7 +785,7 @@ def get_outreach_funnel(
         current_step = int(rd.get("current_step") or 0)
         rec_status = str(rd.get("status") or "pending")
         last_sent_at = rd.get("last_sent_at")
-        has_sent = (current_step >= 1) or bool(last_sent_at)
+        has_sent_meta = (current_step >= 1) or bool(last_sent_at) or (rec_status == "completed")
 
         for dlg in candidate_dlgs:
             did = int(dlg["id"])
@@ -803,7 +803,7 @@ def get_outreach_funnel(
                     has_msg_reply = True
                     if mst["last_in_after_out_text"] and not last_inbound_text:
                         last_inbound_text = mst["last_in_after_out_text"]
-                elif has_sent and mst["has_in"]:
+                elif has_sent_meta and mst["has_in"]:
                     ref_sent = str(last_sent_at or "")
                     if not ref_sent or (dlg.get("last_message_at") or "") >= ref_sent:
                         has_msg_reply = True
@@ -811,13 +811,15 @@ def get_outreach_funnel(
                             last_inbound_text = mst["last_in_text"]
             if (
                 not has_msg_reply
-                and has_sent
+                and has_sent_meta
                 and int(dlg.get("last_from_peer") or 0) == 1
                 and (not last_sent_at or str(dlg.get("last_message_at") or "") >= str(last_sent_at))
             ):
                 has_msg_reply = True
                 if dlg.get("last_message_preview") and not last_inbound_text:
                     last_inbound_text = str(dlg["last_message_preview"]).strip()
+
+        has_sent = has_sent_meta or bool(last_out_text_from_dlg)
 
         if not last_inbound_text:
             last_inbound_text = _first_nonempty(
