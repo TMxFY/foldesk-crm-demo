@@ -253,3 +253,107 @@ def test_legacy_cleanup_closes_old_1300_scrubs_creatoros_and_prioritizes_newest_
     # Newest pending (@new_pending) must now have a smaller id than @old_pending so it sends FIRST
     assert by_user["new_pending"]["id"] < by_user["old_pending"]["id"]
     assert "CreatorOS" not in render_template("Try CreatorOS today", {"name": "Test"})
+
+
+def test_step1_repair_v2_restores_truncated_ceiling_and_skips_llm_stubs(tmp_path):
+    from app.db import apply_outreach_step1_repair_v2
+
+    conn = connect(tmp_path / "test_v2_repair.db")
+    init_db(conn)
+    _seed_accounts(conn)
+
+    camp = create_campaign(
+        conn,
+        name="SoftUGC — База Все2",
+        account_ids=[30],
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    now = "2026-11-11T08:00:00"
+    conn.executemany(
+        """
+        INSERT INTO campaign_recipients (campaign_id, username, company, status, current_step, step1_text, last_sent_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                camp["id"],
+                "vaibhavsharda",
+                "fabric",
+                "pending",
+                0,
+                "If your user growth has hit a ceiling, it's usually not the product - it's the cost of reach. We built an organic distribution system: in-house short-video production + a network of accounts. 183.5M views in 90 days on our last project, zero live shoots. Saw fabric. Want to see how it's set up for a",
+                None,
+                now,
+                now,
+            ),
+            (
+                camp["id"],
+                "gd_on",
+                "Steno",
+                "pending",
+                0,
+                "Share your email.\n\nActually, here's the rewrite based on what you gave me:\n\nHey,\n\nWe run SoftUGC for Steno. Interested?",
+                None,
+                now,
+                now,
+            ),
+            (
+                camp["id"],
+                "brandon35",
+                "4. Cue",
+                "pending",
+                0,
+                "Hey Brandon, we run SoftUGC. Want me to show how",
+                None,
+                now,
+                now,
+            ),
+            (
+                camp["id"],
+                "hukid",
+                "2. Fina Business",
+                "pending",
+                0,
+                "The message to rewrite didn't come through. Your prompt ends at \"MESSAGE:\"",
+                None,
+                now,
+                now,
+            ),
+            (
+                camp["id"],
+                "davidhwang",
+                "Grocalo",
+                "pending",
+                0,
+                "YC S26",
+                None,
+                now,
+                now,
+            ),
+            (
+                camp["id"],
+                "blockblanc",
+                "CryptoCanal",
+                "in_progress",
+                1,
+                "Old CreatorOS step1",
+                "2026-11-10T17:21:13",
+                now,
+                now,
+            ),
+        ],
+    )
+    conn.commit()
+
+    stats = apply_outreach_step1_repair_v2(conn)
+    assert stats == {"closed_yesterday": 1, "repaired": 3, "skipped_broken": 2}
+
+    by_u = {r["username"]: r for r in get_campaign(conn, camp["id"])["recipients"]}
+    assert by_u["vaibhavsharda"]["step1_text"].endswith(
+        "Saw fabric. Want to see how it's set up for a product like yours?"
+    )
+    assert by_u["gd_on"]["step1_text"] == "Hey,\n\nWe run SoftUGC for Steno. Interested?"
+    assert by_u["brandon35"]["step1_text"].endswith("Want me to show how this would work for Cue?")
+    assert by_u["hukid"]["status"] == "completed"
+    assert by_u["davidhwang"]["status"] == "completed"
+    assert by_u["blockblanc"]["status"] == "completed"

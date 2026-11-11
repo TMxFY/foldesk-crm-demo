@@ -788,6 +788,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if legacy_outreach_fixed is None:
             apply_legacy_outreach_cleanup(conn)
+        step1_truncation_fixed = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'repair_truncated_step1_and_freeze_yesterday_v2'"
+        ).fetchone()
+        if step1_truncation_fixed is None:
+            apply_outreach_step1_repair_v2(conn)
     conn.commit()
 
 
@@ -934,6 +939,72 @@ def apply_legacy_outreach_cleanup(conn: sqlite3.Connection) -> dict:
         "closed_in_progress": closed_in_progress,
         "scrubbed_recipients": scrubbed_recipients,
         "reordered_pending": reordered_pending,
+    }
+
+
+def apply_outreach_step1_repair_v2(conn: sqlite3.Connection) -> dict:
+    from app.outreach import _clean_step1_text
+
+    now_ts = utc_now()
+    closed_yesterday = conn.execute(
+        """
+        UPDATE campaign_recipients
+        SET status = 'completed',
+            error_text = NULL,
+            updated_at = ?
+        WHERE status = 'in_progress'
+          AND (last_sent_at IS NULL OR last_sent_at < '2026-11-11')
+        """,
+        (now_ts,),
+    ).rowcount
+
+    repaired = 0
+    skipped_broken = 0
+    pending_rows = conn.execute(
+        """
+        SELECT id, company, name, step1_text
+        FROM campaign_recipients
+        WHERE status = 'pending' AND step1_text IS NOT NULL
+        """
+    ).fetchall()
+    for r in pending_rows:
+        rid = int(r[0])
+        comp = r[1] or r[2]
+        raw_s1 = str(r[3])
+        cleaned, err = _clean_step1_text(raw_s1, comp)
+        if err is not None or not cleaned:
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET status = 'completed',
+                    error_text = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now_ts, rid),
+            )
+            skipped_broken += 1
+        elif cleaned != raw_s1:
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET step1_text = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (cleaned, now_ts, rid),
+            )
+            repaired += 1
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('repair_truncated_step1_and_freeze_yesterday_v2', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {
+        "closed_yesterday": closed_yesterday,
+        "repaired": repaired,
+        "skipped_broken": skipped_broken,
     }
 
 

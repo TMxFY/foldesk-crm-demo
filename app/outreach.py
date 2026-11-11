@@ -198,7 +198,7 @@ def _sanitize_legacy_brand(text: str | None) -> str:
     return _LEGACY_CREATOROS_RE.sub("SoftUGC", str(text))
 
 
-def _clean_step1_text(raw: str | None) -> tuple[str | None, str | None]:
+def _clean_step1_text(raw: str | None, company: str | None = None) -> tuple[str | None, str | None]:
     if raw is None:
         return None, None
     text = _sanitize_legacy_brand(raw).strip()
@@ -208,8 +208,35 @@ def _clean_step1_text(raw: str | None) -> tuple[str | None, str | None]:
     if marker in text:
         text = text.split(marker, 1)[1].strip()
     low = text.lower()
-    if low.startswith("i can't write this one") or low.startswith("i cannot write"):
+    if (
+        low.startswith("i can't write this one")
+        or low.startswith("i cannot write")
+        or "didn't come through" in low
+        or "prompt ends at" in low
+        or "paste the outreach text" in low
+        or "paste the original outreach text" in low
+        or bool(re.fullmatch(r"(?:yc\s+[swf]\d{2}|hi,?|hey,?)", low))
+    ):
         return None, "Пропущен: в CSV ошибка генерации текста (Cloudflare/пустое описание)"
+    if (
+        text.startswith("If your user growth has hit a ceiling")
+        and text[-1] not in ".?!)\"'"
+    ):
+        m = re.search(r"zero live shoots\.\s*Saw\s+([^.]+)\.", text)
+        proj = (
+            m.group(1).strip()
+            if m
+            else (re.sub(r"^\d+\.\s*", "", str(company or "")).strip() or "your project")
+        )
+        text = (
+            "If your user growth has hit a ceiling, it's usually not the product - it's the cost of reach. "
+            "We built an organic distribution system: in-house short-video production + a network of accounts. "
+            f"183.5M views in 90 days on our last project, zero live shoots. Saw {proj}. "
+            "Want to see how it's set up for a product like yours?"
+        )
+    elif text.endswith("Want me to show how"):
+        clean_comp = re.sub(r"^\d+\.\s*", "", str(company or "")).strip()
+        text = f"{text} this would work for {clean_comp}?" if clean_comp else f"{text} this would work for you?"
     return (text or None), None
 
 
@@ -1820,7 +1847,7 @@ def import_campaign_csv(
         our_angle = (item.get("our_angle") or "").strip() or None
         hook = (item.get("hook") or "").strip() or None
         note = (item.get("note") or "").strip() or their_angle
-        step1_text, error_reason = _clean_step1_text(item.get("step1_text"))
+        step1_text, error_reason = _clean_step1_text(item.get("step1_text"), company)
         step2_text = _sanitize_legacy_brand(item.get("step2_text")).strip() or None
         step3_text = _sanitize_legacy_brand(item.get("step3_text")).strip() or None
         if step2_text:

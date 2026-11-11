@@ -1313,7 +1313,10 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 skipped_duplicates += 1
                 continue
 
-            step1_text, error_reason = _clean_step1_text(item.get("step1_text") or item.get("first_touch"))
+            step1_text, error_reason = _clean_step1_text(
+                item.get("step1_text") or item.get("first_touch"),
+                item.get("company"),
+            )
             step2_text = (str(item.get("step2_text") or item.get("followup_1") or "").strip()) or None
             step3_text = (str(item.get("step3_text") or item.get("followup_2") or "").strip()) or None
             rec_status = "failed" if error_reason else "pending"
