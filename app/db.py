@@ -97,7 +97,7 @@ def resolve_outreach_media(media_ref: str) -> Path | str:
         local_path = OUTREACH_MEDIA_DIR / filename
         if local_path.exists():
             return local_path
-        if filename in {"4fa85f083f9e2911.jpg", "outreach-kermit.jpg"} and _STATIC_KERMIT_PATH.exists():
+        if filename in {"4fa85f083f9e2911.jpg", "e1750ab20e8fecdf.jpg", "outreach-kermit.jpg"} and _STATIC_KERMIT_PATH.exists():
             return _STATIC_KERMIT_PATH
     if raw.startswith(("http://", "https://")):
         return raw
