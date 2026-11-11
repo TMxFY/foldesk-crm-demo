@@ -600,7 +600,8 @@ def render_template(
     text = expand_spintax(text, rng=rng)
 
     lines = []
-    for line in _sanitize_legacy_brand(text).splitlines():
+    norm_text = _sanitize_legacy_brand(text).replace("\u2028\n", "\n").replace("\u2028", "\n")
+    for line in norm_text.splitlines():
         cleaned = re.sub(r"[ \t]{2,}", " ", line).strip()
         cleaned = re.sub(r"\s+([,!?.:;])", r"\1", cleaned)
         lines.append(cleaned)
@@ -2507,6 +2508,7 @@ async def run_campaign_batch(
         no_accounts_left = False
         jitter_applied = False
         replied_skipped = False
+        rotated_after_failure = False
         while True:
             available = [
                 st
@@ -2570,6 +2572,7 @@ async def run_campaign_batch(
                     await asyncio.sleep(j_sec)
 
             replied_skipped = False
+            dialog = None
             try:
                 if acc_provider == "whatsapp":
                     dialog = _ensure_recipient_dialog(
@@ -2579,12 +2582,18 @@ async def run_campaign_batch(
                     need_username_resolve = (
                         not rec.get("telegram_user_id")
                         or _is_synthetic_peer_id(rec["telegram_user_id"])
+                        or rotated_after_failure
                         or (
                             rec.get("assigned_account_id") is not None
                             and int(rec["assigned_account_id"]) != chosen_account_id
                         )
                     )
-                    if use_gateway and rec.get("username") and need_username_resolve:
+                    if (
+                        use_gateway
+                        and rec.get("username")
+                        and need_username_resolve
+                        and hasattr(active_gw, "search_dialogs")
+                    ):
                         found = await active_gw.search_dialogs(session_path, f"@{rec['username']}", limit=1)
                         if found and found[0].get("telegram_user_id"):
                             real_tg_id = int(found[0]["telegram_user_id"])
@@ -2743,14 +2752,27 @@ async def run_campaign_batch(
                 err_kind, err_health = _classify_outreach_send_error(exc)
                 if err_kind in ("account_dead", "account_transient"):
                     chosen_state["disabled"] = True
+                    rotated_after_failure = True
+                    if step_idx == 0 and dialog is not None and not dialog.get("last_message_at"):
+                        msg_cnt = conn.execute(
+                            "SELECT COUNT(*) FROM messages WHERE dialog_id = ?",
+                            (dialog["id"],),
+                        ).fetchone()[0]
+                        if int(msg_cnt or 0) == 0:
+                            conn.execute("DELETE FROM dialogs WHERE id = ?", (dialog["id"],))
                     if err_kind == "account_dead":
                         chosen_state["dead"] = True
+                        err_str = str(exc)[:300]
                         conn.execute(
                             "UPDATE accounts SET health = ?, last_error = ?, updated_at = ? WHERE id = ?",
-                            (err_health, str(exc)[:300], now, chosen_account_id),
+                            (err_health, err_str, now, chosen_account_id),
                         )
                         conn.commit()
-                        if active_gw is not None and hasattr(active_gw, "_close"):
+                        is_spambot_only = any(
+                            m in err_str.casefold()
+                            for m in ("spambot", "cannot message non-contacts", "peerspam", "spam-reported")
+                        )
+                        if not is_spambot_only and active_gw is not None and hasattr(active_gw, "_close"):
                             try:
                                 await active_gw._close(session_path)
                             except Exception:
@@ -2773,6 +2795,7 @@ async def run_campaign_batch(
         if replied_skipped or not sent_this_recipient:
             continue
 
+        stored_media_url = None if acc_provider == "whatsapp" else step_image_url
         conn.execute(
             """
             INSERT INTO messages (
@@ -2780,7 +2803,7 @@ async def run_campaign_batch(
                 reply_to_telegram_message_id, created_at, updated_at
             ) VALUES (?, ?, 'out', ?, ?, ?, NULL, ?, ?)
             """,
-            (dialog["id"], tg_mid, rendered_text, step_image_url, sent_at, now, now),
+            (dialog["id"], tg_mid, rendered_text, stored_media_url, sent_at, now, now),
         )
         conn.execute(
             """

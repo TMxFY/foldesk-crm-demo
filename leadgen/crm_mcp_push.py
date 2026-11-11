@@ -746,7 +746,15 @@ def push_leads_via_mcp(
                 steps=fallback_steps,
             )
             cid = int(created_c["id"])
-        imp = import_campaign_csv(conn, cid, _leads_to_campaign_csv(leads))
+        sendable_leads = [
+            l for l in leads
+            if str(l.get("username") or "").strip() or str(l.get("phone") or "").strip()
+        ]
+        imp = (
+            import_campaign_csv(conn, cid, _leads_to_campaign_csv(sendable_leads))
+            if sendable_leads
+            else {"imported": 0}
+        )
         enrolled = int(imp.get("imported", 0))
         campaign_id = cid
 
@@ -766,7 +774,7 @@ def push_leads_via_mcp(
 def main() -> int:
     ui_cfg = _load_ui_leadgen_config()
     b2b_cfg = ui_cfg.get("b2b") or {}
-    default_touch = os.environ.get("LEADGEN_TOUCH_MODE") or str(b2b_cfg.get("touch_mode") or "direct")
+    default_touch = os.environ.get("LEADGEN_TOUCH_MODE") or "direct"
     default_camp_tg = os.environ.get("LEADGEN_CAMPAIGN_NAME") or str(
         b2b_cfg.get("target_campaign_tg") or "Leadgen Auto (TG)"
     )

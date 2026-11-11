@@ -802,6 +802,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if offline_junk_purged is None:
             apply_purge_offline_non_icp_v3(conn)
+        vlad_canonical_v4 = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'canonical_vlad_outreach_v4'"
+        ).fetchone()
+        if vlad_canonical_v4 is None:
+            apply_canonical_vlad_outreach_v4(conn)
     conn.commit()
 
 
@@ -1083,6 +1088,189 @@ def apply_purge_offline_non_icp_v3(conn: sqlite3.Connection) -> dict:
     )
     conn.commit()
     return {"deleted": len(delete_ids), "fixed_mojibake": fixed_mojibake}
+
+
+def apply_canonical_vlad_outreach_v4(conn: sqlite3.Connection) -> dict:
+    import re as _re
+    from app.outreach import _fix_mojibake, is_offline_non_icp_contact
+    from leadgen.outreach_copy import (
+        VLAD_STEP2_TEMPLATE,
+        VLAD_STEP3_TEXT,
+        clean_brand_name,
+        upgrade_to_vlad_step1,
+    )
+
+    now_ts = utc_now()
+    all_camps = conn.execute("SELECT id, name FROM campaigns").fetchall()
+    b2b_camps = [
+        r for r in all_camps
+        if not any(k in str(r[1] or "").lower() for k in ("ваканс", "vacanc", "job"))
+    ]
+    b2b_cids = [int(r[0]) for r in b2b_camps]
+    camp_names = {int(r[0]): str(r[1] or "") for r in b2b_camps}
+
+    updated_steps_campaigns = 0
+    for cid in b2b_cids:
+        cname_low = camp_names[cid].lower()
+        is_wa = "(wa)" in cname_low or "whatsapp" in cname_low
+        steps = conn.execute(
+            "SELECT step_order, delay_hours, template_text, image_url FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order ASC",
+            (cid,),
+        ).fetchall()
+        if not steps:
+            continue
+        s1_tpl = str(steps[0][2] or "{step1_text}").replace("\u2028", "\n").strip() or "{step1_text}"
+        needs_step_upgrade = (
+            len(steps) == 3
+            and (
+                any("\u2028" in str(s[2] or "") for s in steps)
+                or any("{followup_" in str(s[2] or "") for s in steps)
+                or int(steps[2][1] or 0) == 72
+                or str(steps[1][2] or "").strip() != VLAD_STEP2_TEMPLATE
+                or str(steps[2][2] or "").strip() != VLAD_STEP3_TEXT
+                or (not is_wa and not str(steps[2][3] or "").strip())
+                or (is_wa and bool(str(steps[2][3] or "").strip()))
+            )
+        )
+        if needs_step_upgrade:
+            step3_img = None if is_wa else CANONICAL_STEP3_IMAGE_URL
+            conn.execute("DELETE FROM campaign_steps WHERE campaign_id = ?", (cid,))
+            conn.executemany(
+                """
+                INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, image_url, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (cid, 1, 0, s1_tpl if s1_tpl in ("{step1_text}", "{first_touch}") else "{step1_text}", None, now_ts),
+                    (cid, 2, 24, VLAD_STEP2_TEMPLATE, None, now_ts),
+                    (cid, 3, 24, VLAD_STEP3_TEXT, step3_img, now_ts),
+                ],
+            )
+            updated_steps_campaigns += 1
+
+    healed_spambot = 0
+    deleted_ids: list[int] = []
+    upgraded_drafts = 0
+    touched_campaigns: set[int] = set()
+
+    if b2b_cids:
+        ph_cids = ",".join("?" for _ in b2b_cids)
+        # Heal untouched step=0 recipients that failed due to @SpamBot WITHOUT unpausing paused campaigns
+        healed_spambot = int(
+            conn.execute(
+                f"""
+                UPDATE campaign_recipients
+                SET status = 'pending', error_text = NULL, updated_at = ?
+                WHERE campaign_id IN ({ph_cids})
+                  AND status = 'failed'
+                  AND COALESCE(current_step, 0) = 0
+                  AND last_sent_at IS NULL
+                  AND (
+                      error_text LIKE '%SpamBot%'
+                      OR error_text LIKE '%cannot message non-contacts%'
+                      OR error_text LIKE '%spam-reported%'
+                      OR error_text LIKE '%PeerFlood%'
+                  )
+                """,
+                (now_ts, *b2b_cids),
+            ).rowcount
+            or 0
+        )
+
+        rows = conn.execute(
+            f"""
+            SELECT id, campaign_id, telegram_user_id, username, phone, name, company,
+                   website, category, their_angle, note, step1_text
+            FROM campaign_recipients
+            WHERE campaign_id IN ({ph_cids})
+              AND status = 'pending'
+              AND COALESCE(current_step, 0) = 0
+              AND last_sent_at IS NULL
+            """,
+            tuple(b2b_cids),
+        ).fetchall()
+
+        for r in rows:
+            rid = int(r[0])
+            cid = int(r[1])
+            tg_id = r[2]
+            uname = str(r[3] or "").strip().lstrip("@")
+            phone = str(r[4] or "").strip()
+            name = str(r[5] or "").strip()
+            comp = str(r[6] or "").strip()
+            site = str(r[7] or "").strip()
+            cat = str(r[8] or "").strip()
+            angle = _fix_mojibake(r[9] or r[10] or "")
+            raw_s1 = str(r[11] or "")
+
+            has_handle = bool(
+                uname or phone or (tg_id is not None and not (900000 <= int(tg_id) <= 999999))
+            )
+            if not has_handle or is_offline_non_icp_contact(
+                username=uname,
+                name=name,
+                company=comp,
+                website=site,
+                their_angle=f"{angle} {raw_s1}",
+            ):
+                deleted_ids.append(rid)
+                touched_campaigns.add(cid)
+                continue
+
+            new_s1 = upgrade_to_vlad_step1(
+                raw_s1,
+                company=comp,
+                name=name,
+                site=site,
+                category=cat,
+                their_angle=angle,
+            )
+            new_comp = clean_brand_name(comp, site=site, their_angle=angle) or comp or None
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET company = ?,
+                    their_angle = ?,
+                    step1_text = ?,
+                    step2_text = NULL,
+                    step3_text = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (new_comp, angle or None, new_s1, now_ts, rid),
+            )
+            upgraded_drafts += 1
+
+    if deleted_ids:
+        for start in range(0, len(deleted_ids), 400):
+            chunk = deleted_ids[start : start + 400]
+            ph = ",".join("?" for _ in chunk)
+            conn.execute(f"DELETE FROM campaign_recipients WHERE id IN ({ph})", chunk)
+
+    for cid in touched_campaigns:
+        crow = conn.execute("SELECT name FROM campaigns WHERE id = ?", (cid,)).fetchone()
+        if crow and "База Все2 (" in str(crow[0]):
+            total_now = conn.execute(
+                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ?", (cid,)
+            ).fetchone()[0]
+            formatted_total = f"{int(total_now):,}".replace(",", " ")
+            new_name = _re.sub(r"\(\d[\d\s]*\s*лида?\)", f"({formatted_total} лидов)", str(crow[0]))
+            conn.execute(
+                "UPDATE campaigns SET name = ?, updated_at = ? WHERE id = ?",
+                (new_name, now_ts, cid),
+            )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('canonical_vlad_outreach_v4', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {
+        "updated_steps_campaigns": updated_steps_campaigns,
+        "healed_spambot": healed_spambot,
+        "deleted_non_icp_or_phantom": len(deleted_ids),
+        "upgraded_drafts": upgraded_drafts,
+    }
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:

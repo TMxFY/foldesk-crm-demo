@@ -33,6 +33,7 @@ from app.outreach import (
     _clean_step1_text,
     _parse_account_ids,
     create_campaign,
+    is_offline_non_icp_contact,
 )
 from app.reminders import (
     complete_reminder,
@@ -1124,6 +1125,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
 
                 is_vacancy_camp = any(k in campaign_name.lower() for k in ("ваканс", "vacanc", "job"))
+                is_wa_camp = "(wa)" in campaign_name.lower() or "whatsapp" in campaign_name.lower()
                 default_steps = (
                     [
                         {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
@@ -1138,7 +1140,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                             "step_order": 3,
                             "delay_hours": 24,
                             "template_text": VLAD_STEP3_TEXT,
-                            "image_url": CANONICAL_STEP3_IMAGE_URL,
+                            **({} if is_wa_camp else {"image_url": CANONICAL_STEP3_IMAGE_URL}),
                         },
                     ]
                 )
@@ -1305,7 +1307,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 note=combined_note,
                 offer_details=our_angle,
                 provider=provider,
-                next_step="Отправить цепочку рассылки" if enroll_in_campaign else None,
+                next_step="Отправить цепочку рассылки" if (enroll_in_campaign and has_direct_messenger_handle) else None,
             )
             lid = int(created["id"])
             if tg_id is None:
@@ -1322,6 +1324,19 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             created_leads += 1
 
         lead_ids.append(lid)
+
+        is_b2b_camp = bool(
+            camp_dict is not None
+            and not any(k in str(camp_dict.get("name") or "").lower() for k in ("ваканс", "vacanc", "job"))
+        )
+        if is_b2b_camp and is_offline_non_icp_contact(
+            username=username,
+            name=display_name,
+            company=company,
+            website=url_val,
+            their_angle=f"{their_angle or ''} {item.get('step1_text') or item.get('first_touch') or ''}",
+        ):
+            continue
 
         if enroll_in_campaign and campaign_id is not None and has_direct_messenger_handle:
             is_dup = (

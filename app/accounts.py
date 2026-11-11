@@ -303,10 +303,15 @@ def delete_account(conn, account_id: int, gateway=None) -> dict:
     return {"deleted": True, "id": int(account_id), "session_path": session_path}
 
 
+def _is_spambot_restriction_error(last_error: str | None) -> bool:
+    blob = str(last_error or "").casefold()
+    return any(m in blob for m in ("spambot", "cannot message non-contacts", "peerspam", "spam-reported"))
+
+
 def purge_dead_accounts(conn, gateway=None) -> dict:
     rows = conn.execute(
         """
-        SELECT id FROM accounts
+        SELECT id, health, last_error FROM accounts
         WHERE status != 'connected'
            OR health IN ('unauthorized', 'banned', 'frozen')
         ORDER BY id ASC
@@ -315,6 +320,8 @@ def purge_dead_accounts(conn, gateway=None) -> dict:
     deleted_ids: list[int] = []
     deleted_paths: list[str] = []
     for row in rows:
+        if str(row[1] or "") == "frozen" and _is_spambot_restriction_error(row[2]):
+            continue
         aid = int(row[0])
         try:
             res = delete_account(conn, aid, gateway=gateway)
@@ -1454,7 +1461,12 @@ async def check_all_accounts(conn, gateway=None, wa_gateway=None) -> dict:
         elif is_demo and gateway is None:
             _write_health(conn, account_id, "active", None)
         elif gateway is not None:
-            await probe_account(conn, account_id, gateway)
+            if str(d.get("health") or "") == "frozen" and _is_spambot_restriction_error(d.get("last_error")):
+                probe = await _probe_health(gateway, session_path)
+                if probe["health"] != "active":
+                    _write_health(conn, account_id, probe["health"], probe["last_error"])
+            else:
+                await probe_account(conn, account_id, gateway)
     mtproto_ready = bool(
         os.getenv("TG_API_ID", "").strip() and os.getenv("TG_API_HASH", "").strip()
     )

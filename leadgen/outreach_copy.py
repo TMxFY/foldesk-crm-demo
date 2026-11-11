@@ -558,8 +558,6 @@ def upgrade_to_vlad_step1(
     cleaned = re.sub(r"\bWe\s+run\s+SoftUGC\s+It's\b", "We run SoftUGC. It's", cleaned)
     cleaned = re.sub(r"\s*[—–]\s*", ", ", cleaned)
     cleaned = re.sub(r"\b\d+[\.\)]\s+([A-Z][A-Za-z0-9]+)", r"\1", cleaned)
-    if REVSHARE_OFFER_TEXT in cleaned:
-        return cleaned
 
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
     # Normalize greeting to clean "Hey,"
@@ -570,6 +568,9 @@ def upgrade_to_vlad_step1(
         paragraphs = ["Hey,", rest] + paragraphs[1:]
     else:
         paragraphs.insert(0, "Hey,")
+
+    if any(REVSHARE_OFFER_TEXT in p for p in paragraphs):
+        return "\n\n".join(paragraphs)
 
     # Drop standalone short CTA paragraph at the end if present
     while len(paragraphs) > 2:

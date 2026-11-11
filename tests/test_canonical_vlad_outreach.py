@@ -12,8 +12,16 @@ _WORKTREE_ROOT = str(Path(__file__).resolve().parents[1])
 if _WORKTREE_ROOT not in sys.path:
     sys.path.insert(0, _WORKTREE_ROOT)
 
+from app.accounts import check_all_accounts, purge_dead_accounts
 import app.cloud_persistence as cp
-from app.db import CANONICAL_STEP3_IMAGE_URL, connect, init_db, resolve_outreach_media, utc_now
+from app.db import (
+    CANONICAL_STEP3_IMAGE_URL,
+    apply_canonical_vlad_outreach_v4,
+    connect,
+    init_db,
+    resolve_outreach_media,
+    utc_now,
+)
 from app.main import create_app
 from app.mcp_server import handle_jsonrpc_message
 from app.outreach import (
@@ -287,17 +295,35 @@ def test_spambot_freezes_account_and_retries_step1_on_next_healthy_account(tmp_p
     assert healed == 1
 
     calls = []
+    closed_sessions = []
+    searched_sessions = []
 
     class _SpamThenHealthyGateway:
+        async def _close(self, session_path):
+            closed_sessions.append(str(session_path))
+
+        async def search_dialogs(self, session_path, query, limit=1):
+            searched_sessions.append((str(session_path), query))
+            return [{"telegram_user_id": 55501, "username": "target_founder"}]
+
+        async def session_health(self, session_path):
+            return {"health": "active", "last_error": None}
+
         async def send_message(self, session_path, peer_target, text, reply_to=None, image_path=None):
             calls.append((str(session_path), peer_target, text, image_path))
             if "s1.session" in str(session_path):
                 raise RuntimeError("PeerFloodError: You cannot message non-contacts, check @SpamBot for details")
             return {"telegram_message_id": 9101, "sent_at": now}
 
-    res = asyncio.run(run_campaign_batch(conn, cid, gateway=_SpamThenHealthyGateway(), max_send=1))
+    gw = _SpamThenHealthyGateway()
+    res = asyncio.run(run_campaign_batch(conn, cid, gateway=gw, max_send=1))
     assert res["sent"] == 1
     assert [c[0] for c in calls] == ["data/sessions/s1.session", "data/sessions/s2.session"]
+    # @SpamBot account must NOT have its live Telethon listener closed, and acc2 resolves @username on rotation
+    assert closed_sessions == []
+    assert ("data/sessions/s2.session", "@target_founder") in searched_sessions
+    # Empty orphan dialog on acc1 was cleaned up
+    assert conn.execute("SELECT COUNT(*) FROM dialogs WHERE account_id = ?", (acc1,)).fetchone()[0] == 0
 
     acc1_health = conn.execute("SELECT health FROM accounts WHERE id = ?", (acc1,)).fetchone()["health"]
     acc2_health = conn.execute("SELECT health FROM accounts WHERE id = ?", (acc2,)).fetchone()["health"]
@@ -309,6 +335,103 @@ def test_spambot_freezes_account_and_retries_step1_on_next_healthy_account(tmp_p
     assert rec_row["current_step"] == 1
     assert rec_row["assigned_account_id"] == acc2
     assert rec_row["error_text"] is None
+
+    # Bulk check_all_accounts and purge_dead_accounts preserve @SpamBot-restricted account
+    asyncio.run(check_all_accounts(conn, gateway=gw))
+    assert conn.execute("SELECT health FROM accounts WHERE id = ?", (acc1,)).fetchone()["health"] == "frozen"
+    purge_res = purge_dead_accounts(conn, gateway=gw)
+    assert acc1 not in purge_res["deleted_ids"]
+
+
+def test_apply_canonical_vlad_outreach_v4_migrates_existing_campaigns_without_unpausing(tmp_path):
+    conn = connect(tmp_path / "v4_migration.db")
+    init_db(conn)
+    now = utc_now()
+
+    # Simulate pre-existing legacy Campaign #4 (72h + {followup_2}), paused Campaign #5, and TG Вакансии
+    c4 = create_campaign(
+        conn,
+        name="Leadgen Auto (TG)",
+        status="draft",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+            {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
+            {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
+        ],
+    )["id"]
+    c5 = create_campaign(
+        conn,
+        name="SoftUGC — База Все2 (2 050 лидов)",
+        status="paused",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+            {"step_order": 2, "delay_hours": 24, "template_text": VLAD_STEP2_TEMPLATE.replace("\n\n", "\u2028\n\n")},
+            {"step_order": 3, "delay_hours": 24, "template_text": VLAD_STEP3_TEXT, "image_url": ""},
+        ],
+    )["id"]
+    cvac = create_campaign(
+        conn,
+        name="TG Вакансии",
+        status="draft",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+            {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
+            {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
+        ],
+    )["id"]
+
+    # Insert: 1 phantom row in C4, 1 real TG row in C4, 1 @SpamBot failed row in C5, 1 junk row in C5, 1 contacted row in C5
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (campaign_id, telegram_user_id, username, company, category, step1_text, step2_text, current_step, status, created_at, updated_at)
+        VALUES (?, 900372, NULL, 'Reific', 'AI', 'Hey, saw Reific — running reels?', 'Old step2', 0, 'pending', ?, ?),
+               (?, 777001, 'adalat_ceo', 'Adalat AI', 'SaaS', 'Hey, saw Adalat AI — running reels?', 'Old step2', 0, 'pending', ?, ?),
+               (?, 777002, 'openeden_j', 'Jeremy | OpenEden', 'DeFi', 'Scaling reach for RWA protocol is hard.', NULL, 0, 'failed', ?, ?),
+               (?, 777003, 'tgsoft_oleg', 'Павел Орлов', 'SaaS', 'Пишу про софт tgcenterapp.ru', NULL, 0, 'pending', ?, ?),
+               (?, 777004, 'already_sent', 'OldCorp', 'SaaS', 'Legacy CreatorOS text already sent', NULL, 1, 'completed', ?, ?)
+        """,
+        (c4, now, now, c4, now, now, c5, now, now, c5, now, now, c5, now, now),
+    )
+    conn.execute(
+        "UPDATE campaign_recipients SET error_text = 'You cannot message non-contacts (@SpamBot)' WHERE username = 'openeden_j'"
+    )
+    conn.execute("DELETE FROM kv_settings WHERE key = 'canonical_vlad_outreach_v4'")
+    conn.commit()
+
+    stats = apply_canonical_vlad_outreach_v4(conn)
+    assert stats["updated_steps_campaigns"] >= 2
+    assert stats["healed_spambot"] >= 1
+    assert stats["deleted_non_icp_or_phantom"] >= 2
+    assert stats["upgraded_drafts"] >= 2
+
+    # Paused Campaign #5 MUST stay paused, and already-contacted completed row MUST NOT be touched
+    assert conn.execute("SELECT status FROM campaigns WHERE id = ?", (c5,)).fetchone()["status"] == "paused"
+    sent_row = conn.execute("SELECT status, current_step, step1_text FROM campaign_recipients WHERE username = 'already_sent'").fetchone()
+    assert sent_row["status"] == "completed"
+    assert sent_row["step1_text"] == "Legacy CreatorOS text already sent"
+
+    # Healed OpenEden row has canonical Vlad Step 1 & cleaned brand
+    oe = conn.execute("SELECT status, company, step1_text FROM campaign_recipients WHERE username = 'openeden_j'").fetchone()
+    assert oe["status"] == "pending"
+    assert oe["company"] == "OpenEden"
+    assert oe["step1_text"].startswith("Hey,\n\nSaw OpenEden.")
+    assert oe["step1_text"].endswith(REVSHARE_OFFER_TEXT)
+
+    # Campaign #4 steps upgraded to 24h + Kermit image, phantom Reific deleted, Adalat upgraded
+    c4_steps = conn.execute("SELECT step_order, delay_hours, image_url FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order", (c4,)).fetchall()
+    assert [(r[0], r[1], r[2]) for r in c4_steps] == [(1, 0, None), (2, 24, None), (3, 24, CANONICAL_STEP3_IMAGE_URL)]
+    assert conn.execute("SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ?", (c4,)).fetchone()[0] == 1
+
+    # TG Вакансии remains completely untouched on 72h {followup_2}
+    vac_steps = conn.execute("SELECT delay_hours, template_text FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order", (cvac,)).fetchall()
+    assert [(r[0], r[1]) for r in vac_steps] == [(0, "{first_touch}"), (24, "{followup_1}"), (72, "{followup_2}")]
+
+    # Greeting "Hey Alex," normalizes to "Hey," even when REVSHARE_OFFER_TEXT is already present
+    already_offered = (
+        "Hey Alex,\n\nSawAcme. Scaling outbound is tough.\n\n"
+        f"{SOFTUGC_PITCH_TEXT}\n\n{REVSHARE_OFFER_TEXT}"
+    )
+    assert upgrade_to_vlad_step1(already_offered, company="Acme", category="SaaS").startswith("Hey,\n\n")
 
 
 def test_ingest_discovered_leads_skips_phantom_email_only_from_campaign_recipients(tmp_path):

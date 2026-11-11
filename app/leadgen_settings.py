@@ -150,10 +150,10 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     b2b = merged.get("b2b") or {}
     b2b["enabled"] = bool(b2b.get("enabled", True))
     b2b_mode = str(b2b.get("touch_mode") or "direct").strip().lower()
-    if b2b_mode == "full":
+    if b2b_mode in ("full", "micro_ping"):
         b2b_mode = "direct"
-    if b2b_mode not in ("micro_ping", "direct"):
-        raise ValueError("b2b.touch_mode должен быть 'micro_ping' или 'direct'")
+    if b2b_mode != "direct":
+        raise ValueError("b2b.touch_mode должен быть 'direct'")
     b2b["touch_mode"] = b2b_mode
 
     b2b["target_campaign_tg"] = str(b2b.get("target_campaign_tg") or "Leadgen Auto (TG)").strip() or "Leadgen Auto (TG)"
@@ -430,6 +430,15 @@ DEFAULT_B2B_STEPS = [
         "image_url": CANONICAL_STEP3_IMAGE_URL,
     },
 ]
+DEFAULT_B2B_WA_STEPS = [
+    {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+    {"step_order": 2, "delay_hours": 24, "template_text": VLAD_STEP2_TEMPLATE},
+    {
+        "step_order": 3,
+        "delay_hours": 24,
+        "template_text": VLAD_STEP3_TEXT,
+    },
+]
 DEFAULT_VACANCY_STEPS = [
     {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
     {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
@@ -465,6 +474,7 @@ def sync_leadgen_campaigns(
                     "leadgen_daily_quota": quota,
                     "leadgen_sources": b2b_enabled_sources,
                     "default_steps": DEFAULT_B2B_STEPS,
+                    "is_b2b": True,
                 }
             )
         if wa_name and wa_name.lower() != tg_name.lower():
@@ -474,7 +484,8 @@ def sync_leadgen_campaigns(
                     "daily_limit": daily_lim,
                     "leadgen_daily_quota": quota,
                     "leadgen_sources": b2b_enabled_sources,
-                    "default_steps": DEFAULT_B2B_STEPS,
+                    "default_steps": DEFAULT_B2B_WA_STEPS,
+                    "is_b2b": True,
                 }
             )
 
@@ -490,6 +501,7 @@ def sync_leadgen_campaigns(
                     "leadgen_daily_quota": vac_quota,
                     "leadgen_sources": vac_enabled_layers,
                     "default_steps": DEFAULT_VACANCY_STEPS,
+                    "is_b2b": False,
                 }
             )
 
@@ -509,7 +521,16 @@ def sync_leadgen_campaigns(
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
             )
-            if not updated.get("steps"):
+            cur_steps = updated.get("steps") or []
+            needs_b2b_step_sync = bool(spec.get("is_b2b")) and (
+                len(cur_steps) == 3
+                and (
+                    any("{followup_" in str(s.get("template_text") or "") for s in cur_steps)
+                    or any("\u2028" in str(s.get("template_text") or "") for s in cur_steps)
+                    or int(cur_steps[2].get("delay_hours") or 0) == 72
+                )
+            )
+            if not cur_steps or needs_b2b_step_sync:
                 updated = update_campaign(conn, cid, steps=spec["default_steps"])
             synced_campaigns.append(updated)
         else:
