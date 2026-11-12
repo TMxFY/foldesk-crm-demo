@@ -694,6 +694,8 @@ class TelethonGateway(TelegramGateway):
         self._device_profiles = {}
         self._session_strings: dict[str, str] = {}
         self._warmed_dialogs: set[str] = set()
+        self._rpc_timeout: float = float(os.getenv("TG_RPC_TIMEOUT", "25.0") or "25.0")
+        self._disconnect_timeout: float = 2.0
 
     def set_session_string(self, session_path: str, session_string: str | None) -> None:
         if not session_path:
@@ -953,19 +955,38 @@ class TelethonGateway(TelegramGateway):
             )
         return int(api_id), api_hash
 
+    async def _safe_disconnect(self, client) -> None:
+        if client is None:
+            return
+        try:
+            if client.is_connected():
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=self._disconnect_timeout
+                )
+        except (asyncio.TimeoutError, Exception):
+            pass
+        try:
+            sess = getattr(client, "session", None)
+            if sess is not None and hasattr(sess, "close"):
+                sess.close()
+        except Exception:
+            pass
+
+    async def _drop_zombie_client_unlocked(self, session_path: str) -> None:
+        client = self._clients.pop(session_path, None)
+        self._warmed_dialogs.discard(session_path)
+        await self._safe_disconnect(client)
+
     async def _open(self, session_path: str):
         client = self._clients.get(session_path)
         if client is not None:
             if client.is_connected():
                 return client, False
             try:
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=self._rpc_timeout)
                 return client, False
             except Exception:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                await self._safe_disconnect(client)
                 self._clients.pop(session_path, None)
                 self._warmed_dialogs.discard(session_path)
         from telethon import TelegramClient
@@ -990,23 +1011,20 @@ class TelethonGateway(TelegramGateway):
                 **dev_profile,
                 "use_ipv6": False,
                 "sequential_updates": True,
+                "timeout": 15,
             }
             if proxy_tuple:
                 kwargs["proxy"] = proxy_tuple
-                kwargs["timeout"] = 15
                 kwargs["connection_retries"] = 1
                 kwargs["retry_delay"] = 1
             client = TelegramClient(session_obj, api_id, api_hash, **kwargs)
             try:
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=self._rpc_timeout)
                 self._clients[session_path] = client
                 return client, False
             except Exception as exc:
                 last_exc = exc
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                await self._safe_disconnect(client)
                 if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
                     break
                 if attempt == 0:
@@ -1023,18 +1041,7 @@ class TelethonGateway(TelegramGateway):
             self._app_credentials.pop(session_path, None)
             self._device_profiles.pop(session_path, None)
             self._warmed_dialogs.discard(session_path)
-            if client is not None:
-                try:
-                    if client.is_connected():
-                        await client.disconnect()
-                except Exception:
-                    pass
-                try:
-                    sess = getattr(client, "session", None)
-                    if sess is not None and hasattr(sess, "close"):
-                        sess.close()
-                except Exception:
-                    pass
+            await self._safe_disconnect(client)
 
     async def close_all(self) -> None:
         for path in list(self._clients.keys()):
@@ -1174,51 +1181,56 @@ class TelethonGateway(TelegramGateway):
         client = self._clients.pop(session_path, None)
         self._warmed_dialogs.discard(session_path)
         self._session_strings.pop(session_path, None)
-        if client is not None:
-            try:
-                if client.is_connected():
-                    await client.disconnect()
-            except Exception:
-                pass
-            try:
-                sess = getattr(client, "session", None)
-                if sess is not None and hasattr(sess, "close"):
-                    sess.close()
-            except Exception:
-                pass
+        await self._safe_disconnect(client)
 
     async def session_health(self, session_path: str) -> dict:
         async with self._session_lock(session_path):
-            try:
-                client, owned = await self._open(session_path)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                return _classify_session_error(exc)
-            try:
-                if not await client.is_user_authorized():
-                    await self._evict_client_unlocked(session_path)
-                    return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
-                me = await client.get_me()
-                if me is None:
-                    await self._evict_client_unlocked(session_path)
-                    return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
-                return {"health": "active", "last_error": None}
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                classified = _classify_session_error(exc)
-                if classified.get("health") in ("unauthorized", "banned", "frozen"):
-                    await self._evict_client_unlocked(session_path)
-                return classified
-            finally:
-                if owned:
-                    try:
-                        await self._close(session_path)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        pass
+            for attempt in range(2):
+                was_cached = (
+                    session_path in self._clients
+                    and self._clients[session_path].is_connected()
+                )
+                try:
+                    client, owned = await self._open(session_path)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return _classify_session_error(exc)
+                try:
+                    authed = await asyncio.wait_for(
+                        client.is_user_authorized(), timeout=self._rpc_timeout
+                    )
+                    if not authed:
+                        await self._evict_client_unlocked(session_path)
+                        return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+                    me = await asyncio.wait_for(
+                        client.get_me(), timeout=self._rpc_timeout
+                    )
+                    if me is None:
+                        await self._evict_client_unlocked(session_path)
+                        return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
+                    return {"health": "active", "last_error": None}
+                except asyncio.CancelledError:
+                    raise
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                    await self._drop_zombie_client_unlocked(session_path)
+                    if was_cached and attempt == 0:
+                        continue
+                    return _classify_session_error(exc)
+                except Exception as exc:
+                    classified = _classify_session_error(exc)
+                    if classified.get("health") in ("unauthorized", "banned", "frozen"):
+                        await self._evict_client_unlocked(session_path)
+                    return classified
+                finally:
+                    if owned:
+                        try:
+                            await self._close(session_path)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            pass
+            return {"health": "offline", "last_error": "Нет связи"}
 
     async def probe_spambot(self, session_path: str) -> dict:
         async with self._session_lock(session_path):
@@ -1229,12 +1241,16 @@ class TelethonGateway(TelegramGateway):
             except Exception as exc:
                 return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
             try:
-                sent_msg = await client.send_message("SpamBot", "/start")
+                sent_msg = await asyncio.wait_for(
+                    client.send_message("SpamBot", "/start"), timeout=self._rpc_timeout
+                )
                 sent_id = int(getattr(sent_msg, "id", 0) or 0)
                 reply_text = ""
                 for _ in range(6):
                     await asyncio.sleep(0.8)
-                    msgs = await client.get_messages("SpamBot", limit=4)
+                    msgs = await asyncio.wait_for(
+                        client.get_messages("SpamBot", limit=4), timeout=self._rpc_timeout
+                    )
                     for m in msgs or []:
                         if getattr(m, "out", False):
                             continue
@@ -1252,6 +1268,9 @@ class TelethonGateway(TelegramGateway):
                 }
             except asyncio.CancelledError:
                 raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                await self._drop_zombie_client_unlocked(session_path)
+                return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
             except Exception as exc:
                 return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
             finally:
@@ -1265,31 +1284,59 @@ class TelethonGateway(TelegramGateway):
 
     async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
         async with self._session_lock(session_path):
-            client, owned = await self._open(session_path)
-            try:
-                return await self._search(client, query, limit)
-            except GatewayError:
-                raise
-            except Exception as exc:
-                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
-                    await self._evict_client_unlocked(session_path)
-                raise GatewayError(str(exc) or "Не удалось прочитать диалоги") from exc
-            finally:
-                if owned:
-                    await self._close(session_path)
+            for attempt in range(2):
+                was_cached = (
+                    session_path in self._clients
+                    and self._clients[session_path].is_connected()
+                )
+                client, owned = await self._open(session_path)
+                try:
+                    return await asyncio.wait_for(
+                        self._search(client, query, limit), timeout=self._rpc_timeout
+                    )
+                except GatewayError:
+                    raise
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                    await self._drop_zombie_client_unlocked(session_path)
+                    if was_cached and attempt == 0:
+                        continue
+                    raise GatewayError(str(exc) or "Таймаут чтения диалогов") from exc
+                except Exception as exc:
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                        await self._evict_client_unlocked(session_path)
+                    raise GatewayError(str(exc) or "Не удалось прочитать диалоги") from exc
+                finally:
+                    if owned:
+                        await self._close(session_path)
+            raise GatewayError("Не удалось прочитать диалоги")
 
     async def load_inbox(self, session_path: str, limit: int = 30) -> list:
         async with self._session_lock(session_path):
-            client, owned = await self._open(session_path)
-            try:
-                return await self._load_private(client, limit)
-            except GatewayError:
-                raise
-            except Exception as exc:
-                raise GatewayError(str(exc) or "Не удалось прочитать входящие") from exc
-            finally:
-                if owned:
-                    await self._close(session_path)
+            for attempt in range(2):
+                was_cached = (
+                    session_path in self._clients
+                    and self._clients[session_path].is_connected()
+                )
+                client, owned = await self._open(session_path)
+                try:
+                    return await asyncio.wait_for(
+                        self._load_private(client, limit), timeout=self._rpc_timeout
+                    )
+                except GatewayError:
+                    raise
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                    await self._drop_zombie_client_unlocked(session_path)
+                    if was_cached and attempt == 0:
+                        continue
+                    raise GatewayError(str(exc) or "Таймаут чтения входящих") from exc
+                except Exception as exc:
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                        await self._evict_client_unlocked(session_path)
+                    raise GatewayError(str(exc) or "Не удалось прочитать входящие") from exc
+                finally:
+                    if owned:
+                        await self._close(session_path)
+            raise GatewayError("Не удалось прочитать входящие")
 
     async def _load_private(self, client, limit: int) -> list:
         from telethon.tl.types import User
@@ -1400,7 +1447,7 @@ class TelethonGateway(TelegramGateway):
                     return await client.send_message(target, body, **kwargs)
 
                 try:
-                    msg = await _do_send()
+                    msg = await asyncio.wait_for(_do_send(), timeout=self._rpc_timeout)
                 except Exception as first_exc:
                     if (
                         isinstance(target, int)
@@ -1408,15 +1455,20 @@ class TelethonGateway(TelegramGateway):
                         and session_path not in self._warmed_dialogs
                     ):
                         try:
-                            await client.get_dialogs(limit=150)
+                            await asyncio.wait_for(
+                                client.get_dialogs(limit=150), timeout=self._rpc_timeout
+                            )
                             self._warmed_dialogs.add(session_path)
                         except Exception:
                             pass
-                        msg = await _do_send()
+                        msg = await asyncio.wait_for(_do_send(), timeout=self._rpc_timeout)
                     else:
                         raise
             except GatewayError:
                 raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                await self._drop_zombie_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Таймаут отправки в Telegram") from exc
             except Exception as exc:
                 if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
                     await self._evict_client_unlocked(session_path)
@@ -1434,16 +1486,32 @@ class TelethonGateway(TelegramGateway):
 
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         async with self._session_lock(session_path):
-            client, owned = await self._open(session_path)
-            try:
-                return await self._history(client, peer_id, limit, session_path=session_path)
-            except GatewayError:
-                raise
-            except Exception as exc:
-                raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
-            finally:
-                if owned:
-                    await self._close(session_path)
+            for attempt in range(2):
+                was_cached = (
+                    session_path in self._clients
+                    and self._clients[session_path].is_connected()
+                )
+                client, owned = await self._open(session_path)
+                try:
+                    return await asyncio.wait_for(
+                        self._history(client, peer_id, limit, session_path=session_path),
+                        timeout=self._rpc_timeout,
+                    )
+                except GatewayError:
+                    raise
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                    await self._drop_zombie_client_unlocked(session_path)
+                    if was_cached and attempt == 0:
+                        continue
+                    raise GatewayError(str(exc) or "Таймаут чтения истории") from exc
+                except Exception as exc:
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                        await self._evict_client_unlocked(session_path)
+                    raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
+                finally:
+                    if owned:
+                        await self._close(session_path)
+            raise GatewayError("Не удалось прочитать историю")
 
     async def _history(self, client, peer_id, limit: int, session_path: str | None = None) -> list:
         # get_messages is newest-first. A channel or chat id is not a personal dialog.
@@ -1473,7 +1541,7 @@ class TelethonGateway(TelegramGateway):
                     entity = await client.get_entity(target)
                 else:
                     raise
-        except GatewayError:
+        except (GatewayError, asyncio.TimeoutError, TimeoutError, ConnectionError, OSError):
             raise
         except Exception as exc:
             raise GatewayError(str(exc) or "Не удалось открыть диалог") from exc
@@ -1481,7 +1549,7 @@ class TelethonGateway(TelegramGateway):
             raise GatewayError("Это не личный диалог")
         try:
             raw = await client.get_messages(entity, limit=cap)
-        except GatewayError:
+        except (GatewayError, asyncio.TimeoutError, TimeoutError, ConnectionError, OSError):
             raise
         except Exception as exc:
             raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
@@ -1584,7 +1652,7 @@ class TelethonGateway(TelegramGateway):
             try:
                 # Difference only: a long outage can miss updates Telegram already dropped.
                 try:
-                    await client.catch_up()
+                    await asyncio.wait_for(client.catch_up(), timeout=self._rpc_timeout)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1593,12 +1661,9 @@ class TelethonGateway(TelegramGateway):
             except Exception:
                 client.remove_event_handler(handler)
                 client.remove_event_handler(raw_handler)
-                self._clients.pop(session_path, None)
-                try:
-                    if client.is_connected():
-                        await client.disconnect()
-                except Exception:
-                    pass
+                if self._clients.get(session_path) is client:
+                    self._clients.pop(session_path, None)
+                await self._safe_disconnect(client)
                 raise
 
         try:
@@ -1606,12 +1671,9 @@ class TelethonGateway(TelegramGateway):
         finally:
             client.remove_event_handler(handler)
             client.remove_event_handler(raw_handler)
-            self._clients.pop(session_path, None)
-            try:
-                if client.is_connected():
-                    await client.disconnect()
-            except Exception:
-                pass
+            if self._clients.get(session_path) is client:
+                self._clients.pop(session_path, None)
+            await self._safe_disconnect(client)
 
     async def _resolve_username(self, client, query: str) -> list:
         from telethon.tl.types import User
@@ -1638,30 +1700,61 @@ class TelethonGateway(TelegramGateway):
 
     async def list_folders(self, session_path: str) -> list:
         async with self._session_lock(session_path):
-            client, owned = await self._open(session_path)
-            try:
-                items = await self._dialog_filters(client)
-            except GatewayError:
-                raise
-            except Exception as exc:
-                raise GatewayError(str(exc) or "Не удалось прочитать папки") from exc
-            finally:
-                if owned:
-                    await self._close(session_path)
-            return [_folder_row(item) for item in items]
+            for attempt in range(2):
+                was_cached = (
+                    session_path in self._clients
+                    and self._clients[session_path].is_connected()
+                )
+                client, owned = await self._open(session_path)
+                try:
+                    items = await asyncio.wait_for(
+                        self._dialog_filters(client), timeout=self._rpc_timeout
+                    )
+                    return [_folder_row(item) for item in items]
+                except GatewayError:
+                    raise
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                    await self._drop_zombie_client_unlocked(session_path)
+                    if was_cached and attempt == 0:
+                        continue
+                    raise GatewayError(str(exc) or "Таймаут чтения папок") from exc
+                except Exception as exc:
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                        await self._evict_client_unlocked(session_path)
+                    raise GatewayError(str(exc) or "Не удалось прочитать папки") from exc
+                finally:
+                    if owned:
+                        await self._close(session_path)
+            raise GatewayError("Не удалось прочитать папки")
 
     async def folder_peers(self, session_path: str, telegram_folder_id: int) -> list:
         async with self._session_lock(session_path):
-            client, owned = await self._open(session_path)
-            try:
-                return await self._explicit_users(client, int(telegram_folder_id))
-            except GatewayError:
-                raise
-            except Exception as exc:
-                raise GatewayError(str(exc) or "Не удалось прочитать папку") from exc
-            finally:
-                if owned:
-                    await self._close(session_path)
+            for attempt in range(2):
+                was_cached = (
+                    session_path in self._clients
+                    and self._clients[session_path].is_connected()
+                )
+                client, owned = await self._open(session_path)
+                try:
+                    return await asyncio.wait_for(
+                        self._explicit_users(client, int(telegram_folder_id)),
+                        timeout=self._rpc_timeout,
+                    )
+                except GatewayError:
+                    raise
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                    await self._drop_zombie_client_unlocked(session_path)
+                    if was_cached and attempt == 0:
+                        continue
+                    raise GatewayError(str(exc) or "Таймаут чтения папки") from exc
+                except Exception as exc:
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                        await self._evict_client_unlocked(session_path)
+                    raise GatewayError(str(exc) or "Не удалось прочитать папку") from exc
+                finally:
+                    if owned:
+                        await self._close(session_path)
+            raise GatewayError("Не удалось прочитать папку")
 
     async def _dialog_filters(self, client) -> list:
         from telethon.tl.functions.messages import GetDialogFiltersRequest
