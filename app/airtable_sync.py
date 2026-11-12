@@ -35,6 +35,7 @@ from app.db import (
     utc_now,
 )
 from app.events import record_lead_event
+from app.notes import compose_lead_notes_text
 from app.leads import (
     _clean_amount,
     _clean_username,
@@ -1152,6 +1153,9 @@ def push_lead_to_airtable(
     if row is None:
         raise LookupError("lead")
     lead = as_dict(row)
+    composed_note = compose_lead_notes_text(conn, lead)
+    if composed_note:
+        lead["note"] = composed_note
 
     if client is None:
         client = AirtableRestClient()

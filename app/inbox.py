@@ -1518,6 +1518,36 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
     return list_messages(conn, dialog_id, cap)
 
 
+def _dialog_has_peer_reply(conn, dialog: dict) -> bool:
+    """Return True if the peer has replied or initiated the conversation."""
+    if int(dialog.get("last_from_peer") or 0) == 1:
+        return True
+    did = int(dialog["id"])
+    has_in_msg = conn.execute(
+        "SELECT 1 FROM messages WHERE dialog_id = ? AND direction = 'in' LIMIT 1",
+        (did,),
+    ).fetchone()
+    if has_in_msg is not None:
+        return True
+    lead_id = dialog.get("lead_id")
+    if lead_id is not None:
+        has_replied_lead = conn.execute(
+            "SELECT 1 FROM campaign_recipients WHERE lead_id = ? AND status = 'replied' LIMIT 1",
+            (int(lead_id),),
+        ).fetchone()
+        if has_replied_lead is not None:
+            return True
+    peer_id = dialog.get("peer_id")
+    if peer_id is not None and int(peer_id) > 0:
+        has_replied_peer = conn.execute(
+            "SELECT 1 FROM campaign_recipients WHERE telegram_user_id = ? AND status = 'replied' LIMIT 1",
+            (int(peer_id),),
+        ).fetchone()
+        if has_replied_peer is not None:
+            return True
+    return False
+
+
 async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) -> dict:
     body = (text or "").strip()
     if not body:
@@ -1534,7 +1564,9 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     account = as_dict(account)
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
-    check_daily_limit(conn, account["id"])
+    is_reply_to_peer = _dialog_has_peer_reply(conn, dialog)
+    if not is_reply_to_peer:
+        check_daily_limit(conn, account["id"])
     if gateway is None:
         next_row = conn.execute(
             "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
@@ -1624,7 +1656,8 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
         """,
         (sent_at, preview, now, dialog_id),
     )
-    increment_daily_sent(conn, account["id"])
+    if not is_reply_to_peer:
+        increment_daily_sent(conn, account["id"])
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)
