@@ -621,3 +621,44 @@ def test_rest_client_pagination_retry_and_readonly_filtering():
     assert "Lead Summary (AI)" not in created["fields"]
     assert attempt_counter["post"] == 2
     assert len(sleeps) >= 1
+
+
+def test_lead_notes_mark_dirty_and_push_to_airtable(tmp_path):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    fake = FakeAirtableClient(
+        leads=[
+            {
+                "id": "recNote1",
+                "fields": {
+                    "Lead Name": "Алекс Видео",
+                    "Status": "In conversation",
+                    "Contact": "@alex_vid",
+                    "Notes": "Первый контакт",
+                },
+            }
+        ]
+    )
+    pull_res = sync_airtable(conn, direction="pull", client=fake)
+    assert pull_res["created_in_crm"] == 1
+    lead = conn.execute("SELECT * FROM leads WHERE airtable_record_id = 'recNote1'").fetchone()
+    lead_id = int(lead["id"])
+
+    app = create_app(conn=conn, gateway=None)
+    app.state.airtable_client = fake
+    with TestClient(app) as client:
+        resp = client.post(
+            f"/api/leads/{lead_id}/notes",
+            json={"body": "Ему нужны 3 видоса"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    sync_res = sync_airtable(conn, direction="both", client=fake)
+    assert sync_res["pushed_to_airtable"] >= 1
+    rec = next(r for r in fake.tables["Leads"] if r["id"] == "recNote1")
+    notes_text = rec["fields"].get("Notes") or ""
+    assert "Первый контакт" in notes_text
+    assert "Ему нужны 3 видоса" in notes_text

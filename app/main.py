@@ -1530,7 +1530,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/leads/{lead_id}/notes")
     def lead_note_create(lead_id: int, body: NoteIn, request: Request):
-        return _call(add_note, request.app.state.conn, lead_id, body.body)
+        created = _call(add_note, request.app.state.conn, lead_id, body.body)
+        _schedule_airtable_push_lead(request.app, int(lead_id))
+        return created
 
     @app.post("/api/leads/{lead_id}/tasks")
     def lead_task_create(lead_id: int, body: TaskIn, request: Request):

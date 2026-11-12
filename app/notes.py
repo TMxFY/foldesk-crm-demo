@@ -24,6 +24,10 @@ def add_note(conn, lead_id: int, body: str, source: str = "manual") -> dict:
             """,
             (lead_id, text, source, now, now),
         )
+        conn.execute(
+            "UPDATE leads SET updated_at = ? WHERE id = ?",
+            (now, lead_id),
+        )
         record_lead_event(
             conn,
             lead_id,
@@ -69,3 +73,18 @@ def notes_for_card(conn, lead: dict) -> list:
         "updated_at": when,
         "stored": False,
     }]
+
+
+def compose_lead_notes_text(conn, lead: dict) -> str | None:
+    """Return combined text of all notes for a lead (table notes + legacy lead.note)."""
+    items = notes_for_card(conn, lead)
+    parts: list[str] = []
+    for item in items:
+        body = str(item.get("body") or "").strip()
+        if body and body not in parts:
+            parts.append(body)
+    legacy = str(lead.get("note") or "").strip()
+    if legacy and legacy not in parts and not any(legacy in p for p in parts):
+        parts.insert(0, legacy)
+    joined = "\n\n".join(parts).strip()
+    return joined or None

@@ -5,7 +5,7 @@ from app.main import create_app
 from app.telegram_gateway import FakeGateway
 
 
-def _seed_connected_account(conn, phone="+79990001122", daily_limit=10):
+def _seed_connected_account(conn, phone="+79990001122", daily_limit=10, last_from_peer=0):
     now = utc_now()
     cur = conn.execute(
         """
@@ -24,9 +24,9 @@ def _seed_connected_account(conn, phone="+79990001122", daily_limit=10):
             account_id, peer_type, peer_id, username, title,
             is_group, unread_count, last_from_peer, muted,
             created_at, updated_at
-        ) VALUES (?, 'user', 810001, 'client_one', 'Клиент Один', 0, 0, 1, 0, ?, ?)
+        ) VALUES (?, 'user', 810001, 'client_one', 'Клиент Один', 0, 0, ?, 0, ?, ?)
         """,
-        (account_id, now, now),
+        (account_id, int(last_from_peer), now, now),
     )
     conn.commit()
     return account_id, dcur.lastrowid
@@ -68,6 +68,73 @@ def test_account_daily_limit_patch_and_send_enforcement(tmp_path):
         )
         assert blocked.status_code == 400
         assert "Достигнут суточный лимит" in blocked.json()["detail"]
+
+
+def test_replied_peer_dialog_bypasses_daily_limit(tmp_path):
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    account_id, untouched_dialog_id = _seed_connected_account(conn, daily_limit=2, last_from_peer=0)
+    now = utc_now()
+    today = now[:10]
+    conn.execute(
+        "UPDATE accounts SET sent_today = 2, sent_date = ? WHERE id = ?",
+        (today, account_id),
+    )
+    replied_in_cur = conn.execute(
+        """
+        INSERT INTO dialogs (
+            account_id, peer_type, peer_id, username, title,
+            is_group, unread_count, last_from_peer, muted,
+            created_at, updated_at
+        ) VALUES (?, 'user', 810002, 'replied_in', 'Ответивший Клиент', 0, 0, 0, 0, ?, ?)
+        """,
+        (account_id, now, now),
+    )
+    replied_in_dialog_id = replied_in_cur.lastrowid
+    conn.execute(
+        """
+        INSERT INTO messages (
+            dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at
+        ) VALUES (?, 501, 'in', 'Да, интересны 3 видоса', ?, ?, ?)
+        """,
+        (replied_in_dialog_id, now, now, now),
+    )
+    replied_flag_cur = conn.execute(
+        """
+        INSERT INTO dialogs (
+            account_id, peer_type, peer_id, username, title,
+            is_group, unread_count, last_from_peer, muted,
+            created_at, updated_at
+        ) VALUES (?, 'user', 810003, 'replied_flag', 'Входящий Клиент', 0, 1, 1, 0, ?, ?)
+        """,
+        (account_id, now, now),
+    )
+    replied_flag_dialog_id = replied_flag_cur.lastrowid
+    conn.commit()
+
+    app = create_app(conn=conn, gateway=None)
+    with TestClient(app) as client:
+        blocked = client.post(
+            f"/api/dialogs/{untouched_dialog_id}/messages",
+            json={"text": "Холодный фоллоу-ап сверх лимита"},
+        )
+        assert blocked.status_code == 400
+        assert "Достигнут суточный лимит" in blocked.json()["detail"]
+
+        r1 = client.post(
+            f"/api/dialogs/{replied_in_dialog_id}/messages",
+            json={"text": "Отлично, отправляю детали по 3 видосам"},
+        )
+        assert r1.status_code == 200, r1.text
+
+        r2 = client.post(
+            f"/api/dialogs/{replied_flag_dialog_id}/messages",
+            json={"text": "Привет! Конечно, давай обсудим"},
+        )
+        assert r2.status_code == 200, r2.text
+
+        accounts = client.get("/api/accounts").json()
+        assert accounts[0]["sent_today"] == 2
 
 
 def test_outreach_campaign_csv_import_and_multistep_sequence_respects_limits(tmp_path):
