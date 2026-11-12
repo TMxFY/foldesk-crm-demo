@@ -2689,6 +2689,7 @@ async def run_campaign_batch(
                 "daily_limit": int(acc_pub["daily_limit"]),
                 "sent_today": int(acc_pub["sent_today"]),
                 "sent_in_batch": 0,
+                "reserved_followups": 0,
                 "disabled": False,
                 "spambot_warm_only": is_spambot_warm_only,
             }
@@ -2722,6 +2723,164 @@ async def run_campaign_batch(
     effective_quota = min(total_account_remaining, campaign_remaining, cap)
     max_failed_in_batch = max(5, effective_quota * 3)
 
+    sent_count = 0
+    failed_in_batch = 0
+    sent_by_account: dict[str, int] = {}
+    jitter_delays_ms: list[int] = []
+    state_by_id = {st["id"]: st for st in connected_states}
+    reserved_rec_to_acc: dict[int, tuple[int, int]] = {}
+    camp_reserved_by_acc: dict[int, int] = {}
+
+    def _resolve_verified_followup_acc(
+        raw_sent_acc,
+        clean_uname: str,
+        real_peer_id: int | None,
+        clean_phone: str,
+        lead_id_val: int | None,
+    ) -> tuple[int | None, bool]:
+        if raw_sent_acc is not None:
+            verified = _lookup_prior_outgoing_account(
+                conn,
+                clean_uname=clean_uname,
+                real_peer_id=real_peer_id,
+                clean_phone=clean_phone,
+                lead_id_val=lead_id_val,
+                required_account_id=int(raw_sent_acc),
+            )
+            if verified is not None:
+                return int(verified), False
+        found = _lookup_prior_outgoing_account(
+            conn,
+            clean_uname=clean_uname,
+            real_peer_id=real_peer_id,
+            clean_phone=clean_phone,
+            lead_id_val=lead_id_val,
+        )
+        if found is not None:
+            return int(found), True
+        return None, False
+
+    def _count_followup_slots_due_today(
+        c_steps: list[dict],
+        start_idx: int,
+        base_sent_iso: str | None,
+        now_iso_val: str,
+        today_iso_val: str,
+    ) -> int:
+        if start_idx < 1 or start_idx >= len(c_steps):
+            return 0
+        cur_base = base_sent_iso
+        slots = 0
+        for idx in range(start_idx, len(c_steps)):
+            dh = int(c_steps[idx].get("delay_hours") or 0)
+            if cur_base and dh > 0:
+                due_at = _add_hours_iso(cur_base, dh)
+                if due_at and due_at[:10] > today_iso_val:
+                    break
+                cur_base = due_at if (due_at and due_at > now_iso_val) else now_iso_val
+            else:
+                cur_base = now_iso_val
+            slots += 1
+        return slots
+
+    def _add_current_camp_reservation(rec_id: int, aid_int: int, slots: int) -> None:
+        if slots <= 0 or aid_int not in state_by_id:
+            return
+        state_by_id[aid_int]["reserved_followups"] += slots
+        reserved_rec_to_acc[int(rec_id)] = (aid_int, slots)
+        camp_reserved_by_acc[aid_int] = camp_reserved_by_acc.get(aid_int, 0) + slots
+
+    def _release_followup_reservation(rec_id: int) -> None:
+        entry = reserved_rec_to_acc.pop(int(rec_id), None)
+        if entry is None:
+            return
+        aid_int, slots = entry
+        if aid_int in state_by_id:
+            state_by_id[aid_int]["reserved_followups"] = max(
+                0, state_by_id[aid_int]["reserved_followups"] - slots
+            )
+        if camp_reserved_by_acc.get(aid_int, 0) > 0:
+            camp_reserved_by_acc[aid_int] = max(0, camp_reserved_by_acc[aid_int] - slots)
+
+    if respect_delays:
+        now_boot = utc_now()
+        today_iso = utc_today()
+        steps_by_camp: dict[int, list[dict]] = {int(campaign_id): steps}
+        other_allowed_accs: dict[int, set[int]] = {}
+        other_remaining_cap: dict[int, int] = {}
+        other_rows = conn.execute(
+            "SELECT id, account_id, account_ids_json, daily_limit FROM campaigns WHERE status = 'running'"
+        ).fetchall()
+        active_cids = {int(campaign_id)}
+        for orow in other_rows:
+            ocid = int(orow["id"])
+            active_cids.add(ocid)
+            if ocid == int(campaign_id):
+                continue
+            o_accs = _parse_account_ids(orow["account_id"], orow["account_ids_json"])
+            _sync_campaign_replies(conn, ocid, o_accs[0] if len(o_accs) == 1 else None)
+            other_allowed_accs[ocid] = set(int(x) for x in o_accs)
+            o_sent_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM campaign_recipients WHERE campaign_id = ? AND COALESCE(last_sent_at, '') LIKE ?",
+                (ocid, f"{today_iso}%"),
+            ).fetchone()
+            o_sent = int(o_sent_row["cnt"] or 0)
+            other_remaining_cap[ocid] = max(0, int(orow["daily_limit"] or 20) - o_sent)
+            steps_by_camp[ocid] = [
+                as_dict(sr)
+                for sr in conn.execute(
+                    "SELECT * FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order",
+                    (ocid,),
+                ).fetchall()
+            ]
+        ph_active = ",".join("?" for _ in active_cids)
+        inprog_rows = conn.execute(
+            f"""
+            SELECT id, campaign_id, current_step, last_sent_at, sent_account_id,
+                   assigned_account_id, username, telegram_user_id, phone, lead_id
+            FROM campaign_recipients
+            WHERE campaign_id IN ({ph_active})
+              AND status = 'in_progress'
+            ORDER BY id
+            """,
+            tuple(active_cids),
+        ).fetchall()
+        for r in inprog_rows:
+            rcid = int(r["campaign_id"])
+            c_steps = steps_by_camp.get(rcid) or []
+            s_idx = int(r["current_step"] or 0)
+            slots = _count_followup_slots_due_today(
+                c_steps, s_idx, r["last_sent_at"], now_boot, today_iso
+            )
+            if slots <= 0:
+                continue
+            r_uname = (_clean_handle(r["username"]) or "").lower()
+            r_peer_id = (
+                int(r["telegram_user_id"])
+                if r["telegram_user_id"] is not None and not _is_synthetic_peer_id(r["telegram_user_id"])
+                else None
+            )
+            r_phone = str(r["phone"] or "").strip()
+            r_lid = int(r["lead_id"]) if r["lead_id"] is not None else None
+            aid_int, _ = _resolve_verified_followup_acc(
+                r["sent_account_id"], r_uname, r_peer_id, r_phone, r_lid
+            )
+            if aid_int is None or aid_int not in state_by_id:
+                continue
+            if _is_same_tg_identity(state_by_id[aid_int]["raw"], r_uname, r_peer_id):
+                continue
+            if rcid == int(campaign_id):
+                _add_current_camp_reservation(int(r["id"]), aid_int, slots)
+            else:
+                if aid_int not in other_allowed_accs.get(rcid, set()):
+                    continue
+                rem_other = other_remaining_cap.get(rcid, 0)
+                if rem_other <= 0:
+                    continue
+                capped_slots = min(slots, rem_other)
+                state_by_id[aid_int]["reserved_followups"] += capped_slots
+                other_remaining_cap[rcid] = rem_other - capped_slots
+
     eligible_rows = conn.execute(
         """
         SELECT cr.*, l.niche AS lead_niche
@@ -2730,16 +2889,10 @@ async def run_campaign_batch(
         WHERE cr.campaign_id = ?
           AND cr.status IN ('pending', 'in_progress')
           AND cr.current_step < ?
-        ORDER BY cr.id
+        ORDER BY CASE WHEN COALESCE(cr.current_step, 0) >= 1 THEN 0 ELSE 1 END, cr.id
         """,
         (campaign_id, len(steps)),
     ).fetchall()
-
-    sent_count = 0
-    failed_in_batch = 0
-    sent_by_account: dict[str, int] = {}
-    jitter_delays_ms: list[int] = []
-    state_by_id = {st["id"]: st for st in connected_states}
 
     async def _tg_send_with_username_fallback(
         active_gw,
@@ -2811,6 +2964,24 @@ async def run_campaign_batch(
                 due_iso = _add_hours_iso(rec["last_sent_at"], delay_hours)
                 if due_iso and due_iso > now:
                     continue
+
+        today_loop_iso = utc_today()
+        new_lead_slots_today = (
+            1 + _count_followup_slots_due_today(steps, 1, now, now, today_loop_iso)
+            if (respect_delays and step_idx == 0)
+            else 1
+        )
+        if respect_delays and step_idx == 0:
+            camp_followup_reserve = sum(
+                min(
+                    camp_reserved_by_acc.get(st["id"], 0),
+                    max(0, st["daily_limit"] - st["sent_today"]),
+                )
+                for st in connected_states
+                if not st.get("disabled") and not st.get("dead")
+            )
+            if campaign_remaining - sent_count - camp_followup_reserve < new_lead_slots_today:
+                break
 
         clean_rec_uname = (_clean_handle(rec.get("username")) or "").lower()
         clean_rec_phone = str(rec.get("phone") or "").strip()
@@ -2961,34 +3132,27 @@ async def run_campaign_batch(
                         ),
                     )
                     conn.commit()
+                    if respect_delays and synced_status == "in_progress" and dup_acc is not None:
+                        dup_slots = _count_followup_slots_due_today(
+                            steps, synced_step, dup_sent_at, now, today_loop_iso
+                        )
+                        _add_current_camp_reservation(int(rec["id"]), int(dup_acc), dup_slots)
                     continue
 
         pinned_followup_acc_id: int | None = None
         if step_idx >= 1:
             # Guard 2a & 2b: Resolve sent_account_id strictly and require real prior outgoing message in messages
-            raw_sent_acc = rec.get("sent_account_id")
-            if raw_sent_acc is not None:
-                verified_acc = _lookup_prior_outgoing_account(
-                    conn,
-                    clean_uname=clean_rec_uname,
-                    real_peer_id=real_rec_peer_id,
-                    clean_phone=clean_rec_phone,
-                    lead_id_val=rec_lead_id,
-                    required_account_id=int(raw_sent_acc),
-                )
-                if verified_acc is not None:
-                    pinned_followup_acc_id = verified_acc
-            if pinned_followup_acc_id is None:
-                found_hist_acc = _lookup_prior_outgoing_account(
-                    conn,
-                    clean_uname=clean_rec_uname,
-                    real_peer_id=real_rec_peer_id,
-                    clean_phone=clean_rec_phone,
-                    lead_id_val=rec_lead_id,
-                )
-                if found_hist_acc is not None:
-                    pinned_followup_acc_id = found_hist_acc
-                    rec["sent_account_id"] = found_hist_acc
+            resolved_hist_acc, needs_hist_repair = _resolve_verified_followup_acc(
+                rec.get("sent_account_id"),
+                clean_rec_uname,
+                real_rec_peer_id,
+                clean_rec_phone,
+                rec_lead_id,
+            )
+            if resolved_hist_acc is not None:
+                pinned_followup_acc_id = resolved_hist_acc
+                if needs_hist_repair:
+                    rec["sent_account_id"] = resolved_hist_acc
                     conn.execute(
                         """
                         UPDATE campaign_recipients
@@ -2997,7 +3161,7 @@ async def run_campaign_batch(
                             updated_at = ?
                         WHERE id = ?
                         """,
-                        (found_hist_acc, found_hist_acc, now, rec["id"]),
+                        (resolved_hist_acc, resolved_hist_acc, now, rec["id"]),
                     )
                     conn.commit()
             if pinned_followup_acc_id is None:
@@ -3012,10 +3176,12 @@ async def run_campaign_batch(
                     (now, rec["id"]),
                 )
                 conn.commit()
+                _release_followup_reservation(int(rec["id"]))
                 continue
 
         sent_this_recipient = False
         no_accounts_left = False
+        no_new_lead_quota_left = False
         jitter_applied = False
         replied_skipped = False
         rotated_after_failure = False
@@ -3033,10 +3199,17 @@ async def run_campaign_batch(
                 st
                 for st in connected_states
                 if not st.get("disabled")
-                and st["sent_today"] < st["daily_limit"]
+                and (
+                    st["daily_limit"]
+                    - st["sent_today"]
+                    - (st["reserved_followups"] if (respect_delays and step_idx == 0) else 0)
+                    >= (new_lead_slots_today if step_idx == 0 else 1)
+                )
                 and (step_idx >= 1 or not st.get("spambot_warm_only"))
             ]
             if not globally_available:
+                if step_idx == 0:
+                    no_new_lead_quota_left = True
                 break
             available = [
                 st
@@ -3067,14 +3240,16 @@ async def run_campaign_batch(
                     chosen_state = None
                 else:
                     pinned_state = state_by_id[int(pinned_followup_acc_id)]
-                    if (
+                    if _is_same_tg_identity(
+                        pinned_state["raw"], clean_rec_uname, real_rec_peer_id
+                    ):
+                        _release_followup_reservation(int(rec["id"]))
+                        chosen_state = None
+                    elif (
                         not pinned_state.get("disabled")
                         and not pinned_state.get("dead")
                         and pinned_state["id"] not in recipient_excluded_accounts
                         and pinned_state["sent_today"] < pinned_state["daily_limit"]
-                        and not _is_same_tg_identity(
-                            pinned_state["raw"], clean_rec_uname, real_rec_peer_id
-                        )
                     ):
                         chosen_state = pinned_state
                     else:
@@ -3085,7 +3260,12 @@ async def run_campaign_batch(
                     not pinned_state.get("disabled")
                     and not pinned_state.get("spambot_warm_only")
                     and pinned_state["id"] not in recipient_excluded_accounts
-                    and pinned_state["sent_today"] < pinned_state["daily_limit"]
+                    and (
+                        pinned_state["daily_limit"]
+                        - pinned_state["sent_today"]
+                        - (pinned_state["reserved_followups"] if respect_delays else 0)
+                        >= new_lead_slots_today
+                    )
                     and not _is_same_tg_identity(
                         pinned_state["raw"], clean_rec_uname, real_rec_peer_id
                     )
@@ -3404,12 +3584,16 @@ async def run_campaign_batch(
                     """,
                     (str(exc)[:300], now, rec["id"]),
                 )
+                _release_followup_reservation(int(rec["id"]))
                 failed_in_batch += 1
                 break
 
-        if no_accounts_left:
+        if no_accounts_left or no_new_lead_quota_left:
             break
-        if replied_skipped or not sent_this_recipient:
+        if replied_skipped:
+            _release_followup_reservation(int(rec["id"]))
+            continue
+        if not sent_this_recipient:
             continue
 
         stored_media_url = None if acc_provider == "whatsapp" else step_image_url
@@ -3434,9 +3618,15 @@ async def run_campaign_batch(
         chosen_state["sent_today"] += 1
         chosen_state["sent_in_batch"] += 1
         sent_by_account[str(chosen_account_id)] = sent_by_account.get(str(chosen_account_id), 0) + 1
+        _release_followup_reservation(int(rec["id"]))
 
         next_step = step_idx + 1
         next_status = "completed" if next_step >= len(steps) else "in_progress"
+        if respect_delays and next_status == "in_progress":
+            rem_slots = _count_followup_slots_due_today(
+                steps, next_step, sent_at, now, today_loop_iso
+            )
+            _add_current_camp_reservation(int(rec["id"]), chosen_account_id, rem_slots)
         pinned_sent_acc = (
             chosen_account_id
             if step_idx == 0
