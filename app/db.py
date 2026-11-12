@@ -820,6 +820,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if vlad_canonical_v5 is None:
             apply_canonical_vlad_outreach_v5(conn)
+        try:
+            from app.digest import resolve_colleague_bot_credentials
+
+            tok, cid = resolve_colleague_bot_credentials(conn, default_chat_id=False)
+            now_ts = utc_now()
+            if tok:
+                conn.execute(
+                    "INSERT OR IGNORE INTO kv_settings (key, value, updated_at) VALUES ('bot_token', ?, ?)",
+                    (tok, now_ts),
+                )
+            if cid:
+                conn.execute(
+                    "INSERT OR IGNORE INTO kv_settings (key, value, updated_at) VALUES ('bot_chat_id', ?, ?)",
+                    (cid, now_ts),
+                )
+        except Exception:
+            pass
     conn.commit()
 
 

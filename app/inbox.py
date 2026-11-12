@@ -126,6 +126,7 @@ def stop_outreach_on_reply(
     preview: str | None = None,
     force_event: bool = False,
     min_sent_at: str | None = None,
+    opener=None,
 ) -> int:
     now = utc_now()
     clean_min_sent = str(min_sent_at).strip() if min_sent_at else None
@@ -141,6 +142,9 @@ def stop_outreach_on_reply(
     phone_peer_id = int(phone_digits[-12:]) if (phone_digits and len(phone_digits) >= 7) else None
     clean_peer_id = int(peer_id) if peer_id is not None else phone_peer_id
     clean_lead_id = int(lead_id) if lead_id is not None else None
+
+    if clean_peer_id in (777000, 178220800):
+        return 0
 
     if not any((clean_lead_id, clean_peer_id, clean_user, phone_variants)):
         return 0
@@ -197,24 +201,54 @@ def stop_outreach_on_reply(
 
     stopped_count = 0
     stopped_campaign_ids: set[int] = set()
+    candidate_account_ids: list[int] = []
+    candidate_usernames: list[str] = []
+    candidate_names: list[str] = []
+    candidate_phones: list[str] = []
     had_active_recs = False
+    has_any_recipient = False
+
     if rec_clauses:
-        rec_rows = conn.execute(
+        all_rec_rows = conn.execute(
             f"""
-            SELECT id, campaign_id, lead_id, status, last_sent_at FROM campaign_recipients
-            WHERE status IN ('pending', 'in_progress', 'completed')
-              AND ({' OR '.join(rec_clauses)})
+            SELECT id, campaign_id, lead_id, status, last_sent_at,
+                   sent_account_id, assigned_account_id, username, name, phone
+            FROM campaign_recipients
+            WHERE {' OR '.join(rec_clauses)}
             """,
             rec_params,
         ).fetchall()
-        had_active_recs = len(rec_rows) > 0
+        has_any_recipient = len(all_rec_rows) > 0
+        for rr in all_rec_rows:
+            if rr["username"]:
+                u = str(rr["username"]).strip().lstrip("@")
+                if u and u not in candidate_usernames:
+                    candidate_usernames.append(u)
+            if rr["name"]:
+                n = str(rr["name"]).strip()
+                if n and n not in candidate_names:
+                    candidate_names.append(n)
+            if rr["phone"]:
+                p = str(rr["phone"]).strip()
+                if p and p not in candidate_phones:
+                    candidate_phones.append(p)
+            for cand_acc in (rr["sent_account_id"], rr["assigned_account_id"]):
+                if cand_acc is not None:
+                    aid = int(cand_acc)
+                    if aid not in candidate_account_ids:
+                        candidate_account_ids.append(aid)
+
+        active_rec_rows = [
+            rr for rr in all_rec_rows if rr["status"] in ("pending", "in_progress", "completed")
+        ]
+        had_active_recs = len(active_rec_rows) > 0
         if clean_min_sent:
-            rec_rows = [
+            active_rec_rows = [
                 rr
-                for rr in rec_rows
+                for rr in active_rec_rows
                 if not rr["last_sent_at"] or str(rr["last_sent_at"]) <= clean_min_sent
             ]
-        for rr in rec_rows:
+        for rr in active_rec_rows:
             if rr["lead_id"]:
                 lid = int(rr["lead_id"])
                 matched_lead_ids.add(lid)
@@ -234,9 +268,33 @@ def stop_outreach_on_reply(
             )
             stopped_count += 1
 
+    dlg_row = None
+    if account_id is not None and clean_peer_id is not None:
+        dlg_row = conn.execute(
+            "SELECT * FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?",
+            (int(account_id), int(clean_peer_id)),
+        ).fetchone()
+    elif clean_peer_id is not None:
+        dlg_row = conn.execute(
+            "SELECT * FROM dialogs WHERE peer_type = 'user' AND peer_id = ? ORDER BY last_message_at DESC LIMIT 1",
+            (int(clean_peer_id),),
+        ).fetchone()
+    elif clean_user:
+        dlg_row = conn.execute(
+            "SELECT * FROM dialogs WHERE lower(username) = lower(?) ORDER BY last_message_at DESC LIMIT 1",
+            (clean_user,),
+        ).fetchone()
+    elif matched_lead_ids:
+        ph_lids = ",".join("?" for _ in matched_lead_ids)
+        dlg_row = conn.execute(
+            f"SELECT * FROM dialogs WHERE lead_id IN ({ph_lids}) ORDER BY last_message_at DESC LIMIT 1",
+            sorted(matched_lead_ids),
+        ).fetchone()
+
     if clean_min_sent and had_active_recs and stopped_count == 0 and not force_event:
         return 0
 
+    any_lead_status_moved = False
     if matched_lead_ids:
         primary_lid = sorted(matched_lead_ids)[0]
         if account_id is not None and clean_peer_id is not None:
@@ -271,6 +329,8 @@ def stop_outreach_on_reply(
         for lid in sorted(matched_lead_ids):
             old_status = prev_lead_statuses.get(lid)
             status_moved = old_status in ("new", "waiting")
+            if status_moved:
+                any_lead_status_moved = True
             if stopped_count > 0 or status_moved or force_event:
                 snippet = f": «{str(preview).strip()[:80]}»" if preview and str(preview).strip() else ""
                 if stopped_count > 0:
@@ -297,11 +357,102 @@ def stop_outreach_on_reply(
                     now=now,
                 )
 
+    should_notify_colleague = (
+        stopped_count > 0
+        or any_lead_status_moved
+        or (force_event and (bool(matched_lead_ids) or has_any_recipient or (dlg_row is not None)))
+    )
+    if should_notify_colleague:
+        try:
+            from app.digest import send_lead_reply_notification
+
+            lrow_disp = None
+            if matched_lead_ids:
+                lrow_disp = conn.execute(
+                    "SELECT username, name, phone, account_id FROM leads WHERE id = ?",
+                    (sorted(matched_lead_ids)[0],),
+                ).fetchone()
+                if lrow_disp is not None and account_id is None and lrow_disp["account_id"] is not None:
+                    aid = int(lrow_disp["account_id"])
+                    if aid not in candidate_account_ids:
+                        candidate_account_ids.append(aid)
+
+            lead_username = clean_user
+            if not lead_username and candidate_usernames:
+                lead_username = candidate_usernames[0]
+            if not lead_username and dlg_row and dlg_row["username"]:
+                lead_username = str(dlg_row["username"]).strip().lstrip("@")
+            if not lead_username and lrow_disp is not None:
+                lu = str(lrow_disp["username"] or "").strip().lstrip("@")
+                if lu:
+                    lead_username = lu
+
+            if lead_username:
+                lead_display = f"@{lead_username}"
+            else:
+                lead_name = ""
+                if candidate_names:
+                    lead_name = candidate_names[0]
+                elif dlg_row and dlg_row["title"]:
+                    lead_name = str(dlg_row["title"]).strip()
+                elif lrow_disp and lrow_disp["name"]:
+                    lead_name = str(lrow_disp["name"]).strip()
+
+                if lead_name:
+                    lead_display = lead_name
+                else:
+                    lead_phone = clean_phone
+                    if not lead_phone and candidate_phones:
+                        lead_phone = candidate_phones[0]
+                    elif not lead_phone and dlg_row and dlg_row["phone"]:
+                        lead_phone = str(dlg_row["phone"]).strip()
+                    elif not lead_phone and lrow_disp and lrow_disp["phone"]:
+                        lead_phone = str(lrow_disp["phone"]).strip()
+
+                    lead_display = (
+                        lead_phone
+                        or (f"id:{clean_peer_id}" if clean_peer_id else "unknown")
+                    )
+
+            resolved_acc_id = (
+                int(account_id)
+                if account_id is not None
+                else (
+                    candidate_account_ids[0]
+                    if candidate_account_ids
+                    else (int(dlg_row["account_id"]) if dlg_row and dlg_row["account_id"] is not None else None)
+                )
+            )
+            acc_display = "unknown"
+            if resolved_acc_id is not None:
+                arow = conn.execute(
+                    "SELECT telegram_username, telegram_name, phone FROM accounts WHERE id = ?",
+                    (resolved_acc_id,),
+                ).fetchone()
+                if arow is not None:
+                    au = str(arow["telegram_username"] or "").strip().lstrip("@")
+                    if au:
+                        acc_display = f"@{au}"
+                    elif arow["telegram_name"]:
+                        acc_display = str(arow["telegram_name"]).strip()
+                    elif arow["phone"]:
+                        acc_display = str(arow["phone"]).strip()
+                    else:
+                        acc_display = f"#{resolved_acc_id}"
+            send_lead_reply_notification(
+                conn,
+                lead_handle=lead_display,
+                account_handle=acc_display,
+                opener=opener,
+            )
+        except Exception:
+            pass
+
     return stopped_count
 
 
 
-def remember_dialogs(conn, account_id: int, people: list) -> list:
+def remember_dialogs(conn, account_id: int, people: list, opener=None) -> list:
     acc_provider = _account_provider(conn, account_id)
     now = utc_now()
     saved = []
@@ -382,6 +533,7 @@ def remember_dialogs(conn, account_id: int, people: list) -> list:
                 phone=row["phone"],
                 lead_id=row["lead_id"],
                 preview=row["last_message_preview"],
+                opener=opener,
             )
             row = conn.execute(
                 "SELECT * FROM dialogs WHERE id = ?",
@@ -392,7 +544,7 @@ def remember_dialogs(conn, account_id: int, people: list) -> list:
     return saved
 
 
-def apply_incoming(conn, account_id: int, message: dict) -> dict:
+def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
     if not isinstance(message, dict) or message.get("is_group"):
         raise ValueError("Это не личный диалог")
     if (message.get("peer_type") or "user") != "user":
@@ -417,6 +569,14 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
     text = message.get("text")
     preview = "" if text is None else str(text)[:120]
     sent_at = str(message.get("sent_at") or now)
+    prev_dlg = conn.execute(
+        """
+        SELECT last_from_peer FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        """,
+        (account_id, int(peer_id)),
+    ).fetchone()
+    was_already_from_peer = bool(prev_dlg and int(prev_dlg["last_from_peer"] or 0) == 1)
     conn.execute(
         """
         INSERT INTO dialogs (
@@ -472,7 +632,8 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
         phone=row["phone"],
         lead_id=row["lead_id"],
         preview=preview,
-        force_event=True,
+        force_event=not was_already_from_peer,
+        opener=opener,
     )
     row = conn.execute(
         "SELECT * FROM dialogs WHERE id = ?",
@@ -482,7 +643,7 @@ def apply_incoming(conn, account_id: int, message: dict) -> dict:
     return _public(row)
 
 
-def sync_inbox(conn, account_id: int, people: list) -> list:
+def sync_inbox(conn, account_id: int, people: list, opener=None) -> list:
     acc_provider = _account_provider(conn, account_id, require_exists=True)
     now = utc_now()
     saved = []
@@ -568,6 +729,7 @@ def sync_inbox(conn, account_id: int, people: list) -> list:
                     phone=row["phone"],
                     lead_id=row["lead_id"],
                     preview=row["last_message_preview"],
+                    opener=opener,
                 )
                 row = conn.execute(
                     "SELECT * FROM dialogs WHERE id = ?",

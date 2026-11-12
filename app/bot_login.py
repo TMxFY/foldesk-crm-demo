@@ -4,6 +4,7 @@ import urllib.error
 import urllib.request
 
 from app.db import as_dict, utc_now
+from app.digest import resolve_colleague_bot_credentials
 from app.leads import create_lead
 from app.notes import add_note
 
@@ -14,12 +15,14 @@ BAD_UPDATE = "Не апдейт"
 REJECTED = "Telegram не принял запрос"
 
 
-def _token() -> str:
-    return os.environ.get("BOT_TOKEN", "").strip()
+def _token(conn=None) -> str:
+    token, _ = resolve_colleague_bot_credentials(conn, default_chat_id=False)
+    return token
 
 
-def _expected_chat() -> str:
-    return os.environ.get("BOT_CHAT_ID", "").strip()
+def _expected_chat(conn=None) -> str:
+    _, chat_id = resolve_colleague_bot_credentials(conn, default_chat_id=False)
+    return chat_id
 
 
 def operator_status(conn) -> dict:
@@ -228,9 +231,9 @@ def _save_forward_lead(conn, person: dict) -> tuple:
 
 def apply_forward_update(conn, update: dict) -> dict:
     # Не отвечает пересланному человеку и не шлёт сообщений.
-    if not _token():
+    if not _token(conn):
         raise ValueError(NO_TOKEN)
-    expected = _expected_chat()
+    expected = _expected_chat(conn)
     if not expected:
         raise ValueError(NO_CHAT)
     if not isinstance(update, dict):
@@ -272,9 +275,9 @@ def apply_bot_update(conn, update: dict) -> dict:
 
 def apply_start_update(conn, update: dict) -> dict:
     # Пустой токен не пишет сессию и не считается входом.
-    if not _token():
+    if not _token(conn):
         raise ValueError(NO_TOKEN)
-    expected = _expected_chat()
+    expected = _expected_chat(conn)
     if not expected:
         raise ValueError(NO_CHAT)
     if not isinstance(update, dict):
@@ -325,10 +328,10 @@ def _read(url: str, payload: dict, opener) -> dict:
 def poll_bot_login(conn, opener=None) -> dict:
     # Кнопка тянет getUpdates. Не шлёт сообщений и не подтверждает offset:
     # чужие апдейты, включая callback дайджеста, остаются в очереди.
-    token = _token()
+    token = _token(conn)
     if not token:
         raise ValueError(NO_TOKEN)
-    if not _expected_chat():
+    if not _expected_chat(conn):
         raise ValueError(NO_CHAT)
     params: dict = {"timeout": 0, "allowed_updates": ["message"]}
     row = conn.execute("SELECT MAX(update_id) FROM bot_seen_updates").fetchone()

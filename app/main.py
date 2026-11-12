@@ -741,7 +741,7 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
                 wa_gateway=_resolve_app_gateway(app, "whatsapp"),
             )
             dirty = isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
-            if tick_counter % 8 == 0 and "PYTEST_CURRENT_TEST" not in os.environ:
+            if tick_counter % 2 == 0 and "PYTEST_CURRENT_TEST" not in os.environ:
                 tg_rows = app.state.conn.execute(
                     "SELECT id, session_path, provider FROM accounts WHERE status = 'connected' ORDER BY id"
                 ).fetchall()

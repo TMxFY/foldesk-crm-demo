@@ -749,7 +749,7 @@ def _dialog_has_client_reply(conn, dialog: dict, rec: dict) -> bool:
     return False
 
 
-def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None) -> int:
+def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None, opener=None) -> int:
     rows = conn.execute(
         """
         SELECT * FROM campaign_recipients
@@ -769,6 +769,17 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
             dialogs = _find_recipient_dialogs(conn, rec, account_id=None)
         has_reply = any(_dialog_has_client_reply(conn, d, rec) for d in dialogs)
         if has_reply:
+            matched_dlg = next((d for d in dialogs if _dialog_has_client_reply(conn, d, rec)), dialogs[0] if dialogs else None)
+            stop_outreach_on_reply(
+                conn,
+                account_id=(matched_dlg.get("account_id") if matched_dlg else None) or rec.get("sent_account_id") or rec.get("assigned_account_id") or account_id,
+                peer_id=(matched_dlg.get("peer_id") if matched_dlg else None) or rec.get("telegram_user_id"),
+                username=(matched_dlg.get("username") if matched_dlg else None) or rec.get("username"),
+                phone=(matched_dlg.get("phone") if matched_dlg else None) or rec.get("phone"),
+                lead_id=(matched_dlg.get("lead_id") if matched_dlg else None) or rec.get("lead_id"),
+                preview=(matched_dlg.get("last_message_preview") if matched_dlg else None),
+                opener=opener,
+            )
             conn.execute(
                 """
                 UPDATE campaign_recipients
@@ -776,14 +787,6 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
                 WHERE id = ?
                 """,
                 (now, rec["id"]),
-            )
-            stop_outreach_on_reply(
-                conn,
-                account_id=rec.get("assigned_account_id") or account_id,
-                peer_id=rec.get("telegram_user_id"),
-                username=rec.get("username"),
-                phone=rec.get("phone"),
-                lead_id=rec.get("lead_id"),
             )
             replied_now += 1
     if replied_now:
@@ -3397,10 +3400,6 @@ async def run_campaign_batch(
                     if refreshed_dlg_row is not None:
                         dialog = as_dict(refreshed_dlg_row)
                     if _dialog_has_client_reply(conn, dialog, rec):
-                        conn.execute(
-                            "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
-                            (now, rec["id"]),
-                        )
                         stop_outreach_on_reply(
                             conn,
                             account_id=chosen_account_id,
@@ -3408,6 +3407,11 @@ async def run_campaign_batch(
                             username=dialog.get("username") or rec.get("username"),
                             phone=dialog.get("phone") or rec.get("phone"),
                             lead_id=dialog.get("lead_id") or rec.get("lead_id"),
+                            preview=dialog.get("last_message_preview"),
+                        )
+                        conn.execute(
+                            "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
+                            (now, rec["id"]),
                         )
                         conn.commit()
                         replied_skipped = True

@@ -1,17 +1,38 @@
 import json
 import os
+from pathlib import Path
 import sqlite3
+import ssl
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from app.db import as_dict, utc_now
+from app.db import ROOT, as_dict, utc_now
 from app.reminders import complete_reminder, list_reminders, normalize_due
 
 SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 EMPTY_TEXT = "На сегодня задач нет."
 REJECTED = "Telegram не принял сообщение"
 NO_OPERATOR = "Нет BOT_TOKEN или BOT_CHAT_ID"
+TIM_ASSISTANT_ENV = Path("/Users/timofei/tim-assistant/.env")
+DEFAULT_COLLEAGUE_CHAT_ID = "764309033"
+
+
+def _default_urlopen(req, timeout: float = 15):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not isinstance(getattr(exc, "reason", None), ssl.SSLError):
+            raise
+    cafile: str | None = None
+    try:
+        import certifi
+        cafile = certifi.where()
+    except Exception:
+        if os.path.exists("/etc/ssl/cert.pem"):
+            cafile = "/etc/ssl/cert.pem"
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
 
 def _day(value: str) -> str:
@@ -114,9 +135,55 @@ def build_digest(rows: list) -> tuple[str, dict | None]:
     return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
-def _operator() -> tuple[str, str]:
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("BOT_CHAT_ID", "").strip()
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        return {}
+    return out
+
+
+def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = True) -> tuple[str, str]:
+    token = (os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.environ.get("BOT_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if token == "e2e-not-a-secret":
+        return "", ""
+    if not token or not chat_id:
+        if "PYTEST_CURRENT_TEST" not in os.environ or os.environ.get("ALLOW_FILE_BOT_CREDS_IN_TEST") == "1":
+            for env_path in (ROOT / ".env", TIM_ASSISTANT_ENV):
+                vals = _read_env_file(env_path)
+                if not token:
+                    token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
+                if not chat_id:
+                    chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
+    if (not token or not chat_id) and conn is not None:
+        try:
+            rows = dict(
+                conn.execute(
+                    "SELECT key, value FROM kv_settings WHERE key IN ('bot_token', 'bot_chat_id')"
+                ).fetchall()
+            )
+            if not token:
+                token = str(rows.get("bot_token") or "").strip()
+            if not chat_id:
+                chat_id = str(rows.get("bot_chat_id") or "").strip()
+        except Exception:
+            pass
+    if token and not chat_id and default_chat_id:
+        chat_id = DEFAULT_COLLEAGUE_CHAT_ID
+    return token, chat_id
+
+
+def _operator(conn=None) -> tuple[str, str]:
+    token, chat_id = resolve_colleague_bot_credentials(conn, default_chat_id=False)
     if not token or not chat_id:
         raise ValueError(NO_OPERATOR)
     return token, chat_id
@@ -141,7 +208,7 @@ def _post(url: str, payload: dict, opener) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    open_fn = opener or urllib.request.urlopen
+    open_fn = opener or _default_urlopen
     try:
         with open_fn(req, timeout=15) as resp:
             status = getattr(resp, "status", None)
@@ -157,8 +224,35 @@ def _post(url: str, payload: dict, opener) -> None:
     _accepted(status, raw)
 
 
+def format_lead_reply_notification(
+    lead_handle: str,
+    account_handle: str,
+) -> str:
+    clean_lead = str(lead_handle or "").strip() or "unknown"
+    clean_acc = str(account_handle or "").strip() or "unknown"
+    return f"You received a response from {clean_lead}\n\nAccount: {clean_acc}"
+
+
+def send_lead_reply_notification(
+    conn,
+    *,
+    lead_handle: str,
+    account_handle: str,
+    opener=None,
+) -> bool:
+    try:
+        token, chat_id = resolve_colleague_bot_credentials(conn)
+        if not token or not chat_id:
+            return False
+        text = format_lead_reply_notification(lead_handle, account_handle)
+        _post(SEND_URL.format(token=token), {"chat_id": chat_id, "text": text}, opener)
+        return True
+    except Exception:
+        return False
+
+
 def send_morning_digest(conn, opener=None, now: str | None = None) -> dict:
-    token, chat_id = _operator()
+    token, chat_id = _operator(conn)
     rows = open_today(conn, now)
     text, markup = build_digest(rows)
     payload = {"chat_id": chat_id, "text": text}
