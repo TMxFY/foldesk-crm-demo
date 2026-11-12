@@ -14,7 +14,7 @@ SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 EMPTY_TEXT = "На сегодня задач нет."
 REJECTED = "Telegram не принял сообщение"
 NO_OPERATOR = "Нет BOT_TOKEN или BOT_CHAT_ID"
-TIM_ASSISTANT_ENV = Path("/Users/timofei/tim-assistant/.env")
+SOFTUGCBOT_ENV = Path("/Users/timofei/dev/Python/new era/softugcbot/.env")
 DEFAULT_COLLEAGUE_CHAT_ID = "764309033"
 
 
@@ -156,27 +156,29 @@ def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = True
     chat_id = (os.environ.get("BOT_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if token == "e2e-not-a-secret":
         return "", ""
+    in_pytest = "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("ALLOW_FILE_BOT_CREDS_IN_TEST") != "1"
     if not token or not chat_id:
-        if "PYTEST_CURRENT_TEST" not in os.environ or os.environ.get("ALLOW_FILE_BOT_CREDS_IN_TEST") == "1":
-            for env_path in (ROOT / ".env", TIM_ASSISTANT_ENV):
+        if not in_pytest:
+            for env_path in (ROOT / ".env", SOFTUGCBOT_ENV):
                 vals = _read_env_file(env_path)
                 if not token:
                     token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
                 if not chat_id:
                     chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
     if (not token or not chat_id) and conn is not None:
-        try:
-            rows = dict(
-                conn.execute(
-                    "SELECT key, value FROM kv_settings WHERE key IN ('bot_token', 'bot_chat_id')"
-                ).fetchall()
-            )
-            if not token:
-                token = str(rows.get("bot_token") or "").strip()
-            if not chat_id:
-                chat_id = str(rows.get("bot_chat_id") or "").strip()
-        except Exception:
-            pass
+        if not in_pytest or default_chat_id:
+            try:
+                rows = dict(
+                    conn.execute(
+                        "SELECT key, value FROM kv_settings WHERE key IN ('bot_token', 'bot_chat_id')"
+                    ).fetchall()
+                )
+                if not token:
+                    token = str(rows.get("bot_token") or "").strip()
+                if not chat_id:
+                    chat_id = str(rows.get("bot_chat_id") or "").strip()
+            except Exception:
+                pass
     if token and not chat_id and default_chat_id:
         chat_id = DEFAULT_COLLEAGUE_CHAT_ID
     return token, chat_id

@@ -823,11 +823,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         try:
             from app.digest import resolve_colleague_bot_credentials
 
-            tok, cid = resolve_colleague_bot_credentials(conn, default_chat_id=False)
+            tok, cid = resolve_colleague_bot_credentials(conn, default_chat_id=True)
             now_ts = utc_now()
             if tok:
                 conn.execute(
-                    "INSERT OR IGNORE INTO kv_settings (key, value, updated_at) VALUES ('bot_token', ?, ?)",
+                    "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('bot_token', ?, ?)",
                     (tok, now_ts),
                 )
             if cid:
