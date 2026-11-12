@@ -832,7 +832,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 )
             if cid:
                 conn.execute(
-                    "INSERT OR IGNORE INTO kv_settings (key, value, updated_at) VALUES ('bot_chat_id', ?, ?)",
+                    "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('bot_chat_id', ?, ?)",
                     (cid, now_ts),
                 )
         except Exception:

@@ -15,7 +15,7 @@ EMPTY_TEXT = "На сегодня задач нет."
 REJECTED = "Telegram не принял сообщение"
 NO_OPERATOR = "Нет BOT_TOKEN или BOT_CHAT_ID"
 SOFTUGCBOT_ENV = Path("/Users/timofei/dev/Python/new era/softugcbot/.env")
-DEFAULT_COLLEAGUE_CHAT_ID = "764309033"
+DEFAULT_COLLEAGUE_CHAT_ID = "978069541"
 
 
 def _default_urlopen(req, timeout: float = 15):
