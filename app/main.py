@@ -384,9 +384,11 @@ def should_enable_live_tg_runtime(conn=None, gateway=None) -> bool:
         or os.getenv("BOT_TOKEN") == "e2e-not-a-secret"
     ):
         return False
-    if os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes") or os.getenv(
-        "ALLOW_LOCAL_TG_SESSIONS", ""
-    ).strip().lower() in ("1", "true", "yes"):
+    if (
+        os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in ("1", "true", "yes")
+        or os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes")
+        or os.getenv("ALLOW_LOCAL_TG_SESSIONS", "").strip().lower() in ("1", "true", "yes")
+    ):
         return True
     from app.cloud_persistence import _resolve_r2_config
 

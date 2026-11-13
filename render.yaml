@@ -3,7 +3,7 @@ services:
     name: foldesk-crm-demo
     runtime: docker
     plan: free
-    autoDeploy: true
+    autoDeploy: false
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/accounts
     envVars:

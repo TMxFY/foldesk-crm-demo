@@ -562,6 +562,39 @@ def test_credentials_from_kv_settings_when_env_not_set(conn, monkeypatch):
     assert info["text"] == "You received a response from @phoenixIam\n\nAccount: @saabath"
 
 
+def test_credentials_from_vps_softugcbot_env_fallback(conn, monkeypatch, tmp_path):
+    import app.digest as digest_mod
+
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.delenv("BOT_CHAT_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.setenv("ALLOW_FILE_BOT_CREDS_IN_TEST", "1")
+
+    fake_vps_env = tmp_path / "opt_softugcbot.env"
+    fake_vps_env.write_text("TELEGRAM_BOT_TOKEN=vps_token_777\n", encoding="utf-8")
+    monkeypatch.setattr(digest_mod, "ROOT", tmp_path / "empty_root")
+    monkeypatch.setattr(digest_mod, "SOFTUGCBOT_ENV", tmp_path / "missing_mac_env")
+    monkeypatch.setattr(digest_mod, "VPS_SOFTUGCBOT_ENV", fake_vps_env, raising=False)
+
+    token, chat_id = resolve_colleague_bot_credentials(conn)
+    assert token == "vps_token_777"
+    assert chat_id == "978069541"
+
+    # Explicit kv_settings in DB must take precedence over VPS_SOFTUGCBOT_ENV fallback
+    now = utc_now()
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('bot_token', 'custom_kv_token_888', ?)",
+        (now,),
+    )
+    conn.commit()
+    token_kv, chat_kv = resolve_colleague_bot_credentials(conn)
+    assert token_kv == "custom_kv_token_888"
+    assert chat_kv == "978069541"
+
+
+
+
 def test_consecutive_apply_incoming_does_not_spam_duplicates(conn, monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "colleague-token-123")
     monkeypatch.setenv("BOT_CHAT_ID", "colleague-chat-456")

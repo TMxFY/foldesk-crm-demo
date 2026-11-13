@@ -1,0 +1,26 @@
+# Foldesk Telegram CRM (crmtg) on Contabo VPS (169.58.145.85).
+# Secrets stay in /opt/crmtg/.env, not in git.
+# Install: install -m 0644 deploy/systemd/crmtg.service /etc/systemd/system/crmtg.service
+
+[Unit]
+Description=Foldesk Telegram CRM (crmtg) — Web Telegram, Outreach & MCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crmtg
+EnvironmentFile=-/opt/crmtg/.env
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="PYTHONUNBUFFERED=1"
+Environment="DEMO_AUTOSEED=0"
+Environment="BOOTSTRAP_PROD_SNAPSHOT=1"
+Environment="CRMTG_VPS_RUNTIME=1"
+Environment="PORT=18084"
+ExecStart=/opt/crmtg/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 18084 --timeout-graceful-shutdown 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

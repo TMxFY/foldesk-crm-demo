@@ -14,6 +14,7 @@ SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 EMPTY_TEXT = "На сегодня задач нет."
 REJECTED = "Telegram не принял сообщение"
 NO_OPERATOR = "Нет BOT_TOKEN или BOT_CHAT_ID"
+VPS_SOFTUGCBOT_ENV = Path("/opt/softugcbot/.env")
 SOFTUGCBOT_ENV = Path("/Users/timofei/dev/Python/new era/softugcbot/.env")
 DEFAULT_COLLEAGUE_CHAT_ID = "978069541"
 
@@ -159,12 +160,11 @@ def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = True
     in_pytest = "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("ALLOW_FILE_BOT_CREDS_IN_TEST") != "1"
     if not token or not chat_id:
         if not in_pytest:
-            for env_path in (ROOT / ".env", SOFTUGCBOT_ENV):
-                vals = _read_env_file(env_path)
-                if not token:
-                    token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
-                if not chat_id:
-                    chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
+            vals = _read_env_file(ROOT / ".env")
+            if not token:
+                token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
+            if not chat_id:
+                chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
     if (not token or not chat_id) and conn is not None:
         if not in_pytest or default_chat_id:
             try:
@@ -179,6 +179,14 @@ def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = True
                     chat_id = str(rows.get("bot_chat_id") or "").strip()
             except Exception:
                 pass
+    if not token or not chat_id:
+        if not in_pytest:
+            for env_path in (VPS_SOFTUGCBOT_ENV, SOFTUGCBOT_ENV):
+                vals = _read_env_file(env_path)
+                if not token:
+                    token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
+                if not chat_id:
+                    chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
     if token and not chat_id and default_chat_id:
         chat_id = DEFAULT_COLLEAGUE_CHAT_ID
     return token, chat_id
