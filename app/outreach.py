@@ -2513,9 +2513,17 @@ def _mark_cloud_persistence_dirty(conn, now_iso: str | None = None) -> None:
     ):
         return
     try:
-        from app.cloud_persistence import DEFAULT_DB, _resolve_r2_config, backup_to_cloud
+        from app.cloud_persistence import (
+            DEFAULT_DB,
+            _resolve_r2_config,
+            backup_to_cloud,
+            check_tg_runtime_lease_owned,
+        )
+        from app.main import should_enable_live_tg_runtime
 
         if not _resolve_r2_config(conn):
+            return
+        if not should_enable_live_tg_runtime(conn, None):
             return
         db_file = DEFAULT_DB
         try:
@@ -2538,7 +2546,8 @@ def _mark_cloud_persistence_dirty(conn, now_iso: str | None = None) -> None:
                 _CLOUD_BACKUP_RERUN = False
                 await asyncio.sleep(0.5)
                 try:
-                    await asyncio.to_thread(backup_to_cloud, None, target_db)
+                    if await asyncio.to_thread(check_tg_runtime_lease_owned, None):
+                        await asyncio.to_thread(backup_to_cloud, None, target_db)
                 except Exception:
                     pass
                 if not _CLOUD_BACKUP_RERUN:
@@ -2762,6 +2771,149 @@ async def run_campaign_batch(
         if found is not None:
             return int(found), True
         return None, False
+
+    def _norm_followup_text(raw: str | None) -> str:
+        if not raw:
+            return ""
+        s = str(raw).replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+        return re.sub(r"\s+", " ", s.strip()).lower()
+
+    def _check_followup_already_sent_or_not_due(
+        rec_obj: dict,
+        step_idx_val: int,
+        rendered_val: str,
+        clean_uname: str,
+        real_peer_id: int | None,
+        clean_phone: str,
+        lead_id_val: int | None,
+        now_val: str,
+        today_iso_val: str,
+        dialog_id_val: int | None = None,
+    ) -> bool:
+        """Return True if recipient follow-up was already sent (and synced) or is not yet due."""
+        peer_str_val = str(real_peer_id) if real_peer_id is not None else ""
+        raw_digits = re.sub(r"\D+", "", clean_phone)
+        norm_phone_val = raw_digits if len(raw_digits) >= 7 else ""
+        out_rows = conn.execute(
+            """
+            SELECT m.id, m.text, m.sent_at, d.account_id
+            FROM dialogs d
+            JOIN messages m ON m.dialog_id = d.id
+            WHERE m.direction = 'out'
+              AND (
+                  (? IS NOT NULL AND d.id = ?)
+                  OR (? != '' AND lower(trim(coalesce(d.username, ''), '@')) = lower(?))
+                  OR (? != '' AND d.peer_id = ?)
+                  OR (? != '' AND replace(replace(replace(coalesce(d.phone, ''), '+', ''), ' ', ''), '-', '') = ?)
+                  OR (? IS NOT NULL AND d.lead_id = ?)
+              )
+            ORDER BY m.sent_at DESC, m.id DESC
+            """,
+            (
+                dialog_id_val,
+                dialog_id_val,
+                clean_uname,
+                clean_uname,
+                peer_str_val,
+                real_peer_id,
+                norm_phone_val,
+                norm_phone_val,
+                lead_id_val,
+                lead_id_val,
+            ),
+        ).fetchall()
+        if not out_rows:
+            return False
+
+        matched_step_num: int | None = None
+        matched_msg = None
+        for cand_idx in range(len(steps) - 1, step_idx_val - 1, -1):
+            cand_txt = (
+                rendered_val
+                if cand_idx == step_idx_val
+                else _render_step_text(
+                    steps[cand_idx], cand_idx, rec_obj, campaign_name=camp.get("name")
+                )
+            )
+            cand_norm = _norm_followup_text(cand_txt)
+            if not cand_norm:
+                continue
+            hit = next(
+                (m for m in out_rows if _norm_followup_text(m["text"]) == cand_norm),
+                None,
+            )
+            if hit is not None:
+                matched_step_num = cand_idx + 1
+                matched_msg = hit
+                break
+
+        if matched_step_num is not None and matched_msg is not None:
+            synced_step = max(int(rec_obj.get("current_step") or 0), matched_step_num)
+            synced_status = "completed" if synced_step >= len(steps) else "in_progress"
+            dup_sent_at = str(matched_msg["sent_at"] or rec_obj.get("last_sent_at") or now_val)
+            dup_acc = (
+                int(matched_msg["account_id"])
+                if matched_msg["account_id"] is not None
+                else rec_obj.get("sent_account_id")
+            )
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET current_step = ?,
+                    status = ?,
+                    sent_account_id = COALESCE(sent_account_id, ?),
+                    assigned_account_id = COALESCE(assigned_account_id, ?),
+                    last_sent_at = ?,
+                    error_text = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    synced_step,
+                    synced_status,
+                    dup_acc,
+                    dup_acc,
+                    dup_sent_at,
+                    now_val,
+                    rec_obj["id"],
+                ),
+            )
+            conn.commit()
+            _mark_cloud_persistence_dirty(conn, now_val)
+            _release_followup_reservation(int(rec_obj["id"]))
+            if respect_delays and synced_status == "in_progress" and dup_acc is not None:
+                dup_slots = _count_followup_slots_due_today(
+                    steps, synced_step, dup_sent_at, now_val, today_iso_val
+                )
+                _add_current_camp_reservation(int(rec_obj["id"]), int(dup_acc), dup_slots)
+            return True
+
+        latest_out_sent_at = max(
+            (str(m["sent_at"] or "") for m in out_rows if m["sent_at"]),
+            default="",
+        )
+        if latest_out_sent_at:
+            cur_last_sent = str(rec_obj.get("last_sent_at") or "")
+            if latest_out_sent_at > cur_last_sent:
+                rec_obj["last_sent_at"] = latest_out_sent_at
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET last_sent_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (latest_out_sent_at, now_val, rec_obj["id"]),
+                )
+                conn.commit()
+                _mark_cloud_persistence_dirty(conn, now_val)
+            if respect_delays:
+                dh = int(steps[step_idx_val].get("delay_hours") or 0)
+                if dh > 0:
+                    due_iso_real = _add_hours_iso(latest_out_sent_at, dh)
+                    if due_iso_real and due_iso_real > now_val:
+                        _release_followup_reservation(int(rec_obj["id"]))
+                        return True
+        return False
 
     def _count_followup_slots_due_today(
         c_steps: list[dict],
@@ -3181,6 +3333,18 @@ async def run_campaign_batch(
                 conn.commit()
                 _release_followup_reservation(int(rec["id"]))
                 continue
+            if _check_followup_already_sent_or_not_due(
+                rec,
+                step_idx,
+                rendered_text,
+                clean_rec_uname,
+                real_rec_peer_id,
+                clean_rec_phone,
+                rec_lead_id,
+                now,
+                today_loop_iso,
+            ):
+                continue
 
         sent_this_recipient = False
         no_accounts_left = False
@@ -3359,7 +3523,7 @@ async def run_campaign_batch(
                     if use_gateway and hasattr(active_gw, "fetch_messages"):
                         try:
                             fetched_msgs = await active_gw.fetch_messages(
-                                session_path, dialog["peer_id"], 5
+                                session_path, dialog["peer_id"], 10
                             )
                             if isinstance(fetched_msgs, list):
                                 live_history_checked = True
@@ -3380,7 +3544,7 @@ async def run_campaign_batch(
                                 try:
                                     await active_gw.search_dialogs(session_path, f"@{clean_un}", limit=1)
                                     fetched_msgs = await active_gw.fetch_messages(
-                                        session_path, dialog["peer_id"], 5
+                                        session_path, dialog["peer_id"], 10
                                     )
                                     if isinstance(fetched_msgs, list):
                                         live_history_checked = True
@@ -3428,6 +3592,20 @@ async def run_campaign_batch(
                             (now, rec["id"]),
                         )
                         conn.commit()
+                        replied_skipped = True
+                        break
+                    if _check_followup_already_sent_or_not_due(
+                        rec,
+                        step_idx,
+                        rendered_text,
+                        clean_rec_uname,
+                        real_rec_peer_id,
+                        clean_rec_phone,
+                        rec_lead_id,
+                        now,
+                        today_loop_iso,
+                        dialog_id_val=int(dialog["id"]),
+                    ):
                         replied_skipped = True
                         break
 

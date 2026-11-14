@@ -279,8 +279,10 @@ def restore_from_cloud(
     if not db_b64:
         return {"ok": False, "restored": False, "configured": True}
 
+    raw_db_bytes = base64.b64decode(db_b64)
     saved_at = str(bundle.get("saved_at") or "")
-    if not force and saved_at and db_path.exists() and db_path.stat().st_size > 4096:
+    saved_at_cmp = saved_at.rstrip("Z")
+    if not force and db_path.exists() and db_path.stat().st_size > 4096:
         try:
             local_conn = sqlite3.connect(db_path, timeout=5.0)
             try:
@@ -289,27 +291,106 @@ def restore_from_cloud(
                     ("leads", "updated_at"),
                     ("dialogs", "updated_at"),
                     ("messages", "sent_at"),
+                    ("campaign_recipients", "last_sent_at"),
+                    ("campaign_recipients", "updated_at"),
                     ("kv_settings", "updated_at"),
                     ("accounts", "created_at"),
                     ("accounts", "updated_at"),
                 ):
                     try:
                         row = local_conn.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()
-                        if row and row[0] and str(row[0]) > local_max:
-                            local_max = str(row[0])
+                        if row and row[0] and str(row[0]).rstrip("Z") > local_max:
+                            local_max = str(row[0]).rstrip("Z")
                     except Exception:
                         pass
-                if local_max and local_max > saved_at:
+                local_step_sum = 0
+                local_camp_progress: dict[int, tuple[int, str]] = {}
+                try:
+                    s_row = local_conn.execute(
+                        "SELECT COALESCE(SUM(COALESCE(current_step, 0)), 0) FROM campaign_recipients"
+                    ).fetchone()
+                    if s_row and s_row[0] is not None:
+                        local_step_sum = int(s_row[0])
+                    for c_id, c_sum, c_last in local_conn.execute(
+                        """
+                        SELECT campaign_id,
+                               COALESCE(SUM(COALESCE(current_step, 0)), 0),
+                               COALESCE(MAX(COALESCE(last_sent_at, '')), '')
+                        FROM campaign_recipients
+                        GROUP BY campaign_id
+                        """
+                    ).fetchall():
+                        if c_id is not None:
+                            local_camp_progress[int(c_id)] = (
+                                int(c_sum or 0),
+                                str(c_last or "").rstrip("Z"),
+                            )
+                except Exception:
+                    local_step_sum = 0
+            finally:
+                local_conn.close()
+
+            if local_step_sum > 0 or local_camp_progress:
+                cloud_step_sum: int | None = None
+                cloud_camp_progress: dict[int, tuple[int, str]] = {}
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as ctmp:
+                    ctmp_path = Path(ctmp.name)
+                try:
+                    ctmp_path.write_bytes(raw_db_bytes)
+                    cconn = sqlite3.connect(ctmp_path, timeout=5.0)
+                    try:
+                        crow = cconn.execute(
+                            "SELECT COALESCE(SUM(COALESCE(current_step, 0)), 0) FROM campaign_recipients"
+                        ).fetchone()
+                        if crow and crow[0] is not None:
+                            cloud_step_sum = int(crow[0])
+                        for c_id, c_sum, c_last in cconn.execute(
+                            """
+                            SELECT campaign_id,
+                                   COALESCE(SUM(COALESCE(current_step, 0)), 0),
+                                   COALESCE(MAX(COALESCE(last_sent_at, '')), '')
+                            FROM campaign_recipients
+                            GROUP BY campaign_id
+                            """
+                        ).fetchall():
+                            if c_id is not None:
+                                cloud_camp_progress[int(c_id)] = (
+                                    int(c_sum or 0),
+                                    str(c_last or "").rstrip("Z"),
+                                )
+                    finally:
+                        cconn.close()
+                except Exception:
+                    cloud_step_sum = None
+                finally:
+                    if ctmp_path.exists():
+                        ctmp_path.unlink()
+                ahead_campaign_id: int | None = None
+                for c_id, (l_sum, l_last) in local_camp_progress.items():
+                    c_sum, c_last = cloud_camp_progress.get(c_id, (0, ""))
+                    if l_sum > c_sum or (l_last and l_last > c_last):
+                        ahead_campaign_id = c_id
+                        break
+                if (cloud_step_sum is not None and local_step_sum > cloud_step_sum) or ahead_campaign_id is not None:
                     return {
                         "ok": True,
                         "restored": False,
                         "configured": True,
-                        "reason": "local_db_newer",
-                        "local_updated_at": local_max,
-                        "cloud_saved_at": saved_at,
+                        "reason": "local_outreach_progress_ahead",
+                        "local_step_sum": local_step_sum,
+                        "cloud_step_sum": cloud_step_sum,
+                        "ahead_campaign_id": ahead_campaign_id,
                     }
-            finally:
-                local_conn.close()
+
+            if saved_at_cmp and local_max and local_max > saved_at_cmp:
+                return {
+                    "ok": True,
+                    "restored": False,
+                    "configured": True,
+                    "reason": "local_db_newer",
+                    "local_updated_at": local_max,
+                    "cloud_saved_at": saved_at,
+                }
         except Exception:
             pass
 
@@ -329,7 +410,6 @@ def restore_from_cloud(
     except Exception:
         pass
 
-    raw_db_bytes = base64.b64decode(db_b64)
     if live_conn is not None:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -549,6 +629,17 @@ def schedule_cloud_backup(app: Any, delay_seconds: float = 1.5) -> None:
         or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
     ):
         return
+    if not getattr(app.state, "tg_lease_ready", True):
+        return
+    try:
+        from app.main import should_enable_live_tg_runtime
+
+        if not should_enable_live_tg_runtime(
+            getattr(app.state, "conn", None), getattr(app.state, "gateway", None)
+        ):
+            return
+    except Exception:
+        pass
     existing_task = getattr(app.state, "cloud_backup_task", None)
     if existing_task is not None and not existing_task.done():
         app.state._cloud_backup_rerun = True
@@ -559,7 +650,10 @@ def schedule_cloud_backup(app: Any, delay_seconds: float = 1.5) -> None:
             app.state._cloud_backup_rerun = False
             await asyncio.sleep(delay_seconds)
             try:
-                await asyncio.to_thread(backup_to_cloud, None, DEFAULT_DB)
+                if getattr(app.state, "tg_lease_ready", True) and await asyncio.to_thread(
+                    check_tg_runtime_lease_owned, None
+                ):
+                    await asyncio.to_thread(backup_to_cloud, None, DEFAULT_DB)
             except Exception:
                 pass
             if not getattr(app.state, "_cloud_backup_rerun", False):

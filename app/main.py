@@ -929,14 +929,28 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     async def _tg_lease_heartbeat_loop(app: FastAPI) -> None:
         from app.cloud_persistence import (
             check_tg_runtime_lease_owned,
+            wait_and_acquire_tg_runtime_lease,
             write_tg_runtime_lease,
         )
 
+        is_vps_canonical = os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         while True:
             try:
                 await asyncio.sleep(20.0)
                 owned = await asyncio.to_thread(check_tg_runtime_lease_owned, None)
                 if not owned:
+                    if is_vps_canonical:
+                        await asyncio.to_thread(
+                            wait_and_acquire_tg_runtime_lease,
+                            None,
+                            max_wait_seconds=10.0,
+                        )
+                        app.state.tg_lease_ready = True
+                        continue
                     app.state.tg_lease_ready = False
                     await stop_autopilot_loop(app)
                     await stop_inbox_watches(app)
@@ -950,7 +964,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 continue
 
     async def _leased_tg_runtime_boot(app: FastAPI) -> None:
-        from app.cloud_persistence import wait_and_acquire_tg_runtime_lease
+        from app.cloud_persistence import (
+            schedule_cloud_backup,
+            wait_and_acquire_tg_runtime_lease,
+        )
 
         try:
             await asyncio.to_thread(wait_and_acquire_tg_runtime_lease, None)
@@ -959,6 +976,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         except Exception:
             pass
         app.state.tg_lease_ready = True
+        if getattr(app.state, "_needs_initial_session_backup", False):
+            app.state._needs_initial_session_backup = False
+            schedule_cloud_backup(app, delay_seconds=3.0)
         app.state.tg_lease_heartbeat_task = asyncio.create_task(
             _tg_lease_heartbeat_loop(app)
         )
@@ -967,11 +987,6 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if getattr(app.state, "_needs_initial_session_backup", False):
-            app.state._needs_initial_session_backup = False
-            from app.cloud_persistence import schedule_cloud_backup
-
-            schedule_cloud_backup(app, delay_seconds=3.0)
         live_tg_enabled = False
         if "PYTEST_CURRENT_TEST" in os.environ or gateway is not None:
             if os.getenv("DISABLE_TG_WATCHES") != "1":
@@ -989,6 +1004,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             app.state.tg_lease_boot_task = asyncio.create_task(
                 _leased_tg_runtime_boot(app)
             )
+        if not live_tg_enabled and getattr(app.state, "_needs_initial_session_backup", False):
+            app.state._needs_initial_session_backup = False
+            from app.cloud_persistence import schedule_cloud_backup
+
+            schedule_cloud_backup(app, delay_seconds=3.0)
         await start_airtable_sync_loop(app)
         try:
             yield

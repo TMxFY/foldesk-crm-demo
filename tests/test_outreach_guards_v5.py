@@ -1332,3 +1332,234 @@ def test_delete_campaign_endpoint_blocks_running_and_deletes_completed(tmp_path,
         ids_left = [c["id"] for c in client.get("/api/campaigns", headers=hdrs).json()]
         assert c_done["id"] not in ids_left
         assert c_run["id"] in ids_left
+
+
+def test_followup_never_sends_duplicate_when_already_in_db_or_live_telegram(tmp_path):
+    conn = connect(tmp_path / "no_dup_followup.db")
+    init_db(conn)
+    _seed_two_accounts(conn)
+
+    camp = create_campaign(
+        conn,
+        name="SoftUGC — База Все2",
+        account_ids=[21, 31],
+        daily_limit=50,
+        status="running",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+            {"step_order": 2, "delay_hours": 24, "template_text": VLAD_STEP2_TEMPLATE},
+            {
+                "step_order": 3,
+                "delay_hours": 24,
+                "template_text": VLAD_STEP3_TEXT,
+                "image_url": "/media/outreach/4fa85f083f9e2911.jpg",
+            },
+        ],
+    )
+
+    # Recipient 1 (peer 50101): current_step=2 in DB (rolled back), but Step 3 already exists in messages table
+    # (even with straight apostrophe vs curly apostrophe).
+    _seed_prior_outgoing_msg(
+        conn,
+        account_id=21,
+        peer_id=50101,
+        username="already_in_db",
+        text="Hey, first touch",
+        sent_at="2026-11-12T08:00:00",
+    )
+    dlg1_id = conn.execute("SELECT id FROM dialogs WHERE peer_id = 50101").fetchone()["id"]
+    conn.executemany(
+        """
+        INSERT INTO messages (dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at)
+        VALUES (?, ?, 'out', ?, ?, ?, ?)
+        """,
+        [
+            (dlg1_id, 2002, VLAD_STEP2_TEMPLATE, "2026-11-13T08:05:00", "2026-11-13T08:05:00", "2026-11-13T08:05:00"),
+            (dlg1_id, 2003, "You're doing me dirty mate... :(((", "2026-11-14T08:08:14", "2026-11-14T08:08:14", "2026-11-14T08:08:14"),
+        ],
+    )
+
+    # Recipient 2 (peer 50102): current_step=2 in DB (rolled back), DB only has Step 1 & Step 2,
+    # BUT live Telegram history via fetch_messages already has Step 3 sent at 08:08:14!
+    _seed_prior_outgoing_msg(
+        conn,
+        account_id=31,
+        peer_id=50102,
+        username="already_in_live_tg",
+        text="Hey, first touch 2",
+        sent_at="2026-11-12T08:00:00",
+    )
+    dlg2_id = conn.execute("SELECT id FROM dialogs WHERE peer_id = 50102").fetchone()["id"]
+    conn.execute(
+        """
+        INSERT INTO messages (dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at)
+        VALUES (?, 3002, 'out', ?, '2026-11-13T08:05:00', '2026-11-13T08:05:00', '2026-11-13T08:05:00')
+        """,
+        (dlg2_id, VLAD_STEP2_TEMPLATE),
+    )
+
+    # Recipient 3 (peer 50103): current_step=2 in DB with stale last_sent_at (>24h ago),
+    # BUT live Telegram shows Step 2 was actually sent 1 hour ago, so 24h delay has NOT elapsed!
+    _seed_prior_outgoing_msg(
+        conn,
+        account_id=21,
+        peer_id=50103,
+        username="recent_step2_in_live_tg",
+        text="Hey, first touch 3",
+        sent_at="2026-11-12T08:00:00",
+    )
+
+    now_iso = utc_now()
+    conn.executemany(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, telegram_user_id, username, name, company, category,
+            step1_text, sent_account_id, assigned_account_id, current_step, status,
+            last_sent_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'TestCo', 'SaaS', 'Hey, first touch', ?, ?, 2, 'in_progress', '2026-11-13T08:05:00', ?, ?)
+        """,
+        [
+            (camp["id"], 50101, "already_in_db", "Already DB", 21, 21, now_iso, now_iso),
+            (camp["id"], 50102, "already_in_live_tg", "Already Live", 31, 31, now_iso, now_iso),
+            (camp["id"], 50103, "recent_step2_in_live_tg", "Recent Step2", 21, 21, now_iso, now_iso),
+        ],
+    )
+    conn.commit()
+
+    gw = RecordingGateway(
+        live_messages_by_session_peer={
+            ("data/sessions/acc31.session", 50102): [
+                {"telegram_message_id": 3001, "direction": "out", "text": "Hey, first touch 2", "sent_at": "2026-11-12T08:00:00"},
+                {"telegram_message_id": 3002, "direction": "out", "text": VLAD_STEP2_TEMPLATE, "sent_at": "2026-11-13T08:05:00"},
+                {"telegram_message_id": 3003, "direction": "out", "text": VLAD_STEP3_TEXT, "sent_at": "2026-11-14T08:08:14"},
+            ],
+            ("data/sessions/acc21.session", 50103): [
+                {"telegram_message_id": 4001, "direction": "out", "text": "Hey, first touch 3", "sent_at": "2026-11-12T08:00:00"},
+                {"telegram_message_id": 4002, "direction": "out", "text": VLAD_STEP2_TEMPLATE, "sent_at": now_iso},
+            ],
+        }
+    )
+
+    res = asyncio.run(run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True))
+    # ZERO messages must be sent!
+    assert res["sent"] == 0
+    assert len(gw.sent) == 0
+
+    rows = {
+        r["username"]: dict(r)
+        for r in conn.execute(
+            "SELECT username, current_step, status, last_sent_at FROM campaign_recipients WHERE campaign_id = ?",
+            (camp["id"],),
+        ).fetchall()
+    }
+    # Recipients 1 and 2 must be auto-advanced to step 3 (completed) without re-sending
+    assert rows["already_in_db"]["current_step"] == 3
+    assert rows["already_in_db"]["status"] == "completed"
+    assert rows["already_in_db"]["last_sent_at"] == "2026-11-14T08:08:14"
+
+    assert rows["already_in_live_tg"]["current_step"] == 3
+    assert rows["already_in_live_tg"]["status"] == "completed"
+    assert rows["already_in_live_tg"]["last_sent_at"] == "2026-11-14T08:08:14"
+
+    # Recipient 3 stays at current_step=2 (in_progress) with updated last_sent_at from live history
+    assert rows["recent_step2_in_live_tg"]["current_step"] == 2
+    assert rows["recent_step2_in_live_tg"]["status"] == "in_progress"
+    assert rows["recent_step2_in_live_tg"]["last_sent_at"] == now_iso
+
+
+def test_cloud_persistence_blocks_regressed_restore_and_unleased_background_backup(tmp_path, monkeypatch):
+    import base64
+    import gzip
+    import app.cloud_persistence as cp
+
+    # 1. Create a local DB where 2 recipients have already reached current_step=3 at 08:40
+    local_db_path = tmp_path / "local_prod.db"
+    lconn = connect(local_db_path)
+    init_db(lconn)
+    lconn.execute(
+        "INSERT INTO campaigns (id, name, daily_limit, status, created_at, updated_at) VALUES (5, 'SoftUGC', 100, 'running', '2026-11-12T08:00:00', '2026-11-14T08:40:00')"
+    )
+    lconn.executemany(
+        """
+        INSERT INTO campaign_recipients (id, campaign_id, username, name, current_step, status, last_sent_at, created_at, updated_at)
+        VALUES (?, 5, ?, ?, 3, 'completed', '2026-11-14T08:40:00', '2026-11-12T08:00:00', '2026-11-14T08:40:00')
+        """,
+        [
+            (1, "user_one", "User One"),
+            (2, "user_two", "User Two"),
+        ],
+    )
+    lconn.commit()
+    lconn.close()
+
+    # 2. Create a stale DB where those 2 recipients are still at current_step=2,
+    # even though someone logged in / updated kv_settings at 08:53 (newer timestamp, but regressed outreach steps!)
+    stale_db_path = tmp_path / "stale_mac.db"
+    sconn = connect(stale_db_path)
+    init_db(sconn)
+    sconn.execute(
+        "INSERT INTO campaigns (id, name, daily_limit, status, created_at, updated_at) VALUES (5, 'SoftUGC', 100, 'running', '2026-11-12T08:00:00', '2026-11-14T08:53:00')"
+    )
+    sconn.executemany(
+        """
+        INSERT INTO campaign_recipients (id, campaign_id, username, name, current_step, status, last_sent_at, created_at, updated_at)
+        VALUES (?, 5, ?, ?, 2, 'in_progress', '2026-11-13T08:40:00', '2026-11-12T08:00:00', '2026-11-13T08:40:00')
+        """,
+        [
+            (1, "user_one", "User One"),
+            (2, "user_two", "User Two"),
+        ],
+    )
+    sconn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('dummy', '1', '2026-11-14T08:53:46')"
+    )
+    sconn.commit()
+    sconn.close()
+
+    stale_bundle = {
+        "version": 1,
+        "saved_at": "2026-11-14T08:53:49Z",
+        "db_b64": base64.b64encode(stale_db_path.read_bytes()).decode("ascii"),
+        "sessions": {},
+        "outreach_media": {},
+    }
+    compressed_stale = gzip.compress(json.dumps(stale_bundle).encode("utf-8"))
+
+    class FakeResp:
+        def __init__(self, status_code: int, content: bytes = b""):
+            self.status_code = status_code
+            self.content = content
+            self.text = ""
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, url, headers=None):
+            return FakeResp(200, compressed_stale)
+
+    monkeypatch.setattr(cp.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        cp,
+        "_resolve_r2_config",
+        lambda conn=None: {"account_id": "a", "access_key": "k", "secret_key": "s", "bucket": "b"},
+    )
+
+    res = cp.restore_from_cloud(local_db_path, force=False)
+    assert res["restored"] is False
+    assert res["reason"] in ("local_db_newer", "local_outreach_progress_ahead")
+
+    check_conn = connect(local_db_path)
+    steps_after = [
+        r["current_step"]
+        for r in check_conn.execute("SELECT current_step FROM campaign_recipients ORDER BY id").fetchall()
+    ]
+    check_conn.close()
+    assert steps_after == [3, 3]
+

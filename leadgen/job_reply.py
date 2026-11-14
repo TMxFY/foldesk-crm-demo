@@ -479,14 +479,19 @@ def main() -> int:
             f"campaign_id={res.get('campaign_id')}"
         )
 
-        # Если писали напрямую в локальную SQLite БД (без HTTP MCP), синхронизируем R2 снэпшот
+        # Если писали напрямую в локальную SQLite БД (без HTTP MCP), синхронизируем R2 снэпшот только на каноническом VPS с активным lease
         if not a.mcp_url and "PYTEST_CURRENT_TEST" not in os.environ:
             try:
-                from app.cloud_persistence import backup_to_cloud
+                from app.cloud_persistence import (
+                    backup_to_cloud,
+                    check_tg_runtime_lease_owned,
+                )
                 from app.db import connect
+                from app.runtime_context import should_enable_live_tg_runtime
 
                 with connect(resolved_db) as conn:
-                    backup_to_cloud(conn)
+                    if should_enable_live_tg_runtime(conn, None) and check_tg_runtime_lease_owned(conn):
+                        backup_to_cloud(conn)
             except Exception:
                 pass
 
