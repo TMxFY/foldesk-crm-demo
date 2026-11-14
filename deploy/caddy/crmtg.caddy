@@ -2,12 +2,40 @@ crm.softugc.com, crm-169-58-145-85.sslip.io {
 	request_body {
 		max_size 200MB
 	}
+
 	header {
+		defer
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
 		Referrer-Policy "no-referrer"
+		X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
 		-Server
 	}
+
+	@scanners {
+		path /.env* */.env* /.git* /.svn* /.ssh* /.aws* *.php *.sql *.bak *.swp /wp-admin* /wp-login* /wp-content* /wp-includes* /wp-config* /xmlrpc* /phpmyadmin* /actuator* /vendor/phpunit* /cgi-bin*
+	}
+	respond @scanners "Forbidden" 403
+
+	@bad_bots {
+		header_regexp User-Agent (?i)(scrapy|sqlmap|nikto|nmap|masscan|zgrab|gobuster|nuclei|dirbuster|ffuf|ahrefsbot|semrushbot|mj12bot|dotbot|petalbot|bytespider|gptbot|ccbot|claude-web|perplexitybot)
+	}
+	respond @bad_bots "Forbidden" 403
+
+	@script_scrapers {
+		not path /mcp* /api/health /robots.txt
+		not header Authorization *
+		not header X-MCP-API-Key *
+		not header X-MCP-Key *
+		not header X-Foldesk-Token *
+		header_regexp User-Agent (?i)(python-requests|python-httpx|aiohttp|wget/)
+	}
+	respond @script_scrapers "Forbidden" 403
+
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:18084
+	reverse_proxy 127.0.0.1:18084 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
 }

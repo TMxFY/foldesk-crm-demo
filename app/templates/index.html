@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet" />
   <title>Foldesk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
@@ -186,32 +187,32 @@
 
         <div class="auth-mode-tabs" role="tablist" aria-label="Режим авторизации">
           <button type="button" class="auth-tab-btn" id="modal-tab-login" data-crm-auth-tab="login" role="tab" aria-selected="true">Вход по логину</button>
-          <button type="button" class="auth-tab-btn" id="modal-tab-register" data-crm-auth-tab="register" role="tab" aria-selected="false">Регистрация нового аккаунта</button>
+          <button type="button" class="auth-tab-btn" id="modal-tab-register" data-crm-auth-tab="register" role="tab" aria-selected="false">Создать сотрудника</button>
         </div>
 
         <div id="modal-pane-login" class="auth-tab-pane stack">
-          <span class="steps-caption">БЫСТРЫЙ ВХОД В 1 КЛИК (3 РАБОЧИХ ПРОФИЛЯ):</span>
+          <span class="steps-caption">БЫСТРЫЙ ВЫБОР ПРОФИЛЯ КОМАНДЫ:</span>
           <div class="auth-presets-grid">
-            <button type="button" class="auth-preset-card" data-modal-preset-user="tim" data-modal-preset-pass="TimFoldesk2026!">
+            <button type="button" class="auth-preset-card" data-modal-preset-user="tim">
               <div class="row">
                 <strong>Тимофей</strong>
                 <span class="badge b-won">Owner · Admin</span>
               </div>
-              <code>tim / TimFoldesk2026!</code>
+              <code>@tim</code>
             </button>
-            <button type="button" class="auth-preset-card" data-modal-preset-user="vlad" data-modal-preset-pass="VladSales2026!">
+            <button type="button" class="auth-preset-card" data-modal-preset-user="vlad">
               <div class="row">
                 <strong>Влад</strong>
                 <span class="badge b-talk">Sales · Партнёр</span>
               </div>
-              <code>vlad / VladSales2026!</code>
+              <code>@vlad</code>
             </button>
-            <button type="button" class="auth-preset-card" data-modal-preset-user="operator" data-modal-preset-pass="Operator2026!">
+            <button type="button" class="auth-preset-card" data-modal-preset-user="operator">
               <div class="row">
                 <strong>Оператор</strong>
                 <span class="badge b-new">Outreach</span>
               </div>
-              <code>operator / Operator2026!</code>
+              <code>@operator</code>
             </button>
           </div>
 
@@ -220,7 +221,7 @@
               <input id="modal-login-username" name="username" type="text" autocomplete="username" value="tim" placeholder="tim / vlad / operator" required>
             </label>
             <label for="modal-login-password">Пароль
-              <input id="modal-login-password" name="password" type="password" autocomplete="current-password" value="TimFoldesk2026!" placeholder="Пароль" required>
+              <input id="modal-login-password" name="password" type="password" autocomplete="current-password" value="" placeholder="Введите пароль" required>
             </label>
             <div class="row">
               <button type="submit" id="modal-login-submit-btn" class="btn primary sm">Войти в аккаунт</button>

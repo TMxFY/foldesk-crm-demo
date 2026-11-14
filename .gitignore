@@ -6,6 +6,8 @@ __pycache__/
 data/
 .tg_pipeline
 .env
+.env.*
+!.env.example
 *.session
 *.session-journal
 .DS_Store

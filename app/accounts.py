@@ -14,6 +14,7 @@ from app.telegram_gateway import (
     SESSION_HEALTH,
     GatewayError,
     extract_string_session_from_sqlite,
+    mask_proxy_url,
 )
 from app.whatsapp_gateway import (
     WhatsAppGateway,

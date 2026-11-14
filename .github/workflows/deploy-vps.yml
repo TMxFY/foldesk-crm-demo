@@ -61,9 +61,14 @@ jobs:
             PREV_SHA="$(git rev-parse HEAD)"
             echo "Deploying crmtg: $PREV_SHA -> $TARGET_SHA"
 
-            mkdir -p "$APP_DIR/backups"
+            mkdir -p -m 700 "$APP_DIR/backups"
+            chmod 700 "$APP_DIR/backups"
             if [ -f "$APP_DIR/data/crm.db" ]; then
+              OLD_UMASK="$(umask)"
+              umask 077
               "$APP_DIR/.venv/bin/python" -c "import sqlite3; s=sqlite3.connect('$APP_DIR/data/crm.db', timeout=30); d=sqlite3.connect('$APP_DIR/backups/crm.db.pre-${TARGET_SHA:0:8}'); s.backup(d); d.close(); s.close()"
+              chmod 600 "$APP_DIR/backups/crm.db.pre-${TARGET_SHA:0:8}"
+              umask "$OLD_UMASK"
               ls -1t "$APP_DIR/backups"/crm.db.pre-* 2>/dev/null | tail -n +11 | xargs -r rm -f
             fi
 
@@ -80,7 +85,7 @@ jobs:
 
             healthy=0
             for i in $(seq 1 60); do
-              if curl -fsS --max-time 3 http://127.0.0.1:18084/api/accounts >/dev/null 2>&1; then
+              if curl -fsS --max-time 3 http://127.0.0.1:18084/api/health >/dev/null 2>&1; then
                 healthy=1
                 break
               fi

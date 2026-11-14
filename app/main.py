@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
@@ -1078,11 +1078,29 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             request.method in ("POST", "PATCH", "PUT", "DELETE")
             and response.status_code < 400
             and not request.url.path.startswith("/api/test")
+            and not request.url.path.startswith("/api/auth/")
         ):
             from app.cloud_persistence import schedule_cloud_backup
 
             schedule_cloud_backup(request.app)
         return response
+
+    from app.security import (
+        has_valid_mcp_api_key,
+        is_auth_enforced,
+        register_security_middleware,
+    )
+
+    register_security_middleware(app)
+
+    @app.get("/api/health")
+    def api_health():
+        return {"ok": True, "status": "healthy"}
+
+    @app.get("/robots.txt", response_class=PlainTextResponse)
+    def robots_txt():
+        return PlainTextResponse("User-agent: *\nDisallow: /\n")
+
     app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
     register_tg_web_routes(app)
 
@@ -1187,7 +1205,18 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/api/accounts")
     def accounts_list(request: Request):
-        return list_accounts(request.app.state.conn)
+        items = list_accounts(request.app.state.conn)
+        if is_auth_enforced() and not has_valid_mcp_api_key(request):
+            from app.accounts import mask_proxy_url
+            from app.crm_auth import resolve_request_crm_user
+
+            caller = resolve_request_crm_user(request.app.state.conn, request)
+            if caller is None or caller.get("role") != "admin":
+                items = [
+                    {**acc, "proxy_url": mask_proxy_url(acc.get("proxy_url"))}
+                    for acc in items
+                ]
+        return items
 
     async def _cleanup_deleted_account_runtime(app, account_id: int, session_path: str | None) -> None:
         task = app.state.inbox_tasks.pop(account_id, None)
@@ -2280,19 +2309,19 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
     def _require_admin_or_mcp_auth(request: Request) -> None:
-        import hmac as _hmac
-        from app.crm_auth import extract_request_token, get_user_by_token
+        from app.crm_auth import resolve_request_crm_user
 
-        auth_hdr = (request.headers.get("authorization") or "").strip()
-        mcp_key = (os.environ.get("MCP_API_KEY") or "").strip()
-        if mcp_key and auth_hdr.lower().startswith("bearer "):
-            provided = auth_hdr[7:].strip()
-            if provided and _hmac.compare_digest(provided, mcp_key):
-                return
-        tok = extract_request_token(request)
-        if tok and get_user_by_token(request.app.state.conn, tok) is not None:
+        if has_valid_mcp_api_key(request):
             return
-        raise HTTPException(status_code=401, detail="Требуется авторизация CRM или MCP_API_KEY")
+        user = resolve_request_crm_user(request.app.state.conn, request)
+        if user is None:
+            raise HTTPException(
+                status_code=401, detail="Требуется авторизация CRM или MCP_API_KEY"
+            )
+        if user.get("role") != "admin":
+            raise HTTPException(
+                status_code=403, detail="Доступ только для администратора"
+            )
 
     @app.post("/api/analytics/sync-read-receipts")
     async def analytics_sync_read_receipts(request: Request, account_id: int | None = None):
@@ -2834,6 +2863,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/demo/seed")
     def demo_seed(request: Request):
+        if is_auth_enforced() and os.getenv("ALLOW_PROD_DEMO_SEED") != "1":
+            raise HTTPException(
+                status_code=403, detail="Demo seed is disabled on production"
+            )
         result = _call(seed_demo, request.app.state.conn)
         account_id = result.get("account_id")
         if account_id is not None:

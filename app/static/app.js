@@ -528,6 +528,7 @@ async function api(path, options) {
     try {
       res = await fetch(path, {
         method,
+        credentials: "same-origin",
         headers: opts.body ? { "Content-Type": "application/json" } : undefined,
         body: opts.body ? JSON.stringify(opts.body) : undefined,
       });
@@ -551,6 +552,17 @@ async function api(path, options) {
     try { data = JSON.parse(text); } catch (_err) { data = { detail: text }; }
   }
   if (!res.ok) {
+    const reqPath = String(path || "").split("?")[0];
+    if (
+      res.status === 401 &&
+      reqPath.startsWith("/api/") &&
+      reqPath !== "/api/auth/login" &&
+      reqPath !== "/api/auth/me"
+    ) {
+      if (window.location.pathname !== "/login") {
+        window.location.assign("/login");
+      }
+    }
     let detail = data && data.detail;
     if (typeof detail === "string") {
       const trimmed = detail.trim();
@@ -11131,6 +11143,15 @@ function bindCrmAuthEvents() {
         method: "POST",
         body: { username, password },
       });
+      if (res && res.user) {
+        try {
+          localStorage.setItem("foldesk_crm_user", JSON.stringify(res.user));
+        } catch (_err) {
+          /* ignore */
+        }
+      }
+      const pInput = document.querySelector("#modal-login-password");
+      if (pInput) pInput.value = "";
       await loadCrmAuthStatus();
       toast(`Вход выполнен: ${res?.user?.display_name || username}`, "ok");
     } catch (error) {
@@ -11143,12 +11164,13 @@ function bindCrmAuthEvents() {
   document.querySelectorAll("[data-modal-preset-user]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const u = btn.getAttribute("data-modal-preset-user") || "";
-      const p = btn.getAttribute("data-modal-preset-pass") || "";
       const uInput = document.querySelector("#modal-login-username");
       const pInput = document.querySelector("#modal-login-password");
       if (uInput) uInput.value = u;
-      if (pInput) pInput.value = p;
-      performModalLogin(u, p);
+      if (pInput) {
+        pInput.value = "";
+        pInput.focus();
+      }
     });
   });
 
@@ -11177,6 +11199,8 @@ function bindCrmAuthEvents() {
           method: "POST",
           body: { username, display_name, role, password },
         });
+        const regPassInput = document.querySelector("#modal-reg-password");
+        if (regPassInput) regPassInput.value = "";
         await loadCrmAuthStatus();
         toast(`Аккаунт «${res?.user?.display_name || username}» зарегистрирован и выполнен вход`, "ok");
       } catch (error) {
@@ -11192,8 +11216,13 @@ function bindCrmAuthEvents() {
     logoutBtn.addEventListener("click", async () => {
       try {
         await api("/api/auth/logout", { method: "POST" });
-        await loadCrmAuthStatus();
-        toast("Вы вышли из аккаунта", "ok");
+        try {
+          localStorage.removeItem("foldesk_auth_token");
+          localStorage.removeItem("foldesk_crm_user");
+        } catch (_err) {
+          /* ignore */
+        }
+        window.location.assign("/login");
       } catch (error) {
         toast(error.message || "Ошибка выхода", "error");
       }

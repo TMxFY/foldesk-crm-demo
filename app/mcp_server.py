@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import inspect
 import json
 import os
@@ -12,6 +13,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.analytics import get_analytics_summary
+from app.crm_auth import resolve_request_crm_user
+from app.security import is_auth_enforced
 from app.db import (
     ROOT,
     as_dict,
@@ -1734,29 +1737,62 @@ def handle_jsonrpc_message(conn: sqlite3.Connection, payload: dict | list) -> di
 
 
 def _verify_mcp_auth(request: Request) -> None:
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    db_conn = getattr(app_state, "conn", None) if app_state is not None else None
+    crm_user = (
+        resolve_request_crm_user(db_conn, request) if db_conn is not None else None
+    )
+    if crm_user is not None and crm_user.get("role") == "admin":
+        return
+
+    enforced = is_auth_enforced()
     expected_key = os.getenv("MCP_API_KEY", "").strip()
     if not expected_key:
+        if enforced:
+            if crm_user is not None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Forbidden: admin role required",
+                )
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized: MCP_API_KEY is required in production",
+            )
         return
+
     auth_header = (request.headers.get("authorization") or "").strip()
     bearer_token = ""
     if auth_header.lower().startswith("bearer "):
         bearer_token = auth_header[7:].strip()
-    header_key = (request.headers.get("x-mcp-key") or "").strip()
-    query_key = (request.query_params.get("api_key") or "").strip()
+    header_key = (
+        request.headers.get("x-mcp-api-key")
+        or request.headers.get("x-mcp-key")
+        or ""
+    ).strip()
+    query_key = "" if enforced else (request.query_params.get("api_key") or "").strip()
 
     provided = bearer_token or header_key or query_key
-    if provided != expected_key:
+    if provided and hmac.compare_digest(
+        provided.encode("utf-8"), expected_key.encode("utf-8")
+    ):
+        return
+
+    if crm_user is not None:
         raise HTTPException(
-            status_code=401,
-            detail="Неверный или отсутствующий MCP_API_KEY",
+            status_code=403,
+            detail="Forbidden: admin role required",
         )
+    raise HTTPException(
+        status_code=401,
+        detail="Неверный или отсутствующий MCP_API_KEY",
+    )
 
 
 def get_mcp_server_info(base_url: str = "http://127.0.0.1:8000") -> dict:
     clean_base = str(base_url or "http://127.0.0.1:8000").rstrip("/")
     venv_python = ROOT / ".venv" / "bin" / "python"
     python_cmd = str(venv_python) if venv_python.exists() else sys.executable
-    has_key = bool(os.getenv("MCP_API_KEY", "").strip())
+    has_key = bool(os.getenv("MCP_API_KEY", "").strip()) or is_auth_enforced()
 
     stdio_config = {
         "mcpServers": {
@@ -1812,6 +1848,8 @@ def get_mcp_server_info(base_url: str = "http://127.0.0.1:8000") -> dict:
 def register_mcp_routes(app: FastAPI) -> None:
     @app.get("/api/mcp/info")
     def mcp_info(request: Request):
+        if is_auth_enforced():
+            _verify_mcp_auth(request)
         base_url = str(request.base_url).rstrip("/")
         return get_mcp_server_info(base_url=base_url)
 
@@ -1841,7 +1879,11 @@ def register_mcp_routes(app: FastAPI) -> None:
     @app.get("/mcp/sse")
     async def mcp_sse_endpoint(request: Request):
         _verify_mcp_auth(request)
-        api_key = (request.query_params.get("api_key") or "").strip()
+        api_key = (
+            ""
+            if is_auth_enforced()
+            else (request.query_params.get("api_key") or "").strip()
+        )
         post_endpoint = f"/mcp?api_key={api_key}" if api_key else "/mcp"
 
         async def sse_stream():
