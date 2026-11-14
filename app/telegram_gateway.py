@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import html
+import json
 import os
 import re
 import shutil
@@ -12,6 +14,342 @@ from urllib.parse import unquote, urlparse
 from datetime import timezone
 
 from app.db import DEFAULT_DB, resolve_session, utc_now
+
+
+def _utf16_span_to_char_span(text: str, offset: int, length: int) -> tuple[int, int]:
+    if not text or length <= 0 or offset < 0:
+        return (0, 0)
+    has_surrogate = any(ord(ch) > 0xFFFF for ch in text)
+    if not has_surrogate:
+        start = min(len(text), max(0, offset))
+        end = min(len(text), max(start, offset + length))
+        return (start, end)
+    u16_pos = 0
+    char_start = None
+    char_end = None
+    target_end = offset + length
+    for idx, ch in enumerate(text):
+        if char_start is None and u16_pos >= offset:
+            char_start = idx
+        if char_end is None and u16_pos >= target_end:
+            char_end = idx
+            break
+        u16_pos += 2 if ord(ch) > 0xFFFF else 1
+    if char_start is None:
+        char_start = len(text)
+    if char_end is None:
+        char_end = len(text)
+    return (char_start, max(char_start, char_end))
+
+
+def _sanitize_href(raw_url: str | None) -> str | None:
+    url = str(raw_url or "").strip()
+    if not url:
+        return None
+    low = url.lower()
+    if low.startswith(("javascript:", "data:", "vbscript:")):
+        return None
+    if not low.startswith(("http://", "https://", "tg://", "mailto:")):
+        url = f"https://{url}"
+    return html.escape(url, quote=True)
+
+
+def render_formatted_html(text: str | None, entities: list[dict] | str | None = None) -> str:
+    if text is None or text == "":
+        return ""
+    s = str(text)
+    parsed_entities: list[dict] = []
+    if isinstance(entities, str) and entities.strip():
+        try:
+            loaded = json.loads(entities)
+            if isinstance(loaded, list):
+                parsed_entities = [e for e in loaded if isinstance(e, dict)]
+        except Exception:
+            parsed_entities = []
+    elif isinstance(entities, list):
+        parsed_entities = [e for e in entities if isinstance(e, dict)]
+
+    if parsed_entities:
+        spans: list[tuple[int, int, str, str, int]] = []
+        for idx, ent in enumerate(parsed_entities):
+            try:
+                off = int(ent.get("offset", 0))
+                ln = int(ent.get("length", 0))
+            except (TypeError, ValueError):
+                continue
+            start, end = _utf16_span_to_char_span(s, off, ln)
+            if start >= end:
+                continue
+            etype = str(ent.get("type") or "").strip().lower()
+            open_tag = ""
+            close_tag = ""
+            if etype in ("bold", "messageentitybold"):
+                open_tag, close_tag = "<strong>", "</strong>"
+            elif etype in ("italic", "messageentityitalic"):
+                open_tag, close_tag = "<em>", "</em>"
+            elif etype in ("code", "messageentitycode"):
+                open_tag, close_tag = "<code>", "</code>"
+            elif etype in ("pre", "messageentitypre"):
+                open_tag, close_tag = "<pre><code>", "</code></pre>"
+            elif etype in ("blockquote", "messageentityblockquote"):
+                open_tag, close_tag = "<blockquote>", "</blockquote>"
+            elif etype in ("spoiler", "messageentityspoiler"):
+                open_tag, close_tag = '<span class="tg-spoiler">', "</span>"
+            elif etype in ("underline", "messageentityunderline"):
+                open_tag, close_tag = "<u>", "</u>"
+            elif etype in ("strikethrough", "strike", "messageentitystrike"):
+                open_tag, close_tag = "<s>", "</s>"
+            elif etype in ("text_link", "text_url", "messageentitytexturl"):
+                safe_href = _sanitize_href(ent.get("url"))
+                if safe_href:
+                    open_tag = f'<a href="{safe_href}" target="_blank" rel="noopener">'
+                    close_tag = "</a>"
+            elif etype in ("url", "messageentityurl"):
+                safe_href = _sanitize_href(ent.get("url") or s[start:end])
+                if safe_href:
+                    open_tag = f'<a href="{safe_href}" target="_blank" rel="noopener">'
+                    close_tag = "</a>"
+            if open_tag and close_tag:
+                spans.append((start, end, open_tag, close_tag, idx))
+
+        if spans:
+            starts_at: dict[int, list[tuple[int, int, str, str, int]]] = {}
+            for sp in spans:
+                starts_at.setdefault(sp[0], []).append(sp)
+            for pos_list in starts_at.values():
+                pos_list.sort(key=lambda x: (-x[1], x[4]))
+
+            out_parts: list[str] = []
+            active: list[tuple[int, int, str, str, int]] = []
+            for pos in range(len(s) + 1):
+                if active:
+                    still_open = []
+                    to_close = []
+                    for sp in active:
+                        if sp[1] == pos:
+                            to_close.append(sp)
+                        else:
+                            still_open.append(sp)
+                    for sp in reversed(to_close):
+                        out_parts.append(sp[3])
+                    active = still_open
+                if pos < len(s):
+                    for sp in starts_at.get(pos, ()):
+                        out_parts.append(sp[2])
+                        active.append(sp)
+                    out_parts.append(html.escape(s[pos]))
+            while active:
+                sp = active.pop()
+                out_parts.append(sp[3])
+            return "".join(out_parts)
+
+    # Markdown & auto-link rendering when entities are empty
+    placeholders: dict[str, str] = {}
+    ph_seq = 0
+
+    def _put_ph(rendered_html: str) -> str:
+        nonlocal ph_seq
+        ph_seq += 1
+        key = f"\x00PH{ph_seq}\x00"
+        placeholders[key] = rendered_html
+        return key
+
+    work = re.sub(
+        r"```(?:[a-zA-Z0-9_+-]+\n)?([\s\S]*?)```",
+        lambda m: _put_ph(f"<pre><code>{html.escape(m.group(1).strip())}</code></pre>"),
+        s,
+    )
+    work = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: _put_ph(f"<code>{html.escape(m.group(1))}</code>"),
+        work,
+    )
+    work = re.sub(
+        r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)",
+        lambda m: (
+            _put_ph(
+                f'<a href="{_sanitize_href(m.group(2))}" target="_blank" rel="noopener">{html.escape(m.group(1))}</a>'
+            )
+            if _sanitize_href(m.group(2))
+            else m.group(0)
+        ),
+        work,
+    )
+
+    def _replace_autolink(m: re.Match) -> str:
+        raw_url = m.group(0)
+        trailing = ""
+        while raw_url and raw_url[-1] in ".,;:!?)":
+            if raw_url[-1] == ")" and raw_url.count("(") >= raw_url.count(")"):
+                break
+            trailing = raw_url[-1] + trailing
+            raw_url = raw_url[:-1]
+        safe_href = _sanitize_href(raw_url)
+        if not safe_href:
+            return m.group(0)
+        return _put_ph(
+            f'<a href="{safe_href}" target="_blank" rel="noopener">{html.escape(raw_url)}</a>'
+        ) + trailing
+
+    work = re.sub(r"https?://[^\s<>\"'\x00]+", _replace_autolink, work)
+    work = html.escape(work)
+
+    # Blockquotes (> quote at line start)
+    lines = work.split("\n")
+    out_lines: list[str] = []
+    quote_buf: list[str] = []
+    for line in lines:
+        if line.startswith("&gt; ") or line == "&gt;" or line.startswith("&gt;"):
+            q_content = line[5:] if line.startswith("&gt; ") else line[4:]
+            quote_buf.append(q_content)
+        else:
+            if quote_buf:
+                out_lines.append(f"<blockquote>{'<br>'.join(quote_buf)}</blockquote>")
+                quote_buf = []
+            out_lines.append(line)
+    if quote_buf:
+        out_lines.append(f"<blockquote>{'<br>'.join(quote_buf)}</blockquote>")
+    work = "\n".join(out_lines)
+
+    work = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", work, flags=re.DOTALL)
+    work = re.sub(r"__(.+?)__", r"<em>\1</em>", work, flags=re.DOTALL)
+    work = re.sub(r"~~(.+?)~~", r"<s>\1</s>", work, flags=re.DOTALL)
+    work = re.sub(r"\|\|(.+?)\|\|", r'<span class="tg-spoiler">\1</span>', work, flags=re.DOTALL)
+
+    for key, val in placeholders.items():
+        work = work.replace(key, val)
+    return work
+
+
+def _extract_message_entities(msg) -> list[dict]:
+    raw_entities = getattr(msg, "entities", None)
+    if not raw_entities:
+        return []
+    type_map = {
+        "MessageEntityBold": "bold",
+        "MessageEntityItalic": "italic",
+        "MessageEntityCode": "code",
+        "MessageEntityPre": "pre",
+        "MessageEntityTextUrl": "text_link",
+        "MessageEntityUrl": "url",
+        "MessageEntityBlockquote": "blockquote",
+        "MessageEntitySpoiler": "spoiler",
+        "MessageEntityUnderline": "underline",
+        "MessageEntityStrike": "strikethrough",
+    }
+    out: list[dict] = []
+    for ent in raw_entities:
+        if isinstance(ent, dict):
+            etype = str(ent.get("type") or "").strip()
+            if not etype:
+                continue
+            item = {
+                "type": etype,
+                "offset": int(ent.get("offset", 0) or 0),
+                "length": int(ent.get("length", 0) or 0),
+            }
+            if ent.get("url"):
+                item["url"] = str(ent["url"])
+            out.append(item)
+            continue
+        cls_name = ent.__class__.__name__
+        etype = type_map.get(cls_name) or cls_name.removeprefix("MessageEntity").lower()
+        try:
+            offset = int(getattr(ent, "offset", 0) or 0)
+            length = int(getattr(ent, "length", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        item = {"type": etype, "offset": offset, "length": length}
+        url = getattr(ent, "url", None)
+        if url:
+            item["url"] = str(url)
+        out.append(item)
+    return out
+
+
+def _extract_message_media(msg) -> dict:
+    media_type = getattr(msg, "media_type", None) or None
+    media_mime = getattr(msg, "media_mime", None) or None
+    media_filename = getattr(msg, "media_filename", None) or None
+    media_duration = getattr(msg, "media_duration", None)
+    if media_duration is not None:
+        try:
+            media_duration = int(round(float(media_duration)))
+        except (TypeError, ValueError):
+            media_duration = None
+
+    if getattr(msg, "voice", None):
+        media_type = "voice"
+    elif getattr(msg, "video_note", None):
+        media_type = "video_note"
+    elif getattr(msg, "photo", None) or getattr(getattr(msg, "media", None), "__class__", None).__name__ == "MessageMediaPhoto":
+        media_type = media_type or "photo"
+        media_mime = media_mime or "image/jpeg"
+
+    doc = getattr(msg, "document", None) or getattr(getattr(msg, "media", None), "document", None)
+    if doc is not None:
+        if not media_mime:
+            media_mime = getattr(doc, "mime_type", None) or None
+        for attr in getattr(doc, "attributes", None) or []:
+            cls_name = attr.__class__.__name__
+            if getattr(attr, "voice", False):
+                media_type = "voice"
+            elif getattr(attr, "round_message", False):
+                media_type = "video_note"
+            elif cls_name == "DocumentAttributeAudio" and not media_type:
+                media_type = "audio"
+            elif cls_name == "DocumentAttributeVideo" and not media_type:
+                media_type = "video"
+            if getattr(attr, "duration", None) is not None and media_duration is None:
+                try:
+                    media_duration = int(round(float(getattr(attr, "duration"))))
+                except (TypeError, ValueError):
+                    pass
+            if getattr(attr, "file_name", None) and not media_filename:
+                media_filename = str(getattr(attr, "file_name"))
+        if not media_type:
+            if getattr(msg, "audio", None):
+                media_type = "audio"
+            elif getattr(msg, "video", None):
+                media_type = "video"
+            elif media_mime:
+                if media_mime.startswith("audio/ogg") and not media_filename:
+                    media_type = "voice"
+                elif media_mime.startswith("audio/"):
+                    media_type = "audio"
+                elif media_mime.startswith("video/"):
+                    media_type = "video"
+                elif media_mime.startswith("image/"):
+                    media_type = "photo"
+                else:
+                    media_type = "document"
+            else:
+                media_type = "document"
+    else:
+        if not media_type:
+            if getattr(msg, "audio", None):
+                media_type = "audio"
+            elif getattr(msg, "video", None):
+                media_type = "video"
+
+    file_obj = getattr(msg, "file", None)
+    if file_obj is not None:
+        if not media_mime:
+            media_mime = getattr(file_obj, "mime_type", None) or None
+        if not media_filename:
+            media_filename = getattr(file_obj, "name", None) or None
+        if media_duration is None and getattr(file_obj, "duration", None) is not None:
+            try:
+                media_duration = int(round(float(getattr(file_obj, "duration"))))
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "media_type": media_type,
+        "media_mime": media_mime,
+        "media_filename": media_filename,
+        "media_duration": media_duration,
+    }
 
 
 class GatewayError(Exception):
@@ -39,6 +377,29 @@ class TelegramGateway(ABC):
 
     async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
         raise GatewayError("Отправка не подключена")
+
+    async def edit_message(
+        self, session_path: str, peer_id, telegram_message_id: int, text: str
+    ) -> dict:
+        raise GatewayError("Редактирование не подключено")
+
+    async def send_media_message(
+        self,
+        session_path: str,
+        peer_id,
+        file_path: str,
+        *,
+        media_type: str = "document",
+        caption: str = "",
+        reply_to=None,
+        duration: int | None = None,
+    ) -> dict:
+        raise GatewayError("Отправка медиа не подключена")
+
+    async def download_message_media(
+        self, session_path: str, peer_id, telegram_message_id: int, dest_path: str
+    ) -> dict | None:
+        return None
 
     async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
         """Last personal-dialog messages, oldest first. Not groups or channels."""
@@ -1484,6 +1845,158 @@ class TelethonGateway(TelegramGateway):
                 "direction": "out",
             }
 
+    async def edit_message(
+        self, session_path: str, peer_id, telegram_message_id: int, text: str
+    ) -> dict:
+        body = (text or "").strip()
+        if not body:
+            raise GatewayError("Напишите сообщение")
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                target = (
+                    int(peer_id)
+                    if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+                    else str(peer_id).strip()
+                )
+                msg = await asyncio.wait_for(
+                    client.edit_message(target, int(telegram_message_id), body),
+                    timeout=self._rpc_timeout,
+                )
+            except GatewayError:
+                raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                await self._drop_zombie_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Таймаут редактирования в Telegram") from exc
+            except Exception as exc:
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Не удалось отредактировать сообщение") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
+            edit_dt = getattr(msg, "edit_date", None) if msg is not None else None
+            edited_at = _stamp(edit_dt) if edit_dt is not None else utc_now()
+            return {
+                "telegram_message_id": int(telegram_message_id),
+                "text": body,
+                "edited_at": edited_at,
+            }
+
+    async def send_media_message(
+        self,
+        session_path: str,
+        peer_id,
+        file_path: str,
+        *,
+        media_type: str = "document",
+        caption: str = "",
+        reply_to=None,
+        duration: int | None = None,
+    ) -> dict:
+        clean_path = str(file_path or "").strip()
+        if not clean_path:
+            raise GatewayError("Выберите файл для отправки")
+        body = (caption or "").strip()
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                target = (
+                    int(peer_id)
+                    if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+                    else str(peer_id).strip()
+                )
+                kwargs: dict = {
+                    "caption": body or None,
+                    "voice_note": media_type == "voice",
+                    "video_note": media_type == "video_note",
+                }
+                if reply_to:
+                    kwargs["reply_to"] = int(reply_to)
+
+                async def _do_send_media():
+                    return await client.send_file(target, clean_path, **kwargs)
+
+                try:
+                    msg = await asyncio.wait_for(_do_send_media(), timeout=self._rpc_timeout)
+                except Exception as first_exc:
+                    if (
+                        isinstance(target, int)
+                        and "could not find the input entity" in str(first_exc).casefold()
+                        and session_path not in self._warmed_dialogs
+                    ):
+                        try:
+                            await asyncio.wait_for(
+                                client.get_dialogs(limit=150), timeout=self._rpc_timeout
+                            )
+                            self._warmed_dialogs.add(session_path)
+                        except Exception:
+                            pass
+                        msg = await asyncio.wait_for(_do_send_media(), timeout=self._rpc_timeout)
+                    else:
+                        raise
+            except GatewayError:
+                raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                await self._drop_zombie_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Таймаут отправки медиа в Telegram") from exc
+            except Exception as exc:
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Не удалось отправить медиа") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
+            return {
+                "telegram_message_id": int(msg.id),
+                "text": getattr(msg, "message", None) if getattr(msg, "message", None) is not None else body,
+                "media_type": media_type,
+                "media_duration": duration,
+                "sent_at": _stamp(getattr(msg, "date", None)),
+                "direction": "out",
+                "reply_to_telegram_message_id": int(reply_to) if reply_to else None,
+            }
+
+    async def download_message_media(
+        self, session_path: str, peer_id, telegram_message_id: int, dest_path: str
+    ) -> dict | None:
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                target = (
+                    int(peer_id)
+                    if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+                    else str(peer_id).strip()
+                )
+                msg = await asyncio.wait_for(
+                    client.get_messages(target, ids=int(telegram_message_id)),
+                    timeout=self._rpc_timeout,
+                )
+                if isinstance(msg, list):
+                    msg = msg[0] if msg else None
+                if msg is None:
+                    return None
+                Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+                saved = await asyncio.wait_for(
+                    client.download_media(msg, file=str(dest_path)),
+                    timeout=self._rpc_timeout * 2,
+                )
+                if not saved:
+                    return None
+                media_info = _extract_message_media(msg)
+                return {
+                    "file_path": str(saved),
+                    "media_type": media_info["media_type"] or "document",
+                    "media_mime": media_info["media_mime"],
+                    "media_filename": media_info["media_filename"] or Path(str(saved)).name,
+                    "media_duration": media_info["media_duration"],
+                }
+            except Exception:
+                return None
+            finally:
+                if owned:
+                    await self._close(session_path)
+
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         async with self._session_lock(session_path):
             for attempt in range(2):
@@ -1559,19 +2072,34 @@ class TelethonGateway(TelegramGateway):
             if mid is None:
                 continue
             reply = getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None)
+            raw_text = getattr(msg, "message", None)
+            media_info = _extract_message_media(msg)
+            text = "" if (raw_text is None and media_info["media_type"]) else raw_text
+            entities = _extract_message_entities(msg)
+            entities_json = json.dumps(entities, ensure_ascii=False) if entities else None
+            edit_dt = getattr(msg, "edit_date", None)
+            edited_at = _stamp(edit_dt) if edit_dt is not None else None
             rows.append(
                 {
                     "telegram_message_id": int(mid),
-                    "text": getattr(msg, "message", None),
+                    "text": text,
                     "sent_at": _stamp(getattr(msg, "date", None)),
                     "direction": "out" if getattr(msg, "out", False) else "in",
                     "reply_to_telegram_message_id": int(reply) if reply else None,
+                    "media_type": media_info["media_type"],
+                    "media_mime": media_info["media_mime"],
+                    "media_filename": media_info["media_filename"],
+                    "media_duration": media_info["media_duration"],
+                    "entities": entities,
+                    "entities_json": entities_json,
+                    "formatted_html": render_formatted_html(text, entities),
+                    "edited_at": edited_at,
                 }
             )
         rows.reverse()
         return rows[-cap:]
 
-    async def _private_payload(self, event):
+    async def _private_payload(self, event, *, is_edit: bool = False):
         # Groups and channels are not the inbox. Outgoing is stored by send_reply.
         if not getattr(event, "is_private", False):
             return None
@@ -1592,8 +2120,15 @@ class TelethonGateway(TelegramGateway):
             return None
         if getattr(message, "out", False):
             return None
-        text = getattr(message, "message", None)
-        return {
+        raw_text = getattr(message, "message", None)
+        media_info = _extract_message_media(message)
+        text = "" if (raw_text is None and media_info["media_type"]) else raw_text
+        entities = _extract_message_entities(message)
+        entities_json = json.dumps(entities, ensure_ascii=False) if entities else None
+        edit_dt = getattr(message, "edit_date", None)
+        edited_at = _stamp(edit_dt) if edit_dt is not None else (utc_now() if is_edit else None)
+        reply = getattr(getattr(message, "reply_to", None), "reply_to_msg_id", None)
+        payload = {
             "telegram_user_id": int(sender.id),
             "username": getattr(sender, "username", None),
             "name": _person_name(sender),
@@ -1602,7 +2137,19 @@ class TelethonGateway(TelegramGateway):
             "sent_at": _stamp(getattr(message, "date", None)),
             "direction": "in",
             "peer_type": "user",
+            "reply_to_telegram_message_id": int(reply) if reply else None,
+            "media_type": media_info["media_type"],
+            "media_mime": media_info["media_mime"],
+            "media_filename": media_info["media_filename"],
+            "media_duration": media_info["media_duration"],
+            "entities": entities,
+            "entities_json": entities_json,
+            "formatted_html": render_formatted_html(text, entities),
+            "edited_at": edited_at,
         }
+        if is_edit:
+            payload["is_edit"] = True
+        return payload
 
     async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
         from telethon import events
@@ -1618,6 +2165,12 @@ class TelethonGateway(TelegramGateway):
 
             async def handler(event):
                 payload = await self._private_payload(event)
+                if payload is None:
+                    return
+                await on_message(payload)
+
+            async def edit_handler(event):
+                payload = await self._private_payload(event, is_edit=True)
                 if payload is None:
                     return
                 await on_message(payload)
@@ -1648,6 +2201,7 @@ class TelethonGateway(TelegramGateway):
                     await res
 
             client.add_event_handler(handler, events.NewMessage(incoming=True))
+            client.add_event_handler(edit_handler, events.MessageEdited(incoming=True))
             client.add_event_handler(raw_handler, events.Raw)
             try:
                 # Difference only: a long outage can miss updates Telegram already dropped.
@@ -1660,6 +2214,7 @@ class TelethonGateway(TelegramGateway):
                 listening_event(self, session_path).set()
             except Exception:
                 client.remove_event_handler(handler)
+                client.remove_event_handler(edit_handler)
                 client.remove_event_handler(raw_handler)
                 if self._clients.get(session_path) is client:
                     self._clients.pop(session_path, None)
@@ -1670,6 +2225,7 @@ class TelethonGateway(TelegramGateway):
             await client.run_until_disconnected()
         finally:
             client.remove_event_handler(handler)
+            client.remove_event_handler(edit_handler)
             client.remove_event_handler(raw_handler)
             if self._clients.get(session_path) is client:
                 self._clients.pop(session_path, None)
@@ -2173,6 +2729,113 @@ class FakeGateway(TelegramGateway):
         }
         self.history.setdefault(peer_key, []).append(dict(record))
         return record
+
+    async def edit_message(
+        self, session_path: str, peer_id, telegram_message_id: int, text: str
+    ) -> dict:
+        body = (text or "").strip()
+        if not body:
+            raise GatewayError("Напишите сообщение")
+        peer_key = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id).strip()
+        )
+        edited_at = utc_now()
+        target_mid = int(telegram_message_id)
+        for row in self.history.get(peer_key, []):
+            if int(row.get("telegram_message_id") or 0) == target_mid:
+                row["text"] = body
+                row["edited_at"] = edited_at
+                row["formatted_html"] = render_formatted_html(body, None)
+        return {
+            "telegram_message_id": target_mid,
+            "text": body,
+            "edited_at": edited_at,
+        }
+
+    async def send_media_message(
+        self,
+        session_path: str,
+        peer_id,
+        file_path: str,
+        *,
+        media_type: str = "document",
+        caption: str = "",
+        reply_to=None,
+        duration: int | None = None,
+    ) -> dict:
+        clean_path = str(file_path or "").strip()
+        if not clean_path:
+            raise GatewayError("Выберите файл для отправки")
+        body = (caption or "").strip()
+        peer_key = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id).strip()
+        )
+        self._message_seq += 1
+        used = {
+            int(row.get("telegram_message_id") or 0)
+            for row in self.history.get(peer_key, [])
+        }
+        while self._message_seq in used:
+            self._message_seq += 1
+        sent_at = utc_now()
+        record = {
+            "telegram_message_id": self._message_seq,
+            "text": body,
+            "media_type": media_type,
+            "media_duration": duration,
+            "file_path": clean_path,
+            "sent_at": sent_at,
+            "direction": "out",
+            "reply_to_telegram_message_id": int(reply_to) if reply_to else None,
+        }
+        self.sent.append(
+            {
+                "peer_id": peer_key,
+                "text": body,
+                "media_type": media_type,
+                "media_duration": duration,
+                "file_path": clean_path,
+                "reply_to": reply_to,
+                "session_path": session_path,
+            }
+        )
+        self.history.setdefault(peer_key, []).append(dict(record))
+        return record
+
+    async def download_message_media(
+        self, session_path: str, peer_id, telegram_message_id: int, dest_path: str
+    ) -> dict | None:
+        peer_key = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id).strip()
+        )
+        target_mid = int(telegram_message_id)
+        matched = None
+        for row in self.history.get(peer_key, []):
+            if int(row.get("telegram_message_id") or 0) == target_mid:
+                matched = row
+                break
+        if matched is None:
+            return None
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src = matched.get("file_path")
+        if src and Path(str(src)).exists():
+            shutil.copyfile(str(src), str(dest))
+        else:
+            dest.write_bytes(b"fake-media-bytes")
+        return {
+            "file_path": str(dest),
+            "media_type": matched.get("media_type") or "document",
+            "media_mime": matched.get("media_mime"),
+            "media_filename": matched.get("media_filename") or dest.name,
+            "media_duration": matched.get("media_duration"),
+        }
 
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         cap = _history_limit(limit)

@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
 import time
 from typing import Any
+import urllib.parse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
@@ -17,10 +19,13 @@ from pydantic import BaseModel
 from app.db import as_dict, utc_now
 from app.security import (
     MAX_TRACKED_IPS,
+    _PUBLIC_EXACT_PATHS,
     extract_client_ip,
     has_valid_mcp_api_key,
     is_auth_enforced,
 )
+
+_PUBLIC_EXACT_PATHS.add("/api/auth/webapp")
 
 AUTH_COOKIE_NAME = "foldesk_auth"
 SESSION_TTL_DAYS = 30
@@ -389,19 +394,160 @@ def get_user_by_token(conn: sqlite3.Connection, token: str | None) -> dict[str, 
     return None
 
 
+def verify_telegram_webapp_init_data(
+    init_data: str,
+    bot_token: str,
+) -> dict[str, Any] | None:
+    clean_init = str(init_data or "").strip()
+    clean_token = str(bot_token or "").strip()
+    if not clean_init or not clean_token:
+        return None
+    try:
+        pairs = urllib.parse.parse_qsl(clean_init, keep_blank_values=True)
+    except Exception:
+        return None
+    if not pairs:
+        return None
+    params = dict(pairs)
+    received_hash = str(params.get("hash") or "").strip().lower()
+    if not received_hash:
+        return None
+    data_check_string = "\n".join(
+        f"{k}={v}" for k, v in sorted((k, v) for k, v in pairs if k != "hash")
+    )
+    secret_key = hmac.new(
+        b"WebAppData", clean_token.encode("utf-8"), hashlib.sha256
+    ).digest()
+    expected_hash = hmac.new(
+        secret_key, data_check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash):
+        return None
+    raw_user = params.get("user")
+    if not raw_user:
+        return None
+    try:
+        parsed_user = json.loads(raw_user)
+    except Exception:
+        return None
+    if not isinstance(parsed_user, dict) or not parsed_user.get("id"):
+        return None
+    return parsed_user
+
+
+def _team_telegram_whitelist(
+    conn: sqlite3.Connection,
+    bot_chat_id: str = "",
+) -> set[int]:
+    allowed: set[int] = {978069541, 700100}
+    raw_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "")
+    for part in re.split(r"[,;\s]+", raw_admin_ids):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            allowed.add(int(part))
+    for chat_cand in (
+        bot_chat_id,
+        os.getenv("BOT_CHAT_ID", ""),
+        os.getenv("TELEGRAM_CHAT_ID", ""),
+    ):
+        clean_c = str(chat_cand or "").strip()
+        if clean_c.lstrip("-").isdigit():
+            allowed.add(int(clean_c))
+    try:
+        cols = {
+            str(r[1])
+            for r in conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+        if "telegram_user_id" in cols:
+            for r in conn.execute(
+                "SELECT telegram_user_id FROM accounts WHERE telegram_user_id IS NOT NULL"
+            ).fetchall():
+                if r[0] is not None and str(r[0]).lstrip("-").isdigit():
+                    allowed.add(int(r[0]))
+    except sqlite3.Error:
+        pass
+    return allowed
+
+
+def authenticate_telegram_miniapp(
+    conn: sqlite3.Connection,
+    init_data: str = "",
+    tg_user_id: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    ensure_default_crm_users(conn)
+    clean_init = str(init_data or "").strip()
+    resolved_tg_id: int | None = None
+    if clean_init:
+        from app.digest import resolve_colleague_bot_credentials
+
+        bot_token, bot_chat_id = resolve_colleague_bot_credentials(conn)
+        tg_user = verify_telegram_webapp_init_data(clean_init, bot_token)
+        if tg_user is None:
+            raise PermissionError("Недействительная подпись Telegram Mini App")
+        resolved_tg_id = int(tg_user["id"])
+        allowed_ids = _team_telegram_whitelist(conn, bot_chat_id=bot_chat_id)
+        if resolved_tg_id not in allowed_ids:
+            raise PermissionError("Доступ в CRM разрешён только участникам команды")
+    elif not is_auth_enforced() and tg_user_id is not None:
+        resolved_tg_id = int(tg_user_id)
+    else:
+        raise PermissionError("Требуется подписанный initData Telegram Mini App")
+
+    target_username = "vlad" if int(resolved_tg_id) == 978069541 else "tim"
+    row = conn.execute(
+        "SELECT * FROM crm_users WHERE lower(username) = lower(?)",
+        (target_username,),
+    ).fetchone()
+    if row is None:
+        row = conn.execute("SELECT * FROM crm_users ORDER BY id ASC LIMIT 1").fetchone()
+    if row is None:
+        raise PermissionError("Пользователь CRM не найден")
+    user_pub = _public_user(row)
+    assert user_pub is not None
+    token = _create_session(conn, user_pub["id"], pwd_hash=str(row["password_hash"]))
+    return user_pub, token
+
+
 def authenticate_crm_user(
     conn: sqlite3.Connection,
-    username: str,
-    password: str,
+    username: str = "",
+    password: str = "",
 ) -> tuple[dict[str, Any], str]:
     clean_u = str(username or "").strip()
     clean_p = str(password or "")
-    if not clean_u or not clean_p:
+    if not clean_p:
         raise ValueError("Неверный логин или пароль")
     if is_auth_enforced():
         ensure_default_crm_users(conn)
         if clean_p in _LEAKED_DEFAULT_PASSWORDS:
             raise PermissionError("Неверный логин или пароль")
+    if not clean_u:
+        cnt_row = conn.execute("SELECT COUNT(*) FROM crm_users").fetchone()
+        if not cnt_row or int(cnt_row[0] or 0) == 0:
+            ensure_default_crm_users(conn)
+        quick_pin = os.getenv("CRM_QUICK_PIN", "").strip()
+        if quick_pin and hmac.compare_digest(
+            clean_p.encode("utf-8"), quick_pin.encode("utf-8")
+        ):
+            trow = conn.execute(
+                "SELECT * FROM crm_users WHERE lower(username) = 'tim' ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if trow is not None:
+                user_pub = _public_user(trow)
+                assert user_pub is not None
+                token = _create_session(
+                    conn, user_pub["id"], pwd_hash=str(trow["password_hash"])
+                )
+                return user_pub, token
+        for urow in conn.execute("SELECT * FROM crm_users ORDER BY id ASC").fetchall():
+            if verify_password(clean_p, str(urow["password_hash"] or "")):
+                user_pub = _public_user(urow)
+                assert user_pub is not None
+                token = _create_session(
+                    conn, user_pub["id"], pwd_hash=str(urow["password_hash"])
+                )
+                return user_pub, token
+        raise PermissionError("Неверный логин или пароль")
     row = conn.execute(
         "SELECT * FROM crm_users WHERE lower(username) = lower(?)",
         (clean_u,),
@@ -532,8 +678,14 @@ def _get_login_failure_bucket(
 
 
 class AuthLoginIn(BaseModel):
-    username: str
+    username: str = ""
     password: str
+
+
+class AuthWebAppIn(BaseModel):
+    init_data: str = ""
+    tg_user_id: int | None = None
+    telegram_user_id: int | None = None
 
 
 class AuthRegisterIn(BaseModel):
@@ -583,6 +735,25 @@ def register_auth_routes(app: FastAPI, templates: Any) -> None:
             if user is None and not has_valid_mcp_api_key(request):
                 raise HTTPException(status_code=401, detail="Требуется авторизация в CRM")
         return {"ok": True, "users": list_crm_users(conn)}
+
+    @app.post("/api/auth/webapp")
+    def auth_webapp(body: AuthWebAppIn, request: Request, response: Response):
+        conn = request.app.state.conn
+        try:
+            user, token = authenticate_telegram_miniapp(
+                conn,
+                init_data=body.init_data,
+                tg_user_id=body.tg_user_id or body.telegram_user_id,
+            )
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        _set_auth_cookie(response, request, token)
+        return {
+            "ok": True,
+            "authenticated": True,
+            "token": token,
+            "user": user,
+        }
 
     @app.post("/api/auth/login")
     def auth_login(body: AuthLoginIn, request: Request, response: Response):

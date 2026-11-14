@@ -199,7 +199,7 @@ def _operator(conn=None) -> tuple[str, str]:
     return token, chat_id
 
 
-def _accepted(status: int, raw: bytes) -> None:
+def _accepted(status: int, raw: bytes) -> dict:
     if status != 200:
         raise ValueError(REJECTED)
     try:
@@ -208,9 +208,10 @@ def _accepted(status: int, raw: bytes) -> None:
         raise ValueError(REJECTED) from exc
     if not isinstance(parsed, dict) or parsed.get("ok") is not True:
         raise ValueError(REJECTED)
+    return parsed
 
 
-def _post(url: str, payload: dict, opener) -> None:
+def _post(url: str, payload: dict, opener) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -227,20 +228,50 @@ def _post(url: str, payload: dict, opener) -> None:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raw = exc.read() if exc.fp is not None else b""
-        _accepted(exc.code, raw)
-        return
+        return _accepted(exc.code, raw)
     except urllib.error.URLError as exc:
         raise ValueError(REJECTED) from exc
-    _accepted(status, raw)
+    return _accepted(status, raw)
+
+
+def ensure_bot_reply_notifications_table(conn) -> None:
+    if conn is None:
+        return
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_reply_notifications (
+            bot_message_id INTEGER NOT NULL,
+            chat_id TEXT NOT NULL,
+            dialog_id INTEGER,
+            lead_id INTEGER,
+            account_id INTEGER,
+            peer_id INTEGER,
+            lead_handle TEXT,
+            account_handle TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, bot_message_id)
+        )
+        """
+    )
 
 
 def format_lead_reply_notification(
     lead_handle: str,
     account_handle: str,
+    preview: str | None = None,
+    lead_name: str | None = None,
 ) -> str:
     clean_lead = str(lead_handle or "").strip() or "unknown"
     clean_acc = str(account_handle or "").strip() or "unknown"
-    return f"You received a response from {clean_lead}\n\nAccount: {clean_acc}"
+    base = f"You received a response from {clean_lead}\n\nAccount: {clean_acc}"
+    clean_preview = str(preview or "").strip()
+    if not clean_preview:
+        return base
+    return (
+        f"{base}"
+        f"\n💬 {clean_preview}\n\n"
+        "↩️ Сделайте Reply на это сообщение, чтобы ответить клиенту прямо из бота."
+    )
 
 
 def send_lead_reply_notification(
@@ -248,14 +279,67 @@ def send_lead_reply_notification(
     *,
     lead_handle: str,
     account_handle: str,
+    preview: str | None = None,
+    lead_name: str | None = None,
+    dialog_id: int | None = None,
+    lead_id: int | None = None,
+    account_id: int | None = None,
+    peer_id: int | None = None,
+    crm_url: str | None = None,
     opener=None,
 ) -> bool:
     try:
         token, chat_id = resolve_colleague_bot_credentials(conn)
         if not token or not chat_id:
             return False
-        text = format_lead_reply_notification(lead_handle, account_handle)
-        _post(SEND_URL.format(token=token), {"chat_id": chat_id, "text": text}, opener)
+        if conn is not None:
+            ensure_bot_reply_notifications_table(conn)
+        text = format_lead_reply_notification(
+            lead_handle,
+            account_handle,
+            preview=preview,
+            lead_name=lead_name,
+        )
+        payload: dict = {"chat_id": chat_id, "text": text}
+        buttons: list[dict] = []
+        if dialog_id is not None:
+            buttons.append({"text": "✍️ Ответить", "callback_data": f"reply_dlg:{int(dialog_id)}"})
+        elif lead_id is not None:
+            buttons.append({"text": "✍️ Ответить", "callback_data": f"reply_lead:{int(lead_id)}"})
+        base_url = (crm_url or os.getenv("CRM_PUBLIC_URL") or "").strip().rstrip("/")
+        if base_url.startswith("https://"):
+            buttons.append(
+                {
+                    "text": "📱 Открыть CRM",
+                    "web_app": {"url": f"{base_url}/?tg_miniapp=1#inbox"},
+                }
+            )
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": [buttons]}
+        parsed = _post(SEND_URL.format(token=token), payload, opener)
+        result_obj = parsed.get("result") if isinstance(parsed, dict) else None
+        bot_msg_id = result_obj.get("message_id") if isinstance(result_obj, dict) else None
+        if conn is not None and bot_msg_id is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO bot_reply_notifications (
+                    bot_message_id, chat_id, dialog_id, lead_id, account_id, peer_id,
+                    lead_handle, account_handle, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(bot_msg_id),
+                    str(chat_id),
+                    int(dialog_id) if dialog_id is not None else None,
+                    int(lead_id) if lead_id is not None else None,
+                    int(account_id) if account_id is not None else None,
+                    int(peer_id) if peer_id is not None else None,
+                    str(lead_handle or "").strip() or None,
+                    str(account_handle or "").strip() or None,
+                    utc_now(),
+                ),
+            )
+            conn.commit()
         return True
     except Exception:
         return False
@@ -272,7 +356,29 @@ def send_morning_digest(conn, opener=None, now: str | None = None) -> dict:
     return {"ok": True, "chat_id": chat_id, "text": text, "count": len(rows)}
 
 
-def apply_digest_callback(conn, data: str) -> dict:
+def _store_active_reply_dialog(conn, dialog_id: int, chat_id: str | None = None) -> None:
+    now_stamp = utc_now()
+    clean_chat = str(chat_id or "").strip()
+    keys = ["bot_active_reply_dialog_default"]
+    if clean_chat:
+        keys.append(f"bot_active_reply_dialog_{clean_chat}")
+    else:
+        _, resolved_chat = resolve_colleague_bot_credentials(conn)
+        if resolved_chat:
+            keys.append(f"bot_active_reply_dialog_{resolved_chat}")
+    for key in set(keys):
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(int(dialog_id)), now_stamp),
+        )
+    conn.commit()
+
+
+def apply_digest_callback(conn, data: str, chat_id: str | None = None) -> dict:
     # Не шлёт сообщение: ни оператору, ни лиду.
     raw = (data or "").strip()
     action, sep, rest = raw.partition(":")
@@ -323,6 +429,34 @@ def apply_digest_callback(conn, data: str) -> dict:
         if found is None:
             raise LookupError("lead")
         return {"ok": True, "action": "open", "lead_id": lead_id}
+    if action == "reply_dlg":
+        try:
+            dialog_id = int(rest)
+        except ValueError as exc:
+            raise ValueError("Неизвестное действие") from exc
+        found = conn.execute("SELECT id FROM dialogs WHERE id = ?", (dialog_id,)).fetchone()
+        if found is None:
+            raise LookupError("dialog")
+        _store_active_reply_dialog(conn, dialog_id, chat_id=chat_id)
+        return {"ok": True, "action": "reply_prompt", "dialog_id": dialog_id}
+    if action == "reply_lead":
+        try:
+            lead_id = int(rest)
+        except ValueError as exc:
+            raise ValueError("Неизвестное действие") from exc
+        dlg_row = conn.execute(
+            "SELECT id FROM dialogs WHERE lead_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            (lead_id,),
+        ).fetchone()
+        if dlg_row is not None:
+            dialog_id = int(dlg_row["id"])
+        else:
+            from app.inbox import open_dialog_by_lead
+
+            opened = open_dialog_by_lead(conn, lead_id=lead_id)
+            dialog_id = int(opened["id"])
+        _store_active_reply_dialog(conn, dialog_id, chat_id=chat_id)
+        return {"ok": True, "action": "reply_prompt", "dialog_id": dialog_id}
     raise ValueError("Неизвестное действие")
 
 

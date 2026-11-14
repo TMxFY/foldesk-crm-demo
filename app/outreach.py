@@ -3601,14 +3601,29 @@ async def run_campaign_batch(
             continue
 
         stored_media_url = None if acc_provider == "whatsapp" else step_image_url
+        stored_media_type = "photo" if stored_media_url else None
+        from app.telegram_gateway import render_formatted_html
+
+        rendered_html = render_formatted_html(rendered_text, None)
         conn.execute(
             """
             INSERT INTO messages (
-                dialog_id, telegram_message_id, direction, text, media_url, sent_at,
+                dialog_id, telegram_message_id, direction, text, media_url,
+                media_type, formatted_html, sent_at,
                 reply_to_telegram_message_id, created_at, updated_at
-            ) VALUES (?, ?, 'out', ?, ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, NULL, ?, ?)
             """,
-            (dialog["id"], tg_mid, rendered_text, stored_media_url, sent_at, now, now),
+            (
+                dialog["id"],
+                tg_mid,
+                rendered_text,
+                stored_media_url,
+                stored_media_type,
+                rendered_html,
+                sent_at,
+                now,
+                now,
+            ),
         )
         conn.execute(
             """

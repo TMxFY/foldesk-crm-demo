@@ -1,10 +1,36 @@
+import hashlib
 import json
+import os
+from pathlib import Path
 import re
 import sqlite3
 
 from app.accounts import check_daily_limit, increment_daily_sent
-from app.db import as_dict, normalize_status, utc_now
-from app.telegram_gateway import GatewayError
+from app.db import INBOX_MEDIA_DIR, ROOT, as_dict, normalize_status, utc_now
+from app.telegram_gateway import GatewayError, render_formatted_html
+
+
+def _media_preview_label(
+    media_type: str | None,
+    text: str | None,
+    filename: str | None = None,
+) -> str:
+    if text is not None and str(text).strip():
+        return str(text)[:120]
+    mt = str(media_type or "").strip().lower()
+    if mt == "voice":
+        return "🎤 Голосовое сообщение"
+    if mt == "video_note":
+        return "🔵 Видеосообщение"
+    if mt == "photo":
+        return "📷 Фото"
+    if mt == "video":
+        return "🎬 Видео"
+    if mt == "audio":
+        return "🎵 Аудио"
+    if mt == "document":
+        return f"📎 {filename}"[:120] if filename else "📎 Файл"
+    return "" if text is None else str(text)[:120]
 
 
 def _is_synthetic_peer_id(peer_id) -> bool:
@@ -87,6 +113,11 @@ def _public(row) -> dict:
         peer_str = str(data.get("peer_id") or "").strip()
         if peer_str.isdigit() and 7 <= len(peer_str) <= 15 and not peer_str.startswith("900"):
             phone = f"+{peer_str}"
+    resolved_lead_id = (
+        data["lead_id"]
+        if data.get("lead_id") is not None
+        else data.get("resolved_lead_id")
+    )
     out = {
         "id": data["id"],
         "dialog_id": data["id"],
@@ -103,7 +134,7 @@ def _public(row) -> dict:
         "last_message_at": data["last_message_at"],
         "last_message_preview": data["last_message_preview"],
         "last_from_peer": data["last_from_peer"],
-        "lead_id": data["lead_id"],
+        "lead_id": resolved_lead_id,
     }
     if "account_phone" in data:
         out["account_phone"] = data["account_phone"]
@@ -205,6 +236,7 @@ def stop_outreach_on_reply(
     candidate_usernames: list[str] = []
     candidate_names: list[str] = []
     candidate_phones: list[str] = []
+    all_rec_rows = []
     had_active_recs = False
     has_any_recipient = False
 
@@ -212,7 +244,8 @@ def stop_outreach_on_reply(
         all_rec_rows = conn.execute(
             f"""
             SELECT id, campaign_id, lead_id, status, last_sent_at,
-                   sent_account_id, assigned_account_id, username, name, phone
+                   sent_account_id, assigned_account_id, telegram_user_id,
+                   username, name, phone, company, note, website, category, their_angle
             FROM campaign_recipients
             WHERE {' OR '.join(rec_clauses)}
             """,
@@ -220,6 +253,13 @@ def stop_outreach_on_reply(
         ).fetchall()
         has_any_recipient = len(all_rec_rows) > 0
         for rr in all_rec_rows:
+            if rr["lead_id"]:
+                lid_existing = int(rr["lead_id"])
+                matched_lead_ids.add(lid_existing)
+                if lid_existing not in prev_lead_statuses:
+                    lrow_ex = conn.execute("SELECT status FROM leads WHERE id = ?", (lid_existing,)).fetchone()
+                    if lrow_ex is not None:
+                        prev_lead_statuses[lid_existing] = str(lrow_ex["status"] or "")
             if rr["username"]:
                 u = str(rr["username"]).strip().lstrip("@")
                 if u and u not in candidate_usernames:
@@ -294,9 +334,109 @@ def stop_outreach_on_reply(
     if clean_min_sent and had_active_recs and stopped_count == 0 and not force_event:
         return 0
 
+    if has_any_recipient and not matched_lead_ids and all_rec_rows:
+        first_rec = all_rec_rows[0]
+        auto_acc_id = (
+            int(account_id)
+            if account_id is not None
+            else (
+                candidate_account_ids[0]
+                if candidate_account_ids
+                else (int(dlg_row["account_id"]) if dlg_row and dlg_row["account_id"] is not None else None)
+            )
+        )
+        auto_tg_id = (
+            clean_peer_id
+            if clean_peer_id is not None
+            else (int(first_rec["telegram_user_id"]) if first_rec["telegram_user_id"] is not None else None)
+        )
+        auto_user = clean_user or (candidate_usernames[0] if candidate_usernames else None)
+        if not auto_user and dlg_row and dlg_row["username"]:
+            auto_user = str(dlg_row["username"]).strip().lstrip("@") or None
+        auto_phone = clean_phone or (candidate_phones[0] if candidate_phones else None)
+        if not auto_phone and dlg_row and dlg_row["phone"]:
+            auto_phone = str(dlg_row["phone"]).strip() or None
+        auto_company = str(first_rec["company"] or "").strip() or None
+        auto_note = (
+            str(first_rec["note"] or "").strip()
+            or str(first_rec["their_angle"] or "").strip()
+            or None
+        )
+        auto_url = str(first_rec["website"] or "").strip() or None
+        if auto_url and not re.match(r"^https?://", auto_url, flags=re.IGNORECASE):
+            auto_url = f"https://{auto_url}"
+        auto_niche = str(first_rec["category"] or "").strip() or None
+        auto_name = candidate_names[0] if candidate_names else None
+        if not auto_name and dlg_row and dlg_row["title"]:
+            auto_name = str(dlg_row["title"]).strip() or None
+        if not auto_name:
+            auto_name = auto_company or auto_user or auto_phone or (f"id:{auto_tg_id}" if auto_tg_id else "Контакт")
+        auto_dlg_id = int(dlg_row["id"]) if dlg_row is not None else None
+        auto_next_step = "Клиент ответил — цепочка остановлена, ответьте вручную"
+        try:
+            cur_lead = conn.execute(
+                """
+                INSERT INTO leads (
+                    account_id, telegram_user_id, username, name, phone,
+                    status, airtable_status, company, description, niche, url,
+                    note, next_step, dialog_id, provider, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'talking', 'In conversation', ?, ?, ?, ?, ?, ?, ?, 'telegram', ?, ?)
+                """,
+                (
+                    auto_acc_id,
+                    auto_tg_id,
+                    auto_user,
+                    auto_name,
+                    auto_phone,
+                    auto_company,
+                    auto_company,
+                    auto_niche,
+                    auto_url,
+                    auto_note,
+                    auto_next_step,
+                    auto_dlg_id,
+                    now,
+                    now,
+                ),
+            )
+            new_lid = int(cur_lead.lastrowid)
+            matched_lead_ids.add(new_lid)
+            prev_lead_statuses[new_lid] = "talking"
+        except sqlite3.IntegrityError:
+            if auto_tg_id is not None:
+                ex_row = conn.execute(
+                    "SELECT id, status FROM leads WHERE telegram_user_id = ? ORDER BY id LIMIT 1",
+                    (auto_tg_id,),
+                ).fetchone()
+                if ex_row is not None:
+                    ex_lid = int(ex_row["id"])
+                    matched_lead_ids.add(ex_lid)
+                    prev_lead_statuses[ex_lid] = str(ex_row["status"] or "")
+
     any_lead_status_moved = False
     if matched_lead_ids:
         primary_lid = sorted(matched_lead_ids)[0]
+        if has_any_recipient and all_rec_rows:
+            rec_ids = [int(r["id"]) for r in all_rec_rows]
+            ph_recs = ",".join("?" for _ in rec_ids)
+            conn.execute(
+                f"""
+                UPDATE campaign_recipients
+                SET lead_id = COALESCE(lead_id, ?),
+                    updated_at = ?
+                WHERE id IN ({ph_recs})
+                """,
+                [primary_lid, now, *rec_ids],
+            )
+        if dlg_row is not None:
+            conn.execute(
+                """
+                UPDATE dialogs
+                SET lead_id = COALESCE(lead_id, ?)
+                WHERE id = ?
+                """,
+                (primary_lid, int(dlg_row["id"])),
+            )
         if account_id is not None and clean_peer_id is not None:
             conn.execute(
                 """
@@ -443,6 +583,11 @@ def stop_outreach_on_reply(
                 conn,
                 lead_handle=lead_display,
                 account_handle=acc_display,
+                preview=preview if os.getenv("BOT_INCLUDE_PREVIEW") == "1" else None,
+                dialog_id=int(dlg_row["id"]) if dlg_row and dlg_row["id"] is not None else None,
+                lead_id=sorted(matched_lead_ids)[0] if matched_lead_ids else lead_id,
+                account_id=resolved_acc_id,
+                peer_id=clean_peer_id,
                 opener=opener,
             )
         except Exception:
@@ -567,7 +712,40 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
     if username is not None:
         username = str(username).strip().lstrip("@") or None
     text = message.get("text")
-    preview = "" if text is None else str(text)[:120]
+    media_url = message.get("media_url")
+    media_type = message.get("media_type")
+    media_mime = message.get("media_mime")
+    media_filename = message.get("media_filename")
+    media_duration = (
+        int(message["media_duration"])
+        if message.get("media_duration") is not None
+        else None
+    )
+    raw_entities = (
+        message.get("entities")
+        if "entities" in message
+        else message.get("entities_json")
+    )
+    if isinstance(raw_entities, list):
+        entities_json = json.dumps(raw_entities, ensure_ascii=False) if raw_entities else None
+    elif isinstance(raw_entities, str):
+        entities_json = raw_entities.strip() or None
+    else:
+        entities_json = None
+    formatted_html = message.get("formatted_html")
+    if not formatted_html:
+        formatted_html = render_formatted_html(
+            text,
+            raw_entities if isinstance(raw_entities, (list, str)) else entities_json,
+        )
+    edited_at = message.get("edited_at")
+    is_edit = bool(message.get("is_edit"))
+    reply_to_mid = (
+        int(message["reply_to_telegram_message_id"])
+        if message.get("reply_to_telegram_message_id")
+        else None
+    )
+    preview = _media_preview_label(media_type, text, media_filename)
     sent_at = str(message.get("sent_at") or now)
     prev_dlg = conn.execute(
         """
@@ -576,26 +754,40 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
         """,
         (account_id, int(peer_id)),
     ).fetchone()
-    was_already_from_peer = bool(prev_dlg and int(prev_dlg["last_from_peer"] or 0) == 1)
+    was_already_from_peer = is_edit or bool(prev_dlg and int(prev_dlg["last_from_peer"] or 0) == 1)
+    unread_inc = 0 if is_edit else 1
     conn.execute(
         """
         INSERT INTO dialogs (
             account_id, peer_type, peer_id, username, title, phone, provider,
             is_group, unread_count, last_message_at, last_message_preview,
             last_from_peer, muted, created_at, updated_at
-        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 1, ?, ?, 1, 0, ?, ?)
+        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, 0, ?, ?)
         ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
             username = COALESCE(excluded.username, dialogs.username),
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
             phone = COALESCE(excluded.phone, dialogs.phone),
             provider = COALESCE(excluded.provider, dialogs.provider),
-            unread_count = dialogs.unread_count + 1,
+            unread_count = dialogs.unread_count + ?,
             last_message_at = excluded.last_message_at,
             last_message_preview = excluded.last_message_preview,
             last_from_peer = 1,
             updated_at = excluded.updated_at
         """,
-        (account_id, int(peer_id), username, title, phone, provider, sent_at, preview, now, now),
+        (
+            account_id,
+            int(peer_id),
+            username,
+            title,
+            phone,
+            provider,
+            unread_inc,
+            sent_at,
+            preview,
+            now,
+            now,
+            unread_inc,
+        ),
     )
     row = conn.execute(
         """
@@ -611,15 +803,41 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
             conn.execute(
                 """
                 INSERT INTO messages (
-                    dialog_id, telegram_message_id, direction, text, sent_at,
-                    reply_to_telegram_message_id, created_at, updated_at
-                ) VALUES (?, ?, 'in', ?, ?, NULL, ?, ?)
+                    dialog_id, telegram_message_id, direction, text, media_url,
+                    media_type, media_mime, media_filename, media_duration,
+                    entities_json, formatted_html, edited_at,
+                    sent_at, reply_to_telegram_message_id, created_at, updated_at
+                ) VALUES (?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
                     text = excluded.text,
+                    formatted_html = excluded.formatted_html,
+                    entities_json = excluded.entities_json,
+                    edited_at = COALESCE(excluded.edited_at, messages.edited_at),
+                    media_type = COALESCE(excluded.media_type, messages.media_type),
+                    media_url = COALESCE(excluded.media_url, messages.media_url),
+                    media_mime = COALESCE(excluded.media_mime, messages.media_mime),
+                    media_duration = COALESCE(excluded.media_duration, messages.media_duration),
+                    media_filename = COALESCE(excluded.media_filename, messages.media_filename),
                     sent_at = excluded.sent_at,
                     updated_at = excluded.updated_at
                 """,
-                (row["id"], int(mid), body, sent_at, now, now),
+                (
+                    row["id"],
+                    int(mid),
+                    body,
+                    media_url,
+                    media_type,
+                    media_mime,
+                    media_filename,
+                    media_duration,
+                    entities_json,
+                    formatted_html,
+                    edited_at,
+                    sent_at,
+                    reply_to_mid,
+                    now,
+                    now,
+                ),
             )
         except sqlite3.IntegrityError as exc:
             conn.rollback()
@@ -643,7 +861,78 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
     return _public(row)
 
 
-def sync_inbox(conn, account_id: int, people: list, opener=None) -> list:
+def _person_is_crm_relevant(
+    conn,
+    account_id: int,
+    peer_id: int,
+    username: str | None,
+    phone: str | None,
+) -> bool:
+    clean_u = (username or "").strip().lstrip("@").lower()
+    clean_p = (phone or "").strip()
+    p_digits = re.sub(r"\D", "", clean_p)
+
+    dlg_existing = conn.execute(
+        """
+        SELECT lead_id FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        LIMIT 1
+        """,
+        (int(account_id), int(peer_id)),
+    ).fetchone()
+    if dlg_existing is not None and dlg_existing["lead_id"] is not None:
+        return True
+
+    lead_clauses = ["telegram_user_id = ?"]
+    lead_params: list = [int(peer_id)]
+    if clean_u:
+        lead_clauses.append("(username IS NOT NULL AND ltrim(lower(username), '@') = ?)")
+        lead_params.append(clean_u)
+    if clean_p:
+        lead_clauses.append("phone = ?")
+        lead_params.append(clean_p)
+    if len(p_digits) >= 7:
+        lead_clauses.append("phone = ?")
+        lead_params.append(p_digits)
+        lead_clauses.append("phone = ?")
+        lead_params.append(f"+{p_digits}")
+
+    if conn.execute(
+        f"SELECT 1 FROM leads WHERE {' OR '.join(lead_clauses)} LIMIT 1",
+        lead_params,
+    ).fetchone() is not None:
+        return True
+
+    rec_clauses = ["telegram_user_id = ?"]
+    rec_params: list = [int(peer_id)]
+    if clean_u:
+        rec_clauses.append("(username IS NOT NULL AND ltrim(lower(username), '@') = ?)")
+        rec_params.append(clean_u)
+    if clean_p:
+        rec_clauses.append("phone = ?")
+        rec_params.append(clean_p)
+    if len(p_digits) >= 7:
+        rec_clauses.append("phone = ?")
+        rec_params.append(p_digits)
+        rec_clauses.append("phone = ?")
+        rec_params.append(f"+{p_digits}")
+
+    if conn.execute(
+        f"SELECT 1 FROM campaign_recipients WHERE {' OR '.join(rec_clauses)} LIMIT 1",
+        rec_params,
+    ).fetchone() is not None:
+        return True
+
+    return False
+
+
+def sync_inbox(
+    conn,
+    account_id: int,
+    people: list,
+    opener=None,
+    crm_only: bool = False,
+) -> list:
     acc_provider = _account_provider(conn, account_id, require_exists=True)
     now = utc_now()
     saved = []
@@ -666,6 +955,10 @@ def sync_inbox(conn, account_id: int, people: list, opener=None) -> list:
                 username = str(username).strip().lstrip("@") or None
             provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
             phone = _extract_dialog_phone(person, int(peer_id), provider)
+            if crm_only and not _person_is_crm_relevant(
+                conn, account_id, int(peer_id), username, phone
+            ):
+                continue
             unread = person.get("unread_count") if "unread_count" in person else None
             if unread is not None:
                 unread = max(0, int(unread))
@@ -764,6 +1057,13 @@ _INBOX_SELECT_SQL = """
         COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
         a.telegram_username AS account_username,
         COALESCE(
+            d.lead_id,
+            (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
+            (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1),
+            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND ltrim(lower(l.username), '@') = ltrim(lower(d.username), '@') AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
+            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND ltrim(lower(l.username), '@') = ltrim(lower(d.username), '@') ORDER BY l.id LIMIT 1)
+        ) AS resolved_lead_id,
+        COALESCE(
             (SELECT l.status FROM leads l WHERE l.id = d.lead_id LIMIT 1),
             (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
             (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1),
@@ -816,18 +1116,115 @@ def _resolve_missing_lead_status_by_phone(conn, dialogs: list[dict]) -> None:
             d["lead_id"] = best["id"]
 
 
+def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
+    if not rows:
+        return []
+    rec_rows = conn.execute(
+        """
+        SELECT lead_id, telegram_user_id, username, phone, status
+        FROM campaign_recipients
+        """
+    ).fetchall()
+    recs_by_lid: dict[int, list[str]] = {}
+    recs_by_tgid: dict[int, list[str]] = {}
+    recs_by_uname: dict[str, list[str]] = {}
+    recs_by_phone: dict[str, list[str]] = {}
+    for rr in rec_rows:
+        st = str(rr["status"] or "").strip().lower()
+        if rr["lead_id"] is not None:
+            recs_by_lid.setdefault(int(rr["lead_id"]), []).append(st)
+        if rr["telegram_user_id"] is not None:
+            recs_by_tgid.setdefault(int(rr["telegram_user_id"]), []).append(st)
+        if rr["username"]:
+            u = str(rr["username"]).strip().lstrip("@").lower()
+            if u:
+                recs_by_uname.setdefault(u, []).append(st)
+        if rr["phone"]:
+            p_dig = re.sub(r"\D", "", str(rr["phone"]))
+            if len(p_dig) >= 7:
+                recs_by_phone.setdefault(p_dig, []).append(st)
+
+    in_msg_dialog_ids: set[int] = set()
+    dialog_ids = [int(r["id"]) for r in rows if r.get("id") is not None]
+    if dialog_ids:
+        ph_dids = ",".join("?" for _ in dialog_ids)
+        for mrow in conn.execute(
+            f"SELECT DISTINCT dialog_id FROM messages WHERE dialog_id IN ({ph_dids}) AND direction = 'in'",
+            dialog_ids,
+        ).fetchall():
+            in_msg_dialog_ids.add(int(mrow["dialog_id"]))
+
+    active_deal_statuses = {
+        "talking",
+        "call_scheduled",
+        "won",
+        "in conversation",
+        "call scheduled",
+        "signed",
+    }
+    filtered = []
+    for row in rows:
+        if int(row.get("is_group") or 0) != 0:
+            continue
+        if (row.get("peer_type") or "user") != "user":
+            continue
+
+        matched_rec_statuses: list[str] = []
+        lid = row.get("lead_id")
+        if lid is not None and int(lid) in recs_by_lid:
+            matched_rec_statuses.extend(recs_by_lid[int(lid)])
+        tg_id = row.get("telegram_user_id")
+        if tg_id is not None and int(tg_id) in recs_by_tgid:
+            matched_rec_statuses.extend(recs_by_tgid[int(tg_id)])
+        uname = str(row.get("username") or "").strip().lstrip("@").lower()
+        if uname and uname in recs_by_uname:
+            matched_rec_statuses.extend(recs_by_uname[uname])
+        p_dig = re.sub(r"\D", "", str(row.get("phone") or ""))
+        if len(p_dig) >= 7 and p_dig in recs_by_phone:
+            matched_rec_statuses.extend(recs_by_phone[p_dig])
+
+        has_any_rec = len(matched_rec_statuses) > 0
+        has_replied_rec = "replied" in matched_rec_statuses
+        has_lead = bool(row.get("lead_id") is not None or row.get("lead_status"))
+
+        if not has_lead and not has_replied_rec:
+            continue
+
+        if has_any_rec and not has_replied_rec:
+            last_from_peer = int(row.get("last_from_peer") or 0)
+            has_in_msg = int(row["id"]) in in_msg_dialog_ids
+            raw_lstatus = str(row.get("lead_status") or "").strip().lower()
+            try:
+                norm_lstatus = normalize_status(raw_lstatus, conn).strip().lower() if raw_lstatus else ""
+            except ValueError:
+                norm_lstatus = raw_lstatus
+            is_active_deal = (
+                raw_lstatus in active_deal_statuses
+                or norm_lstatus in ("talking", "call_scheduled", "won")
+            )
+            if last_from_peer == 0 and not has_in_msg and not is_active_deal:
+                continue
+
+        filtered.append(row)
+    return filtered
+
+
 def _query_inbox_rows(
     conn,
     account_id: int | None = None,
     q: str = "",
     provider: str | None = None,
     status: str | None = None,
+    crm_only: bool = False,
 ) -> list[dict]:
     where_clauses = [
         "(d.peer_type = 'user' OR d.is_group = 1)",
         "COALESCE(d.peer_id, 0) != 178220800",
         "lower(COALESCE(d.username, '')) != 'spambot'",
     ]
+    if crm_only:
+        where_clauses.append("d.peer_type = 'user'")
+        where_clauses.append("COALESCE(d.is_group, 0) = 0")
     params: list = []
 
     if account_id is not None and int(account_id) != 0:
@@ -851,6 +1248,9 @@ def _query_inbox_rows(
     rows = conn.execute(sql, params).fetchall()
     found = [_public(row) for row in rows]
     _resolve_missing_lead_status_by_phone(conn, found)
+
+    if crm_only:
+        found = _filter_crm_only_rows(conn, found)
 
     raw_status = (status or "").strip()
     if raw_status:
@@ -911,9 +1311,15 @@ def get_inbox_counts(
     q: str = "",
     provider: str | None = None,
     status: str | None = None,
+    crm_only: bool = False,
 ) -> dict:
     base_rows = _query_inbox_rows(
-        conn, account_id=account_id, q=q, provider=provider, status=status
+        conn,
+        account_id=account_id,
+        q=q,
+        provider=provider,
+        status=status,
+        crm_only=crm_only,
     )
     return compute_inbox_counts(base_rows)
 
@@ -940,9 +1346,15 @@ def list_inbox(
     provider: str | None = None,
     status: str | None = None,
     with_counts: bool = False,
+    crm_only: bool = False,
 ) -> list | dict:
     base_rows = _query_inbox_rows(
-        conn, account_id=account_id, q=q, provider=provider, status=status
+        conn,
+        account_id=account_id,
+        q=q,
+        provider=provider,
+        status=status,
+        crm_only=crm_only,
     )
     counts = compute_inbox_counts(base_rows)
 
@@ -957,6 +1369,7 @@ def list_inbox(
         or (q or "").strip()
         or (provider or "").strip()
         or (status or "").strip()
+        or crm_only
     )
     if has_explicit_filter:
         cap = 500
@@ -1359,33 +1772,98 @@ def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
             """,
             (dialog_id, int(limit)),
         ).fetchall()
-    return [as_dict(row) for row in rows]
+    out = []
+    for row in rows:
+        d = as_dict(row)
+        if not d.get("formatted_html") and d.get("text"):
+            d["formatted_html"] = render_formatted_html(d["text"], d.get("entities_json"))
+        elif d.get("formatted_html") is None:
+            d["formatted_html"] = ""
+        out.append(d)
+    return out
 
 
 def _cache_messages(conn, dialog_id: int, items: list) -> None:
     now = utc_now()
     normalized = [_normalize_message(item, now) for item in items]
     try:
-        for message_id, direction, text, sent_at, reply_to in normalized:
+        for (
+            message_id,
+            direction,
+            text,
+            sent_at,
+            reply_to,
+            media_url,
+            media_type,
+            media_mime,
+            media_filename,
+            media_duration,
+            entities_json,
+            formatted_html,
+            edited_at,
+        ) in normalized:
             conn.execute(
                 """
                 INSERT INTO messages (
-                    dialog_id, telegram_message_id, direction, text, sent_at,
-                    reply_to_telegram_message_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    dialog_id, telegram_message_id, direction, text, media_url,
+                    media_type, media_mime, media_filename, media_duration,
+                    entities_json, formatted_html, edited_at,
+                    sent_at, reply_to_telegram_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
                     direction = excluded.direction,
                     text = excluded.text,
+                    formatted_html = excluded.formatted_html,
+                    entities_json = excluded.entities_json,
+                    edited_at = COALESCE(excluded.edited_at, messages.edited_at),
+                    media_type = COALESCE(excluded.media_type, messages.media_type),
+                    media_url = COALESCE(excluded.media_url, messages.media_url),
+                    media_mime = COALESCE(excluded.media_mime, messages.media_mime),
+                    media_duration = COALESCE(excluded.media_duration, messages.media_duration),
+                    media_filename = COALESCE(excluded.media_filename, messages.media_filename),
                     sent_at = excluded.sent_at,
                     reply_to_telegram_message_id = excluded.reply_to_telegram_message_id,
                     updated_at = excluded.updated_at
                 """,
-                (dialog_id, message_id, direction, text, sent_at, reply_to, now, now),
+                (
+                    dialog_id,
+                    message_id,
+                    direction,
+                    text,
+                    media_url,
+                    media_type,
+                    media_mime,
+                    media_filename,
+                    media_duration,
+                    entities_json,
+                    formatted_html,
+                    edited_at,
+                    sent_at,
+                    reply_to,
+                    now,
+                    now,
+                ),
             )
         if normalized:
             latest = max(normalized, key=lambda m: (m[3], m[0]))
-            _, last_dir, last_text, last_at, _ = latest
-            last_preview = "" if last_text is None else str(last_text)[:120]
+            (
+                _,
+                last_dir,
+                last_text,
+                last_at,
+                _,
+                _,
+                last_media_type,
+                _,
+                last_media_filename,
+                _,
+                _,
+                _,
+                _,
+            ) = latest
+            last_preview = _media_preview_label(
+                last_media_type, last_text, last_media_filename
+            )
             if last_dir == "in":
                 conn.execute(
                     """
@@ -1441,12 +1919,47 @@ def _normalize_message(item, now: str):
         text = str(text)
     sent_at = item.get("sent_at") or now
     reply = item.get("reply_to_telegram_message_id")
+    media_url = item.get("media_url")
+    media_type = item.get("media_type")
+    media_mime = item.get("media_mime")
+    media_filename = item.get("media_filename")
+    media_duration = (
+        int(item["media_duration"])
+        if item.get("media_duration") is not None
+        else None
+    )
+    raw_entities = (
+        item.get("entities")
+        if "entities" in item
+        else item.get("entities_json")
+    )
+    if isinstance(raw_entities, list):
+        entities_json = json.dumps(raw_entities, ensure_ascii=False) if raw_entities else None
+    elif isinstance(raw_entities, str):
+        entities_json = raw_entities.strip() or None
+    else:
+        entities_json = None
+    formatted_html = item.get("formatted_html")
+    if not formatted_html:
+        formatted_html = render_formatted_html(
+            text,
+            raw_entities if isinstance(raw_entities, (list, str)) else entities_json,
+        )
+    edited_at = item.get("edited_at")
     return (
         int(item["telegram_message_id"]),
         direction,
         text,
         str(sent_at),
         int(reply) if reply else None,
+        media_url,
+        media_type,
+        media_mime,
+        media_filename,
+        media_duration,
+        entities_json,
+        formatted_html,
+        edited_at,
     )
 
 
@@ -1626,18 +2139,20 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     now = utc_now()
     sent_at = sent.get("sent_at") or now
     message_text = (sent.get("text") or body).strip() or body
+    formatted_html = sent.get("formatted_html") or render_formatted_html(message_text, None)
     try:
         cur = conn.execute(
             """
             INSERT INTO messages (
-                dialog_id, telegram_message_id, direction, text, sent_at,
-                reply_to_telegram_message_id, created_at, updated_at
-            ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?)
+                dialog_id, telegram_message_id, direction, text, formatted_html,
+                sent_at, reply_to_telegram_message_id, created_at, updated_at
+            ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?)
             """,
             (
                 dialog_id,
                 int(sent["telegram_message_id"]),
                 message_text,
+                formatted_html,
                 sent_at,
                 int(reply_to) if reply_to else None,
                 now,
@@ -1655,6 +2170,277 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
         WHERE id = ?
         """,
         (sent_at, preview, now, dialog_id),
+    )
+    if not is_reply_to_peer:
+        increment_daily_sent(conn, account["id"])
+    conn.commit()
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return as_dict(row)
+
+
+async def edit_dialog_message(
+    conn,
+    dialog_id: int,
+    telegram_message_id: int,
+    text: str,
+    gateway=None,
+) -> dict:
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("Напишите сообщение")
+    dialog = conn.execute("SELECT * FROM dialogs WHERE id = ?", (int(dialog_id),)).fetchone()
+    if dialog is None:
+        raise LookupError("dialog")
+    dialog = as_dict(dialog)
+    msg_row = conn.execute(
+        """
+        SELECT * FROM messages
+        WHERE dialog_id = ? AND telegram_message_id = ?
+        LIMIT 1
+        """,
+        (int(dialog_id), int(telegram_message_id)),
+    ).fetchone()
+    if msg_row is None:
+        raise LookupError("message")
+    msg = as_dict(msg_row)
+    if msg.get("direction") != "out":
+        raise ValueError("Можно редактировать только исходящие сообщения")
+
+    now = utc_now()
+    edited_at = now
+    new_text = body
+
+    if gateway is not None:
+        account = conn.execute(
+            "SELECT * FROM accounts WHERE id = ?", (dialog["account_id"],)
+        ).fetchone()
+        if account is None:
+            raise LookupError("account")
+        account = as_dict(account)
+        if account["status"] != "connected":
+            raise ValueError("Аккаунт не подключён")
+        peer_target = int(dialog["peer_id"])
+        if _is_synthetic_peer_id(peer_target) and dialog.get("username"):
+            peer_target = f"@{dialog['username']}"
+        try:
+            res = await gateway.edit_message(
+                account["session_path"],
+                peer_target,
+                int(telegram_message_id),
+                body,
+            )
+        except Exception as exc:
+            uname = str(dialog.get("username") or "").strip().lstrip("@")
+            if (
+                uname
+                and peer_target != f"@{uname}"
+                and "could not find the input entity" in str(exc).casefold()
+            ):
+                res = await gateway.edit_message(
+                    account["session_path"],
+                    f"@{uname}",
+                    int(telegram_message_id),
+                    body,
+                )
+            else:
+                raise
+        if isinstance(res, dict):
+            if res.get("text"):
+                new_text = str(res["text"]).strip() or body
+            if res.get("edited_at"):
+                edited_at = str(res["edited_at"])
+
+    formatted_html = render_formatted_html(new_text, None)
+    conn.execute(
+        """
+        UPDATE messages
+        SET text = ?, formatted_html = ?, edited_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_text, formatted_html, edited_at, now, int(msg["id"])),
+    )
+    latest_row = conn.execute(
+        """
+        SELECT telegram_message_id FROM messages
+        WHERE dialog_id = ?
+        ORDER BY sent_at DESC, id DESC
+        LIMIT 1
+        """,
+        (int(dialog_id),),
+    ).fetchone()
+    if latest_row is not None and int(latest_row["telegram_message_id"]) == int(telegram_message_id):
+        preview = _media_preview_label(
+            msg.get("media_type"), new_text, msg.get("media_filename")
+        )
+        conn.execute(
+            """
+            UPDATE dialogs
+            SET last_message_preview = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (preview, now, int(dialog_id)),
+        )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM messages WHERE id = ?", (int(msg["id"]),)).fetchone()
+    return as_dict(updated)
+
+
+async def send_dialog_media(
+    conn,
+    dialog_id: int,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str = "",
+    media_type: str = "document",
+    caption: str = "",
+    duration: int | None = None,
+    reply_to=None,
+    gateway=None,
+) -> dict:
+    if not file_bytes:
+        raise ValueError("Пустой файл")
+    dialog = conn.execute("SELECT * FROM dialogs WHERE id = ?", (int(dialog_id),)).fetchone()
+    if dialog is None:
+        raise LookupError("dialog")
+    dialog = as_dict(dialog)
+    account = conn.execute(
+        "SELECT * FROM accounts WHERE id = ?", (dialog["account_id"],)
+    ).fetchone()
+    if account is None:
+        raise LookupError("account")
+    account = as_dict(account)
+    if account["status"] != "connected":
+        raise ValueError("Аккаунт не подключён")
+
+    is_reply_to_peer = _dialog_has_peer_reply(conn, dialog)
+    if not is_reply_to_peer:
+        check_daily_limit(conn, account["id"])
+
+    clean_mime = (mime_type or "").strip()
+    clean_mtype = (media_type or "").strip().lower()
+    if clean_mtype not in ("voice", "video_note", "photo", "video", "audio", "document"):
+        if clean_mime.startswith("image/"):
+            clean_mtype = "photo"
+        elif clean_mime.startswith("audio/ogg"):
+            clean_mtype = "voice"
+        elif clean_mime.startswith("audio/"):
+            clean_mtype = "audio"
+        elif clean_mime.startswith("video/"):
+            clean_mtype = "video"
+        else:
+            clean_mtype = "document"
+
+    safe_orig_name = Path(filename or "file").name
+    ext = Path(safe_orig_name).suffix.lower()
+    allowed_exts = {
+        ".jpg", ".jpeg", ".png", ".webp", ".gif",
+        ".ogg", ".mp3", ".wav", ".mp4",
+        ".pdf", ".txt", ".csv", ".zip", ".bin",
+    }
+    if not ext or ext not in allowed_exts:
+        if clean_mtype == "voice":
+            ext = ".ogg"
+        elif clean_mtype == "photo":
+            ext = ".jpg"
+        elif clean_mtype in ("video", "video_note"):
+            ext = ".mp4"
+        else:
+            ext = ".bin"
+
+    INBOX_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(file_bytes).hexdigest()[:12]
+    stored_filename = f"dlg{int(dialog_id)}_{digest}{ext}"
+    dest_path = INBOX_MEDIA_DIR / stored_filename
+    dest_path.write_bytes(file_bytes)
+    media_url = f"/media/inbox/{stored_filename}"
+
+    clean_caption = (caption or "").strip()
+    clean_duration = int(duration) if duration is not None else None
+
+    if gateway is None:
+        next_row = conn.execute(
+            "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
+            (int(dialog_id),),
+        ).fetchone()
+        sent = {
+            "telegram_message_id": int(next_row["next_id"]),
+            "text": clean_caption,
+            "media_type": clean_mtype,
+            "sent_at": utc_now(),
+        }
+    else:
+        peer_target = int(dialog["peer_id"])
+        if _is_synthetic_peer_id(peer_target) and dialog.get("username"):
+            peer_target = f"@{dialog['username']}"
+        try:
+            sent = await gateway.send_media_message(
+                account["session_path"],
+                peer_target,
+                str(dest_path),
+                media_type=clean_mtype,
+                caption=clean_caption,
+                reply_to=reply_to,
+                duration=clean_duration,
+            )
+        except Exception as exc:
+            uname = str(dialog.get("username") or "").strip().lstrip("@")
+            if (
+                uname
+                and peer_target != f"@{uname}"
+                and "could not find the input entity" in str(exc).casefold()
+            ):
+                sent = await gateway.send_media_message(
+                    account["session_path"],
+                    f"@{uname}",
+                    str(dest_path),
+                    media_type=clean_mtype,
+                    caption=clean_caption,
+                    reply_to=reply_to,
+                    duration=clean_duration,
+                )
+            else:
+                raise
+
+    if not isinstance(sent, dict) or sent.get("telegram_message_id") is None:
+        raise GatewayError("Ответ без номера сообщения")
+
+    now = utc_now()
+    sent_at = str(sent.get("sent_at") or now)
+    msg_text = str(sent.get("text") if sent.get("text") is not None else clean_caption)
+    formatted_html = sent.get("formatted_html") or render_formatted_html(msg_text, None)
+    cur = conn.execute(
+        """
+        INSERT INTO messages (
+            dialog_id, telegram_message_id, direction, text, media_url,
+            media_type, media_mime, media_filename, media_duration,
+            formatted_html, sent_at, reply_to_telegram_message_id,
+            created_at, updated_at
+        ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(dialog_id),
+            int(sent["telegram_message_id"]),
+            msg_text,
+            media_url,
+            clean_mtype,
+            clean_mime or None,
+            safe_orig_name,
+            clean_duration,
+            formatted_html,
+            sent_at,
+            int(reply_to) if reply_to else None,
+            now,
+            now,
+        ),
+    )
+    preview = _media_preview_label(clean_mtype, msg_text, safe_orig_name)
+    conn.execute(
+        """
+        UPDATE dialogs
+        SET last_message_at = ?, last_message_preview = ?, last_from_peer = 0, updated_at = ?
+        WHERE id = ?
+        """,
+        (sent_at, preview, now, int(dialog_id)),
     )
     if not is_reply_to_peer:
         increment_daily_sent(conn, account["id"])

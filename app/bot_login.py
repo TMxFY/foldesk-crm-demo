@@ -1,10 +1,17 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
 from app.db import as_dict, utc_now
-from app.digest import resolve_colleague_bot_credentials
+from app.digest import (
+    SEND_URL,
+    _post as _digest_post,
+    ensure_bot_reply_notifications_table,
+    resolve_colleague_bot_credentials,
+)
+from app.inbox import open_dialog_by_lead, send_reply
 from app.leads import create_lead
 from app.notes import add_note
 
@@ -354,3 +361,245 @@ def poll_bot_login(conn, opener=None) -> dict:
     status = operator_status(conn)
     status["opened"] = opened
     return status
+
+
+def _resolve_account_id_from_handle(conn, acc_handle: str | None) -> int | None:
+    clean = str(acc_handle or "").strip()
+    if not clean or clean.lower() == "unknown":
+        return None
+    if clean.startswith("#") and clean[1:].isdigit():
+        return int(clean[1:])
+    if clean.startswith("@"):
+        uname = clean[1:].strip()
+        row = conn.execute(
+            "SELECT id FROM accounts WHERE telegram_username IS NOT NULL AND lower(ltrim(telegram_username, '@')) = lower(?) ORDER BY id LIMIT 1",
+            (uname,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+    row = conn.execute(
+        """
+        SELECT id FROM accounts
+        WHERE phone = ?
+           OR telegram_name = ?
+           OR (telegram_username IS NOT NULL AND lower(ltrim(telegram_username, '@')) = lower(?))
+        ORDER BY id LIMIT 1
+        """,
+        (clean, clean, clean.lstrip("@")),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def _resolve_dialog_id_for_bot_reply(
+    conn,
+    *,
+    dialog_id: int | None = None,
+    lead_id: int | None = None,
+    account_id: int | None = None,
+    peer_id: int | None = None,
+    lead_handle: str | None = None,
+    account_handle: str | None = None,
+) -> int | None:
+    if dialog_id is not None:
+        drow = conn.execute("SELECT id FROM dialogs WHERE id = ?", (int(dialog_id),)).fetchone()
+        if drow is not None:
+            return int(drow["id"])
+
+    resolved_acc_id = account_id if account_id is not None else _resolve_account_id_from_handle(conn, account_handle)
+    clean_lead = str(lead_handle or "").strip()
+    uname: str | None = None
+    phone: str | None = None
+    name: str | None = None
+    resolved_peer_id = peer_id
+
+    if clean_lead and clean_lead.lower() != "unknown":
+        if clean_lead.startswith("@"):
+            uname = clean_lead[1:].strip() or None
+        elif clean_lead.startswith("id:") and clean_lead[3:].strip().isdigit():
+            resolved_peer_id = int(clean_lead[3:].strip())
+        elif clean_lead.startswith("+") or (clean_lead.isdigit() and len(clean_lead) >= 7):
+            phone = clean_lead
+        else:
+            name = clean_lead
+
+    if resolved_peer_id is not None:
+        if resolved_acc_id is not None:
+            row = conn.execute(
+                "SELECT id FROM dialogs WHERE account_id = ? AND peer_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+                (int(resolved_acc_id), int(resolved_peer_id)),
+            ).fetchone()
+            if row is not None:
+                return int(row["id"])
+        row = conn.execute(
+            "SELECT id FROM dialogs WHERE peer_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            (int(resolved_peer_id),),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+    if uname:
+        if resolved_acc_id is not None:
+            row = conn.execute(
+                "SELECT id FROM dialogs WHERE account_id = ? AND username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?) ORDER BY last_message_at DESC, id DESC LIMIT 1",
+                (int(resolved_acc_id), uname),
+            ).fetchone()
+            if row is not None:
+                return int(row["id"])
+        row = conn.execute(
+            "SELECT id FROM dialogs WHERE username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?) ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            (uname,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+    if lead_id is not None:
+        row = conn.execute(
+            "SELECT id FROM dialogs WHERE lead_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            (int(lead_id),),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+    if phone:
+        row = conn.execute(
+            "SELECT id FROM dialogs WHERE phone = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            (phone,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+    if name:
+        row = conn.execute(
+            "SELECT id FROM dialogs WHERE title = ? OR (username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?)) ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            (name, name),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+    try:
+        opened = open_dialog_by_lead(
+            conn,
+            lead_id=lead_id,
+            account_id=resolved_acc_id,
+            telegram_user_id=resolved_peer_id,
+            username=uname,
+            phone=phone,
+            name=name,
+        )
+        if isinstance(opened, dict) and opened.get("id"):
+            return int(opened["id"])
+    except Exception:
+        return None
+    return None
+
+
+async def handle_bot_reply_to_lead(conn, update: dict, gateway=None, opener=None) -> dict:
+    if not isinstance(update, dict):
+        return {"ok": True, "replied": False, "dialog_id": None}
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return {"ok": True, "replied": False, "dialog_id": None}
+    reply_text = str(message.get("text") or "").strip()
+    if not reply_text or _is_start(reply_text) or _forward_person(message) is not None:
+        return {"ok": True, "replied": False, "dialog_id": None}
+
+    chat_id = _chat_id(message) or ""
+    dialog_id: int | None = None
+    used_active_key = False
+
+    reply_to = message.get("reply_to_message")
+    if isinstance(reply_to, dict):
+        ensure_bot_reply_notifications_table(conn)
+        reply_msg_id = _positive_id(reply_to.get("message_id"))
+        notif_row = None
+        if reply_msg_id is not None:
+            if chat_id:
+                notif_row = conn.execute(
+                    "SELECT * FROM bot_reply_notifications WHERE chat_id = ? AND bot_message_id = ?",
+                    (chat_id, reply_msg_id),
+                ).fetchone()
+            if notif_row is None:
+                notif_row = conn.execute(
+                    "SELECT * FROM bot_reply_notifications WHERE bot_message_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (reply_msg_id,),
+                ).fetchone()
+        if notif_row is not None:
+            dialog_id = _resolve_dialog_id_for_bot_reply(
+                conn,
+                dialog_id=notif_row["dialog_id"],
+                lead_id=notif_row["lead_id"],
+                account_id=notif_row["account_id"],
+                peer_id=notif_row["peer_id"],
+                lead_handle=notif_row["lead_handle"],
+                account_handle=notif_row["account_handle"],
+            )
+        if dialog_id is None:
+            orig_text = str(reply_to.get("text") or "")
+            m_lead = re.search(r"You received a response from\s+(?P<lead>[^\r\n]+)", orig_text)
+            m_acc = re.search(r"Account:\s*(?P<acc>[^\r\n]+)", orig_text)
+            if m_lead:
+                dialog_id = _resolve_dialog_id_for_bot_reply(
+                    conn,
+                    lead_handle=m_lead.group("lead").strip(),
+                    account_handle=m_acc.group("acc").strip() if m_acc else None,
+                )
+
+    if dialog_id is None:
+        candidate_keys = []
+        if chat_id:
+            candidate_keys.append(f"bot_active_reply_dialog_{chat_id}")
+        candidate_keys.append("bot_active_reply_dialog_default")
+        for key in candidate_keys:
+            row = conn.execute(
+                "SELECT value FROM kv_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row and str(row["value"] or "").strip().isdigit():
+                dialog_id = int(str(row["value"]).strip())
+                used_active_key = True
+                break
+
+    if dialog_id is None:
+        return {"ok": True, "replied": False, "dialog_id": None}
+
+    sent_msg = await send_reply(conn, int(dialog_id), reply_text, gateway)
+
+    if used_active_key:
+        keys_to_clear = ["bot_active_reply_dialog_default"]
+        if chat_id:
+            keys_to_clear.append(f"bot_active_reply_dialog_{chat_id}")
+        for k in set(keys_to_clear):
+            conn.execute("DELETE FROM kv_settings WHERE key = ?", (k,))
+        conn.commit()
+
+    dlg_row = conn.execute(
+        "SELECT username, title, phone FROM dialogs WHERE id = ?",
+        (int(dialog_id),),
+    ).fetchone()
+    lead_label = f"#{dialog_id}"
+    if dlg_row is not None:
+        if dlg_row["username"]:
+            lead_label = f"@{str(dlg_row['username']).strip().lstrip('@')}"
+        elif dlg_row["title"]:
+            lead_label = str(dlg_row["title"]).strip()
+        elif dlg_row["phone"]:
+            lead_label = str(dlg_row["phone"]).strip()
+
+    token, cfg_chat_id = resolve_colleague_bot_credentials(conn)
+    target_chat = chat_id or cfg_chat_id
+    if token and target_chat:
+        try:
+            _digest_post(
+                SEND_URL.format(token=token),
+                {"chat_id": target_chat, "text": f"✅ Ответ отправлен для {lead_label}"},
+                opener,
+            )
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "replied": True,
+        "dialog_id": int(dialog_id),
+        "message": sent_msg,
+    }

@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
 OUTREACH_MEDIA_DIR = ROOT / "data" / "outreach_media"
+INBOX_MEDIA_DIR = ROOT / "data" / "inbox_media"
 CANONICAL_STEP3_IMAGE_URL = "/media/outreach/4fa85f083f9e2911.jpg"
 _STATIC_KERMIT_PATH = ROOT / "app" / "static" / "outreach-kermit.jpg"
 
@@ -126,6 +127,9 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) ->
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+_add_column_if_missing = _ensure_column
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -233,12 +237,33 @@ def init_db(conn: sqlite3.Connection) -> None:
             external_message_id TEXT,
             direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
             text TEXT,
+            media_url TEXT,
+            media_type TEXT,
+            media_mime TEXT,
+            media_filename TEXT,
+            media_duration INTEGER,
+            entities_json TEXT,
+            formatted_html TEXT,
+            edited_at TEXT,
             sent_at TEXT NOT NULL,
             reply_to_telegram_message_id INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (dialog_id, telegram_message_id),
             FOREIGN KEY (dialog_id) REFERENCES dialogs(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_reply_notifications (
+            bot_message_id INTEGER NOT NULL,
+            chat_id TEXT NOT NULL,
+            dialog_id INTEGER,
+            lead_id INTEGER,
+            account_id INTEGER,
+            peer_id INTEGER,
+            lead_handle TEXT,
+            account_handle TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, bot_message_id)
         );
 
         CREATE TABLE IF NOT EXISTS notes (
@@ -615,6 +640,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "dialogs", "phone", "TEXT")
     _ensure_column(conn, "messages", "external_message_id", "TEXT")
     _ensure_column(conn, "messages", "media_url", "TEXT")
+    _ensure_column(conn, "messages", "media_type", "TEXT")
+    _ensure_column(conn, "messages", "media_mime", "TEXT")
+    _ensure_column(conn, "messages", "media_filename", "TEXT")
+    _ensure_column(conn, "messages", "media_duration", "INTEGER")
+    _ensure_column(conn, "messages", "entities_json", "TEXT")
+    _ensure_column(conn, "messages", "formatted_html", "TEXT")
+    _ensure_column(conn, "messages", "edited_at", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_reply_notifications (
+            bot_message_id INTEGER NOT NULL,
+            chat_id TEXT NOT NULL,
+            dialog_id INTEGER,
+            lead_id INTEGER,
+            account_id INTEGER,
+            peer_id INTEGER,
+            lead_handle TEXT,
+            account_handle TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, bot_message_id)
+        )
+        """
+    )
     _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
     _ensure_column(conn, "campaigns", "csv_headers_json", "TEXT")
     _ensure_column(conn, "campaigns", "leadgen_enabled", "INTEGER NOT NULL DEFAULT 0")

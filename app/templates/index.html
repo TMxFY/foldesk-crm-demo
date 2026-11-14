@@ -7,7 +7,8 @@
   <title>Foldesk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261109v5">
+  <link rel="stylesheet" href="/static/app.css?v=20261114v6">
+  <script src="https://telegram.org/js/telegram-web-app.js" async></script>
 </head>
 <body>
   <a class="skip" href="#s04">К списку разговоров</a>
@@ -133,7 +134,7 @@
         <button type="button" id="sidebar-user-btn" class="btn secondary sm sidebar-user-btn" title="Профиль, вход и регистрация" hidden>👤 Войти / Регистрация</button>
         <div class="row">
           <button type="button" id="seed-demo" class="btn secondary sm">Демо-данные</button>
-          <button type="button" id="theme" class="btn ghost sm" aria-pressed="true" hidden>Тема</button>
+          <button type="button" id="theme" class="btn ghost sm" aria-pressed="true">Тема</button>
         </div>
       </div>
     </aside>
@@ -145,7 +146,7 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="4" height="15" rx="1"/></svg>
             <span id="active-sheet-label">Воронка</span>
           </span>
-          <div class="flow-steps" role="group" aria-label="Порядок работы">
+          <div class="flow-steps" role="group" aria-label="Порядок работы" hidden>
             <a href="#accounts" class="flow-step" data-sheet-link="accounts">1. Аккаунт и лимит</a>
             <span class="flow-sep" aria-hidden="true">→</span>
             <a href="#outreach" class="flow-step" data-sheet-link="outreach">2. CSV и цепочка</a>
@@ -160,15 +161,15 @@
         <div class="topbar-stats" id="workspace-stats" aria-label="Сводка">
           <span class="stat-chip stat-chip-money">В работе: <strong id="stat-pipeline-value">$0</strong></span>
           <span class="stat-chip stat-chip-won">Выиграно: <strong id="stat-won-value">$0</strong></span>
-          <span class="stat-chip stat-chip-secondary">Win Rate: <strong id="stat-win-rate">0%</strong></span>
-          <span class="stat-chip stat-chip-secondary">Reply Rate: <strong id="stat-reply-rate">0%</strong></span>
+          <span class="stat-chip stat-chip-secondary" hidden>Win Rate: <strong id="stat-win-rate">0%</strong></span>
+          <span class="stat-chip stat-chip-secondary" hidden>Reply Rate: <strong id="stat-reply-rate">0%</strong></span>
           <span class="stat-chip">Сделки: <strong id="stat-leads">0</strong></span>
           <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
-          <span class="stat-chip stat-chip-secondary">Рассылки: <strong id="stat-campaigns">0</strong></span>
-          <span class="stat-chip stat-chip-secondary">Напоминания: <strong id="stat-reminders">0</strong></span>
+          <span class="stat-chip stat-chip-secondary" hidden>Рассылки: <strong id="stat-campaigns">0</strong></span>
+          <span class="stat-chip stat-chip-secondary" hidden>Напоминания: <strong id="stat-reminders">0</strong></span>
           <button type="button" id="crm-user-btn" class="btn secondary sm topbar-duplicate-btn" title="Сменить аккаунт или зарегистрировать пользователя">👤 Войти / Регистрация</button>
           <button type="button" id="open-mcp-modal-btn" class="btn ghost sm" title="Подключить AI-агента по MCP">MCP</button>
-          <button type="button" id="toggle-view-mode" class="btn ghost sm">Все блоки</button>
+          <button type="button" id="toggle-view-mode" class="btn ghost sm" hidden>Все блоки</button>
         </div>
       </div>
 
@@ -456,7 +457,10 @@
 
         <section id="s04" class="surface-box pane-col" aria-labelledby="s04-title">
           <div class="pane-head">
-            <h2 id="s04-title">Входящие</h2>
+            <div class="row">
+              <h2 id="s04-title">Входящие</h2>
+              <span id="inbox-crm-only-badge" class="badge b-ok" title="Отображаются только чаты сделок CRM и ответившие из рассылок">Только CRM</span>
+            </div>
             <div class="row">
               <span id="inbox-active-session-badge" class="badge b-new">Все сессии</span>
               <button type="button" id="tg-web-sync-btn" class="btn ghost sm" title="Синхронизировать чаты из Telegram">Обновить</button>
@@ -512,7 +516,10 @@
 
         <section id="s05" class="surface-box pane-col chat-pane" aria-labelledby="s05-title">
           <div class="pane-head">
-            <h2 id="s05-title">Переписка</h2>
+            <div class="row">
+              <button type="button" id="thread-mobile-back-btn" class="btn ghost sm thread-mobile-back-btn" hidden>← Чаты</button>
+              <h2 id="s05-title">Переписка</h2>
+            </div>
           </div>
           <div id="thread-view" data-state="empty">
             <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk tall"></span></div>
@@ -539,11 +546,33 @@
                 </div>
                 <div id="reply-snippets-suggest" class="snippets-suggest" hidden></div>
               </div>
+              <div id="reply-context-bar" class="reply-context-bar" hidden>
+                <div class="reply-context-body">
+                  <strong id="reply-context-title">Ответ на сообщение</strong>
+                  <span id="reply-context-preview" class="hint"></span>
+                </div>
+                <button type="button" id="reply-context-cancel" class="btn ghost sm" aria-label="Отменить">×</button>
+              </div>
               <form id="reply-form" class="reply-form">
+                <div id="reply-format-bar" class="reply-format-bar" role="toolbar" aria-label="Форматирование и вложения">
+                  <div class="reply-format-group">
+                    <button type="button" class="btn ghost sm fmt-btn" data-fmt="bold" title="Жирный (**текст**)"><strong>B</strong></button>
+                    <button type="button" class="btn ghost sm fmt-btn" data-fmt="italic" title="Курсив (*текст*)"><em>I</em></button>
+                    <button type="button" class="btn ghost sm fmt-btn" data-fmt="code" title="Код (`код`)"><code>&lt;/&gt;</code></button>
+                    <button type="button" class="btn ghost sm fmt-btn" data-fmt="quote" title="Цитата (&gt; текст)">❝</button>
+                    <button type="button" class="btn ghost sm fmt-btn" data-fmt="spoiler" title="Спойлер (||скрытый||)">▒▒</button>
+                  </div>
+                  <div class="reply-media-group">
+                    <input type="file" id="reply-file-input" hidden>
+                    <button type="button" id="reply-attach-btn" class="btn secondary sm" title="Прикрепить файл, фото или аудио">📎 Файл</button>
+                    <button type="button" id="reply-voice-btn" class="btn secondary sm" title="Записать голосовое сообщение">🎤 Голосовое</button>
+                    <span id="reply-voice-timer" class="voice-timer" hidden>● 0:00</span>
+                  </div>
+                </div>
                 <label for="reply-text">Ответ</label>
-                <textarea id="reply-text" name="text" placeholder="Напишите сообщение или введите / для шаблона..."></textarea>
+                <textarea id="reply-text" name="text" placeholder="Напишите сообщение (поддерживается **жирный**, *курсив*, `код`) или введите / для шаблона..."></textarea>
                 <div class="row">
-                  <button type="submit" class="btn primary sm">Отправить</button>
+                  <button type="submit" id="reply-submit-btn" class="btn primary sm">Отправить</button>
                   <button type="button" class="btn ghost sm" id="mark-unread">Непрочитанное</button>
                 </div>
               </form>
@@ -2111,6 +2140,29 @@
     </main>
   </div>
 
+  <nav class="miniapp-bottom-nav" id="miniapp-bottom-nav" aria-label="Быстрая навигация">
+    <a href="#s04" data-sheet-link="inbox" class="miniapp-nav-item">
+      <span>💬</span>
+      <small>Чаты CRM</small>
+    </a>
+    <a href="#s07" data-sheet-link="s07" class="miniapp-nav-item">
+      <span>📊</span>
+      <small>Воронка</small>
+    </a>
+    <a href="#leads" data-sheet-link="leads" class="miniapp-nav-item">
+      <span>👥</span>
+      <small>Лиды</small>
+    </a>
+    <a href="#outreach" data-sheet-link="outreach" class="miniapp-nav-item">
+      <span>🚀</span>
+      <small>Рассылки</small>
+    </a>
+    <a href="#accounts" data-sheet-link="accounts" class="miniapp-nav-item">
+      <span>🛡️</span>
+      <small>Аккаунты</small>
+    </a>
+  </nav>
+
   <div id="sheet-popup-backdrop" class="sheet-popup-backdrop" hidden></div>
   <div id="toast" class="toast" hidden></div>
   <div id="modal" class="modal-root" hidden>
@@ -2120,6 +2172,6 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261109v5"></script>
+  <script src="/static/app.js?v=20261114v6"></script>
 </body>
 </html>

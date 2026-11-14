@@ -145,6 +145,9 @@ const state = {
   inboxChatModeExplicit: false,
   inboxSessionFilter: "all",
   selectedDialog: null,
+  replyToMessage: null,
+  editingMessage: null,
+  voiceRecorderState: null,
   selectedLeadId: null,
   cards: {},
   folderLists: {},
@@ -3321,12 +3324,21 @@ function renderDialogs() {
         shortTime ? `Вы писали · ${shortTime}` : "Вы писали",
       ]);
     }
-    const metaTags = [sessionTag, statusBadge].filter(Boolean);
+    const dialogLead = leadForDialog(dialog);
+    const crmStageBadge = dialogLead
+      ? el("span", { className: `badge ${BADGE[dialogLead.status] || "b-new"} dialog-crm-badge` }, [
+        (STATUSES.find(([v]) => v === dialogLead.status) || ["", "В CRM"])[1],
+      ])
+      : el("span", { className: "badge b-talk dialog-crm-badge" }, ["CRM"]);
+    const metaTags = [crmStageBadge, sessionTag, statusBadge].filter(Boolean);
     const who = el("span", {}, [
       el("span", { className: "dialog-name-row" }, [
         channelBadgeEl(provider),
         el("span", { className: "name" }, [name]),
-      ]),
+        dialog.last_message_at
+          ? el("time", { className: "dialog-time-stamp", datetime: dialog.last_message_at }, [formatBubbleTime(dialog.last_message_at) || formatShortTime(dialog.last_message_at)])
+          : null,
+      ].filter(Boolean)),
       el("span", { className: "preview" }, [sub]),
       metaTags.length ? el("span", { className: "dialog-meta-row" }, metaTags) : null,
     ].filter(Boolean));
@@ -3365,15 +3377,347 @@ function formatBubbleTime(raw) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+function formatVoiceDuration(seconds) {
+  const total = Math.max(1, Math.round(Number(seconds) || 0));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+const ALLOWED_RICH_TAGS = new Set([
+  "STRONG", "B", "EM", "I", "U", "S", "DEL", "CODE", "PRE", "BLOCKQUOTE", "SPAN", "A", "BR",
+]);
+
+function clientMarkdownToSafeHtml(rawText) {
+  const escaped = String(rawText || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return escaped
+    .replace(/^&gt;\s?(.*)$/gm, "<blockquote>$1</blockquote>")
+    .replace(/```([\s\S]*?)```/g, "<pre><code>$1</code></pre>")
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_\n]+)__/g, "<u>$1</u>")
+    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
+    .replace(/\|\|([^|\n]+)\|\|/g, '<span class="tg-spoiler" data-spoiler="1">$1</span>')
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replace(/\n/g, "<br>");
+}
+
+function buildRichTextNode(message) {
+  const rawHtml = String(message.formatted_html || "").trim()
+    || clientMarkdownToSafeHtml(message.text || "");
+  const container = el("div", { className: "msg-text" }, []);
+  if (!rawHtml) {
+    container.textContent = message.text || (message.media_type ? "" : "Вложение");
+    return container;
+  }
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(`<div>${rawHtml}</div>`, "text/html");
+    const root = doc.body.firstElementChild;
+    const sanitizeNode = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        return document.createTextNode(node.textContent || "");
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return null;
+      const tag = node.tagName.toUpperCase();
+      if (!ALLOWED_RICH_TAGS.has(tag)) {
+        const frag = document.createDocumentFragment();
+        [...node.childNodes].forEach((ch) => {
+          const cleanCh = sanitizeNode(ch);
+          if (cleanCh) frag.append(cleanCh);
+        });
+        return frag;
+      }
+      const cleanEl = document.createElement(tag.toLowerCase());
+      if (tag === "A") {
+        const href = String(node.getAttribute("href") || "").trim();
+        if (/^(https?:|tg:|mailto:)/i.test(href)) {
+          cleanEl.setAttribute("href", href);
+          cleanEl.setAttribute("target", "_blank");
+          cleanEl.setAttribute("rel", "noopener noreferrer");
+        }
+      }
+      if (node.classList.contains("tg-spoiler") || node.getAttribute("data-spoiler") === "1") {
+        cleanEl.className = "tg-spoiler";
+        cleanEl.title = "Нажмите, чтобы показать скрытый текст";
+        cleanEl.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          cleanEl.classList.toggle("is-revealed");
+        });
+      }
+      [...node.childNodes].forEach((ch) => {
+        const cleanCh = sanitizeNode(ch);
+        if (cleanCh) cleanEl.append(cleanCh);
+      });
+      return cleanEl;
+    };
+    if (root) {
+      [...root.childNodes].forEach((ch) => {
+        const cleanCh = sanitizeNode(ch);
+        if (cleanCh) container.append(cleanCh);
+      });
+      return container;
+    }
+  } catch (_err) {
+    /* fallback to plain text */
+  }
+  container.textContent = message.text || "Вложение";
+  return container;
+}
+
+function buildVoiceMessageNode(dialog, message) {
+  const msgId = message.telegram_message_id || message.id || 0;
+  const mediaUrl = message.media_url
+    || (dialog && dialog.id && msgId ? `/api/dialogs/${dialog.id}/messages/${msgId}/media` : "");
+  const meta = (message.media_meta && typeof message.media_meta === "object") ? message.media_meta : {};
+  const durationSec = Number(message.media_duration || meta.duration || 8) || 8;
+  const waveform = Array.isArray(meta.waveform) && meta.waveform.length
+    ? meta.waveform.slice(0, 24)
+    : [28, 52, 74, 42, 88, 64, 92, 50, 35, 78, 95, 60, 44, 82, 70, 38, 62, 86, 54, 72, 48, 66, 40, 30];
+
+  const audioEl = mediaUrl ? el("audio", { preload: "none", src: mediaUrl }, []) : null;
+  let playing = false;
+  let simTimer = 0;
+  let currentRateIdx = 0;
+  const rates = [1, 1.5, 2];
+
+  const playBtn = el("button", {
+    type: "button",
+    className: "voice-play-btn",
+    "aria-label": "Воспроизвести голосовое сообщение",
+  }, ["▶"]);
+
+  const barsNodes = waveform.map((heightPct) =>
+    el("span", {
+      className: "voice-wave-bar",
+      style: `height: ${Math.max(18, Math.min(100, Number(heightPct) || 40))}%`,
+    }, []),
+  );
+  const waveWrap = el("div", { className: "voice-waveform" }, barsNodes);
+  const durLabel = el("span", { className: "voice-duration" }, [formatVoiceDuration(durationSec)]);
+
+  const rateBtn = el("button", {
+    type: "button",
+    className: "voice-rate-btn",
+    title: "Скорость воспроизведения",
+    onclick: (ev) => {
+      ev.stopPropagation();
+      currentRateIdx = (currentRateIdx + 1) % rates.length;
+      const nextRate = rates[currentRateIdx];
+      rateBtn.textContent = `${nextRate}x`;
+      if (audioEl) audioEl.playbackRate = nextRate;
+    },
+  }, ["1x"]);
+
+  const stopPlaybackUI = () => {
+    playing = false;
+    window.clearInterval(simTimer);
+    playBtn.textContent = "▶";
+    playerBox.classList.remove("is-playing");
+    barsNodes.forEach((b) => b.classList.remove("is-active"));
+    durLabel.textContent = formatVoiceDuration(durationSec);
+  };
+
+  const startSimulatedProgress = () => {
+    let elapsed = 0;
+    const rate = rates[currentRateIdx] || 1;
+    window.clearInterval(simTimer);
+    simTimer = window.setInterval(() => {
+      elapsed += 0.25 * rate;
+      const ratio = Math.min(1, elapsed / Math.max(1, durationSec));
+      const activeBars = Math.ceil(ratio * barsNodes.length);
+      barsNodes.forEach((b, idx) => b.classList.toggle("is-active", idx < activeBars));
+      durLabel.textContent = formatVoiceDuration(Math.max(0, durationSec - elapsed));
+      if (elapsed >= durationSec) {
+        stopPlaybackUI();
+      }
+    }, 250);
+  };
+
+  if (audioEl) {
+    audioEl.addEventListener("ended", stopPlaybackUI);
+    audioEl.addEventListener("timeupdate", () => {
+      if (!audioEl.duration || Number.isNaN(audioEl.duration)) return;
+      const ratio = Math.min(1, audioEl.currentTime / audioEl.duration);
+      const activeBars = Math.ceil(ratio * barsNodes.length);
+      barsNodes.forEach((b, idx) => b.classList.toggle("is-active", idx < activeBars));
+      durLabel.textContent = formatVoiceDuration(Math.max(0, audioEl.duration - audioEl.currentTime));
+    });
+  }
+
+  playBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (playing) {
+      if (audioEl) {
+        try { audioEl.pause(); } catch (_e) {}
+      }
+      stopPlaybackUI();
+      return;
+    }
+    playing = true;
+    playBtn.textContent = "⏸";
+    playerBox.classList.add("is-playing");
+    if (audioEl) {
+      audioEl.playbackRate = rates[currentRateIdx] || 1;
+      const playPromise = audioEl.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => {
+          startSimulatedProgress();
+        });
+      } else {
+        startSimulatedProgress();
+      }
+    } else {
+      startSimulatedProgress();
+    }
+  });
+
+  const playerBox = el("div", {
+    className: "voice-player",
+    "data-media-type": message.media_type || "voice",
+  }, [
+    playBtn,
+    el("div", { className: "voice-body" }, [
+      waveWrap,
+      el("div", { className: "voice-meta-row" }, [
+        durLabel,
+        el("span", { className: "voice-label" }, [message.media_type === "audio" ? "Аудиозапись" : "Голосовое сообщение"]),
+      ]),
+    ]),
+    rateBtn,
+    audioEl,
+  ].filter(Boolean));
+
+  return playerBox;
+}
+
+function buildMediaAttachmentNode(dialog, message) {
+  const mType = String(message.media_type || "").trim().toLowerCase();
+  if (!mType) return null;
+  if (mType === "voice" || mType === "audio") {
+    return buildVoiceMessageNode(dialog, message);
+  }
+  const msgId = message.telegram_message_id || message.id || 0;
+  const mediaUrl = message.media_url
+    || (dialog && dialog.id && msgId ? `/api/dialogs/${dialog.id}/messages/${msgId}/media` : "#");
+  const meta = (message.media_meta && typeof message.media_meta === "object") ? message.media_meta : {};
+  const fileName = message.media_filename || meta.filename || meta.file_name || (mType === "photo" ? "Фотография.jpg" : mType === "video_note" ? "Видеокружок.mp4" : "Вложение");
+
+  if (mType === "video_note") {
+    return el("div", { className: "video-note-bubble", "data-media-type": "video_note" }, [
+      el("div", { className: "video-note-circle" }, [
+        el("span", { className: "video-note-icon" }, ["🎥"]),
+        el("span", { className: "video-note-dur" }, [formatVoiceDuration(message.media_duration || meta.duration || 10)]),
+      ]),
+      el("a", {
+        href: mediaUrl,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        className: "media-download-link",
+      }, ["Открыть видеокружок ↗"]),
+    ]);
+  }
+
+  const icon = mType === "photo" ? "🖼" : mType === "video" ? "🎬" : "📎";
+  return el("div", { className: `media-attachment-card is-${mType}`, "data-media-type": mType }, [
+    el("span", { className: "media-attachment-icon" }, [icon]),
+    el("div", { className: "media-attachment-info" }, [
+      el("strong", { className: "media-attachment-name" }, [fileName]),
+      el("span", { className: "hint" }, [
+        mType === "photo" ? "Изображение Telegram" : (message.media_mime || meta.mime_type || "Файл Telegram"),
+      ]),
+    ]),
+    el("a", {
+      href: mediaUrl,
+      target: "_blank",
+      rel: "noopener noreferrer",
+      className: "btn secondary sm media-download-btn",
+    }, ["Открыть"]),
+  ]);
+}
+
+function syncReplyContextBar() {
+  const bar = document.querySelector("#reply-context-bar");
+  const titleNode = document.querySelector("#reply-context-title");
+  const previewNode = document.querySelector("#reply-context-preview");
+  const submitBtn = document.querySelector("#reply-submit-btn") || document.querySelector("#reply-form button[type=submit]");
+  if (!bar) return;
+
+  if (state.editingMessage) {
+    bar.hidden = false;
+    bar.dataset.contextMode = "edit";
+    if (titleNode) titleNode.textContent = "✏️ Редактирование сообщения";
+    if (previewNode) previewNode.textContent = state.editingMessage.text || "Сообщение";
+    if (submitBtn) submitBtn.textContent = "Сохранить";
+    return;
+  }
+
+  if (state.replyToMessage) {
+    bar.hidden = false;
+    bar.dataset.contextMode = "reply";
+    if (titleNode) {
+      titleNode.textContent = state.replyToMessage.direction === "out"
+        ? "↩️ Ответ на ваше сообщение"
+        : "↩️ Ответ клиенту";
+    }
+    if (previewNode) {
+      previewNode.textContent = state.replyToMessage.text || "Голосовое / вложение";
+    }
+    if (submitBtn) submitBtn.textContent = "Отправить";
+    return;
+  }
+
+  bar.hidden = true;
+  delete bar.dataset.contextMode;
+  if (submitBtn) submitBtn.textContent = "Отправить";
+}
+
+function setReplyToMessage(message) {
+  state.editingMessage = null;
+  state.replyToMessage = message || null;
+  syncReplyContextBar();
+  const field = document.querySelector("#reply-text");
+  if (field) field.focus();
+}
+
+function setEditingMessage(message) {
+  if (!message) return;
+  state.replyToMessage = null;
+  state.editingMessage = message;
+  syncReplyContextBar();
+  const field = document.querySelector("#reply-text");
+  if (field) {
+    field.value = message.text || "";
+    field.focus();
+  }
+}
+
+function clearReplyOrEditContext() {
+  const wasEditing = Boolean(state.editingMessage);
+  state.replyToMessage = null;
+  state.editingMessage = null;
+  syncReplyContextBar();
+  if (wasEditing) {
+    const field = document.querySelector("#reply-text");
+    if (field) field.value = "";
+  }
+}
+
 function renderThread() {
   const dialog = state.selectedDialog;
   const error = document.querySelector("#thread-error");
+  const grid = document.querySelector(".messenger-grid");
   error.hidden = true;
   error.textContent = "";
   if (!dialog) {
+    if (grid) grid.dataset.mobilePane = "list";
     setView("#thread-view", "empty");
     return;
   }
+  if (grid) grid.dataset.mobilePane = "thread";
   setView("#thread-view", "filled");
   const name = dialog.name || "Без имени";
   const ownerAcc = (state.accounts || []).find((acc) => Number(acc.id) === Number(dialog.account_id))
@@ -3382,28 +3726,108 @@ function renderThread() {
   const contactHint = dialog.username
     ? `@${dialog.username}${dialog.phone ? ` · ${dialog.phone}` : ""}`
     : (dialog.phone || "без ника");
+  const lead = leadForDialog(dialog);
+  const stageBadge = lead
+    ? el("span", { className: `badge ${BADGE[lead.status] || "b-new"}` }, [
+      (STATUSES.find(([v]) => v === lead.status) || ["", lead.status])[1],
+    ])
+    : null;
   document.querySelector("#thread-head").replaceChildren(
     el("div", { className: "thread-title-group" }, [
       channelBadgeEl(provider),
       el("h3", { className: "name" }, [name]),
+      stageBadge,
+    ].filter(Boolean)),
+    el("div", { className: "thread-head-meta row" }, [
+      el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
+      el("p", { className: "hint" }, [contactHint]),
     ]),
-    el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
-    el("p", { className: "hint" }, [contactHint]),
   );
   const items = state.messages || [];
+  const msgById = new Map();
+  items.forEach((m) => {
+    if (m.telegram_message_id != null) msgById.set(Number(m.telegram_message_id), m);
+    if (m.id != null) msgById.set(Number(m.id), m);
+  });
   const msgList = document.querySelector("#messages");
   msgList.replaceChildren(...items.map((message) => {
     const t = formatBubbleTime(message.sent_at);
+    const isOut = message.direction === "out";
+    const msgId = message.telegram_message_id || message.id;
+
+    let replyQuoteNode = null;
+    if (message.reply_to_telegram_message_id) {
+      const quoted = msgById.get(Number(message.reply_to_telegram_message_id));
+      const quotedText = quoted
+        ? (quoted.text || (quoted.media_type === "voice" ? "🎤 Голосовое сообщение" : "Вложение"))
+        : `Сообщение #${message.reply_to_telegram_message_id}`;
+      replyQuoteNode = el("div", { className: "msg-reply-quote" }, [
+        el("span", { className: "msg-reply-quote-bar" }, []),
+        el("span", { className: "msg-reply-quote-text" }, [quotedText]),
+      ]);
+    }
+
+    const mediaNode = buildMediaAttachmentNode(dialog, message);
+    const hasText = Boolean(String(message.text || "").trim());
+    const textNode = (hasText || !mediaNode) ? buildRichTextNode(message) : null;
+
+    const actionButtons = [
+      el("button", {
+        type: "button",
+        className: "msg-action-btn msg-reply-btn",
+        title: "Ответить на сообщение",
+        "aria-label": "Ответить на сообщение",
+        onclick: (ev) => {
+          ev.stopPropagation();
+          setReplyToMessage(message);
+        },
+      }, ["↩️"]),
+    ];
+    if (isOut && msgId) {
+      actionButtons.push(
+        el("button", {
+          type: "button",
+          className: "msg-action-btn msg-edit-btn",
+          title: "Редактировать сообщение",
+          "aria-label": "Редактировать сообщение",
+          onclick: (ev) => {
+            ev.stopPropagation();
+            setEditingMessage(message);
+          },
+        }, ["✏️"]),
+      );
+    }
+
+    const metaChildren = [
+      el("span", { className: "msg-actions-inline" }, actionButtons),
+      message.edited_at
+        ? el("span", { className: "msg-edited-badge", title: `Изменено: ${message.edited_at}` }, ["изменено"])
+        : null,
+      t ? el("span", { className: "msg-time" }, [t]) : null,
+      isOut
+        ? el("span", {
+          className: `msg-read-check${message.read_at ? " is-read" : ""}`,
+          title: message.read_at ? `Прочитано: ${message.read_at}` : "Отправлено",
+        }, [message.read_at ? "✓✓" : "✓"])
+        : null,
+    ].filter(Boolean);
+
     return el("li", {
-      className: message.direction === "out" ? "out" : "in",
+      className: `${isOut ? "out" : "in"}${message.media_type ? ` has-media media-${message.media_type}` : ""}${message.edited_at ? " is-edited" : ""}`,
       "data-time": t || undefined,
+      "data-message-id": msgId != null ? String(msgId) : undefined,
+      "data-edited": message.edited_at ? "true" : undefined,
     }, [
-      message.text || "Вложение",
-    ]);
+      replyQuoteNode,
+      mediaNode,
+      textNode,
+      el("div", { className: "msg-meta" }, metaChildren),
+    ].filter(Boolean));
   }));
   msgList.scrollTop = msgList.scrollHeight;
   const gap = document.querySelector("#thread-gap");
   if (gap) gap.hidden = items.length > 0;
+  syncReplyContextBar();
 }
 
 function selectedAccount() {
@@ -5089,7 +5513,7 @@ function openInboxLive(accountId) {
   if (inboxSource) inboxSource.close();
   setInboxLive(false);
   inboxLiveAccount = id;
-  const source = new EventSource(`/api/inbox/events?account_id=${encodeURIComponent(id)}`);
+  const source = new EventSource(`/api/inbox/events?account_id=${encodeURIComponent(id)}&crm_only=1`);
   inboxSource = source;
   source.addEventListener("error", () => {
     if (inboxSource !== source) return;
@@ -5157,7 +5581,7 @@ async function loadInbox() {
     ? "0"
     : select.value;
   const activeChips = activeInboxChips().join(",");
-  const qs = new URLSearchParams({ account_id: String(targetAccountId), with_counts: "1" });
+  const qs = new URLSearchParams({ account_id: String(targetAccountId), with_counts: "1", crm_only: "1" });
   if (activeChips) qs.set("chip", activeChips);
   const res = await api(`/api/inbox?${qs.toString()}`);
   const dialogs = Array.isArray(res) ? res : (res && Array.isArray(res.dialogs) ? res.dialogs : []);
@@ -6462,15 +6886,229 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
       try {
         await api("/api/inbox/sync", {
           method: "POST",
-          body: { account_id: accountId || null },
+          body: { account_id: accountId || null, crm_only: true },
         });
         await loadInbox();
-        toast("Список диалогов Telegram синхронизирован", "ok");
+        toast("Список диалогов CRM синхронизирован", "ok");
       } catch (err) {
         toast(err.message || "Не удалось синхронизировать чаты", "error");
       } finally {
         tgWebSyncBtn.disabled = false;
         tgWebSyncBtn.removeAttribute("aria-busy");
+      }
+    });
+  }
+
+  const cancelContextBtn = document.querySelector("#reply-context-cancel");
+  if (cancelContextBtn) {
+    cancelContextBtn.addEventListener("click", () => {
+      clearReplyOrEditContext();
+    });
+  }
+
+  const mobileBackBtn = document.querySelector("#thread-mobile-back-btn");
+  if (mobileBackBtn) {
+    mobileBackBtn.addEventListener("click", () => {
+      const grid = document.querySelector(".messenger-grid");
+      if (grid) grid.dataset.mobilePane = "list";
+    });
+  }
+
+  document.querySelectorAll("#reply-format-bar [data-fmt]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const area = document.querySelector("#reply-text");
+      if (!area) return;
+      const fmt = btn.dataset.fmt;
+      const start = area.selectionStart ?? area.value.length;
+      const end = area.selectionEnd ?? area.value.length;
+      const selected = area.value.slice(start, end) || "текст";
+      const wrapMap = {
+        bold: [`**${selected}**`, 2],
+        italic: [`*${selected}*`, 1],
+        code: [`\`${selected}\``, 1],
+        quote: [`> ${selected}`, 2],
+        spoiler: [`||${selected}||`, 2],
+      };
+      const [replacement, offset] = wrapMap[fmt] || [selected, 0];
+      area.value = `${area.value.slice(0, start)}${replacement}${area.value.slice(end)}`;
+      area.focus();
+      area.setSelectionRange(start + offset, start + offset + selected.length);
+    });
+  });
+
+  const fileToBase64 = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const raw = String(reader.result || "");
+      const idx = raw.indexOf(",");
+      resolve(idx >= 0 ? raw.slice(idx + 1) : raw);
+    };
+    reader.onerror = () => reject(new Error("Не удалось прочитать файл"));
+    reader.readAsDataURL(file);
+  });
+
+  const attachBtn = document.querySelector("#reply-attach-btn");
+  const fileInput = document.querySelector("#reply-file-input");
+  if (attachBtn && fileInput) {
+    attachBtn.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const dialog = state.selectedDialog;
+      if (!dialog || !dialog.id) {
+        toast("Сначала выберите чат", "error");
+        fileInput.value = "";
+        return;
+      }
+      attachBtn.disabled = true;
+      try {
+        const b64 = await fileToBase64(file);
+        const mime = file.type || "application/octet-stream";
+        const mediaType = mime.startsWith("image/")
+          ? "photo"
+          : (mime.startsWith("audio/") ? "voice" : (mime.startsWith("video/") ? "video" : "document"));
+        const field = document.querySelector("#reply-text");
+        const caption = field ? field.value.trim() : "";
+        const message = await api(`/api/dialogs/${dialog.id}/media`, {
+          method: "POST",
+          body: {
+            media_type: mediaType,
+            filename: file.name,
+            mime_type: mime,
+            data_base64: b64,
+            caption,
+            reply_to_msg_id: state.replyToMessage
+              ? (state.replyToMessage.telegram_message_id || state.replyToMessage.id)
+              : null,
+          },
+        });
+        state.messages = [...(state.messages || []), message];
+        dialog.last_message_preview = message.text || `📎 ${file.name}`;
+        dialog.last_from_peer = 0;
+        dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
+        upsertDialog(dialog);
+        if (field) field.value = "";
+        clearReplyOrEditContext();
+        renderThread();
+        renderDialogs();
+        toast(`Отправлен файл: ${file.name}`, "ok");
+      } catch (err) {
+        toast(err.message || "Ошибка отправки файла", "error");
+      } finally {
+        attachBtn.disabled = false;
+        fileInput.value = "";
+      }
+    });
+  }
+
+  const voiceBtn = document.querySelector("#reply-voice-btn");
+  const voiceTimer = document.querySelector("#reply-voice-timer");
+  if (voiceBtn) {
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let recStartMs = 0;
+    let recTimerId = 0;
+    let recordingActive = false;
+
+    const stopVoiceTimer = () => {
+      window.clearInterval(recTimerId);
+      recordingActive = false;
+      voiceBtn.dataset.recording = "false";
+      voiceBtn.textContent = "🎤 Голосовое";
+      if (voiceTimer) voiceTimer.hidden = true;
+    };
+
+    const sendRecordedVoice = async (base64Audio, durationSec) => {
+      const dialog = state.selectedDialog;
+      if (!dialog || !dialog.id) return;
+      voiceBtn.disabled = true;
+      try {
+        const field = document.querySelector("#reply-text");
+        const caption = field ? field.value.trim() : "";
+        const message = await api(`/api/dialogs/${dialog.id}/media`, {
+          method: "POST",
+          body: {
+            media_type: "voice",
+            filename: `voice_${Date.now()}.ogg`,
+            mime_type: "audio/ogg",
+            duration: Math.max(1, Math.round(durationSec || 3)),
+            data_base64: base64Audio || "T2dnUwACAAAAAAAAAAA=",
+            caption,
+            reply_to_msg_id: state.replyToMessage
+              ? (state.replyToMessage.telegram_message_id || state.replyToMessage.id)
+              : null,
+          },
+        });
+        state.messages = [...(state.messages || []), message];
+        dialog.last_message_preview = message.text || "🎤 Голосовое сообщение";
+        dialog.last_from_peer = 0;
+        dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
+        upsertDialog(dialog);
+        if (field) field.value = "";
+        clearReplyOrEditContext();
+        renderThread();
+        renderDialogs();
+        toast("Голосовое сообщение отправлено", "ok");
+      } catch (err) {
+        toast(err.message || "Не удалось отправить голосовое", "error");
+      } finally {
+        voiceBtn.disabled = false;
+      }
+    };
+
+    voiceBtn.addEventListener("click", async () => {
+      const dialog = state.selectedDialog;
+      if (!dialog || !dialog.id) {
+        toast("Сначала выберите разговор", "error");
+        return;
+      }
+      if (recordingActive) {
+        const elapsedSec = Math.max(1, Math.round((Date.now() - recStartMs) / 1000));
+        stopVoiceTimer();
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        } else {
+          await sendRecordedVoice("T2dnUwACAAAAAAAAAAA=", elapsedSec);
+        }
+        return;
+      }
+
+      recordingActive = true;
+      recStartMs = Date.now();
+      voiceBtn.dataset.recording = "true";
+      voiceBtn.textContent = "⏹ Отправить ГС";
+      if (voiceTimer) {
+        voiceTimer.hidden = false;
+        voiceTimer.textContent = "● 0:00";
+      }
+      recTimerId = window.setInterval(() => {
+        const sec = Math.max(0, Math.floor((Date.now() - recStartMs) / 1000));
+        if (voiceTimer) voiceTimer.textContent = `● ${formatVoiceDuration(sec)}`;
+      }, 500);
+
+      if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function" && typeof window.MediaRecorder === "function") {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          audioChunks = [];
+          mediaRecorder = new MediaRecorder(stream);
+          mediaRecorder.addEventListener("dataavailable", (ev) => {
+            if (ev.data && ev.data.size > 0) audioChunks.push(ev.data);
+          });
+          mediaRecorder.addEventListener("stop", async () => {
+            stream.getTracks().forEach((tr) => tr.stop());
+            const elapsedSec = Math.max(1, Math.round((Date.now() - recStartMs) / 1000));
+            if (audioChunks.length) {
+              const blob = new Blob(audioChunks, { type: "audio/ogg" });
+              const b64 = await fileToBase64(blob);
+              await sendRecordedVoice(b64, elapsedSec);
+            } else {
+              await sendRecordedVoice("T2dnUwACAAAAAAAAAAA=", elapsedSec);
+            }
+          });
+          mediaRecorder.start();
+        } catch (_micErr) {
+          mediaRecorder = null;
+        }
       }
     });
   }
@@ -6482,6 +7120,9 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
         event.preventDefault();
         const form = document.querySelector("#reply-form");
         if (form) form.requestSubmit();
+      } else if (event.key === "Escape" && (state.editingMessage || state.replyToMessage)) {
+        event.preventDefault();
+        clearReplyOrEditContext();
       }
     });
   }
@@ -6524,23 +7165,55 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
     const button = event.target.querySelector("button[type=submit]");
     button.disabled = true;
     try {
-      const message = await api(`/api/dialogs/${dialog.id}/messages`, {
-        method: "POST",
-        body: { text },
-      });
-      state.messages = [...(state.messages || []), message];
-      state.pinnedDialogId = dialog.id;
-      dialog.last_message_preview = text;
-      dialog.last_from_peer = 0;
-      dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
-      dialog.unread_count = 0;
-      upsertDialog(dialog);
-      field.value = "";
-      renderThread();
-      renderDialogs();
-      loadAccounts().catch(() => {});
-      loadCampaigns().catch(() => {});
-      loadFocusToday().catch(() => {});
+      if (state.editingMessage) {
+        const targetMsgId = state.editingMessage.telegram_message_id || state.editingMessage.id;
+        const updated = await api(`/api/dialogs/${dialog.id}/messages/${targetMsgId}`, {
+          method: "PATCH",
+          body: { text },
+        });
+        state.messages = (state.messages || []).map((m) => {
+          const mId = m.telegram_message_id || m.id;
+          if (Number(mId) === Number(targetMsgId)) {
+            return { ...m, ...updated, text, edited_at: (updated && updated.edited_at) || new Date().toISOString() };
+          }
+          return m;
+        });
+        const lastMsg = state.messages && state.messages.length ? state.messages[state.messages.length - 1] : null;
+        if (lastMsg && Number(lastMsg.telegram_message_id || lastMsg.id) === Number(targetMsgId)) {
+          dialog.last_message_preview = text;
+        }
+        upsertDialog(dialog);
+        clearReplyOrEditContext();
+        field.value = "";
+        renderThread();
+        renderDialogs();
+        toast("Сообщение изменено", "ok");
+      } else {
+        const replyToId = state.replyToMessage
+          ? (state.replyToMessage.telegram_message_id || state.replyToMessage.id)
+          : undefined;
+        const message = await api(`/api/dialogs/${dialog.id}/messages`, {
+          method: "POST",
+          body: {
+            text,
+            reply_to_msg_id: replyToId != null ? Number(replyToId) : undefined,
+          },
+        });
+        state.messages = [...(state.messages || []), message];
+        state.pinnedDialogId = dialog.id;
+        dialog.last_message_preview = text;
+        dialog.last_from_peer = 0;
+        dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
+        dialog.unread_count = 0;
+        upsertDialog(dialog);
+        clearReplyOrEditContext();
+        field.value = "";
+        renderThread();
+        renderDialogs();
+        loadAccounts().catch(() => {});
+        loadCampaigns().catch(() => {});
+        loadFocusToday().catch(() => {});
+      }
     } catch (err) {
       error.hidden = false;
       error.textContent = err.message;
@@ -11771,10 +12444,80 @@ function bindFunnelEvents() {
   }
 }
 
+function initTelegramMiniApp() {
+  const bottomNav = document.querySelector("#miniapp-bottom-nav");
+  if (bottomNav) {
+    bottomNav.addEventListener("click", (event) => {
+      const link = event.target.closest("a[data-sheet-link]");
+      if (!link) return;
+      const targetSheet = link.dataset.sheetLink || sheetFromHash(link.getAttribute("href"));
+      if (targetSheet) {
+        if (state.viewMode === "sheet") {
+          event.preventDefault();
+          activateSheet(targetSheet, true);
+        } else {
+          state.activeSheet = targetSheet;
+          syncSheetVisibility();
+        }
+        bottomNav.querySelectorAll("a[data-sheet-link]").forEach((node) => {
+          node.classList.toggle("is-active", node.dataset.sheetLink === targetSheet);
+        });
+      }
+    });
+  }
+
+  const urlParams = new URLSearchParams(window.location.search);
+  const isMiniAppParam = urlParams.get("tg_miniapp") === "1";
+  const tgWebApp = window.Telegram && window.Telegram.WebApp;
+  const hasInitData = Boolean(tgWebApp && String(tgWebApp.initData || "").trim());
+
+  if (isMiniAppParam || hasInitData) {
+    document.body.dataset.miniapp = "true";
+    state.viewMode = "sheet";
+    if (!window.location.hash || window.location.hash === "#") {
+      state.activeSheet = "inbox";
+    }
+    syncSheetVisibility();
+  }
+
+  if (tgWebApp) {
+    try {
+      tgWebApp.ready();
+      tgWebApp.expand();
+    } catch (_err) {
+      /* ignore */
+    }
+  }
+
+  const tgUserIdParam = urlParams.get("tg_user_id");
+  if (hasInitData || tgUserIdParam) {
+    const unsafeUser = tgWebApp && tgWebApp.initDataUnsafe && tgWebApp.initDataUnsafe.user;
+    const resolvedTgId = (unsafeUser && unsafeUser.id) || (tgUserIdParam ? Number(tgUserIdParam) : null);
+    api("/api/auth/webapp", {
+      method: "POST",
+      body: {
+        init_data: (tgWebApp && tgWebApp.initData) || "",
+        tg_user_id: resolvedTgId,
+        telegram_user_id: resolvedTgId,
+        username: (unsafeUser && unsafeUser.username) || "",
+        first_name: (unsafeUser && unsafeUser.first_name) || "",
+      },
+    })
+      .then((res) => {
+        if (res && res.user) {
+          state.authUser = res.user;
+          renderCrmAuthUI({ authenticated: true, user: res.user, users: state.authUsers || [] });
+        }
+      })
+      .catch(() => {});
+  }
+}
+
 bindV5Events();
 bindLeadgenEvents();
 bindFunnelEvents();
 bindCrmAuthEvents();
+initTelegramMiniApp();
 
 boot();
 

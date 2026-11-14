@@ -1,11 +1,12 @@
 import asyncio
+import base64
 import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
@@ -27,6 +28,7 @@ from app.accounts import (
 from app.accounts import _load as load_account
 from app.tg_web_proxy import register_tg_web_routes
 from app.db import (
+    INBOX_MEDIA_DIR,
     ROOT,
     connect,
     create_pipeline_stage,
@@ -43,7 +45,9 @@ from app.funnel_analytics import (
     sync_dialog_read_receipts,
 )
 from app.inbox import (
+    _filter_crm_only_rows,
     apply_incoming,
+    edit_dialog_message,
     get_inbox_counts,
     get_thread,
     list_inbox,
@@ -52,6 +56,7 @@ from app.inbox import (
     mark_dialog_unread,
     open_dialog_by_lead,
     remember_dialogs,
+    send_dialog_media,
     send_reply,
     start_direct_dialog,
     sync_inbox,
@@ -82,7 +87,7 @@ from app.properties import (
     set_lead_property,
 )
 from app.tools import convert_phones_to_tg, parse_telegram_group
-from app.bot_login import apply_bot_update, operator_status, poll_bot_login
+from app.bot_login import apply_bot_update, handle_bot_reply_to_lead, operator_status, poll_bot_login
 from app.digest import apply_digest_callback, callback_data_from_update, send_morning_digest
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.tasks import create_task, set_task_done
@@ -165,6 +170,7 @@ class StartDirectDialogIn(BaseModel):
 
 class InboxSyncIn(BaseModel):
     account_id: int | None = None
+    crm_only: bool = False
 
 
 class TgCredentialsIn(BaseModel):
@@ -269,6 +275,22 @@ class DigestCallbackIn(BaseModel):
 class MessageIn(BaseModel):
     text: str
     reply_to: int | None = None
+    reply_to_msg_id: int | None = None
+
+
+class MessageEditIn(BaseModel):
+    text: str
+
+
+class MediaSendIn(BaseModel):
+    media_type: str = "document"
+    filename: str = "attachment.bin"
+    mime_type: str = ""
+    data_base64: str = ""
+    caption: str = ""
+    duration: int | None = None
+    reply_to: int | None = None
+    reply_to_msg_id: int | None = None
 
 
 class NoteIn(BaseModel):
@@ -1110,7 +1132,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
-        default_view_mode = (
+        default_view_mode = os.getenv("CRM_VIEW_MODE") or (
             "all" if os.getenv("BOT_TOKEN") == "e2e-not-a-secret" else "sheet"
         )
         return templates.TemplateResponse(
@@ -1688,13 +1710,38 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(apply_digest_callback, request.app.state.conn, body.data)
 
     @app.post("/api/digest/webhook")
+    @app.post("/api/bot/webhook")
     async def digest_webhook(request: Request):
         try:
             update = await request.json()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Неизвестное действие") from exc
+        if isinstance(update, dict) and isinstance(update.get("message"), dict) and not update.get("callback_query"):
+            opener = getattr(request.app.state, "digest_opener", None) or getattr(request.app.state, "bot_opener", None)
+            gateway = getattr(request.app.state, "gateway", None)
+            if gateway is None:
+                tg_id, tg_hash = _resolve_tg_creds(request.app.state.conn)
+                if tg_id and tg_hash:
+                    gateway = _resolve_app_gateway(request.app, "telegram")
+            res = await _call_async(
+                handle_bot_reply_to_lead,
+                request.app.state.conn,
+                update,
+                gateway=gateway,
+                opener=opener,
+            )
+            if res.get("replied"):
+                return res
         data = _call(callback_data_from_update, update)
-        return _call(apply_digest_callback, request.app.state.conn, data)
+        cb_q = update.get("callback_query") if isinstance(update, dict) else None
+        chat_id = None
+        if isinstance(cb_q, dict):
+            msg = cb_q.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("chat"), dict) and msg["chat"].get("id") is not None:
+                chat_id = str(msg["chat"]["id"])
+            elif isinstance(cb_q.get("from"), dict) and cb_q["from"].get("id") is not None:
+                chat_id = str(cb_q["from"]["id"])
+        return _call(apply_digest_callback, request.app.state.conn, data, chat_id=chat_id)
 
     @app.get("/api/operator")
     def operator_get(request: Request):
@@ -1722,6 +1769,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         provider: str | None = None,
         status: str | None = None,
         with_counts: bool = False,
+        crm_only: bool = False,
     ):
         if account_id is None or account_id == 0:
             rows = request.app.state.conn.execute(
@@ -1740,6 +1788,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             provider,
             status,
             with_counts,
+            crm_only=bool(crm_only),
         )
 
     @app.get("/api/inbox/counts")
@@ -1749,6 +1798,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         q: str = "",
         provider: str | None = None,
         status: str | None = None,
+        crm_only: bool = False,
     ):
         counts = _call(
             get_inbox_counts,
@@ -1757,6 +1807,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             q,
             provider,
             status,
+            crm_only=bool(crm_only),
         )
         return {"counts": counts, **counts}
 
@@ -1771,9 +1822,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return _call(mark_dialog_read, request.app.state.conn, dialog_id)
 
     @app.get("/api/inbox/events")
-    async def inbox_events(request: Request, account_id: int = 0):
+    async def inbox_events(request: Request, account_id: int = 0, crm_only: bool = False):
         try:
-            list_inbox(request.app.state.conn, account_id, "")
+            list_inbox(request.app.state.conn, account_id, "", crm_only=bool(crm_only))
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
         if account_id == 0:
@@ -1790,7 +1841,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             queue = hub.subscribe(account_id)
             try:
                 yield _sse("live", {"ok": _watch_alive(request.app, account_id)})
-                yield _sse("snapshot", list_inbox(request.app.state.conn, account_id, ""))
+                yield _sse(
+                    "snapshot",
+                    list_inbox(request.app.state.conn, account_id, "", crm_only=bool(crm_only)),
+                )
                 while True:
                     try:
                         dialog = await asyncio.wait_for(queue.get(), timeout=15)
@@ -1800,6 +1854,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         yield _sse("live", {"ok": _watch_alive(request.app, account_id)})
                         yield ": ping\n\n"
                         continue
+                    if crm_only and isinstance(dialog, dict):
+                        if not _filter_crm_only_rows(request.app.state.conn, [dialog]):
+                            continue
                     yield _sse("dialog", dialog)
             finally:
                 hub.unsubscribe(account_id, queue)
@@ -1850,6 +1907,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     async def inbox_sync_now(request: Request, body: InboxSyncIn | None = None):
         conn = request.app.state.conn
         target_id = body.account_id if body is not None else None
+        crm_only = bool(body.crm_only) if body is not None else False
         if target_id is None or int(target_id) == 0:
             rows = conn.execute(
                 "SELECT id FROM accounts WHERE status = 'connected'"
@@ -1858,11 +1916,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 aid = int(r["id"])
                 request.app.state.inbox_synced.discard(aid)
                 await start_account_watch(request.app, aid)
-            return {"synced": len(rows), "dialogs": list_inbox(conn, 0, "")}
+            return {"synced": len(rows), "dialogs": list_inbox(conn, 0, "", crm_only=crm_only)}
         aid = int(target_id)
         request.app.state.inbox_synced.discard(aid)
         await start_account_watch(request.app, aid)
-        return {"synced": 1, "dialogs": list_inbox(conn, aid, "")}
+        return {"synced": 1, "dialogs": list_inbox(conn, aid, "", crm_only=crm_only)}
 
     @app.post("/api/settings/tg-credentials")
     def settings_set_tg_credentials(body: TgCredentialsIn, request: Request):
@@ -1928,8 +1986,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             get_thread, conn, dialog_id, gateway
         )
 
-    @app.post("/api/dialogs/{dialog_id}/messages")
-    async def dialog_send(dialog_id: int, body: MessageIn, request: Request):
+    def _resolve_dialog_gateway(dialog_id: int, request: Request):
         conn = request.app.state.conn
         demo_row = conn.execute(
             """
@@ -1943,8 +2000,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         tg_id, tg_hash = _resolve_tg_creds(conn)
         has_tg_creds = bool(tg_id and tg_hash)
         if demo_row and str(demo_row["provider"] or "telegram").strip().lower() == "whatsapp":
-            gateway = _gateway_for_provider(request, "whatsapp")
-        elif (
+            return _gateway_for_provider(request, "whatsapp")
+        if (
             demo_row
             and request.app.state.gateway is None
             and (
@@ -1952,16 +2009,140 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 or not has_tg_creds
             )
         ):
-            gateway = None
-        else:
-            gateway = _gateway(request)
+            return None
+        return _gateway(request)
+
+    @app.post("/api/dialogs/{dialog_id}/messages")
+    async def dialog_send(dialog_id: int, body: MessageIn, request: Request):
+        conn = request.app.state.conn
+        gateway = _resolve_dialog_gateway(dialog_id, request)
+        reply_target = body.reply_to if body.reply_to is not None else body.reply_to_msg_id
         return await _call_async(
             send_reply,
             conn,
             dialog_id,
             body.text,
             gateway,
-            body.reply_to,
+            reply_target,
+        )
+
+    @app.patch("/api/dialogs/{dialog_id}/messages/{telegram_message_id}")
+    async def dialog_edit_message(
+        dialog_id: int,
+        telegram_message_id: int,
+        body: MessageEditIn,
+        request: Request,
+    ):
+        conn = request.app.state.conn
+        gateway = _resolve_dialog_gateway(dialog_id, request)
+        return await _call_async(
+            edit_dialog_message,
+            conn,
+            dialog_id,
+            telegram_message_id,
+            body.text,
+            gateway,
+        )
+
+    @app.post("/api/dialogs/{dialog_id}/media")
+    async def dialog_send_media(dialog_id: int, body: MediaSendIn, request: Request):
+        conn = request.app.state.conn
+        gateway = _resolve_dialog_gateway(dialog_id, request)
+        raw_b64 = (body.data_base64 or "").strip()
+        if "," in raw_b64 and raw_b64.startswith("data:"):
+            raw_b64 = raw_b64.split(",", 1)[1]
+        try:
+            file_bytes = base64.b64decode(raw_b64) if raw_b64 else b""
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный base64 файл") from exc
+        reply_target = body.reply_to if body.reply_to is not None else body.reply_to_msg_id
+        return await _call_async(
+            send_dialog_media,
+            conn,
+            dialog_id,
+            file_bytes,
+            body.filename,
+            mime_type=body.mime_type,
+            media_type=body.media_type,
+            caption=body.caption,
+            duration=body.duration,
+            reply_to=reply_target,
+            gateway=gateway,
+        )
+
+    @app.get("/media/inbox/{filename}")
+    def serve_inbox_media_file(filename: str):
+        safe_name = Path(filename).name
+        target = INBOX_MEDIA_DIR / safe_name
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="Медиафайл не найден")
+        return FileResponse(target, headers={"Content-Security-Policy": "sandbox"})
+
+    @app.get("/api/dialogs/{dialog_id}/messages/{telegram_message_id}/media")
+    async def dialog_get_message_media(
+        dialog_id: int,
+        telegram_message_id: int,
+        request: Request,
+    ):
+        conn = request.app.state.conn
+        msg_row = conn.execute(
+            """
+            SELECT m.*, d.peer_id, d.account_id, a.session_path
+            FROM messages m
+            JOIN dialogs d ON d.id = m.dialog_id
+            JOIN accounts a ON a.id = d.account_id
+            WHERE m.dialog_id = ? AND m.telegram_message_id = ?
+            LIMIT 1
+            """,
+            (dialog_id, telegram_message_id),
+        ).fetchone()
+        if msg_row is None:
+            raise HTTPException(status_code=404, detail="Сообщение не найдено")
+
+        media_url = str(msg_row["media_url"] or "").strip()
+        if media_url.startswith("/media/inbox/"):
+            local_file = INBOX_MEDIA_DIR / Path(media_url).name
+            if local_file.exists() and local_file.is_file():
+                return FileResponse(
+                    local_file,
+                    media_type=msg_row["media_mime"] or "application/octet-stream",
+                    filename=msg_row["media_filename"] or local_file.name,
+                )
+
+        INBOX_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        mtype = str(msg_row["media_type"] or "document").lower()
+        ext = ".ogg" if mtype == "voice" else (".mp4" if mtype in ("video", "video_note") else (".jpg" if mtype == "photo" else ".bin"))
+        dest_path = INBOX_MEDIA_DIR / f"dlg{dialog_id}_msg{telegram_message_id}{ext}"
+        if not dest_path.exists():
+            try:
+                gateway = _resolve_dialog_gateway(dialog_id, request)
+            except Exception:
+                gateway = None
+            if gateway is not None and hasattr(gateway, "download_message_media"):
+                dl_res = await gateway.download_message_media(
+                    msg_row["session_path"],
+                    int(msg_row["peer_id"]),
+                    int(telegram_message_id),
+                    str(dest_path),
+                )
+                if isinstance(dl_res, dict) and dl_res.get("file_path"):
+                    actual_path = Path(dl_res["file_path"])
+                    if actual_path.exists():
+                        rel_url = f"/media/inbox/{actual_path.name}"
+                        conn.execute(
+                            "UPDATE messages SET media_url = ? WHERE id = ?",
+                            (rel_url, int(msg_row["id"])),
+                        )
+                        conn.commit()
+                        return FileResponse(
+                            actual_path,
+                            media_type=dl_res.get("media_mime") or msg_row["media_mime"] or "application/octet-stream",
+                            filename=dl_res.get("media_filename") or msg_row["media_filename"] or actual_path.name,
+                        )
+
+        return Response(
+            content=b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+            media_type=msg_row["media_mime"] or ("audio/ogg" if mtype == "voice" else "application/octet-stream"),
         )
 
     @app.get("/api/outreach/schedule")

@@ -8,10 +8,11 @@
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
   <link rel="stylesheet" href="/static/app.css">
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
 </head>
 <body class="auth-page-body">
   <main class="auth-page-wrap">
-    <section class="surface-box auth-card stack" aria-labelledby="auth-card-title">
+    <section class="surface-box auth-card stack" aria-labelledby="auth-card-title" style="max-width: 420px; margin: 0 auto;">
       <div class="auth-card-header">
         <div class="ws-header auth-ws-brand">
           <span class="ws-logo" aria-hidden="true">F</span>
@@ -21,56 +22,53 @@
           </div>
         </div>
         <div class="row">
-          <span id="auth-current-badge" class="badge b-new">Проверка сессии...</span>
+          <span id="auth-current-badge" class="badge b-new" hidden>Проверка сессии...</span>
           <button type="button" id="auth-theme-btn" class="btn ghost sm">Тема</button>
         </div>
       </div>
 
       <div id="pane-login" class="auth-tab-pane stack">
-        <div class="stack">
-          <span class="steps-caption">БЫСТРЫЙ ВЫБОР ПРОФИЛЯ КОМАНДЫ:</span>
-          <div class="auth-presets-grid">
-            <button type="button" class="auth-preset-card" data-preset-user="tim">
-              <div class="row">
-                <strong>Тимофей</strong>
-                <span class="badge b-won">Owner · Admin</span>
-              </div>
-              <code>@tim</code>
-              <span class="hint">Полный доступ, Лидген, MCP, Рассылки</span>
-            </button>
-            <button type="button" class="auth-preset-card" data-preset-user="vlad">
-              <div class="row">
-                <strong>Влад</strong>
-                <span class="badge b-talk">Sales · Партнёр</span>
-              </div>
-              <code>@vlad</code>
-              <span class="hint">Воронка сделок, Переписки, Созвоны</span>
-            </button>
-            <button type="button" class="auth-preset-card" data-preset-user="operator">
-              <div class="row">
-                <strong>Оператор</strong>
-                <span class="badge b-new">Outreach</span>
-              </div>
-              <code>@operator</code>
-              <span class="hint">Аутрич, Очереди рассылок, Чаты</span>
-            </button>
-          </div>
-        </div>
-
         <form id="login-page-form" class="stack">
-          <div class="outreach-form-row">
-            <label for="login-username">Логин
-              <input id="login-username" name="username" type="text" autocomplete="username" placeholder="tim, vlad или operator" value="tim" required>
-            </label>
-            <label for="login-password">Пароль
-              <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Введите пароль" value="" required>
-            </label>
-          </div>
+          <label for="login-password">Пароль или быстрый PIN
+            <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Введите пароль или PIN доступа" value="" required autofocus>
+          </label>
+
           <div class="row">
-            <button type="submit" id="login-submit-btn" class="btn primary sm">Войти в Foldesk CRM</button>
-            <button type="button" id="login-logout-btn" class="btn ghost sm" hidden>Выйти из текущего аккаунта</button>
+            <button type="submit" id="login-submit-btn" class="btn primary sm" style="width: 100%; justify-content: center;">Войти</button>
+            <button type="button" id="login-logout-btn" class="btn ghost sm" hidden>Выйти</button>
           </div>
-          <p class="hint">Доступ только для команды Foldesk. Новые аккаунты создаёт администратор внутри CRM.</p>
+
+          <details class="login-advanced-toggle">
+            <summary>Войти по логину сотрудника</summary>
+            <div class="stack" style="margin-top: 10px;">
+              <label for="login-username">Логин сотрудника
+                <input id="login-username" name="username" type="text" autocomplete="username" placeholder="tim, vlad или operator (необязательно)" value="">
+              </label>
+              <div class="auth-presets-grid">
+                <button type="button" class="auth-preset-card" data-preset-user="tim">
+                  <div class="row">
+                    <strong>Тимофей</strong>
+                    <span class="badge b-won">Admin</span>
+                  </div>
+                  <code>@tim</code>
+                </button>
+                <button type="button" class="auth-preset-card" data-preset-user="vlad">
+                  <div class="row">
+                    <strong>Влад</strong>
+                    <span class="badge b-talk">Sales</span>
+                  </div>
+                  <code>@vlad</code>
+                </button>
+                <button type="button" class="auth-preset-card" data-preset-user="operator">
+                  <div class="row">
+                    <strong>Оператор</strong>
+                    <span class="badge b-new">Outreach</span>
+                  </div>
+                  <code>@operator</code>
+                </button>
+              </div>
+            </div>
+          </details>
         </form>
       </div>
 
@@ -82,11 +80,6 @@
           <span id="auth-users-count" class="badge b-ok">0 акк.</span>
         </div>
         <div id="auth-users-list" class="auth-users-list"></div>
-      </div>
-
-      <div class="auth-footer-row">
-        <a href="/" class="btn secondary sm">← Открыть рабочий стол CRM</a>
-        <span class="hint">Сессия сохраняется в защищённом HttpOnly cookie <code>foldesk_auth</code></span>
       </div>
     </section>
   </main>
@@ -139,6 +132,29 @@
         return data;
       }
 
+      async function tryTelegramWebAppAutoLogin() {
+        const initData = window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData;
+        if (!initData) return false;
+        try {
+          if (window.Telegram.WebApp.ready) window.Telegram.WebApp.ready();
+          if (window.Telegram.WebApp.expand) window.Telegram.WebApp.expand();
+          showMsg("Вход через Telegram Mini App...", false);
+          const res = await apiCall("/api/auth/webapp", "POST", { init_data: initData });
+          if (res && res.authenticated) {
+            try {
+              if (res.user) localStorage.setItem("foldesk_crm_user", JSON.stringify(res.user));
+            } catch (_err) {
+              /* ignore */
+            }
+            window.location.href = "/";
+            return true;
+          }
+        } catch (err) {
+          showMsg(err.message || "Не удалось войти через Telegram Mini App", true);
+        }
+        return false;
+      }
+
       async function doLogin(username, password) {
         const btn = document.querySelector("#login-submit-btn");
         if (btn) btn.disabled = true;
@@ -151,7 +167,7 @@
               /* ignore */
             }
           }
-          showMsg("Вход выполнен: " + (res.user?.display_name || username) + ". Переход в CRM...", false);
+          showMsg("Вход выполнен: " + (res.user?.display_name || username || "CRM") + ". Переход...", false);
           window.location.href = "/";
         } catch (err) {
           showMsg(err.message || "Ошибка входа", true);
@@ -180,8 +196,8 @@
           e.preventDefault();
           const u = document.getElementById("login-username")?.value.trim() || "";
           const p = document.getElementById("login-password")?.value || "";
-          if (!u || !p) {
-            showMsg("Введите логин и пароль", true);
+          if (!p) {
+            showMsg("Введите пароль или PIN доступа", true);
             return;
           }
           doLogin(u, p);
@@ -204,52 +220,32 @@
       }
 
       async function loadAuthMe() {
+        const autoLogged = await tryTelegramWebAppAutoLogin();
+        if (autoLogged) return;
         try {
           const data = await apiCall("/api/auth/me", "GET");
           const badge = document.querySelector("#auth-current-badge");
           if (badge) {
             if (data.authenticated && data.user) {
+              badge.hidden = false;
               badge.textContent = "Активен: " + (data.user.display_name || data.user.username);
               badge.className = "badge b-ok";
               if (logoutBtn) logoutBtn.hidden = false;
             } else {
-              badge.textContent = "Требуется вход";
-              badge.className = "badge b-wait";
+              badge.hidden = true;
               if (logoutBtn) logoutBtn.hidden = true;
             }
           }
-          const card = document.querySelector("#auth-users-card");
-          const list = document.querySelector("#auth-users-list");
-          const cnt = document.querySelector("#auth-users-count");
-          const users = Array.isArray(data.users) ? data.users : [];
-          if (card) card.hidden = users.length === 0;
-          if (cnt) cnt.textContent = users.length + " акк.";
-          if (list) {
-            list.replaceChildren();
-            users.forEach((u) => {
-              const row = document.createElement("div");
-              row.className = "auth-user-pill";
-              const nameEl = document.createElement("strong");
-              nameEl.textContent = u.display_name || u.username;
-              const codeEl = document.createElement("code");
-              codeEl.textContent = "@" + u.username;
-              const roleBadge = document.createElement("span");
-              roleBadge.className = "badge " + (u.role === "admin" ? "b-won" : u.role === "sales" ? "b-talk" : "b-new");
-              roleBadge.textContent = u.role || "operator";
-              row.append(nameEl, codeEl, roleBadge);
-              list.append(row);
-            });
-          }
         } catch (_err) {
-          const badge = document.querySelector("#auth-current-badge");
-          if (badge) {
-            badge.textContent = "Требуется вход";
-            badge.className = "badge b-wait";
-          }
+          /* ignore */
         }
       }
 
-      loadAuthMe();
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", loadAuthMe);
+      } else {
+        loadAuthMe();
+      }
     })();
   </script>
 </body>
