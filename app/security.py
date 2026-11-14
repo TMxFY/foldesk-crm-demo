@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hmac
 import os
+import sqlite3
+import threading
 import time
 import urllib.parse
 
@@ -322,11 +324,29 @@ def register_security_middleware(app: FastAPI) -> None:
                 from app.crm_auth import resolve_request_crm_user
 
                 conn = getattr(request.app.state, "conn", None)
-                user = (
-                    resolve_request_crm_user(conn, request)
-                    if conn is not None
-                    else None
-                )
+                user = None
+                if conn is not None:
+                    auth_lock = getattr(request.app.state, "_auth_db_lock", None)
+                    if auth_lock is None:
+                        auth_lock = threading.Lock()
+                        request.app.state._auth_db_lock = auth_lock
+                    with auth_lock:
+                        auth_conn = getattr(request.app.state, "_auth_conn", None)
+                        if auth_conn is None:
+                            try:
+                                db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+                            except Exception:
+                                db_file = ""
+                            if db_file and db_file not in (":memory:", ""):
+                                auth_conn = sqlite3.connect(
+                                    db_file, check_same_thread=False, timeout=30.0
+                                )
+                                auth_conn.row_factory = sqlite3.Row
+                                auth_conn.execute("PRAGMA busy_timeout = 30000")
+                                request.app.state._auth_conn = auth_conn
+                            else:
+                                auth_conn = conn
+                        user = resolve_request_crm_user(auth_conn, request)
                 api_mcp_ok = path.startswith("/api/") and has_valid_mcp_api_key(request)
                 if not api_mcp_ok:
                     if user is None:
