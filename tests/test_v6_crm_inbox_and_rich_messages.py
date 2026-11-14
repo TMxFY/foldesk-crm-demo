@@ -640,6 +640,13 @@ def test_api_endpoints_crm_only_edit_and_media_and_bot_webhook(conn, tmp_path, m
     assert r_crm.status_code == 200
     data_crm = r_crm.json()
     assert [d["username"] for d in data_crm["dialogs"]] == ["api_lead_user"]
+    assert data_crm["dialogs"][0]["avatar_url"] == f"/api/dialogs/{dlg_id}/avatar"
+
+    r_avatar = client.get(f"/api/dialogs/{dlg_id}/avatar")
+    assert r_avatar.status_code == 200
+    assert "image/svg+xml" in r_avatar.headers.get("content-type", "")
+    assert b"<svg" in r_avatar.content
+    assert b"AL" in r_avatar.content
 
     # 2. Send message with reply_to_msg_id and edit it via PATCH
     r_send = client.post(
@@ -683,6 +690,14 @@ def test_api_endpoints_crm_only_edit_and_media_and_bot_webhook(conn, tmp_path, m
     )
     assert r_fetch_media.status_code == 200
     assert r_fetch_media.content == b"OggS-test-voice-stream"
+
+    r_fetch_playable = client.get(
+        f"/api/dialogs/{dlg_id}/messages/{m_json['telegram_message_id']}/media?playable=1"
+    )
+    assert r_fetch_playable.status_code == 200
+    assert "audio/wav" in r_fetch_playable.headers.get("content-type", "")
+    assert r_fetch_playable.content[:4] == b"RIFF"
+    assert len(r_fetch_playable.content) > 256
 
     # 4. Bot webhook reply via POST /api/bot/webhook
     r_bot_cb = client.post(

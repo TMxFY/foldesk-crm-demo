@@ -471,10 +471,11 @@
             <button type="button" class="chip session-pill" data-session-account="all" aria-pressed="true">Все сессии</button>
           </div>
 
-          <form id="tg-web-new-chat-form" class="tg-web-new-chat-bar" aria-label="Написать новому контакту в Telegram">
+          <form id="tg-web-new-chat-form" class="tg-web-new-chat-bar" aria-label="Написать новому контакту в Telegram" hidden>
             <input id="tg-web-handle" name="handle" type="text" autocomplete="off" placeholder="Написать в Telegram: @username или +телефон..." aria-label="Ник или телефон для нового чата">
             <button type="submit" id="tg-web-open-btn" class="btn primary sm">Начать чат</button>
           </form>
+          <form id="new-chat-form" class="row tg-web-new-chat-bar" hidden></form>
 
           <section id="search" class="search-panel" aria-labelledby="search-title">
             <div class="search-top">
@@ -564,7 +565,7 @@
                   </div>
                   <div class="reply-media-group">
                     <input type="file" id="reply-file-input" hidden>
-                    <button type="button" id="reply-attach-btn" class="btn secondary sm" title="Прикрепить файл, фото или аудио">📎 Файл</button>
+                    <button type="button" id="reply-attach-btn" class="btn secondary sm" title="Прикрепить файл, фото или аудио">📎 Прикрепить файл</button>
                     <button type="button" id="reply-voice-btn" class="btn secondary sm" title="Записать голосовое сообщение">🎤 Голосовое</button>
                     <span id="reply-voice-timer" class="voice-timer" hidden>● 0:00</span>
                   </div>
@@ -582,8 +583,9 @@
 
         <div class="inspector-col">
           <section id="s06" class="surface-box" aria-labelledby="s06-title">
-            <div class="pane-head">
-              <h2 id="s06-title">Рядом с чатом</h2>
+            <div class="pane-head row">
+              <h2 id="s06-title">Карточка сделки и заметки</h2>
+              <button type="button" id="close-deal-popup-btn" class="btn ghost sm">✕ Закрыть</button>
             </div>
             <div id="side-view" data-state="empty">
               <p data-when="empty" class="hint empty-state">Выберите разговор</p>
@@ -1089,7 +1091,24 @@
 
             <div class="surface-subcard stack outreach-queue-card">
               <div class="subcard-head all-only-flex">
-                <h3>3. Очередь и запуск</h3>
+                <h3>3. Витрина рассылок и запуск</h3>
+              </div>
+              <div id="outreach-filter-bar" class="outreach-filter-bar" role="region" aria-label="Фильтр рассылок">
+                <div class="outreach-filter-pills" role="group" aria-label="Статус рассылок">
+                  <button type="button" class="chip is-active" data-outreach-filter="all" aria-pressed="true">Все</button>
+                  <button type="button" class="chip" data-outreach-filter="active" aria-pressed="false">🟢 Активные</button>
+                  <button type="button" class="chip" data-outreach-filter="autopilot" aria-pressed="false">🤖 Автопилот</button>
+                  <button type="button" class="chip" data-outreach-filter="draft" aria-pressed="false">📝 Черновики</button>
+                  <button type="button" class="chip" data-outreach-filter="done" aria-pressed="false">✅ Завершённые</button>
+                </div>
+                <input
+                  type="search"
+                  id="outreach-search-input"
+                  class="outreach-search-input"
+                  autocomplete="off"
+                  placeholder="Поиск рассылки по названию..."
+                  aria-label="Поиск рассылки по названию"
+                >
               </div>
               <div id="campaigns-view" data-state="empty">
                 <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
@@ -1276,7 +1295,7 @@
           <div class="surface-subcard stack leadgen-col">
             <div class="subcard-head">
               <div class="row">
-                <h3>Источники B2B и стартапов</h3>
+                <h3>🏢 Источники B2B и стартапов</h3>
                 <span id="b2b-active-count-badge" class="badge b-ok">9/9</span>
               </div>
               <div class="row">
@@ -1287,81 +1306,6 @@
                   <span class="badge b-ok" data-switch-pill="b2b-enabled">ВКЛ</span>
                 </label>
               </div>
-            </div>
-
-            <div id="leadgen-b2b-sources-grid" class="leadgen-compact-sources">
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="tg_ad_spy" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>TG Ad Spy</strong>
-                  <span class="leadgen-src-tag">Посевы и TG Ads</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="channel_graph" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>TG Channel Graph</strong>
-                  <span class="leadgen-src-tag">Смежные админы</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="tg_groups" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>TG-группы фаундеров</strong>
-                  <span class="leadgen-src-tag">Авторы и чаты</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="social_x_reddit" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>X / Reddit Social</strong>
-                  <span class="leadgen-src-tag">Запросы трафика</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="yc_ph" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>YC &amp; Product Hunt</strong>
-                  <span class="leadgen-src-tag">Свежие релизы</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="meta_ads" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>Meta Ads Library</strong>
-                  <span class="leadgen-src-tag">FB / IG креативы</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="tg_comments" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>Комментарии TG</strong>
-                  <span class="leadgen-src-tag">Дискуссии каналов</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="buyer_catalogs" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>SaaS &amp; Whop</strong>
-                  <span class="leadgen-src-tag">Маркетплейсы</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-b2b-source="linkedin_jobs" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>LinkedIn Hiring</strong>
-                  <span class="leadgen-src-tag">Найм в маркетинг</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
             </div>
 
             <div class="leadgen-inline-routing">
@@ -1381,12 +1325,90 @@
                 <input type="number" id="leadgen-b2b-daily-limit" min="1" max="500" value="30">
               </label>
             </div>
+
+            <details class="leadgen-sources-spoiler" id="leadgen-b2b-sources-spoiler">
+              <summary id="leadgen-b2b-sources-summary">⚙️ Выбрать конкретные источники (включено 9 из 9)</summary>
+              <div id="leadgen-b2b-sources-grid" class="leadgen-compact-sources">
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="tg_ad_spy" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>TG Ad Spy</strong>
+                    <span class="leadgen-src-tag">Посевы и TG Ads</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="channel_graph" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>TG Channel Graph</strong>
+                    <span class="leadgen-src-tag">Смежные админы</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="tg_groups" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>TG-группы фаундеров</strong>
+                    <span class="leadgen-src-tag">Авторы и чаты</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="social_x_reddit" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>X / Reddit Social</strong>
+                    <span class="leadgen-src-tag">Запросы трафика</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="yc_ph" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>YC &amp; Product Hunt</strong>
+                    <span class="leadgen-src-tag">Свежие релизы</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="meta_ads" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>Meta Ads Library</strong>
+                    <span class="leadgen-src-tag">FB / IG креативы</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="tg_comments" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>Комментарии TG</strong>
+                    <span class="leadgen-src-tag">Дискуссии каналов</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="buyer_catalogs" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>SaaS &amp; Whop</strong>
+                    <span class="leadgen-src-tag">Маркетплейсы</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-b2b-source="linkedin_jobs" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>LinkedIn Hiring</strong>
+                    <span class="leadgen-src-tag">Найм в маркетинг</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+              </div>
+            </details>
           </div>
 
           <div class="surface-subcard stack leadgen-col">
             <div class="subcard-head">
               <div class="row">
-                <h3>TG-Вакансии и авто-отклик</h3>
+                <h3>💼 TG-Вакансии и авто-отклик</h3>
                 <span id="vac-active-count-badge" class="badge b-ok">4/4</span>
               </div>
               <div class="row">
@@ -1397,71 +1419,74 @@
               </div>
             </div>
 
-            <div id="leadgen-vac-layers-grid" class="leadgen-compact-sources leadgen-compact-sources-2col">
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-vac-layer="AI-контент" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>AI-видео, UGC и рилсы</strong>
-                  <span class="leadgen-src-tag">Креаторы · Аватары</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-vac-layer="автоматизация" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>Автоматизация и боты</strong>
-                  <span class="leadgen-src-tag">n8n · Make · Агенты</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-vac-layer="трафик" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>Трафик и воронки</strong>
-                  <span class="leadgen-src-tag">SMM · Контент-заводы</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" data-vac-layer="AI-роль" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>AI-роли в продукт</strong>
-                  <span class="leadgen-src-tag">Head of GenAI · Lead</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" id="leadgen-vac-remote-only" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>Только удалёнка</strong>
-                  <span class="leadgen-src-tag">Без офиса/гибрида</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-              <label class="leadgen-switch-row">
-                <input type="checkbox" id="leadgen-vac-hot-priority" checked>
-                <div class="leadgen-switch-copy">
-                  <strong>Приоритет горячих</strong>
-                  <span class="leadgen-src-tag">Прямые фаундеры</span>
-                </div>
-                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
-              </label>
-            </div>
-
             <div class="leadgen-inline-routing leadgen-inline-routing-3">
-              <label for="leadgen-vac-touch-mode">Режим AI-отклика
+              <label for="leadgen-vac-touch-mode">Касание (AI-отклик)
                 <select id="leadgen-vac-touch-mode">
                   <option value="direct">Полный отклик с кейсами (шаг 1)</option>
                   <option value="micro_ping">Короткий вопрос → кейсы (шаг 2)</option>
                 </select>
               </label>
-              <label for="leadgen-vac-campaign">Кампания рассылки
+              <label for="leadgen-vac-campaign">TG-кампания
                 <input type="text" id="leadgen-vac-campaign" value="TG Вакансии">
               </label>
               <label for="leadgen-vac-daily-limit">Лимит/сут
                 <input type="number" id="leadgen-vac-daily-limit" min="1" max="500" value="20">
               </label>
             </div>
+
+            <details class="leadgen-sources-spoiler" id="leadgen-vac-layers-spoiler">
+              <summary id="leadgen-vac-layers-summary">⚙️ Фильтры тематик вакансий (включено 4 из 4)</summary>
+              <div id="leadgen-vac-layers-grid" class="leadgen-compact-sources leadgen-compact-sources-2col">
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-vac-layer="AI-контент" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>AI-видео, UGC и рилсы</strong>
+                    <span class="leadgen-src-tag">Креаторы · Аватары</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-vac-layer="автоматизация" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>Автоматизация и боты</strong>
+                    <span class="leadgen-src-tag">n8n · Make · Агенты</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-vac-layer="трафик" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>Трафик и воронки</strong>
+                    <span class="leadgen-src-tag">SMM · Контент-заводы</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" data-vac-layer="AI-роль" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>AI-роли в продукт</strong>
+                    <span class="leadgen-src-tag">Head of GenAI · Lead</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" id="leadgen-vac-remote-only" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>Только удалёнка</strong>
+                    <span class="leadgen-src-tag">Без офиса/гибрида</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+                <label class="leadgen-switch-row">
+                  <input type="checkbox" id="leadgen-vac-hot-priority" checked>
+                  <div class="leadgen-switch-copy">
+                    <strong>Приоритет горячих</strong>
+                    <span class="leadgen-src-tag">Прямые фаундеры</span>
+                  </div>
+                  <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+                </label>
+              </div>
+            </details>
           </div>
         </div>
 
@@ -1974,7 +1999,7 @@
         <div class="pane-head funnel-head-bar">
           <div class="pipeline-title-row">
             <h2 id="funnel-title">Воронка и Лидген</h2>
-            <span class="badge b-ok">SSOT · Прочтения · A/B Варианты</span>
+            <span class="badge b-ok">Путь клиента: от базы до ответа</span>
             <span id="funnel-ssot-badge" class="badge b-new">Загрузка…</span>
           </div>
           <div class="funnel-filters-bar">
@@ -1988,11 +2013,11 @@
               <span class="funnel-filter-caption">Этап воронки</span>
               <select id="funnel-stage-filter" aria-label="Этап воронки">
                 <option value="all">Все этапы</option>
-                <option value="queued">В очереди / Не отправлено</option>
-                <option value="sent_unread">Отправлено · Не прочитано</option>
-                <option value="read_no_reply">Прочитано · Без ответа</option>
-                <option value="replied_no_call">Ответил · Без созвона</option>
-                <option value="positive_or_call">Интерес / Созвон / Сделка</option>
+                <option value="queued">1. В базе (очередь)</option>
+                <option value="sent_unread">2. Отправлено 1-е касание</option>
+                <option value="read_no_reply">3. Прочитали</option>
+                <option value="replied_no_call">4. Ответили</option>
+                <option value="positive_or_call">5. Интерес / Созвон</option>
               </select>
             </label>
             <label class="funnel-filter-field" for="funnel-variant-filter">
@@ -2046,79 +2071,20 @@
           </div>
         </div>
 
-        <div id="funnel-stages-bar" class="funnel-stages-bar" role="group" aria-label="Распределение по 5 этапам воронки"></div>
-
-        <div class="funnel-analytics-split">
-          <div class="surface-subcard funnel-panel stack">
-            <div class="subcard-head">
-              <h3>Ежедневный приток и качество лидов</h3>
-              <span id="funnel-intake-badge" class="badge b-new">—</span>
-            </div>
-            <div class="funnel-table-wrap">
-              <table class="funnel-table funnel-compact-table">
-                <thead>
-                  <tr>
-                    <th>Дата</th>
-                    <th>Добавлено</th>
-                    <th>Ср. ICP балл</th>
-                    <th>Источники</th>
-                  </tr>
-                </thead>
-                <tbody id="funnel-daily-intake-tbody">
-                  <tr><td colspan="4" class="hint">Загрузка данных…</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="funnel-right-stack stack">
-            <div class="surface-subcard funnel-panel stack">
-              <div class="subcard-head">
-                <h3>Причины остановки в воронке (Обратная связь)</h3>
-                <span id="funnel-dropoff-badge" class="badge b-talk">Диагностика</span>
-              </div>
-              <div id="funnel-steps-strip" class="funnel-steps-strip"></div>
-              <div id="funnel-dropoff-list" class="funnel-dropoff-list">
-                <p class="hint">Загрузка причин…</p>
-              </div>
-            </div>
-
-            <div class="surface-subcard funnel-panel stack">
-              <div class="subcard-head">
-                <h3>Сравнение сообщений и A/B вариантов</h3>
-                <span id="funnel-variants-badge" class="badge b-ok">Конверсия шаблонов</span>
-              </div>
-              <div class="funnel-table-wrap">
-                <table class="funnel-table funnel-compact-table">
-                  <thead>
-                    <tr>
-                      <th>Вариант</th>
-                      <th>В очереди</th>
-                      <th>Отправлено</th>
-                      <th>Прочитано %</th>
-                      <th>Ответили %</th>
-                      <th>Интерес/Созвон %</th>
-                    </tr>
-                  </thead>
-                  <tbody id="funnel-variants-tbody">
-                    <tr><td colspan="6" class="hint">Загрузка вариантов…</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
+        <div id="funnel-stage-strip" class="funnel-stage-strip" aria-label="Воронка по шагам">
+          <div id="funnel-stages-bar" class="funnel-stages-bar" role="group" aria-label="Распределение по 5 этапам воронки"></div>
         </div>
 
         <div id="funnel-leads-card" class="surface-subcard funnel-panel stack">
           <div class="subcard-head">
             <div class="row">
-              <h3>Детальный трекинг каждого лида</h3>
+              <h3>Список людей на выбранном этапе</h3>
               <span id="funnel-leads-count-badge" class="badge b-new">—</span>
             </div>
             <button type="button" id="funnel-reset-filters-btn" class="btn ghost sm" hidden>Сбросить фильтры</button>
           </div>
           <div class="funnel-table-wrap">
-            <table class="funnel-table funnel-leads-table">
+            <table id="funnel-leads-table" class="funnel-table funnel-leads-table">
               <thead>
                 <tr>
                   <th>Лид / Продукт</th>
@@ -2136,6 +2102,71 @@
             </table>
           </div>
         </div>
+
+        <details class="surface-subcard funnel-advanced-spoiler">
+          <summary>📊 Подробная статистика по дням, шагам и A/B-шаблонам (нажмите, чтобы развернуть)</summary>
+          <div class="funnel-analytics-split">
+            <div class="surface-subcard funnel-panel stack">
+              <div class="subcard-head">
+                <h3>Ежедневный приток и качество лидов ICP</h3>
+                <span id="funnel-intake-badge" class="badge b-new">—</span>
+              </div>
+              <div class="funnel-table-wrap">
+                <table class="funnel-table funnel-compact-table">
+                  <thead>
+                    <tr>
+                      <th>Дата</th>
+                      <th>Добавлено</th>
+                      <th>Ср. ICP балл</th>
+                      <th>Источники</th>
+                    </tr>
+                  </thead>
+                  <tbody id="funnel-daily-intake-tbody">
+                    <tr><td colspan="4" class="hint">Загрузка данных…</td></tr>
+                  </tbody>
+                  <tbody id="funnel-daily-tbody" hidden></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="funnel-right-stack stack">
+              <div class="surface-subcard funnel-panel stack" id="funnel-dropoff-steps">
+                <div class="subcard-head">
+                  <h3>Причины остановки в воронке Step 1/2/3</h3>
+                  <span id="funnel-dropoff-badge" class="badge b-talk">Диагностика</span>
+                </div>
+                <div id="funnel-steps-strip" class="funnel-steps-strip"></div>
+                <div id="funnel-dropoff-list" class="funnel-dropoff-list">
+                  <p class="hint">Загрузка причин…</p>
+                </div>
+              </div>
+
+              <div class="surface-subcard funnel-panel stack">
+                <div class="subcard-head">
+                  <h3>Сравнение сообщений и A/B вариантов</h3>
+                  <span id="funnel-variants-badge" class="badge b-ok">Конверсия шаблонов</span>
+                </div>
+                <div class="funnel-table-wrap">
+                  <table class="funnel-table funnel-compact-table">
+                    <thead>
+                      <tr>
+                        <th>Вариант</th>
+                        <th>В очереди</th>
+                        <th>Отправлено</th>
+                        <th>Прочитано %</th>
+                        <th>Ответили %</th>
+                        <th>Интерес/Созвон %</th>
+                      </tr>
+                    </thead>
+                    <tbody id="funnel-variants-tbody">
+                      <tr><td colspan="6" class="hint">Загрузка вариантов…</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </details>
       </section>
     </main>
   </div>

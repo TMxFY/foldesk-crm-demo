@@ -48,6 +48,8 @@ from app.inbox import (
     _filter_crm_only_rows,
     apply_incoming,
     edit_dialog_message,
+    ensure_playable_voice_wav,
+    get_dialog_avatar,
     get_inbox_counts,
     get_thread,
     list_inbox,
@@ -2071,12 +2073,46 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
     @app.get("/media/inbox/{filename}")
-    def serve_inbox_media_file(filename: str):
+    def serve_inbox_media_file(filename: str, request: Request):
         safe_name = Path(filename).name
         target = INBOX_MEDIA_DIR / safe_name
         if not target.exists() or not target.is_file():
             raise HTTPException(status_code=404, detail="Медиафайл не найден")
+        playable_flag = str(request.query_params.get("playable") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if playable_flag:
+            wav_bytes = ensure_playable_voice_wav(
+                target.read_bytes(),
+                cache_key=Path(safe_name).stem,
+            )
+            return Response(
+                content=wav_bytes,
+                media_type="audio/wav",
+                headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+            )
         return FileResponse(target, headers={"Content-Security-Policy": "sandbox"})
+
+    @app.get("/api/dialogs/{dialog_id}/avatar")
+    async def dialog_avatar_get(dialog_id: int, request: Request):
+        conn = request.app.state.conn
+        try:
+            gateway = _resolve_dialog_gateway(dialog_id, request)
+        except Exception:
+            gateway = None
+        data, mime = await _call_async(
+            get_dialog_avatar,
+            conn,
+            dialog_id,
+            gateway=gateway,
+        )
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
 
     @app.get("/api/dialogs/{dialog_id}/messages/{telegram_message_id}/media")
     async def dialog_get_message_media(
@@ -2099,50 +2135,80 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         if msg_row is None:
             raise HTTPException(status_code=404, detail="Сообщение не найдено")
 
+        playable_flag = str(request.query_params.get("playable") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        mtype = str(msg_row["media_type"] or "document").lower()
         media_url = str(msg_row["media_url"] or "").strip()
+        resolved_local: Path | None = None
+        resolved_mime: str | None = msg_row["media_mime"]
+        resolved_filename: str | None = msg_row["media_filename"]
+
         if media_url.startswith("/media/inbox/"):
             local_file = INBOX_MEDIA_DIR / Path(media_url).name
             if local_file.exists() and local_file.is_file():
-                return FileResponse(
-                    local_file,
-                    media_type=msg_row["media_mime"] or "application/octet-stream",
-                    filename=msg_row["media_filename"] or local_file.name,
-                )
+                resolved_local = local_file
 
-        INBOX_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-        mtype = str(msg_row["media_type"] or "document").lower()
-        ext = ".ogg" if mtype == "voice" else (".mp4" if mtype in ("video", "video_note") else (".jpg" if mtype == "photo" else ".bin"))
-        dest_path = INBOX_MEDIA_DIR / f"dlg{dialog_id}_msg{telegram_message_id}{ext}"
-        if not dest_path.exists():
-            try:
-                gateway = _resolve_dialog_gateway(dialog_id, request)
-            except Exception:
-                gateway = None
-            if gateway is not None and hasattr(gateway, "download_message_media"):
-                dl_res = await gateway.download_message_media(
-                    msg_row["session_path"],
-                    int(msg_row["peer_id"]),
-                    int(telegram_message_id),
-                    str(dest_path),
-                )
-                if isinstance(dl_res, dict) and dl_res.get("file_path"):
-                    actual_path = Path(dl_res["file_path"])
-                    if actual_path.exists():
-                        rel_url = f"/media/inbox/{actual_path.name}"
-                        conn.execute(
-                            "UPDATE messages SET media_url = ? WHERE id = ?",
-                            (rel_url, int(msg_row["id"])),
-                        )
-                        conn.commit()
-                        return FileResponse(
-                            actual_path,
-                            media_type=dl_res.get("media_mime") or msg_row["media_mime"] or "application/octet-stream",
-                            filename=dl_res.get("media_filename") or msg_row["media_filename"] or actual_path.name,
-                        )
+        if resolved_local is None:
+            INBOX_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            ext = ".ogg" if mtype == "voice" else (".mp4" if mtype in ("video", "video_note") else (".jpg" if mtype == "photo" else ".bin"))
+            dest_path = INBOX_MEDIA_DIR / f"dlg{dialog_id}_msg{telegram_message_id}{ext}"
+            wav_cand = INBOX_MEDIA_DIR / f"dlg{dialog_id}_msg{telegram_message_id}.wav"
+            if wav_cand.exists() and wav_cand.is_file():
+                resolved_local = wav_cand
+                resolved_mime = resolved_mime or "audio/wav"
+            elif dest_path.exists() and dest_path.is_file():
+                resolved_local = dest_path
+            else:
+                try:
+                    gateway = _resolve_dialog_gateway(dialog_id, request)
+                except Exception:
+                    gateway = None
+                if gateway is not None and hasattr(gateway, "download_message_media"):
+                    dl_res = await gateway.download_message_media(
+                        msg_row["session_path"],
+                        int(msg_row["peer_id"]),
+                        int(telegram_message_id),
+                        str(dest_path),
+                    )
+                    if isinstance(dl_res, dict) and dl_res.get("file_path"):
+                        actual_path = Path(dl_res["file_path"])
+                        if actual_path.exists():
+                            rel_url = f"/media/inbox/{actual_path.name}"
+                            conn.execute(
+                                "UPDATE messages SET media_url = ? WHERE id = ?",
+                                (rel_url, int(msg_row["id"])),
+                            )
+                            conn.commit()
+                            resolved_local = actual_path
+                            resolved_mime = dl_res.get("media_mime") or resolved_mime
+                            resolved_filename = dl_res.get("media_filename") or resolved_filename
+
+        if playable_flag and mtype in ("voice", "audio"):
+            raw_bytes = resolved_local.read_bytes() if (resolved_local and resolved_local.exists()) else b""
+            wav_bytes = ensure_playable_voice_wav(
+                raw_bytes,
+                cache_key=f"dlg{dialog_id}_msg{telegram_message_id}",
+                text_hint=str(msg_row["text"] or ""),
+            )
+            return Response(
+                content=wav_bytes,
+                media_type="audio/wav",
+                headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+            )
+
+        if resolved_local is not None and resolved_local.exists():
+            return FileResponse(
+                resolved_local,
+                media_type=resolved_mime or "application/octet-stream",
+                filename=resolved_filename or resolved_local.name,
+            )
 
         return Response(
             content=b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00",
-            media_type=msg_row["media_mime"] or ("audio/ogg" if mtype == "voice" else "application/octet-stream"),
+            media_type=resolved_mime or ("audio/ogg" if mtype == "voice" else "application/octet-stream"),
         )
 
     @app.get("/api/outreach/schedule")

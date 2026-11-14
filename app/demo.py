@@ -740,6 +740,37 @@ def seed_demo(conn) -> dict:
             )
             message_count += 1
 
+        if d_spec["username"] == "denis_fb":
+            from app.db import INBOX_MEDIA_DIR
+            from app.inbox import ensure_playable_voice_wav
+
+            voice_mid = 1006
+            voice_sent = _iso(now_dt + timedelta(minutes=-10))
+            voice_text = "Голосовое по запуску пилота и созвону в Zoom"
+            voice_url = f"/api/dialogs/{dialog_id}/messages/{voice_mid}/media"
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    dialog_id, telegram_message_id, direction, text,
+                    media_url, media_type, media_mime, media_filename, media_duration,
+                    sent_at, reply_to_telegram_message_id, created_at, updated_at
+                ) VALUES (?, ?, 'in', ?, ?, 'voice', 'audio/wav', 'voice_1006.wav', 6, ?, NULL, ?, ?)
+                """,
+                (dialog_id, voice_mid, voice_text, voice_url, voice_sent, voice_sent, voice_sent),
+            )
+            message_count += 1
+            try:
+                wav_bytes = ensure_playable_voice_wav(
+                    b"",
+                    f"dlg{dialog_id}_msg{voice_mid}",
+                    text_hint=voice_text,
+                )
+                INBOX_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+                (INBOX_MEDIA_DIR / f"dlg{dialog_id}_msg{voice_mid}.wav").write_bytes(wav_bytes)
+                (INBOX_MEDIA_DIR / f"dlg{dialog_id}_msg{voice_mid}.ogg").write_bytes(wav_bytes)
+            except Exception:
+                pass
+
     end_of_day = now_dt.replace(hour=23, minute=59, second=50, microsecond=0)
     today_due_1 = min(now_dt + timedelta(hours=2), end_of_day - timedelta(seconds=20))
     today_due_2 = min(now_dt + timedelta(hours=4), end_of_day)

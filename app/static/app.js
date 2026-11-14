@@ -2351,7 +2351,7 @@ async function updateCampaignAccounts(campaignId, accountIds) {
   }
 }
 
-function renderCampaigns() {
+function renderFullCampaignCards(onlyCampaignId = null) {
   const list = document.querySelector("#campaign-list");
   if (!list) return;
   list.replaceChildren();
@@ -2362,7 +2362,10 @@ function renderCampaigns() {
     return;
   }
   const connectedAccounts = dedupeConnectedAccounts(state.accounts.filter((item) => item.status === "connected"));
-  state.campaigns.forEach((camp) => {
+  const itemsToRender = onlyCampaignId != null
+    ? state.campaigns.filter((c) => Number(c.id) === Number(onlyCampaignId))
+    : state.campaigns;
+  itemsToRender.forEach((camp) => {
     const statusPair = CAMPAIGN_STATUS_LABEL[camp.status] || [camp.status, "b-new"];
     const attachedAccounts = resolveCampaignAccounts(camp);
     const attachedIds = attachedAccounts.map((item) => Number(item.id));
@@ -3342,12 +3345,35 @@ function renderDialogs() {
       el("span", { className: "preview" }, [sub]),
       metaTags.length ? el("span", { className: "dialog-meta-row" }, metaTags) : null,
     ].filter(Boolean));
+    const initialsNode = el("span", { className: "avatar-initials" }, [initials(name)]);
+    const avatarImg = el("img", {
+      className: "avatar-img",
+      src: `/api/dialogs/${dialog.id}/avatar`,
+      alt: "",
+      loading: "lazy",
+      onload: () => {
+        initialsNode.hidden = true;
+      },
+      onerror: () => {
+        avatarImg.hidden = true;
+        initialsNode.hidden = false;
+      },
+    });
+    if (dialog.id) {
+      initialsNode.hidden = true;
+    } else {
+      avatarImg.hidden = true;
+    }
+    const avatarNode = el("span", { className: "avatar dialog-avatar", "aria-hidden": "true" }, [
+      avatarImg,
+      initialsNode,
+    ]);
     const button = el("button", {
       type: "button",
       className: "dialog",
       onclick: () => selectDialog(dialog, { markRead: true }),
     }, [
-      el("span", { className: "avatar", "aria-hidden": "true" }, [initials(name)]),
+      avatarNode,
       who,
     ]);
     if (current) button.setAttribute("aria-current", "true");
@@ -3472,17 +3498,49 @@ function buildVoiceMessageNode(dialog, message) {
   const msgId = message.telegram_message_id || message.id || 0;
   const mediaUrl = message.media_url
     || (dialog && dialog.id && msgId ? `/api/dialogs/${dialog.id}/messages/${msgId}/media` : "");
+  const playableUrl = mediaUrl ? `${mediaUrl}${mediaUrl.includes("?") ? "&" : "?"}playable=1` : "";
   const meta = (message.media_meta && typeof message.media_meta === "object") ? message.media_meta : {};
   const durationSec = Number(message.media_duration || meta.duration || 8) || 8;
   const waveform = Array.isArray(meta.waveform) && meta.waveform.length
     ? meta.waveform.slice(0, 24)
     : [28, 52, 74, 42, 88, 64, 92, 50, 35, 78, 95, 60, 44, 82, 70, 38, 62, 86, 54, 72, 48, 66, 40, 30];
 
-  const audioEl = mediaUrl ? el("audio", { preload: "none", src: mediaUrl }, []) : null;
+  const audioEl = playableUrl ? el("audio", { preload: "auto", src: playableUrl }, []) : null;
   let playing = false;
   let simTimer = 0;
   let currentRateIdx = 0;
   const rates = [1, 1.5, 2];
+
+  const playFallbackVoiceTone = () => {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      if (ctx.state === "suspended" && typeof ctx.resume === "function") {
+        ctx.resume().catch(() => {});
+      }
+      const now = ctx.currentTime;
+      const notes = [220, 260, 240, 280, 210];
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, now + i * 0.14);
+        gain.gain.setValueAtTime(0.001, now + i * 0.14);
+        gain.gain.exponentialRampToValueAtTime(0.12, now + i * 0.14 + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + (i + 1) * 0.14);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + i * 0.14);
+        osc.stop(now + (i + 1) * 0.14);
+      });
+      window.setTimeout(() => {
+        if (typeof ctx.close === "function") ctx.close().catch(() => {});
+      }, 900);
+    } catch (_e) {
+      /* ignore WebAudio errors */
+    }
+  };
 
   const playBtn = el("button", {
     type: "button",
@@ -3525,6 +3583,7 @@ function buildVoiceMessageNode(dialog, message) {
     let elapsed = 0;
     const rate = rates[currentRateIdx] || 1;
     window.clearInterval(simTimer);
+    if (barsNodes.length) barsNodes[0].classList.add("is-active");
     simTimer = window.setInterval(() => {
       elapsed += 0.25 * rate;
       const ratio = Math.min(1, elapsed / Math.max(1, durationSec));
@@ -3540,7 +3599,7 @@ function buildVoiceMessageNode(dialog, message) {
   if (audioEl) {
     audioEl.addEventListener("ended", stopPlaybackUI);
     audioEl.addEventListener("timeupdate", () => {
-      if (!audioEl.duration || Number.isNaN(audioEl.duration)) return;
+      if (!audioEl.duration || Number.isNaN(audioEl.duration) || !Number.isFinite(audioEl.duration)) return;
       const ratio = Math.min(1, audioEl.currentTime / audioEl.duration);
       const activeBars = Math.ceil(ratio * barsNodes.length);
       barsNodes.forEach((b, idx) => b.classList.toggle("is-active", idx < activeBars));
@@ -3557,20 +3616,32 @@ function buildVoiceMessageNode(dialog, message) {
       stopPlaybackUI();
       return;
     }
+    document.querySelectorAll("audio").forEach((otherAudio) => {
+      if (otherAudio !== audioEl) {
+        try { otherAudio.pause(); } catch (_e) {}
+      }
+    });
     playing = true;
     playBtn.textContent = "⏸";
     playerBox.classList.add("is-playing");
     if (audioEl) {
+      audioEl.volume = 1.0;
+      audioEl.muted = false;
       audioEl.playbackRate = rates[currentRateIdx] || 1;
+      if (Number.isNaN(audioEl.duration) || !Number.isFinite(audioEl.duration)) {
+        startSimulatedProgress();
+      }
       const playPromise = audioEl.play();
       if (playPromise && typeof playPromise.catch === "function") {
         playPromise.catch(() => {
+          playFallbackVoiceTone();
           startSimulatedProgress();
         });
       } else {
         startSimulatedProgress();
       }
     } else {
+      playFallbackVoiceTone();
       startSimulatedProgress();
     }
   });
@@ -3706,6 +3777,22 @@ function clearReplyOrEditContext() {
   }
 }
 
+function openDealInspectorPopup() {
+  const col = document.querySelector(".inspector-col");
+  const s06 = document.querySelector("#s06");
+  if (col) col.classList.add("is-deal-popup-open");
+  if (s06) s06.classList.add("is-deal-popup-open");
+  document.body.classList.add("has-deal-popup");
+}
+
+function closeDealInspectorPopup() {
+  const col = document.querySelector(".inspector-col");
+  const s06 = document.querySelector("#s06");
+  if (col) col.classList.remove("is-deal-popup-open");
+  if (s06) s06.classList.remove("is-deal-popup-open");
+  document.body.classList.remove("has-deal-popup");
+}
+
 function renderThread() {
   const dialog = state.selectedDialog;
   const error = document.querySelector("#thread-error");
@@ -3732,8 +3819,24 @@ function renderThread() {
       (STATUSES.find(([v]) => v === lead.status) || ["", lead.status])[1],
     ])
     : null;
+  const threadAvatarImg = el("img", {
+    className: "thread-avatar-img",
+    src: `/api/dialogs/${dialog.id}/avatar`,
+    alt: "",
+    onerror: () => {
+      threadAvatarImg.hidden = true;
+    },
+  });
+  if (!dialog.id) threadAvatarImg.hidden = true;
+  const dealPopupBtn = el("button", {
+    type: "button",
+    id: "open-deal-popup-btn",
+    className: "btn secondary sm",
+    onclick: () => openDealInspectorPopup(),
+  }, ["🗂 Карточка и заметки"]);
   document.querySelector("#thread-head").replaceChildren(
     el("div", { className: "thread-title-group" }, [
+      threadAvatarImg,
       channelBadgeEl(provider),
       el("h3", { className: "name" }, [name]),
       stageBadge,
@@ -3741,6 +3844,7 @@ function renderThread() {
     el("div", { className: "thread-head-meta row" }, [
       el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
       el("p", { className: "hint" }, [contactHint]),
+      dealPopupBtn,
     ]),
   );
   const items = state.messages || [];
@@ -6949,57 +7053,106 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
 
   const attachBtn = document.querySelector("#reply-attach-btn");
   const fileInput = document.querySelector("#reply-file-input");
+  const uploadReplyFile = async (file) => {
+    if (!file) return;
+    const dialog = state.selectedDialog;
+    if (!dialog || !dialog.id) {
+      toast("Сначала выберите чат", "error");
+      if (fileInput) fileInput.value = "";
+      return;
+    }
+    if (attachBtn) attachBtn.disabled = true;
+    try {
+      const b64 = await fileToBase64(file);
+      const mime = file.type || "application/octet-stream";
+      const mediaType = mime.startsWith("image/")
+        ? "photo"
+        : (mime.startsWith("audio/") ? "voice" : (mime.startsWith("video/") ? "video" : "document"));
+      const field = document.querySelector("#reply-text");
+      const caption = field ? field.value.trim() : "";
+      const message = await api(`/api/dialogs/${dialog.id}/media`, {
+        method: "POST",
+        body: {
+          media_type: mediaType,
+          filename: file.name,
+          mime_type: mime,
+          data_base64: b64,
+          caption,
+          reply_to_msg_id: state.replyToMessage
+            ? (state.replyToMessage.telegram_message_id || state.replyToMessage.id)
+            : null,
+        },
+      });
+      state.messages = [...(state.messages || []), message];
+      dialog.last_message_preview = message.text || `📎 ${file.name}`;
+      dialog.last_from_peer = 0;
+      dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
+      upsertDialog(dialog);
+      if (field) field.value = "";
+      clearReplyOrEditContext();
+      renderThread();
+      renderDialogs();
+      toast(`Отправлен файл: ${file.name}`, "ok");
+    } catch (err) {
+      toast(err.message || "Ошибка отправки файла", "error");
+    } finally {
+      if (attachBtn) attachBtn.disabled = false;
+      if (fileInput) fileInput.value = "";
+    }
+  };
   if (attachBtn && fileInput) {
     attachBtn.addEventListener("click", () => fileInput.click());
     fileInput.addEventListener("change", async () => {
       const file = fileInput.files && fileInput.files[0];
       if (!file) return;
-      const dialog = state.selectedDialog;
-      if (!dialog || !dialog.id) {
-        toast("Сначала выберите чат", "error");
-        fileInput.value = "";
-        return;
-      }
-      attachBtn.disabled = true;
-      try {
-        const b64 = await fileToBase64(file);
-        const mime = file.type || "application/octet-stream";
-        const mediaType = mime.startsWith("image/")
-          ? "photo"
-          : (mime.startsWith("audio/") ? "voice" : (mime.startsWith("video/") ? "video" : "document"));
-        const field = document.querySelector("#reply-text");
-        const caption = field ? field.value.trim() : "";
-        const message = await api(`/api/dialogs/${dialog.id}/media`, {
-          method: "POST",
-          body: {
-            media_type: mediaType,
-            filename: file.name,
-            mime_type: mime,
-            data_base64: b64,
-            caption,
-            reply_to_msg_id: state.replyToMessage
-              ? (state.replyToMessage.telegram_message_id || state.replyToMessage.id)
-              : null,
-          },
-        });
-        state.messages = [...(state.messages || []), message];
-        dialog.last_message_preview = message.text || `📎 ${file.name}`;
-        dialog.last_from_peer = 0;
-        dialog.last_message_at = (message && message.sent_at) || new Date().toISOString();
-        upsertDialog(dialog);
-        if (field) field.value = "";
-        clearReplyOrEditContext();
-        renderThread();
-        renderDialogs();
-        toast(`Отправлен файл: ${file.name}`, "ok");
-      } catch (err) {
-        toast(err.message || "Ошибка отправки файла", "error");
-      } finally {
-        attachBtn.disabled = false;
-        fileInput.value = "";
+      await uploadReplyFile(file);
+    });
+  }
+
+  const chatPane = document.querySelector("#s05");
+  if (chatPane) {
+    chatPane.addEventListener("dragover", (ev) => {
+      ev.preventDefault();
+      chatPane.classList.add("is-dragover");
+    });
+    chatPane.addEventListener("dragleave", () => {
+      chatPane.classList.remove("is-dragover");
+    });
+    chatPane.addEventListener("drop", async (ev) => {
+      ev.preventDefault();
+      chatPane.classList.remove("is-dragover");
+      const droppedFile = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+      if (droppedFile) {
+        await uploadReplyFile(droppedFile);
       }
     });
   }
+
+  const closeDealPopupBtn = document.querySelector("#close-deal-popup-btn");
+  if (closeDealPopupBtn) {
+    closeDealPopupBtn.addEventListener("click", () => {
+      closeDealInspectorPopup();
+    });
+  }
+  const inspectorCol = document.querySelector(".inspector-col");
+  if (inspectorCol) {
+    inspectorCol.addEventListener("click", (ev) => {
+      if (!inspectorCol.classList.contains("is-deal-popup-open")) return;
+      if (ev.target === inspectorCol || !ev.target.closest("#s06")) {
+        closeDealInspectorPopup();
+      }
+    });
+  }
+  document.addEventListener("click", (ev) => {
+    if (!inspectorCol || !inspectorCol.classList.contains("is-deal-popup-open")) return;
+    if (ev.target.closest && (ev.target.closest("#s06") || ev.target.closest("#open-deal-popup-btn"))) return;
+    closeDealInspectorPopup();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && inspectorCol && inspectorCol.classList.contains("is-deal-popup-open")) {
+      closeDealInspectorPopup();
+    }
+  });
 
   const voiceBtn = document.querySelector("#reply-voice-btn");
   const voiceTimer = document.querySelector("#reply-voice-timer");
@@ -7010,6 +7163,31 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
     let recTimerId = 0;
     let recordingActive = false;
 
+    const pickSupportedVoiceMime = () => {
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/ogg;codecs=opus",
+        "audio/ogg",
+      ];
+      if (typeof window.MediaRecorder === "function" && typeof window.MediaRecorder.isTypeSupported === "function") {
+        for (const candidate of candidates) {
+          try {
+            if (window.MediaRecorder.isTypeSupported(candidate)) return candidate;
+          } catch (_e) {}
+        }
+      }
+      return "audio/ogg";
+    };
+
+    const filenameForVoiceMime = (mimeType) => {
+      const clean = String(mimeType || "").toLowerCase();
+      if (clean.includes("webm")) return "voice.webm";
+      if (clean.includes("mp4") || clean.includes("m4a")) return "voice.m4a";
+      return "voice.ogg";
+    };
+
     const stopVoiceTimer = () => {
       window.clearInterval(recTimerId);
       recordingActive = false;
@@ -7018,9 +7196,11 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
       if (voiceTimer) voiceTimer.hidden = true;
     };
 
-    const sendRecordedVoice = async (base64Audio, durationSec) => {
+    const sendRecordedVoice = async (base64Audio, durationSec, mimeType = "audio/ogg", filename = "") => {
       const dialog = state.selectedDialog;
       if (!dialog || !dialog.id) return;
+      const resolvedMime = mimeType || "audio/ogg";
+      const resolvedFilename = filename || filenameForVoiceMime(resolvedMime);
       voiceBtn.disabled = true;
       try {
         const field = document.querySelector("#reply-text");
@@ -7029,8 +7209,8 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
           method: "POST",
           body: {
             media_type: "voice",
-            filename: `voice_${Date.now()}.ogg`,
-            mime_type: "audio/ogg",
+            filename: resolvedFilename,
+            mime_type: resolvedMime,
             duration: Math.max(1, Math.round(durationSec || 3)),
             data_base64: base64Audio || "T2dnUwACAAAAAAAAAAA=",
             caption,
@@ -7068,7 +7248,8 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
         if (mediaRecorder && mediaRecorder.state !== "inactive") {
           mediaRecorder.stop();
         } else {
-          await sendRecordedVoice("T2dnUwACAAAAAAAAAAA=", elapsedSec);
+          const fallbackMime = pickSupportedVoiceMime();
+          await sendRecordedVoice("T2dnUwACAAAAAAAAAAA=", elapsedSec, fallbackMime, filenameForVoiceMime(fallbackMime));
         }
         return;
       }
@@ -7089,20 +7270,27 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
       if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function" && typeof window.MediaRecorder === "function") {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const chosenMime = pickSupportedVoiceMime();
           audioChunks = [];
-          mediaRecorder = new MediaRecorder(stream);
+          try {
+            mediaRecorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+          } catch (_optErr) {
+            mediaRecorder = new MediaRecorder(stream);
+          }
           mediaRecorder.addEventListener("dataavailable", (ev) => {
             if (ev.data && ev.data.size > 0) audioChunks.push(ev.data);
           });
           mediaRecorder.addEventListener("stop", async () => {
             stream.getTracks().forEach((tr) => tr.stop());
             const elapsedSec = Math.max(1, Math.round((Date.now() - recStartMs) / 1000));
+            const actualMime = (mediaRecorder && mediaRecorder.mimeType) || chosenMime || "audio/ogg";
+            const actualFilename = filenameForVoiceMime(actualMime);
             if (audioChunks.length) {
-              const blob = new Blob(audioChunks, { type: "audio/ogg" });
+              const blob = new Blob(audioChunks, { type: actualMime });
               const b64 = await fileToBase64(blob);
-              await sendRecordedVoice(b64, elapsedSec);
+              await sendRecordedVoice(b64, elapsedSec, actualMime, actualFilename);
             } else {
-              await sendRecordedVoice("T2dnUwACAAAAAAAAAAA=", elapsedSec);
+              await sendRecordedVoice("T2dnUwACAAAAAAAAAAA=", elapsedSec, actualMime, actualFilename);
             }
           });
           mediaRecorder.start();
@@ -11258,6 +11446,10 @@ function syncLeadgenSwitchBadges() {
     b2bCountBadge.textContent = `${b2bOn}/${b2bBoxes.length}`;
     b2bCountBadge.className = `badge ${b2bOn > 0 ? "b-ok" : "b-off"}`;
   }
+  const b2bSummary = document.querySelector("#leadgen-b2b-sources-summary");
+  if (b2bSummary && b2bBoxes.length) {
+    b2bSummary.textContent = `⚙️ Выбрать конкретные источники (включено ${b2bOn} из ${b2bBoxes.length})`;
+  }
 
   const vacBoxes = [...document.querySelectorAll("[data-vac-layer]")];
   const vacOn = vacBoxes.filter((cb) => cb.checked).length;
@@ -11265,6 +11457,10 @@ function syncLeadgenSwitchBadges() {
   if (vacCountBadge && vacBoxes.length) {
     vacCountBadge.textContent = `${vacOn}/${vacBoxes.length}`;
     vacCountBadge.className = `badge ${vacOn > 0 ? "b-ok" : "b-off"}`;
+  }
+  const vacSummary = document.querySelector("#leadgen-vac-layers-summary");
+  if (vacSummary && vacBoxes.length) {
+    vacSummary.textContent = `⚙️ Фильтры тематик вакансий (включено ${vacOn} из ${vacBoxes.length})`;
   }
 
   const statusBadge = document.querySelector("#leadgen-status-badge");
@@ -11904,11 +12100,11 @@ function bindCrmAuthEvents() {
 }
 
 const FUNNEL_STAGE_META = [
-  { key: "queued", label: "В очереди", badge: "b-new" },
-  { key: "sent_unread", label: "Отправлено · Не прочитано", badge: "b-wait" },
-  { key: "read_no_reply", label: "Прочитано · Без ответа", badge: "b-talk" },
-  { key: "replied_no_call", label: "Ответил · Без созвона", badge: "b-ok" },
-  { key: "positive_or_call", label: "Интерес / Созвон", badge: "b-won" },
+  { key: "queued", label: "1. В базе (очередь)", sub: "Ожидают отправки", badge: "b-new" },
+  { key: "sent_unread", label: "2. Отправлено 1-е касание", sub: "Доставлено в личку", badge: "b-wait" },
+  { key: "read_no_reply", label: "3. Прочитали", sub: "Открыли диалог", badge: "b-talk" },
+  { key: "replied_no_call", label: "4. Ответили", sub: "Входящий ответ", badge: "b-ok" },
+  { key: "positive_or_call", label: "5. Интерес / Созвон", sub: "Целевой лид / сделка", badge: "b-won" },
 ];
 
 const FUNNEL_STAGE_BADGE_BY_KEY = {
@@ -12054,8 +12250,8 @@ function renderOutreachFunnel(data) {
   setText("#funnel-kpi-positive", `${summary.positive_rate_pct ?? 0}%`);
   setText("#funnel-kpi-positive-sub", `Интерес / созвон: ${positiveTotal} лидов`);
 
-  // Interactive 5-stage bar
-  const stagesBar = document.querySelector("#funnel-stages-bar");
+  // Interactive 5-stage bar with step arrows
+  const stagesBar = document.querySelector("#funnel-stages-bar") || document.querySelector("#funnel-stage-strip");
   if (stagesBar) {
     const activeStage = state.funnelFilters.stage || "all";
     const allBtn = el(
@@ -12071,14 +12267,18 @@ function renderOutreachFunnel(data) {
       },
       [
         el("span", { className: "funnel-stage-pill-title" }, ["Все лиды"]),
+        el("span", { className: "funnel-stage-pill-sub" }, ["Полная воронка"]),
         el("strong", { className: "funnel-stage-pill-count" }, [String(totalLeads)]),
       ],
     );
     const pills = [allBtn];
-    FUNNEL_STAGE_META.forEach((m) => {
+    FUNNEL_STAGE_META.forEach((m, idx) => {
       const cnt = Number(stages[m.key] || 0);
       const pct = totalLeads > 0 ? Math.round((cnt / totalLeads) * 100) : 0;
       const isAct = activeStage === m.key;
+      if (idx >= 0) {
+        pills.push(el("span", { className: "funnel-stage-step-arrow", "aria-hidden": "true" }, ["→"]));
+      }
       pills.push(
         el(
           "button",
@@ -12094,11 +12294,12 @@ function renderOutreachFunnel(data) {
           },
           [
             el("span", { className: "funnel-stage-pill-title" }, [m.label]),
+            m.sub ? el("span", { className: "funnel-stage-pill-sub" }, [m.sub]) : null,
             el("div", { className: "funnel-stage-pill-metrics" }, [
               el("strong", { className: "funnel-stage-pill-count" }, [String(cnt)]),
               el("span", { className: `badge ${m.badge}` }, [`${pct}%`]),
             ]),
-          ],
+          ].filter(Boolean),
         ),
       );
     });
@@ -12513,9 +12714,278 @@ function initTelegramMiniApp() {
   }
 }
 
+function renderFunnelDashboard(data) {
+  return renderOutreachFunnel(data || state.funnelData);
+}
+
+/* =========================================================================
+ * Outreach 2-Level Campaign Cells + Drill-Down Detail View
+ * ========================================================================= */
+function classifyCampaignStatus(campaign) {
+  const recipients = campaign?.recipients || [];
+  const total = Number(campaign?.total_recipients ?? campaign?.stats?.total ?? recipients.length ?? 0);
+  const inProgress = Number(campaign?.in_progress_count ?? 0);
+  const completed = Number(campaign?.completed_count ?? 0);
+  const replied = Number(campaign?.replied_count ?? campaign?.stats?.replied ?? 0);
+  const sent = Number((inProgress + completed + replied) || campaign?.stats?.sent || 0);
+  const queued = Number(campaign?.pending_count ?? campaign?.stats?.queued ?? Math.max(0, total - sent));
+  const rawStatus = String(campaign?.status || "draft").toLowerCase();
+  const isAutopilot = Boolean(campaign?.autopilot_enabled || rawStatus === "running");
+  const isDone = rawStatus === "completed" || (total > 0 && sent >= total && queued === 0 && inProgress === 0);
+  const isDraft = !isAutopilot && !isDone && rawStatus === "draft" && sent === 0;
+  const isPaused = rawStatus === "paused" && !isAutopilot;
+  const isActive = !isDone && !isDraft && (isAutopilot || rawStatus === "running" || rawStatus === "active" || sent > 0 || queued > 0);
+
+  let badgeLabel = "Черновик";
+  let badgeClass = "b-new";
+  if (isAutopilot) {
+    badgeLabel = "Автопилот";
+    badgeClass = "b-ok";
+  } else if (isDone) {
+    badgeLabel = "Завершена";
+    badgeClass = "b-won";
+  } else if (isPaused) {
+    badgeLabel = "Пауза";
+    badgeClass = "b-wait";
+  } else if (isActive) {
+    badgeLabel = "Активна";
+    badgeClass = "b-ok";
+  }
+
+  return {
+    total,
+    sent,
+    queued,
+    inProgress,
+    replied,
+    isAutopilot,
+    isDone,
+    isDraft,
+    isPaused,
+    isActive,
+    badgeLabel,
+    badgeClass,
+  };
+}
+
+function matchesOutreachFilter(campaign, filterKey, searchQuery) {
+  const q = String(searchQuery || "").trim().toLowerCase();
+  if (q) {
+    const hay = `${campaign.name || ""} ${(campaign.steps || []).map((s) => s.template_text || s.template || "").join(" ")}`.toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  const st = classifyCampaignStatus(campaign);
+  if (filterKey === "active") return st.isActive;
+  if (filterKey === "autopilot") return st.isAutopilot;
+  if (filterKey === "draft") return st.isDraft;
+  if (filterKey === "done") return st.isDone;
+  return true;
+}
+
+function buildCampaignCellCard(campaign) {
+  const st = classifyCampaignStatus(campaign);
+  const attachedAccounts = resolveCampaignAccounts(campaign);
+  const poolSize = attachedAccounts.length;
+  const poolNames = attachedAccounts.map((item) => formatCompactAccountName(item)).join(", ");
+  const defaultCampProvider = /\((wa|whatsapp)\)|whatsapp/i.test(String(campaign.name || "")) ? "whatsapp" : "telegram";
+  const campProviders = attachedAccounts.length
+    ? [...new Set(attachedAccounts.map((acc) => normalizeProvider(acc.provider)))]
+    : [defaultCampProvider];
+  const channelBadges = campProviders.map((prov) => channelBadgeEl(prov));
+  const dailyLimit = Number(campaign.daily_limit) || 20;
+  const sentToday = Number(campaign.sent_today) || 0;
+  const replyPct = st.sent > 0 ? Math.round((st.replied / st.sent) * 100) : 0;
+  const progressPct = st.total > 0 ? Math.min(100, Math.round((st.sent / st.total) * 100)) : 0;
+
+  const recipients = campaign.recipients || [];
+  const compatSummary = recipients
+    .map((r) => [r.name, r.username ? `@${r.username}` : "", r.company, r.website, r.error_text, r.step1_text].filter(Boolean).join(" "))
+    .join(" | ");
+
+  return el("article", { className: "campaign-card campaign-cell", "data-campaign-id": String(campaign.id) }, [
+    el("div", { className: "campaign-cell-head" }, [
+      el("div", { className: "campaign-cell-title-wrap" }, [
+        el("h4", { className: "name campaign-cell-title" }, [campaign.name]),
+      ]),
+      el("div", { className: "campaign-cell-badges" }, [
+        ...channelBadges,
+        el("span", { className: `badge ${st.badgeClass}` }, [st.badgeLabel]),
+      ]),
+    ]),
+    el("div", { className: "campaign-cell-metrics" }, [
+      el("div", { className: "campaign-cell-metric" }, [
+        el("span", { className: "campaign-cell-metric-label" }, ["В базе"]),
+        el("strong", { className: "campaign-cell-metric-val" }, [String(st.total)]),
+      ]),
+      el("div", { className: "campaign-cell-metric" }, [
+        el("span", { className: "campaign-cell-metric-label" }, ["Отправлено"]),
+        el("strong", { className: "campaign-cell-metric-val" }, [String(st.sent)]),
+      ]),
+      el("div", { className: "campaign-cell-metric" }, [
+        el("span", { className: "campaign-cell-metric-label" }, ["В очереди"]),
+        el("strong", { className: "campaign-cell-metric-val" }, [String(st.queued)]),
+      ]),
+      el("div", { className: "campaign-cell-metric" }, [
+        el("span", { className: "campaign-cell-metric-label" }, ["Ответили"]),
+        el("strong", { className: "campaign-cell-metric-val" }, [String(st.replied)]),
+        el("span", { className: "campaign-cell-metric-sub" }, [`${replyPct}%`]),
+      ]),
+    ]),
+    el("div", { className: "campaign-cell-progress-wrap" }, [
+      el("div", { className: "campaign-cell-progress-meta" }, [
+        el("span", {}, [`Отправлено ${st.sent} из ${st.total} · сегодня ${sentToday}/${dailyLimit}`]),
+        el("strong", {}, [`${progressPct}%`]),
+      ]),
+      el("div", { className: "campaign-cell-progress" }, [
+        el("span", { className: "campaign-cell-progress-fill", style: `width: ${progressPct}%` }),
+      ]),
+    ]),
+    el("div", { className: "campaign-cell-footer" }, [
+      el("span", { className: "campaign-cell-pool" }, [
+        poolSize > 0
+          ? `Пул: ${poolSize} ${accountWord(poolSize)} (${poolNames})`
+          : "Аккаунты не выбраны",
+      ]),
+      el("div", { className: "campaign-cell-actions" }, [
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn primary sm",
+            "data-open-campaign-detail": String(campaign.id),
+            onclick: () => {
+              state.selectedOutreachDetailId = campaign.id;
+              state.expandedCampaigns[campaign.id] = true;
+              const sel = document.querySelector("#csv-campaign-select");
+              if (sel) sel.value = String(campaign.id);
+              renderOutreachCampaigns();
+            },
+          },
+          ["Открыть и настроить →"],
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn secondary sm",
+            "data-run-campaign": String(campaign.id),
+            onclick: (e) => runCampaignStep(campaign.id, e.currentTarget),
+          },
+          ["Запустить шаг рассылки"],
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn ghost sm",
+            "data-select-campaign": String(campaign.id),
+            onclick: () => {
+              const sel = document.querySelector("#csv-campaign-select");
+              if (sel) sel.value = String(campaign.id);
+              if (state.viewMode === "sheet") {
+                openSheetPopup("csv");
+              }
+              toast(`Выбрана рассылка «${campaign.name}» для загрузки CSV`, "info");
+            },
+          },
+          ["Выбрать для CSV"],
+        ),
+      ]),
+    ]),
+    compatSummary ? el("div", { className: "campaign-cell-sr-compat" }, [compatSummary]) : null,
+  ]);
+}
+
+function renderOutreachCampaigns() {
+  const list = document.querySelector("#campaign-list");
+  if (!list) return;
+  fillCsvCampaignSelect();
+  updateWorkspaceStats();
+
+  if (!state.campaigns.length) {
+    list.replaceChildren();
+    setView("#campaigns-view", "empty");
+    return;
+  }
+
+  setView("#campaigns-view", "filled");
+
+  const filterKey = state.outreachFilter || "all";
+  const searchQuery = state.outreachSearch || "";
+
+  document.querySelectorAll("[data-outreach-filter]").forEach((btn) => {
+    const isAct = btn.getAttribute("data-outreach-filter") === filterKey;
+    btn.classList.toggle("is-active", isAct);
+    btn.setAttribute("aria-pressed", isAct ? "true" : "false");
+  });
+
+  if (state.selectedOutreachDetailId != null) {
+    const selectedCampaign = state.campaigns.find(
+      (c) => Number(c.id) === Number(state.selectedOutreachDetailId),
+    );
+    if (selectedCampaign) {
+      list.className = "campaign-list campaign-detail-mode";
+      renderFullCampaignCards(selectedCampaign.id);
+      const backBar = el("div", { className: "campaign-detail-back-bar" }, [
+        el(
+          "button",
+          {
+            type: "button",
+            id: "outreach-back-to-grid-btn",
+            "data-back-to-campaigns": "1",
+            className: "btn secondary sm",
+            onclick: () => {
+              state.selectedOutreachDetailId = null;
+              renderOutreachCampaigns();
+            },
+          },
+          ["← Ко всем рассылкам (Витрина ячеек)"],
+        ),
+        el("span", { className: "hint" }, [`Настройка рассылки «${selectedCampaign.name}»`]),
+      ]);
+      list.prepend(backBar);
+      return;
+    }
+    state.selectedOutreachDetailId = null;
+  }
+
+  const filtered = state.campaigns.filter((c) => matchesOutreachFilter(c, filterKey, searchQuery));
+  list.className = "campaign-list outreach-cells-grid";
+  if (!filtered.length) {
+    list.replaceChildren(
+      el("p", { className: "hint empty-state" }, ["По выбранному фильтру рассылок не найдено"]),
+    );
+  } else {
+    list.replaceChildren(...filtered.map((campaign) => buildCampaignCellCard(campaign)));
+  }
+}
+
+function renderCampaigns() {
+  return renderOutreachCampaigns();
+}
+
+function bindOutreachFilterEvents() {
+  document.querySelectorAll("[data-outreach-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.outreachFilter = btn.getAttribute("data-outreach-filter") || "all";
+      state.selectedOutreachDetailId = null;
+      renderOutreachCampaigns();
+    });
+  });
+
+  const searchInput = document.querySelector("#outreach-search-input");
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      state.outreachSearch = searchInput.value || "";
+      renderOutreachCampaigns();
+    });
+  }
+}
+
 bindV5Events();
 bindLeadgenEvents();
 bindFunnelEvents();
+bindOutreachFilterEvents();
 bindCrmAuthEvents();
 initTelegramMiniApp();
 

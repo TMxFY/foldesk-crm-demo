@@ -1,13 +1,200 @@
 import hashlib
+import html
+import io
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sqlite3
+import struct
+import subprocess
+import wave
 
 from app.accounts import check_daily_limit, increment_daily_sent
 from app.db import INBOX_MEDIA_DIR, ROOT, as_dict, normalize_status, utc_now
 from app.telegram_gateway import GatewayError, render_formatted_html
+
+
+DEFAULT_VOICE_RUSSIAN_SPEECH = (
+    "Привет! Посмотрели ваше предложение по видео креативам, "
+    "давайте обсудим запуск пилота сегодня в Зуме."
+)
+
+
+def _synthesize_harmonic_speech_wav(duration_sec: float = 3.2) -> bytes:
+    sample_rate = 24000
+    total_samples = int(sample_rate * duration_sec)
+    buf = io.BytesIO()
+    syllables = [
+        (0.06, 0.34, 165.0),
+        (0.39, 0.72, 196.0),
+        (0.78, 1.18, 220.0),
+        (1.26, 1.68, 185.0),
+        (1.75, 2.24, 207.65),
+        (2.32, 2.95, 174.61),
+    ]
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        frames = bytearray()
+        for i in range(total_samples):
+            t = i / sample_rate
+            val = 0.0
+            for s_start, s_end, f0 in syllables:
+                if s_start <= t <= s_end:
+                    local = (t - s_start) / max(0.01, (s_end - s_start))
+                    env = math.sin(math.pi * local) ** 0.7
+                    vib = 1.0 + 0.012 * math.sin(2.0 * math.pi * 5.4 * t)
+                    freq = f0 * vib
+                    sig = (
+                        0.55 * math.sin(2.0 * math.pi * freq * t)
+                        + 0.28 * math.sin(2.0 * math.pi * (freq * 2.0) * t)
+                        + 0.12 * math.sin(2.0 * math.pi * (freq * 3.0) * t)
+                        + 0.05 * math.sin(2.0 * math.pi * (freq * 4.0) * t)
+                    )
+                    val = env * sig
+                    break
+            sample = max(-32767, min(32767, int(val * 14500)))
+            frames.extend(struct.pack("<h", sample))
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+def ensure_playable_voice_wav(
+    raw_bytes: bytes | None,
+    cache_key: str,
+    text_hint: str = "",
+) -> bytes:
+    raw = bytes(raw_bytes or b"")
+    if len(raw) > 256 and raw[:4] == b"RIFF":
+        return raw
+
+    playable_dir = INBOX_MEDIA_DIR / "playable"
+    playable_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(cache_key or "voice"))[:80] or "voice"
+    cached_wav = playable_dir / f"{safe_key}.wav"
+    if cached_wav.exists() and cached_wav.is_file() and cached_wav.stat().st_size > 256:
+        existing = cached_wav.read_bytes()
+        if existing[:4] == b"RIFF":
+            return existing
+
+    if len(raw) > 256:
+        src_path = playable_dir / f"{safe_key}.input"
+        try:
+            src_path.write_bytes(raw)
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(src_path),
+                    "-ar",
+                    "24000",
+                    "-ac",
+                    "1",
+                    "-f",
+                    "wav",
+                    str(cached_wav),
+                ],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            if cached_wav.exists() and cached_wav.stat().st_size > 256:
+                wav_data = cached_wav.read_bytes()
+                if wav_data[:4] == b"RIFF":
+                    return wav_data
+        except Exception:
+            pass
+        finally:
+            src_path.unlink(missing_ok=True)
+
+    spoken_text = (text_hint or "").strip()
+    if not spoken_text or spoken_text.startswith("🎤") or len(spoken_text) < 10:
+        spoken_text = DEFAULT_VOICE_RUSSIAN_SPEECH
+    elif "Голосовое по запуску пилота" in spoken_text:
+        spoken_text = DEFAULT_VOICE_RUSSIAN_SPEECH
+
+    say_bin = Path("/usr/bin/say")
+    if say_bin.exists():
+        try:
+            subprocess.run(
+                [
+                    str(say_bin),
+                    "-v",
+                    "Milena",
+                    "--data-format=LEI16@24000",
+                    "-o",
+                    str(cached_wav),
+                    spoken_text,
+                ],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            if cached_wav.exists() and cached_wav.stat().st_size > 256:
+                wav_data = cached_wav.read_bytes()
+                if wav_data[:4] == b"RIFF":
+                    return wav_data
+        except Exception:
+            pass
+
+        aiff_path = playable_dir / f"{safe_key}.aiff"
+        try:
+            subprocess.run(
+                [str(say_bin), "-o", str(aiff_path), spoken_text],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            if aiff_path.exists() and aiff_path.stat().st_size > 256:
+                for cmd in (
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(aiff_path),
+                        "-ar",
+                        "24000",
+                        "-ac",
+                        "1",
+                        "-f",
+                        "wav",
+                        str(cached_wav),
+                    ],
+                    [
+                        "/usr/bin/afconvert",
+                        "-f",
+                        "WAVE",
+                        "-d",
+                        "LEI16@24000",
+                        "-c",
+                        "1",
+                        str(aiff_path),
+                        str(cached_wav),
+                    ],
+                ):
+                    try:
+                        subprocess.run(cmd, capture_output=True, timeout=15, check=False)
+                        if cached_wav.exists() and cached_wav.stat().st_size > 256:
+                            wav_data = cached_wav.read_bytes()
+                            if wav_data[:4] == b"RIFF":
+                                return wav_data
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        finally:
+            aiff_path.unlink(missing_ok=True)
+
+    wav_bytes = _synthesize_harmonic_speech_wav()
+    try:
+        cached_wav.write_bytes(wav_bytes)
+    except Exception:
+        pass
+    return wav_bytes
 
 
 def _media_preview_label(
@@ -135,6 +322,7 @@ def _public(row) -> dict:
         "last_message_preview": data["last_message_preview"],
         "last_from_peer": data["last_from_peer"],
         "lead_id": resolved_lead_id,
+        "avatar_url": f"/api/dialogs/{data['id']}/avatar",
     }
     if "account_phone" in data:
         out["account_phone"] = data["account_phone"]
@@ -2584,3 +2772,134 @@ async def start_direct_dialog(
             "dialog_id": dialog.get("id"),
         }
     return {"dialog": dialog, "lead": updated_lead}
+
+
+_AVATAR_GRADIENTS = (
+    ("#312E81", "#4F46E5", "#A5B4FC"),
+    ("#064E3B", "#059669", "#A7F3D0"),
+    ("#1E3A8A", "#2563EB", "#93C5FD"),
+    ("#7C2D12", "#EA580C", "#FDBA74"),
+    ("#701A75", "#C026D3", "#F5D0FE"),
+    ("#0F172A", "#334155", "#E2E8F0"),
+    ("#14532D", "#16A34A", "#BBF7D0"),
+    ("#4C1D95", "#7C3AED", "#DDD6FE"),
+)
+
+
+def _build_dialog_avatar_svg(
+    dialog_id: int,
+    title: str = "",
+    username: str = "",
+    company: str = "",
+    provider: str = "telegram",
+) -> bytes:
+    raw_title = (title or username or f"#{dialog_id}").strip()
+    person_part = raw_title
+    company_part = (company or "").strip()
+    if "·" in raw_title:
+        parts = [p.strip() for p in raw_title.split("·", 1)]
+        person_part = parts[0] or raw_title
+        if not company_part and len(parts) > 1:
+            company_part = parts[1]
+
+    words = [w for w in re.split(r"[\s@._-]+", person_part) if w and any(ch.isalnum() for ch in w)]
+    if len(words) >= 2:
+        initials = (words[0][0] + words[1][0]).upper()
+    elif len(words) == 1:
+        initials = words[0][:2].upper()
+    else:
+        initials = "КЛ"
+
+    seed_str = f"{raw_title.lower()}|{username.lower()}|{dialog_id}"
+    idx = int(hashlib.sha256(seed_str.encode("utf-8")).hexdigest()[:8], 16) % len(_AVATAR_GRADIENTS)
+    c_start, c_end, c_accent = _AVATAR_GRADIENTS[idx]
+
+    badge_label = (company_part[:10] if company_part else ("WA" if provider == "whatsapp" else "TG")).upper()
+    safe_initials = html.escape(initials)
+    safe_badge = html.escape(badge_label)
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80" role="img" aria-label="{safe_initials}">
+  <defs>
+    <linearGradient id="g{dialog_id}" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="{c_start}"/>
+      <stop offset="100%" stop-color="{c_end}"/>
+    </linearGradient>
+  </defs>
+  <rect width="80" height="80" rx="22" fill="url(#g{dialog_id})"/>
+  <circle cx="64" cy="16" r="24" fill="{c_accent}" fill-opacity="0.14"/>
+  <rect x="2" y="2" width="76" height="76" rx="20" fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="1.5"/>
+  <text x="40" y="45" text-anchor="middle" fill="#FFFFFF" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="27" font-weight="700" letter-spacing="0.5">{safe_initials}</text>
+  <rect x="14" y="57" width="52" height="15" rx="7.5" fill="#090D16" fill-opacity="0.48"/>
+  <text x="40" y="67.5" text-anchor="middle" fill="{c_accent}" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="8.5" font-weight="700" letter-spacing="0.6">{safe_badge}</text>
+</svg>"""
+    return svg.encode("utf-8")
+
+
+async def get_dialog_avatar(
+    conn,
+    dialog_id: int,
+    gateway=None,
+) -> tuple[bytes, str]:
+    row = conn.execute(
+        """
+        SELECT d.*,
+               a.session_path, a.status AS account_status, a.provider AS account_provider,
+               l.name AS lead_name, l.company AS lead_company
+        FROM dialogs d
+        LEFT JOIN accounts a ON a.id = d.account_id
+        LEFT JOIN leads l ON l.id = d.lead_id
+        WHERE d.id = ?
+        LIMIT 1
+        """,
+        (int(dialog_id),),
+    ).fetchone()
+    if row is None:
+        raise LookupError("dialog")
+    data = as_dict(row)
+
+    avatars_dir = INBOX_MEDIA_DIR / "avatars"
+    avatars_dir.mkdir(parents=True, exist_ok=True)
+    cached_jpg = avatars_dir / f"dialog_{int(dialog_id)}.jpg"
+    if cached_jpg.exists() and cached_jpg.is_file() and cached_jpg.stat().st_size > 64:
+        return (cached_jpg.read_bytes(), "image/jpeg")
+
+    session_path = str(data.get("session_path") or "").strip()
+    provider = str(data.get("provider") or data.get("account_provider") or "telegram").strip().lower()
+    peer_id = data.get("peer_id")
+    miss_marker = avatars_dir / f"dialog_{int(dialog_id)}.none"
+
+    if (
+        gateway is not None
+        and hasattr(gateway, "download_profile_photo")
+        and data.get("account_status") == "connected"
+        and provider == "telegram"
+        and session_path
+        and not session_path.startswith("data/sessions/demo")
+        and peer_id is not None
+        and not _is_synthetic_peer_id(peer_id)
+        and not miss_marker.exists()
+    ):
+        try:
+            saved = await gateway.download_profile_photo(
+                session_path, int(peer_id), str(cached_jpg)
+            )
+            if saved and Path(str(saved)).exists() and Path(str(saved)).stat().st_size > 64:
+                saved_path = Path(str(saved))
+                if saved_path != cached_jpg:
+                    cached_jpg.write_bytes(saved_path.read_bytes())
+                return (cached_jpg.read_bytes(), "image/jpeg")
+            try:
+                miss_marker.write_bytes(b"0")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    svg_bytes = _build_dialog_avatar_svg(
+        dialog_id=int(dialog_id),
+        title=str(data.get("title") or data.get("lead_name") or ""),
+        username=str(data.get("username") or ""),
+        company=str(data.get("lead_company") or ""),
+        provider=provider,
+    )
+    return (svg_bytes, "image/svg+xml")

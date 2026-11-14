@@ -401,6 +401,11 @@ class TelegramGateway(ABC):
     ) -> dict | None:
         return None
 
+    async def download_profile_photo(
+        self, session_path: str, peer_id: int | str, dest_path: str
+    ) -> str | None:
+        return None
+
     async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
         """Last personal-dialog messages, oldest first. Not groups or channels."""
         raise GatewayError("История не подключена")
@@ -1997,6 +2002,33 @@ class TelethonGateway(TelegramGateway):
                 if owned:
                     await self._close(session_path)
 
+    async def download_profile_photo(
+        self, session_path: str, peer_id: int | str, dest_path: str
+    ) -> str | None:
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                target = (
+                    int(peer_id)
+                    if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+                    else str(peer_id).strip()
+                )
+                entity = await asyncio.wait_for(
+                    client.get_entity(target),
+                    timeout=self._rpc_timeout,
+                )
+                Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+                saved = await asyncio.wait_for(
+                    client.download_profile_photo(entity, file=str(dest_path)),
+                    timeout=self._rpc_timeout,
+                )
+                return str(saved) if saved else None
+            except Exception:
+                return None
+            finally:
+                if owned:
+                    await self._close(session_path)
+
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         async with self._session_lock(session_path):
             for attempt in range(2):
@@ -2200,9 +2232,11 @@ class TelethonGateway(TelegramGateway):
                 if asyncio.iscoroutine(res):
                     await res
 
+            supports_edit = hasattr(client, "get_messages")
             client.add_event_handler(handler, events.NewMessage(incoming=True))
-            client.add_event_handler(edit_handler, events.MessageEdited(incoming=True))
             client.add_event_handler(raw_handler, events.Raw)
+            if supports_edit:
+                client.add_event_handler(edit_handler, events.MessageEdited(incoming=True))
             try:
                 # Difference only: a long outage can miss updates Telegram already dropped.
                 try:
@@ -2214,7 +2248,8 @@ class TelethonGateway(TelegramGateway):
                 listening_event(self, session_path).set()
             except Exception:
                 client.remove_event_handler(handler)
-                client.remove_event_handler(edit_handler)
+                if supports_edit:
+                    client.remove_event_handler(edit_handler)
                 client.remove_event_handler(raw_handler)
                 if self._clients.get(session_path) is client:
                     self._clients.pop(session_path, None)
@@ -2225,7 +2260,8 @@ class TelethonGateway(TelegramGateway):
             await client.run_until_disconnected()
         finally:
             client.remove_event_handler(handler)
-            client.remove_event_handler(edit_handler)
+            if supports_edit:
+                client.remove_event_handler(edit_handler)
             client.remove_event_handler(raw_handler)
             if self._clients.get(session_path) is client:
                 self._clients.pop(session_path, None)
@@ -2836,6 +2872,11 @@ class FakeGateway(TelegramGateway):
             "media_filename": matched.get("media_filename") or dest.name,
             "media_duration": matched.get("media_duration"),
         }
+
+    async def download_profile_photo(
+        self, session_path: str, peer_id: int | str, dest_path: str
+    ) -> str | None:
+        return None
 
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         cap = _history_limit(limit)
