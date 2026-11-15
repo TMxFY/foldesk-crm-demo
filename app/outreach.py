@@ -1,6 +1,7 @@
 import asyncio
 import csv
 from datetime import datetime, timedelta, timezone
+import inspect
 import io
 import json
 import os
@@ -710,43 +711,343 @@ def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> l
     return [as_dict(r) for r in rows]
 
 
+def _norm_ts(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = raw
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(candidate)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        pass
+    return raw[:19].replace(" ", "T")
+
+
 def _dialog_has_client_reply(conn, dialog: dict, rec: dict) -> bool:
+    if not isinstance(dialog, dict) or not isinstance(rec, dict):
+        return False
     current_step = int(rec.get("current_step") or 0)
     last_sent_at = rec.get("last_sent_at")
     if current_step < 1 and not last_sent_at:
         return False
-    ref_ts = str(last_sent_at or rec.get("created_at") or "").strip()
+    ref_ts = _norm_ts(last_sent_at or rec.get("created_at"))
+    raw_dlg_id = dialog.get("id")
+    dlg_id: int | None = None
+    if raw_dlg_id is not None:
+        try:
+            dlg_id = int(raw_dlg_id)
+        except (TypeError, ValueError):
+            dlg_id = None
+
+    in_rows = (
+        conn.execute(
+            "SELECT sent_at FROM messages WHERE dialog_id = ? AND direction = 'in' ORDER BY id DESC LIMIT 200",
+            (dlg_id,),
+        ).fetchall()
+        if dlg_id is not None
+        else []
+    )
     if int(dialog.get("last_from_peer") or 0) == 1:
-        dlg_last_at = str(dialog.get("last_message_at") or "").strip()
+        dlg_last_at = _norm_ts(dialog.get("last_message_at"))
         if ref_ts and dlg_last_at:
             if dlg_last_at >= ref_ts:
                 return True
-        else:
+        elif not dlg_last_at and (dlg_id is None or not in_rows or not ref_ts):
             return True
-    dlg_id = int(dialog["id"])
+
+    if dlg_id is None:
+        return False
     if ref_ts:
-        in_row = conn.execute(
-            """
-            SELECT id FROM messages
-            WHERE dialog_id = ? AND direction = 'in' AND sent_at >= ?
-            LIMIT 1
-            """,
-            (dlg_id, ref_ts),
-        ).fetchone()
-        if in_row is not None:
-            return True
-    elif current_step >= 1:
-        any_in = conn.execute(
-            """
-            SELECT id FROM messages
-            WHERE dialog_id = ? AND direction = 'in'
-            LIMIT 1
-            """,
-            (dlg_id,),
-        ).fetchone()
-        if any_in is not None:
-            return True
+        for row in in_rows:
+            in_ts = _norm_ts(row["sent_at"])
+            if in_ts and in_ts >= ref_ts:
+                return True
+    elif current_step >= 1 and in_rows:
+        return True
     return False
+
+
+def _dialog_is_unread_awaiting_reply(conn, dialog: dict, rec: dict) -> bool:
+    if not _dialog_has_client_reply(conn, dialog, rec):
+        return False
+    if int(dialog.get("last_from_peer") or 0) != 1:
+        return False
+    if int(dialog.get("unread_count") or 0) <= 0:
+        return False
+    raw_dlg_id = dialog.get("id")
+    if raw_dlg_id is None:
+        return True
+    try:
+        dlg_id = int(raw_dlg_id)
+    except (TypeError, ValueError):
+        return True
+    dlg_last_at = _norm_ts(dialog.get("last_message_at"))
+    msg_rows = conn.execute(
+        "SELECT id, direction, sent_at FROM messages WHERE dialog_id = ? ORDER BY id DESC LIMIT 200",
+        (dlg_id,),
+    ).fetchall()
+    if not msg_rows:
+        return True
+
+    def _msg_sort_key(row):
+        return (_norm_ts(row["sent_at"]), int(row["id"] or 0))
+
+    latest = max(msg_rows, key=_msg_sort_key)
+    if str(latest["direction"] or "") == "out":
+        latest_ts = _norm_ts(latest["sent_at"])
+        if not (dlg_last_at and latest_ts and dlg_last_at > latest_ts):
+            return False
+
+    in_rows = [r for r in msg_rows if str(r["direction"] or "") == "in"]
+    out_rows = [r for r in msg_rows if str(r["direction"] or "") == "out"]
+    if in_rows and out_rows:
+        last_in = max(in_rows, key=_msg_sort_key)
+        last_out = max(out_rows, key=_msg_sort_key)
+        in_ts = _norm_ts(last_in["sent_at"])
+        out_ts = _norm_ts(last_out["sent_at"])
+        if out_ts and in_ts and out_ts > in_ts:
+            if not (dlg_last_at and dlg_last_at > out_ts):
+                return False
+    return True
+
+
+def _latest_dialog_in_meta(conn, matched_dlg: dict | None) -> tuple[int | None, str | None]:
+    incoming_tg_msg_id: int | None = None
+    incoming_sent_at: str | None = None
+    if not isinstance(matched_dlg, dict):
+        return None, None
+    raw_dlg_id = matched_dlg.get("id")
+    if raw_dlg_id is not None:
+        try:
+            in_rows = conn.execute(
+                """
+                SELECT id, telegram_message_id, sent_at
+                FROM messages
+                WHERE dialog_id = ? AND direction = 'in'
+                ORDER BY id DESC
+                LIMIT 200
+                """,
+                (int(raw_dlg_id),),
+            ).fetchall()
+            if in_rows:
+                best = max(
+                    in_rows,
+                    key=lambda r: (_norm_ts(r["sent_at"]), int(r["id"] or 0)),
+                )
+                if best["telegram_message_id"] is not None:
+                    incoming_tg_msg_id = int(best["telegram_message_id"])
+                norm_in = _norm_ts(best["sent_at"])
+                if norm_in:
+                    incoming_sent_at = norm_in
+        except (TypeError, ValueError):
+            pass
+    if incoming_sent_at is None and int(matched_dlg.get("last_from_peer") or 0) == 1:
+        norm_dlg_at = _norm_ts(matched_dlg.get("last_message_at"))
+        if norm_dlg_at:
+            incoming_sent_at = norm_dlg_at
+    return incoming_tg_msg_id, incoming_sent_at
+
+
+def _stop_recipient_and_lead_quietly(
+    conn,
+    *,
+    rec: dict,
+    matched_dlg: dict | None,
+    peer_id: Any,
+    lead_id: Any,
+    min_sent_at: str | None = None,
+) -> int:
+    now = utc_now()
+    norm_min = _norm_ts(min_sent_at)
+    rec_last_sent = _norm_ts(rec.get("last_sent_at"))
+    if norm_min and rec_last_sent and rec_last_sent > norm_min:
+        return 0
+
+    eligible_ids: list[int] = []
+    seen_ids: set[int] = set()
+
+    def _collect_eligible(rows) -> None:
+        for row in rows:
+            rid = int(row["id"])
+            if rid in seen_ids:
+                continue
+            row_sent = _norm_ts(row["last_sent_at"])
+            if norm_min and row_sent and row_sent > norm_min:
+                continue
+            seen_ids.add(rid)
+            eligible_ids.append(rid)
+
+    rec_id = rec.get("id")
+    if rec_id is not None:
+        _collect_eligible(
+            conn.execute(
+                """
+                SELECT id, last_sent_at FROM campaign_recipients
+                WHERE id = ? AND status IN ('pending', 'in_progress', 'completed')
+                """,
+                (int(rec_id),),
+            ).fetchall()
+        )
+    if lead_id is not None:
+        _collect_eligible(
+            conn.execute(
+                """
+                SELECT id, last_sent_at FROM campaign_recipients
+                WHERE lead_id = ? AND status IN ('pending', 'in_progress')
+                """,
+                (int(lead_id),),
+            ).fetchall()
+        )
+    peer_int = 0
+    if peer_id is not None:
+        try:
+            peer_int = int(peer_id)
+        except (TypeError, ValueError):
+            peer_int = 0
+    if peer_int > 0:
+        _collect_eligible(
+            conn.execute(
+                """
+                SELECT id, last_sent_at FROM campaign_recipients
+                WHERE telegram_user_id = ? AND status IN ('pending', 'in_progress')
+                """,
+                (peer_int,),
+            ).fetchall()
+        )
+
+    if eligible_ids:
+        ph = ",".join("?" for _ in eligible_ids)
+        conn.execute(
+            f"UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id IN ({ph})",
+            [now, *eligible_ids],
+        )
+
+    if lead_id is not None:
+        conn.execute(
+            """
+            UPDATE leads
+            SET status = 'talking',
+                airtable_status = CASE
+                    WHEN COALESCE(airtable_status, '') IN ('', 'Not started', 'Waiting') THEN 'In conversation'
+                    ELSE airtable_status
+                END,
+                updated_at = ?
+            WHERE id = ? AND status IN ('new', 'waiting')
+            """,
+            (now, int(lead_id)),
+        )
+    if peer_int > 0:
+        conn.execute(
+            """
+            UPDATE leads
+            SET status = 'talking',
+                airtable_status = CASE
+                    WHEN COALESCE(airtable_status, '') IN ('', 'Not started', 'Waiting') THEN 'In conversation'
+                    ELSE airtable_status
+                END,
+                updated_at = ?
+            WHERE telegram_user_id = ? AND status IN ('new', 'waiting')
+            """,
+            (now, peer_int),
+        )
+    raw_dlg_id = matched_dlg.get("id") if isinstance(matched_dlg, dict) else None
+    if raw_dlg_id is not None and lead_id is not None:
+        try:
+            conn.execute(
+                "UPDATE dialogs SET lead_id = ? WHERE id = ? AND lead_id IS NULL",
+                (int(lead_id), int(raw_dlg_id)),
+            )
+        except (TypeError, ValueError):
+            pass
+    return len(eligible_ids)
+
+
+def _stop_outreach_from_dialog_sync(
+    conn,
+    rec: dict,
+    matched_dlg: dict | None,
+    *,
+    account_id: int | None = None,
+    notify: bool = True,
+    opener=None,
+) -> bool:
+    eff_account_id = (
+        (matched_dlg.get("account_id") if matched_dlg else None)
+        or rec.get("sent_account_id")
+        or rec.get("assigned_account_id")
+        or account_id
+    )
+    eff_peer_id = (matched_dlg.get("peer_id") if matched_dlg else None) or rec.get("telegram_user_id")
+    eff_username = (matched_dlg.get("username") if matched_dlg else None) or rec.get("username")
+    eff_phone = (matched_dlg.get("phone") if matched_dlg else None) or rec.get("phone")
+    eff_lead_id = (matched_dlg.get("lead_id") if matched_dlg else None) or rec.get("lead_id")
+    preview = matched_dlg.get("last_message_preview") if matched_dlg else None
+
+    incoming_tg_msg_id, incoming_sent_at = _latest_dialog_in_meta(conn, matched_dlg)
+    rec_last_sent = _norm_ts(rec.get("last_sent_at"))
+    if incoming_sent_at and rec_last_sent and rec_last_sent > incoming_sent_at:
+        return False
+
+    try:
+        sig = inspect.signature(stop_outreach_on_reply)
+        params = sig.parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    if not notify and "notify" not in params:
+        return (
+            _stop_recipient_and_lead_quietly(
+                conn,
+                rec=rec,
+                matched_dlg=matched_dlg,
+                peer_id=eff_peer_id,
+                lead_id=eff_lead_id,
+                min_sent_at=incoming_sent_at,
+            )
+            > 0
+        )
+
+    kwargs: dict[str, Any] = {
+        "account_id": eff_account_id,
+        "peer_id": eff_peer_id,
+        "username": eff_username,
+        "phone": eff_phone,
+        "lead_id": eff_lead_id,
+        "preview": preview,
+    }
+    if "opener" in params:
+        kwargs["opener"] = opener
+    if "min_sent_at" in params and incoming_sent_at:
+        kwargs["min_sent_at"] = incoming_sent_at
+    if "notify" in params:
+        kwargs["notify"] = notify
+    if "incoming_unread" in params:
+        kwargs["incoming_unread"] = notify
+    if "telegram_message_id" in params and incoming_tg_msg_id is not None:
+        kwargs["telegram_message_id"] = incoming_tg_msg_id
+    if "incoming_sent_at" in params and incoming_sent_at:
+        kwargs["incoming_sent_at"] = incoming_sent_at
+    if "source" in params:
+        kwargs["source"] = "outreach_sync"
+
+    stopped = stop_outreach_on_reply(conn, **kwargs)
+    if isinstance(stopped, int) and not isinstance(stopped, bool) and stopped == 0:
+        return False
+    if not notify:
+        _stop_recipient_and_lead_quietly(
+            conn,
+            rec=rec,
+            matched_dlg=matched_dlg,
+            peer_id=eff_peer_id,
+            lead_id=eff_lead_id,
+            min_sent_at=incoming_sent_at,
+        )
+    return True
 
 
 def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None, opener=None) -> int:
@@ -767,28 +1068,27 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
         if not dialogs and account_id is not None:
             # Also check across any account if assigned_account_id or dialog exists elsewhere
             dialogs = _find_recipient_dialogs(conn, rec, account_id=None)
-        has_reply = any(_dialog_has_client_reply(conn, d, rec) for d in dialogs)
-        if has_reply:
-            matched_dlg = next((d for d in dialogs if _dialog_has_client_reply(conn, d, rec)), dialogs[0] if dialogs else None)
-            stop_outreach_on_reply(
+        replied_dialogs = [d for d in dialogs if _dialog_has_client_reply(conn, d, rec)]
+        if replied_dialogs:
+            unread_dialogs = [d for d in replied_dialogs if _dialog_is_unread_awaiting_reply(conn, d, rec)]
+            matched_dlg = unread_dialogs[0] if unread_dialogs else replied_dialogs[0]
+            if _stop_outreach_from_dialog_sync(
                 conn,
-                account_id=(matched_dlg.get("account_id") if matched_dlg else None) or rec.get("sent_account_id") or rec.get("assigned_account_id") or account_id,
-                peer_id=(matched_dlg.get("peer_id") if matched_dlg else None) or rec.get("telegram_user_id"),
-                username=(matched_dlg.get("username") if matched_dlg else None) or rec.get("username"),
-                phone=(matched_dlg.get("phone") if matched_dlg else None) or rec.get("phone"),
-                lead_id=(matched_dlg.get("lead_id") if matched_dlg else None) or rec.get("lead_id"),
-                preview=(matched_dlg.get("last_message_preview") if matched_dlg else None),
+                rec,
+                matched_dlg,
+                account_id=account_id,
+                notify=bool(unread_dialogs),
                 opener=opener,
-            )
-            conn.execute(
-                """
-                UPDATE campaign_recipients
-                SET status = 'replied', updated_at = ?
-                WHERE id = ?
-                """,
-                (now, rec["id"]),
-            )
-            replied_now += 1
+            ):
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'replied', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, rec["id"]),
+                )
+                replied_now += 1
     if replied_now:
         conn.commit()
     return replied_now
@@ -3558,21 +3858,19 @@ async def run_campaign_batch(
                                 except Exception as inner_exc:
                                     if _classify_outreach_send_error(inner_exc)[0] in ("account_dead", "account_transient"):
                                         raise
-                    refreshed_dlg_row = conn.execute(
-                        "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
-                    ).fetchone()
-                    if refreshed_dlg_row is not None:
-                        dialog = as_dict(refreshed_dlg_row)
-                    if _dialog_has_client_reply(conn, dialog, rec):
-                        stop_outreach_on_reply(
-                            conn,
-                            account_id=chosen_account_id,
-                            peer_id=dialog.get("peer_id") or rec.get("telegram_user_id"),
-                            username=dialog.get("username") or rec.get("username"),
-                            phone=dialog.get("phone") or rec.get("phone"),
-                            lead_id=dialog.get("lead_id") or rec.get("lead_id"),
-                            preview=dialog.get("last_message_preview"),
-                        )
+                    if dialog.get("id") is not None:
+                        refreshed_dlg_row = conn.execute(
+                            "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
+                        ).fetchone()
+                        if refreshed_dlg_row is not None:
+                            dialog = as_dict(refreshed_dlg_row)
+                    if _dialog_has_client_reply(conn, dialog, rec) and _stop_outreach_from_dialog_sync(
+                        conn,
+                        rec,
+                        dialog,
+                        account_id=chosen_account_id,
+                        notify=_dialog_is_unread_awaiting_reply(conn, dialog, rec),
+                    ):
                         conn.execute(
                             "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
                             (now, rec["id"]),

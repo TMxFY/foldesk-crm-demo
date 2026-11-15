@@ -1,8 +1,12 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
+import threading
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
@@ -111,12 +115,155 @@ def resolve_outreach_media(media_ref: str) -> Path | str:
     return raw
 
 
+_FALLBACK_CONN_LOCKS: dict[int, threading.RLock] = {}
+_FALLBACK_CONN_LOCKS_GUARD = threading.Lock()
+
+
+def conn_lock(conn: sqlite3.Connection | None) -> threading.RLock | None:
+    if conn is None:
+        return None
+    lock = getattr(conn, "_lock", None)
+    if lock is not None:
+        return lock
+    key = id(conn)
+    with _FALLBACK_CONN_LOCKS_GUARD:
+        lock = _FALLBACK_CONN_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _FALLBACK_CONN_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def locked_conn(conn: sqlite3.Connection | None):
+    lock = conn_lock(conn)
+    if lock is None:
+        yield conn
+        return
+    with lock:
+        yield conn
+
+
+class ThreadSafeCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        with locked_conn(self.connection):
+            return super().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        with locked_conn(self.connection):
+            return super().executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script):
+        with locked_conn(self.connection):
+            return super().executescript(sql_script)
+
+    def fetchone(self):
+        with locked_conn(self.connection):
+            return super().fetchone()
+
+    def fetchmany(self, size=None):
+        with locked_conn(self.connection):
+            if size is None:
+                return super().fetchmany()
+            return super().fetchmany(size)
+
+    def fetchall(self):
+        with locked_conn(self.connection):
+            return super().fetchall()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with locked_conn(self.connection):
+            return super().__next__()
+
+    def close(self):
+        with locked_conn(self.connection):
+            return super().close()
+
+
+class ThreadSafeConnection(sqlite3.Connection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lock = threading.RLock()
+
+    @property
+    def in_transaction(self):
+        with self._lock:
+            return super().in_transaction
+
+    def cursor(self, factory=None):
+        with self._lock:
+            return super().cursor(ThreadSafeCursor if factory is None else factory)
+
+    def execute(self, sql, parameters=()):
+        with self._lock:
+            return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        with self._lock:
+            return self.cursor().executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script):
+        with self._lock:
+            return self.cursor().executescript(sql_script)
+
+    def commit(self):
+        with self._lock:
+            return super().commit()
+
+    def rollback(self):
+        with self._lock:
+            return super().rollback()
+
+    def close(self):
+        with self._lock:
+            return super().close()
+
+    def __enter__(self):
+        with self._lock:
+            return super().__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        with self._lock:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+
+    def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.25):
+        with self._lock:
+            if target is not None and target is not self:
+                with locked_conn(target):
+                    return super().backup(
+                        target, pages=pages, progress=progress, name=name, sleep=sleep
+                    )
+            return super().backup(
+                target, pages=pages, progress=progress, name=name, sleep=sleep
+            )
+
+    def iterdump(self, *args, **kwargs):
+        with self._lock:
+            return iter(list(super().iterdump(*args, **kwargs)))
+
+
 def connect(db_path=None) -> sqlite3.Connection:
-    path = Path(db_path) if db_path else DEFAULT_DB
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    raw = str(db_path or "").strip()
+    is_memory = raw == ":memory:" or "mode=memory" in raw
+    target = raw if is_memory else Path(db_path) if db_path else DEFAULT_DB
+    if not is_memory:
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        target,
+        check_same_thread=False,
+        timeout=30.0,
+        factory=ThreadSafeConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
+    if not is_memory:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -223,6 +370,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             lead_id INTEGER,
             provider TEXT NOT NULL DEFAULT 'telegram',
             phone TEXT,
+            last_read_at TEXT,
+            read_inbox_max_id INTEGER DEFAULT 0,
+            reply_turn_seq INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (account_id, peer_type, peer_id),
@@ -638,6 +788,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "accounts", "system_lang_code", "TEXT")
     _ensure_column(conn, "dialogs", "provider", "TEXT NOT NULL DEFAULT 'telegram'")
     _ensure_column(conn, "dialogs", "phone", "TEXT")
+    _ensure_column(conn, "dialogs", "last_read_at", "TEXT")
+    _ensure_column(conn, "dialogs", "read_inbox_max_id", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "dialogs", "reply_turn_seq", "INTEGER DEFAULT 0")
     _ensure_column(conn, "messages", "external_message_id", "TEXT")
     _ensure_column(conn, "messages", "media_url", "TEXT")
     _ensure_column(conn, "messages", "media_type", "TEXT")
@@ -647,22 +800,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "messages", "entities_json", "TEXT")
     _ensure_column(conn, "messages", "formatted_html", "TEXT")
     _ensure_column(conn, "messages", "edited_at", "TEXT")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bot_reply_notifications (
-            bot_message_id INTEGER NOT NULL,
-            chat_id TEXT NOT NULL,
-            dialog_id INTEGER,
-            lead_id INTEGER,
-            account_id INTEGER,
-            peer_id INTEGER,
-            lead_handle TEXT,
-            account_handle TEXT,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, bot_message_id)
-        )
-        """
+    from app.digest import (
+        ensure_bot_reply_notifications_table,
+        ensure_dialog_notify_columns,
     )
+
+    ensure_dialog_notify_columns(conn)
+    ensure_bot_reply_notifications_table(conn)
     _ensure_column(conn, "campaigns", "account_ids_json", "TEXT")
     _ensure_column(conn, "campaigns", "csv_headers_json", "TEXT")
     _ensure_column(conn, "campaigns", "leadgen_enabled", "INTEGER NOT NULL DEFAULT 0")

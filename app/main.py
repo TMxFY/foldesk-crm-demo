@@ -1,7 +1,10 @@
 import asyncio
 import base64
+import inspect
 import json
 import os
+import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,13 +30,16 @@ from app.accounts import (
 )
 from app.accounts import _load as load_account
 from app.tg_web_proxy import register_tg_web_routes
+import app.inbox as _inbox_mod
 from app.db import (
     INBOX_MEDIA_DIR,
     ROOT,
+    ThreadSafeConnection,
     connect,
     create_pipeline_stage,
     init_db,
     list_pipeline_stages,
+    locked_conn,
     update_pipeline_stage,
     utc_now,
 )
@@ -448,13 +454,14 @@ def _resolve_app_gateway(app, provider: str = "telegram"):
     if not getattr(app.state, "tg_lease_ready", True):
         return None
     conn = getattr(app.state, "conn", None)
-    if not should_enable_live_tg_runtime(conn, None):
-        return None
-    api_id, api_hash = _resolve_tg_creds(conn)
-    if not api_id or not api_hash:
-        return None
-    gateway = TelethonGateway()
-    _seed_gateway_session_strings(conn, gateway)
+    with locked_conn(conn):
+        if not should_enable_live_tg_runtime(conn, None):
+            return None
+        api_id, api_hash = _resolve_tg_creds(conn)
+        if not api_id or not api_hash:
+            return None
+        gateway = TelethonGateway()
+        _seed_gateway_session_strings(conn, gateway)
     app.state.gateway = gateway
     return gateway
 
@@ -469,19 +476,22 @@ def _gateway(request: Request):
             detail="Переключение релиза Telegram-сессий, повторите через 5 сек",
         )
     conn = getattr(request.app.state, "conn", None)
+    with locked_conn(conn):
+        enable_live = should_enable_live_tg_runtime(conn, None)
     if (
-        not should_enable_live_tg_runtime(conn, None)
+        not enable_live
         and "PYTEST_CURRENT_TEST" not in os.environ
     ):
         raise HTTPException(
             status_code=409,
             detail="Локальное подключение Telegram отключено для защиты прод-сессий на Render от AUTH_KEY_DUPLICATED. Задайте ALLOW_LOCAL_TG_SESSIONS=1 для явного локального входа.",
         )
-    api_id, api_hash = _resolve_tg_creds(conn)
-    if not api_id or not api_hash:
-        raise HTTPException(status_code=400, detail=KEYS_DETAIL)
-    gateway = TelethonGateway()
-    _seed_gateway_session_strings(conn, gateway)
+    with locked_conn(conn):
+        api_id, api_hash = _resolve_tg_creds(conn)
+        if not api_id or not api_hash:
+            raise HTTPException(status_code=400, detail=KEYS_DETAIL)
+        gateway = TelethonGateway()
+        _seed_gateway_session_strings(conn, gateway)
     request.app.state.gateway = gateway
     return gateway
 
@@ -499,14 +509,29 @@ def _gateway_for_provider(request: Request, provider: str = "telegram"):
 
 def _gateway_for_account(request: Request, account_id: int):
     try:
-        account = load_account(request.app.state.conn, account_id)
+        with locked_conn(request.app.state.conn):
+            account = load_account(request.app.state.conn, account_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Не найдено") from exc
     return _gateway_for_provider(request, account.get("provider") or "telegram")
 
 
+def _extract_conn(args, kwargs):
+    for val in args:
+        if isinstance(val, sqlite3.Connection):
+            return val
+    for val in kwargs.values():
+        if isinstance(val, sqlite3.Connection):
+            return val
+    return None
+
+
 def _call(func, *args, **kwargs):
+    conn = _extract_conn(args, kwargs)
     try:
+        if conn is not None:
+            with locked_conn(conn):
+                return func(*args, **kwargs)
         return func(*args, **kwargs)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Не найдено") from exc
@@ -527,27 +552,57 @@ async def _call_async(func, *args, **kwargs):
 
 class InboxHub:
     def __init__(self):
+        self._lock = threading.Lock()
         self._subs = {}
+        self._loops = {}
 
     def subscribe(self, account_id: int) -> asyncio.Queue:
         queue = asyncio.Queue()
-        self._subs.setdefault(account_id, set()).add(queue)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        with self._lock:
+            if loop is not None:
+                self._loops[queue] = loop
+            self._subs.setdefault(account_id, set()).add(queue)
         return queue
 
     def unsubscribe(self, account_id: int, queue) -> None:
-        subs = self._subs.get(account_id)
-        if not subs:
-            return
-        subs.discard(queue)
-        if not subs:
-            self._subs.pop(account_id, None)
+        with self._lock:
+            self._loops.pop(queue, None)
+            subs = self._subs.get(account_id)
+            if not subs:
+                return
+            subs.discard(queue)
+            if not subs:
+                self._subs.pop(account_id, None)
 
     def publish(self, account_id: int, dialog: dict) -> None:
-        for queue in list(self._subs.get(account_id, ())):
-            queue.put_nowait(dict(dialog))
-        if account_id != 0:
-            for queue in list(self._subs.get(0, ())):
-                queue.put_nowait(dict(dialog))
+        if not isinstance(dialog, dict):
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        with self._lock:
+            targets = [
+                (queue, self._loops.get(queue))
+                for queue in list(self._subs.get(account_id, ()))
+            ]
+            if account_id != 0:
+                targets.extend(
+                    (queue, self._loops.get(queue))
+                    for queue in list(self._subs.get(0, ()))
+                )
+
+        for queue, loop in targets:
+            item = dict(dialog)
+            if loop is not None and loop is not running_loop and not loop.is_closed():
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+            else:
+                queue.put_nowait(item)
 
 
 def _watch_alive(app, account_id: int) -> bool:
@@ -565,6 +620,66 @@ def _sse(event: str, data) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _dialog_sync_fingerprint(dialog: dict) -> tuple:
+    return (
+        int(dialog.get("unread_count") or 0),
+        int(dialog.get("last_from_peer") or 0),
+        str(dialog.get("last_message_at") or ""),
+        str(dialog.get("last_message_preview") or ""),
+        str(dialog.get("last_message_dir") or ""),
+        int(dialog.get("read_outbox_max_id") or 0),
+    )
+
+
+async def _run_db_sync(conn, func, *args, **kwargs):
+    if isinstance(conn, ThreadSafeConnection):
+        def _locked_call():
+            with locked_conn(conn):
+                return func(*args, **kwargs)
+
+        return await asyncio.to_thread(_locked_call)
+    with locked_conn(conn):
+        return func(*args, **kwargs)
+
+
+def _sync_and_publish_dialogs_sync(conn, account_id: int, people: list[dict]):
+    load_all = getattr(_inbox_mod, "_query_inbox_rows", None)
+    if load_all is not None:
+        before_rows = load_all(conn, account_id=account_id)
+    else:
+        before_rows = list_inbox(conn, account_id, "")
+    before_map = {
+        int(row["id"]): _dialog_sync_fingerprint(row)
+        for row in before_rows
+        if isinstance(row, dict) and row.get("id") is not None
+    }
+    sync_inbox(conn, account_id, people)
+    res = sync_dialog_read_receipts(conn, account_id, people)
+    if load_all is not None:
+        after_rows = load_all(conn, account_id=account_id)
+    else:
+        after_rows = list_inbox(conn, account_id, "")
+    changed = []
+    for row in after_rows:
+        if not isinstance(row, dict) or row.get("id") is None:
+            continue
+        did = int(row["id"])
+        if did not in before_map or before_map[did] != _dialog_sync_fingerprint(row):
+            changed.append(row)
+    return res, changed
+
+
+async def _sync_and_publish_dialogs(app, conn, account_id: int, people: list[dict]):
+    res, changed = await _run_db_sync(
+        conn, _sync_and_publish_dialogs_sync, conn, account_id, people
+    )
+    hub = getattr(app.state, "inbox_hub", None)
+    if hub is not None:
+        for row in changed:
+            hub.publish(account_id, row)
+    return res
+
+
 async def ensure_private_inbox(app, account_id: int) -> None:
     # One successful pull per process. A later page open reads SQLite.
     synced = app.state.inbox_synced
@@ -574,7 +689,8 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if account_id in synced:
             return
         try:
-            account = load_account(app.state.conn, account_id)
+            with locked_conn(app.state.conn):
+                account = load_account(app.state.conn, account_id)
         except LookupError:
             return
         if account["status"] != "connected":
@@ -585,9 +701,11 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if "PYTEST_CURRENT_TEST" not in os.environ and isinstance(
             getattr(app.state, "gateway", None), (type(None), TelethonGateway)
         ):
-            total_dlg_cnt = app.state.conn.execute(
-                "SELECT COUNT(*) FROM dialogs"
-            ).fetchone()[0]
+            with locked_conn(app.state.conn):
+                total_dlg_cnt = app.state.conn.execute(
+                    "SELECT COUNT(*) FROM dialogs WHERE account_id = ?",
+                    (int(account_id),),
+                ).fetchone()[0]
             if int(total_dlg_cnt or 0) > 0:
                 synced.add(account_id)
                 return
@@ -602,8 +720,7 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if not isinstance(people, list):
             return
         try:
-            sync_inbox(app.state.conn, account_id, people[:30])
-            sync_dialog_read_receipts(app.state.conn, account_id, people[:30])
+            await _sync_and_publish_dialogs(app, app.state.conn, account_id, people[:30])
         except (LookupError, ValueError):
             return
         synced.add(account_id)
@@ -611,7 +728,8 @@ async def ensure_private_inbox(app, account_id: int) -> None:
 
 async def start_account_watch(app, account_id: int) -> None:
     try:
-        account = load_account(app.state.conn, account_id)
+        with locked_conn(app.state.conn):
+            account = load_account(app.state.conn, account_id)
     except LookupError:
         return
     if account["status"] != "connected":
@@ -640,27 +758,87 @@ async def start_account_watch(app, account_id: int) -> None:
 
     async def on_message(message):
         try:
-            dialog = apply_incoming(app.state.conn, account_id, message)
+            dialog = await _run_db_sync(
+                app.state.conn, apply_incoming, app.state.conn, account_id, message
+            )
         except ValueError:
             return
         app.state.inbox_hub.publish(account_id, dialog)
+
+    async def on_outgoing(message):
+        if not isinstance(message, dict):
+            return
+        apply_live_outgoing_fn = getattr(_inbox_mod, "apply_live_outgoing", None)
+        if apply_live_outgoing_fn is None:
+            return
+        try:
+            dialog = await _run_db_sync(
+                app.state.conn, apply_live_outgoing_fn, app.state.conn, account_id, message
+            )
+        except Exception:
+            return
+        if isinstance(dialog, dict):
+            app.state.inbox_hub.publish(account_id, dialog)
 
     async def on_read(payload):
         if not isinstance(payload, dict):
             return
         peer_id = payload.get("telegram_user_id")
-        max_id = payload.get("read_outbox_max_id")
-        if peer_id is None or max_id is None:
+        if peer_id is None:
+            peer_id = payload.get("peer_id")
+        if peer_id is None:
             return
-        try:
-            apply_read_outbox_update(app.state.conn, account_id, int(peer_id), int(max_id))
-        except Exception:
-            return
+        outbox_max = payload.get("read_outbox_max_id")
+        if outbox_max is not None:
+            try:
+                await _run_db_sync(
+                    app.state.conn,
+                    apply_read_outbox_update,
+                    app.state.conn,
+                    account_id,
+                    int(peer_id),
+                    int(outbox_max),
+                )
+            except Exception:
+                pass
+        inbox_max = payload.get("read_inbox_max_id")
+        is_inbox_read = inbox_max is not None or (
+            "unread_count" in payload and int(payload.get("unread_count") or 0) == 0
+        )
+        if is_inbox_read:
+            apply_inbox_read_fn = getattr(_inbox_mod, "apply_inbox_read_update", None)
+            if apply_inbox_read_fn is not None:
+                try:
+                    max_arg = int(inbox_max) if inbox_max is not None else None
+                    updated = await _run_db_sync(
+                        app.state.conn,
+                        apply_inbox_read_fn,
+                        app.state.conn,
+                        account_id,
+                        int(peer_id),
+                        max_arg,
+                    )
+                except Exception:
+                    updated = None
+                if isinstance(updated, dict):
+                    app.state.inbox_hub.publish(account_id, updated)
 
     async def runner():
+        watch_kwargs = {}
+        try:
+            sig_params = inspect.signature(gateway.watch_private).parameters
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+            )
+            if accepts_var_kw or "on_read" in sig_params:
+                watch_kwargs["on_read"] = on_read
+            if accepts_var_kw or "on_outgoing" in sig_params:
+                watch_kwargs["on_outgoing"] = on_outgoing
+        except (TypeError, ValueError):
+            watch_kwargs = {"on_read": on_read, "on_outgoing": on_outgoing}
         try:
             try:
-                await gateway.watch_private(session_path, on_message, on_read=on_read)
+                await gateway.watch_private(session_path, on_message, **watch_kwargs)
             except TypeError:
                 await gateway.watch_private(session_path, on_message)
         except asyncio.CancelledError:
@@ -677,9 +855,10 @@ async def start_account_watch(app, account_id: int) -> None:
 
 
 async def start_connected_watches(app) -> None:
-    rows = app.state.conn.execute(
-        "SELECT id, provider FROM accounts WHERE status = 'connected'"
-    ).fetchall()
+    with locked_conn(app.state.conn):
+        rows = app.state.conn.execute(
+            "SELECT id, provider FROM accounts WHERE status = 'connected'"
+        ).fetchall()
     for row in rows:
         provider = str(row["provider"] or "telegram").strip().lower()
         if provider != "whatsapp" and _resolve_app_gateway(app, "telegram") is None:
@@ -712,15 +891,16 @@ async def sync_live_tg_read_receipts_once(
     if gateway is None or not hasattr(gateway, "load_inbox"):
         return {"ok": False, "synced_accounts": 0, "updated_recipients": 0}
     conn = app.state.conn
-    if account_id is not None:
-        acc_rows = conn.execute(
-            "SELECT id, session_path, provider, status FROM accounts WHERE id = ? AND status = 'connected'",
-            (int(account_id),),
-        ).fetchall()
-    else:
-        acc_rows = conn.execute(
-            "SELECT id, session_path, provider, status FROM accounts WHERE status = 'connected' ORDER BY id"
-        ).fetchall()
+    with locked_conn(conn):
+        if account_id is not None:
+            acc_rows = conn.execute(
+                "SELECT id, session_path, provider, status FROM accounts WHERE id = ? AND status = 'connected'",
+                (int(account_id),),
+            ).fetchall()
+        else:
+            acc_rows = conn.execute(
+                "SELECT id, session_path, provider, status FROM accounts WHERE status = 'connected' ORDER BY id"
+            ).fetchall()
     tg_accs = [
         r
         for r in acc_rows
@@ -738,8 +918,7 @@ async def sync_live_tg_read_receipts_once(
         if not isinstance(people, list):
             continue
         try:
-            sync_inbox(conn, aid, people[:limit])
-            res = sync_dialog_read_receipts(conn, aid, people[:limit])
+            res = await _sync_and_publish_dialogs(app, conn, aid, people[:limit])
             synced_accs += 1
             if isinstance(res, dict):
                 updated_recs += int(res.get("updated_recipients") or 0)
@@ -768,9 +947,10 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
             )
             dirty = isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
             if tick_counter % 2 == 0 and "PYTEST_CURRENT_TEST" not in os.environ:
-                tg_rows = app.state.conn.execute(
-                    "SELECT id, session_path, provider FROM accounts WHERE status = 'connected' ORDER BY id"
-                ).fetchall()
+                with locked_conn(app.state.conn):
+                    tg_rows = app.state.conn.execute(
+                        "SELECT id, session_path, provider FROM accounts WHERE status = 'connected' ORDER BY id"
+                    ).fetchall()
                 tg_ids = [
                     int(r["id"])
                     for r in tg_rows
@@ -794,12 +974,11 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
 
 
 async def start_autopilot_loop(app: FastAPI) -> None:
-    if (
-        not should_enable_live_tg_runtime(
+    with locked_conn(getattr(app.state, "conn", None)):
+        enable = should_enable_live_tg_runtime(
             getattr(app.state, "conn", None), getattr(app.state, "gateway", None)
         )
-        and "PYTEST_CURRENT_TEST" not in os.environ
-    ):
+    if not enable and "PYTEST_CURRENT_TEST" not in os.environ:
         return
     existing = getattr(app.state, "autopilot_task", None)
     if existing is not None and not existing.done():
@@ -828,7 +1007,9 @@ def _schedule_airtable_push_lead(app: FastAPI, lead_id: int) -> None:
     try:
         from app.airtable_sync import get_airtable_config, push_lead_to_airtable
 
-        cfg = get_airtable_config(getattr(app.state, "conn", None))
+        conn = getattr(app.state, "conn", None)
+        with locked_conn(conn):
+            cfg = get_airtable_config(conn)
         if not cfg.get("configured"):
             return
     except Exception:
@@ -1216,9 +1397,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             daily_limit=body.daily_limit,
             has_proxy=("proxy_url" in fields),
         )
-        row = request.app.state.conn.execute(
-            "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
-        ).fetchone()
+        with locked_conn(request.app.state.conn):
+            row = request.app.state.conn.execute(
+                "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
         gw = getattr(request.app.state, "gateway", None)
         if row and row["session_path"] and gw is not None and hasattr(gw, "set_proxy"):
             try:
@@ -1249,12 +1431,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/api/accounts")
     def accounts_list(request: Request):
-        items = list_accounts(request.app.state.conn)
-        if is_auth_enforced() and not has_valid_mcp_api_key(request):
-            from app.accounts import mask_proxy_url
-            from app.crm_auth import resolve_request_crm_user
+        with locked_conn(request.app.state.conn):
+            items = list_accounts(request.app.state.conn)
+            caller = None
+            check_mask = is_auth_enforced() and not has_valid_mcp_api_key(request)
+            if check_mask:
+                from app.crm_auth import resolve_request_crm_user
 
-            caller = resolve_request_crm_user(request.app.state.conn, request)
+                caller = resolve_request_crm_user(request.app.state.conn, request)
+        if check_mask:
+            from app.accounts import mask_proxy_url
+
             if caller is None or caller.get("role") != "admin":
                 items = [
                     {**acc, "proxy_url": mask_proxy_url(acc.get("proxy_url"))}
@@ -1281,9 +1468,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.delete("/api/accounts/{account_id}")
     async def accounts_delete(account_id: int, request: Request):
-        row = request.app.state.conn.execute(
-            "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
-        ).fetchone()
+        with locked_conn(request.app.state.conn):
+            row = request.app.state.conn.execute(
+                "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
         pre_path = row["session_path"] if row else None
         await _cleanup_deleted_account_runtime(request.app, account_id, pre_path)
         res = _call(
@@ -1296,13 +1484,14 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/accounts/purge-dead")
     async def accounts_purge_dead(request: Request):
-        dead_rows = request.app.state.conn.execute(
-            """
-            SELECT id, session_path FROM accounts
-            WHERE status != 'connected'
-               OR COALESCE(health, 'active') IN ('unauthorized', 'banned', 'frozen')
-            """
-        ).fetchall()
+        with locked_conn(request.app.state.conn):
+            dead_rows = request.app.state.conn.execute(
+                """
+                SELECT id, session_path FROM accounts
+                WHERE status != 'connected'
+                   OR COALESCE(health, 'active') IN ('unauthorized', 'banned', 'frozen')
+                """
+            ).fetchall()
         for r in dead_rows:
             await _cleanup_deleted_account_runtime(
                 request.app, int(r["id"]), r["session_path"]
@@ -1382,7 +1571,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/accounts/{account_id}/dialogs")
     async def account_dialogs(account_id: int, request: Request, q: str = ""):
         try:
-            account = load_account(request.app.state.conn, account_id)
+            with locked_conn(request.app.state.conn):
+                account = load_account(request.app.state.conn, account_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
         if account["status"] != "connected":
@@ -1392,8 +1582,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             found = await gateway.search_dialogs(account["session_path"], q, limit=30)
         except GatewayError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        saved = remember_dialogs(request.app.state.conn, account_id, found[:30])
-        sync_dialog_read_receipts(request.app.state.conn, account_id, found[:30])
+        with locked_conn(request.app.state.conn):
+            saved = remember_dialogs(request.app.state.conn, account_id, found[:30])
+            sync_dialog_read_receipts(request.app.state.conn, account_id, found[:30])
         return saved
 
     @app.post("/api/leads")
@@ -1742,7 +1933,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             opener = getattr(request.app.state, "digest_opener", None) or getattr(request.app.state, "bot_opener", None)
             gateway = getattr(request.app.state, "gateway", None)
             if gateway is None:
-                tg_id, tg_hash = _resolve_tg_creds(request.app.state.conn)
+                with locked_conn(request.app.state.conn):
+                    tg_id, tg_hash = _resolve_tg_creds(request.app.state.conn)
                 if tg_id and tg_hash:
                     gateway = _resolve_app_gateway(request.app, "telegram")
             res = await _call_async(
@@ -1767,7 +1959,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/api/operator")
     def operator_get(request: Request):
-        return operator_status(request.app.state.conn)
+        return _call(operator_status, request.app.state.conn)
 
     @app.post("/api/operator/bot-login")
     def operator_bot_login(request: Request):
@@ -1794,9 +1986,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         crm_only: bool = False,
     ):
         if account_id is None or account_id == 0:
-            rows = request.app.state.conn.execute(
-                "SELECT id FROM accounts WHERE status = 'connected'"
-            ).fetchall()
+            with locked_conn(request.app.state.conn):
+                rows = request.app.state.conn.execute(
+                    "SELECT id FROM accounts WHERE status = 'connected'"
+                ).fetchall()
             for r in rows:
                 await ensure_private_inbox(request.app, int(r["id"]))
         else:
@@ -1835,24 +2028,137 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/inbox/dialogs/{dialog_id}/unread")
     @app.post("/api/dialogs/{dialog_id}/unread")
-    def inbox_dialog_mark_unread(dialog_id: int, request: Request):
-        return _call(mark_dialog_unread, request.app.state.conn, dialog_id)
+    def inbox_dialog_mark_unread(
+        dialog_id: int, request: Request, crm_only: bool = False
+    ):
+        conn = request.app.state.conn
+        out = _call(mark_dialog_unread, conn, dialog_id)
+        if isinstance(out, dict):
+            aid = out.get("account_id")
+            if crm_only:
+                with locked_conn(conn):
+                    out = {
+                        **out,
+                        "counts": get_inbox_counts(conn, aid, crm_only=True),
+                        "all_counts": get_inbox_counts(conn, None, crm_only=True),
+                    }
+            if aid is not None:
+                request.app.state.inbox_hub.publish(int(aid), out)
+        return out
+
+    def _mark_dialog_read_tx(conn, dialog_id: int, crm_only: bool) -> tuple[dict, int | None]:
+        row_max = conn.execute(
+            "SELECT MAX(telegram_message_id) FROM messages WHERE dialog_id = ? AND direction = 'in'",
+            (int(dialog_id),),
+        ).fetchone()
+        max_in_id = int(row_max[0]) if row_max and row_max[0] is not None else None
+
+        can_fast_crm = (
+            crm_only
+            and mark_dialog_read is getattr(_inbox_mod, "mark_dialog_read", None)
+            and hasattr(_inbox_mod, "ensure_dialog_notify_columns")
+            and hasattr(_inbox_mod, "_advance_dialog_read_state")
+            and hasattr(_inbox_mod, "_load_dialog_public")
+            and hasattr(_inbox_mod, "_query_inbox_rows")
+            and hasattr(_inbox_mod, "compute_inbox_counts")
+        )
+        if can_fast_crm:
+            _inbox_mod.ensure_dialog_notify_columns(conn)
+            existing = conn.execute("SELECT * FROM dialogs WHERE id = ?", (int(dialog_id),)).fetchone()
+            if existing is None:
+                raise LookupError("dialog")
+            _inbox_mod._advance_dialog_read_state(
+                conn, existing, utc_now(), max_id=None, force_bump_turn=True
+            )
+            conn.commit()
+            out = _inbox_mod._load_dialog_public(conn, int(dialog_id))
+            all_crm = _inbox_mod._query_inbox_rows(conn, crm_only=True)
+            aid_val = int(out["account_id"])
+            out["counts"] = _inbox_mod.compute_inbox_counts(
+                [r for r in all_crm if int(r.get("account_id") or 0) == aid_val]
+            )
+            out["all_counts"] = _inbox_mod.compute_inbox_counts(all_crm)
+            return out, max_in_id
+
+        out = mark_dialog_read(conn, dialog_id)
+        if isinstance(out, dict) and crm_only:
+            aid_val = out.get("account_id")
+            if hasattr(_inbox_mod, "_query_inbox_rows") and hasattr(_inbox_mod, "compute_inbox_counts"):
+                all_crm = _inbox_mod._query_inbox_rows(conn, crm_only=True)
+                counts = _inbox_mod.compute_inbox_counts(
+                    [r for r in all_crm if aid_val is None or int(r.get("account_id") or 0) == int(aid_val)]
+                )
+                all_counts = _inbox_mod.compute_inbox_counts(all_crm)
+            else:
+                counts = get_inbox_counts(conn, aid_val, crm_only=True)
+                all_counts = get_inbox_counts(conn, None, crm_only=True)
+            out = {**out, "counts": counts, "all_counts": all_counts}
+        return out, max_in_id
 
     @app.post("/api/inbox/dialogs/{dialog_id}/read")
     @app.post("/api/dialogs/{dialog_id}/read")
-    def inbox_dialog_mark_read(dialog_id: int, request: Request):
-        return _call(mark_dialog_read, request.app.state.conn, dialog_id)
+    async def inbox_dialog_mark_read(
+        dialog_id: int, request: Request, crm_only: bool = False
+    ):
+        conn = request.app.state.conn
+        out, max_in_id = _call(_mark_dialog_read_tx, conn, dialog_id, bool(crm_only))
+        if not isinstance(out, dict):
+            return out
+        aid = out.get("account_id")
+        if aid is not None:
+            request.app.state.inbox_hub.publish(int(aid), out)
+        peer_id = (
+            out.get("peer_id")
+            if out.get("peer_id") is not None
+            else out.get("telegram_user_id")
+        )
+        if aid is not None and peer_id is not None:
+            try:
+                with locked_conn(conn):
+                    acc = load_account(conn, int(aid))
+            except LookupError:
+                acc = None
+            if isinstance(acc, dict) and acc.get("status") == "connected":
+                sess_path = str(acc.get("session_path") or "")
+                is_demo = sess_path.startswith("data/sessions/demo")
+                app_gw = getattr(request.app.state, "gateway", None)
+                if not (
+                    is_demo and isinstance(app_gw, (type(None), TelethonGateway))
+                ):
+                    provider = str(acc.get("provider") or "telegram").strip().lower()
+                    gw = _resolve_app_gateway(request.app, provider)
+                    if gw is not None and hasattr(gw, "mark_dialog_read"):
+                        try:
+                            params = inspect.signature(gw.mark_dialog_read).parameters
+                            accepts_var_kw = any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in params.values()
+                            )
+                            if accepts_var_kw or "max_id" in params:
+                                res = gw.mark_dialog_read(
+                                    sess_path, int(peer_id), max_id=max_in_id
+                                )
+                            else:
+                                res = gw.mark_dialog_read(sess_path, int(peer_id))
+                            if inspect.isawaitable(res):
+                                await asyncio.wait_for(res, timeout=3.0)
+                        except Exception:
+                            pass
+        return out
 
     @app.get("/api/inbox/events")
     async def inbox_events(request: Request, account_id: int = 0, crm_only: bool = False):
+        conn = request.app.state.conn
         try:
-            list_inbox(request.app.state.conn, account_id, "", crm_only=bool(crm_only))
+            with locked_conn(conn):
+                list_inbox(conn, account_id, "", crm_only=bool(crm_only))
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
         if account_id == 0:
-            rows = request.app.state.conn.execute(
-                "SELECT id FROM accounts WHERE status = 'connected'"
-            ).fetchall()
+            with locked_conn(conn):
+                rows = conn.execute(
+                    "SELECT id FROM accounts WHERE status = 'connected'"
+                ).fetchall()
             for r in rows:
                 await ensure_private_inbox(request.app, int(r["id"]))
         else:
@@ -1863,10 +2169,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             queue = hub.subscribe(account_id)
             try:
                 yield _sse("live", {"ok": _watch_alive(request.app, account_id)})
-                yield _sse(
-                    "snapshot",
-                    list_inbox(request.app.state.conn, account_id, "", crm_only=bool(crm_only)),
-                )
+                with locked_conn(conn):
+                    snap = list_inbox(conn, account_id, "", crm_only=bool(crm_only))
+                yield _sse("snapshot", snap)
                 while True:
                     try:
                         dialog = await asyncio.wait_for(queue.get(), timeout=15)
@@ -1877,7 +2182,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         yield ": ping\n\n"
                         continue
                     if crm_only and isinstance(dialog, dict):
-                        if not _filter_crm_only_rows(request.app.state.conn, [dialog]):
+                        with locked_conn(conn):
+                            allowed = _filter_crm_only_rows(conn, [dialog])
+                        if not allowed:
                             continue
                     yield _sse("dialog", dialog)
             finally:
@@ -1908,7 +2215,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         gateway = None
         if body.account_id:
             try:
-                acc = load_account(conn, body.account_id)
+                with locked_conn(conn):
+                    acc = load_account(conn, body.account_id)
                 prov = str(acc.get("provider") or "telegram").strip().lower()
                 if not str(acc.get("session_path") or "").startswith("data/sessions/demo"):
                     gateway = _resolve_app_gateway(request.app, prov)
@@ -1931,18 +2239,23 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         target_id = body.account_id if body is not None else None
         crm_only = bool(body.crm_only) if body is not None else False
         if target_id is None or int(target_id) == 0:
-            rows = conn.execute(
-                "SELECT id FROM accounts WHERE status = 'connected'"
-            ).fetchall()
+            with locked_conn(conn):
+                rows = conn.execute(
+                    "SELECT id FROM accounts WHERE status = 'connected'"
+                ).fetchall()
             for r in rows:
                 aid = int(r["id"])
                 request.app.state.inbox_synced.discard(aid)
                 await start_account_watch(request.app, aid)
-            return {"synced": len(rows), "dialogs": list_inbox(conn, 0, "", crm_only=crm_only)}
+            with locked_conn(conn):
+                dialogs = list_inbox(conn, 0, "", crm_only=crm_only)
+            return {"synced": len(rows), "dialogs": dialogs}
         aid = int(target_id)
         request.app.state.inbox_synced.discard(aid)
         await start_account_watch(request.app, aid)
-        return {"synced": 1, "dialogs": list_inbox(conn, aid, "", crm_only=crm_only)}
+        with locked_conn(conn):
+            dialogs = list_inbox(conn, aid, "", crm_only=crm_only)
+        return {"synced": 1, "dialogs": dialogs}
 
     @app.post("/api/settings/tg-credentials")
     def settings_set_tg_credentials(body: TgCredentialsIn, request: Request):
@@ -1952,21 +2265,22 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Укажите числовой api_id и строку api_hash")
         now = utc_now()
         conn = request.app.state.conn
-        conn.execute(
-            """
-            INSERT INTO kv_settings (key, value, updated_at) VALUES ('tg_api_id', ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (api_id, now),
-        )
-        conn.execute(
-            """
-            INSERT INTO kv_settings (key, value, updated_at) VALUES ('tg_api_hash', ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (api_hash, now),
-        )
-        conn.commit()
+        with locked_conn(conn):
+            conn.execute(
+                """
+                INSERT INTO kv_settings (key, value, updated_at) VALUES ('tg_api_id', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (api_id, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO kv_settings (key, value, updated_at) VALUES ('tg_api_hash', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (api_hash, now),
+            )
+            conn.commit()
         os.environ["TG_API_ID"] = api_id
         os.environ["TG_API_HASH"] = api_hash
         return {"ok": True, "api_id": int(api_id)}
@@ -1974,16 +2288,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @app.get("/api/dialogs/{dialog_id}/messages")
     async def dialog_messages(dialog_id: int, request: Request):
         conn = request.app.state.conn
-        demo_row = conn.execute(
-            """
-            SELECT d.peer_type, d.is_group, a.status, a.session_path, a.provider, a.id AS account_id
-            FROM dialogs d
-            JOIN accounts a ON a.id = d.account_id
-            WHERE d.id = ?
-            """,
-            (dialog_id,),
-        ).fetchone()
-        tg_id, tg_hash = _resolve_tg_creds(conn)
+        with locked_conn(conn):
+            demo_row = conn.execute(
+                """
+                SELECT d.peer_type, d.is_group, a.status, a.session_path, a.provider, a.id AS account_id
+                FROM dialogs d
+                JOIN accounts a ON a.id = d.account_id
+                WHERE d.id = ?
+                """,
+                (dialog_id,),
+            ).fetchone()
+            tg_id, tg_hash = _resolve_tg_creds(conn)
         has_tg_creds = bool(tg_id and tg_hash)
         if (
             demo_row
@@ -2010,16 +2325,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     def _resolve_dialog_gateway(dialog_id: int, request: Request):
         conn = request.app.state.conn
-        demo_row = conn.execute(
-            """
-            SELECT a.session_path, a.provider
-            FROM dialogs d
-            JOIN accounts a ON a.id = d.account_id
-            WHERE d.id = ?
-            """,
-            (dialog_id,),
-        ).fetchone()
-        tg_id, tg_hash = _resolve_tg_creds(conn)
+        with locked_conn(conn):
+            demo_row = conn.execute(
+                """
+                SELECT a.session_path, a.provider
+                FROM dialogs d
+                JOIN accounts a ON a.id = d.account_id
+                WHERE d.id = ?
+                """,
+                (dialog_id,),
+            ).fetchone()
+            tg_id, tg_hash = _resolve_tg_creds(conn)
         has_tg_creds = bool(tg_id and tg_hash)
         if demo_row and str(demo_row["provider"] or "telegram").strip().lower() == "whatsapp":
             return _gateway_for_provider(request, "whatsapp")
@@ -2141,17 +2457,18 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         request: Request,
     ):
         conn = request.app.state.conn
-        msg_row = conn.execute(
-            """
-            SELECT m.*, d.peer_id, d.account_id, a.session_path
-            FROM messages m
-            JOIN dialogs d ON d.id = m.dialog_id
-            JOIN accounts a ON a.id = d.account_id
-            WHERE m.dialog_id = ? AND m.telegram_message_id = ?
-            LIMIT 1
-            """,
-            (dialog_id, telegram_message_id),
-        ).fetchone()
+        with locked_conn(conn):
+            msg_row = conn.execute(
+                """
+                SELECT m.*, d.peer_id, d.account_id, a.session_path
+                FROM messages m
+                JOIN dialogs d ON d.id = m.dialog_id
+                JOIN accounts a ON a.id = d.account_id
+                WHERE m.dialog_id = ? AND m.telegram_message_id = ?
+                LIMIT 1
+                """,
+                (dialog_id, telegram_message_id),
+            ).fetchone()
         if msg_row is None:
             raise HTTPException(status_code=404, detail="Сообщение не найдено")
 
@@ -2197,11 +2514,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         actual_path = Path(dl_res["file_path"])
                         if actual_path.exists():
                             rel_url = f"/media/inbox/{actual_path.name}"
-                            conn.execute(
-                                "UPDATE messages SET media_url = ? WHERE id = ?",
-                                (rel_url, int(msg_row["id"])),
-                            )
-                            conn.commit()
+                            with locked_conn(conn):
+                                conn.execute(
+                                    "UPDATE messages SET media_url = ? WHERE id = ?",
+                                    (rel_url, int(msg_row["id"])),
+                                )
+                                conn.commit()
                             resolved_local = actual_path
                             resolved_mime = dl_res.get("media_mime") or resolved_mime
                             resolved_filename = dl_res.get("media_filename") or resolved_filename
@@ -2491,31 +2809,33 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     ):
         max_send = body.max_send if body is not None else None
         respect_delays = bool(body.respect_delays) if body is not None else False
-        camp_row = request.app.state.conn.execute(
-            """
-            SELECT a.session_path, a.provider, c.account_ids_json
-            FROM campaigns c
-            LEFT JOIN accounts a ON a.id = c.account_id
-            WHERE c.id = ?
-            """,
-            (campaign_id,),
-        ).fetchone()
-        session_path = camp_row["session_path"] if camp_row else None
-        provider = camp_row["provider"] if camp_row else None
-        if camp_row and not session_path and camp_row["account_ids_json"]:
-            try:
-                acc_ids = json.loads(camp_row["account_ids_json"])
-                if isinstance(acc_ids, list) and acc_ids:
-                    acc_row = request.app.state.conn.execute(
-                        "SELECT session_path, provider FROM accounts WHERE id = ?",
-                        (int(acc_ids[0]),),
-                    ).fetchone()
-                    if acc_row:
-                        session_path = acc_row["session_path"]
-                        provider = acc_row["provider"]
-            except Exception:
-                pass
-        tg_id, tg_hash = _resolve_tg_creds(request.app.state.conn)
+        conn = request.app.state.conn
+        with locked_conn(conn):
+            camp_row = conn.execute(
+                """
+                SELECT a.session_path, a.provider, c.account_ids_json
+                FROM campaigns c
+                LEFT JOIN accounts a ON a.id = c.account_id
+                WHERE c.id = ?
+                """,
+                (campaign_id,),
+            ).fetchone()
+            session_path = camp_row["session_path"] if camp_row else None
+            provider = camp_row["provider"] if camp_row else None
+            if camp_row and not session_path and camp_row["account_ids_json"]:
+                try:
+                    acc_ids = json.loads(camp_row["account_ids_json"])
+                    if isinstance(acc_ids, list) and acc_ids:
+                        acc_row = conn.execute(
+                            "SELECT session_path, provider FROM accounts WHERE id = ?",
+                            (int(acc_ids[0]),),
+                        ).fetchone()
+                        if acc_row:
+                            session_path = acc_row["session_path"]
+                            provider = acc_row["provider"]
+                except Exception:
+                    pass
+            tg_id, tg_hash = _resolve_tg_creds(conn)
         has_tg_creds = bool(tg_id and tg_hash)
         wa_gateway = _gateway_for_provider(request, "whatsapp")
         if (
@@ -2542,7 +2862,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             gateway = request.app.state.gateway
         return await _call_async(
             run_campaign_batch,
-            request.app.state.conn,
+            conn,
             campaign_id,
             gateway=gateway,
             max_send=max_send,
@@ -2580,7 +2900,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
         if has_valid_mcp_api_key(request):
             return
-        user = resolve_request_crm_user(request.app.state.conn, request)
+        with locked_conn(request.app.state.conn):
+            user = resolve_request_crm_user(request.app.state.conn, request)
         if user is None:
             raise HTTPException(
                 status_code=401, detail="Требуется авторизация CRM или MCP_API_KEY"
@@ -2639,21 +2960,22 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
         now = utc_now()
         conn_obj = request.app.state.conn
-        for kv_key, raw in (
-            ("airtable_api_key", body.api_key),
-            ("airtable_base_id", body.base_id),
-            ("airtable_table_name", body.table_name),
-        ):
-            if raw is not None and str(raw).strip():
-                conn_obj.execute(
-                    """
-                    INSERT INTO kv_settings (key, value, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                    """,
-                    (kv_key, str(raw).strip(), now),
-                )
-        conn_obj.commit()
+        with locked_conn(conn_obj):
+            for kv_key, raw in (
+                ("airtable_api_key", body.api_key),
+                ("airtable_base_id", body.base_id),
+                ("airtable_table_name", body.table_name),
+            ):
+                if raw is not None and str(raw).strip():
+                    conn_obj.execute(
+                        """
+                        INSERT INTO kv_settings (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                        """,
+                        (kv_key, str(raw).strip(), now),
+                    )
+            conn_obj.commit()
         return _call(get_airtable_config, conn_obj)
 
     class CloudCredentialsIn(BaseModel):
@@ -2678,17 +3000,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     async def cloud_restore_run(request: Request):
         from app.cloud_persistence import restore_from_cloud
 
-        res = _call(
-            lambda: restore_from_cloud(force=True, live_conn=request.app.state.conn)
-        )
-        if isinstance(res, dict) and res.get("restored"):
-            init_db(request.app.state.conn)
-            ensure_funnel_columns(request.app.state.conn)
-            restore_disk_sessions(request.app.state.conn)
-            gw = getattr(request.app.state, "gateway", None)
-            if gw is not None and hasattr(gw, "_session_strings"):
-                gw._session_strings.clear()
-                _seed_gateway_session_strings(request.app.state.conn, gw)
+        conn_obj = request.app.state.conn
+        with locked_conn(conn_obj):
+            res = _call(restore_from_cloud, force=True, live_conn=conn_obj)
+            if isinstance(res, dict) and res.get("restored"):
+                init_db(conn_obj)
+                ensure_funnel_columns(conn_obj)
+                restore_disk_sessions(conn_obj)
+                gw = getattr(request.app.state, "gateway", None)
+                if gw is not None and hasattr(gw, "_session_strings"):
+                    gw._session_strings.clear()
+                    _seed_gateway_session_strings(conn_obj, gw)
         return res
 
     @app.post("/api/cloud/credentials")
@@ -2698,24 +3020,25 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
         now = utc_now()
         conn_obj = request.app.state.conn
-        for kv_key, env_key, raw in (
-            ("r2_account_id", "R2_ACCOUNT_ID", body.account_id),
-            ("r2_access_key", "R2_ACCESS_KEY", body.access_key),
-            ("r2_secret_key", "R2_SECRET_KEY", body.secret_key),
-            ("r2_bucket", "R2_BUCKET", body.bucket),
-        ):
-            if raw is not None and str(raw).strip():
-                clean_v = str(raw).strip()
-                os.environ[env_key] = clean_v
-                conn_obj.execute(
-                    """
-                    INSERT INTO kv_settings (key, value, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                    """,
-                    (kv_key, clean_v, now),
-                )
-        conn_obj.commit()
+        with locked_conn(conn_obj):
+            for kv_key, env_key, raw in (
+                ("r2_account_id", "R2_ACCOUNT_ID", body.account_id),
+                ("r2_access_key", "R2_ACCESS_KEY", body.access_key),
+                ("r2_secret_key", "R2_SECRET_KEY", body.secret_key),
+                ("r2_bucket", "R2_BUCKET", body.bucket),
+            ):
+                if raw is not None and str(raw).strip():
+                    clean_v = str(raw).strip()
+                    os.environ[env_key] = clean_v
+                    conn_obj.execute(
+                        """
+                        INSERT INTO kv_settings (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                        """,
+                        (kv_key, clean_v, now),
+                    )
+            conn_obj.commit()
         return _call(backup_to_cloud, conn_obj)
 
     @app.post("/api/airtable/sync")
@@ -2854,16 +3177,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             try:
                 from app.airtable_sync import get_airtable_config, push_calendar_date_to_airtable
 
-                cfg = get_airtable_config(request.app.state.conn)
-                if cfg.get("configured"):
-                    client = getattr(request.app.state, "airtable_client", None)
-                    push_calendar_date_to_airtable(
-                        request.app.state.conn,
-                        item_kind=res["item_kind"],
-                        item_id=int(res["item_id"]),
-                        new_date=res["new_date"],
-                        client=client,
-                    )
+                with locked_conn(request.app.state.conn):
+                    cfg = get_airtable_config(request.app.state.conn)
+                    if cfg.get("configured"):
+                        client = getattr(request.app.state, "airtable_client", None)
+                        push_calendar_date_to_airtable(
+                            request.app.state.conn,
+                            item_kind=res["item_kind"],
+                            item_id=int(res["item_id"]),
+                            new_date=res["new_date"],
+                            client=client,
+                        )
             except Exception:
                 pass
         return res
@@ -2880,9 +3204,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.get("/api/ai-bot/config")
     def ai_bot_config_get(request: Request):
-        row = request.app.state.conn.execute(
-            "SELECT value FROM kv_settings WHERE key = 'ai_bot_config'"
-        ).fetchone()
+        with locked_conn(request.app.state.conn):
+            row = request.app.state.conn.execute(
+                "SELECT value FROM kv_settings WHERE key = 'ai_bot_config'"
+            ).fetchone()
         default_cfg = {
             "enabled": True,
             "copilot_enabled": True,
@@ -2906,15 +3231,16 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def ai_bot_config_save(body: AiBotConfigIn, request: Request):
         cfg = body.model_dump()
         now = utc_now()
-        request.app.state.conn.execute(
-            """
-            INSERT INTO kv_settings (key, value, updated_at)
-            VALUES ('ai_bot_config', ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (json.dumps(cfg, ensure_ascii=False), now),
-        )
-        request.app.state.conn.commit()
+        with locked_conn(request.app.state.conn):
+            request.app.state.conn.execute(
+                """
+                INSERT INTO kv_settings (key, value, updated_at)
+                VALUES ('ai_bot_config', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (json.dumps(cfg, ensure_ascii=False), now),
+            )
+            request.app.state.conn.commit()
         return {"ok": True, "config": cfg}
 
     class NodeMavenConfigIn(BaseModel):
@@ -2944,37 +3270,38 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
 
         conn = request.app.state.conn
-        cfg = resolve_nodemaven_config(conn)
-        rows = conn.execute(
-            "SELECT id, phone, telegram_username, telegram_name, proxy_url, provider FROM accounts ORDER BY id"
-        ).fetchall()
-        accounts_preview = []
-        for r in rows:
-            aid = r["id"]
-            phone = r["phone"]
-            raw_proxy = str(r["proxy_url"] or "").strip()
-            nm_url = build_nodemaven_proxy_url(
-                account_key=aid,
-                phone=phone,
-                preset=raw_proxy or "auto",
-                conn=conn,
-            )
-            effective = nm_url or raw_proxy or None
-            accounts_preview.append(
-                {
-                    "account_id": aid,
-                    "phone": phone,
-                    "username": r["telegram_username"],
-                    "title": r["telegram_name"],
-                    "sid": make_nodemaven_sid(aid),
-                    "country": infer_proxy_country(
-                        phone=phone,
-                        preset=raw_proxy or "auto",
-                        default_country=(cfg or {}).get("default_country", "us"),
-                    ),
-                    "proxy_masked": mask_proxy_url(effective),
-                }
-            )
+        with locked_conn(conn):
+            cfg = resolve_nodemaven_config(conn)
+            rows = conn.execute(
+                "SELECT id, phone, telegram_username, telegram_name, proxy_url, provider FROM accounts ORDER BY id"
+            ).fetchall()
+            accounts_preview = []
+            for r in rows:
+                aid = r["id"]
+                phone = r["phone"]
+                raw_proxy = str(r["proxy_url"] or "").strip()
+                nm_url = build_nodemaven_proxy_url(
+                    account_key=aid,
+                    phone=phone,
+                    preset=raw_proxy or "auto",
+                    conn=conn,
+                )
+                effective = nm_url or raw_proxy or None
+                accounts_preview.append(
+                    {
+                        "account_id": aid,
+                        "phone": phone,
+                        "username": r["telegram_username"],
+                        "title": r["telegram_name"],
+                        "sid": make_nodemaven_sid(aid),
+                        "country": infer_proxy_country(
+                            phone=phone,
+                            preset=raw_proxy or "auto",
+                            default_country=(cfg or {}).get("default_country", "us"),
+                        ),
+                        "proxy_masked": mask_proxy_url(effective),
+                    }
+                )
         if not cfg:
             return {
                 "ok": True,
@@ -3019,16 +3346,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             pairs["nodemaven_pass"] = body.password.strip()
         if body.api_key.strip():
             pairs["nodemaven_api_key"] = body.api_key.strip()
-        for k, v in pairs.items():
-            conn.execute(
-                """
-                INSERT INTO kv_settings (key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                """,
-                (k, v, now),
-            )
-        conn.commit()
+        with locked_conn(conn):
+            for k, v in pairs.items():
+                conn.execute(
+                    """
+                    INSERT INTO kv_settings (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (k, v, now),
+                )
+            conn.commit()
         gw = _resolve_app_gateway(request.app, "telegram")
         if gw is not None and hasattr(gw, "_proxies"):
             gw._proxies.clear()
@@ -3048,23 +3376,24 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             acc_key: int | str = body.account_id or 1
             phone = body.phone
             preset = body.preset or "auto"
-            if body.account_id:
-                row = conn.execute(
-                    "SELECT id, phone, proxy_url FROM accounts WHERE id = ?",
-                    (int(body.account_id),),
-                ).fetchone()
-                if row:
-                    phone = phone or row["phone"]
-                    preset = body.preset or row["proxy_url"] or "auto"
-            target_url = (
-                build_nodemaven_proxy_url(
-                    account_key=acc_key,
-                    phone=phone,
-                    preset=preset,
-                    conn=conn,
+            with locked_conn(conn):
+                if body.account_id:
+                    row = conn.execute(
+                        "SELECT id, phone, proxy_url FROM accounts WHERE id = ?",
+                        (int(body.account_id),),
+                    ).fetchone()
+                    if row:
+                        phone = phone or row["phone"]
+                        preset = body.preset or row["proxy_url"] or "auto"
+                target_url = (
+                    build_nodemaven_proxy_url(
+                        account_key=acc_key,
+                        phone=phone,
+                        preset=preset,
+                        conn=conn,
+                    )
+                    or ""
                 )
-                or ""
-            )
         if not target_url:
             return {
                 "ok": False,

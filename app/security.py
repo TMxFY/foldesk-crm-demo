@@ -322,6 +322,7 @@ def register_security_middleware(app: FastAPI) -> None:
 
             if not _is_public_path(path):
                 from app.crm_auth import resolve_request_crm_user
+                from app.db import locked_conn
 
                 conn = getattr(request.app.state, "conn", None)
                 user = None
@@ -334,7 +335,8 @@ def register_security_middleware(app: FastAPI) -> None:
                         auth_conn = getattr(request.app.state, "_auth_conn", None)
                         if auth_conn is None:
                             try:
-                                db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+                                with locked_conn(conn):
+                                    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
                             except Exception:
                                 db_file = ""
                             if db_file and db_file not in (":memory:", ""):
@@ -346,7 +348,8 @@ def register_security_middleware(app: FastAPI) -> None:
                                 request.app.state._auth_conn = auth_conn
                             else:
                                 auth_conn = conn
-                        user = resolve_request_crm_user(auth_conn, request)
+                        with locked_conn(auth_conn):
+                            user = resolve_request_crm_user(auth_conn, request)
                 api_mcp_ok = path.startswith("/api/") and has_valid_mcp_api_key(request)
                 if not api_mcp_ok:
                     if user is None:
