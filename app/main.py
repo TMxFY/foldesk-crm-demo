@@ -82,6 +82,7 @@ from app.outreach import (
     import_campaign_csv,
     list_campaigns,
     preview_campaign_csv,
+    preview_outreach_batch,
     run_autopilot_tick,
     run_campaign_batch,
     set_autopilot_enabled,
@@ -381,6 +382,7 @@ class CampaignFromLeadsIn(BaseModel):
 class CampaignRunIn(BaseModel):
     max_send: int | None = None
     respect_delays: bool = False
+    dry_run: bool = False
 
 
 def _resolve_tg_creds(conn=None) -> tuple[str, str]:
@@ -2823,7 +2825,17 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     ):
         max_send = body.max_send if body is not None else None
         respect_delays = bool(body.respect_delays) if body is not None else False
+        dry_run = bool(body.dry_run) if body is not None else False
         conn = request.app.state.conn
+        if dry_run:
+            return _call(
+                preview_outreach_batch,
+                conn,
+                campaign_id,
+                max_send=max_send,
+                respect_delays=respect_delays,
+                strict=True,
+            )
         with locked_conn(conn):
             camp_row = conn.execute(
                 """

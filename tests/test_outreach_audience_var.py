@@ -247,7 +247,8 @@ def test_enroll_from_crm_leads_propagates_niche_into_audience_placeholder(tmp_pa
                 "account_ids": [acc_id],
                 "daily_limit": 50,
                 "steps": [
-                    {"step_order": 1, "delay_hours": 0, "template_text": VLAD_FOLLOWUP_2},
+                    {"step_order": 1, "delay_hours": 0, "template_text": "Hey {name}, quick intro from SoftUGC"},
+                    {"step_order": 2, "delay_hours": 0, "template_text": VLAD_FOLLOWUP_2},
                 ],
             },
         )
@@ -259,6 +260,10 @@ def test_enroll_from_crm_leads_propagates_niche_into_audience_placeholder(tmp_pa
         )
         assert enr.status_code == 200
         assert enr.json()["imported_count"] == 3
+
+        run_step1 = client.post(f"/api/campaigns/{cid}/run", json={})
+        assert run_step1.status_code == 200
+        assert run_step1.json()["sent"] == 3
 
         run = client.post(f"/api/campaigns/{cid}/run", json={})
         assert run.status_code == 200
@@ -285,7 +290,10 @@ def test_csv_column_mapping_and_mcp_ingest_preserve_explicit_audience_override(t
                 "name": "Mapped & MCP Audience",
                 "account_ids": [acc_id],
                 "daily_limit": 50,
-                "steps": [{"step_order": 1, "delay_hours": 0, "template_text": VLAD_FOLLOWUP_2}],
+                "steps": [
+                    {"step_order": 1, "delay_hours": 0, "template_text": "Hey {name}, quick intro from SoftUGC"},
+                    {"step_order": 2, "delay_hours": 0, "template_text": VLAD_FOLLOWUP_2},
+                ],
             },
         ).json()
         cid = camp["id"]
@@ -317,6 +325,10 @@ def test_csv_column_mapping_and_mcp_ingest_preserve_explicit_audience_override(t
             },
         )
         assert mcp_res["enrolled_in_campaign"] == 1
+
+        run_step1 = client.post(f"/api/campaigns/{cid}/run", json={})
+        assert run_step1.status_code == 200
+        assert run_step1.json()["sent"] == 2
 
         run = client.post(f"/api/campaigns/{cid}/run", json={})
         assert run.status_code == 200

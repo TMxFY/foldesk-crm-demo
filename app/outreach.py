@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import csv
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 import random
 import re
 import sqlite3
+import sys
 import time
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -195,8 +197,31 @@ def _clean_company_title(raw: str | None) -> str | None:
 
 
 _LEGACY_CREATOROS_RE = re.compile(r"\bCreatorOS\b", re.IGNORECASE)
+_FORBIDDEN_CREATOROS_RE = re.compile(r"(?:\bCreator\s*OS\b|creatoros)", re.IGNORECASE)
 _LEGACY_STEP1_UPGRADE_RE = re.compile(
     r"(?:\bCreatorOS\b|If your user growth has hit a ceiling|plug-and-play growth arm|Want me to show how\s*$)",
+    re.IGNORECASE,
+)
+_FOLLOWUP_STEP1_TOKENS = (
+    "{followup_1}",
+    "{followup_2}",
+    "{step2_text}",
+    "{step3_text}",
+    "{фоллоуап 1}",
+    "{фоллоуап_1}",
+    "{фоллоуап 2}",
+    "{фоллоуап_2}",
+)
+_FOLLOWUP_TEXT_RE = re.compile(
+    r"(?:\bregarding\s+(?:my\s+)?last\s+message\b"
+    r"|\byou['’]?re\s+doing\s+me\s+dirty\b"
+    r"|\bdoing\s+me\s+dirty\b"
+    r"|\bjust\s+bumping\b"
+    r"|\bfollowing\s+up\s+(?:quickly\s+)?on\b"
+    r"|\bchecking\s+(?:in|back)\s+on\b"
+    r"|возвращаюсь\s+к\s+(?:письму|вопросу)"
+    r"|пишу\s+финальный\s+раз"
+    r"|\bstep\s*[23]\s+follow[\s-]?up\b)",
     re.IGNORECASE,
 )
 
@@ -205,6 +230,39 @@ def _sanitize_legacy_brand(text: str | None) -> str:
     if not text:
         return ""
     return _LEGACY_CREATOROS_RE.sub("SoftUGC", str(text))
+
+
+def _has_legacy_creatoros_brand(text: str | None) -> bool:
+    return bool(text and _FORBIDDEN_CREATOROS_RE.search(str(text)))
+
+
+def _is_followup_step1_violation(text: str | None) -> bool:
+    if not text:
+        return False
+    raw = str(text)
+    low = raw.lower()
+    if any(tok in low for tok in _FOLLOWUP_STEP1_TOKENS):
+        return True
+    return bool(_FOLLOWUP_TEXT_RE.search(raw))
+
+
+def is_legacy_exhausted_recipient(rec: dict, *, step_idx: int = 0) -> bool:
+    """Return True when recipient belongs to the old exhausted 1300+ base or is already touched."""
+    extra = _extract_extra_fields(rec)
+    fine_status = str(extra.get("fine_status") or "").strip().lower()
+    if fine_status.startswith(("need_step", "seen_step", "legacy")) or fine_status in (
+        "old_base",
+        "old_base_1300",
+        "exhausted",
+    ):
+        return True
+    for key in ("source_base", "base", "batch", "segment", "lead_source", "source"):
+        val = str(extra.get(key) or rec.get(key) or "").strip().lower()
+        if val and any(mark in val for mark in ("1300", "legacy_1300", "old_base")):
+            return True
+    if step_idx == 0 and (rec.get("last_sent_at") or rec.get("sent_account_id")):
+        return True
+    return False
 
 
 def _needs_legacy_vlad_step1_upgrade(text: str | None) -> bool:
@@ -1563,6 +1621,24 @@ def _normalize_steps(steps: list | None) -> list[dict]:
                 "image_url": None,
             }
         ]
+    explicit_orders = [
+        step.get("step_order")
+        for step in steps
+        if isinstance(step, dict) and step.get("step_order") is not None
+    ]
+    if explicit_orders:
+        parsed_orders: list[int] = []
+        for raw_ord in explicit_orders:
+            if isinstance(raw_ord, bool):
+                raise ValueError("Некорректный step_order")
+            try:
+                parsed_orders.append(int(raw_ord))
+            except (TypeError, ValueError):
+                raise ValueError("step_order должен быть целым числом") from None
+        if len(explicit_orders) == len(steps) and parsed_orders != list(range(1, len(steps) + 1)):
+            raise ValueError(
+                "Нарушен порядок шагов: Step 1 должен идти строго до follow-up (1, 2, 3...)"
+            )
     normalized = []
     for idx, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
@@ -1571,6 +1647,10 @@ def _normalize_steps(steps: list | None) -> list[dict]:
         image_url = str(step.get("image_url") or "").strip() or None
         if not text and not image_url:
             raise ValueError("Укажите текст сообщения для каждого шага")
+        if _has_legacy_creatoros_brand(text):
+            raise ValueError("Запрещено использовать устаревший бренд CreatorOS в шаблоне шага")
+        if idx == 1 and _is_followup_step1_violation(text):
+            raise ValueError("Step 1 не может содержать текст или токен follow-up")
         delay_raw = step.get("delay_hours", 0 if idx == 1 else 24)
         try:
             delay_hours = max(0, int(delay_raw or 0))
@@ -2963,7 +3043,16 @@ async def run_campaign_batch(
     respect_delays: bool = False,
     wa_gateway=None,
     jitter_range: tuple[float, float] | None = None,
+    dry_run: bool = False,
 ) -> dict:
+    if dry_run:
+        return preview_outreach_batch(
+            conn,
+            campaign_id,
+            max_send=max_send,
+            respect_delays=respect_delays,
+            strict=True,
+        )
     camp = get_campaign(conn, campaign_id)
     account_ids = camp.get("account_ids") or []
     if not account_ids:
@@ -3478,7 +3567,56 @@ async def run_campaign_batch(
         )
         step_image_url = (step.get("image_url") or "").strip() or None
 
+        if _has_legacy_creatoros_brand(rendered_text):
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET status = 'failed',
+                    error_text = 'Заблокировано: обнаружен устаревший бренд CreatorOS',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, rec["id"]),
+            )
+            conn.commit()
+            failed_in_batch += 1
+            continue
+
+        if int(step.get("step_order") or (step_idx + 1)) != step_idx + 1 or (
+            step_idx == 0
+            and (
+                _is_followup_step1_violation(rendered_text)
+                or _is_followup_step1_violation(step.get("template_text"))
+            )
+        ):
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET status = 'failed',
+                    error_text = 'Заблокировано: follow-up запрещён до Step 1',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, rec["id"]),
+            )
+            conn.commit()
+            failed_in_batch += 1
+            continue
+
         if step_idx == 0:
+            if is_legacy_exhausted_recipient(rec, step_idx=0):
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = 'Пропущен: лид из старой отработанной базы 1300+',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, rec["id"]),
+                )
+                conn.commit()
+                continue
             # Guard 3a: Anti-duplicate across campaign_recipients (username, real telegram_user_id, lead_id, or normalized phone)
             has_already_contacted_dup = False
             norm_rec_phone_digits = re.sub(r"\D+", "", clean_rec_phone)
@@ -4387,3 +4525,285 @@ async def run_autopilot_tick(
         "status": get_autopilot_status(conn, now_dt=effective_now),
     }
 
+
+
+def _validate_campaign_steps_for_preview(camp: dict) -> tuple[list[dict], list[dict]]:
+    violations: list[dict] = []
+    if _has_legacy_creatoros_brand(camp.get("name")):
+        violations.append(
+            {
+                "code": "legacy_brand_creatoros",
+                "message": "Название кампании содержит устаревший бренд CreatorOS",
+            }
+        )
+    steps = camp.get("steps") or []
+    if not steps:
+        violations.append(
+            {
+                "code": "followup_before_step1",
+                "message": "У кампании отсутствуют шаги рассылки (требуется Step 1)",
+            }
+        )
+        return steps, violations
+
+    expected_orders = list(range(1, len(steps) + 1))
+    actual_orders = [int(s.get("step_order") or 0) for s in steps]
+    if actual_orders != expected_orders:
+        violations.append(
+            {
+                "code": "followup_before_step1",
+                "message": (
+                    f"Нарушен порядок шагов: ожидалось {expected_orders}, "
+                    f"получено {actual_orders} (Step 1 должен идти до follow-up)"
+                ),
+            }
+        )
+
+    for step in steps:
+        order_val = int(step.get("step_order") or 0)
+        tmpl = str(step.get("template_text") or "")
+        if _has_legacy_creatoros_brand(tmpl):
+            violations.append(
+                {
+                    "code": "legacy_brand_creatoros",
+                    "message": f"Шаг {order_val} содержит устаревший бренд CreatorOS",
+                }
+            )
+        if order_val == 1 and _is_followup_step1_violation(tmpl):
+            violations.append(
+                {
+                    "code": "followup_before_step1",
+                    "message": "Step 1 содержит текст или токен follow-up (запрещено слать follow-up первым сообщением)",
+                }
+            )
+    return steps, violations
+
+
+def preview_outreach_batch(
+    conn,
+    campaign_id: int,
+    *,
+    sample_size: int = 5,
+    max_send: int | None = None,
+    respect_delays: bool = True,
+    strict: bool = True,
+) -> dict:
+    """Dry-run validator (Rule 5): preview 3-5 fresh recipients and enforce SoftUGC + Step 1 invariants."""
+    if isinstance(sample_size, bool) or not isinstance(sample_size, int) or sample_size < 1:
+        raise ValueError("sample_size должен быть положительным целым числом")
+    effective_sample = min(5, max(3, sample_size))
+
+    camp = get_campaign(conn, campaign_id)
+    steps, violations = _validate_campaign_steps_for_preview(camp)
+    step1 = steps[0] if steps else None
+
+    rows = conn.execute(
+        """
+        SELECT cr.*, l.niche AS lead_niche, l.created_at AS lead_created_at, l.status AS lead_status
+        FROM campaign_recipients cr
+        LEFT JOIN leads l ON l.id = cr.lead_id
+        WHERE cr.campaign_id = ?
+          AND cr.status IN ('pending', 'in_progress')
+        ORDER BY CASE WHEN COALESCE(cr.current_step, 0) = 0 THEN 0 ELSE 1 END, cr.id
+        """,
+        (campaign_id,),
+    ).fetchall()
+
+    now_dt = datetime.now(timezone.utc)
+    fresh_candidates: list[dict] = []
+    legacy_skipped: list[int] = []
+    previews: list[dict] = []
+    valid_followup_count = 0
+
+    for row in rows:
+        rec = as_dict(row)
+        step_idx = int(rec.get("current_step") or 0)
+        clean_uname = _clean_handle(rec.get("username")) or ""
+        raw_tg_id = rec.get("telegram_user_id")
+        real_peer_id = (
+            int(raw_tg_id)
+            if raw_tg_id is not None and not _is_synthetic_peer_id(raw_tg_id)
+            else None
+        )
+        clean_phone = str(rec.get("phone") or "").strip()
+        rec_lead_id = int(rec["lead_id"]) if rec.get("lead_id") is not None else None
+
+        if step_idx >= 1 or rec.get("status") == "in_progress":
+            prior_acc = _lookup_prior_outgoing_account(
+                conn,
+                clean_uname=clean_uname.lower(),
+                real_peer_id=real_peer_id,
+                clean_phone=clean_phone,
+                lead_id_val=rec_lead_id,
+            )
+            if prior_acc is None and not rec.get("last_sent_at"):
+                violations.append(
+                    {
+                        "code": "followup_before_step1",
+                        "recipient_id": int(rec["id"]),
+                        "message": f"Получатель #{rec['id']} стоит на follow-up без отправленного Step 1",
+                    }
+                )
+            else:
+                valid_followup_count += 1
+            continue
+
+        if is_legacy_exhausted_recipient(rec, step_idx=0):
+            legacy_skipped.append(int(rec["id"]))
+            continue
+
+        rendered_text = (
+            _render_step_text(step1, 0, rec, campaign_name=camp.get("name"))
+            if step1 is not None
+            else ""
+        )
+        row_violations: list[str] = []
+        if _has_legacy_creatoros_brand(rendered_text):
+            row_violations.append("legacy_brand_creatoros")
+            violations.append(
+                {
+                    "code": "legacy_brand_creatoros",
+                    "recipient_id": int(rec["id"]),
+                    "message": f"В тексте для получателя #{rec['id']} обнаружен устаревший бренд CreatorOS",
+                }
+            )
+        if _is_followup_step1_violation(rendered_text):
+            row_violations.append("followup_before_step1")
+            violations.append(
+                {
+                    "code": "followup_before_step1",
+                    "recipient_id": int(rec["id"]),
+                    "message": f"Текст Step 1 для получателя #{rec['id']} содержит формулировку follow-up",
+                }
+            )
+        if not rendered_text.strip():
+            row_violations.append("empty_step1_message")
+            violations.append(
+                {
+                    "code": "empty_step1_message",
+                    "recipient_id": int(rec["id"]),
+                    "message": f"Пустое сообщение Step 1 для получателя #{rec['id']}",
+                }
+            )
+
+        created_raw = rec.get("lead_created_at") or rec.get("created_at")
+        created_dt = _parse_iso_dt(created_raw)
+        age_hours = (
+            round(max(0.0, (now_dt - created_dt).total_seconds() / 3600.0), 2)
+            if created_dt is not None
+            else None
+        )
+        candidate_info = {
+            "recipient_id": int(rec["id"]),
+            "lead_id": rec_lead_id,
+            "username": clean_uname or rec.get("username"),
+            "name": rec.get("name") or "",
+            "company": rec.get("company") or "",
+            "status": rec.get("status"),
+            "lead_status": rec.get("lead_status"),
+            "current_step": step_idx,
+            "step_order": int(step1.get("step_order") or 1) if step1 else 1,
+            "created_at": created_raw,
+            "lead_age_hours": age_hours,
+            "untouched": True,
+            "brand": "SoftUGC",
+            "message_text": rendered_text,
+            "forbidden_patterns": row_violations,
+        }
+        fresh_candidates.append(candidate_info)
+        if len(previews) < effective_sample:
+            previews.append(candidate_info)
+
+    if not fresh_candidates:
+        if legacy_skipped:
+            violations.append(
+                {
+                    "code": "legacy_1300_base_only",
+                    "message": "В выборке только отработанные лиды старой базы 1300+; свежих нетронутых лидов нет",
+                }
+            )
+        elif valid_followup_count == 0 and not any(
+            v.get("code") == "followup_before_step1" for v in violations
+        ):
+            violations.append(
+                {
+                    "code": "no_fresh_untouched_leads",
+                    "message": "Нет свежих нетронутых лидов для рассылки",
+                }
+            )
+
+    deduped_violations: list[dict] = []
+    seen_viol: set[tuple[str, str]] = set()
+    for v in violations:
+        key = (str(v.get("code") or ""), str(v.get("message") or ""))
+        if key not in seen_viol:
+            seen_viol.add(key)
+            deduped_violations.append(v)
+
+    result = {
+        "ok": len(deduped_violations) == 0,
+        "dry_run": True,
+        "campaign_id": int(camp["id"]),
+        "campaign_name": camp["name"],
+        "brand": "SoftUGC",
+        "max_send": max_send,
+        "respect_delays": bool(respect_delays),
+        "total_candidates_checked": len(rows),
+        "fresh_untouched_count": len(fresh_candidates),
+        "skipped_legacy_count": len(legacy_skipped),
+        "sample_count": len(previews),
+        "previews": previews,
+        "forbidden_pattern_count": len(deduped_violations),
+        "violations": deduped_violations,
+        "sent": 0,
+    }
+    if strict and deduped_violations:
+        raise ValueError("; ".join(v["message"] for v in deduped_violations))
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Outreach batch CLI (Rule 5 dry-run supported)")
+    parser.add_argument("--db", default=os.environ.get("CRMTG_DB", "data/crmtg.db"), help="Path to SQLite DB")
+    parser.add_argument("--campaign-id", type=int, required=True, help="Campaign ID")
+    parser.add_argument("--dry-run", action="store_true", help="Run mandatory Rule 5 dry-run preview and validation")
+    parser.add_argument("--sample-size", type=int, default=5, help="Preview sample size (3-5)")
+    parser.add_argument("--max-send", type=int, default=None, help="Optional max_send metadata")
+    parser.add_argument("--respect-delays", action="store_true", help="Respect step delays")
+    args = parser.parse_args(argv)
+
+    if not args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "CLI requires --dry-run (Rule 5: mandatory dry-run before outreach).",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    from app.db import connect, init_db
+
+    conn = connect(args.db)
+    init_db(conn)
+    try:
+        res = preview_outreach_batch(
+            conn,
+            args.campaign_id,
+            sample_size=args.sample_size,
+            max_send=args.max_send,
+            respect_delays=bool(args.respect_delays),
+            strict=False,
+        )
+    finally:
+        conn.close()
+
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0 if res.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
