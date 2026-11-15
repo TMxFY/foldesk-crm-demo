@@ -246,7 +246,18 @@ def _is_followup_step1_violation(text: str | None) -> bool:
     return bool(_FOLLOWUP_TEXT_RE.search(raw))
 
 
-def is_legacy_exhausted_recipient(rec: dict, *, step_idx: int = 0) -> bool:
+_LEGACY_BASE_MARKER_RE = re.compile(
+    r"(?:legacy[_\s-]*1300|old[_\s-]*base|(?:^|[^0-9])1300(?:\+|[^0-9]|$)|старая\s+база|отработанная\s+база)",
+    re.IGNORECASE,
+)
+
+
+def is_legacy_exhausted_recipient(
+    rec: dict,
+    *,
+    step_idx: int = 0,
+    campaign_name: str | None = None,
+) -> bool:
     """Return True when recipient belongs to the old exhausted 1300+ base or is already touched."""
     extra = _extract_extra_fields(rec)
     fine_status = str(extra.get("fine_status") or "").strip().lower()
@@ -256,10 +267,27 @@ def is_legacy_exhausted_recipient(rec: dict, *, step_idx: int = 0) -> bool:
         "exhausted",
     ):
         return True
-    for key in ("source_base", "base", "batch", "segment", "lead_source", "source"):
-        val = str(extra.get(key) or rec.get(key) or "").strip().lower()
-        if val and any(mark in val for mark in ("1300", "legacy_1300", "old_base")):
+    for key in (
+        "source_base",
+        "base",
+        "batch",
+        "segment",
+        "lead_source",
+        "source",
+        "note",
+        "lead_note",
+        "description",
+        "lead_description",
+    ):
+        val_extra = str(extra.get(key) or "").strip()
+        val_rec = str(rec.get(key) or "").strip()
+        if (val_extra and _LEGACY_BASE_MARKER_RE.search(val_extra)) or (
+            val_rec and _LEGACY_BASE_MARKER_RE.search(val_rec)
+        ):
             return True
+    camp_label = str(campaign_name or rec.get("campaign_name") or "").strip()
+    if camp_label and _LEGACY_BASE_MARKER_RE.search(camp_label):
+        return True
     if step_idx == 0 and (rec.get("last_sent_at") or rec.get("sent_account_id")):
         return True
     return False
@@ -3451,7 +3479,7 @@ async def run_campaign_batch(
 
     eligible_rows = conn.execute(
         """
-        SELECT cr.*, l.niche AS lead_niche
+        SELECT cr.*, l.niche AS lead_niche, l.note AS lead_note, l.description AS lead_description
         FROM campaign_recipients cr
         LEFT JOIN leads l ON l.id = cr.lead_id
         WHERE cr.campaign_id = ?
@@ -3567,7 +3595,9 @@ async def run_campaign_batch(
         )
         step_image_url = (step.get("image_url") or "").strip() or None
 
-        if _has_legacy_creatoros_brand(rendered_text):
+        if _has_legacy_creatoros_brand(camp.get("name")) or _has_legacy_creatoros_brand(
+            rendered_text
+        ):
             conn.execute(
                 """
                 UPDATE campaign_recipients
@@ -3604,7 +3634,9 @@ async def run_campaign_batch(
             continue
 
         if step_idx == 0:
-            if is_legacy_exhausted_recipient(rec, step_idx=0):
+            if is_legacy_exhausted_recipient(
+                rec, step_idx=0, campaign_name=camp.get("name")
+            ):
                 conn.execute(
                     """
                     UPDATE campaign_recipients
@@ -4599,7 +4631,8 @@ def preview_outreach_batch(
 
     rows = conn.execute(
         """
-        SELECT cr.*, l.niche AS lead_niche, l.created_at AS lead_created_at, l.status AS lead_status
+        SELECT cr.*, l.niche AS lead_niche, l.created_at AS lead_created_at, l.status AS lead_status,
+               l.note AS lead_note, l.description AS lead_description
         FROM campaign_recipients cr
         LEFT JOIN leads l ON l.id = cr.lead_id
         WHERE cr.campaign_id = ?
@@ -4648,7 +4681,7 @@ def preview_outreach_batch(
                 valid_followup_count += 1
             continue
 
-        if is_legacy_exhausted_recipient(rec, step_idx=0):
+        if is_legacy_exhausted_recipient(rec, step_idx=0, campaign_name=camp.get("name")):
             legacy_skipped.append(int(rec["id"]))
             continue
 

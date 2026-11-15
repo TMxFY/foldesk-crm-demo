@@ -244,6 +244,60 @@ def test_preview_and_batch_reject_legacy_1300_exhausted_leads(tmp_path):
     assert gw.sent == []
 
 
+def test_run_campaign_batch_blocks_creatoros_in_campaign_name_and_1300_note_description_markers(tmp_path):
+    conn = connect(tmp_path / "p2_symmetry.db")
+    init_db(conn)
+    _seed_connected_account(conn)
+
+    # 1. Campaign name contains CreatorOS, even though Step 1 copy is clean SoftUGC -> run_campaign_batch must block!
+    camp_brand = _seed_fresh_leads_campaign(conn, count=2)
+    conn.execute("UPDATE campaigns SET name = 'Legacy CreatorOS Relaunch' WHERE id = ?", (camp_brand["id"],))
+    conn.commit()
+    gw_brand = _SpyGateway()
+    res_brand = asyncio.run(run_campaign_batch(conn, camp_brand["id"], gateway=gw_brand, max_send=2))
+    assert res_brand["sent"] == 0
+    assert gw_brand.sent == []
+
+    # 2. Clean campaign name, but recipient rows have 1300+ markers in cr.note and leads.description
+    camp_1300 = _seed_fresh_leads_campaign(conn, count=2)
+    recs = get_campaign(conn, camp_1300["id"])["recipients"]
+    conn.execute("UPDATE campaign_recipients SET note = 'Из старой базы 1300+' WHERE id = ?", (recs[0]["id"],))
+    cur_lead = conn.execute(
+        """
+        INSERT INTO leads (account_id, telegram_user_id, username, name, status, description, created_at, updated_at)
+        VALUES (30, 991300, ?, 'Lead Desc 1300', 'new', 'old_base 1300 exhausted pool', ?, ?)
+        """,
+        (recs[1]["username"], utc_now(), utc_now()),
+    )
+    conn.execute(
+        "UPDATE campaign_recipients SET lead_id = ? WHERE id = ?",
+        (cur_lead.lastrowid, recs[1]["id"]),
+    )
+    conn.commit()
+
+    p_1300 = preview_outreach_batch(conn, camp_1300["id"], strict=False)
+    assert p_1300["ok"] is False
+    assert p_1300["fresh_untouched_count"] == 0
+    assert p_1300["skipped_legacy_count"] == 2
+
+    gw_1300 = _SpyGateway()
+    res_1300 = asyncio.run(run_campaign_batch(conn, camp_1300["id"], gateway=gw_1300, max_send=2))
+    assert res_1300["sent"] == 0
+    assert gw_1300.sent == []
+
+    # 3. Campaign name itself marks legacy 1300+ pool -> blocked in preview and live batch
+    camp_named_1300 = _seed_fresh_leads_campaign(conn, count=2)
+    conn.execute("UPDATE campaigns SET name = 'SoftUGC — база 1300+ старая' WHERE id = ?", (camp_named_1300["id"],))
+    conn.commit()
+    p_named = preview_outreach_batch(conn, camp_named_1300["id"], strict=False)
+    assert p_named["ok"] is False
+    assert p_named["fresh_untouched_count"] == 0
+    gw_named = _SpyGateway()
+    res_named = asyncio.run(run_campaign_batch(conn, camp_named_1300["id"], gateway=gw_named, max_send=2))
+    assert res_named["sent"] == 0
+    assert gw_named.sent == []
+
+
 def test_run_campaign_batch_and_http_api_support_dry_run(tmp_path, monkeypatch):
     monkeypatch.setenv("CRM_REQUIRE_AUTH", "0")
     conn = connect(tmp_path / "api_dry_run.db")
