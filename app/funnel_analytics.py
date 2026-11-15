@@ -112,11 +112,23 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in rows}
 
 
+def _safe_int(val, default: int = 0) -> int:
+    if val is None or isinstance(val, bool):
+        return int(val) if isinstance(val, bool) else default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def ensure_funnel_columns(conn: sqlite3.Connection) -> None:
     changed = False
     dialog_cols = _table_columns(conn, "dialogs")
     if dialog_cols and "read_outbox_max_id" not in dialog_cols:
         conn.execute("ALTER TABLE dialogs ADD COLUMN read_outbox_max_id INTEGER DEFAULT 0")
+        changed = True
+    if dialog_cols and "read_inbox_max_id" not in dialog_cols:
+        conn.execute("ALTER TABLE dialogs ADD COLUMN read_inbox_max_id INTEGER DEFAULT 0")
         changed = True
 
     rec_cols = _table_columns(conn, "campaign_recipients")
@@ -243,8 +255,10 @@ def apply_read_outbox_update(
 
     updated_recipients = 0
     for dlg in dlg_rows:
-        dlg_id = int(dlg["id"])
-        eff_max = max(max_int, int(dlg["read_outbox_max_id"] or 0))
+        dlg_id = _safe_int(dlg["id"])
+        if dlg_id <= 0:
+            continue
+        eff_max = max(max_int, _safe_int(dlg["read_outbox_max_id"]))
         out_row = conn.execute(
             """
             SELECT COALESCE(MAX(telegram_message_id), 0) AS max_out_id
@@ -297,14 +311,14 @@ def sync_dialog_read_receipts(
         for item in people:
             if not isinstance(item, dict):
                 continue
-            peer_id = item.get("telegram_user_id") or item.get("peer_id")
-            max_id = int(item.get("read_outbox_max_id") or 0)
-            if peer_id is None or max_id <= 0:
+            peer_id = _safe_int(item.get("telegram_user_id") or item.get("peer_id"))
+            max_id = _safe_int(item.get("read_outbox_max_id"))
+            if peer_id <= 0 or max_id <= 0:
                 continue
             updated += apply_read_outbox_update(
                 conn,
                 account_id,
-                int(peer_id),
+                peer_id,
                 max_id,
                 commit=False,
             )
@@ -315,17 +329,23 @@ def sync_dialog_read_receipts(
         SELECT account_id, peer_id, COALESCE(read_outbox_max_id, 0) AS read_outbox_max_id
         FROM dialogs
         WHERE peer_type = 'user' AND COALESCE(read_outbox_max_id, 0) > 0
+          AND account_id IS NOT NULL AND peer_id IS NOT NULL
     """
     params: tuple = ()
     if account_id is not None:
         sql += " AND account_id = ?"
-        params = (int(account_id),)
+        params = (_safe_int(account_id),)
     for row in conn.execute(sql, params).fetchall():
+        acc_val = _safe_int(row["account_id"])
+        peer_val = _safe_int(row["peer_id"])
+        max_val = _safe_int(row["read_outbox_max_id"])
+        if acc_val <= 0 or peer_val <= 0 or max_val <= 0:
+            continue
         updated += apply_read_outbox_update(
             conn,
-            int(row["account_id"]),
-            int(row["peer_id"]),
-            int(row["read_outbox_max_id"]),
+            acc_val,
+            peer_val,
+            max_val,
             commit=False,
         )
     conn.commit()
@@ -610,12 +630,16 @@ def get_outreach_funnel(
         """
     ).fetchall():
         dd = as_dict(drow)
-        did = int(dd["id"])
+        did = _safe_int(dd.get("id"))
+        if did <= 0:
+            continue
         dialogs_by_id[did] = dd
-        if dd.get("lead_id") is not None:
-            dialogs_by_lead_id.setdefault(int(dd["lead_id"]), []).append(dd)
-        if dd.get("peer_id") is not None:
-            dialogs_by_peer_id.setdefault(int(dd["peer_id"]), []).append(dd)
+        lead_val = _safe_int(dd.get("lead_id"))
+        if lead_val > 0:
+            dialogs_by_lead_id.setdefault(lead_val, []).append(dd)
+        peer_val = _safe_int(dd.get("peer_id"))
+        if peer_val > 0:
+            dialogs_by_peer_id.setdefault(peer_val, []).append(dd)
         un = _clean_username(dd.get("username")).lower()
         if un:
             dialogs_by_uname.setdefault(un, []).append(dd)
@@ -632,8 +656,8 @@ def get_outreach_funnel(
             ORDER BY sent_at ASC, id ASC
             """
         ).fetchall():
-            did = int(mrow["dialog_id"])
-            if did not in dialogs_by_id:
+            did = _safe_int(mrow["dialog_id"])
+            if did <= 0 or did not in dialogs_by_id:
                 continue
             st = msg_stats_by_dlg.get(did)
             if st is None:
@@ -642,6 +666,7 @@ def get_outreach_funnel(
                     "last_out_at": None,
                     "last_out_msg_id": 0,
                     "last_out_text": None,
+                    "last_in_at": None,
                     "last_in_text": None,
                     "last_in_after_out_text": None,
                     "has_in": False,
@@ -651,7 +676,7 @@ def get_outreach_funnel(
             direction = mrow["direction"]
             sent_at = str(mrow["sent_at"] or "")
             txt = str(mrow["text"] or "").strip()
-            tg_mid = int(mrow["telegram_message_id"] or 0)
+            tg_mid = _safe_int(mrow["telegram_message_id"])
             if direction == "out":
                 if st["first_out_at"] is None:
                     st["first_out_at"] = sent_at
@@ -662,6 +687,8 @@ def get_outreach_funnel(
                     st["last_out_text"] = txt
             elif direction == "in":
                 st["has_in"] = True
+                if sent_at and (not st["last_in_at"] or sent_at >= st["last_in_at"]):
+                    st["last_in_at"] = sent_at
                 if txt:
                     st["last_in_text"] = txt
                 if st["first_out_at"] is not None and sent_at >= st["first_out_at"]:
@@ -778,40 +805,43 @@ def get_outreach_funnel(
             _add_dlgs(dialogs_by_phone.get(str(rd["phone"]).strip()))
 
         if pref_acc is not None and len(candidate_dlgs) > 1:
-            pref_int = int(pref_acc)
-            candidate_dlgs.sort(key=lambda d: 0 if int(d["account_id"]) == pref_int else 1)
+            pref_int = _safe_int(pref_acc)
+            candidate_dlgs.sort(key=lambda d: 0 if _safe_int(d.get("account_id")) == pref_int else 1)
 
-        primary_dialog_id = int(candidate_dlgs[0]["id"]) if candidate_dlgs else None
+        primary_dialog_id = (_safe_int(candidate_dlgs[0].get("id")) or None) if candidate_dlgs else None
         max_read_outbox_id = 0
         dialog_read_confirmed = False
         has_msg_reply = False
         last_inbound_text = ""
         last_out_text_from_dlg = ""
 
-        current_step = int(rd.get("current_step") or 0)
+        current_step = _safe_int(rd.get("current_step"))
         rec_status = str(rd.get("status") or "pending")
         last_sent_at = rd.get("last_sent_at")
         has_sent_meta = (current_step >= 1) or bool(last_sent_at) or (rec_status == "completed")
 
         for dlg in candidate_dlgs:
-            did = int(dlg["id"])
-            r_max = int(dlg.get("read_outbox_max_id") or 0)
+            did = _safe_int(dlg.get("id"))
+            if did <= 0:
+                continue
+            r_max = _safe_int(dlg.get("read_outbox_max_id"))
             if r_max > max_read_outbox_id:
                 max_read_outbox_id = r_max
             mst = msg_stats_by_dlg.get(did)
             if mst:
                 if mst["last_out_text"] and not last_out_text_from_dlg:
                     last_out_text_from_dlg = mst["last_out_text"]
-                last_out_mid = int(mst["last_out_msg_id"] or 0)
+                last_out_mid = _safe_int(mst["last_out_msg_id"])
                 if r_max > 0 and last_out_mid > 0 and r_max >= last_out_mid:
                     dialog_read_confirmed = True
                 if mst["has_in_after_out"]:
                     has_msg_reply = True
                     if mst["last_in_after_out_text"] and not last_inbound_text:
                         last_inbound_text = mst["last_in_after_out_text"]
-                elif has_sent_meta and mst["has_in"]:
+                elif has_sent_meta and mst["has_in"] and mst["first_out_at"] is None:
                     ref_sent = str(last_sent_at or "")
-                    if not ref_sent or (dlg.get("last_message_at") or "") >= ref_sent:
+                    last_in_at = str(mst.get("last_in_at") or "")
+                    if (not ref_sent) or (last_in_at and last_in_at >= ref_sent):
                         has_msg_reply = True
                         if mst["last_in_text"] and not last_inbound_text:
                             last_inbound_text = mst["last_in_text"]

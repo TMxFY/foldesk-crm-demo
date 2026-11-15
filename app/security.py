@@ -397,6 +397,7 @@ def _check_api_rate_limit(
 
 def _resolve_request_user(request: Request):
     from app.crm_auth import resolve_request_crm_user
+    from app.db import locked_conn
 
     conn = getattr(request.app.state, "conn", None)
     if conn is None:
@@ -409,7 +410,8 @@ def _resolve_request_user(request: Request):
         auth_conn = getattr(request.app.state, "_auth_conn", None)
         if auth_conn is None:
             try:
-                db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+                with locked_conn(conn):
+                    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
             except Exception:
                 db_file = ""
             if db_file and db_file not in (":memory:", ""):
@@ -426,7 +428,8 @@ def _resolve_request_user(request: Request):
                 request.app.state._auth_conn = auth_conn
             else:
                 auth_conn = conn
-        return resolve_request_crm_user(auth_conn, request)
+        with locked_conn(auth_conn):
+            return resolve_request_crm_user(auth_conn, request)
 
 
 def close_auth_connection(app: FastAPI) -> None:

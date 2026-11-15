@@ -15,6 +15,7 @@ import wave
 import weakref
 
 from app.db import INBOX_MEDIA_DIR, as_dict, normalize_status, safe_int, utc_now
+from app.digest import _norm_ts, ensure_dialog_notify_columns
 from app.telegram_gateway import GatewayError, render_formatted_html
 
 
@@ -244,6 +245,98 @@ def _ensure_lead_events_table(conn) -> None:
     )
 
 
+def _is_duplicate_reply_received_event(conn, lead_id: int, meta: dict) -> bool:
+    moved = bool(meta.get("old_status") != meta.get("new_status") and meta.get("new_status") == "talking")
+    mid = meta.get("telegram_message_id")
+    dlg_id = meta.get("dialog_id")
+
+    if mid is not None:
+        recent_rows = conn.execute(
+            """
+            SELECT meta_json FROM lead_events
+            WHERE lead_id = ? AND event_type = 'reply_received'
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (int(lead_id),),
+        ).fetchall()
+        for rr in recent_rows:
+            if not rr["meta_json"]:
+                continue
+            try:
+                prev = json.loads(rr["meta_json"])
+            except Exception:
+                continue
+            if prev.get("telegram_message_id") == int(mid) and (
+                dlg_id is None or prev.get("dialog_id") in (None, int(dlg_id))
+            ):
+                return True
+
+    if moved:
+        return False
+
+    latest = conn.execute(
+        """
+        SELECT event_type, meta_json FROM lead_events
+        WHERE lead_id = ?
+          AND event_type IN ('reply_received', 'outreach_sent', 'outreach_completed')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (int(lead_id),),
+    ).fetchone()
+    if latest is None or latest["event_type"] != "reply_received":
+        return False
+    prev = {}
+    if latest["meta_json"]:
+        try:
+            prev = json.loads(latest["meta_json"])
+        except Exception:
+            prev = {}
+    same_dialog = dlg_id is not None and prev.get("dialog_id") == int(dlg_id)
+    same_peer = (
+        meta.get("peer_id") is not None
+        and prev.get("peer_id") == meta.get("peer_id")
+        and prev.get("account_id") == meta.get("account_id")
+    )
+    if not (same_dialog or same_peer):
+        return False
+
+    cur_out_row_id = int(meta.get("last_out_msg_row_id") or 0)
+    prev_out_row_id = int(prev.get("last_out_msg_row_id") or 0)
+    if cur_out_row_id > prev_out_row_id:
+        return False
+
+    src = meta.get("source")
+    if src == "cache_messages":
+        return True
+
+    read_max_id = int(meta.get("dialog_read_inbox_max_id") or 0)
+    read_at = _norm_ts(meta.get("dialog_last_read_at"))
+    in_ts = _norm_ts(meta.get("incoming_sent_at"))
+    is_already_read_msg = False
+    if mid is not None and read_max_id > 0:
+        is_already_read_msg = int(mid) <= read_max_id
+    elif read_at and in_ts:
+        is_already_read_msg = in_ts <= read_at
+    if is_already_read_msg:
+        return True
+
+    cur_turn = meta.get("turn_seq")
+    prev_turn = prev.get("turn_seq")
+    if cur_turn is not None and prev_turn is not None and cur_turn != prev_turn:
+        return False
+
+    if cur_turn is not None and prev_turn is not None and cur_turn == prev_turn:
+        return True
+
+    if src in ("sync_inbox", "remember_dialogs"):
+        return True
+    if _norm_ts(meta.get("incoming_sent_at")) == _norm_ts(prev.get("incoming_sent_at")):
+        return True
+    return False
+
+
 def _record_lead_event_safe(
     conn,
     lead_id: int,
@@ -258,6 +351,9 @@ def _record_lead_event_safe(
     meta_str = json.dumps(meta, ensure_ascii=False) if isinstance(meta, dict) else None
     try:
         _ensure_lead_events_table(conn)
+        if event_type == "reply_received" and isinstance(meta, dict):
+            if _is_duplicate_reply_received_event(conn, int(lead_id), meta):
+                return
         conn.execute(
             """
             INSERT INTO lead_events (lead_id, event_type, title, meta_json, created_at)
@@ -348,6 +444,11 @@ def stop_outreach_on_reply(
     force_event: bool = False,
     min_sent_at: str | None = None,
     opener=None,
+    notify: bool = True,
+    incoming_unread: bool | None = None,
+    telegram_message_id: int | None = None,
+    incoming_sent_at: str | None = None,
+    source: str | None = None,
 ) -> int:
     now = utc_now()
     clean_min_sent = str(min_sent_at).strip() if min_sent_at else None
@@ -369,6 +470,8 @@ def stop_outreach_on_reply(
 
     if not any((clean_lead_id, clean_peer_id, clean_user, phone_variants)):
         return 0
+
+    ensure_dialog_notify_columns(conn)
 
     # Find matching leads first so we can also match campaign_recipients by lead_id
     lead_clauses = []
@@ -473,10 +576,11 @@ def stop_outreach_on_reply(
         ]
         had_active_recs = len(active_rec_rows) > 0
         if clean_min_sent:
+            norm_min = _norm_ts(clean_min_sent)
             active_rec_rows = [
                 rr
                 for rr in active_rec_rows
-                if not rr["last_sent_at"] or str(rr["last_sent_at"]) <= clean_min_sent
+                if not rr["last_sent_at"] or _norm_ts(str(rr["last_sent_at"])) <= norm_min
             ]
         for rr in active_rec_rows:
             if rr["lead_id"]:
@@ -511,13 +615,13 @@ def stop_outreach_on_reply(
         ).fetchone()
     elif clean_user:
         dlg_row = conn.execute(
-            "SELECT * FROM dialogs WHERE lower(username) = lower(?) ORDER BY last_message_at DESC LIMIT 1",
+            "SELECT * FROM dialogs WHERE peer_type = 'user' AND lower(username) = lower(?) ORDER BY last_message_at DESC LIMIT 1",
             (clean_user,),
         ).fetchone()
     elif matched_lead_ids:
         ph_lids = ",".join("?" for _ in matched_lead_ids)
         dlg_row = conn.execute(
-            f"SELECT * FROM dialogs WHERE lead_id IN ({ph_lids}) ORDER BY last_message_at DESC LIMIT 1",
+            f"SELECT * FROM dialogs WHERE peer_type = 'user' AND lead_id IN ({ph_lids}) ORDER BY last_message_at DESC LIMIT 1",
             sorted(matched_lead_ids),
         ).fetchone()
 
@@ -603,6 +707,16 @@ def stop_outreach_on_reply(
                     matched_lead_ids.add(ex_lid)
                     prev_lead_statuses[ex_lid] = str(ex_row["status"] or "")
 
+    effective_incoming_sent_at = (
+        str(incoming_sent_at).strip()
+        if incoming_sent_at
+        else (
+            str(dlg_row["last_message_at"]).strip()
+            if dlg_row is not None and dlg_row["last_message_at"]
+            else clean_min_sent
+        )
+    )
+
     any_lead_status_moved = False
     if matched_lead_ids:
         primary_lid = sorted(matched_lead_ids)[0]
@@ -656,6 +770,14 @@ def stop_outreach_on_reply(
             [now, *sorted(matched_lead_ids)],
         )
 
+        latest_out_row_id = 0
+        if dlg_row is not None:
+            out_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS max_out_id FROM messages WHERE dialog_id = ? AND direction = 'out'",
+                (int(dlg_row["id"]),),
+            ).fetchone()
+            latest_out_row_id = int(out_row["max_out_id"] or 0) if out_row is not None else 0
+
         for lid in sorted(matched_lead_ids):
             old_status = prev_lead_statuses.get(lid)
             status_moved = old_status in ("new", "waiting")
@@ -683,15 +805,78 @@ def stop_outreach_on_reply(
                         "old_status": old_status,
                         "new_status": "talking" if status_moved else old_status,
                         "preview": str(preview)[:120] if preview else None,
+                        "dialog_id": int(dlg_row["id"]) if dlg_row and dlg_row["id"] is not None else None,
+                        "telegram_message_id": (
+                            int(telegram_message_id) if telegram_message_id is not None else None
+                        ),
+                        "incoming_sent_at": _norm_ts(effective_incoming_sent_at) or None,
+                        "turn_seq": int(dlg_row["reply_turn_seq"] or 0) if dlg_row is not None else None,
+                        "last_out_msg_row_id": latest_out_row_id if dlg_row is not None else None,
+                        "dialog_last_read_at": (
+                            (_norm_ts(dlg_row["last_read_at"]) or None) if dlg_row is not None else None
+                        ),
+                        "dialog_read_inbox_max_id": (
+                            int(dlg_row["read_inbox_max_id"] or 0) if dlg_row is not None else None
+                        ),
+                        "source": source,
                     },
                     now=now,
                 )
 
-    should_notify_colleague = (
+    base_notify_trigger = (
         stopped_count > 0
         or any_lead_status_moved
         or (force_event and (bool(matched_lead_ids) or has_any_recipient or (dlg_row is not None)))
     )
+    should_notify_colleague = bool(notify) and base_notify_trigger
+    allow_read_flag = bool(
+        force_event
+        and source is None
+        and incoming_unread is None
+        and (
+            dlg_row is None
+            or (
+                not dlg_row["last_read_at"]
+                and int(dlg_row["read_inbox_max_id"] or 0) == 0
+            )
+        )
+    )
+    if should_notify_colleague and incoming_unread is False:
+        should_notify_colleague = False
+    if should_notify_colleague and dlg_row is not None:
+        if int(dlg_row["last_from_peer"] or 0) == 0:
+            should_notify_colleague = False
+        else:
+            latest_msg = conn.execute(
+                """
+                SELECT direction, sent_at, telegram_message_id FROM messages
+                WHERE dialog_id = ?
+                ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC,
+                         COALESCE(telegram_message_id, 0) DESC,
+                         id DESC
+                LIMIT 1
+                """,
+                (int(dlg_row["id"]),),
+            ).fetchone()
+            if latest_msg is not None and str(latest_msg["direction"]) == "out":
+                out_mid = latest_msg["telegram_message_id"]
+                if telegram_message_id is not None and out_mid is not None:
+                    if int(telegram_message_id) <= int(out_mid):
+                        should_notify_colleague = False
+                else:
+                    out_ts = _norm_ts(latest_msg["sent_at"])
+                    in_ts = _norm_ts(effective_incoming_sent_at)
+                    if not (in_ts and out_ts and in_ts > out_ts):
+                        should_notify_colleague = False
+        if should_notify_colleague and not allow_read_flag:
+            if int(dlg_row["unread_count"] or 0) == 0:
+                should_notify_colleague = False
+            elif dlg_row["last_read_at"]:
+                read_ts = _norm_ts(dlg_row["last_read_at"])
+                in_ts = _norm_ts(effective_incoming_sent_at)
+                if telegram_message_id is None and (not in_ts or in_ts <= read_ts):
+                    should_notify_colleague = False
+
     if should_notify_colleague:
         try:
             from app.digest import send_lead_reply_notification
@@ -779,6 +964,9 @@ def stop_outreach_on_reply(
                 account_id=resolved_acc_id,
                 peer_id=clean_peer_id,
                 opener=opener,
+                incoming_sent_at=effective_incoming_sent_at,
+                telegram_message_id=int(telegram_message_id) if telegram_message_id is not None else None,
+                allow_read=allow_read_flag,
             )
         except Exception:
             pass
@@ -787,116 +975,337 @@ def stop_outreach_on_reply(
 
 
 
+def _resolve_private_peer_id(item: dict) -> int | None:
+    peer_id = item.get("telegram_user_id")
+    if peer_id is None and item.get("phone"):
+        digits = re.sub(r"\D", "", str(item["phone"]))
+        if len(digits) >= 7:
+            peer_id = int(digits[-12:])
+    return int(peer_id) if peer_id is not None else None
+
+
+def _pick_newer_ts(ts_a: str | None, ts_b: str | None) -> str | None:
+    if not ts_a:
+        return ts_b
+    if not ts_b:
+        return ts_a
+    return ts_a if _norm_ts(ts_a) >= _norm_ts(ts_b) else ts_b
+
+
+def _advance_dialog_read_state(
+    conn,
+    dlg_row,
+    now: str,
+    *,
+    max_id: int | None = None,
+    force_bump_turn: bool = False,
+):
+    ensure_dialog_notify_columns(conn)
+    did = int(dlg_row["id"])
+    prev_unread = int(dlg_row["unread_count"] or 0)
+    prev_max_id = int(dlg_row["read_inbox_max_id"] or 0)
+    prev_read_at = str(dlg_row["last_read_at"] or "").strip() or None
+
+    if max_id is not None:
+        in_row = conn.execute(
+            """
+            SELECT MAX(COALESCE(telegram_message_id, 0)) AS max_mid,
+                   (SELECT sent_at FROM messages
+                    WHERE dialog_id = ? AND direction = 'in' AND COALESCE(telegram_message_id, 0) <= ?
+                    ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC, COALESCE(telegram_message_id, 0) DESC, id DESC
+                    LIMIT 1) AS latest_sent_at
+            FROM messages
+            WHERE dialog_id = ? AND direction = 'in' AND COALESCE(telegram_message_id, 0) <= ?
+            """,
+            (did, int(max_id), did, int(max_id)),
+        ).fetchone()
+        eff_max_id = max(prev_max_id, int(max_id))
+        msg_ts = str(in_row["latest_sent_at"]).strip() if in_row and in_row["latest_sent_at"] else None
+    else:
+        in_row = conn.execute(
+            """
+            SELECT MAX(COALESCE(telegram_message_id, 0)) AS max_mid,
+                   (SELECT sent_at FROM messages
+                    WHERE dialog_id = ?
+                    ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC, COALESCE(telegram_message_id, 0) DESC, id DESC
+                    LIMIT 1) AS latest_sent_at
+            FROM messages
+            WHERE dialog_id = ? AND direction = 'in'
+            """,
+            (did, did),
+        ).fetchone()
+        max_in_mid = int(in_row["max_mid"] or 0) if in_row and in_row["max_mid"] is not None else 0
+        eff_max_id = max(prev_max_id, max_in_mid)
+        msg_ts = str(in_row["latest_sent_at"]).strip() if in_row and in_row["latest_sent_at"] else None
+
+    dlg_last_ts = str(dlg_row["last_message_at"]).strip() if dlg_row["last_message_at"] else None
+    candidate_ts = _pick_newer_ts(msg_ts, dlg_last_ts)
+    eff_read_at = _pick_newer_ts(prev_read_at, candidate_ts) or now
+
+    changed = (
+        force_bump_turn
+        or prev_unread > 0
+        or eff_max_id > prev_max_id
+        or _norm_ts(eff_read_at) > _norm_ts(prev_read_at)
+    )
+    turn_delta = 1 if changed else 0
+    conn.execute(
+        """
+        UPDATE dialogs
+        SET unread_count = 0,
+            read_inbox_max_id = ?,
+            last_read_at = ?,
+            reply_turn_seq = COALESCE(reply_turn_seq, 0) + ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (eff_max_id, eff_read_at, turn_delta, now, did),
+    )
+    return conn.execute("SELECT * FROM dialogs WHERE id = ?", (did,)).fetchone()
+
+
+def _mark_dialog_replied_out(
+    conn,
+    dialog_id: int,
+    sent_at: str,
+    preview: str,
+    now: str,
+) -> None:
+    ensure_dialog_notify_columns(conn)
+    row = conn.execute(
+        "SELECT id, last_read_at, read_inbox_max_id FROM dialogs WHERE id = ?",
+        (int(dialog_id),),
+    ).fetchone()
+    latest_in = conn.execute(
+        """
+        SELECT MAX(COALESCE(telegram_message_id, 0)) AS max_mid
+        FROM messages
+        WHERE dialog_id = ? AND direction = 'in'
+        """,
+        (int(dialog_id),),
+    ).fetchone()
+    max_mid = int(latest_in["max_mid"] or 0) if latest_in is not None else 0
+    prev_max_mid = int(row["read_inbox_max_id"] or 0) if row is not None else 0
+    eff_max_mid = max(prev_max_mid, max_mid)
+    prev_read = str(row["last_read_at"] or "").strip() if (row is not None and row["last_read_at"]) else None
+    eff_read_at = _pick_newer_ts(prev_read, sent_at) or now
+    conn.execute(
+        """
+        UPDATE dialogs
+        SET last_message_at = ?,
+            last_message_preview = ?,
+            last_from_peer = 0,
+            unread_count = 0,
+            last_read_at = ?,
+            read_inbox_max_id = ?,
+            reply_turn_seq = COALESCE(reply_turn_seq, 0) + 1,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (sent_at, preview, eff_read_at, eff_max_mid, now, int(dialog_id)),
+    )
+
+
+def _upsert_snapshot_dialog(
+    conn,
+    account_id: int,
+    person: dict,
+    acc_provider: str | None,
+    now: str,
+    *,
+    opener=None,
+    source: str,
+) -> dict | None:
+    peer_id = _resolve_private_peer_id(person)
+    if peer_id is None:
+        return None
+    title = (person.get("name") or "").strip()
+    username = person.get("username")
+    if username is not None:
+        username = str(username).strip().lstrip("@") or None
+    provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
+    phone = _extract_dialog_phone(person, int(peer_id), provider)
+    unread = person.get("unread_count") if "unread_count" in person else None
+    if unread is not None:
+        unread = max(0, int(unread))
+    preview = person.get("last_message_preview")
+    if preview is not None:
+        preview = str(preview)[:120]
+    sent_at = person.get("last_message_at")
+    if sent_at is not None:
+        sent_at = str(sent_at)
+    last_from = person.get("last_from_peer") if "last_from_peer" in person else None
+    if last_from is not None:
+        last_from = 1 if last_from else 0
+    read_in_max = (
+        int(person["read_inbox_max_id"])
+        if person.get("read_inbox_max_id") is not None
+        else None
+    )
+
+    prev_dlg = conn.execute(
+        """
+        SELECT * FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        """,
+        (account_id, int(peer_id)),
+    ).fetchone()
+
+    effective_unread = unread
+    effective_last_from = last_from
+    effective_sent_at = sent_at
+    effective_preview = preview
+    new_last_read_at = str(prev_dlg["last_read_at"]).strip() if (prev_dlg and prev_dlg["last_read_at"]) else None
+    new_read_max_id = int(prev_dlg["read_inbox_max_id"] or 0) if prev_dlg else 0
+    if read_in_max is not None and read_in_max > new_read_max_id:
+        new_read_max_id = read_in_max
+    turn_delta = 0
+
+    if prev_dlg is not None:
+        prev_ts = _norm_ts(prev_dlg["last_message_at"])
+        new_ts = _norm_ts(sent_at)
+        prev_read_ts = _norm_ts(new_last_read_at)
+        is_stale_ts = bool(prev_ts and new_ts and new_ts < prev_ts)
+
+        if is_stale_ts:
+            effective_sent_at = None
+            effective_preview = None
+            effective_last_from = None
+            effective_unread = None
+        else:
+            if (
+                int(prev_dlg["last_from_peer"] or 0) == 0
+                and last_from == 1
+                and (not new_ts or (prev_ts and new_ts <= prev_ts))
+            ):
+                # Manager already replied at/after this snapshot timestamp
+                effective_last_from = 0
+                effective_unread = 0
+
+            if unread == 0:
+                ref_ts = sent_at or (
+                    str(prev_dlg["last_message_at"]).strip() if prev_dlg["last_message_at"] else None
+                )
+                if ref_ts:
+                    new_last_read_at = _pick_newer_ts(new_last_read_at, ref_ts)
+                if int(prev_dlg["unread_count"] or 0) > 0:
+                    turn_delta = 1
+            elif unread is not None and unread > 0:
+                if (
+                    int(prev_dlg["unread_count"] or 0) == 0
+                    and prev_read_ts
+                    and (not new_ts or new_ts <= prev_read_ts)
+                ):
+                    # Local read watermark already covers this snapshot timestamp
+                    effective_unread = 0
+    else:
+        if unread == 0 and sent_at:
+            new_last_read_at = sent_at
+
+    conn.execute(
+        """
+        INSERT INTO dialogs (
+            account_id, peer_type, peer_id, username, title, phone, provider,
+            is_group, unread_count, last_message_at, last_message_preview,
+            last_from_peer, muted, last_read_at, read_inbox_max_id, reply_turn_seq,
+            created_at, updated_at
+        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?)
+        ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
+            username = COALESCE(excluded.username, dialogs.username),
+            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
+            phone = COALESCE(excluded.phone, dialogs.phone),
+            provider = COALESCE(excluded.provider, dialogs.provider),
+            unread_count = COALESCE(?, dialogs.unread_count),
+            last_message_at = COALESCE(?, dialogs.last_message_at),
+            last_message_preview = COALESCE(?, dialogs.last_message_preview),
+            last_from_peer = COALESCE(?, dialogs.last_from_peer),
+            last_read_at = COALESCE(?, dialogs.last_read_at),
+            read_inbox_max_id = MAX(COALESCE(dialogs.read_inbox_max_id, 0), ?),
+            reply_turn_seq = COALESCE(dialogs.reply_turn_seq, 0) + ?,
+            updated_at = excluded.updated_at
+        """,
+        (
+            account_id,
+            int(peer_id),
+            username,
+            title,
+            phone,
+            provider,
+            0 if effective_unread is None else effective_unread,
+            effective_sent_at,
+            effective_preview,
+            0 if effective_last_from is None else effective_last_from,
+            new_last_read_at,
+            new_read_max_id,
+            now,
+            now,
+            effective_unread,
+            effective_sent_at,
+            effective_preview,
+            effective_last_from,
+            new_last_read_at,
+            new_read_max_id,
+            turn_delta,
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT * FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        """,
+        (account_id, int(peer_id)),
+    ).fetchone()
+    if row and int(row["last_from_peer"] or 0) == 1:
+        has_explicit_unread = unread is not None and int(row["unread_count"] or 0) > 0
+        stop_outreach_on_reply(
+            conn,
+            account_id=account_id,
+            peer_id=int(row["peer_id"]),
+            username=row["username"],
+            phone=row["phone"],
+            lead_id=row["lead_id"],
+            preview=row["last_message_preview"],
+            opener=opener,
+            notify=has_explicit_unread,
+            incoming_unread=has_explicit_unread,
+            incoming_sent_at=sent_at or (str(row["last_message_at"]) if row["last_message_at"] else None),
+            source=source,
+        )
+        row = conn.execute(
+            "SELECT * FROM dialogs WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+    return _public(row)
+
+
 def remember_dialogs(conn, account_id: int, people: list, opener=None) -> list:
+    ensure_dialog_notify_columns(conn)
     acc_provider = _account_provider(conn, account_id)
     now = utc_now()
     saved = []
     for person in people:
-        peer_id = person.get("telegram_user_id")
-        if peer_id is None and person.get("phone"):
-            digits = re.sub(r"\D", "", str(person["phone"]))
-            if len(digits) >= 7:
-                peer_id = int(digits[-12:])
-        if peer_id is None:
-            continue
-        title = (person.get("name") or "").strip()
-        username = person.get("username")
-        if username is not None:
-            username = str(username).strip().lstrip("@") or None
-        provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
-        phone = _extract_dialog_phone(person, int(peer_id), provider)
-        unread = person.get("unread_count") if "unread_count" in person else None
-        if unread is not None:
-            unread = max(0, int(unread))
-        preview = person.get("last_message_preview")
-        if preview is not None:
-            preview = str(preview)[:120]
-        sent_at = person.get("last_message_at")
-        if sent_at is not None:
-            sent_at = str(sent_at)
-        last_from = person.get("last_from_peer") if "last_from_peer" in person else None
-        if last_from is not None:
-            last_from = 1 if last_from else 0
-        conn.execute(
-            """
-            INSERT INTO dialogs (
-                account_id, peer_type, peer_id, username, title, phone, provider,
-                is_group, unread_count, last_message_at, last_message_preview,
-                last_from_peer, muted, created_at, updated_at
-            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
-            ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
-                username = COALESCE(excluded.username, dialogs.username),
-                title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
-                phone = COALESCE(excluded.phone, dialogs.phone),
-                provider = COALESCE(excluded.provider, dialogs.provider),
-                unread_count = COALESCE(?, dialogs.unread_count),
-                last_message_at = COALESCE(excluded.last_message_at, dialogs.last_message_at),
-                last_message_preview = COALESCE(excluded.last_message_preview, dialogs.last_message_preview),
-                last_from_peer = COALESCE(?, dialogs.last_from_peer),
-                updated_at = excluded.updated_at
-            """,
-            (
-                account_id,
-                int(peer_id),
-                username,
-                title,
-                phone,
-                provider,
-                0 if unread is None else unread,
-                sent_at,
-                preview,
-                0 if last_from is None else last_from,
-                now,
-                now,
-                unread,
-                last_from,
-            ),
+        item = _upsert_snapshot_dialog(
+            conn,
+            account_id,
+            person,
+            acc_provider,
+            now,
+            opener=opener,
+            source="remember_dialogs",
         )
-        row = conn.execute(
-            """
-            SELECT * FROM dialogs
-            WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
-            """,
-            (account_id, int(peer_id)),
-        ).fetchone()
-        if row and int(row["last_from_peer"] or 0) == 1:
-            stop_outreach_on_reply(
-                conn,
-                account_id=account_id,
-                peer_id=int(row["peer_id"]),
-                username=row["username"],
-                phone=row["phone"],
-                lead_id=row["lead_id"],
-                preview=row["last_message_preview"],
-                opener=opener,
-            )
-            row = conn.execute(
-                "SELECT * FROM dialogs WHERE id = ?",
-                (row["id"],),
-            ).fetchone()
-        saved.append(_public(row))
+        if item is not None:
+            saved.append(item)
     conn.commit()
     return saved
 
 
-def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
-    if not isinstance(message, dict) or message.get("is_group"):
-        raise ValueError("Это не личный диалог")
-    if (message.get("peer_type") or "user") != "user":
-        raise ValueError("Это не личный диалог")
-    if (message.get("direction") or "in") != "in":
-        raise ValueError("Нужно входящее")
-    peer_id = message.get("telegram_user_id")
-    if peer_id is None and message.get("phone"):
-        digits = re.sub(r"\D", "", str(message["phone"]))
-        if len(digits) >= 7:
-            peer_id = int(digits[-12:])
+def _prepare_message_fields(conn, account_id: int, message: dict, now: str) -> dict:
+    peer_id = _resolve_private_peer_id(message)
     if peer_id is None:
         raise ValueError("Это не личный диалог")
     acc_provider = _account_provider(conn, account_id, require_exists=True)
     provider = str(message.get("provider") or acc_provider or "telegram").strip().lower()
     phone = _extract_dialog_phone(message, int(peer_id), provider)
-    now = utc_now()
     title = (message.get("name") or "").strip()
     username = message.get("username")
     if username is not None:
@@ -936,119 +1345,452 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
         else None
     )
     preview = _media_preview_label(media_type, text, media_filename)
-    sent_at = str(message.get("sent_at") or now)
-    prev_dlg = conn.execute(
-        """
-        SELECT last_from_peer FROM dialogs
-        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
-        """,
-        (account_id, int(peer_id)),
-    ).fetchone()
-    was_already_from_peer = is_edit or bool(prev_dlg and int(prev_dlg["last_from_peer"] or 0) == 1)
-    unread_inc = 0 if is_edit else 1
+    explicit_sent_at = message.get("sent_at")
+    sent_at = str(explicit_sent_at or now)
+    mid = int(message["telegram_message_id"]) if message.get("telegram_message_id") is not None else None
+    return {
+        "peer_id": int(peer_id),
+        "provider": provider,
+        "phone": phone,
+        "title": title,
+        "username": username,
+        "text": text,
+        "media_url": media_url,
+        "media_type": media_type,
+        "media_mime": media_mime,
+        "media_filename": media_filename,
+        "media_duration": media_duration,
+        "entities_json": entities_json,
+        "formatted_html": formatted_html,
+        "edited_at": edited_at,
+        "is_edit": is_edit,
+        "reply_to_mid": reply_to_mid,
+        "preview": preview,
+        "has_explicit_sent_at": explicit_sent_at is not None and str(explicit_sent_at).strip() != "",
+        "sent_at": sent_at,
+        "mid": mid,
+    }
+
+
+def _upsert_dialog_message_row(conn, dialog_id: int, direction: str, fields: dict, now: str) -> None:
+    mid = fields["mid"]
+    if mid is None:
+        return
+    body = None if fields["text"] is None else str(fields["text"])
     conn.execute(
         """
-        INSERT INTO dialogs (
-            account_id, peer_type, peer_id, username, title, phone, provider,
-            is_group, unread_count, last_message_at, last_message_preview,
-            last_from_peer, muted, created_at, updated_at
-        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, 0, ?, ?)
-        ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
-            username = COALESCE(excluded.username, dialogs.username),
-            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
-            phone = COALESCE(excluded.phone, dialogs.phone),
-            provider = COALESCE(excluded.provider, dialogs.provider),
-            unread_count = dialogs.unread_count + ?,
-            last_message_at = excluded.last_message_at,
-            last_message_preview = excluded.last_message_preview,
-            last_from_peer = 1,
+        INSERT INTO messages (
+            dialog_id, telegram_message_id, direction, text, media_url,
+            media_type, media_mime, media_filename, media_duration,
+            entities_json, formatted_html, edited_at,
+            sent_at, reply_to_telegram_message_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+            direction = excluded.direction,
+            text = excluded.text,
+            formatted_html = excluded.formatted_html,
+            entities_json = excluded.entities_json,
+            edited_at = COALESCE(excluded.edited_at, messages.edited_at),
+            media_type = COALESCE(excluded.media_type, messages.media_type),
+            media_url = COALESCE(excluded.media_url, messages.media_url),
+            media_mime = COALESCE(excluded.media_mime, messages.media_mime),
+            media_duration = COALESCE(excluded.media_duration, messages.media_duration),
+            media_filename = COALESCE(excluded.media_filename, messages.media_filename),
+            sent_at = excluded.sent_at,
             updated_at = excluded.updated_at
         """,
         (
-            account_id,
-            int(peer_id),
-            username,
-            title,
-            phone,
-            provider,
-            unread_inc,
-            sent_at,
-            preview,
+            int(dialog_id),
+            int(mid),
+            direction,
+            body,
+            fields["media_url"],
+            fields["media_type"],
+            fields["media_mime"],
+            fields["media_filename"],
+            fields["media_duration"],
+            fields["entities_json"],
+            fields["formatted_html"],
+            fields["edited_at"],
+            fields["sent_at"],
+            fields["reply_to_mid"],
             now,
             now,
-            unread_inc,
         ),
     )
+
+
+def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
+    if not isinstance(message, dict) or message.get("is_group"):
+        raise ValueError("Это не личный диалог")
+    if (message.get("peer_type") or "user") != "user":
+        raise ValueError("Это не личный диалог")
+    if (message.get("direction") or "in") != "in":
+        raise ValueError("Нужно входящее")
+    now = utc_now()
+    fields = _prepare_message_fields(conn, account_id, message, now)
+    ensure_dialog_notify_columns(conn)
+
+    peer_id = fields["peer_id"]
+    is_edit = fields["is_edit"]
+    mid = fields["mid"]
+    sent_at = fields["sent_at"]
+
+    prev_dlg = conn.execute(
+        """
+        SELECT * FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        """,
+        (account_id, peer_id),
+    ).fetchone()
+
+    existing_msg = None
+    if prev_dlg is not None and mid is not None:
+        existing_msg = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE dialog_id = ? AND telegram_message_id = ?
+            """,
+            (int(prev_dlg["id"]), int(mid)),
+        ).fetchone()
+
+    # Idempotent redelivery guard for non-edit events
+    if not is_edit and existing_msg is not None:
+        return _public(prev_dlg)
+
+    if is_edit and existing_msg is not None and not fields["has_explicit_sent_at"]:
+        if existing_msg["sent_at"]:
+            sent_at = str(existing_msg["sent_at"])
+            fields = {**fields, "sent_at": sent_at}
+
+    latest_msg = None
+    if prev_dlg is not None:
+        latest_msg = conn.execute(
+            """
+            SELECT id, telegram_message_id, direction, sent_at FROM messages
+            WHERE dialog_id = ?
+            ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC,
+                     COALESCE(telegram_message_id, 0) DESC,
+                     id DESC
+            LIMIT 1
+            """,
+            (int(prev_dlg["id"]),),
+        ).fetchone()
+
+    if is_edit and prev_dlg is not None:
+        try:
+            _upsert_dialog_message_row(conn, int(prev_dlg["id"]), "in", fields, now)
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise ValueError("Не удалось записать входящее") from exc
+
+        # Edit must NOT clobber newer or outgoing dialog state, and NEVER increments unread or notifies
+        has_newer_out = (
+            int(prev_dlg["last_from_peer"] or 0) == 0
+            or (latest_msg is not None and str(latest_msg["direction"]) == "out")
+        )
+        has_newer_msg = bool(
+            (prev_dlg["last_message_at"] and _norm_ts(prev_dlg["last_message_at"]) > _norm_ts(sent_at))
+            or (
+                latest_msg is not None
+                and mid is not None
+                and latest_msg["telegram_message_id"] is not None
+                and int(latest_msg["telegram_message_id"]) != int(mid)
+                and _norm_ts(latest_msg["sent_at"]) >= _norm_ts(sent_at)
+            )
+        )
+        if not has_newer_out and not has_newer_msg:
+            conn.execute(
+                """
+                UPDATE dialogs
+                SET username = COALESCE(?, username),
+                    title = CASE WHEN ? != '' THEN ? ELSE title END,
+                    phone = COALESCE(?, phone),
+                    last_message_preview = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    fields["username"],
+                    fields["title"],
+                    fields["title"],
+                    fields["phone"],
+                    fields["preview"],
+                    now,
+                    int(prev_dlg["id"]),
+                ),
+            )
+        row = conn.execute("SELECT * FROM dialogs WHERE id = ?", (int(prev_dlg["id"]),)).fetchone()
+        conn.commit()
+        return _public(row)
+
+    prev_read_max_id = int(prev_dlg["read_inbox_max_id"] or 0) if prev_dlg is not None else 0
+    is_already_read_mid = bool(mid is not None and prev_read_max_id > 0 and int(mid) <= prev_read_max_id)
+    has_newer_mid = bool(
+        mid is not None
+        and latest_msg is not None
+        and latest_msg["telegram_message_id"] is not None
+        and int(latest_msg["telegram_message_id"]) > int(mid)
+    )
+    is_strictly_newer_mid = bool(
+        mid is not None
+        and latest_msg is not None
+        and latest_msg["telegram_message_id"] is not None
+        and int(mid) > int(latest_msg["telegram_message_id"])
+        and int(mid) > prev_read_max_id
+    )
+    is_stale_backfill = bool(
+        prev_dlg is not None
+        and prev_dlg["last_message_at"]
+        and _norm_ts(sent_at) < _norm_ts(prev_dlg["last_message_at"])
+        and (has_newer_mid or not is_strictly_newer_mid)
+    )
+    was_already_unread_turn = is_edit or bool(
+        prev_dlg is not None
+        and int(prev_dlg["last_from_peer"] or 0) == 1
+        and int(prev_dlg["unread_count"] or 0) > 0
+    )
+
+    if prev_dlg is not None and is_stale_backfill:
+        row = prev_dlg
+    else:
+        unread_inc = 0 if (is_edit or is_already_read_mid) else 1
+        conn.execute(
+            """
+            INSERT INTO dialogs (
+                account_id, peer_type, peer_id, username, title, phone, provider,
+                is_group, unread_count, last_message_at, last_message_preview,
+                last_from_peer, muted, created_at, updated_at
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, 0, ?, ?)
+            ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
+                username = COALESCE(excluded.username, dialogs.username),
+                title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
+                phone = COALESCE(excluded.phone, dialogs.phone),
+                provider = COALESCE(excluded.provider, dialogs.provider),
+                unread_count = dialogs.unread_count + ?,
+                last_message_at = excluded.last_message_at,
+                last_message_preview = excluded.last_message_preview,
+                last_from_peer = 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                account_id,
+                peer_id,
+                fields["username"],
+                fields["title"],
+                fields["phone"],
+                fields["provider"],
+                unread_inc,
+                sent_at,
+                fields["preview"],
+                now,
+                now,
+                unread_inc,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT * FROM dialogs
+            WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+            """,
+            (account_id, peer_id),
+        ).fetchone()
+
+    try:
+        _upsert_dialog_message_row(conn, int(row["id"]), "in", fields, now)
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("Не удалось записать входящее") from exc
+
+    if not is_edit:
+        should_notify = not is_already_read_mid and not is_stale_backfill
+        stop_outreach_on_reply(
+            conn,
+            account_id=account_id,
+            peer_id=int(row["peer_id"]),
+            username=row["username"],
+            phone=row["phone"],
+            lead_id=row["lead_id"],
+            preview=fields["preview"],
+            force_event=not was_already_unread_turn and not is_already_read_mid and not is_stale_backfill,
+            opener=opener,
+            notify=should_notify,
+            incoming_unread=not is_already_read_mid,
+            telegram_message_id=mid,
+            incoming_sent_at=sent_at,
+            source="apply_incoming",
+        )
+        row = conn.execute(
+            "SELECT * FROM dialogs WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+    conn.commit()
+    return _public(row)
+
+
+def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
+    if not isinstance(message, dict) or message.get("is_group"):
+        return None
+    if (message.get("peer_type") or "user") != "user":
+        return None
+    if (message.get("direction") or "out") != "out":
+        return None
+    if _resolve_private_peer_id(message) is None:
+        return None
+    now = utc_now()
+    fields = _prepare_message_fields(conn, account_id, message, now)
+    ensure_dialog_notify_columns(conn)
+
+    peer_id = fields["peer_id"]
+    sent_at = fields["sent_at"]
+    mid = fields["mid"]
+    is_edit = fields["is_edit"]
+
+    prev_dlg = conn.execute(
+        """
+        SELECT * FROM dialogs
+        WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
+        """,
+        (account_id, peer_id),
+    ).fetchone()
+
+    existing_msg = None
+    if prev_dlg is not None and mid is not None:
+        existing_msg = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE dialog_id = ? AND telegram_message_id = ?
+            """,
+            (int(prev_dlg["id"]), int(mid)),
+        ).fetchone()
+
+    if is_edit and existing_msg is not None and not fields["has_explicit_sent_at"]:
+        if existing_msg["sent_at"]:
+            sent_at = str(existing_msg["sent_at"])
+            fields = {**fields, "sent_at": sent_at}
+
+    is_stale = bool(
+        prev_dlg is not None
+        and prev_dlg["last_message_at"]
+        and _norm_ts(sent_at) < _norm_ts(prev_dlg["last_message_at"])
+    )
+
+    if prev_dlg is None:
+        conn.execute(
+            """
+            INSERT INTO dialogs (
+                account_id, peer_type, peer_id, username, title, phone, provider,
+                is_group, unread_count, last_message_at, last_message_preview,
+                last_from_peer, muted, last_read_at, read_inbox_max_id, reply_turn_seq,
+                created_at, updated_at
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 0, ?, 0, 1, ?, ?)
+            """,
+            (
+                account_id,
+                peer_id,
+                fields["username"],
+                fields["title"],
+                fields["phone"],
+                fields["provider"],
+                sent_at,
+                fields["preview"],
+                sent_at,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?",
+            (account_id, peer_id),
+        ).fetchone()
+    else:
+        did = int(prev_dlg["id"])
+        if is_stale or (is_edit and existing_msg is not None):
+            conn.execute(
+                """
+                UPDATE dialogs
+                SET username = COALESCE(?, username),
+                    title = CASE WHEN ? != '' THEN ? ELSE title END,
+                    phone = COALESCE(?, phone),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (fields["username"], fields["title"], fields["title"], fields["phone"], now, did),
+            )
+        else:
+            prev_read = str(prev_dlg["last_read_at"]).strip() if prev_dlg["last_read_at"] else None
+            eff_read_at = _pick_newer_ts(prev_read, sent_at) or now
+            is_duplicate_out = existing_msg is not None and str(existing_msg["direction"]) == "out"
+            turn_delta = 1 if (
+                not is_duplicate_out
+                or int(prev_dlg["last_from_peer"] or 0) == 1
+                or int(prev_dlg["unread_count"] or 0) > 0
+            ) else 0
+            conn.execute(
+                """
+                UPDATE dialogs
+                SET username = COALESCE(?, username),
+                    title = CASE WHEN ? != '' THEN ? ELSE title END,
+                    phone = COALESCE(?, phone),
+                    provider = COALESCE(?, provider),
+                    unread_count = 0,
+                    last_message_at = ?,
+                    last_message_preview = ?,
+                    last_from_peer = 0,
+                    last_read_at = ?,
+                    reply_turn_seq = COALESCE(reply_turn_seq, 0) + ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    fields["username"],
+                    fields["title"],
+                    fields["title"],
+                    fields["phone"],
+                    fields["provider"],
+                    sent_at,
+                    fields["preview"],
+                    eff_read_at,
+                    turn_delta,
+                    now,
+                    did,
+                ),
+            )
+        row = conn.execute("SELECT * FROM dialogs WHERE id = ?", (did,)).fetchone()
+
+    try:
+        _upsert_dialog_message_row(conn, int(row["id"]), "out", fields, now)
+    except sqlite3.IntegrityError:
+        pass
+    conn.commit()
+    return _public(row)
+
+
+def apply_inbox_read_update(
+    conn,
+    account_id: int,
+    peer_id: int,
+    max_id: int | None = None,
+) -> dict | None:
+    ensure_dialog_notify_columns(conn)
     row = conn.execute(
         """
         SELECT * FROM dialogs
         WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
         """,
-        (account_id, int(peer_id)),
+        (int(account_id), int(peer_id)),
     ).fetchone()
-    mid = message.get("telegram_message_id")
-    if mid is not None:
-        body = None if text is None else str(text)
-        try:
-            conn.execute(
-                """
-                INSERT INTO messages (
-                    dialog_id, telegram_message_id, direction, text, media_url,
-                    media_type, media_mime, media_filename, media_duration,
-                    entities_json, formatted_html, edited_at,
-                    sent_at, reply_to_telegram_message_id, created_at, updated_at
-                ) VALUES (?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
-                    text = excluded.text,
-                    formatted_html = excluded.formatted_html,
-                    entities_json = excluded.entities_json,
-                    edited_at = COALESCE(excluded.edited_at, messages.edited_at),
-                    media_type = COALESCE(excluded.media_type, messages.media_type),
-                    media_url = COALESCE(excluded.media_url, messages.media_url),
-                    media_mime = COALESCE(excluded.media_mime, messages.media_mime),
-                    media_duration = COALESCE(excluded.media_duration, messages.media_duration),
-                    media_filename = COALESCE(excluded.media_filename, messages.media_filename),
-                    sent_at = excluded.sent_at,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    row["id"],
-                    int(mid),
-                    body,
-                    media_url,
-                    media_type,
-                    media_mime,
-                    media_filename,
-                    media_duration,
-                    entities_json,
-                    formatted_html,
-                    edited_at,
-                    sent_at,
-                    reply_to_mid,
-                    now,
-                    now,
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            conn.rollback()
-            raise ValueError("Не удалось записать входящее") from exc
-    stop_outreach_on_reply(
+    if row is None:
+        return None
+    updated = _advance_dialog_read_state(
         conn,
-        account_id=account_id,
-        peer_id=int(row["peer_id"]),
-        username=row["username"],
-        phone=row["phone"],
-        lead_id=row["lead_id"],
-        preview=preview,
-        force_event=not was_already_from_peer,
-        opener=opener,
+        row,
+        utc_now(),
+        max_id=int(max_id) if max_id is not None else None,
+        force_bump_turn=False,
     )
-    row = conn.execute(
-        "SELECT * FROM dialogs WHERE id = ?",
-        (row["id"],),
-    ).fetchone()
     conn.commit()
-    return _public(row)
+    return _public(updated)
 
 
 def _person_is_crm_relevant(
@@ -1123,6 +1865,7 @@ def sync_inbox(
     opener=None,
     crm_only: bool = False,
 ) -> list:
+    ensure_dialog_notify_columns(conn)
     acc_provider = _account_provider(conn, account_id, require_exists=True)
     now = utc_now()
     saved = []
@@ -1132,93 +1875,30 @@ def sync_inbox(
                 continue
             if (person.get("peer_type") or "user") != "user":
                 continue
-            peer_id = person.get("telegram_user_id")
-            if peer_id is None and person.get("phone"):
-                digits = re.sub(r"\D", "", str(person["phone"]))
-                if len(digits) >= 7:
-                    peer_id = int(digits[-12:])
+            peer_id = _resolve_private_peer_id(person)
             if peer_id is None:
                 continue
-            title = (person.get("name") or "").strip()
-            username = person.get("username")
-            if username is not None:
-                username = str(username).strip().lstrip("@") or None
-            provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
-            phone = _extract_dialog_phone(person, int(peer_id), provider)
-            if crm_only and not _person_is_crm_relevant(
-                conn, account_id, int(peer_id), username, phone
-            ):
-                continue
-            unread = person.get("unread_count") if "unread_count" in person else None
-            if unread is not None:
-                unread = max(0, int(unread))
-            preview = person.get("last_message_preview")
-            if preview is not None:
-                preview = str(preview)[:120]
-            sent_at = person.get("last_message_at")
-            if sent_at is not None:
-                sent_at = str(sent_at)
-            last_from = person.get("last_from_peer") if "last_from_peer" in person else None
-            if last_from is not None:
-                last_from = 1 if last_from else 0
-            conn.execute(
-                """
-                INSERT INTO dialogs (
-                    account_id, peer_type, peer_id, username, title, phone, provider,
-                    is_group, unread_count, last_message_at, last_message_preview,
-                    last_from_peer, muted, created_at, updated_at
-                ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
-                ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
-                    username = COALESCE(excluded.username, dialogs.username),
-                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
-                    phone = COALESCE(excluded.phone, dialogs.phone),
-                    provider = COALESCE(excluded.provider, dialogs.provider),
-                    unread_count = COALESCE(?, dialogs.unread_count),
-                    last_message_at = COALESCE(excluded.last_message_at, dialogs.last_message_at),
-                    last_message_preview = COALESCE(excluded.last_message_preview, dialogs.last_message_preview),
-                    last_from_peer = COALESCE(?, dialogs.last_from_peer),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    account_id,
-                    int(peer_id),
-                    username,
-                    title,
-                    phone,
-                    provider,
-                    0 if unread is None else unread,
-                    sent_at,
-                    preview,
-                    0 if last_from is None else last_from,
-                    now,
-                    now,
-                    unread,
-                    last_from,
-                ),
+            if crm_only:
+                username = person.get("username")
+                if username is not None:
+                    username = str(username).strip().lstrip("@") or None
+                provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
+                phone = _extract_dialog_phone(person, int(peer_id), provider)
+                if not _person_is_crm_relevant(
+                    conn, account_id, int(peer_id), username, phone
+                ):
+                    continue
+            item = _upsert_snapshot_dialog(
+                conn,
+                account_id,
+                person,
+                acc_provider,
+                now,
+                opener=opener,
+                source="sync_inbox",
             )
-            row = conn.execute(
-                """
-                SELECT * FROM dialogs
-                WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?
-                """,
-                (account_id, int(peer_id)),
-            ).fetchone()
-            if row and int(row["last_from_peer"] or 0) == 1:
-                stop_outreach_on_reply(
-                    conn,
-                    account_id=account_id,
-                    peer_id=int(row["peer_id"]),
-                    username=row["username"],
-                    phone=row["phone"],
-                    lead_id=row["lead_id"],
-                    preview=row["last_message_preview"],
-                    opener=opener,
-                )
-                row = conn.execute(
-                    "SELECT * FROM dialogs WHERE id = ?",
-                    (row["id"],),
-                ).fetchone()
-            saved.append(_public(row))
+            if item is not None:
+                saved.append(item)
         conn.commit()
     except (sqlite3.IntegrityError, TypeError, ValueError) as exc:
         conn.rollback()
@@ -1607,19 +2287,11 @@ def mark_dialog_unread(conn, dialog_id: int) -> dict:
 
 def mark_dialog_read(conn, dialog_id: int) -> dict:
     did = int(dialog_id)
-    existing = conn.execute("SELECT id, account_id FROM dialogs WHERE id = ?", (did,)).fetchone()
+    ensure_dialog_notify_columns(conn)
+    existing = conn.execute("SELECT * FROM dialogs WHERE id = ?", (did,)).fetchone()
     if existing is None:
         raise LookupError("dialog")
-    now = utc_now()
-    conn.execute(
-        """
-        UPDATE dialogs
-        SET unread_count = 0,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (now, did),
-    )
+    _advance_dialog_read_state(conn, existing, utc_now(), max_id=None, force_bump_turn=True)
     conn.commit()
     out = _load_dialog_public(conn, did)
     out["counts"] = get_inbox_counts(conn, account_id=out["account_id"])
@@ -2035,9 +2707,13 @@ def _cache_messages(conn, dialog_id: int, items: list) -> None:
                 ),
             )
         if normalized:
-            latest = max(normalized, key=lambda m: (m[3], m[0]))
+            ensure_dialog_notify_columns(conn)
+            prev_dlg = conn.execute(
+                "SELECT * FROM dialogs WHERE id = ?", (dialog_id,)
+            ).fetchone()
+            latest = max(normalized, key=lambda m: (_norm_ts(m[3]), int(m[0] or 0)))
             (
-                _,
+                latest_mid,
                 last_dir,
                 last_text,
                 last_at,
@@ -2054,44 +2730,76 @@ def _cache_messages(conn, dialog_id: int, items: list) -> None:
             last_preview = _media_preview_label(
                 last_media_type, last_text, last_media_filename
             )
+            prev_ts = _norm_ts(prev_dlg["last_message_at"]) if prev_dlg else ""
+            batch_ts = _norm_ts(last_at)
+            db_latest = conn.execute(
+                """
+                SELECT direction, sent_at FROM messages
+                WHERE dialog_id = ?
+                ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC,
+                         COALESCE(telegram_message_id, 0) DESC,
+                         id DESC
+                LIMIT 1
+                """,
+                (dialog_id,),
+            ).fetchone()
+            db_has_newer_out = bool(
+                db_latest is not None
+                and str(db_latest["direction"]) == "out"
+                and (not batch_ts or _norm_ts(db_latest["sent_at"]) >= batch_ts)
+            )
             if last_dir == "in":
-                conn.execute(
-                    """
-                    UPDATE dialogs
-                    SET last_from_peer = 1,
-                        last_message_at = COALESCE(?, last_message_at),
-                        last_message_preview = CASE WHEN ? != '' THEN ? ELSE last_message_preview END,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (last_at, last_preview, last_preview, now, dialog_id),
-                )
-                dlg_row = conn.execute(
-                    "SELECT * FROM dialogs WHERE id = ?", (dialog_id,)
-                ).fetchone()
-                if dlg_row is not None:
-                    stop_outreach_on_reply(
-                        conn,
-                        account_id=int(dlg_row["account_id"]),
-                        peer_id=int(dlg_row["peer_id"]),
-                        username=dlg_row["username"],
-                        phone=dlg_row["phone"],
-                        lead_id=dlg_row["lead_id"],
-                        preview=last_preview,
-                        min_sent_at=last_at,
-                    )
+                is_stale_against_out = bool(
+                    prev_dlg is not None
+                    and int(prev_dlg["last_from_peer"] or 0) == 0
+                    and (not batch_ts or (prev_ts and batch_ts <= prev_ts))
+                ) or db_has_newer_out
+                if not is_stale_against_out:
+                    if not prev_ts or not batch_ts or batch_ts >= prev_ts:
+                        conn.execute(
+                            """
+                            UPDATE dialogs
+                            SET last_from_peer = 1,
+                                last_message_at = COALESCE(?, last_message_at),
+                                last_message_preview = CASE WHEN ? != '' THEN ? ELSE last_message_preview END,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (last_at, last_preview, last_preview, now, dialog_id),
+                        )
+                    dlg_row = conn.execute(
+                        "SELECT * FROM dialogs WHERE id = ?", (dialog_id,)
+                    ).fetchone()
+                    if dlg_row is not None:
+                        stop_outreach_on_reply(
+                            conn,
+                            account_id=int(dlg_row["account_id"]),
+                            peer_id=int(dlg_row["peer_id"]),
+                            username=dlg_row["username"],
+                            phone=dlg_row["phone"],
+                            lead_id=dlg_row["lead_id"],
+                            preview=last_preview,
+                            min_sent_at=last_at,
+                            notify=False,
+                            incoming_unread=False,
+                            telegram_message_id=int(latest_mid) if latest_mid is not None else None,
+                            incoming_sent_at=last_at,
+                            source="cache_messages",
+                        )
             else:
-                conn.execute(
-                    """
-                    UPDATE dialogs
-                    SET last_from_peer = 0,
-                        last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at <= ? THEN ? ELSE last_message_at END,
-                        last_message_preview = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (last_at, last_at, last_preview, now, dialog_id),
-                )
+                if not prev_ts or not batch_ts or prev_ts <= batch_ts:
+                    conn.execute(
+                        """
+                        UPDATE dialogs
+                        SET last_from_peer = 0,
+                            unread_count = 0,
+                            last_message_at = ?,
+                            last_message_preview = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (last_at, last_preview, now, dialog_id),
+                    )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -2320,14 +3028,7 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
         conn.rollback()
         raise ValueError("Такое сообщение уже есть") from exc
     preview = message_text[:120]
-    conn.execute(
-        """
-        UPDATE dialogs
-        SET last_message_at = ?, last_message_preview = ?, last_from_peer = 0, updated_at = ?
-        WHERE id = ?
-        """,
-        (sent_at, preview, now, dialog_id),
-    )
+    _mark_dialog_replied_out(conn, int(dialog_id), sent_at, preview, now)
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)
@@ -2585,14 +3286,7 @@ async def send_dialog_media(
         ),
     )
     preview = _media_preview_label(clean_mtype, msg_text, safe_orig_name)
-    conn.execute(
-        """
-        UPDATE dialogs
-        SET last_message_at = ?, last_message_preview = ?, last_from_peer = 0, updated_at = ?
-        WHERE id = ?
-        """,
-        (sent_at, preview, now, int(dialog_id)),
-    )
+    _mark_dialog_replied_out(conn, int(dialog_id), sent_at, preview, now)
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)

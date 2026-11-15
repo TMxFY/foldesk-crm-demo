@@ -8,6 +8,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import types
 import urllib.parse
 from pathlib import Path
@@ -20,6 +21,7 @@ from app.telegram_gateway import (
     _history_limit,
     _inbox_limit,
     _private_incoming,
+    _private_outgoing,
     listening_event,
 )
 
@@ -171,6 +173,9 @@ def generate_qr_svg(session_path: str, phone: str = "") -> str:
 
 
 class WhatsAppGateway(TelegramGateway):
+    _seq_lock = threading.Lock()
+    _global_last_seq = 0
+
     def __init__(
         self,
         code: str = "12345",
@@ -187,25 +192,47 @@ class WhatsAppGateway(TelegramGateway):
         self._pending = {}
         self.sent = []
         self.presence_log = []
-        self._message_seq = 5000
+        now_ms = int(time.time() * 1000)
+        db_max = 0
         try:
             if DEFAULT_DB.exists():
                 with sqlite3.connect(DEFAULT_DB) as conn:
                     row = conn.execute(
-                        "SELECT COALESCE(MAX(telegram_message_id), 5000) FROM messages"
+                        "SELECT COALESCE(MAX(telegram_message_id), 0) FROM messages"
                     ).fetchone()
                     if row and row[0] is not None:
-                        self._message_seq = max(5000, int(row[0]))
+                        db_max = int(row[0])
         except Exception:
             pass
+        with WhatsAppGateway._seq_lock:
+            floor = max(1_000_000_000, db_max, now_ms, WhatsAppGateway._global_last_seq)
+            WhatsAppGateway._global_last_seq = floor
+            self._message_seq = floor
         self._lock = threading.Lock()
         self._listeners = {}
+        self._outgoing_listeners = {}
         self._backlog = {}
+        self._outgoing_backlog = {}
         self._loop = None
         self._neonize_clients = {}
         self._qr_events = {}
         self._pair_events = {}
         self._proxies = {}
+
+    def _next_message_seq(self, used: set[int] | None = None) -> int:
+        now_ms = int(time.time() * 1000)
+        with WhatsAppGateway._seq_lock:
+            cand = max(
+                self._message_seq + 1,
+                now_ms,
+                WhatsAppGateway._global_last_seq + 1,
+                1_000_000_001,
+            )
+            while used and cand in used:
+                cand += 1
+            self._message_seq = cand
+            WhatsAppGateway._global_last_seq = cand
+            return cand
 
     def set_proxy(self, session_path: str, proxy_url: str | None) -> None:
         if not session_path:
@@ -348,10 +375,20 @@ class WhatsAppGateway(TelegramGateway):
             try:
                 info_proto = getattr(ev, "Info", None)
                 src = getattr(info_proto, "MessageSource", None)
-                if src is None or getattr(src, "IsGroup", False) or getattr(src, "IsFromMe", False):
+                if src is None or getattr(src, "IsGroup", False):
                     return
-                sender = getattr(src, "Sender", None) or getattr(src, "Chat", None)
-                sender_user = str(getattr(sender, "User", "") or "").split(":", 1)[0]
+                is_from_me = bool(getattr(src, "IsFromMe", False))
+                if is_from_me:
+                    with self._lock:
+                        has_out_listener = session_path in self._outgoing_listeners
+                    if not has_out_listener:
+                        return
+                    peer_jid = getattr(src, "Chat", None) or getattr(src, "Sender", None)
+                else:
+                    peer_jid = getattr(src, "Sender", None) or getattr(src, "Chat", None)
+                if str(getattr(peer_jid, "Server", "") or "").lower() == "g.us":
+                    return
+                sender_user = str(getattr(peer_jid, "User", "") or "").split(":", 1)[0]
                 digits = re.sub(r"\D", "", sender_user)
                 if not digits:
                     return
@@ -364,23 +401,29 @@ class WhatsAppGateway(TelegramGateway):
                 if not text:
                     return
                 peer_id = int(digits[-15:])
-                push_name = str(getattr(info_proto, "Pushname", "") or f"WA +{digits}").strip()
-                self._message_seq += 1
+                if is_from_me:
+                    push_name = f"WA +{digits}"
+                else:
+                    push_name = str(getattr(info_proto, "Pushname", "") or f"WA +{digits}").strip()
+                seq_id = self._next_message_seq()
                 payload = {
                     "telegram_user_id": peer_id,
                     "username": None,
                     "name": push_name,
                     "phone": f"+{digits}",
                     "wa_jid": f"{digits}@s.whatsapp.net",
-                    "telegram_message_id": self._message_seq,
-                    "external_message_id": str(getattr(info_proto, "ID", "") or f"WA{self._message_seq}"),
+                    "telegram_message_id": seq_id,
+                    "external_message_id": str(getattr(info_proto, "ID", "") or f"WA{seq_id}"),
                     "text": text,
                     "sent_at": utc_now(),
-                    "direction": "in",
+                    "direction": "out" if is_from_me else "in",
                     "peer_type": "user",
                 }
                 self.history.setdefault(peer_id, []).append(dict(payload))
-                self.push_private(session_path, payload)
+                if is_from_me:
+                    self.push_outgoing(session_path, payload)
+                else:
+                    self.push_private(session_path, payload)
             except Exception:
                 pass
 
@@ -748,16 +791,14 @@ class WhatsAppGateway(TelegramGateway):
             )
             await asyncio.sleep(0.01)
 
-        self._message_seq += 1
         used = {
             int(row.get("telegram_message_id") or 0)
             for row in self.history.get(peer_key, [])
         }
-        while self._message_seq in used:
-            self._message_seq += 1
+        seq_id = self._next_message_seq(used)
 
         ext_hash = hashlib.sha1(
-            f"{session_path}:{peer_key}:{self._message_seq}:{body}".encode("utf-8")
+            f"{session_path}:{peer_key}:{seq_id}:{body}".encode("utf-8")
         ).hexdigest()[:16].upper()
         external_message_id = f"3EB0{ext_hash}"
 
@@ -787,7 +828,7 @@ class WhatsAppGateway(TelegramGateway):
         self.sent.append(sent_item)
 
         record = {
-            "telegram_message_id": self._message_seq,
+            "telegram_message_id": seq_id,
             "external_message_id": external_message_id,
             "text": body,
             "sent_at": utc_now(),
@@ -805,6 +846,22 @@ class WhatsAppGateway(TelegramGateway):
         rows = self.history.get(int(peer_id), [])
         return [dict(row) for row in rows[-cap:]]
 
+    @staticmethod
+    async def _invoke_cb(listener, item: dict) -> None:
+        res = listener(item)
+        if asyncio.iscoroutine(res):
+            await res
+
+    def _dispatch_cb(self, listener, loop, item: dict) -> None:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            loop.create_task(self._invoke_cb(listener, item))
+            return
+        asyncio.run_coroutine_threadsafe(self._invoke_cb(listener, item), loop).result(timeout=5)
+
     def push_private(self, session_path: str, message: dict) -> None:
         if not _private_incoming(message):
             return
@@ -818,16 +875,26 @@ class WhatsAppGateway(TelegramGateway):
             if listener is None or loop is None:
                 self._backlog.setdefault(session_path, []).append(item)
                 return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            loop.create_task(listener(item))
-            return
-        asyncio.run_coroutine_threadsafe(listener(item), loop).result(timeout=5)
+        self._dispatch_cb(listener, loop, item)
 
-    async def watch_private(self, session_path: str, on_message) -> None:
+    def push_outgoing(self, session_path: str, message: dict) -> None:
+        if not _private_outgoing(message):
+            return
+        jid = str(message.get("wa_jid") or "")
+        if jid.endswith("@g.us"):
+            return
+        item = dict(message)
+        with self._lock:
+            listener = self._outgoing_listeners.get(session_path)
+            loop = self._loop
+            if listener is None or loop is None:
+                self._outgoing_backlog.setdefault(session_path, []).append(item)
+                return
+        self._dispatch_cb(listener, loop, item)
+
+    async def watch_private(
+        self, session_path: str, on_message, on_read=None, on_outgoing=None
+    ) -> None:
         self._loop = asyncio.get_running_loop()
         if _use_live_neonize() and _inspect_whatsmeow_db(session_path) is not None:
             try:
@@ -836,16 +903,27 @@ class WhatsAppGateway(TelegramGateway):
                 pass
         with self._lock:
             self._listeners[session_path] = on_message
+            if on_outgoing is not None:
+                self._outgoing_listeners[session_path] = on_outgoing
             batch = self._backlog.pop(session_path, [])
+            out_batch = self._outgoing_backlog.pop(session_path, []) if on_outgoing is not None else []
         try:
             for item in batch:
-                await on_message(dict(item))
+                await self._invoke_cb(on_message, dict(item))
+            if on_outgoing is not None:
+                for o_item in out_batch:
+                    await self._invoke_cb(on_outgoing, dict(o_item))
             listening_event(self, session_path).set()
             await asyncio.Future()
         finally:
             with self._lock:
                 if self._listeners.get(session_path) is on_message:
                     self._listeners.pop(session_path, None)
+                if (
+                    on_outgoing is not None
+                    and self._outgoing_listeners.get(session_path) is on_outgoing
+                ):
+                    self._outgoing_listeners.pop(session_path, None)
 
     async def check_numbers(
         self, session_path: str, phones: list[str]

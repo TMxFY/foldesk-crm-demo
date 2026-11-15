@@ -412,9 +412,17 @@ class TelegramGateway(ABC):
         """Last personal-dialog messages, oldest first. Not groups or channels."""
         raise GatewayError("История не подключена")
 
-    async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
+    async def watch_private(
+        self, session_path: str, on_message, on_read=None, on_outgoing=None
+    ) -> None:
         """Listen until cancelled. Deliver incoming private messages to on_message."""
         raise GatewayError("Живые входящие не подключены")
+
+    async def mark_dialog_read(
+        self, session_path: str, peer_id: int, max_id: int | None = None
+    ) -> bool:
+        """Acknowledge incoming private messages as read in Telegram if supported."""
+        return False
 
     async def load_inbox(self, session_path: str, limit: int = 30) -> list:
         """Private dialogs already on the account. Not search, not groups or channels."""
@@ -644,6 +652,18 @@ def _private_incoming(message) -> bool:
     if (message.get("peer_type") or "user") != "user":
         return False
     if (message.get("direction") or "in") != "in":
+        return False
+    return message.get("telegram_user_id") is not None
+
+
+def _private_outgoing(message) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("is_group"):
+        return False
+    if (message.get("peer_type") or "user") != "user":
+        return False
+    if (message.get("direction") or "") != "out":
         return False
     return message.get("telegram_user_id") is not None
 
@@ -1752,19 +1772,28 @@ class TelethonGateway(TelegramGateway):
                 preview = "" if text is None else str(text)[:120]
                 sent_at = _stamp(getattr(message, "date", None))
                 last_from = 0 if getattr(message, "out", False) else 1
-            read_outbox_max_id = int(
-                getattr(getattr(dialog, "dialog", None), "read_outbox_max_id", 0) or 0
-            )
+            raw_dlg = getattr(dialog, "dialog", None)
+            raw_unread = getattr(dialog, "unread_count", None)
+            if raw_unread is None and raw_dlg is not None:
+                raw_unread = getattr(raw_dlg, "unread_count", 0)
+            unread_count = max(0, int(raw_unread or 0))
+            read_inbox_max_id = int(getattr(raw_dlg, "read_inbox_max_id", 0) or 0)
+            read_outbox_max_id = int(getattr(raw_dlg, "read_outbox_max_id", 0) or 0)
+            unread_mark = bool(getattr(raw_dlg, "unread_mark", False))
+            msg_id = int(getattr(message, "id", 0) or 0) if message is not None else 0
+            if last_from == 1 and msg_id > 0 and read_inbox_max_id >= msg_id and not unread_mark:
+                unread_count = 0
             found.append(
                 {
                     "telegram_user_id": int(entity.id),
                     "username": getattr(entity, "username", None),
                     "name": dialog.name or _person_name(entity),
                     "peer_type": "user",
-                    "unread_count": int(getattr(dialog, "unread_count", 0) or 0),
+                    "unread_count": unread_count,
                     "last_message_preview": preview,
                     "last_message_at": sent_at,
                     "last_from_peer": last_from,
+                    "read_inbox_max_id": read_inbox_max_id,
                     "read_outbox_max_id": read_outbox_max_id,
                 }
             )
@@ -2347,26 +2376,77 @@ class TelethonGateway(TelegramGateway):
         rows.reverse()
         return rows[-cap:]
 
-    async def _private_payload(self, event, *, is_edit: bool = False):
-        # Groups and channels are not the inbox. Outgoing is stored by send_reply.
+    async def _private_payload(
+        self, event, *, is_edit: bool = False, allow_outgoing: bool = False
+    ):
+        # Groups and channels are not the inbox. Outgoing requires allow_outgoing=True.
         if not getattr(event, "is_private", False):
             return None
         if getattr(event, "is_group", False) or getattr(event, "is_channel", False):
             return None
-        getter = getattr(event, "get_sender", None)
-        if getter is None:
-            return None
-        sender = await getter()
-        from telethon.tl.types import User
-
-        if not isinstance(sender, User):
-            return None
-        if int(getattr(sender, "id", 0) or 0) == 178220800 or str(getattr(sender, "username", "") or "").lower() == "spambot":
-            return None
         message = getattr(event, "message", None)
         if message is None or getattr(message, "id", None) is None:
             return None
-        if getattr(message, "out", False):
+        is_out = bool(getattr(message, "out", False))
+        if is_out and not allow_outgoing:
+            return None
+        if not is_out and allow_outgoing:
+            return None
+
+        from telethon.tl.types import User
+
+        peer = None
+        self_id = 0
+        if is_out:
+            get_chat = getattr(event, "get_chat", None)
+            if callable(get_chat):
+                try:
+                    peer = await get_chat()
+                except Exception:
+                    peer = None
+            if peer is None:
+                peer = getattr(event, "chat", None)
+            getter = getattr(event, "get_sender", None)
+            if callable(getter):
+                try:
+                    cand = await getter()
+                except Exception:
+                    cand = None
+                if getattr(cand, "is_self", False):
+                    self_id = int(getattr(cand, "id", 0) or 0)
+                elif peer is None:
+                    # Fake events in tests without get_chat may supply peer via get_sender.
+                    peer = cand
+        else:
+            getter = getattr(event, "get_sender", None)
+            if getter is None:
+                return None
+            peer = await getter()
+
+        peer_id_val = None
+        username = None
+        name = ""
+        if isinstance(peer, User):
+            if is_out and getattr(peer, "is_self", False):
+                return None
+            peer_id_val = int(getattr(peer, "id", 0) or 0)
+            username = getattr(peer, "username", None)
+            name = _person_name(peer)
+        elif is_out:
+            raw_peer = getattr(message, "peer_id", None)
+            uid = getattr(raw_peer, "user_id", None) or getattr(event, "chat_id", None)
+            if uid is None:
+                return None
+            peer_id_val = int(uid)
+            if self_id and peer_id_val == self_id:
+                return None
+            name = f"TG {peer_id_val}"
+        else:
+            return None
+
+        if peer_id_val <= 0:
+            return None
+        if peer_id_val == 178220800 or str(username or "").lower() == "spambot":
             return None
         raw_text = getattr(message, "message", None)
         media_info = _extract_message_media(message)
@@ -2377,13 +2457,13 @@ class TelethonGateway(TelegramGateway):
         edited_at = _stamp(edit_dt) if edit_dt is not None else (utc_now() if is_edit else None)
         reply = getattr(getattr(message, "reply_to", None), "reply_to_msg_id", None)
         payload = {
-            "telegram_user_id": int(sender.id),
-            "username": getattr(sender, "username", None),
-            "name": _person_name(sender),
+            "telegram_user_id": int(peer_id_val),
+            "username": username,
+            "name": name,
             "telegram_message_id": int(message.id),
             "text": text,
             "sent_at": _stamp(getattr(message, "date", None)),
-            "direction": "in",
+            "direction": "out" if is_out else "in",
             "peer_type": "user",
             "reply_to_telegram_message_id": int(reply) if reply else None,
             "media_type": media_info["media_type"],
@@ -2399,7 +2479,80 @@ class TelethonGateway(TelegramGateway):
             payload["is_edit"] = True
         return payload
 
-    async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
+    async def mark_dialog_read(
+        self, session_path: str, peer_id: int, max_id: int | None = None
+    ) -> bool:
+        try:
+            target = int(peer_id)
+        except (TypeError, ValueError):
+            return False
+        if target <= 0:
+            return False
+        max_id_arg = None
+        if max_id is not None:
+            try:
+                parsed_max = int(max_id)
+                if parsed_max > 0:
+                    max_id_arg = parsed_max
+            except (TypeError, ValueError):
+                max_id_arg = None
+
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                from telethon.tl.types import Channel, Chat
+
+                async def _resolve_and_ack():
+                    entity = None
+                    try:
+                        entity = await client.get_entity(target)
+                    except Exception:
+                        entity = target
+                    if isinstance(entity, (Channel, Chat)):
+                        return False
+                    ack_fn = getattr(client, "send_read_acknowledge", None)
+                    if ack_fn is None:
+                        return False
+                    if max_id_arg is not None:
+                        await ack_fn(entity, max_id=max_id_arg)
+                    else:
+                        await ack_fn(entity)
+                    return True
+
+                try:
+                    return bool(
+                        await asyncio.wait_for(_resolve_and_ack(), timeout=self._rpc_timeout)
+                    )
+                except Exception as first_exc:
+                    if (
+                        "could not find the input entity" in str(first_exc).casefold()
+                        and session_path not in self._warmed_dialogs
+                    ):
+                        try:
+                            await asyncio.wait_for(
+                                client.get_dialogs(limit=150), timeout=self._rpc_timeout
+                            )
+                            self._warmed_dialogs.add(session_path)
+                        except Exception:
+                            pass
+                        return bool(
+                            await asyncio.wait_for(_resolve_and_ack(), timeout=self._rpc_timeout)
+                        )
+                    raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError):
+                await self._drop_zombie_client_unlocked(session_path)
+                return False
+            except Exception as exc:
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
+                return False
+            finally:
+                if owned:
+                    await self._close(session_path)
+
+    async def watch_private(
+        self, session_path: str, on_message, on_read=None, on_outgoing=None
+    ) -> None:
         from telethon import events
 
         try:
@@ -2423,28 +2576,50 @@ class TelethonGateway(TelegramGateway):
                     return
                 await on_message(payload)
 
+            async def outgoing_handler(event):
+                if on_outgoing is None:
+                    return
+                payload = await self._private_payload(event, allow_outgoing=True)
+                if payload is None:
+                    return
+                res = on_outgoing(payload)
+                if asyncio.iscoroutine(res):
+                    await res
+
             async def raw_handler(event):
                 if on_read is None or event is None:
                     return
                 outbox_cls = getattr(getattr(tl, "types", None), "UpdateReadHistoryOutbox", None)
+                inbox_cls = getattr(getattr(tl, "types", None), "UpdateReadHistoryInbox", None)
                 is_outbox_read = (
                     isinstance(event, outbox_cls)
                     if outbox_cls is not None
                     else event.__class__.__name__ == "UpdateReadHistoryOutbox"
                 )
-                if not is_outbox_read:
+                is_inbox_read = (
+                    isinstance(event, inbox_cls)
+                    if inbox_cls is not None
+                    else event.__class__.__name__ == "UpdateReadHistoryInbox"
+                )
+                if not is_outbox_read and not is_inbox_read:
                     return
                 peer = getattr(event, "peer", None)
                 user_id = getattr(peer, "user_id", None)
                 max_id = int(getattr(event, "max_id", 0) or 0)
                 if user_id is None or max_id <= 0:
                     return
-                res = on_read(
-                    {
+                if is_outbox_read:
+                    read_payload = {
                         "telegram_user_id": int(user_id),
                         "read_outbox_max_id": max_id,
                     }
-                )
+                else:
+                    read_payload = {
+                        "telegram_user_id": int(user_id),
+                        "read_inbox_max_id": max_id,
+                        "unread_count": 0,
+                    }
+                res = on_read(read_payload)
                 if asyncio.iscoroutine(res):
                     await res
 
@@ -2453,6 +2628,8 @@ class TelethonGateway(TelegramGateway):
             client.add_event_handler(raw_handler, events.Raw)
             if supports_edit:
                 client.add_event_handler(edit_handler, events.MessageEdited(incoming=True))
+            if on_outgoing is not None:
+                client.add_event_handler(outgoing_handler, events.NewMessage(outgoing=True))
             try:
                 # Difference only: a long outage can miss updates Telegram already dropped.
                 try:
@@ -2466,6 +2643,8 @@ class TelethonGateway(TelegramGateway):
                 client.remove_event_handler(handler)
                 if supports_edit:
                     client.remove_event_handler(edit_handler)
+                if on_outgoing is not None:
+                    client.remove_event_handler(outgoing_handler)
                 client.remove_event_handler(raw_handler)
                 if self._clients.get(session_path) is client:
                     self._clients.pop(session_path, None)
@@ -2478,6 +2657,8 @@ class TelethonGateway(TelegramGateway):
             client.remove_event_handler(handler)
             if supports_edit:
                 client.remove_event_handler(edit_handler)
+            if on_outgoing is not None:
+                client.remove_event_handler(outgoing_handler)
             client.remove_event_handler(raw_handler)
             if self._clients.get(session_path) is client:
                 self._clients.pop(session_path, None)
@@ -2728,9 +2909,28 @@ class FakeGateway(TelegramGateway):
         self._lock = threading.Lock()
         self._listeners = {}
         self._read_listeners = {}
+        self._outgoing_listeners = {}
         self._backlog = {}
         self._read_backlog = {}
+        self._outgoing_backlog = {}
+        self.read_acks = []
         self._loop = None
+
+    @staticmethod
+    async def _invoke_cb(listener, item: dict) -> None:
+        res = listener(item)
+        if asyncio.iscoroutine(res):
+            await res
+
+    def _dispatch_cb(self, listener, loop, item: dict) -> None:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            loop.create_task(self._invoke_cb(listener, item))
+            return
+        asyncio.run_coroutine_threadsafe(self._invoke_cb(listener, item), loop).result(timeout=5)
 
     def push_private(self, session_path: str, message: dict) -> None:
         """Queue one incoming private message. Groups and channels are ignored."""
@@ -2743,14 +2943,20 @@ class FakeGateway(TelegramGateway):
             if listener is None or loop is None:
                 self._backlog.setdefault(session_path, []).append(item)
                 return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            loop.create_task(listener(item))
+        self._dispatch_cb(listener, loop, item)
+
+    def push_outgoing(self, session_path: str, message: dict) -> None:
+        """Queue or deliver one outgoing private message."""
+        if not _private_outgoing(message):
             return
-        asyncio.run_coroutine_threadsafe(listener(item), loop).result(timeout=5)
+        item = dict(message)
+        with self._lock:
+            listener = self._outgoing_listeners.get(session_path)
+            loop = self._loop
+            if listener is None or loop is None:
+                self._outgoing_backlog.setdefault(session_path, []).append(item)
+                return
+        self._dispatch_cb(listener, loop, item)
 
     def push_read_outbox(self, session_path: str, peer_id: int, max_id: int) -> None:
         item = {"telegram_user_id": int(peer_id), "read_outbox_max_id": int(max_id)}
@@ -2760,29 +2966,71 @@ class FakeGateway(TelegramGateway):
             if listener is None or loop is None:
                 self._read_backlog.setdefault(session_path, []).append(item)
                 return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            loop.create_task(listener(item))
-            return
-        asyncio.run_coroutine_threadsafe(listener(item), loop).result(timeout=5)
+        self._dispatch_cb(listener, loop, item)
 
-    async def watch_private(self, session_path: str, on_message, on_read=None) -> None:
+    def push_read_inbox(self, session_path: str, peer_id: int, max_id: int) -> None:
+        item = {
+            "telegram_user_id": int(peer_id),
+            "read_inbox_max_id": int(max_id),
+            "unread_count": 0,
+        }
+        with self._lock:
+            listener = self._read_listeners.get(session_path)
+            loop = self._loop
+            if listener is None or loop is None:
+                self._read_backlog.setdefault(session_path, []).append(item)
+                return
+        self._dispatch_cb(listener, loop, item)
+
+    async def mark_dialog_read(
+        self, session_path: str, peer_id: int, max_id: int | None = None
+    ) -> bool:
+        try:
+            target = int(peer_id)
+        except (TypeError, ValueError):
+            return False
+        if target <= 0:
+            return False
+        self.read_acks.append(
+            {
+                "session_path": session_path,
+                "peer_id": target,
+                "max_id": int(max_id) if max_id is not None else None,
+            }
+        )
+        for item in self.dialogs:
+            if isinstance(item, dict) and item.get("telegram_user_id") == target:
+                item["unread_count"] = 0
+                if max_id is not None:
+                    item["read_inbox_max_id"] = max(
+                        int(item.get("read_inbox_max_id") or 0), int(max_id)
+                    )
+        return True
+
+    async def watch_private(
+        self, session_path: str, on_message, on_read=None, on_outgoing=None
+    ) -> None:
         self._loop = asyncio.get_running_loop()
         with self._lock:
             self._listeners[session_path] = on_message
             if on_read is not None:
                 self._read_listeners[session_path] = on_read
+            if on_outgoing is not None:
+                self._outgoing_listeners[session_path] = on_outgoing
             batch = self._backlog.pop(session_path, [])
             read_batch = self._read_backlog.pop(session_path, []) if on_read is not None else []
+            out_batch = self._outgoing_backlog.pop(session_path, []) if on_outgoing is not None else []
         try:
             for item in batch:
                 await on_message(dict(item))
             if on_read is not None:
                 for r_item in read_batch:
                     res = on_read(dict(r_item))
+                    if asyncio.iscoroutine(res):
+                        await res
+            if on_outgoing is not None:
+                for o_item in out_batch:
+                    res = on_outgoing(dict(o_item))
                     if asyncio.iscoroutine(res):
                         await res
             listening_event(self, session_path).set()
@@ -2793,6 +3041,11 @@ class FakeGateway(TelegramGateway):
                     self._listeners.pop(session_path, None)
                 if on_read is not None and self._read_listeners.get(session_path) is on_read:
                     self._read_listeners.pop(session_path, None)
+                if (
+                    on_outgoing is not None
+                    and self._outgoing_listeners.get(session_path) is on_outgoing
+                ):
+                    self._outgoing_listeners.pop(session_path, None)
 
     async def session_health(self, session_path: str) -> dict:
         forced = self.health
@@ -2904,6 +3157,8 @@ class FakeGateway(TelegramGateway):
                 row["last_message_at"] = str(item["last_message_at"])
             if "last_from_peer" in item and item.get("last_from_peer") is not None:
                 row["last_from_peer"] = 1 if item.get("last_from_peer") else 0
+            if "read_inbox_max_id" in item and item.get("read_inbox_max_id") is not None:
+                row["read_inbox_max_id"] = max(0, int(item["read_inbox_max_id"]))
             if "read_outbox_max_id" in item and item.get("read_outbox_max_id") is not None:
                 row["read_outbox_max_id"] = max(0, int(item["read_outbox_max_id"]))
             found.append(row)

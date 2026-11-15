@@ -401,7 +401,10 @@ def _resolve_dialog_id_for_bot_reply(
     account_handle: str | None = None,
 ) -> int | None:
     if dialog_id is not None:
-        drow = conn.execute("SELECT id FROM dialogs WHERE id = ?", (int(dialog_id),)).fetchone()
+        drow = conn.execute(
+            "SELECT id FROM dialogs WHERE id = ? AND peer_type = 'user'",
+            (int(dialog_id),),
+        ).fetchone()
         if drow is not None:
             return int(drow["id"])
 
@@ -425,13 +428,13 @@ def _resolve_dialog_id_for_bot_reply(
     if resolved_peer_id is not None:
         if resolved_acc_id is not None:
             row = conn.execute(
-                "SELECT id FROM dialogs WHERE account_id = ? AND peer_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+                "SELECT id FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
                 (int(resolved_acc_id), int(resolved_peer_id)),
             ).fetchone()
             if row is not None:
                 return int(row["id"])
         row = conn.execute(
-            "SELECT id FROM dialogs WHERE peer_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            "SELECT id FROM dialogs WHERE peer_type = 'user' AND peer_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
             (int(resolved_peer_id),),
         ).fetchone()
         if row is not None:
@@ -440,13 +443,13 @@ def _resolve_dialog_id_for_bot_reply(
     if uname:
         if resolved_acc_id is not None:
             row = conn.execute(
-                "SELECT id FROM dialogs WHERE account_id = ? AND username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?) ORDER BY last_message_at DESC, id DESC LIMIT 1",
+                "SELECT id FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?) ORDER BY last_message_at DESC, id DESC LIMIT 1",
                 (int(resolved_acc_id), uname),
             ).fetchone()
             if row is not None:
                 return int(row["id"])
         row = conn.execute(
-            "SELECT id FROM dialogs WHERE username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?) ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            "SELECT id FROM dialogs WHERE peer_type = 'user' AND username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?) ORDER BY last_message_at DESC, id DESC LIMIT 1",
             (uname,),
         ).fetchone()
         if row is not None:
@@ -454,7 +457,7 @@ def _resolve_dialog_id_for_bot_reply(
 
     if lead_id is not None:
         row = conn.execute(
-            "SELECT id FROM dialogs WHERE lead_id = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            "SELECT id FROM dialogs WHERE lead_id = ? AND peer_type = 'user' ORDER BY last_message_at DESC, id DESC LIMIT 1",
             (int(lead_id),),
         ).fetchone()
         if row is not None:
@@ -462,7 +465,7 @@ def _resolve_dialog_id_for_bot_reply(
 
     if phone:
         row = conn.execute(
-            "SELECT id FROM dialogs WHERE phone = ? ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            "SELECT id FROM dialogs WHERE phone = ? AND peer_type = 'user' ORDER BY last_message_at DESC, id DESC LIMIT 1",
             (phone,),
         ).fetchone()
         if row is not None:
@@ -470,7 +473,7 @@ def _resolve_dialog_id_for_bot_reply(
 
     if name:
         row = conn.execute(
-            "SELECT id FROM dialogs WHERE title = ? OR (username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?)) ORDER BY last_message_at DESC, id DESC LIMIT 1",
+            "SELECT id FROM dialogs WHERE peer_type = 'user' AND (title = ? OR (username IS NOT NULL AND lower(ltrim(username, '@')) = lower(?))) ORDER BY last_message_at DESC, id DESC LIMIT 1",
             (name, name),
         ).fetchone()
         if row is not None:
