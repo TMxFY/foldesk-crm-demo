@@ -7,6 +7,8 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
+import weakref
 from abc import ABC, abstractmethod
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -1052,6 +1054,8 @@ def _parse_proxy_for_telethon(proxy_url: str | None) -> tuple | None:
 
 
 class TelethonGateway(TelegramGateway):
+    _supports_avatar_username = True
+
     def __init__(self):
         self._clients = {}
         self._locks = {}
@@ -1062,6 +1066,22 @@ class TelethonGateway(TelegramGateway):
         self._warmed_dialogs: set[str] = set()
         self._rpc_timeout: float = float(os.getenv("TG_RPC_TIMEOUT", "25.0") or "25.0")
         self._disconnect_timeout: float = 2.0
+        self._avatar_timeout: float = float(os.getenv("TG_AVATAR_TIMEOUT", "4.0") or "4.0")
+        self._avatar_lock_timeout: float = float(
+            os.getenv("TG_AVATAR_LOCK_TIMEOUT", "0.25") or "0.25"
+        )
+        self._avatar_max_concurrent: int = max(
+            1, int(os.getenv("TG_AVATAR_MAX_CONCURRENT", "2") or "2")
+        )
+        self._avatar_error_cooldown: float = float(
+            os.getenv("TG_AVATAR_ERROR_COOLDOWN", "60.0") or "60.0"
+        )
+        self._avatar_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._avatar_pending_by_loop: weakref.WeakKeyDictionary = (
+            weakref.WeakKeyDictionary()
+        )
+        self._avatar_cooldowns: dict[tuple[str, str], float] = {}
+        self._avatar_last_outcomes: dict[tuple[str, str], str] = {}
 
     def set_session_string(self, session_path: str, session_string: str | None) -> None:
         if not session_path:
@@ -1351,10 +1371,12 @@ class TelethonGateway(TelegramGateway):
             try:
                 await asyncio.wait_for(client.connect(), timeout=self._rpc_timeout)
                 return client, False
-            except Exception:
+            except BaseException as exc:
                 await self._safe_disconnect(client)
                 self._clients.pop(session_path, None)
                 self._warmed_dialogs.discard(session_path)
+                if not isinstance(exc, Exception):
+                    raise
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
@@ -1388,9 +1410,11 @@ class TelethonGateway(TelegramGateway):
                 await asyncio.wait_for(client.connect(), timeout=self._rpc_timeout)
                 self._clients[session_path] = client
                 return client, False
-            except Exception as exc:
-                last_exc = exc
+            except BaseException as exc:
                 await self._safe_disconnect(client)
+                if not isinstance(exc, Exception):
+                    raise
+                last_exc = exc
                 if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
                     break
                 if attempt == 0:
@@ -2002,32 +2026,224 @@ class TelethonGateway(TelegramGateway):
                 if owned:
                     await self._close(session_path)
 
+    def _set_avatar_cooldown(self, cache_key: tuple[str, str], seconds: float) -> None:
+        now = time.monotonic()
+        if len(self._avatar_cooldowns) > 4096:
+            expired = [k for k, exp in self._avatar_cooldowns.items() if exp <= now]
+            for k in expired:
+                self._avatar_cooldowns.pop(k, None)
+            if len(self._avatar_cooldowns) > 4096:
+                self._avatar_cooldowns.clear()
+        self._avatar_cooldowns[cache_key] = now + max(1.0, float(seconds))
+
+    def _set_avatar_outcome(self, cache_key: tuple[str, str], outcome: str) -> None:
+        if len(self._avatar_last_outcomes) > 4096:
+            self._avatar_last_outcomes.clear()
+        self._avatar_last_outcomes[cache_key] = outcome
+
+    def get_avatar_outcome(self, session_path: str, peer_id: int | str) -> str | None:
+        target = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id).strip()
+        )
+        return self._avatar_last_outcomes.get((session_path, str(target)))
+
+    def was_avatar_transient_miss(self, session_path: str, peer_id: int | str) -> bool:
+        return self.get_avatar_outcome(session_path, peer_id) in ("transient", "busy")
+
+    @staticmethod
+    def _cleanup_empty_avatar_file(dest_path: str) -> None:
+        try:
+            p = Path(dest_path)
+            if p.exists() and p.is_file() and (p.stat().st_size <= 64 or p.name.startswith(".tmp_")):
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    async def _resolve_avatar_entity(
+        self,
+        client,
+        session_path: str,
+        target: int | str,
+        *,
+        username: str | None = None,
+    ):
+        try:
+            return await asyncio.wait_for(
+                client.get_entity(target), timeout=self._avatar_timeout
+            )
+        except Exception as first_exc:
+            if (
+                isinstance(target, int)
+                and "could not find the input entity" in str(first_exc).casefold()
+            ):
+                if session_path not in self._warmed_dialogs:
+                    try:
+                        await asyncio.wait_for(
+                            client.get_dialogs(limit=150),
+                            timeout=self._avatar_timeout,
+                        )
+                        self._warmed_dialogs.add(session_path)
+                    except Exception:
+                        pass
+                    try:
+                        return await asyncio.wait_for(
+                            client.get_entity(target), timeout=self._avatar_timeout
+                        )
+                    except Exception:
+                        pass
+                clean_un = str(username or "").strip().lstrip("@")
+                if clean_un:
+                    return await asyncio.wait_for(
+                        client.get_entity(clean_un), timeout=self._avatar_timeout
+                    )
+            raise
+
     async def download_profile_photo(
-        self, session_path: str, peer_id: int | str, dest_path: str
+        self,
+        session_path: str,
+        peer_id: int | str,
+        dest_path: str,
+        *,
+        username: str | None = None,
     ) -> str | None:
-        async with self._session_lock(session_path):
-            client, owned = await self._open(session_path)
+        target = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id).strip()
+        )
+        cache_key = (session_path, str(target))
+        if self._avatar_cooldowns.get(cache_key, 0.0) > time.monotonic():
+            self._set_avatar_outcome(cache_key, "transient")
+            return None
+
+        loop = asyncio.get_running_loop()
+        sem = self._avatar_semaphores.get(loop)
+        if sem is None:
+            sem = asyncio.Semaphore(self._avatar_max_concurrent)
+            self._avatar_semaphores[loop] = sem
+
+        pending_map = self._avatar_pending_by_loop.get(loop)
+        if pending_map is None:
+            pending_map = {}
+            self._avatar_pending_by_loop[loop] = pending_map
+
+        pending_count = pending_map.get(session_path, 0)
+        lock = self._session_lock(session_path)
+        max_pending = max(2, self._avatar_max_concurrent + 1)
+        if pending_count >= max_pending or (lock.locked() and pending_count >= 1):
+            self._set_avatar_outcome(cache_key, "busy")
+            return None
+
+        pending_map[session_path] = pending_count + 1
+        sem_acquired = False
+        lock_acquired = False
+        owned = False
+        try:
             try:
-                target = (
-                    int(peer_id)
-                    if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
-                    else str(peer_id).strip()
+                await asyncio.wait_for(
+                    sem.acquire(), timeout=self._avatar_lock_timeout
                 )
-                entity = await asyncio.wait_for(
-                    client.get_entity(target),
-                    timeout=self._rpc_timeout,
+                sem_acquired = True
+            except asyncio.TimeoutError:
+                self._set_avatar_outcome(cache_key, "busy")
+                return None
+
+            try:
+                await asyncio.wait_for(
+                    lock.acquire(), timeout=self._avatar_lock_timeout
+                )
+                lock_acquired = True
+            except asyncio.TimeoutError:
+                self._set_avatar_outcome(cache_key, "busy")
+                return None
+
+            client, owned = await asyncio.wait_for(
+                self._open(session_path), timeout=self._avatar_timeout
+            )
+            try:
+                entity = await self._resolve_avatar_entity(
+                    client, session_path, target, username=username
                 )
                 Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
-                saved = await asyncio.wait_for(
-                    client.download_profile_photo(entity, file=str(dest_path)),
-                    timeout=self._rpc_timeout,
-                )
-                return str(saved) if saved else None
-            except Exception:
+
+                async def _dl():
+                    try:
+                        return await client.download_profile_photo(
+                            entity, file=str(dest_path), download_big=False
+                        )
+                    except TypeError as exc:
+                        if "download_big" not in str(exc):
+                            raise
+                        return await client.download_profile_photo(
+                            entity, file=str(dest_path)
+                        )
+
+                saved = await asyncio.wait_for(_dl(), timeout=self._avatar_timeout)
+                if (
+                    saved
+                    and Path(str(saved)).exists()
+                    and Path(str(saved)).stat().st_size > 64
+                ):
+                    self._avatar_cooldowns.pop(cache_key, None)
+                    self._set_avatar_outcome(cache_key, "ok")
+                    return str(saved)
+                self._cleanup_empty_avatar_file(dest_path)
+                self._set_avatar_outcome(cache_key, "empty")
                 return None
-            finally:
-                if owned:
+            except asyncio.CancelledError:
+                self._cleanup_empty_avatar_file(dest_path)
+                raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                self._cleanup_empty_avatar_file(dest_path)
+                is_conn_err = isinstance(exc, ConnectionError) or (
+                    isinstance(exc, OSError) and not isinstance(exc, TimeoutError)
+                )
+                if is_conn_err or not client.is_connected():
+                    await self._drop_zombie_client_unlocked(session_path)
+                self._set_avatar_cooldown(cache_key, self._avatar_error_cooldown)
+                self._set_avatar_outcome(cache_key, "transient")
+                return None
+            except Exception as exc:
+                self._cleanup_empty_avatar_file(dest_path)
+                if _classify_session_error(exc).get("health") in (
+                    "unauthorized",
+                    "banned",
+                    "frozen",
+                ):
+                    await self._evict_client_unlocked(session_path)
+                flood_sec = getattr(exc, "seconds", None)
+                cooldown = (
+                    min(600.0, max(self._avatar_error_cooldown, float(flood_sec)))
+                    if isinstance(flood_sec, (int, float)) and flood_sec > 0
+                    else self._avatar_error_cooldown
+                )
+                self._set_avatar_cooldown(cache_key, cooldown)
+                self._set_avatar_outcome(cache_key, "transient")
+                return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._cleanup_empty_avatar_file(dest_path)
+            self._set_avatar_cooldown(cache_key, self._avatar_error_cooldown)
+            self._set_avatar_outcome(cache_key, "transient")
+            return None
+        finally:
+            if lock_acquired:
+                lock.release()
+            if owned:
+                try:
                     await self._close(session_path)
+                except Exception:
+                    pass
+            if sem_acquired:
+                sem.release()
+            cur_pending = pending_map.get(session_path, 0)
+            if cur_pending <= 1:
+                pending_map.pop(session_path, None)
+            else:
+                pending_map[session_path] = cur_pending - 1
 
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         async with self._session_lock(session_path):

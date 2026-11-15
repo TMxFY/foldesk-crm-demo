@@ -31,7 +31,7 @@ test('F20-H1 sheet mode switches active sheet and hides inactive sections', asyn
   await expect(page.locator('#accounts')).toBeHidden();
 });
 
-test('F20-H2 account daily limit buttons (10 / 20) update limit and enforce cap', async ({ page }) => {
+test('F20-H2 account daily limit buttons (10 / 20) leave manual inbox unlimited and cap outreach', async ({ page }) => {
   await connect(page);
   const accounts = page.locator('#accounts');
   const btn10 = accounts.getByRole('button', { name: /10\s*\/\s*сут/ });
@@ -51,13 +51,34 @@ test('F20-H2 account daily limit buttons (10 / 20) update limit and enforce cap'
   await page.getByRole('button', { name: /Иван Петров/ }).click();
 
   const thread = page.getByRole('region', { name: 'Переписка' });
-  await thread.getByLabel('Ответ').fill('Первое сообщение в пределах лимита');
+  await thread.getByLabel('Ответ').fill('Первое ручное сообщение без лимита');
   await thread.getByRole('button', { name: 'Отправить' }).click();
-  await expect(thread.getByText('Первое сообщение в пределах лимита')).toBeVisible();
+  await expect(thread.getByText('Первое ручное сообщение без лимита')).toBeVisible();
 
-  await thread.getByLabel('Ответ').fill('Второе сообщение сверх лимита');
+  await thread.getByLabel('Ответ').fill('Второе ручное сообщение сверх аутрич-лимита');
   await thread.getByRole('button', { name: 'Отправить' }).click();
-  await expect(thread.getByRole('alert')).toContainText(
+  await expect(thread.getByText('Второе ручное сообщение сверх аутрич-лимита')).toBeVisible();
+  await expect(accounts.getByText('Сегодня: 0 / 1')).toBeVisible();
+
+  await page.locator('#campaign-name').fill('Аутрич с лимитом 1');
+  await page.locator('#create-campaign-btn').click();
+  await expect(page.locator('#campaign-list')).toContainText('Аутрич с лимитом 1');
+
+  const csvText = [
+    'username,name,phone,company,note',
+    '@olga,Ольга,+79991112244,Studio,Lead',
+    '@petr,Пётр,+79991112255,Shop,Lead',
+  ].join('\n');
+  await page.locator('#csv-text').fill(csvText);
+  await page.locator('#import-csv-btn').click();
+  await expect(page.locator('#campaign-list')).toContainText('Ольга');
+
+  await page.locator('#campaign-list').getByRole('button', { name: 'Запустить шаг рассылки' }).click();
+  await expect(page.locator('#toast')).toContainText('Отправлено сообщений: 1');
+  await expect(accounts.getByText('Сегодня: 1 / 1')).toBeVisible();
+
+  await page.locator('#campaign-list').getByRole('button', { name: 'Запустить шаг рассылки' }).click();
+  await expect(page.locator('#toast')).toContainText(
     'Достигнут суточный лимит аккаунта (1 сообщ./сутки)'
   );
 });

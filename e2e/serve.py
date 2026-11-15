@@ -7,6 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Fake operator bot & disabled cloud/tg watchers must be set before importing app.main.
+os.environ["BOT_TOKEN"] = "e2e-not-a-secret"
+os.environ["BOT_CHAT_ID"] = "900001"
+os.environ["CLOUD_BACKUP_ENABLED"] = "0"
+os.environ["DISABLE_TG_WATCHES"] = "1"
+
 from app.db import connect, init_db
 from app.main import create_app, stop_inbox_watches
 from app.telegram_gateway import FakeGateway

@@ -21,7 +21,13 @@ from typing import Any
 
 import httpx
 
-from app.db import DEFAULT_DB, OUTREACH_MEDIA_DIR, ROOT, utc_now
+from app.db import (
+    DEFAULT_DB,
+    OUTREACH_MEDIA_DIR,
+    ROOT,
+    locked_raw_connection,
+    utc_now,
+)
 
 R2_OBJECT_KEY = "foldesk-crm/crm_state.bundle.json.gz"
 R2_LEASE_KEY = "foldesk-crm/tg_runtime_lease.json"
@@ -51,6 +57,7 @@ def _resolve_r2_config(conn: sqlite3.Connection | None = None) -> dict[str, str]
     if (
         "PYTEST_CURRENT_TEST" in os.environ
         or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+        or os.environ.get("CLOUD_BACKUP_ENABLED", "1").strip().lower() in ("0", "false", "no", "off")
     ):
         return None
     dotenv_vals = _read_dotenv()
@@ -182,19 +189,20 @@ def backup_to_cloud(
         )
         dst_conn = sqlite3.connect(tmp_path, timeout=30.0)
         try:
-            src_conn.backup(dst_conn)
-            try:
-                rows = src_conn.execute(
-                    "SELECT session_path, session_blob FROM accounts WHERE session_path IS NOT NULL"
-                ).fetchall()
-                for s_path, s_blob in rows:
-                    fname = Path(str(s_path)).name
-                    if fname.endswith(".session"):
-                        active_session_names.add(fname)
-                        if s_blob and len(bytes(s_blob)) > 100:
-                            sessions_map[fname] = base64.b64encode(bytes(s_blob)).decode("ascii")
-            except Exception:
-                pass
+            with locked_raw_connection(src_conn) as raw_src:
+                raw_src.backup(dst_conn)
+                try:
+                    rows = src_conn.execute(
+                        "SELECT session_path, session_blob FROM accounts WHERE session_path IS NOT NULL"
+                    ).fetchall()
+                    for s_path, s_blob in rows:
+                        fname = Path(str(s_path)).name
+                        if fname.endswith(".session"):
+                            active_session_names.add(fname)
+                            if s_blob and len(bytes(s_blob)) > 100:
+                                sessions_map[fname] = base64.b64encode(bytes(s_blob)).decode("ascii")
+                except Exception:
+                    pass
         finally:
             dst_conn.close()
             if use_separate_conn:
@@ -417,19 +425,20 @@ def restore_from_cloud(
             tmp_path.write_bytes(raw_db_bytes)
             src_conn = sqlite3.connect(tmp_path, timeout=30.0)
             try:
-                src_conn.backup(live_conn)
+                with locked_raw_connection(live_conn) as raw_live:
+                    src_conn.backup(raw_live)
+                    if existing_auth_sessions:
+                        try:
+                            for srow in existing_auth_sessions:
+                                live_conn.execute(
+                                    "INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                                    (srow[0], srow[1], srow[2], srow[3]),
+                                )
+                            live_conn.commit()
+                        except Exception:
+                            pass
             finally:
                 src_conn.close()
-            if existing_auth_sessions:
-                try:
-                    for srow in existing_auth_sessions:
-                        live_conn.execute(
-                            "INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                            (srow[0], srow[1], srow[2], srow[3]),
-                        )
-                    live_conn.commit()
-                except Exception:
-                    pass
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()

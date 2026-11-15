@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 
 from fastapi.testclient import TestClient
 
@@ -398,6 +399,7 @@ def test_demo_seed_focus_and_playwright_e2e(tmp_path):
 
     env = dict(os.environ)
     env["E2E_PORT"] = str(_free_port())
+    env.setdefault("E2E_PYTHON", sys.executable)
     proc = subprocess.run(
         ["npx", "playwright", "test", "f27-v4-block6-timeline-focus.spec.ts"],
         cwd=str(ROOT / "e2e"),

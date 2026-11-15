@@ -1,8 +1,11 @@
+from contextlib import contextmanager
 import os
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
@@ -111,13 +114,313 @@ def resolve_outreach_media(media_ref: str) -> Path | str:
     return raw
 
 
-def connect(db_path=None) -> sqlite3.Connection:
+_MISSING = object()
+
+
+def safe_int(value: Any, default: int | None = None) -> int | None:
+    """Convert numeric values to int while safely rejecting None, bool, and malformed strings."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class _BufferedCursor:
+    """Eagerly materialized cursor so fetch/iteration never touch shared C sqlite3 state."""
+
+    def __init__(
+        self,
+        owner: "_ThreadSafeConnection",
+        rows: list[Any] | None = None,
+        *,
+        description: Any = None,
+        lastrowid: int | None = None,
+        rowcount: int = -1,
+        arraysize: int = 1,
+    ) -> None:
+        self._owner = owner
+        self._rows: list[Any] = rows if rows is not None else []
+        self._pos = 0
+        self.description = description
+        self.lastrowid = lastrowid
+        self.rowcount = rowcount
+        self.arraysize = arraysize
+        self._closed = False
+
+    @property
+    def connection(self) -> "_ThreadSafeConnection":
+        return self._owner
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed cursor.")
+
+    def _load_from_raw(self, raw_cur: sqlite3.Cursor) -> "_BufferedCursor":
+        self.description = raw_cur.description
+        self.lastrowid = raw_cur.lastrowid
+        self.rowcount = raw_cur.rowcount
+        self.arraysize = raw_cur.arraysize
+        self._rows = raw_cur.fetchall() if raw_cur.description is not None else []
+        self._pos = 0
+        return self
+
+    def execute(self, sql: str, parameters: Any = _MISSING) -> "_BufferedCursor":
+        self._ensure_open()
+        return self._owner._run_cursor(
+            lambda raw_cur: (
+                raw_cur.execute(sql)
+                if parameters is _MISSING
+                else raw_cur.execute(sql, parameters)
+            ),
+            target=self,
+        )
+
+    def executemany(self, sql: str, seq_of_parameters: Any) -> "_BufferedCursor":
+        self._ensure_open()
+        return self._owner._run_cursor(
+            lambda raw_cur: raw_cur.executemany(sql, seq_of_parameters),
+            target=self,
+        )
+
+    def executescript(self, sql_script: str) -> "_BufferedCursor":
+        self._ensure_open()
+        return self._owner._run_cursor(
+            lambda raw_cur: raw_cur.executescript(sql_script),
+            target=self,
+        )
+
+    def fetchone(self) -> Any:
+        self._ensure_open()
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def fetchmany(self, size: int | None = None) -> list[Any]:
+        self._ensure_open()
+        count = self.arraysize if size is None else int(size)
+        if count <= 0 or self._pos >= len(self._rows):
+            return []
+        end = min(len(self._rows), self._pos + count)
+        chunk = self._rows[self._pos : end]
+        self._pos = end
+        return list(chunk)
+
+    def fetchall(self) -> list[Any]:
+        self._ensure_open()
+        if self._pos >= len(self._rows):
+            return []
+        rest = self._rows[self._pos :]
+        self._pos = len(self._rows)
+        return list(rest)
+
+    def close(self) -> None:
+        self._closed = True
+        self._rows = []
+
+    def __iter__(self) -> "_BufferedCursor":
+        self._ensure_open()
+        return self
+
+    def __next__(self) -> Any:
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+
+class _ThreadSafeConnection:
+    """RLock-serialized wrapper around sqlite3.Connection with buffered cursors."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._lock = threading.RLock()
+
+    def _run_cursor(
+        self, fn, *, target: _BufferedCursor | None = None
+    ) -> _BufferedCursor:
+        with self._lock:
+            raw_cur = self._conn.cursor()
+            try:
+                fn(raw_cur)
+                cursor = target if target is not None else _BufferedCursor(self)
+                return cursor._load_from_raw(raw_cur)
+            finally:
+                raw_cur.close()
+
+    def cursor(self) -> _BufferedCursor:
+        return _BufferedCursor(self)
+
+    def execute(self, sql: str, parameters: Any = _MISSING) -> _BufferedCursor:
+        return self._run_cursor(
+            lambda raw_cur: (
+                raw_cur.execute(sql)
+                if parameters is _MISSING
+                else raw_cur.execute(sql, parameters)
+            )
+        )
+
+    def executemany(self, sql: str, seq_of_parameters: Any) -> _BufferedCursor:
+        return self._run_cursor(
+            lambda raw_cur: raw_cur.executemany(sql, seq_of_parameters)
+        )
+
+    def executescript(self, sql_script: str) -> _BufferedCursor:
+        return self._run_cursor(lambda raw_cur: raw_cur.executescript(sql_script))
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def rollback(self) -> None:
+        with self._lock:
+            self._conn.rollback()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def backup(
+        self,
+        target: Any,
+        *,
+        pages: int = -1,
+        progress: Any = None,
+        name: str = "main",
+        sleep: float = 0.250,
+    ) -> None:
+        raw_target = unwrap_connection(target)
+        target_lock = getattr(target, "_lock", None)
+        if target_lock is not None and target_lock is not self._lock:
+            first, second = (
+                (self._lock, target_lock)
+                if id(self._lock) < id(target_lock)
+                else (target_lock, self._lock)
+            )
+            with first:
+                with second:
+                    self._conn.backup(
+                        raw_target, pages=pages, progress=progress, name=name, sleep=sleep
+                    )
+        else:
+            with self._lock:
+                self._conn.backup(
+                    raw_target, pages=pages, progress=progress, name=name, sleep=sleep
+                )
+
+    @property
+    def row_factory(self) -> Any:
+        with self._lock:
+            return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        with self._lock:
+            self._conn.row_factory = value
+
+    @property
+    def in_transaction(self) -> bool:
+        with self._lock:
+            return self._conn.in_transaction
+
+    @property
+    def isolation_level(self) -> Any:
+        with self._lock:
+            return self._conn.isolation_level
+
+    @isolation_level.setter
+    def isolation_level(self, value: Any) -> None:
+        with self._lock:
+            self._conn.isolation_level = value
+
+    @property
+    def total_changes(self) -> int:
+        with self._lock:
+            return self._conn.total_changes
+
+    def create_function(self, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            self._conn.create_function(*args, **kwargs)
+
+    def create_aggregate(self, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            self._conn.create_aggregate(*args, **kwargs)
+
+    def create_collation(self, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            self._conn.create_collation(*args, **kwargs)
+
+    def set_progress_handler(self, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            self._conn.set_progress_handler(*args, **kwargs)
+
+    def set_trace_callback(self, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            self._conn.set_trace_callback(*args, **kwargs)
+
+    def iterdump(self):
+        with self._lock:
+            return iter(list(self._conn.iterdump()))
+
+    def interrupt(self) -> None:
+        self._conn.interrupt()
+
+    def __enter__(self) -> "_ThreadSafeConnection":
+        self._lock.acquire()
+        try:
+            self._conn.__enter__()
+        except BaseException:
+            self._lock.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._lock.release()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def __repr__(self) -> str:
+        return f"<_ThreadSafeConnection conn={self._conn!r}>"
+
+
+def unwrap_connection(conn: Any) -> sqlite3.Connection:
+    """Return the underlying sqlite3.Connection for C-level APIs such as backup()."""
+    if isinstance(conn, _ThreadSafeConnection):
+        return conn._conn
+    return conn
+
+
+@contextmanager
+def locked_raw_connection(conn: Any):
+    """Acquire any per-connection lock and yield the underlying raw sqlite3.Connection."""
+    if isinstance(conn, _ThreadSafeConnection):
+        with conn._lock:
+            yield conn._conn
+    else:
+        yield conn
+
+
+def connect(db_path=None) -> _ThreadSafeConnection:
     path = Path(db_path) if db_path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
-    conn.row_factory = sqlite3.Row
+    raw = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    raw.row_factory = sqlite3.Row
+    conn = _ThreadSafeConnection(raw)
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
+    if str(path) != ":memory:":
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 

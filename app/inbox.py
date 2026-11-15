@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import html
 import io
@@ -9,10 +10,11 @@ import re
 import sqlite3
 import struct
 import subprocess
+import time
 import wave
+import weakref
 
-from app.accounts import check_daily_limit, increment_daily_sent
-from app.db import INBOX_MEDIA_DIR, ROOT, as_dict, normalize_status, utc_now
+from app.db import INBOX_MEDIA_DIR, as_dict, normalize_status, safe_int, utc_now
 from app.telegram_gateway import GatewayError, render_formatted_html
 
 
@@ -2219,36 +2221,6 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
     return list_messages(conn, dialog_id, cap)
 
 
-def _dialog_has_peer_reply(conn, dialog: dict) -> bool:
-    """Return True if the peer has replied or initiated the conversation."""
-    if int(dialog.get("last_from_peer") or 0) == 1:
-        return True
-    did = int(dialog["id"])
-    has_in_msg = conn.execute(
-        "SELECT 1 FROM messages WHERE dialog_id = ? AND direction = 'in' LIMIT 1",
-        (did,),
-    ).fetchone()
-    if has_in_msg is not None:
-        return True
-    lead_id = dialog.get("lead_id")
-    if lead_id is not None:
-        has_replied_lead = conn.execute(
-            "SELECT 1 FROM campaign_recipients WHERE lead_id = ? AND status = 'replied' LIMIT 1",
-            (int(lead_id),),
-        ).fetchone()
-        if has_replied_lead is not None:
-            return True
-    peer_id = dialog.get("peer_id")
-    if peer_id is not None and int(peer_id) > 0:
-        has_replied_peer = conn.execute(
-            "SELECT 1 FROM campaign_recipients WHERE telegram_user_id = ? AND status = 'replied' LIMIT 1",
-            (int(peer_id),),
-        ).fetchone()
-        if has_replied_peer is not None:
-            return True
-    return False
-
-
 async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) -> dict:
     body = (text or "").strip()
     if not body:
@@ -2265,9 +2237,6 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     account = as_dict(account)
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
-    is_reply_to_peer = _dialog_has_peer_reply(conn, dialog)
-    if not is_reply_to_peer:
-        check_daily_limit(conn, account["id"])
     if gateway is None:
         next_row = conn.execute(
             "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
@@ -2359,8 +2328,6 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
         """,
         (sent_at, preview, now, dialog_id),
     )
-    if not is_reply_to_peer:
-        increment_daily_sent(conn, account["id"])
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)
@@ -2500,10 +2467,6 @@ async def send_dialog_media(
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
 
-    is_reply_to_peer = _dialog_has_peer_reply(conn, dialog)
-    if not is_reply_to_peer:
-        check_daily_limit(conn, account["id"])
-
     clean_mime = (mime_type or "").strip()
     clean_mtype = (media_type or "").strip().lower()
     if clean_mtype not in ("voice", "video_note", "photo", "video", "audio", "document"):
@@ -2630,8 +2593,6 @@ async def send_dialog_media(
         """,
         (sent_at, preview, now, int(dialog_id)),
     )
-    if not is_reply_to_peer:
-        increment_daily_sent(conn, account["id"])
     conn.commit()
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
     return as_dict(row)
@@ -2835,11 +2796,183 @@ def _build_dialog_avatar_svg(
     return svg.encode("utf-8")
 
 
-async def get_dialog_avatar(
+_AVATAR_MISS_TTL_SECONDS = 86400.0
+_AVATAR_ERROR_COOLDOWN_SECONDS = float(
+    os.getenv("CRM_AVATAR_ERROR_COOLDOWN", "60.0") or "60.0"
+)
+_AVATAR_MAX_CONCURRENT = max(
+    1, int(os.getenv("CRM_AVATAR_MAX_CONCURRENT", "3") or "3")
+)
+_AVATAR_ACQUIRE_TIMEOUT = float(
+    os.getenv("CRM_AVATAR_ACQUIRE_TIMEOUT", "0.25") or "0.25"
+)
+_AVATAR_DOWNLOAD_TIMEOUT = float(
+    os.getenv("CRM_AVATAR_TIMEOUT", "4.5") or "4.5"
+)
+_AVATAR_LOOP_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_AVATAR_LOOP_PENDING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_AVATAR_LOOP_INFLIGHT: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_AVATAR_ERROR_COOLDOWN_UNTIL: dict[tuple[str, int], float] = {}
+
+
+def _avatar_cache_scope(conn, gateway) -> str:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        db_file = str(row[2] or "") if row else ""
+    except Exception:
+        db_file = ""
+    if not db_file or db_file == ":memory:":
+        db_file = f"mem:{id(conn)}"
+    return f"{INBOX_MEDIA_DIR}|{db_file}|{id(gateway)}"
+
+
+def _set_avatar_error_cooldown(cd_key: tuple[str, int], seconds: float) -> None:
+    now = time.monotonic()
+    if len(_AVATAR_ERROR_COOLDOWN_UNTIL) > 4096:
+        expired = [k for k, exp in _AVATAR_ERROR_COOLDOWN_UNTIL.items() if exp <= now]
+        for k in expired:
+            _AVATAR_ERROR_COOLDOWN_UNTIL.pop(k, None)
+        if len(_AVATAR_ERROR_COOLDOWN_UNTIL) > 4096:
+            _AVATAR_ERROR_COOLDOWN_UNTIL.clear()
+    _AVATAR_ERROR_COOLDOWN_UNTIL[cd_key] = now + max(1.0, float(seconds))
+
+
+def _is_fresh_miss_marker(miss_marker: Path) -> bool:
+    if not miss_marker.exists():
+        return False
+    try:
+        age = time.time() - miss_marker.stat().st_mtime
+        return age < _AVATAR_MISS_TTL_SECONDS
+    except Exception:
+        return True
+
+
+async def _fetch_dialog_avatar_from_gateway(
+    gateway,
+    session_path: str,
+    peer_id: int | str,
+    username: str | None,
+    cached_jpg: Path,
+    miss_marker: Path,
+    cd_key: tuple[str, int],
+) -> tuple[bytes | None, bool]:
+    numeric_peer = safe_int(peer_id)
+    tg_target: int | str = numeric_peer if numeric_peer is not None else str(peer_id or "").strip()
+    if tg_target == "":
+        return (None, False)
+
+    if _AVATAR_ERROR_COOLDOWN_UNTIL.get(cd_key, 0.0) > time.monotonic():
+        return (None, True)
+
+    loop = asyncio.get_running_loop()
+    inflight_map = _AVATAR_LOOP_INFLIGHT.get(loop)
+    if inflight_map is None:
+        inflight_map = {}
+        _AVATAR_LOOP_INFLIGHT[loop] = inflight_map
+
+    existing_fut = inflight_map.get(cd_key)
+    if existing_fut is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(existing_fut),
+                timeout=_AVATAR_ACQUIRE_TIMEOUT,
+            )
+        except Exception:
+            pass
+        if cached_jpg.exists() and cached_jpg.is_file() and cached_jpg.stat().st_size > 64:
+            return (cached_jpg.read_bytes(), False)
+        if _is_fresh_miss_marker(miss_marker):
+            return (None, False)
+        return (None, True)
+
+    sem = _AVATAR_LOOP_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_AVATAR_MAX_CONCURRENT)
+        _AVATAR_LOOP_SEMAPHORES[loop] = sem
+
+    pending_count = int(_AVATAR_LOOP_PENDING.get(loop, 0) or 0)
+    max_pending = _AVATAR_MAX_CONCURRENT + 2
+    if pending_count >= max_pending:
+        return (None, True)
+
+    _AVATAR_LOOP_PENDING[loop] = pending_count + 1
+    fut = loop.create_future()
+    inflight_map[cd_key] = fut
+    sem_acquired = False
+    tmp_jpg = cached_jpg.parent / f".tmp_{cached_jpg.stem}_{os.getpid()}_{time.monotonic_ns()}.jpg"
+    try:
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=_AVATAR_ACQUIRE_TIMEOUT)
+            sem_acquired = True
+        except asyncio.TimeoutError:
+            return (None, True)
+
+        if getattr(gateway, "_supports_avatar_username", False):
+            dl_coro = gateway.download_profile_photo(
+                session_path,
+                tg_target,
+                str(tmp_jpg),
+                username=username,
+            )
+        else:
+            dl_coro = gateway.download_profile_photo(
+                session_path, tg_target, str(tmp_jpg)
+            )
+        saved = await asyncio.wait_for(dl_coro, timeout=_AVATAR_DOWNLOAD_TIMEOUT)
+        saved_path = Path(str(saved)) if saved else None
+        if saved_path and saved_path.exists() and saved_path.is_file() and saved_path.stat().st_size > 64:
+            if saved_path.resolve() == tmp_jpg.resolve():
+                jpg_bytes = tmp_jpg.read_bytes()
+                os.replace(tmp_jpg, cached_jpg)
+            else:
+                jpg_bytes = saved_path.read_bytes()
+                tmp_jpg.write_bytes(jpg_bytes)
+                os.replace(tmp_jpg, cached_jpg)
+            _AVATAR_ERROR_COOLDOWN_UNTIL.pop(cd_key, None)
+            return (jpg_bytes, False)
+
+        outcome = (
+            gateway.get_avatar_outcome(session_path, tg_target)
+            if callable(getattr(gateway, "get_avatar_outcome", None))
+            else None
+        )
+        if outcome == "busy":
+            return (None, True)
+        if outcome == "transient" or (
+            callable(getattr(gateway, "was_avatar_transient_miss", None))
+            and gateway.was_avatar_transient_miss(session_path, tg_target)
+        ):
+            _set_avatar_error_cooldown(cd_key, _AVATAR_ERROR_COOLDOWN_SECONDS)
+            return (None, True)
+        try:
+            miss_marker.write_bytes(b"0")
+        except Exception:
+            pass
+        return (None, False)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _set_avatar_error_cooldown(cd_key, _AVATAR_ERROR_COOLDOWN_SECONDS)
+        return (None, True)
+    finally:
+        try:
+            tmp_jpg.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if sem_acquired:
+            sem.release()
+        cur_pending = int(_AVATAR_LOOP_PENDING.get(loop, 0) or 0)
+        _AVATAR_LOOP_PENDING[loop] = max(0, cur_pending - 1)
+        inflight_map.pop(cd_key, None)
+        if not fut.done():
+            fut.set_result(None)
+
+
+async def get_dialog_avatar_with_cache(
     conn,
     dialog_id: int,
     gateway=None,
-) -> tuple[bytes, str]:
+) -> tuple[bytes, str, str]:
     row = conn.execute(
         """
         SELECT d.*,
@@ -2861,14 +2994,14 @@ async def get_dialog_avatar(
     avatars_dir.mkdir(parents=True, exist_ok=True)
     cached_jpg = avatars_dir / f"dialog_{int(dialog_id)}.jpg"
     if cached_jpg.exists() and cached_jpg.is_file() and cached_jpg.stat().st_size > 64:
-        return (cached_jpg.read_bytes(), "image/jpeg")
+        return (cached_jpg.read_bytes(), "image/jpeg", "private, max-age=3600")
 
     session_path = str(data.get("session_path") or "").strip()
     provider = str(data.get("provider") or data.get("account_provider") or "telegram").strip().lower()
     peer_id = data.get("peer_id")
     miss_marker = avatars_dir / f"dialog_{int(dialog_id)}.none"
 
-    if (
+    can_fetch_tg = (
         gateway is not None
         and hasattr(gateway, "download_profile_photo")
         and data.get("account_status") == "connected"
@@ -2877,23 +3010,22 @@ async def get_dialog_avatar(
         and not session_path.startswith("data/sessions/demo")
         and peer_id is not None
         and not _is_synthetic_peer_id(peer_id)
-        and not miss_marker.exists()
-    ):
-        try:
-            saved = await gateway.download_profile_photo(
-                session_path, int(peer_id), str(cached_jpg)
-            )
-            if saved and Path(str(saved)).exists() and Path(str(saved)).stat().st_size > 64:
-                saved_path = Path(str(saved))
-                if saved_path != cached_jpg:
-                    cached_jpg.write_bytes(saved_path.read_bytes())
-                return (cached_jpg.read_bytes(), "image/jpeg")
-            try:
-                miss_marker.write_bytes(b"0")
-            except Exception:
-                pass
-        except Exception:
-            pass
+        and not _is_fresh_miss_marker(miss_marker)
+    )
+    is_transient = False
+    if can_fetch_tg:
+        cd_key = (_avatar_cache_scope(conn, gateway), int(dialog_id))
+        jpg_bytes, is_transient = await _fetch_dialog_avatar_from_gateway(
+            gateway=gateway,
+            session_path=session_path,
+            peer_id=peer_id,
+            username=data.get("username"),
+            cached_jpg=cached_jpg,
+            miss_marker=miss_marker,
+            cd_key=cd_key,
+        )
+        if jpg_bytes:
+            return (jpg_bytes, "image/jpeg", "private, max-age=3600")
 
     svg_bytes = _build_dialog_avatar_svg(
         dialog_id=int(dialog_id),
@@ -2902,4 +3034,16 @@ async def get_dialog_avatar(
         company=str(data.get("lead_company") or ""),
         provider=provider,
     )
-    return (svg_bytes, "image/svg+xml")
+    cache_control = "private, no-store" if is_transient else "private, max-age=300"
+    return (svg_bytes, "image/svg+xml", cache_control)
+
+
+async def get_dialog_avatar(
+    conn,
+    dialog_id: int,
+    gateway=None,
+) -> tuple[bytes, str]:
+    data, mime, _cache_control = await get_dialog_avatar_with_cache(
+        conn, dialog_id, gateway=gateway
+    )
+    return (data, mime)

@@ -4285,9 +4285,9 @@ tr.bulk-selected,
   min-width: 240px;
   padding: 10px;
   border-radius: var(--radius-md);
-  border: var(--line) solid var(--border-strong);
+  border: var(--line) solid var(--border);
   background: var(--surface);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-pop);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -4321,7 +4321,7 @@ tr.bulk-selected,
 }
 
 .board {
-  grid-template-columns: repeat(var(--stage-cols, 5), minmax(225px, 1fr));
+  grid-template-columns: repeat(var(--stage-cols, 5), minmax(195px, 1fr));
   overflow-x: auto;
   max-width: 100%;
   padding-bottom: 6px;
@@ -6161,7 +6161,7 @@ tr.bulk-selected,
 #reply-voice-btn[data-recording="true"] {
   background: var(--danger);
   border-color: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .voice-timer {
@@ -6351,7 +6351,7 @@ tr.bulk-selected,
 .outreach-filter-pills .chip[aria-pressed="true"],
 .outreach-filter-pills .chip.is-active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
 

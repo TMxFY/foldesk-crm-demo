@@ -16,7 +16,7 @@ from app.accounts import _is_spambot_restriction_error
 from app.accounts import _load as load_account
 from app.accounts import _public as public_account
 from app.accounts import increment_daily_sent
-from app.db import as_dict, utc_now, utc_today
+from app.db import as_dict, safe_int, utc_now, utc_today
 from app.inbox import (
     _cache_messages,
     _is_synthetic_peer_id,
@@ -671,20 +671,26 @@ def _add_hours_iso(iso_str: str | None, hours: int) -> str | None:
 
 
 def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> list[dict]:
+    if not isinstance(rec, dict):
+        return []
     acc_ids = set()
-    if account_id:
-        acc_ids.add(int(account_id))
-    if rec.get("assigned_account_id"):
-        acc_ids.add(int(rec["assigned_account_id"]))
+    aid_val = safe_int(account_id)
+    if aid_val:
+        acc_ids.add(aid_val)
+    assigned_aid = safe_int(rec.get("assigned_account_id"))
+    if assigned_aid:
+        acc_ids.add(assigned_aid)
 
     match_clauses = []
     match_params = []
-    if rec.get("telegram_user_id"):
+    tg_uid = safe_int(rec.get("telegram_user_id"))
+    if tg_uid:
         match_clauses.append("peer_id = ?")
-        match_params.append(int(rec["telegram_user_id"]))
-    if rec.get("lead_id"):
+        match_params.append(tg_uid)
+    rec_lid = safe_int(rec.get("lead_id"))
+    if rec_lid:
         match_clauses.append("lead_id = ?")
-        match_params.append(int(rec["lead_id"]))
+        match_params.append(rec_lid)
     if rec.get("username"):
         clean_u = _clean_handle(rec["username"])
         if clean_u:
@@ -707,23 +713,27 @@ def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> l
         sql += f" AND account_id IN ({ph})"
         params.extend(sorted(acc_ids))
     rows = conn.execute(sql, params).fetchall()
-    return [as_dict(r) for r in rows]
+    return [d for d in (as_dict(r) for r in rows) if d and safe_int(d.get("id")) is not None]
 
 
 def _dialog_has_client_reply(conn, dialog: dict, rec: dict) -> bool:
-    current_step = int(rec.get("current_step") or 0)
+    if not isinstance(dialog, dict) or not isinstance(rec, dict):
+        return False
+    dlg_id = safe_int(dialog.get("id"))
+    if dlg_id is None:
+        return False
+    current_step = safe_int(rec.get("current_step"), 0) or 0
     last_sent_at = rec.get("last_sent_at")
     if current_step < 1 and not last_sent_at:
         return False
     ref_ts = str(last_sent_at or rec.get("created_at") or "").strip()
-    if int(dialog.get("last_from_peer") or 0) == 1:
+    if (safe_int(dialog.get("last_from_peer"), 0) or 0) == 1:
         dlg_last_at = str(dialog.get("last_message_at") or "").strip()
         if ref_ts and dlg_last_at:
             if dlg_last_at >= ref_ts:
                 return True
         else:
             return True
-    dlg_id = int(dialog["id"])
     if ref_ts:
         in_row = conn.execute(
             """
@@ -761,23 +771,28 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
     now = utc_now()
     for row in rows:
         rec = as_dict(row)
-        if int(rec.get("current_step") or 0) < 1 and not rec.get("last_sent_at"):
+        rec_id = safe_int(rec.get("id")) if rec else None
+        if not rec or rec_id is None:
+            continue
+        if (safe_int(rec.get("current_step"), 0) or 0) < 1 and not rec.get("last_sent_at"):
             continue
         dialogs = _find_recipient_dialogs(conn, rec, account_id=account_id)
         if not dialogs and account_id is not None:
             # Also check across any account if assigned_account_id or dialog exists elsewhere
             dialogs = _find_recipient_dialogs(conn, rec, account_id=None)
-        has_reply = any(_dialog_has_client_reply(conn, d, rec) for d in dialogs)
-        if has_reply:
-            matched_dlg = next((d for d in dialogs if _dialog_has_client_reply(conn, d, rec)), dialogs[0] if dialogs else None)
+        matched_dlg = next(
+            (d for d in dialogs if _dialog_has_client_reply(conn, d, rec)),
+            None,
+        )
+        if matched_dlg is not None:
             stop_outreach_on_reply(
                 conn,
-                account_id=(matched_dlg.get("account_id") if matched_dlg else None) or rec.get("sent_account_id") or rec.get("assigned_account_id") or account_id,
-                peer_id=(matched_dlg.get("peer_id") if matched_dlg else None) or rec.get("telegram_user_id"),
-                username=(matched_dlg.get("username") if matched_dlg else None) or rec.get("username"),
-                phone=(matched_dlg.get("phone") if matched_dlg else None) or rec.get("phone"),
-                lead_id=(matched_dlg.get("lead_id") if matched_dlg else None) or rec.get("lead_id"),
-                preview=(matched_dlg.get("last_message_preview") if matched_dlg else None),
+                account_id=matched_dlg.get("account_id") or rec.get("sent_account_id") or rec.get("assigned_account_id") or account_id,
+                peer_id=matched_dlg.get("peer_id") or rec.get("telegram_user_id"),
+                username=matched_dlg.get("username") or rec.get("username"),
+                phone=matched_dlg.get("phone") or rec.get("phone"),
+                lead_id=matched_dlg.get("lead_id") or rec.get("lead_id"),
+                preview=matched_dlg.get("last_message_preview"),
                 opener=opener,
             )
             conn.execute(
@@ -786,7 +801,7 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
                 SET status = 'replied', updated_at = ?
                 WHERE id = ?
                 """,
-                (now, rec["id"]),
+                (now, rec_id),
             )
             replied_now += 1
     if replied_now:
@@ -861,15 +876,16 @@ def _spambot_cache_key(conn, account_id: int, session_path: str) -> tuple[str, i
 
 
 def _cleanup_empty_step0_dialog(conn, step_idx: int, dialog: dict | None) -> None:
-    if step_idx != 0 or dialog is None or dialog.get("last_message_at"):
+    dlg_id = safe_int(dialog.get("id")) if isinstance(dialog, dict) else None
+    if step_idx != 0 or dlg_id is None or dialog.get("last_message_at"):
         return
     msg_cnt = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE dialog_id = ?",
-        (dialog["id"],),
+        (dlg_id,),
     ).fetchone()[0]
     if int(msg_cnt or 0) == 0:
-        conn.execute("UPDATE leads SET dialog_id = NULL WHERE dialog_id = ?", (dialog["id"],))
-        conn.execute("DELETE FROM dialogs WHERE id = ?", (dialog["id"],))
+        conn.execute("UPDATE leads SET dialog_id = NULL WHERE dialog_id = ?", (dlg_id,))
+        conn.execute("DELETE FROM dialogs WHERE id = ?", (dlg_id,))
 
 
 def _is_spambot_or_peerflood_error(exc: Exception) -> bool:
@@ -951,6 +967,8 @@ def get_campaign(conn, campaign_id: int) -> dict:
         raise LookupError("campaign")
     heal_transient_failed_recipients(conn, int(campaign_id))
     camp = as_dict(row)
+    if not camp:
+        raise LookupError("campaign")
     account_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
     _sync_campaign_replies(conn, campaign_id, account_ids[0] if len(account_ids) == 1 else None)
 
@@ -973,7 +991,7 @@ def get_campaign(conn, campaign_id: int) -> dict:
         "SELECT * FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order",
         (campaign_id,),
     ).fetchall()
-    steps = [as_dict(s) for s in steps_rows]
+    steps = [s for s in (as_dict(s) for s in steps_rows) if s]
 
     rec_rows = conn.execute(
         """
@@ -1021,10 +1039,12 @@ def get_campaign(conn, campaign_id: int) -> dict:
         txt = drow["last_out_text"]
         if not txt:
             continue
-        if drow["lead_id"] is not None:
-            out_by_lead_id.setdefault(int(drow["lead_id"]), txt)
-        if drow["peer_id"] is not None:
-            out_by_peer_id.setdefault(int(drow["peer_id"]), txt)
+        d_lid = safe_int(drow["lead_id"])
+        if d_lid is not None:
+            out_by_lead_id.setdefault(d_lid, txt)
+        d_pid = safe_int(drow["peer_id"])
+        if d_pid is not None:
+            out_by_peer_id.setdefault(d_pid, txt)
         if drow["uname"]:
             out_by_uname.setdefault(str(drow["uname"]).strip().lower(), txt)
         if drow["phone"]:
@@ -1032,6 +1052,8 @@ def get_campaign(conn, campaign_id: int) -> dict:
 
     for r in rec_rows:
         rd = as_dict(r)
+        if not rd:
+            continue
         extra_fields = _extract_extra_fields(rd)
         rd["extra_fields"] = extra_fields
         for hk in extra_fields.keys():
@@ -1039,10 +1061,11 @@ def get_campaign(conn, campaign_id: int) -> dict:
             if hks and hks not in seen_csv_headers_set:
                 seen_csv_headers_set.add(hks)
                 seen_csv_headers.append(hks)
-        assigned_id = rd.get("sent_account_id") or rd.get("assigned_account_id")
+        assigned_id_int = safe_int(rd.get("sent_account_id")) or safe_int(
+            rd.get("assigned_account_id")
+        )
         rd["error"] = rd.get("error_text")
-        if assigned_id is not None:
-            assigned_id_int = int(assigned_id)
+        if assigned_id_int is not None:
             if assigned_id_int not in acc_name_map:
                 try:
                     ap = public_account(load_account(conn, assigned_id_int))
@@ -1058,19 +1081,19 @@ def get_campaign(conn, campaign_id: int) -> dict:
         else:
             rd["assigned_account_name"] = None
 
-        cur_step = int(rd.get("current_step") or 0)
+        cur_step = safe_int(rd.get("current_step"), 0) or 0
         status = rd.get("status")
         last_sent_at = rd.get("last_sent_at")
         if status in ("pending", "in_progress") and cur_step < len(steps):
             rd["next_step_order"] = cur_step + 1
-            next_delay = int(steps[cur_step].get("delay_hours") or 0)
+            next_delay = safe_int(steps[cur_step].get("delay_hours"), 0) or 0
             rd["next_delay_hours"] = next_delay
         else:
             rd["next_step_order"] = None
             rd["next_delay_hours"] = None
 
         if status == "in_progress" and last_sent_at and cur_step < len(steps):
-            next_delay = int(steps[cur_step].get("delay_hours") or 0)
+            next_delay = safe_int(steps[cur_step].get("delay_hours"), 0) or 0
             if next_delay > 0:
                 rd["next_followup_at"] = _add_hours_iso(last_sent_at, next_delay)
             else:
@@ -1087,10 +1110,12 @@ def get_campaign(conn, campaign_id: int) -> dict:
 
         # Compute last_sent_text from messages or rendered step
         last_sent_text = None
-        if rd.get("lead_id") is not None:
-            last_sent_text = out_by_lead_id.get(int(rd["lead_id"]))
-        if not last_sent_text and rd.get("telegram_user_id") is not None:
-            last_sent_text = out_by_peer_id.get(int(rd["telegram_user_id"]))
+        rec_lid = safe_int(rd.get("lead_id"))
+        if rec_lid is not None:
+            last_sent_text = out_by_lead_id.get(rec_lid)
+        rec_tuid = safe_int(rd.get("telegram_user_id"))
+        if not last_sent_text and rec_tuid is not None:
+            last_sent_text = out_by_peer_id.get(rec_tuid)
         if not last_sent_text and rd.get("username"):
             last_sent_text = out_by_uname.get(str(rd["username"]).strip().lower())
         if not last_sent_text and rd.get("phone"):
@@ -1123,16 +1148,16 @@ def get_campaign(conn, campaign_id: int) -> dict:
         leadgen_sources = []
 
     camp_name_low = str(camp.get("name") or "").lower()
-    raw_lg_enabled = camp.get("leadgen_enabled")
-    if raw_lg_enabled is not None and int(raw_lg_enabled or 0) != 0:
+    raw_lg_enabled = safe_int(camp.get("leadgen_enabled"))
+    if raw_lg_enabled is not None and raw_lg_enabled != 0:
         leadgen_enabled = True
     elif raw_lg_enabled == 0 and ("leadgen" in camp_name_low or "ваканс" in camp_name_low) and not camp.get("leadgen_sources_json"):
         leadgen_enabled = True
     else:
-        leadgen_enabled = bool(int(raw_lg_enabled or 0))
+        leadgen_enabled = bool(raw_lg_enabled or 0)
 
-    raw_lg_quota = camp.get("leadgen_daily_quota")
-    leadgen_daily_quota = int(raw_lg_quota) if raw_lg_quota is not None else 20
+    raw_lg_quota = safe_int(camp.get("leadgen_daily_quota"))
+    leadgen_daily_quota = raw_lg_quota if raw_lg_quota is not None else 20
 
     camp["account_ids"] = account_ids
     camp["accounts"] = accounts_list
@@ -1154,7 +1179,16 @@ def get_campaign(conn, campaign_id: int) -> dict:
 
 def list_campaigns(conn) -> list:
     rows = conn.execute("SELECT id FROM campaigns ORDER BY id DESC").fetchall()
-    return [get_campaign(conn, row["id"]) for row in rows]
+    out = []
+    for row in rows:
+        cid = safe_int(row["id"]) if row is not None else None
+        if cid is None:
+            continue
+        try:
+            out.append(get_campaign(conn, cid))
+        except LookupError:
+            continue
+    return out
 
 
 _DEFAULT_BOILERPLATE_TEMPLATES = frozenset(
@@ -1606,7 +1640,9 @@ def is_within_outreach_schedule(
     now: datetime | None = None,
 ) -> bool:
     effective_now = now_dt if now_dt is not None else now
-    if isinstance(schedule_or_conn, sqlite3.Connection):
+    if isinstance(schedule_or_conn, sqlite3.Connection) or (
+        schedule_or_conn is not None and hasattr(schedule_or_conn, "execute")
+    ):
         sched = get_outreach_schedule(schedule_or_conn, now_dt=effective_now)
     else:
         sched = schedule_or_conn
@@ -3517,7 +3553,7 @@ async def run_campaign_batch(
                     )
 
                 # Before sending follow-up (step_idx >= 1), check live and cached messages for reply
-                if step_idx >= 1 and dialog:
+                if step_idx >= 1 and isinstance(dialog, dict) and safe_int(dialog.get("id")) is not None:
                     live_history_checked = False
                     live_has_out = False
                     if use_gateway and hasattr(active_gw, "fetch_messages"):
@@ -3562,7 +3598,9 @@ async def run_campaign_batch(
                         "SELECT * FROM dialogs WHERE id = ?", (dialog["id"],)
                     ).fetchone()
                     if refreshed_dlg_row is not None:
-                        dialog = as_dict(refreshed_dlg_row)
+                        refreshed_dlg = as_dict(refreshed_dlg_row)
+                        if refreshed_dlg and safe_int(refreshed_dlg.get("id")) is not None:
+                            dialog = refreshed_dlg
                     if _dialog_has_client_reply(conn, dialog, rec):
                         stop_outreach_on_reply(
                             conn,

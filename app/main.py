@@ -37,7 +37,7 @@ from app.db import (
     update_pipeline_stage,
     utc_now,
 )
-from app.demo import DEMO_SESSION, seed_demo
+from app.demo import seed_demo
 from app.funnel_analytics import (
     apply_read_outbox_update,
     ensure_funnel_columns,
@@ -49,7 +49,7 @@ from app.inbox import (
     apply_incoming,
     edit_dialog_message,
     ensure_playable_voice_wav,
-    get_dialog_avatar,
+    get_dialog_avatar_with_cache,
     get_inbox_counts,
     get_thread,
     list_inbox,
@@ -1047,10 +1047,18 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     await asyncio.wait_for(obt, timeout=10.0)
             except (asyncio.CancelledError, Exception):
                 pass
+            try:
+                from app.security import close_auth_connection
+
+                close_auth_connection(app)
+            except Exception:
+                pass
             if (
                 live_tg_enabled
                 and "PYTEST_CURRENT_TEST" not in os.environ
                 and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+                and os.getenv("CLOUD_BACKUP_ENABLED", "1").strip().lower()
+                not in ("0", "false", "no", "off")
             ):
                 try:
                     from app.cloud_persistence import release_tg_runtime_lease
@@ -1060,10 +1068,15 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     pass
 
     app = FastAPI(title="CRM Telegram", lifespan=lifespan)
+    cloud_backup_enabled = (
+        os.getenv("CLOUD_BACKUP_ENABLED", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
     if (
         conn is None
         and "PYTEST_CURRENT_TEST" not in os.environ
         and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+        and cloud_backup_enabled
     ):
         try:
             from app.cloud_persistence import restore_from_cloud
@@ -1079,6 +1092,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     if (
         "PYTEST_CURRENT_TEST" not in os.environ
         and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+        and cloud_backup_enabled
     ):
         restore_disk_sessions(conn)
         if os.getenv("BOOTSTRAP_PROD_SNAPSHOT", "").strip().lower() in ("1", "true", "yes"):
@@ -2122,8 +2136,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             gateway = _resolve_dialog_gateway(dialog_id, request)
         except Exception:
             gateway = None
-        data, mime = await _call_async(
-            get_dialog_avatar,
+        data, mime, cache_control = await _call_async(
+            get_dialog_avatar_with_cache,
             conn,
             dialog_id,
             gateway=gateway,
@@ -2131,7 +2145,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return Response(
             content=data,
             media_type=mime,
-            headers={"Cache-Control": "public, max-age=3600"},
+            headers={"Cache-Control": cache_control},
         )
 
     @app.get("/api/dialogs/{dialog_id}/messages/{telegram_message_id}/media")
@@ -3143,5 +3157,20 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     return app
 
 
-load_env_file()
-app = create_app()
+_DEFAULT_APP: FastAPI | None = None
+
+
+def get_app() -> FastAPI:
+    """Create the default FastAPI instance lazily so importing app.main has no side effects."""
+    global _DEFAULT_APP
+    if _DEFAULT_APP is None:
+        load_env_file()
+        _DEFAULT_APP = create_app()
+        globals()["app"] = _DEFAULT_APP
+    return _DEFAULT_APP
+
+
+def __getattr__(name: str):
+    if name == "app":
+        return get_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -4,6 +4,8 @@ import { defineConfig } from '@playwright/test';
 const port = process.env.E2E_PORT || '18765';
 const baseURL = `http://127.0.0.1:${port}`;
 const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const pythonBin = process.env.E2E_PYTHON
+  || (fs.existsSync('../.venv/bin/python') ? '../.venv/bin/python' : 'python3');
 
 export default defineConfig({
   testDir: '.',
@@ -21,7 +23,7 @@ export default defineConfig({
     launchOptions: fs.existsSync(chromePath) ? { executablePath: chromePath } : undefined,
   },
   webServer: {
-    command: '../.venv/bin/python serve.py',
+    command: `"${pythonBin}" serve.py`,
     cwd: '.',
     url: `${baseURL}/api/accounts`,
     reuseExistingServer: false,

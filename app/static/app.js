@@ -313,7 +313,14 @@ function closeSheetPopup() {
   syncSheetVisibility();
 }
 
+function closeToolbarMoreMenus(exceptMenu = null) {
+  document.querySelectorAll("details.toolbar-more-menu[open]").forEach((menu) => {
+    if (menu !== exceptMenu) menu.open = false;
+  });
+}
+
 function syncSheetVisibility() {
+  closeToolbarMoreMenus();
   const main = document.querySelector("#workspace-main");
   if (!main) return;
   const active = state.activeSheet || "s07";
@@ -536,6 +543,15 @@ async function api(path, options) {
         body: opts.body ? JSON.stringify(opts.body) : undefined,
       });
       text = await res.text();
+      if (res.status === 429 && method === "GET" && attempt < maxAttempts) {
+        const retryAfterSec = Number(res.headers.get("retry-after"));
+        const baseWaitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? retryAfterSec * 1000
+          : 800 * attempt;
+        const delayMs = Math.min(Math.max(baseWaitMs, 400), 5000) + Math.round(Math.random() * 150);
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
       if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
         await new Promise((r) => setTimeout(r, 1200 * attempt));
         continue;
@@ -2573,7 +2589,7 @@ function renderFullCampaignCards(onlyCampaignId = null) {
 
     const cardChildren = [
       el("div", { className: "campaign-card-head" }, [
-        el("h4", { className: "name" }, [camp.name]),
+        el("h3", { className: "name" }, [camp.name]),
         el("div", { className: "campaign-badges" }, badgeNodes),
       ]),
       el("div", { className: "campaign-kpis" }, [
@@ -2770,6 +2786,7 @@ function renderFolderList(rows) {
           type: "checkbox",
           className: "folder-select-cb",
           "data-folder-id": String(folder.id),
+          "aria-label": `Выбрать папку ${folder.title || folder.id}`,
           onchange: () => updateSelectedFoldersBtn(),
         })
       : null;
@@ -4605,13 +4622,15 @@ function renderFolderFilter() {
   if (previous) select.value = previous;
 }
 
-async function loadPipelineFolders() {
+async function loadPipelineFolders(force = false) {
   const connected = state.accounts.filter((account) => account.status === "connected");
-  await Promise.all(connected.map(async (account) => {
+  for (const account of connected) {
+    const key = String(account.id);
+    if (!force && Array.isArray(state.folderLists[key])) continue;
     try {
-      state.folderLists[String(account.id)] = await api(`/api/folders?account_id=${account.id}`);
+      state.folderLists[key] = await api(`/api/folders?account_id=${account.id}`);
     } catch (_err) { /* воронка живёт и без папок этого аккаунта */ }
-  }));
+  }
   renderFolderFilter();
 }
 
@@ -4672,6 +4691,8 @@ async function resetPipelineView() {
   if (channelNode) channelNode.value = "";
   const followupNode = document.querySelector("#followup-filter");
   if (followupNode) followupNode.value = "";
+  const pipelineSearchNode = document.querySelector("#pipeline-quick-search");
+  if (pipelineSearchNode) pipelineSearchNode.value = "";
   document.querySelector("#saved-view").value = "";
   document.querySelector("#view-name").value = "";
   if (state.mode === "crm") {
@@ -4690,7 +4711,7 @@ function folderTitleById(folderId) {
   return found ? found.title : "";
 }
 
-function updateWorkspaceStats() {
+function updateWorkspaceStats(opts = {}) {
   const leadCount = (state.leads || []).length;
   const leadsNode = document.querySelector("#stat-leads");
   if (leadsNode) leadsNode.textContent = String(leadCount);
@@ -4719,7 +4740,9 @@ function updateWorkspaceStats() {
     const pctAcc = Math.min(100, Math.max(10, Math.round((connectedCount / 10) * 100)));
     quotaAccFill.style.width = `${pctAcc}%`;
   }
-  scheduleAnalyticsRefresh();
+  if (opts.refreshAnalytics !== false) {
+    scheduleAnalyticsRefresh();
+  }
 }
 
 function renderBoard() {
@@ -5243,7 +5266,7 @@ async function loadLeads(query = "", keepId = null, silent = false) {
   renderBoard();
   renderCard();
   renderSide({ syncSelectedLead: keepId == null && state.selectedLeadId == null });
-  loadFocusToday().catch(() => {});
+  if (!isBootInFlight()) loadFocusToday().catch(() => {});
   const leadMode = leads.length ? "filled" : (state.leadQuery ? "none" : "empty");
   setView("#leads-view", leadMode);
   setView("#board-view", leads.length ? "filled" : "empty");
@@ -5375,7 +5398,7 @@ async function loadReminders() {
   renderLeadTable();
   renderBoard();
   renderCard();
-  loadFocusToday().catch(() => {});
+  if (!isBootInFlight()) loadFocusToday().catch(() => {});
 }
 
 function renderFocusToday(data) {
@@ -7583,8 +7606,20 @@ if (sheetPopupBackdrop) {
   sheetPopupBackdrop.addEventListener("click", () => closeSheetPopup());
 }
 
+document.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) return;
+  if (target.closest(".toolbar-more-popover button, .toolbar-more-popover a")) {
+    closeToolbarMoreMenus();
+    return;
+  }
+  const insideMenu = target.closest("details.toolbar-more-menu");
+  closeToolbarMoreMenus(insideMenu);
+});
+
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  closeToolbarMoreMenus();
   const modalNode = document.querySelector("#modal");
   if (modalNode && !modalNode.hidden) return;
   if (state.activePopup || state.activeSheet === "s09") {
@@ -8328,6 +8363,7 @@ function formatMoneyUsd(value) {
 
 function scheduleAnalyticsRefresh() {
   window.clearTimeout(analyticsRefreshTimer);
+  if (isBootInFlight()) return;
   analyticsRefreshTimer = window.setTimeout(() => {
     loadAnalyticsSummary().catch(() => {});
   }, 60);
@@ -9279,119 +9315,135 @@ async function loadSnippets() {
 }
 
 let bootSeq = 0;
+let bootingSeq = 0;
+
+function isBootInFlight() {
+  return bootingSeq !== 0 && bootingSeq === bootSeq;
+}
 
 async function boot() {
   const mySeq = ++bootSeq;
-  const initialHashSheet = sheetFromHash(window.location.hash);
-  if (initialHashSheet) state.activeSheet = initialHashSheet;
-  syncSheetVisibility();
-  renderBuilderSteps();
-  renderScheduleDays();
-  renderCrmProperties();
-  loadSnippets().catch(() => {});
-  const addStageBtn = document.querySelector("#add-stage-btn");
-  if (addStageBtn && !addStageBtn.dataset.bound) {
-    addStageBtn.dataset.bound = "1";
-    addStageBtn.addEventListener("click", () => promptCreateStage());
-  }
-  await loadPipelineStages();
-  if (mySeq !== bootSeq) return;
+  bootingSeq = mySeq;
+  try {
+    const initialHashSheet = sheetFromHash(window.location.hash);
+    if (initialHashSheet) state.activeSheet = initialHashSheet;
+    syncSheetVisibility();
+    renderBuilderSteps();
+    renderScheduleDays();
+    renderCrmProperties();
+    const addStageBtn = document.querySelector("#add-stage-btn");
+    if (addStageBtn && !addStageBtn.dataset.bound) {
+      addStageBtn.dataset.bound = "1";
+      addStageBtn.addEventListener("click", () => promptCreateStage());
+    }
+    await loadPipelineStages();
+    if (mySeq !== bootSeq) return;
 
-  setView("#board-view", "loading");
-  setView("#leads-view", "loading");
-  setView("#accounts-view", "loading");
-  setView("#inbox-view", "empty");
-  setView("#thread-view", "empty");
-  setView("#side-view", "empty");
-  setView("#card-view", "empty");
-  try {
-    await loadLeads("");
-  } catch (error) {
+    setView("#board-view", "loading");
+    setView("#leads-view", "loading");
+    setView("#accounts-view", "loading");
+    setView("#inbox-view", "empty");
+    setView("#thread-view", "empty");
+    setView("#side-view", "empty");
+    setView("#card-view", "empty");
+    let initialLeadsFailed = false;
+    try {
+      await loadLeads("");
+    } catch (error) {
+      if (mySeq !== bootSeq) return;
+      initialLeadsFailed = true;
+      failRegion("#leads-view", "#leads-error", error);
+      document.querySelector("#board-error").textContent = error.message;
+      setView("#board-view", "error");
+    }
     if (mySeq !== bootSeq) return;
-    failRegion("#leads-view", "#leads-error", error);
-    document.querySelector("#board-error").textContent = error.message;
-    setView("#board-view", "error");
-  }
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadOperator();
-  } catch (error) {
+    try {
+      await loadOperator();
+    } catch (error) {
+      if (mySeq !== bootSeq) return;
+      showOperator(error.message || "Нет BOT_TOKEN", "alert");
+    }
     if (mySeq !== bootSeq) return;
-    showOperator(error.message || "Нет BOT_TOKEN", "alert");
-  }
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadAccounts();
+    try {
+      await loadAccounts();
+      if (mySeq !== bootSeq) return;
+      loadPipelineFolders().catch(() => {});
+    } catch (error) {
+      if (mySeq !== bootSeq) return;
+      failRegion("#accounts-view", "#accounts-error", error);
+    }
     if (mySeq !== bootSeq) return;
-    loadPipelineFolders().catch(() => {});
-  } catch (error) {
+    try {
+      await loadInbox();
+    } catch (error) {
+      if (mySeq !== bootSeq) return;
+      closeInboxLive();
+      state.inbox = "error";
+      const node = document.querySelector("#inbox-error");
+      if (node) node.textContent = error.message;
+      setView("#inbox-view", "error");
+    }
     if (mySeq !== bootSeq) return;
-    failRegion("#accounts-view", "#accounts-error", error);
-  }
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadInbox();
-  } catch (error) {
+    try {
+      await loadViews();
+    } catch (error) {
+      if (mySeq !== bootSeq) return;
+      toast(error.message, "error");
+    }
     if (mySeq !== bootSeq) return;
-    closeInboxLive();
-    state.inbox = "error";
-    const node = document.querySelector("#inbox-error");
-    if (node) node.textContent = error.message;
-    setView("#inbox-view", "error");
-  }
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadViews();
-  } catch (error) {
+    try {
+      await loadReminders();
+    } catch (error) {
+      if (mySeq !== bootSeq) return;
+      failRegion("#digest-view", "#digest-error", error);
+    }
     if (mySeq !== bootSeq) return;
-    toast(error.message, "error");
-  }
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadReminders();
-  } catch (error) {
+    try {
+      await loadCampaigns();
+    } catch (_error) { /* рассылки могут загрузиться позже */ }
     if (mySeq !== bootSeq) return;
-    failRegion("#digest-view", "#digest-error", error);
-  }
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadCampaigns();
-  } catch (_error) { /* рассылки могут загрузиться позже */ }
-  if (mySeq !== bootSeq) return;
-  loadOutreachSchedule().catch(() => {});
-  loadCrmProperties().catch(() => {});
-  loadAiBotConfig().catch(() => {});
-  await loadSnippets();
-  if (mySeq !== bootSeq) return;
-  await loadAnalyticsSummary();
-  if (mySeq !== bootSeq) return;
-  try {
-    await loadLeads("");
-  } catch (error) {
+    loadOutreachSchedule().catch(() => {});
+    loadCrmProperties().catch(() => {});
+    loadAiBotConfig().catch(() => {});
+    await loadSnippets();
     if (mySeq !== bootSeq) return;
-    failRegion("#leads-view", "#leads-error", error);
-    document.querySelector("#board-error").textContent = error.message;
-    setView("#board-view", "error");
-  }
-  if (mySeq !== bootSeq) return;
-  const focusRefreshBtn = document.querySelector("#focus-today-refresh");
-  if (focusRefreshBtn && !focusRefreshBtn.dataset.bound) {
-    focusRefreshBtn.dataset.bound = "1";
-    focusRefreshBtn.addEventListener("click", () => {
-      loadFocusToday().then(() => toast("Фокус на сегодня обновлён", "ok"));
-    });
-  }
-  await loadFocusToday();
-  if (mySeq !== bootSeq) return;
-  updateWorkspaceStats();
-  loadAirtableStatus().catch(() => {});
-  loadMcpInfo().catch(() => {});
-  loadCalendar().catch(() => {});
-  loadLeadgenConfig().catch(() => {});
-  loadCrmAuthStatus().catch(() => {});
-  if (window.location.hash === "#login" || window.location.hash === "#auth") {
-    const authModal = document.querySelector("#crm-auth-modal");
-    if (authModal) authModal.hidden = false;
+    await loadAnalyticsSummary();
+    if (mySeq !== bootSeq) return;
+    if (initialLeadsFailed) {
+      try {
+        await loadLeads("");
+      } catch (error) {
+        if (mySeq !== bootSeq) return;
+        failRegion("#leads-view", "#leads-error", error);
+        document.querySelector("#board-error").textContent = error.message;
+        setView("#board-view", "error");
+      }
+    } else {
+      renderLeadTable();
+      renderBoard();
+    }
+    if (mySeq !== bootSeq) return;
+    const focusRefreshBtn = document.querySelector("#focus-today-refresh");
+    if (focusRefreshBtn && !focusRefreshBtn.dataset.bound) {
+      focusRefreshBtn.dataset.bound = "1";
+      focusRefreshBtn.addEventListener("click", () => {
+        loadFocusToday().then(() => toast("Фокус на сегодня обновлён", "ok"));
+      });
+    }
+    await loadFocusToday();
+    if (mySeq !== bootSeq) return;
+    updateWorkspaceStats({ refreshAnalytics: false });
+    loadAirtableStatus().catch(() => {});
+    loadMcpInfo().catch(() => {});
+    loadCalendar().catch(() => {});
+    loadLeadgenConfig().catch(() => {});
+    loadCrmAuthStatus().catch(() => {});
+    if (window.location.hash === "#login" || window.location.hash === "#auth") {
+      const authModal = document.querySelector("#crm-auth-modal");
+      if (authModal) authModal.hidden = false;
+    }
+  } finally {
+    if (bootingSeq === mySeq) bootingSeq = 0;
   }
 }
 
@@ -12805,7 +12857,7 @@ function buildCampaignCellCard(campaign) {
   return el("article", { className: "campaign-card campaign-cell", "data-campaign-id": String(campaign.id) }, [
     el("div", { className: "campaign-cell-head" }, [
       el("div", { className: "campaign-cell-title-wrap" }, [
-        el("h4", { className: "name campaign-cell-title" }, [campaign.name]),
+        el("h3", { className: "name campaign-cell-title" }, [campaign.name]),
       ]),
       el("div", { className: "campaign-cell-badges" }, [
         ...channelBadges,

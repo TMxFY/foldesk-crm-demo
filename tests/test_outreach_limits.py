@@ -1,5 +1,8 @@
+import base64
+
 from fastapi.testclient import TestClient
 
+from app import inbox as inbox_mod
 from app.db import connect, init_db, utc_now
 from app.main import create_app
 from app.telegram_gateway import FakeGateway
@@ -32,7 +35,7 @@ def _seed_connected_account(conn, phone="+79990001122", daily_limit=10, last_fro
     return account_id, dcur.lastrowid
 
 
-def test_account_daily_limit_patch_and_send_enforcement(tmp_path):
+def test_account_daily_limit_patch_and_manual_inbox_unlimited(tmp_path):
     conn = connect(tmp_path / "crm.db")
     init_db(conn)
     account_id, dialog_id = _seed_connected_account(conn, daily_limit=20)
@@ -51,26 +54,20 @@ def test_account_daily_limit_patch_and_send_enforcement(tmp_path):
         assert bad.status_code == 400
         assert "Лимит должен быть от 1 до 500" in bad.json()["detail"]
 
-        for i in range(1, 11):
+        for i in range(1, 13):
             resp = client.post(
                 f"/api/dialogs/{dialog_id}/messages",
-                json={"text": f"Тестовое сообщение #{i}"},
+                json={"text": f"Ручное сообщение #{i}"},
             )
             assert resp.status_code == 200, resp.text
 
         accounts = client.get("/api/accounts").json()
-        assert accounts[0]["sent_today"] == 10
+        assert accounts[0]["sent_today"] == 0
         assert accounts[0]["daily_limit"] == 10
 
-        blocked = client.post(
-            f"/api/dialogs/{dialog_id}/messages",
-            json={"text": "Одиннадцатое сообщение сверх лимита"},
-        )
-        assert blocked.status_code == 400
-        assert "Достигнут суточный лимит" in blocked.json()["detail"]
 
-
-def test_replied_peer_dialog_bypasses_daily_limit(tmp_path):
+def test_manual_inbox_text_and_media_unlimited_at_limit_while_outreach_enforces_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbox_mod, "INBOX_MEDIA_DIR", tmp_path / "inbox_media")
     conn = connect(tmp_path / "crm.db")
     init_db(conn)
     account_id, untouched_dialog_id = _seed_connected_account(conn, daily_limit=2, last_from_peer=0)
@@ -99,42 +96,58 @@ def test_replied_peer_dialog_bypasses_daily_limit(tmp_path):
         """,
         (replied_in_dialog_id, now, now, now),
     )
-    replied_flag_cur = conn.execute(
-        """
-        INSERT INTO dialogs (
-            account_id, peer_type, peer_id, username, title,
-            is_group, unread_count, last_from_peer, muted,
-            created_at, updated_at
-        ) VALUES (?, 'user', 810003, 'replied_flag', 'Входящий Клиент', 0, 1, 1, 0, ?, ?)
-        """,
-        (account_id, now, now),
-    )
-    replied_flag_dialog_id = replied_flag_cur.lastrowid
     conn.commit()
 
     app = create_app(conn=conn, gateway=None)
     with TestClient(app) as client:
-        blocked = client.post(
+        cold_manual = client.post(
             f"/api/dialogs/{untouched_dialog_id}/messages",
-            json={"text": "Холодный фоллоу-ап сверх лимита"},
+            json={"text": "Ручной фоллоу-ап в личке без лимита"},
         )
-        assert blocked.status_code == 400
-        assert "Достигнут суточный лимит" in blocked.json()["detail"]
+        assert cold_manual.status_code == 200, cold_manual.text
 
-        r1 = client.post(
+        b64_audio = base64.b64encode(b"OggS-manual-media-at-limit").decode("ascii")
+        media_manual = client.post(
+            f"/api/dialogs/{untouched_dialog_id}/media",
+            json={
+                "media_type": "voice",
+                "filename": "note.ogg",
+                "mime_type": "audio/ogg",
+                "data_base64": b64_audio,
+                "duration": 3,
+            },
+        )
+        assert media_manual.status_code == 200, media_manual.text
+
+        reply_manual = client.post(
             f"/api/dialogs/{replied_in_dialog_id}/messages",
             json={"text": "Отлично, отправляю детали по 3 видосам"},
         )
-        assert r1.status_code == 200, r1.text
-
-        r2 = client.post(
-            f"/api/dialogs/{replied_flag_dialog_id}/messages",
-            json={"text": "Привет! Конечно, давай обсудим"},
-        )
-        assert r2.status_code == 200, r2.text
+        assert reply_manual.status_code == 200, reply_manual.text
 
         accounts = client.get("/api/accounts").json()
         assert accounts[0]["sent_today"] == 2
+
+        camp = client.post(
+            "/api/campaigns",
+            json={
+                "name": "Аутрич с лимитом",
+                "account_id": account_id,
+                "daily_limit": 2,
+                "steps": [{"step_order": 1, "delay_hours": 0, "template_text": "Привет, {name}!"}],
+            },
+        )
+        assert camp.status_code == 200, camp.text
+        camp_id = camp.json()["id"]
+        csv_res = client.post(
+            f"/api/campaigns/{camp_id}/csv",
+            json={"csv_text": "username,name,company\n@cold_target,Колд,Acme"},
+        )
+        assert csv_res.status_code == 200, csv_res.text
+
+        outreach_blocked = client.post(f"/api/campaigns/{camp_id}/run", json={})
+        assert outreach_blocked.status_code == 400
+        assert "Достигнут суточный лимит аккаунта" in outreach_blocked.json()["detail"]
 
 
 def test_outreach_campaign_csv_import_and_multistep_sequence_respects_limits(tmp_path):
