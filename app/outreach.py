@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 import inspect
 import io
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import random
@@ -15,11 +17,19 @@ import time
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from app.accounts import _is_spambot_restriction_error
-from app.accounts import _load as load_account
-from app.accounts import _public as public_account
-from app.accounts import increment_daily_sent
-from app.db import as_dict, safe_int, utc_now, utc_today
+from app.accounts import (
+    ORPHAN_DEAD_ACCOUNT_ERROR,
+    _is_spambot_restriction_error,
+    _load as load_account,
+    _public as public_account,
+    increment_daily_sent,
+    record_account_health_transition,
+)
+from app.db import DEFAULT_DB, as_dict, safe_int, utc_now, utc_today
+
+logger = logging.getLogger(__name__)
+PREWARM_STORIES_TIMEOUT_SEC: float = 8.0
+ICP_GUARD_ERROR = "Остановлено ICP-фильтром: нерелевантный профиль или пустой продукт"
 from app.inbox import (
     _cache_messages,
     _is_synthetic_peer_id,
@@ -440,6 +450,103 @@ def is_offline_non_icp_contact(
     )
     if _OFFLINE_NON_ICP_RE.search(blob):
         return True
+    return False
+
+
+_NO_PRODUCT_MARKER_RE = re.compile(
+    r"(?:недостаточно\s+информации(?:\s+о\s+продукте)?|нет\s+информации\s+о\s+продукте|"
+    r"пустой\s+продукт|описание\s+продукта\s+отсутствует|"
+    r"i\s+can['’]?t\s+write\s+this\s+one|i\s+cannot\s+write|cloudflare\s+anti-bot)",
+    re.IGNORECASE,
+)
+_LAST_MILE_NON_ICP_ROLE_RE = re.compile(
+    r"(?:\bugc[\s\-]*creator\b|ugc[\s\-]*креатор|\bvideo\s+creator\b|\bfreelancer\b|фрилансер|"
+    r"\bweb3\s+shiller\b|\bcrypto\s+shiller\b|\bshiller\b|@?matrixreach_bot\b)",
+    re.IGNORECASE,
+)
+_BROKEN_STEP1_STUB_RE = re.compile(
+    r"^(?:hi[,!.?]*|hey[,!.?]*|hello[,!.?]*|yc\s+[swf]\d{2}|test)$",
+    re.IGNORECASE,
+)
+
+
+def has_last_mile_icp_defect(
+    rec: dict,
+    *,
+    step_idx: int,
+    rendered_text: str,
+    step: dict,
+    steps: list[dict],
+    is_qa_camp: bool = False,
+) -> bool:
+    clean_uname = (_clean_handle(rec.get("username")) or "").lower()
+    if clean_uname and (clean_uname == "matrixreach_bot" or clean_uname.endswith("_bot")):
+        return True
+
+    text_fields = (
+        rec.get("note"),
+        rec.get("category"),
+        rec.get("their_angle"),
+        rec.get("our_angle"),
+        rec.get("step1_text"),
+        rec.get("lead_note"),
+        rec.get("lead_description"),
+    )
+    for field_val in text_fields:
+        fixed = _fix_mojibake(field_val)
+        if fixed and _NO_PRODUCT_MARKER_RE.search(fixed):
+            return True
+
+    profile_blob = " ".join(
+        _fix_mojibake(val)
+        for val in (
+            rec.get("username"),
+            rec.get("name"),
+            rec.get("company"),
+            rec.get("category"),
+            rec.get("note"),
+            rec.get("their_angle"),
+            rec.get("lead_note"),
+            rec.get("lead_description"),
+        )
+        if val
+    )
+    if profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
+        return True
+    if not is_qa_camp and is_offline_non_icp_contact(
+        username=clean_uname,
+        name=rec.get("name"),
+        company=rec.get("company"),
+        website=rec.get("website"),
+        their_angle=rec.get("their_angle") or rec.get("note"),
+    ):
+        return True
+
+    rec_s1 = str(rec.get("step1_text") or "").strip()
+    if rec_s1 and _BROKEN_STEP1_STUB_RE.fullmatch(rec_s1):
+        return True
+
+    s0_tmpl = str(
+        (steps[0].get("template_text") if steps else step.get("template_text")) or ""
+    ).lower()
+    uses_step1_var = any(
+        tok in s0_tmpl
+        for tok in ("{step1_text}", "{first_touch}", "{первое касание}", "{первое_касание}")
+    )
+
+    if step_idx == 0:
+        clean_rendered = rendered_text.strip()
+        has_img = bool((step.get("image_url") or "").strip())
+        if not clean_rendered and not has_img:
+            return True
+        if clean_rendered and _BROKEN_STEP1_STUB_RE.fullmatch(clean_rendered):
+            return True
+        if not is_qa_camp and (uses_step1_var or rec_s1) and len(clean_rendered) < 25:
+            return True
+    else:
+        if not is_qa_camp and rec_s1 and len(rec_s1) < 25:
+            return True
+
     return False
 
 
@@ -1238,15 +1345,121 @@ _SPAMBOT_PROBE_CACHE: dict[tuple[str, int, str], tuple[float, dict]] = {}
 _SPAMBOT_PROBE_COOLDOWN_SEC = 600.0
 _SPAMBOT_UNKNOWN_COOLDOWN_SEC = 120.0
 _SPAMBOT_WARM_RECHECK_SEC = 3600.0
+_ACCOUNT_COOLDOWN_UNTIL: dict[tuple[str, int], float] = {}
+_FLOOD_WAIT_SEC_RE = re.compile(
+    r"(?:wait\s+of\s+(\d+)\s+seconds|flood_?wait_?(\d+))",
+    re.IGNORECASE,
+)
+
+
+def _db_ident(conn) -> str:
+    try:
+        db_row = conn.execute("PRAGMA database_list").fetchone()
+        return str(db_row[2] or id(conn)) if db_row is not None else str(id(conn))
+    except Exception:
+        return str(id(conn))
 
 
 def _spambot_cache_key(conn, account_id: int, session_path: str) -> tuple[str, int, str]:
-    try:
-        db_row = conn.execute("PRAGMA database_list").fetchone()
-        db_ident = str(db_row[2] or id(conn)) if db_row is not None else str(id(conn))
-    except Exception:
-        db_ident = str(id(conn))
-    return (db_ident, int(account_id), str(session_path))
+    return (_db_ident(conn), int(account_id), str(session_path))
+
+
+def _now_epoch_ts(*, now_iso: str | None = None, now_dt: datetime | None = None) -> float:
+    if isinstance(now_dt, datetime):
+        dt = now_dt if now_dt.tzinfo is not None else now_dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    parsed = _parse_iso_dt(now_iso or utc_now())
+    if parsed is not None:
+        return parsed.timestamp()
+    return time.time()
+
+
+def _extract_flood_wait_seconds(exc: BaseException | None) -> int:
+    if exc is None:
+        return 0
+    for obj in (exc, getattr(exc, "__cause__", None)):
+        if obj is None:
+            continue
+        sec_attr = getattr(obj, "seconds", None)
+        if isinstance(sec_attr, (int, float)) and sec_attr > 0:
+            return int(sec_attr)
+        m = _FLOOD_WAIT_SEC_RE.search(str(obj))
+        if m:
+            raw_num = m.group(1) or m.group(2)
+            if raw_num and raw_num.isdigit():
+                return int(raw_num)
+    return 0
+
+
+def set_account_cooldown(
+    conn,
+    account_id: int,
+    wait_seconds: int | float = 0,
+    *,
+    now_iso: str | None = None,
+    now_dt: datetime | None = None,
+) -> float:
+    base_ts = _now_epoch_ts(now_iso=now_iso, now_dt=now_dt)
+    until_ts = base_ts + max(float(wait_seconds or 0), 300.0)
+    _ACCOUNT_COOLDOWN_UNTIL[(_db_ident(conn), int(account_id))] = until_ts
+    return until_ts
+
+
+def get_account_cooldown_until(
+    conn,
+    account_id: int,
+    *,
+    now_iso: str | None = None,
+    now_dt: datetime | None = None,
+) -> float | None:
+    key = (_db_ident(conn), int(account_id))
+    until_ts = _ACCOUNT_COOLDOWN_UNTIL.get(key)
+    if until_ts is None:
+        return None
+    if until_ts > _now_epoch_ts(now_iso=now_iso, now_dt=now_dt):
+        return until_ts
+    _ACCOUNT_COOLDOWN_UNTIL.pop(key, None)
+    return None
+
+
+def clear_account_cooldown(conn, account_id: int) -> None:
+    _ACCOUNT_COOLDOWN_UNTIL.pop((_db_ident(conn), int(account_id)), None)
+
+
+def _is_invalid_recipient_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    cause = getattr(exc, "__cause__", None)
+    blob = (
+        f"{exc.__class__.__name__} "
+        f"{cause.__class__.__name__ if cause is not None else ''} "
+        f"{cause or ''} {exc}"
+    ).casefold()
+    return any(
+        marker in blob
+        for marker in (
+            "no user has ",
+            "nobody is using this username",
+            "usernameinvalid",
+            "usernamenotoccupied",
+            "cannot find any entity corresponding to",
+            "the specified user was deleted",
+            "input user deactivated",
+            "user_is_blocked",
+            "userisblocked",
+            "userprivacyrestricted",
+            "chatwriteforbidden",
+            "allow_payment_required",
+            "payment_required",
+        )
+    )
+
+
+def _followup_reserve_cap(daily_limit: int) -> int:
+    lim = max(0, int(daily_limit or 0))
+    if lim <= 1:
+        return lim
+    return max(1, lim // 2)
 
 
 def _cleanup_empty_step0_dialog(conn, step_idx: int, dialog: dict | None) -> None:
@@ -2614,6 +2827,20 @@ def import_campaign_csv(
         )
     else:
         conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
+    conn.execute(
+        """
+        UPDATE campaigns
+        SET status = 'running', updated_at = ?
+        WHERE id = ?
+          AND status = 'completed'
+          AND EXISTS (
+              SELECT 1 FROM campaign_recipients cr
+              WHERE cr.campaign_id = campaigns.id
+                AND cr.status IN ('pending', 'in_progress')
+          )
+        """,
+        (now, campaign_id),
+    )
     conn.commit()
     updated_campaign = get_campaign(conn, campaign_id)
     return {
@@ -2771,7 +2998,22 @@ def enroll_leads_from_crm(
             seen_phones.add(phone)
         imported_count += 1
 
-    conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
+    conn.execute(
+        """
+        UPDATE campaigns
+        SET status = CASE
+                WHEN status = 'completed' AND EXISTS (
+                    SELECT 1 FROM campaign_recipients cr
+                    WHERE cr.campaign_id = campaigns.id
+                      AND cr.status IN ('pending', 'in_progress')
+                ) THEN 'running'
+                ELSE status
+            END,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (now, campaign_id),
+    )
     conn.commit()
     updated_campaign = get_campaign(conn, campaign_id)
     return {
@@ -3063,6 +3305,124 @@ def _lookup_prior_outgoing_account(
     return int(row["account_id"]) if row is not None and row["account_id"] is not None else None
 
 
+def heal_orphaned_followups_from_dead_accounts(conn, campaign_id: int | None = None) -> int:
+    acc_map = {
+        int(r["id"]): as_dict(r)
+        for r in conn.execute("SELECT id, status, health, last_error FROM accounts").fetchall()
+    }
+    where_camp = "AND campaign_id = ?" if campaign_id is not None else ""
+    params: tuple = (int(campaign_id),) if campaign_id is not None else ()
+    rows = conn.execute(
+        f"""
+        SELECT id, campaign_id, current_step, sent_account_id, assigned_account_id,
+               username, telegram_user_id, phone, lead_id
+        FROM campaign_recipients
+        WHERE status = 'in_progress'
+          {where_camp}
+        ORDER BY id
+        """,
+        params,
+    ).fetchall()
+    if not rows:
+        return 0
+
+    def _is_acc_permanently_dead(aid: int) -> bool:
+        info = acc_map.get(aid)
+        if info is None:
+            return True
+        return str(info.get("health") or "") in ("unauthorized", "banned")
+
+    now = utc_now()
+    closed_ids: list[int] = []
+    for r in rows:
+        pinned_aid = safe_int(r["sent_account_id"])
+        if pinned_aid is None:
+            clean_u = (_clean_handle(r["username"]) or "").lower()
+            raw_tid = r["telegram_user_id"]
+            real_pid = (
+                int(raw_tid)
+                if raw_tid is not None and not _is_synthetic_peer_id(raw_tid)
+                else None
+            )
+            clean_p = str(r["phone"] or "").strip()
+            lid_val = int(r["lead_id"]) if r["lead_id"] is not None else None
+            pinned_aid = _lookup_prior_outgoing_account(
+                conn,
+                clean_uname=clean_u,
+                real_peer_id=real_pid,
+                clean_phone=clean_p,
+                lead_id_val=lid_val,
+            )
+        if pinned_aid is None:
+            cand_assigned = safe_int(r["assigned_account_id"])
+            if cand_assigned is not None and _is_acc_permanently_dead(cand_assigned):
+                pinned_aid = cand_assigned
+        if pinned_aid is not None and _is_acc_permanently_dead(pinned_aid):
+            closed_ids.append(int(r["id"]))
+
+    if closed_ids:
+        ph = ",".join("?" for _ in closed_ids)
+        conn.execute(
+            f"""
+            UPDATE campaign_recipients
+            SET status = 'completed',
+                error_text = ?,
+                updated_at = ?
+            WHERE id IN ({ph})
+            """,
+            [ORPHAN_DEAD_ACCOUNT_ERROR, now, *closed_ids],
+        )
+        conn.commit()
+    return len(closed_ids)
+
+
+def _compute_paced_daily_allowance(
+    conn,
+    daily_limit: int,
+    now_dt: datetime | None = None,
+) -> int:
+    lim = max(0, int(daily_limit or 0))
+    if lim <= 1:
+        return lim
+
+    eff_now = now_dt if isinstance(now_dt, datetime) else _parse_iso_dt(utc_now())
+    if eff_now is None:
+        eff_now = datetime.now(timezone.utc)
+    elif eff_now.tzinfo is None:
+        eff_now = eff_now.replace(tzinfo=timezone.utc)
+
+    sched = get_outreach_schedule(conn, now_dt=eff_now)
+    tz_name = str(sched.get("timezone") or "UTC").strip() or "UTC"
+    try:
+        tz_obj = ZoneInfo(tz_name)
+    except Exception:
+        tz_obj = timezone.utc
+
+    local_dt = eff_now.astimezone(tz_obj)
+    day_key = WEEKDAY_KEYS[local_dt.weekday()]
+    days = sched.get("days") if isinstance(sched.get("days"), dict) else DEFAULT_SCHEDULE_DAYS
+    today_cfg = days.get(day_key) if isinstance(days.get(day_key), dict) else DEFAULT_SCHEDULE_DAYS[day_key]
+
+    start_min = _parse_hhmm(str(today_cfg.get("start") or "09:00").strip(), 9 * 60)
+    end_min = _parse_hhmm(str(today_cfg.get("end") or "18:00").strip(), 18 * 60)
+    cur_min = local_dt.hour * 60 + local_dt.minute
+
+    if start_min < end_min:
+        window_minutes = max(1, end_min - start_min)
+        elapsed_minutes = max(0, min(window_minutes, cur_min - start_min))
+    else:
+        window_minutes = max(1, (1440 - start_min) + end_min)
+        raw_elapsed = (cur_min - start_min) if cur_min >= start_min else ((1440 - start_min) + cur_min)
+        elapsed_minutes = max(0, min(window_minutes, raw_elapsed))
+
+    if lim == 2 and elapsed_minutes >= 60:
+        return 2
+    return min(
+        lim,
+        max(1, math.ceil(lim * ((elapsed_minutes + 30) / window_minutes))),
+    )
+
+
 async def run_campaign_batch(
     conn,
     campaign_id: int,
@@ -3072,6 +3432,8 @@ async def run_campaign_batch(
     wa_gateway=None,
     jitter_range: tuple[float, float] | None = None,
     dry_run: bool = False,
+    pace_across_schedule: bool = False,
+    now_dt: datetime | None = None,
 ) -> dict:
     if dry_run:
         return preview_outreach_batch(
@@ -3081,6 +3443,7 @@ async def run_campaign_batch(
             respect_delays=respect_delays,
             strict=True,
         )
+    heal_orphaned_followups_from_dead_accounts(conn, int(campaign_id))
     camp = get_campaign(conn, campaign_id)
     account_ids = camp.get("account_ids") or []
     if not account_ids:
@@ -3134,16 +3497,27 @@ async def run_campaign_batch(
         ):
             continue
         acc_pub = public_account(acc_raw)
+        acc_daily_lim = int(acc_pub["daily_limit"])
+        acc_cd_until = get_account_cooldown_until(
+            conn, int(acc_raw["id"]), now_dt=now_dt
+        )
+        acc_paced_lim = (
+            _compute_paced_daily_allowance(conn, acc_daily_lim, now_dt=now_dt)
+            if pace_across_schedule
+            else acc_daily_lim
+        )
         connected_states.append(
             {
                 "id": int(acc_raw["id"]),
                 "order": order_idx,
                 "raw": acc_raw,
-                "daily_limit": int(acc_pub["daily_limit"]),
+                "daily_limit": acc_daily_lim,
+                "paced_limit": acc_paced_lim,
                 "sent_today": int(acc_pub["sent_today"]),
                 "sent_in_batch": 0,
                 "reserved_followups": 0,
-                "disabled": False,
+                "disabled": acc_cd_until is not None,
+                "cooldown_until": acc_cd_until,
                 "spambot_warm_only": is_spambot_warm_only,
             }
         )
@@ -3173,8 +3547,22 @@ async def run_campaign_batch(
         )
 
     cap = int(max_send) if max_send is not None and int(max_send) > 0 else 500
-    effective_quota = min(total_account_remaining, campaign_remaining, cap)
-    max_failed_in_batch = max(5, effective_quota * 3)
+    if pace_across_schedule:
+        paced_campaign_limit = _compute_paced_daily_allowance(
+            conn, campaign_daily_limit, now_dt=now_dt
+        )
+        paced_campaign_remaining = max(
+            0, min(campaign_remaining, paced_campaign_limit - campaign_sent_today)
+        )
+        paced_account_remaining = sum(
+            max(0, min(st["daily_limit"], st["paced_limit"]) - st["sent_today"])
+            for st in connected_states
+            if not st.get("disabled")
+        )
+        effective_quota = min(paced_account_remaining, paced_campaign_remaining, cap)
+    else:
+        effective_quota = min(total_account_remaining, campaign_remaining, cap)
+    max_failed_in_batch = max(5, max(1, effective_quota) * 3)
 
     sent_count = 0
     failed_in_batch = 0
@@ -3329,31 +3717,52 @@ async def run_campaign_batch(
                 _add_current_camp_reservation(int(rec_obj["id"]), int(dup_acc), dup_slots)
             return True
 
+        prev_step_norms: set[str] = set()
+        for prev_idx in range(0, min(step_idx_val, len(steps))):
+            prev_txt = _render_step_text(
+                steps[prev_idx], prev_idx, rec_obj, campaign_name=camp.get("name")
+            )
+            p_norm = _norm_followup_text(prev_txt)
+            if p_norm:
+                prev_step_norms.add(p_norm)
+            raw_tmpl_norm = _norm_followup_text(steps[prev_idx].get("template_text"))
+            if raw_tmpl_norm:
+                prev_step_norms.add(raw_tmpl_norm)
+
+        latest_campaign_step_sent_at = max(
+            (
+                str(m["sent_at"] or "")
+                for m in out_rows
+                if m["sent_at"] and _norm_followup_text(m["text"]) in prev_step_norms
+            ),
+            default="",
+        )
         latest_out_sent_at = max(
             (str(m["sent_at"] or "") for m in out_rows if m["sent_at"]),
             default="",
         )
-        if latest_out_sent_at:
-            cur_last_sent = str(rec_obj.get("last_sent_at") or "")
-            if latest_out_sent_at > cur_last_sent:
-                rec_obj["last_sent_at"] = latest_out_sent_at
-                conn.execute(
-                    """
-                    UPDATE campaign_recipients
-                    SET last_sent_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (latest_out_sent_at, now_val, rec_obj["id"]),
-                )
-                conn.commit()
-                _mark_cloud_persistence_dirty(conn, now_val)
-            if respect_delays:
-                dh = int(steps[step_idx_val].get("delay_hours") or 0)
-                if dh > 0:
-                    due_iso_real = _add_hours_iso(latest_out_sent_at, dh)
-                    if due_iso_real and due_iso_real > now_val:
-                        _release_followup_reservation(int(rec_obj["id"]))
-                        return True
+        cur_last_sent = str(rec_obj.get("last_sent_at") or "")
+        if latest_campaign_step_sent_at and latest_campaign_step_sent_at > cur_last_sent:
+            cur_last_sent = latest_campaign_step_sent_at
+            rec_obj["last_sent_at"] = latest_campaign_step_sent_at
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET last_sent_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (latest_campaign_step_sent_at, now_val, rec_obj["id"]),
+            )
+            conn.commit()
+            _mark_cloud_persistence_dirty(conn, now_val)
+        effective_delay_base = max(cur_last_sent, latest_out_sent_at)
+        if effective_delay_base and respect_delays:
+            dh = int(steps[step_idx_val].get("delay_hours") or 0)
+            if dh > 0:
+                due_iso_real = _add_hours_iso(effective_delay_base, dh)
+                if due_iso_real and due_iso_real > now_val:
+                    _release_followup_reservation(int(rec_obj["id"]))
+                    return True
         return False
 
     def _count_followup_slots_due_today(
@@ -3421,7 +3830,10 @@ async def run_campaign_batch(
                 (ocid, f"{today_iso}%"),
             ).fetchone()
             o_sent = int(o_sent_row["cnt"] or 0)
-            other_remaining_cap[ocid] = max(0, int(orow["daily_limit"] or 20) - o_sent)
+            o_lim = int(orow["daily_limit"] or 20)
+            other_remaining_cap[ocid] = min(
+                max(0, o_lim - o_sent), _followup_reserve_cap(o_lim)
+            )
             steps_by_camp[ocid] = [
                 as_dict(sr)
                 for sr in conn.execute(
@@ -3568,13 +3980,18 @@ async def run_campaign_batch(
             else 1
         )
         if respect_delays and step_idx == 0:
-            camp_followup_reserve = sum(
+            raw_camp_reserve = sum(
                 min(
                     camp_reserved_by_acc.get(st["id"], 0),
+                    _followup_reserve_cap(st["daily_limit"]),
                     max(0, st["daily_limit"] - st["sent_today"]),
                 )
                 for st in connected_states
                 if not st.get("disabled") and not st.get("dead")
+            )
+            camp_followup_reserve = min(
+                raw_camp_reserve,
+                _followup_reserve_cap(campaign_daily_limit),
             )
             if campaign_remaining - sent_count - camp_followup_reserve < new_lead_slots_today:
                 break
@@ -3609,7 +4026,6 @@ async def run_campaign_batch(
                 (now, rec["id"]),
             )
             conn.commit()
-            failed_in_batch += 1
             continue
 
         if int(step.get("step_order") or (step_idx + 1)) != step_idx + 1 or (
@@ -3630,7 +4046,6 @@ async def run_campaign_batch(
                 (now, rec["id"]),
             )
             conn.commit()
-            failed_in_batch += 1
             continue
 
         if step_idx == 0:
@@ -3840,6 +4255,28 @@ async def run_campaign_batch(
             ):
                 continue
 
+        if not is_qa_camp and has_last_mile_icp_defect(
+            rec,
+            step_idx=step_idx,
+            rendered_text=rendered_text,
+            step=step,
+            steps=steps,
+            is_qa_camp=is_qa_camp,
+        ):
+            conn.execute(
+                """
+                UPDATE campaign_recipients
+                SET status = 'completed',
+                    error_text = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (ICP_GUARD_ERROR, now, rec["id"]),
+            )
+            conn.commit()
+            _release_followup_reservation(int(rec["id"]))
+            continue
+
         sent_this_recipient = False
         no_accounts_left = False
         no_new_lead_quota_left = False
@@ -3850,7 +4287,8 @@ async def run_campaign_batch(
         spambot_retried_accounts: set[int] = set()
         while True:
             any_quota_left = any(
-                not st.get("disabled") and st["sent_today"] < st["daily_limit"]
+                not st.get("disabled")
+                and st["sent_today"] < min(st["daily_limit"], st["paced_limit"])
                 for st in connected_states
             )
             if not any_quota_left:
@@ -3860,10 +4298,15 @@ async def run_campaign_batch(
                 st
                 for st in connected_states
                 if not st.get("disabled")
+                and st["sent_today"] < st["paced_limit"]
                 and (
                     st["daily_limit"]
                     - st["sent_today"]
-                    - (st["reserved_followups"] if (respect_delays and step_idx == 0) else 0)
+                    - (
+                        min(st["reserved_followups"], _followup_reserve_cap(st["daily_limit"]))
+                        if (respect_delays and step_idx == 0)
+                        else 0
+                    )
                     >= (new_lead_slots_today if step_idx == 0 else 1)
                 )
                 and (step_idx >= 1 or not st.get("spambot_warm_only"))
@@ -3910,7 +4353,7 @@ async def run_campaign_batch(
                         not pinned_state.get("disabled")
                         and not pinned_state.get("dead")
                         and pinned_state["id"] not in recipient_excluded_accounts
-                        and pinned_state["sent_today"] < pinned_state["daily_limit"]
+                        and pinned_state["sent_today"] < min(pinned_state["daily_limit"], pinned_state["paced_limit"])
                     ):
                         chosen_state = pinned_state
                     else:
@@ -3921,10 +4364,18 @@ async def run_campaign_batch(
                     not pinned_state.get("disabled")
                     and not pinned_state.get("spambot_warm_only")
                     and pinned_state["id"] not in recipient_excluded_accounts
+                    and pinned_state["sent_today"] < pinned_state["paced_limit"]
                     and (
                         pinned_state["daily_limit"]
                         - pinned_state["sent_today"]
-                        - (pinned_state["reserved_followups"] if respect_delays else 0)
+                        - (
+                            min(
+                                pinned_state["reserved_followups"],
+                                _followup_reserve_cap(pinned_state["daily_limit"]),
+                            )
+                            if respect_delays
+                            else 0
+                        )
                         >= new_lead_slots_today
                     )
                     and not _is_same_tg_identity(
@@ -4131,20 +4582,40 @@ async def run_campaign_batch(
                         )
                         if next_step_order == 1:
                             target_entity = peer_target
-                            lock_fn = getattr(active_gw, "_session_lock", None)
-                            if callable(lock_fn):
-                                async with lock_fn(session_path):
-                                    client = await _resolve_telethon_client_for_prewarm(
-                                        active_gw, session_path
-                                    )
-                                    if client is not None:
-                                        await prewarm_recipient_stories(client, target_entity)
-                            else:
+
+                            async def _do_bounded_prewarm() -> None:
                                 client = await _resolve_telethon_client_for_prewarm(
                                     active_gw, session_path
                                 )
                                 if client is not None:
                                     await prewarm_recipient_stories(client, target_entity)
+
+                            try:
+                                lock_fn = getattr(active_gw, "_session_lock", None)
+                                if callable(lock_fn):
+                                    async with lock_fn(session_path):
+                                        await asyncio.wait_for(
+                                            _do_bounded_prewarm(),
+                                            timeout=PREWARM_STORIES_TIMEOUT_SEC,
+                                        )
+                                else:
+                                    await asyncio.wait_for(
+                                        _do_bounded_prewarm(),
+                                        timeout=PREWARM_STORIES_TIMEOUT_SEC,
+                                    )
+                            except (asyncio.TimeoutError, TimeoutError):
+                                logger.warning(
+                                    "prewarm_recipient_stories timed out after %.2fs for %s on %s",
+                                    PREWARM_STORIES_TIMEOUT_SEC,
+                                    target_entity,
+                                    session_path,
+                                )
+                            except Exception as pre_exc:
+                                logger.debug(
+                                    "prewarm_recipient_stories skipped for %s: %s",
+                                    target_entity,
+                                    pre_exc,
+                                )
                         sent = await _tg_send_with_username_fallback(
                             active_gw,
                             session_path,
@@ -4217,11 +4688,7 @@ async def run_campaign_batch(
                         rotated_after_failure = True
                         reply_snip = str(sb_probe.get("reply_text") or "").strip()
                         err_str = f"@SpamBot: {reply_snip or str(exc)}"[:300]
-                        conn.execute(
-                            "UPDATE accounts SET health = 'frozen', last_error = ?, updated_at = ? WHERE id = ?",
-                            (err_str, now, chosen_account_id),
-                        )
-                        conn.commit()
+                        record_account_health_transition(conn, chosen_account_id, "frozen", err_str)
                         if step_idx >= 1:
                             break
                         continue
@@ -4231,14 +4698,27 @@ async def run_campaign_batch(
                     chosen_state["disabled"] = True
                     rotated_after_failure = True
                     _cleanup_empty_step0_dialog(conn, step_idx, dialog)
-                    if err_kind == "account_dead":
+                    if err_kind == "account_transient":
+                        wait_sec = _extract_flood_wait_seconds(exc)
+                        cd_until = set_account_cooldown(
+                            conn, chosen_account_id, wait_sec, now_iso=now, now_dt=now_dt
+                        )
+                        chosen_state["cooldown_until"] = cd_until
+                        if active_gw is not None and hasattr(active_gw, "invalidate_proxy"):
+                            try:
+                                active_gw.invalidate_proxy(session_path)
+                                active_gw.invalidate_proxy(chosen_account_id)
+                            except Exception:
+                                pass
+                    elif err_kind == "account_dead":
                         chosen_state["dead"] = True
                         err_str = str(exc)[:300]
-                        conn.execute(
-                            "UPDATE accounts SET health = ?, last_error = ?, updated_at = ? WHERE id = ?",
-                            (err_health, err_str, now, chosen_account_id),
-                        )
-                        conn.commit()
+                        record_account_health_transition(conn, chosen_account_id, err_health, err_str)
+                        if err_health in ("unauthorized", "banned"):
+                            for rid_k, (r_aid, _) in list(reserved_rec_to_acc.items()):
+                                if r_aid == chosen_account_id:
+                                    _release_followup_reservation(rid_k)
+                            heal_orphaned_followups_from_dead_accounts(conn, int(campaign_id))
                         is_spambot_only = any(
                             m in err_str.casefold()
                             for m in ("spambot", "cannot message non-contacts", "peerspam", "spam-reported")
@@ -4260,8 +4740,10 @@ async def run_campaign_batch(
                     """,
                     (str(exc)[:300], now, rec["id"]),
                 )
+                conn.commit()
                 _release_followup_reservation(int(rec["id"]))
-                failed_in_batch += 1
+                if not _is_invalid_recipient_error(exc):
+                    failed_in_batch += 1
                 break
 
         if no_accounts_left or no_new_lead_quota_left:
@@ -4493,6 +4975,7 @@ async def run_autopilot_tick(
         }
 
     heal_transient_failed_recipients(conn)
+    heal_orphaned_followups_from_dead_accounts(conn)
     running_rows = conn.execute(
         "SELECT id, name FROM campaigns WHERE status = 'running' ORDER BY id"
     ).fetchall()
@@ -4510,6 +4993,8 @@ async def run_autopilot_tick(
                 respect_delays=respect_delays,
                 wa_gateway=wa_gateway,
                 jitter_range=jitter_range,
+                pace_across_schedule=True,
+                now_dt=effective_now,
             )
             sent_now = int(batch_res.get("sent") or 0)
             total_sent += sent_now
@@ -4797,7 +5282,7 @@ def preview_outreach_batch(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Outreach batch CLI (Rule 5 dry-run supported)")
-    parser.add_argument("--db", default=os.environ.get("CRMTG_DB", "data/crmtg.db"), help="Path to SQLite DB")
+    parser.add_argument("--db", default=os.environ.get("CRMTG_DB", str(DEFAULT_DB)), help="Path to SQLite DB")
     parser.add_argument("--campaign-id", type=int, required=True, help="Campaign ID")
     parser.add_argument("--dry-run", action="store_true", help="Run mandatory Rule 5 dry-run preview and validation")
     parser.add_argument("--sample-size", type=int, default=5, help="Preview sample size (3-5)")

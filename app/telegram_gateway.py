@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import inspect
 import json
 import os
 import re
@@ -1102,6 +1103,32 @@ class TelethonGateway(TelegramGateway):
         )
         self._avatar_cooldowns: dict[tuple[str, str], float] = {}
         self._avatar_last_outcomes: dict[tuple[str, str], str] = {}
+        self._bg_disconnect_tasks: set[asyncio.Task] = set()
+
+    def invalidate_proxy(self, key: str | int | None) -> None:
+        if key is None:
+            return
+        self._proxies.pop(key, None)
+        key_str = str(key).strip()
+        if not key_str:
+            return
+        self._proxies.pop(key_str, None)
+        if isinstance(key, int) or key_str.isdigit():
+            stems = {key_str, f"acc{key_str}", f"acc_{key_str}"}
+            for k in list(self._proxies.keys()):
+                if Path(str(k)).stem in stems:
+                    self._proxies.pop(k, None)
+
+    def _schedule_bg_disconnect(self, client) -> None:
+        if client is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._safe_disconnect(client))
+        self._bg_disconnect_tasks.add(task)
+        task.add_done_callback(self._bg_disconnect_tasks.discard)
 
     def set_session_string(self, session_path: str, session_string: str | None) -> None:
         if not session_path:
@@ -1183,11 +1210,7 @@ class TelethonGateway(TelegramGateway):
         if clean != old_proxy:
             old_client = self._clients.pop(session_path, None)
             if old_client is not None:
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(old_client.disconnect())
-                except Exception:
-                    pass
+                self._schedule_bg_disconnect(old_client)
 
     def set_app_credentials(
         self, session_path: str, app_id: int | str | None, app_hash: str | None
@@ -1365,10 +1388,29 @@ class TelethonGateway(TelegramGateway):
         if client is None:
             return
         try:
-            if client.is_connected():
-                await asyncio.wait_for(
-                    client.disconnect(), timeout=self._disconnect_timeout
-                )
+            is_conn_fn = getattr(client, "is_connected", None)
+            has_sender = getattr(client, "_sender", None) is not None
+            should_disc = True if not callable(is_conn_fn) else bool(is_conn_fn() or has_sender)
+            if should_disc and hasattr(client, "disconnect"):
+                disc_res = client.disconnect()
+                if inspect.isawaitable(disc_res):
+                    await asyncio.wait_for(disc_res, timeout=self._disconnect_timeout)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        try:
+            sender = getattr(client, "_sender", None)
+            if sender is not None:
+                lingering: list[asyncio.Task] = []
+                for attr_name in ("_send_loop_handle", "_recv_loop_handle", "_reconnect_task"):
+                    handle = getattr(sender, attr_name, None)
+                    if isinstance(handle, asyncio.Task) and not handle.done():
+                        handle.cancel()
+                        lingering.append(handle)
+                if lingering:
+                    await asyncio.wait_for(
+                        asyncio.gather(*lingering, return_exceptions=True),
+                        timeout=0.5,
+                    )
         except (asyncio.TimeoutError, Exception):
             pass
         try:
@@ -1381,6 +1423,7 @@ class TelethonGateway(TelegramGateway):
     async def _drop_zombie_client_unlocked(self, session_path: str) -> None:
         client = self._clients.pop(session_path, None)
         self._warmed_dialogs.discard(session_path)
+        self.invalidate_proxy(session_path)
         await self._safe_disconnect(client)
 
     async def _open(self, session_path: str):
@@ -1441,13 +1484,19 @@ class TelethonGateway(TelegramGateway):
                     await asyncio.sleep(0.01 if "PYTEST_CURRENT_TEST" in os.environ else 2.0)
 
         if last_exc is not None:
+            if _classify_session_error(last_exc).get("health") not in (
+                "unauthorized",
+                "banned",
+                "frozen",
+            ):
+                self.invalidate_proxy(session_path)
             raise last_exc
         raise GatewayError("Не удалось подключиться к Telegram")
 
     async def _close(self, session_path: str) -> None:
         async with self._session_lock(session_path):
             client = self._clients.pop(session_path, None)
-            self._proxies.pop(session_path, None)
+            self.invalidate_proxy(session_path)
             self._app_credentials.pop(session_path, None)
             self._device_profiles.pop(session_path, None)
             self._warmed_dialogs.discard(session_path)
@@ -1459,6 +1508,19 @@ class TelethonGateway(TelegramGateway):
                 await self._close(path)
             except Exception:
                 pass
+        pending_bg = [t for t in list(self._bg_disconnect_tasks) if not t.done()]
+        if pending_bg:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_bg, return_exceptions=True),
+                    timeout=self._disconnect_timeout,
+                )
+            except (asyncio.TimeoutError, Exception):
+                for t in pending_bg:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*pending_bg, return_exceptions=True)
+        self._bg_disconnect_tasks.clear()
 
     def _reset_corrupted_session_file(self, session_path: str) -> None:
         try:

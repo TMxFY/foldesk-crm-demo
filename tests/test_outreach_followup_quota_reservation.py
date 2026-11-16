@@ -167,28 +167,28 @@ def test_reserves_daily_quota_for_followups_due_later_today(tmp_path, monkeypatc
     gw = RecordingGateway(live_messages_by_session_peer=live_msgs)
 
     # At 08:05 UTC, 3 follow-ups are due later today (11:00..13:00 UTC).
-    # Account daily_limit=5 -> only 2 slots may be used for new cold leads!
+    # Account daily_limit=5 -> followup reservation capped at daily_limit // 2 = 2, leaving 3 slots for fresh Step 1!
     morning_res = asyncio.run(
         run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True)
     )
-    assert morning_res["sent"] == 2
+    assert morning_res["sent"] == 3
     pending_left = conn.execute(
         "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ? AND status = 'pending'",
         (camp["id"],),
     ).fetchone()[0]
-    assert pending_left == 3
+    assert pending_left == 2
 
-    # At 14:00 UTC, the 3 follow-ups are now due and consume the 3 reserved slots (total 5/5 today).
+    # At 14:00 UTC, 2 due follow-ups consume the 2 reserved slots (total 5/5 today).
     _set_clock(monkeypatch, "2026-11-12T14:00:00")
     afternoon_res = asyncio.run(
         run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True)
     )
-    assert afternoon_res["sent"] == 3
+    assert afternoon_res["sent"] == 2
     step2_count = conn.execute(
         "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ? AND current_step = 2",
         (camp["id"],),
     ).fetchone()[0]
-    assert step2_count == 3
+    assert step2_count == 2
     assert get_campaign(conn, camp["id"])["sent_today"] == 5
 
 
@@ -303,20 +303,20 @@ def test_multi_account_per_account_reservation_does_not_starve_other_account(tmp
 
     gw = RecordingGateway(live_messages_by_session_peer=live_msgs)
 
-    # Morning: Acc 21 must send 0 new leads (reserves all 3 slots), Acc 31 sends 3 new leads!
+    # Morning: Acc 21 caps followup reserve at max(1, 3 // 2) = 1 (sends 2 new leads), Acc 31 sends 3 new leads!
     morning_res = asyncio.run(
         run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True)
     )
-    assert morning_res["sent"] == 3
-    assert morning_res["sent_by_account"] == {"31": 3}
+    assert morning_res["sent"] == 5
+    assert morning_res["sent_by_account"] == {"21": 2, "31": 3}
 
-    # Afternoon: Acc 21 sends its 3 due follow-ups!
+    # Afternoon: Acc 21 sends its 1 reserved follow-up (hitting 3/3 daily limit)!
     _set_clock(monkeypatch, "2026-11-12T13:00:00")
     afternoon_res = asyncio.run(
         run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True)
     )
-    assert afternoon_res["sent"] == 3
-    assert afternoon_res["sent_by_account"] == {"21": 3}
+    assert afternoon_res["sent"] == 1
+    assert afternoon_res["sent_by_account"] == {"21": 1}
 
 
 def test_followups_due_tomorrow_do_not_consume_today_reservation(tmp_path, monkeypatch):
@@ -479,13 +479,13 @@ def test_campaign_daily_limit_smaller_than_account_sum_reserves_followups(tmp_pa
     morning_res = asyncio.run(
         run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True)
     )
-    assert morning_res["sent"] == 2
+    assert morning_res["sent"] == 3
 
     _set_clock(monkeypatch, "2026-11-12T15:00:00")
     afternoon_res = asyncio.run(
         run_campaign_batch(conn, camp["id"], gateway=gw, max_send=10, respect_delays=True)
     )
-    assert afternoon_res["sent"] == 3
+    assert afternoon_res["sent"] == 2
     assert get_campaign(conn, camp["id"])["sent_today"] == 5
 
 
