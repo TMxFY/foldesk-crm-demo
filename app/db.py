@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import threading
+import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
@@ -283,6 +284,32 @@ class ThreadSafeConnection(sqlite3.Connection):
     def rollback(self):
         with self._lock:
             return super().rollback()
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            if super().in_transaction:
+                sp_name = f"sp_{uuid.uuid4().hex[:12]}"
+                super().execute(f"SAVEPOINT {sp_name}")
+                try:
+                    yield self
+                except BaseException:
+                    super().execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    super().execute(f"RELEASE SAVEPOINT {sp_name}")
+                    raise
+                else:
+                    super().execute(f"RELEASE SAVEPOINT {sp_name}")
+            else:
+                super().execute("BEGIN IMMEDIATE")
+                try:
+                    yield self
+                except BaseException:
+                    if super().in_transaction:
+                        super().rollback()
+                    raise
+                else:
+                    if super().in_transaction:
+                        super().commit()
 
     def close(self):
         with self._lock:
@@ -1007,41 +1034,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "PYTEST_CURRENT_TEST" not in os.environ
         and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
     ):
-        strict_airtable_done = conn.execute(
-            "SELECT 1 FROM kv_settings WHERE key = 'strict_airtable_leads_only_v1'"
-        ).fetchone()
-        if strict_airtable_done is None:
-            now_ts = utc_now()
-            non_airtable_subquery = (
-                "SELECT id FROM leads WHERE airtable_record_id IS NULL OR trim(airtable_record_id) = ''"
-            )
-            conn.execute(
-                f"UPDATE campaign_recipients SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({non_airtable_subquery})",
-                (now_ts,),
-            )
-            conn.execute(
-                f"UPDATE dialogs SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({non_airtable_subquery})",
-                (now_ts,),
-            )
-            conn.execute(
-                f"UPDATE calendar_events SET lead_id = NULL, updated_at = ? WHERE lead_id IN ({non_airtable_subquery})",
-                (now_ts,),
-            )
-            conn.execute(
-                f"UPDATE bot_seen_updates SET lead_id = NULL WHERE lead_id IN ({non_airtable_subquery})"
-            )
-            conn.execute(f"DELETE FROM reminders WHERE lead_id IN ({non_airtable_subquery})")
-            conn.execute(f"DELETE FROM notes WHERE lead_id IN ({non_airtable_subquery})")
-            conn.execute(f"DELETE FROM tasks WHERE lead_id IN ({non_airtable_subquery})")
-            conn.execute(f"DELETE FROM property_values WHERE lead_id IN ({non_airtable_subquery})")
-            conn.execute(f"DELETE FROM lead_events WHERE lead_id IN ({non_airtable_subquery})")
-            conn.execute(
-                "DELETE FROM leads WHERE airtable_record_id IS NULL OR trim(airtable_record_id) = ''"
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('strict_airtable_leads_only_v1', '1', ?)",
-                (now_ts,),
-            )
         dead_sessions_fixed = conn.execute(
             "SELECT 1 FROM kv_settings WHERE key = 'purge_dead_tg_sessions_v1'"
         ).fetchone()
@@ -1086,23 +1078,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if vlad_canonical_v5 is None:
             apply_canonical_vlad_outreach_v5(conn)
-        try:
-            from app.digest import resolve_colleague_bot_credentials
-
-            tok, cid = resolve_colleague_bot_credentials(conn, default_chat_id=True)
-            now_ts = utc_now()
-            if tok:
-                conn.execute(
-                    "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('bot_token', ?, ?)",
-                    (tok, now_ts),
-                )
-            if cid:
-                conn.execute(
-                    "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('bot_chat_id', ?, ?)",
-                    (cid, now_ts),
-                )
-        except Exception:
-            pass
     conn.commit()
 
 

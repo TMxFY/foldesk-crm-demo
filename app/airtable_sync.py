@@ -111,21 +111,24 @@ def _resolve_credentials(
 ) -> tuple[str | None, str | None, str]:
     dotenv_vals = _read_dotenv_values()
     kv_vals: dict[str, str] = {}
-    if "PYTEST_CURRENT_TEST" not in os.environ and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret":
-        try:
-            if conn is not None:
-                rows = conn.execute(
+    try:
+        if conn is not None:
+            rows = conn.execute(
+                "SELECT key, value FROM kv_settings WHERE key IN ('airtable_api_key', 'airtable_base_id', 'airtable_table_name')"
+            ).fetchall()
+            kv_vals = {str(r[0]): str(r[1] or "") for r in rows}
+        elif (
+            "PYTEST_CURRENT_TEST" not in os.environ
+            and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
+            and (ROOT / "data" / "crm.db").exists()
+        ):
+            with sqlite3.connect(ROOT / "data" / "crm.db") as c:
+                rows = c.execute(
                     "SELECT key, value FROM kv_settings WHERE key IN ('airtable_api_key', 'airtable_base_id', 'airtable_table_name')"
                 ).fetchall()
                 kv_vals = {str(r[0]): str(r[1] or "") for r in rows}
-            elif (ROOT / "data" / "crm.db").exists():
-                with sqlite3.connect(ROOT / "data" / "crm.db") as c:
-                    rows = c.execute(
-                        "SELECT key, value FROM kv_settings WHERE key IN ('airtable_api_key', 'airtable_base_id', 'airtable_table_name')"
-                    ).fetchall()
-                    kv_vals = {str(r[0]): str(r[1] or "") for r in rows}
-        except Exception:
-            pass
+    except Exception:
+        pass
     resolved_key = (
         api_key
         or os.environ.get("AIRTABLE_API_KEY")
@@ -637,7 +640,7 @@ def _find_matching_crm_lead(
     conn: sqlite3.Connection,
     mapped: dict[str, Any],
 ) -> dict[str, Any] | None:
-    rec_id = mapped.get("airtable_record_id")
+    rec_id = str(mapped.get("airtable_record_id") or "").strip()
     if rec_id:
         row = conn.execute(
             "SELECT * FROM leads WHERE airtable_record_id = ? ORDER BY id ASC LIMIT 1",
@@ -646,11 +649,30 @@ def _find_matching_crm_lead(
         if row is not None:
             return as_dict(row)
 
+    tg_uid = mapped.get("telegram_user_id")
+    if tg_uid is not None:
+        row = conn.execute(
+            """
+            SELECT * FROM leads
+            WHERE telegram_user_id = ?
+              AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
+            ORDER BY id ASC LIMIT 1
+            """,
+            (int(tg_uid), rec_id),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+
     username = mapped.get("username")
     if username:
         row = conn.execute(
-            "SELECT * FROM leads WHERE username IS NOT NULL AND lower(username) = lower(?) ORDER BY id ASC LIMIT 1",
-            (username,),
+            """
+            SELECT * FROM leads
+            WHERE username IS NOT NULL AND lower(username) = lower(?)
+              AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
+            ORDER BY id ASC LIMIT 1
+            """,
+            (username, rec_id),
         ).fetchone()
         if row is not None:
             return as_dict(row)
@@ -658,47 +680,30 @@ def _find_matching_crm_lead(
     phone = mapped.get("phone")
     if phone:
         row = conn.execute(
-            "SELECT * FROM leads WHERE phone IS NOT NULL AND phone = ? ORDER BY id ASC LIMIT 1",
-            (phone,),
-        ).fetchone()
-        if row is not None:
-            return as_dict(row)
-        phone_digits = re.sub(r"\D", "", phone)
-        if len(phone_digits) >= 7:
-            for cand in conn.execute(
-                "SELECT * FROM leads WHERE phone IS NOT NULL ORDER BY id ASC"
-            ).fetchall():
-                cand_digits = re.sub(r"\D", "", str(cand["phone"] or ""))
-                if cand_digits and cand_digits == phone_digits:
-                    return as_dict(cand)
-
-    name = mapped.get("name")
-    company = mapped.get("company")
-    if name:
-        if company:
-            row = conn.execute(
-                """
-                SELECT * FROM leads
-                WHERE name IS NOT NULL AND lower(name) = lower(?)
-                  AND company IS NOT NULL AND lower(company) = lower(?)
-                  AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
-                ORDER BY id ASC LIMIT 1
-                """,
-                (name, company, rec_id or ""),
-            ).fetchone()
-            if row is not None:
-                return as_dict(row)
-        row = conn.execute(
             """
             SELECT * FROM leads
-            WHERE name IS NOT NULL AND lower(name) = lower(?)
+            WHERE phone IS NOT NULL AND phone = ?
               AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
             ORDER BY id ASC LIMIT 1
             """,
-            (name, rec_id or ""),
+            (phone, rec_id),
         ).fetchone()
         if row is not None:
             return as_dict(row)
+        phone_digits = re.sub(r"\D", "", phone)[-15:]
+        if len(phone_digits) >= 7:
+            for cand in conn.execute(
+                """
+                SELECT * FROM leads
+                WHERE phone IS NOT NULL
+                  AND (airtable_record_id IS NULL OR trim(airtable_record_id) = '' OR airtable_record_id = ?)
+                ORDER BY id ASC
+                """,
+                (rec_id,),
+            ).fetchall():
+                cand_digits = re.sub(r"\D", "", str(cand["phone"] or ""))[-15:]
+                if cand_digits and cand_digits == phone_digits:
+                    return as_dict(cand)
 
     return None
 
@@ -1055,29 +1060,27 @@ def pull_from_airtable(
         for r in (records or [])
         if isinstance(r, dict) and str(r.get("id") or "").strip()
     }
-    if (
-        remote_rec_ids
-        and "PYTEST_CURRENT_TEST" not in os.environ
-        and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
-    ):
-        from datetime import datetime, timedelta, timezone
-
-        cutoff_5m = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
-        all_local = conn.execute(
-            "SELECT id, airtable_record_id, folder_id, created_at FROM leads"
+    if isinstance(records, list) and remote_rec_ids:
+        linked_rows = conn.execute(
+            """
+            SELECT id, airtable_record_id, updated_at, airtable_synced_at
+            FROM leads
+            WHERE airtable_record_id IS NOT NULL AND trim(airtable_record_id) != ''
+            """
         ).fetchall()
         stale_ids = []
-        for lrow in all_local:
+        for lrow in linked_rows:
             lid = int(lrow["id"])
             rec_id = str(lrow["airtable_record_id"] or "").strip()
-            if rec_id:
-                if rec_id not in remote_rec_ids:
-                    stale_ids.append(lid)
-            else:
-                if lrow["folder_id"] is None and str(lrow["created_at"] or "") < cutoff_5m:
-                    stale_ids.append(lid)
+            if not rec_id or rec_id in remote_rec_ids:
+                continue
+            if (
+                preserve_dirty
+                and lrow["airtable_synced_at"]
+                and str(lrow["updated_at"] or "") > str(lrow["airtable_synced_at"] or "")
+            ):
+                continue
+            stale_ids.append(lid)
         if stale_ids:
             ph = ",".join("?" for _ in stale_ids)
             conn.execute(
@@ -1118,27 +1121,85 @@ def pull_from_airtable(
     }
 
 
+def _build_remote_airtable_index(
+    conn: sqlite3.Connection,
+    records: list[dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    claimed_rec_ids = {
+        str(r[0]).strip()
+        for r in conn.execute(
+            "SELECT airtable_record_id FROM leads WHERE airtable_record_id IS NOT NULL AND trim(airtable_record_id) != ''"
+        ).fetchall()
+        if r and r[0] and str(r[0]).strip()
+    }
+    by_username: dict[str, dict[str, Any]] = {}
+    by_phone: dict[str, dict[str, Any]] = {}
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        rid = str(rec.get("id") or "").strip()
+        if not rid or rid in claimed_rec_ids:
+            continue
+        fields = rec.get("fields") or {}
+        rec_u, rec_p = parse_airtable_contact(fields.get("Contact"))
+        if rec_u:
+            by_username.setdefault(rec_u.casefold(), rec)
+        if rec_p:
+            p_digits = re.sub(r"\D", "", rec_p)[-15:]
+            if len(p_digits) >= 7:
+                by_phone.setdefault(p_digits, rec)
+    return {
+        "claimed": claimed_rec_ids,
+        "by_username": by_username,
+        "by_phone": by_phone,
+    }
+
+
 def _find_remote_airtable_record(
     client: Any,
     table_name: str,
     lead: dict[str, Any],
+    *,
+    conn: sqlite3.Connection | None = None,
+    remote_index: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    try:
-        records = client.list_records(table_name)
-    except Exception:
+    target_username = _clean_username(lead.get("username"))
+    raw_phone = str(lead.get("phone") or "").strip()
+    target_digits = re.sub(r"\D", "", raw_phone)[-15:] if raw_phone else ""
+    if not target_username and len(target_digits) < 7:
         return None
 
-    target_username = _clean_username(lead.get("username"))
-    target_name = (lead.get("name") or "").strip().casefold()
+    idx = remote_index
+    if idx is None:
+        try:
+            records = client.list_records(table_name)
+        except Exception:
+            return None
+        if conn is not None:
+            idx = _build_remote_airtable_index(conn, records)
+        else:
+            idx = {"claimed": set(), "by_username": {}, "by_phone": {}}
+            for rec in records or []:
+                rid = str(rec.get("id") or "").strip()
+                if not rid:
+                    continue
+                rec_u, rec_p = parse_airtable_contact((rec.get("fields") or {}).get("Contact"))
+                if rec_u:
+                    idx["by_username"].setdefault(rec_u.casefold(), rec)
+                if rec_p:
+                    pd = re.sub(r"\D", "", rec_p)[-15:]
+                    if len(pd) >= 7:
+                        idx["by_phone"].setdefault(pd, rec)
 
-    for rec in records or []:
-        fields = rec.get("fields") or {}
-        rec_u, _ = parse_airtable_contact(fields.get("Contact"))
-        if target_username and rec_u and rec_u.casefold() == target_username.casefold():
-            return rec
-        rec_name = str(fields.get("Lead Name") or "").strip().casefold()
-        if target_name and rec_name and rec_name == target_name:
-            return rec
+    claimed: set[str] = idx["claimed"]
+    if target_username:
+        cand = idx["by_username"].get(target_username.casefold())
+        if cand and str(cand.get("id") or "").strip() not in claimed:
+            return cand
+    if len(target_digits) >= 7:
+        cand = idx["by_phone"].get(target_digits)
+        if cand and str(cand.get("id") or "").strip() not in claimed:
+            return cand
     return None
 
 
@@ -1147,6 +1208,7 @@ def push_lead_to_airtable(
     lead_id: int,
     *,
     client: Any = None,
+    remote_index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _ensure_dirty_tracking_trigger(conn)
     row = conn.execute("SELECT * FROM leads WHERE id = ?", (int(lead_id),)).fetchone()
@@ -1168,7 +1230,9 @@ def push_lead_to_airtable(
         remote_rec = client.update_record(table_name, rec_id, fields, typecast=True)
         action = "updated"
     else:
-        matched_remote = _find_remote_airtable_record(client, table_name, lead)
+        matched_remote = _find_remote_airtable_record(
+            client, table_name, lead, conn=conn, remote_index=remote_index
+        )
         if matched_remote and matched_remote.get("id"):
             rec_id = str(matched_remote["id"])
             remote_rec = client.update_record(table_name, rec_id, fields, typecast=True)
@@ -1177,6 +1241,15 @@ def push_lead_to_airtable(
             remote_rec = client.create_record(table_name, fields, typecast=True)
             rec_id = str(remote_rec.get("id") or "").strip() or None
             action = "created"
+
+    if rec_id and remote_index is not None:
+        remote_index["claimed"].add(rec_id)
+        u_clean = _clean_username(lead.get("username"))
+        if u_clean:
+            remote_index["by_username"].setdefault(u_clean.casefold(), remote_rec)
+        p_digits = re.sub(r"\D", "", str(lead.get("phone") or ""))[-15:]
+        if len(p_digits) >= 7:
+            remote_index["by_phone"].setdefault(p_digits, remote_rec)
 
     now = utc_now()
     airtable_st = fields.get("Status") or status_to_airtable(lead.get("status"))
@@ -1337,16 +1410,7 @@ def sync_airtable(
     stages = ensure_airtable_pipeline_stages(conn)
     if client is None:
         api_key, base_id, table_name = _resolve_credentials(conn=conn)
-        try:
-            client = AirtableRestClient(api_key=api_key, base_id=base_id, table_name=table_name)
-        except ValueError:
-            if "PYTEST_CURRENT_TEST" not in os.environ:
-                cfg = get_airtable_config(conn)
-                if cfg.get("last_sync_summary"):
-                    cached = dict(cfg["last_sync_summary"])
-                    cached["stages"] = stages
-                    return cached
-            raise
+        client = AirtableRestClient(api_key=api_key, base_id=base_id, table_name=table_name)
 
     pulled_leads = 0
     created_in_crm = 0
@@ -1355,22 +1419,11 @@ def sync_airtable(
     synced_tasks = 0
     synced_projects = 0
 
-    if norm_dir in ("both", "pull"):
-        pull_res = pull_from_airtable(
-            conn,
-            client=client,
-            preserve_dirty=(norm_dir == "both"),
-        )
-        pulled_leads = int(pull_res.get("pulled_leads") or 0)
-        created_in_crm = int(pull_res.get("created_in_crm") or 0)
-        updated_in_crm = int(pull_res.get("updated_in_crm") or 0)
-        synced_tasks = int(pull_res.get("synced_tasks") or 0)
-        synced_projects = int(pull_res.get("synced_projects") or 0)
-
+    # Push STRICTLY BEFORE pull so new local leads receive airtable_record_id and dirty edits win
     if norm_dir in ("both", "push"):
         dirty_rows = conn.execute(
             """
-            SELECT id FROM leads
+            SELECT id, airtable_record_id FROM leads
             WHERE (
                 (airtable_record_id IS NULL OR trim(airtable_record_id) = '')
                 AND folder_id IS NULL
@@ -1383,9 +1436,31 @@ def sync_airtable(
             ORDER BY id ASC
             """
         ).fetchall()
+        remote_index: dict[str, Any] | None = None
+        if any(not str(r["airtable_record_id"] or "").strip() for r in dirty_rows):
+            table_name_for_idx = getattr(client, "table_name", None) or DEFAULT_TABLE_NAME
+            try:
+                preloaded = client.list_records(table_name_for_idx)
+            except Exception:
+                preloaded = []
+            remote_index = _build_remote_airtable_index(conn, preloaded)
         for r in dirty_rows:
-            push_lead_to_airtable(conn, int(r["id"]), client=client)
+            push_lead_to_airtable(
+                conn, int(r["id"]), client=client, remote_index=remote_index
+            )
             pushed_to_airtable += 1
+
+    if norm_dir in ("both", "pull"):
+        pull_res = pull_from_airtable(
+            conn,
+            client=client,
+            preserve_dirty=(norm_dir == "both"),
+        )
+        pulled_leads = int(pull_res.get("pulled_leads") or 0)
+        created_in_crm = int(pull_res.get("created_in_crm") or 0)
+        updated_in_crm = int(pull_res.get("updated_in_crm") or 0)
+        synced_tasks = int(pull_res.get("synced_tasks") or 0)
+        synced_projects = int(pull_res.get("synced_projects") or 0)
 
     synced_at = utc_now()
     summary = {

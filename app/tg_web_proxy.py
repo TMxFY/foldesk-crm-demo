@@ -1,3 +1,4 @@
+import os
 import re
 import ssl
 import urllib.error
@@ -12,7 +13,26 @@ from app.db import ROOT
 
 UPSTREAM_BASE = "https://web.telegram.org/a/"
 CACHE_DIR = ROOT / "data" / "tg_web_cache"
-_SSL_CTX = ssl._create_unverified_context()
+
+
+def _build_ssl_context(*, verify: bool = True) -> ssl.SSLContext:
+    if not verify:
+        return ssl._create_unverified_context()
+    cafile: str | None = None
+    try:
+        import certifi
+
+        cafile = certifi.where()
+    except Exception:
+        if os.path.exists("/etc/ssl/cert.pem"):
+            cafile = "/etc/ssl/cert.pem"
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+_SSL_CTX = _build_ssl_context(verify=True)
 
 _MEM_CACHE: dict[str, tuple[bytes, str]] = {}
 
@@ -66,7 +86,7 @@ def _guess_mime(path: str, upstream_ct: str = "") -> str:
     return "application/octet-stream"
 
 
-def _fetch_upstream_asset(rel_path: str) -> tuple[bytes, str] | None:
+def _fetch_upstream_asset(rel_path: str, *, verify: bool = True) -> tuple[bytes, str] | None:
     unquoted = urllib.parse.unquote(rel_path or "")
     clean = unquoted.lstrip("/")
     if "\x00" in unquoted or "\\" in unquoted or ".." in Path(clean).parts:
@@ -101,7 +121,8 @@ def _fetch_upstream_asset(rel_path: str) -> tuple[bytes, str] | None:
             "Accept": "*/*",
         },
     )
-    with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
+    ssl_ctx = _SSL_CTX if verify else _build_ssl_context(verify=False)
+    with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
         data = resp.read()
         ct = resp.headers.get("Content-Type") or ""
         mime = _guess_mime(clean or "index.html", ct)

@@ -562,30 +562,34 @@ def test_credentials_from_kv_settings_when_env_not_set(conn, monkeypatch):
     assert info["text"] == "You received a response from @phoenixIam\n\nAccount: @saabath"
 
 
-def test_credentials_from_vps_softugcbot_env_fallback(conn, monkeypatch, tmp_path):
+def test_credentials_ignore_foreign_softugcbot_env_and_use_crm_kv(conn, monkeypatch, tmp_path):
     import app.digest as digest_mod
 
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("BOT_TOKEN", raising=False)
     monkeypatch.delenv("BOT_CHAT_ID", raising=False)
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
-    monkeypatch.setenv("ALLOW_FILE_BOT_CREDS_IN_TEST", "1")
 
     fake_vps_env = tmp_path / "opt_softugcbot.env"
-    fake_vps_env.write_text("TELEGRAM_BOT_TOKEN=vps_token_777\n", encoding="utf-8")
-    monkeypatch.setattr(digest_mod, "ROOT", tmp_path / "empty_root")
-    monkeypatch.setattr(digest_mod, "SOFTUGCBOT_ENV", tmp_path / "missing_mac_env")
+    fake_vps_env.write_text("TELEGRAM_BOT_TOKEN=vps_token_777\nBOT_CHAT_ID=111222\n", encoding="utf-8")
+    monkeypatch.setattr(digest_mod, "ROOT", tmp_path / "empty_root", raising=False)
+    monkeypatch.setattr(digest_mod, "SOFTUGCBOT_ENV", fake_vps_env, raising=False)
     monkeypatch.setattr(digest_mod, "VPS_SOFTUGCBOT_ENV", fake_vps_env, raising=False)
 
+    # Foreign /opt/softugcbot/.env on disk MUST NEVER be read
     token, chat_id = resolve_colleague_bot_credentials(conn)
-    assert token == "vps_token_777"
-    assert chat_id == "978069541"
+    assert token == ""
+    assert chat_id == ""
 
-    # Explicit kv_settings in DB must take precedence over VPS_SOFTUGCBOT_ENV fallback
+    # Explicit kv_settings in CRM DB are resolved cleanly
     now = utc_now()
-    conn.execute(
-        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('bot_token', 'custom_kv_token_888', ?)",
-        (now,),
+    conn.executemany(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        [
+            ("bot_token", "custom_kv_token_888", now),
+            ("bot_chat_id", "978069541", now),
+        ],
     )
     conn.commit()
     token_kv, chat_kv = resolve_colleague_bot_credentials(conn)

@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from app.db import as_dict, utc_now
+from app.db import as_dict, locked_conn, utc_now
 from app.security import (
     MAX_TRACKED_IPS,
     _PUBLIC_EXACT_PATHS,
@@ -58,27 +58,28 @@ def _get_signing_secret(conn: sqlite3.Connection | None = None) -> bytes:
         return _TOKEN_SIGN_SECRET
     if conn is not None:
         try:
-            row = conn.execute(
-                "SELECT value FROM kv_settings WHERE key = 'crm_auth_secret_v2'"
-            ).fetchone()
-            if row and str(row[0] or "").strip():
-                return str(row[0]).strip().encode("utf-8")
-            generated = secrets.token_hex(32)
-            conn.execute(
-                """
-                INSERT INTO kv_settings (key, value, updated_at)
-                VALUES ('crm_auth_secret_v2', ?, ?)
-                ON CONFLICT(key) DO NOTHING
-                """,
-                (generated, utc_now()),
-            )
-            conn.commit()
-            row2 = conn.execute(
-                "SELECT value FROM kv_settings WHERE key = 'crm_auth_secret_v2'"
-            ).fetchone()
-            if row2 and str(row2[0] or "").strip():
-                return str(row2[0]).strip().encode("utf-8")
-            return generated.encode("utf-8")
+            with locked_conn(conn):
+                row = conn.execute(
+                    "SELECT value FROM kv_settings WHERE key = 'crm_auth_secret_v2'"
+                ).fetchone()
+                if row and str(row[0] or "").strip():
+                    return str(row[0]).strip().encode("utf-8")
+                generated = secrets.token_hex(32)
+                conn.execute(
+                    """
+                    INSERT INTO kv_settings (key, value, updated_at)
+                    VALUES ('crm_auth_secret_v2', ?, ?)
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    (generated, utc_now()),
+                )
+                conn.commit()
+                row2 = conn.execute(
+                    "SELECT value FROM kv_settings WHERE key = 'crm_auth_secret_v2'"
+                ).fetchone()
+                if row2 and str(row2[0] or "").strip():
+                    return str(row2[0]).strip().encode("utf-8")
+                return generated.encode("utf-8")
         except sqlite3.Error:
             pass
     return _PROCESS_FALLBACK_SECRET
@@ -135,14 +136,15 @@ def _verify_stateless_token_uid(
 
 
 def _ensure_revoked_tokens_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS crm_revoked_tokens (
-            token_sha256 TEXT PRIMARY KEY,
-            expires_at INTEGER NOT NULL
+    with locked_conn(conn):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crm_revoked_tokens (
+                token_sha256 TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            )
+            """
         )
-        """
-    )
 
 
 def _token_sha256(token: str) -> str:
@@ -153,11 +155,12 @@ def _is_token_revoked(conn: sqlite3.Connection, token: str) -> bool:
     if token in _REVOKED_TOKENS:
         return True
     try:
-        row = conn.execute(
-            "SELECT 1 FROM crm_revoked_tokens WHERE token_sha256 = ? AND expires_at >= ? LIMIT 1",
-            (_token_sha256(token), int(time.time())),
-        ).fetchone()
-        return row is not None
+        with locked_conn(conn):
+            row = conn.execute(
+                "SELECT 1 FROM crm_revoked_tokens WHERE token_sha256 = ? AND expires_at >= ? LIMIT 1",
+                (_token_sha256(token), int(time.time())),
+            ).fetchone()
+            return row is not None
     except sqlite3.Error:
         return False
 
@@ -198,112 +201,115 @@ def _public_user(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any] | N
 
 
 def ensure_default_crm_users(conn: sqlite3.Connection) -> None:
-    _ensure_revoked_tokens_table(conn)
-    conn.execute(
-        "DELETE FROM crm_revoked_tokens WHERE expires_at < ?",
-        (int(time.time()),),
-    )
-    now = utc_now()
-    enforced = is_auth_enforced()
-    for idx, (username, default_password, display_name, role) in enumerate(
-        DEFAULT_CRM_USERS, start=1
-    ):
-        env_key = _ENV_PASSWORD_KEYS.get(username, "")
-        env_pwd = os.getenv(env_key, "").strip() if env_key else ""
-        row = conn.execute(
-            "SELECT id, password_hash FROM crm_users WHERE lower(username) = lower(?)",
-            (username,),
-        ).fetchone()
-        if row is not None:
-            uid = int(row["id"])
-            stored_hash = str(row["password_hash"] or "")
-            if env_pwd:
-                if not verify_password(env_pwd, stored_hash):
-                    new_hash = hash_password(env_pwd)
-                    conn.execute(
-                        "UPDATE crm_users SET password_hash = ?, updated_at = ? WHERE id = ?",
-                        (new_hash, now, uid),
-                    )
-                    conn.execute(
-                        "DELETE FROM crm_auth_sessions WHERE user_id = ?",
-                        (uid,),
-                    )
-                    _VERIFIED_SAFE_HASHES.add((uid, new_hash))
-            elif enforced and (uid, stored_hash) not in _VERIFIED_SAFE_HASHES:
-                if any(
-                    verify_password(leaked, stored_hash)
-                    for leaked in _LEAKED_DEFAULT_PASSWORDS
-                ):
-                    new_hash = hash_password(secrets.token_urlsafe(24))
-                    conn.execute(
-                        "UPDATE crm_users SET password_hash = ?, updated_at = ? WHERE id = ?",
-                        (new_hash, now, uid),
-                    )
-                    conn.execute(
-                        "DELETE FROM crm_auth_sessions WHERE user_id = ?",
-                        (uid,),
-                    )
-                    _VERIFIED_SAFE_HASHES.add((uid, new_hash))
-                else:
-                    _VERIFIED_SAFE_HASHES.add((uid, stored_hash))
-            continue
-
-        if env_pwd:
-            pwd_hash = hash_password(env_pwd)
-        elif enforced:
-            pwd_hash = hash_password(secrets.token_urlsafe(24))
-        else:
-            # Deterministic salt for local/test defaults keeps DB initialization fast and reproducible
-            seed_salt = hashlib.sha256(
-                f"foldesk_seed_{username}_{idx}".encode("utf-8")
-            ).hexdigest()[:32]
-            pwd_hash = hash_password(default_password, salt=seed_salt)
-        cur = conn.execute(
-            """
-            INSERT INTO crm_users (username, password_hash, display_name, role, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (username, pwd_hash, display_name, role, now, now),
+    with locked_conn(conn):
+        _ensure_revoked_tokens_table(conn)
+        conn.execute(
+            "DELETE FROM crm_revoked_tokens WHERE expires_at < ?",
+            (int(time.time()),),
         )
-        if enforced and not env_pwd and cur.lastrowid:
-            _VERIFIED_SAFE_HASHES.add((int(cur.lastrowid), pwd_hash))
-    conn.commit()
+        now = utc_now()
+        enforced = is_auth_enforced()
+        for idx, (username, default_password, display_name, role) in enumerate(
+            DEFAULT_CRM_USERS, start=1
+        ):
+            env_key = _ENV_PASSWORD_KEYS.get(username, "")
+            env_pwd = os.getenv(env_key, "").strip() if env_key else ""
+            row = conn.execute(
+                "SELECT id, password_hash FROM crm_users WHERE lower(username) = lower(?)",
+                (username,),
+            ).fetchone()
+            if row is not None:
+                uid = int(row["id"])
+                stored_hash = str(row["password_hash"] or "")
+                if env_pwd:
+                    if not verify_password(env_pwd, stored_hash):
+                        new_hash = hash_password(env_pwd)
+                        conn.execute(
+                            "UPDATE crm_users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                            (new_hash, now, uid),
+                        )
+                        conn.execute(
+                            "DELETE FROM crm_auth_sessions WHERE user_id = ?",
+                            (uid,),
+                        )
+                        _VERIFIED_SAFE_HASHES.add((uid, new_hash))
+                elif enforced and (uid, stored_hash) not in _VERIFIED_SAFE_HASHES:
+                    if any(
+                        verify_password(leaked, stored_hash)
+                        for leaked in _LEAKED_DEFAULT_PASSWORDS
+                    ):
+                        new_hash = hash_password(secrets.token_urlsafe(24))
+                        conn.execute(
+                            "UPDATE crm_users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                            (new_hash, now, uid),
+                        )
+                        conn.execute(
+                            "DELETE FROM crm_auth_sessions WHERE user_id = ?",
+                            (uid,),
+                        )
+                        _VERIFIED_SAFE_HASHES.add((uid, new_hash))
+                    else:
+                        _VERIFIED_SAFE_HASHES.add((uid, stored_hash))
+                continue
+
+            if env_pwd:
+                pwd_hash = hash_password(env_pwd)
+            elif enforced:
+                pwd_hash = hash_password(secrets.token_urlsafe(24))
+            else:
+                # Deterministic salt for local/test defaults keeps DB initialization fast and reproducible
+                seed_salt = hashlib.sha256(
+                    f"foldesk_seed_{username}_{idx}".encode("utf-8")
+                ).hexdigest()[:32]
+                pwd_hash = hash_password(default_password, salt=seed_salt)
+            cur = conn.execute(
+                """
+                INSERT INTO crm_users (username, password_hash, display_name, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (username, pwd_hash, display_name, role, now, now),
+            )
+            if enforced and not env_pwd and cur.lastrowid:
+                _VERIFIED_SAFE_HASHES.add((int(cur.lastrowid), pwd_hash))
+        conn.commit()
 
 
 def list_crm_users(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT id, username, display_name, role, created_at FROM crm_users ORDER BY id ASC"
-    ).fetchall()
+    with locked_conn(conn):
+        rows = conn.execute(
+            "SELECT id, username, display_name, role, created_at FROM crm_users ORDER BY id ASC"
+        ).fetchall()
     return [_public_user(r) for r in rows if r is not None]
 
 
 def _create_session(
     conn: sqlite3.Connection, user_id: int, pwd_hash: str = ""
 ) -> str:
-    if not pwd_hash:
-        prow = conn.execute(
-            "SELECT password_hash FROM crm_users WHERE id = ?", (int(user_id),)
-        ).fetchone()
-        pwd_hash = str(prow["password_hash"] or "") if prow else ""
-    now_dt = datetime.now(timezone.utc)
-    exp_dt = now_dt + timedelta(days=SESSION_TTL_DAYS)
-    exp_unix = int(exp_dt.timestamp())
-    nonce = secrets.token_urlsafe(24)
-    token = _sign_stateless_token(
-        int(user_id), exp_unix, nonce, conn=conn, pwd_hash=pwd_hash
-    )
-    _REVOKED_TOKENS.discard(token)
-    now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    exp_iso = exp_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO crm_auth_sessions (token, user_id, created_at, expires_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (token, int(user_id), now_iso, exp_iso),
-    )
-    conn.commit()
-    return token
+    with locked_conn(conn):
+        if not pwd_hash:
+            prow = conn.execute(
+                "SELECT password_hash FROM crm_users WHERE id = ?", (int(user_id),)
+            ).fetchone()
+            pwd_hash = str(prow["password_hash"] or "") if prow else ""
+        now_dt = datetime.now(timezone.utc)
+        exp_dt = now_dt + timedelta(days=SESSION_TTL_DAYS)
+        exp_unix = int(exp_dt.timestamp())
+        nonce = secrets.token_urlsafe(24)
+        token = _sign_stateless_token(
+            int(user_id), exp_unix, nonce, conn=conn, pwd_hash=pwd_hash
+        )
+        _REVOKED_TOKENS.discard(token)
+        now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        exp_iso = exp_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO crm_auth_sessions (token, user_id, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (token, int(user_id), now_iso, exp_iso),
+        )
+        conn.commit()
+        return token
 
 
 def _extract_candidate_tokens(request: Request) -> list[str]:
@@ -330,68 +336,70 @@ def extract_request_token(request: Request) -> str | None:
 def resolve_request_crm_user(
     conn: sqlite3.Connection, request: Request
 ) -> dict[str, Any] | None:
-    for token in _extract_candidate_tokens(request):
-        user = get_user_by_token(conn, token)
-        if user is not None:
-            return user
-    return None
+    with locked_conn(conn):
+        for token in _extract_candidate_tokens(request):
+            user = get_user_by_token(conn, token)
+            if user is not None:
+                return user
+        return None
 
 
 def get_user_by_token(conn: sqlite3.Connection, token: str | None) -> dict[str, Any] | None:
-    if not token or _is_token_revoked(conn, token):
-        return None
-    now_iso = utc_now()
-    row = conn.execute(
-        """
-        SELECT u.id, u.username, u.display_name, u.role, u.created_at, s.expires_at
-        FROM crm_auth_sessions s
-        JOIN crm_users u ON u.id = s.user_id
-        WHERE s.token = ?
-        """,
-        (token,),
-    ).fetchone()
-    if row is not None:
-        if str(row["expires_at"] or "") < now_iso:
-            conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
-            conn.commit()
+    with locked_conn(conn):
+        if not token or _is_token_revoked(conn, token):
             return None
-        return _public_user(row)
-
-    # Stateless HMAC token recovery across container restarts / R2 restores
-    parsed = _parse_stateless_token(token)
-    if parsed is not None:
-        candidate_uid, exp_unix, _, _ = parsed
-        urow = conn.execute(
-            "SELECT id, username, display_name, role, password_hash, created_at FROM crm_users WHERE id = ? ORDER BY id ASC LIMIT 1",
-            (int(candidate_uid),),
+        now_iso = utc_now()
+        row = conn.execute(
+            """
+            SELECT u.id, u.username, u.display_name, u.role, u.created_at, s.expires_at
+            FROM crm_auth_sessions s
+            JOIN crm_users u ON u.id = s.user_id
+            WHERE s.token = ?
+            """,
+            (token,),
         ).fetchone()
-        if urow is None:
-            ensure_default_crm_users(conn)
+        if row is not None:
+            if str(row["expires_at"] or "") < now_iso:
+                conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
+                conn.commit()
+                return None
+            return _public_user(row)
+
+        # Stateless HMAC token recovery across container restarts / R2 restores
+        parsed = _parse_stateless_token(token)
+        if parsed is not None:
+            candidate_uid, exp_unix, _, _ = parsed
             urow = conn.execute(
                 "SELECT id, username, display_name, role, password_hash, created_at FROM crm_users WHERE id = ? ORDER BY id ASC LIMIT 1",
                 (int(candidate_uid),),
             ).fetchone()
-        if urow is not None:
-            verified = _verify_stateless_token_uid(
-                token, conn=conn, pwd_hash=str(urow["password_hash"] or "")
-            )
-            if verified is not None and verified[0] == int(urow["id"]):
-                exp_iso = datetime.fromtimestamp(
-                    exp_unix, tz=timezone.utc
-                ).strftime("%Y-%m-%dT%H:%M:%S")
-                try:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (token, int(urow["id"]), now_iso, exp_iso),
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-                return _public_user(urow)
-    return None
+            if urow is None:
+                ensure_default_crm_users(conn)
+                urow = conn.execute(
+                    "SELECT id, username, display_name, role, password_hash, created_at FROM crm_users WHERE id = ? ORDER BY id ASC LIMIT 1",
+                    (int(candidate_uid),),
+                ).fetchone()
+            if urow is not None:
+                verified = _verify_stateless_token_uid(
+                    token, conn=conn, pwd_hash=str(urow["password_hash"] or "")
+                )
+                if verified is not None and verified[0] == int(urow["id"]):
+                    exp_iso = datetime.fromtimestamp(
+                        exp_unix, tz=timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%S")
+                    try:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO crm_auth_sessions (token, user_id, created_at, expires_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (token, int(urow["id"]), now_iso, exp_iso),
+                        )
+                        conn.commit()
+                    except Exception:
+                        pass
+                    return _public_user(urow)
+        return None
 
 
 def verify_telegram_webapp_init_data(
@@ -454,16 +462,17 @@ def _team_telegram_whitelist(
         if clean_c.lstrip("-").isdigit():
             allowed.add(int(clean_c))
     try:
-        cols = {
-            str(r[1])
-            for r in conn.execute("PRAGMA table_info(accounts)").fetchall()
-        }
-        if "telegram_user_id" in cols:
-            for r in conn.execute(
-                "SELECT telegram_user_id FROM accounts WHERE telegram_user_id IS NOT NULL"
-            ).fetchall():
-                if r[0] is not None and str(r[0]).lstrip("-").isdigit():
-                    allowed.add(int(r[0]))
+        with locked_conn(conn):
+            cols = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(accounts)").fetchall()
+            }
+            if "telegram_user_id" in cols:
+                for r in conn.execute(
+                    "SELECT telegram_user_id FROM accounts WHERE telegram_user_id IS NOT NULL"
+                ).fetchall():
+                    if r[0] is not None and str(r[0]).lstrip("-").isdigit():
+                        allowed.add(int(r[0]))
     except sqlite3.Error:
         pass
     return allowed
@@ -474,38 +483,39 @@ def authenticate_telegram_miniapp(
     init_data: str = "",
     tg_user_id: int | None = None,
 ) -> tuple[dict[str, Any], str]:
-    ensure_default_crm_users(conn)
-    clean_init = str(init_data or "").strip()
-    resolved_tg_id: int | None = None
-    if clean_init:
-        from app.digest import resolve_colleague_bot_credentials
+    with locked_conn(conn):
+        ensure_default_crm_users(conn)
+        clean_init = str(init_data or "").strip()
+        resolved_tg_id: int | None = None
+        if clean_init:
+            from app.digest import resolve_colleague_bot_credentials
 
-        bot_token, bot_chat_id = resolve_colleague_bot_credentials(conn)
-        tg_user = verify_telegram_webapp_init_data(clean_init, bot_token)
-        if tg_user is None:
-            raise PermissionError("Недействительная подпись Telegram Mini App")
-        resolved_tg_id = int(tg_user["id"])
-        allowed_ids = _team_telegram_whitelist(conn, bot_chat_id=bot_chat_id)
-        if resolved_tg_id not in allowed_ids:
-            raise PermissionError("Доступ в CRM разрешён только участникам команды")
-    elif not is_auth_enforced() and tg_user_id is not None:
-        resolved_tg_id = int(tg_user_id)
-    else:
-        raise PermissionError("Требуется подписанный initData Telegram Mini App")
+            bot_token, bot_chat_id = resolve_colleague_bot_credentials(conn)
+            tg_user = verify_telegram_webapp_init_data(clean_init, bot_token)
+            if tg_user is None:
+                raise PermissionError("Недействительная подпись Telegram Mini App")
+            resolved_tg_id = int(tg_user["id"])
+            allowed_ids = _team_telegram_whitelist(conn, bot_chat_id=bot_chat_id)
+            if resolved_tg_id not in allowed_ids:
+                raise PermissionError("Доступ в CRM разрешён только участникам команды")
+        elif not is_auth_enforced() and tg_user_id is not None:
+            resolved_tg_id = int(tg_user_id)
+        else:
+            raise PermissionError("Требуется подписанный initData Telegram Mini App")
 
-    target_username = "vlad" if int(resolved_tg_id) == 978069541 else "tim"
-    row = conn.execute(
-        "SELECT * FROM crm_users WHERE lower(username) = lower(?)",
-        (target_username,),
-    ).fetchone()
-    if row is None:
-        row = conn.execute("SELECT * FROM crm_users ORDER BY id ASC LIMIT 1").fetchone()
-    if row is None:
-        raise PermissionError("Пользователь CRM не найден")
-    user_pub = _public_user(row)
-    assert user_pub is not None
-    token = _create_session(conn, user_pub["id"], pwd_hash=str(row["password_hash"]))
-    return user_pub, token
+        target_username = "vlad" if int(resolved_tg_id) == 978069541 else "tim"
+        row = conn.execute(
+            "SELECT * FROM crm_users WHERE lower(username) = lower(?)",
+            (target_username,),
+        ).fetchone()
+        if row is None:
+            row = conn.execute("SELECT * FROM crm_users ORDER BY id ASC LIMIT 1").fetchone()
+        if row is None:
+            raise PermissionError("Пользователь CRM не найден")
+        user_pub = _public_user(row)
+        assert user_pub is not None
+        token = _create_session(conn, user_pub["id"], pwd_hash=str(row["password_hash"]))
+        return user_pub, token
 
 
 def authenticate_crm_user(
@@ -517,47 +527,48 @@ def authenticate_crm_user(
     clean_p = str(password or "")
     if not clean_p:
         raise ValueError("Неверный логин или пароль")
-    if is_auth_enforced():
-        ensure_default_crm_users(conn)
-        if clean_p in _LEAKED_DEFAULT_PASSWORDS:
-            raise PermissionError("Неверный логин или пароль")
-    if not clean_u:
-        cnt_row = conn.execute("SELECT COUNT(*) FROM crm_users").fetchone()
-        if not cnt_row or int(cnt_row[0] or 0) == 0:
+    with locked_conn(conn):
+        if is_auth_enforced():
             ensure_default_crm_users(conn)
-        quick_pin = os.getenv("CRM_QUICK_PIN", "").strip()
-        if quick_pin and hmac.compare_digest(
-            clean_p.encode("utf-8"), quick_pin.encode("utf-8")
-        ):
-            trow = conn.execute(
-                "SELECT * FROM crm_users WHERE lower(username) = 'tim' ORDER BY id ASC LIMIT 1"
-            ).fetchone()
-            if trow is not None:
-                user_pub = _public_user(trow)
-                assert user_pub is not None
-                token = _create_session(
-                    conn, user_pub["id"], pwd_hash=str(trow["password_hash"])
-                )
-                return user_pub, token
-        for urow in conn.execute("SELECT * FROM crm_users ORDER BY id ASC").fetchall():
-            if verify_password(clean_p, str(urow["password_hash"] or "")):
-                user_pub = _public_user(urow)
-                assert user_pub is not None
-                token = _create_session(
-                    conn, user_pub["id"], pwd_hash=str(urow["password_hash"])
-                )
-                return user_pub, token
-        raise PermissionError("Неверный логин или пароль")
-    row = conn.execute(
-        "SELECT * FROM crm_users WHERE lower(username) = lower(?)",
-        (clean_u,),
-    ).fetchone()
-    if row is None or not verify_password(clean_p, str(row["password_hash"])):
-        raise PermissionError("Неверный логин или пароль")
-    user_pub = _public_user(row)
-    assert user_pub is not None
-    token = _create_session(conn, user_pub["id"], pwd_hash=str(row["password_hash"]))
-    return user_pub, token
+            if clean_p in _LEAKED_DEFAULT_PASSWORDS:
+                raise PermissionError("Неверный логин или пароль")
+        if not clean_u:
+            cnt_row = conn.execute("SELECT COUNT(*) FROM crm_users").fetchone()
+            if not cnt_row or int(cnt_row[0] or 0) == 0:
+                ensure_default_crm_users(conn)
+            quick_pin = os.getenv("CRM_QUICK_PIN", "").strip()
+            if quick_pin and hmac.compare_digest(
+                clean_p.encode("utf-8"), quick_pin.encode("utf-8")
+            ):
+                trow = conn.execute(
+                    "SELECT * FROM crm_users WHERE lower(username) = 'tim' ORDER BY id ASC LIMIT 1"
+                ).fetchone()
+                if trow is not None:
+                    user_pub = _public_user(trow)
+                    assert user_pub is not None
+                    token = _create_session(
+                        conn, user_pub["id"], pwd_hash=str(trow["password_hash"])
+                    )
+                    return user_pub, token
+            for urow in conn.execute("SELECT * FROM crm_users ORDER BY id ASC").fetchall():
+                if verify_password(clean_p, str(urow["password_hash"] or "")):
+                    user_pub = _public_user(urow)
+                    assert user_pub is not None
+                    token = _create_session(
+                        conn, user_pub["id"], pwd_hash=str(urow["password_hash"])
+                    )
+                    return user_pub, token
+            raise PermissionError("Неверный логин или пароль")
+        row = conn.execute(
+            "SELECT * FROM crm_users WHERE lower(username) = lower(?)",
+            (clean_u,),
+        ).fetchone()
+        if row is None or not verify_password(clean_p, str(row["password_hash"])):
+            raise PermissionError("Неверный логин или пароль")
+        user_pub = _public_user(row)
+        assert user_pub is not None
+        token = _create_session(conn, user_pub["id"], pwd_hash=str(row["password_hash"]))
+        return user_pub, token
 
 
 def register_crm_user(
@@ -573,34 +584,35 @@ def register_crm_user(
         raise ValueError("Логин должен содержать минимум 3 символа (латиница, цифры, _, ., -)")
     if len(clean_p) < 4:
         raise ValueError("Пароль должен быть не короче 4 символов")
-    existing = conn.execute(
-        "SELECT id FROM crm_users WHERE lower(username) = lower(?)",
-        (clean_u,),
-    ).fetchone()
-    if existing is not None:
-        raise FileExistsError("Пользователь с таким логином уже существует")
+    with locked_conn(conn):
+        existing = conn.execute(
+            "SELECT id FROM crm_users WHERE lower(username) = lower(?)",
+            (clean_u,),
+        ).fetchone()
+        if existing is not None:
+            raise FileExistsError("Пользователь с таким логином уже существует")
 
-    clean_display = str(display_name or "").strip() or clean_u
-    clean_role = str(role or "operator").strip().lower()
-    if clean_role not in ("admin", "sales", "operator"):
-        clean_role = "operator"
+        clean_display = str(display_name or "").strip() or clean_u
+        clean_role = str(role or "operator").strip().lower()
+        if clean_role not in ("admin", "sales", "operator"):
+            clean_role = "operator"
 
-    now = utc_now()
-    pwd_hash = hash_password(clean_p)
-    cur = conn.execute(
-        """
-        INSERT INTO crm_users (username, password_hash, display_name, role, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (clean_u, pwd_hash, clean_display, clean_role, now, now),
-    )
-    user_id = int(cur.lastrowid)
-    conn.commit()
-    row = conn.execute("SELECT * FROM crm_users WHERE id = ?", (user_id,)).fetchone()
-    user_pub = _public_user(row)
-    assert user_pub is not None
-    token = _create_session(conn, user_id, pwd_hash=pwd_hash)
-    return user_pub, token
+        now = utc_now()
+        pwd_hash = hash_password(clean_p)
+        cur = conn.execute(
+            """
+            INSERT INTO crm_users (username, password_hash, display_name, role, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (clean_u, pwd_hash, clean_display, clean_role, now, now),
+        )
+        user_id = int(cur.lastrowid)
+        conn.commit()
+        row = conn.execute("SELECT * FROM crm_users WHERE id = ?", (user_id,)).fetchone()
+        user_pub = _public_user(row)
+        assert user_pub is not None
+        token = _create_session(conn, user_id, pwd_hash=pwd_hash)
+        return user_pub, token
 
 
 def logout_crm_token(conn: sqlite3.Connection, token: str | None) -> None:
@@ -613,20 +625,21 @@ def logout_crm_token(conn: sqlite3.Connection, token: str | None) -> None:
                 exp_unix = max(int(parts[1]), int(time.time()) + 60)
             except ValueError:
                 pass
-        try:
-            _ensure_revoked_tokens_table(conn)
-            conn.execute(
-                "DELETE FROM crm_revoked_tokens WHERE expires_at < ?",
-                (int(time.time()),),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO crm_revoked_tokens (token_sha256, expires_at) VALUES (?, ?)",
-                (_token_sha256(token), exp_unix),
-            )
-        except sqlite3.Error:
-            pass
-        conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
-        conn.commit()
+        with locked_conn(conn):
+            try:
+                _ensure_revoked_tokens_table(conn)
+                conn.execute(
+                    "DELETE FROM crm_revoked_tokens WHERE expires_at < ?",
+                    (int(time.time()),),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO crm_revoked_tokens (token_sha256, expires_at) VALUES (?, ?)",
+                    (_token_sha256(token), exp_unix),
+                )
+            except sqlite3.Error:
+                pass
+            conn.execute("DELETE FROM crm_auth_sessions WHERE token = ?", (token,))
+            conn.commit()
 
 
 def _is_https_request(request: Request) -> bool:
@@ -712,39 +725,42 @@ def register_auth_routes(app: FastAPI, templates: Any) -> None:
     @app.get("/api/auth/me")
     def auth_me(request: Request):
         conn = request.app.state.conn
-        user = resolve_request_crm_user(conn, request)
-        if is_auth_enforced() and user is None:
+        with locked_conn(conn):
+            user = resolve_request_crm_user(conn, request)
+            if is_auth_enforced() and user is None:
+                return {
+                    "ok": True,
+                    "authenticated": False,
+                    "user": None,
+                    "users": [],
+                }
             return {
                 "ok": True,
-                "authenticated": False,
-                "user": None,
-                "users": [],
+                "authenticated": user is not None,
+                "user": user,
+                "users": list_crm_users(conn),
             }
-        return {
-            "ok": True,
-            "authenticated": user is not None,
-            "user": user,
-            "users": list_crm_users(conn),
-        }
 
     @app.get("/api/auth/users")
     def auth_users_list(request: Request):
         conn = request.app.state.conn
-        if is_auth_enforced():
-            user = resolve_request_crm_user(conn, request)
-            if user is None and not has_valid_mcp_api_key(request):
-                raise HTTPException(status_code=401, detail="Требуется авторизация в CRM")
-        return {"ok": True, "users": list_crm_users(conn)}
+        with locked_conn(conn):
+            if is_auth_enforced():
+                user = resolve_request_crm_user(conn, request)
+                if user is None and not has_valid_mcp_api_key(request):
+                    raise HTTPException(status_code=401, detail="Требуется авторизация в CRM")
+            return {"ok": True, "users": list_crm_users(conn)}
 
     @app.post("/api/auth/webapp")
     def auth_webapp(body: AuthWebAppIn, request: Request, response: Response):
         conn = request.app.state.conn
         try:
-            user, token = authenticate_telegram_miniapp(
-                conn,
-                init_data=body.init_data,
-                tg_user_id=body.tg_user_id or body.telegram_user_id,
-            )
+            with locked_conn(conn):
+                user, token = authenticate_telegram_miniapp(
+                    conn,
+                    init_data=body.init_data,
+                    tg_user_id=body.tg_user_id or body.telegram_user_id,
+                )
         except (PermissionError, ValueError) as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         _set_auth_cookie(response, request, token)
@@ -765,7 +781,8 @@ def register_auth_routes(app: FastAPI, templates: Any) -> None:
                 detail="Слишком много неудачных попыток входа. Подождите 10 минут.",
             )
         try:
-            user, token = authenticate_crm_user(conn, body.username, body.password)
+            with locked_conn(conn):
+                user, token = authenticate_crm_user(conn, body.username, body.password)
         except (PermissionError, ValueError) as exc:
             recent.append(now)
             failures[client_ip] = recent
@@ -783,29 +800,30 @@ def register_auth_routes(app: FastAPI, templates: Any) -> None:
     @app.post("/api/auth/register")
     def auth_register(body: AuthRegisterIn, request: Request, response: Response):
         conn = request.app.state.conn
-        caller = resolve_request_crm_user(conn, request)
-        if is_auth_enforced():
-            if caller is None:
-                raise HTTPException(
-                    status_code=401, detail="Требуется авторизация администратора"
+        with locked_conn(conn):
+            caller = resolve_request_crm_user(conn, request)
+            if is_auth_enforced():
+                if caller is None:
+                    raise HTTPException(
+                        status_code=401, detail="Требуется авторизация администратора"
+                    )
+                if caller.get("role") != "admin":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Только администратор может создавать пользователей",
+                    )
+            try:
+                user, token = register_crm_user(
+                    conn,
+                    username=body.username,
+                    password=body.password,
+                    display_name=body.display_name,
+                    role=body.role,
                 )
-            if caller.get("role") != "admin":
-                raise HTTPException(
-                    status_code=403,
-                    detail="Только администратор может создавать пользователей",
-                )
-        try:
-            user, token = register_crm_user(
-                conn,
-                username=body.username,
-                password=body.password,
-                display_name=body.display_name,
-                role=body.role,
-            )
-        except FileExistsError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except FileExistsError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if caller is None:
             _set_auth_cookie(response, request, token)
@@ -819,7 +837,8 @@ def register_auth_routes(app: FastAPI, templates: Any) -> None:
     @app.post("/api/auth/logout")
     def auth_logout(request: Request, response: Response):
         conn = request.app.state.conn
-        for tok in _extract_candidate_tokens(request):
-            logout_crm_token(conn, tok)
+        with locked_conn(conn):
+            for tok in _extract_candidate_tokens(request):
+                logout_crm_token(conn, tok)
         response.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
         return {"ok": True, "authenticated": False}

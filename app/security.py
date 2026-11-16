@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -108,7 +109,6 @@ def is_auth_enforced() -> bool:
         return True
     if (
         os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in ("1", "true", "yes")
-        and "PYTEST_CURRENT_TEST" not in os.environ
         and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
     ):
         return True
@@ -117,17 +117,17 @@ def is_auth_enforced() -> bool:
 
 def extract_client_ip(request: Request) -> str:
     client_host = (request.client.host or "").strip() if request.client else ""
-    if client_host not in ("127.0.0.1", "::1", "testclient", ""):
-        return client_host
-    xri = (request.headers.get("x-real-ip") or "").strip()
-    if xri:
-        return xri
+    if client_host not in ("127.0.0.1", "::1", "testclient"):
+        return client_host or "0.0.0.0"
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         parts = [part.strip() for part in xff.split(",") if part.strip()]
         if parts:
             return parts[-1]
-    return client_host or "127.0.0.1"
+    xri = (request.headers.get("x-real-ip") or "").strip()
+    if xri:
+        return xri
+    return client_host
 
 
 def _is_dialog_avatar_path(path: str) -> bool:
@@ -247,6 +247,13 @@ def _requires_admin_role(path: str, method: str) -> bool:
         or path.startswith("/api/leadgen/")
         or path == "/api/accounts"
         or path.startswith("/api/accounts/")
+        or path == "/api/leads/bulk"
+        or path.startswith("/api/leads/bulk/")
+        or path == "/api/outreach/autopilot"
+        or path.startswith("/api/outreach/autopilot/")
+        or path == "/api/folders/sync-all"
+        or path.startswith("/api/folders/sync-all/")
+        or bool(re.fullmatch(r"/api/campaigns/[^/]+/run/?", path))
     ):
         return True
     return False
@@ -310,7 +317,7 @@ def _is_loopback_direct(request: Request) -> bool:
     client_ip = extract_client_ip(request)
     return (
         not has_forwarded
-        and client_host in ("127.0.0.1", "::1", "testclient", "")
+        and client_host in ("127.0.0.1", "::1", "testclient")
         and client_ip in ("127.0.0.1", "::1", "testclient")
     )
 

@@ -45,9 +45,6 @@ SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 EMPTY_TEXT = "На сегодня задач нет."
 REJECTED = "Telegram не принял сообщение"
 NO_OPERATOR = "Нет BOT_TOKEN или BOT_CHAT_ID"
-VPS_SOFTUGCBOT_ENV = Path("/opt/softugcbot/.env")
-SOFTUGCBOT_ENV = Path("/Users/timofei/dev/Python/new era/softugcbot/.env")
-DEFAULT_COLLEAGUE_CHAT_ID = "978069541"
 
 
 def _default_urlopen(req, timeout: float = 15):
@@ -167,59 +164,27 @@ def build_digest(rows: list) -> tuple[str, dict | None]:
     return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    out: dict[str, str] = {}
-    try:
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            out[k.strip()] = v.strip().strip('"').strip("'")
-    except Exception:
-        return {}
-    return out
-
-
-def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = True) -> tuple[str, str]:
+def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = False) -> tuple[str, str]:
     token = (os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.environ.get("BOT_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if token == "e2e-not-a-secret":
         return "", ""
-    in_pytest = "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("ALLOW_FILE_BOT_CREDS_IN_TEST") != "1"
-    if not token or not chat_id:
-        if not in_pytest:
-            vals = _read_env_file(ROOT / ".env")
-            if not token:
-                token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
-            if not chat_id:
-                chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
     if (not token or not chat_id) and conn is not None:
-        if not in_pytest or default_chat_id:
-            try:
+        try:
+            with locked_conn(conn):
                 rows = dict(
                     conn.execute(
                         "SELECT key, value FROM kv_settings WHERE key IN ('bot_token', 'bot_chat_id')"
                     ).fetchall()
                 )
-                if not token:
-                    token = str(rows.get("bot_token") or "").strip()
-                if not chat_id:
-                    chat_id = str(rows.get("bot_chat_id") or "").strip()
-            except Exception:
-                pass
-    if not token or not chat_id:
-        if not in_pytest:
-            for env_path in (VPS_SOFTUGCBOT_ENV, SOFTUGCBOT_ENV):
-                vals = _read_env_file(env_path)
-                if not token:
-                    token = (vals.get("BOT_TOKEN") or vals.get("TELEGRAM_BOT_TOKEN") or "").strip()
-                if not chat_id:
-                    chat_id = (vals.get("BOT_CHAT_ID") or vals.get("TELEGRAM_CHAT_ID") or "").strip()
-    if token and not chat_id and default_chat_id:
-        chat_id = DEFAULT_COLLEAGUE_CHAT_ID
+            if not token:
+                token = str(rows.get("bot_token") or "").strip()
+            if not chat_id:
+                chat_id = str(rows.get("bot_chat_id") or "").strip()
+        except Exception:
+            pass
+    if token == "e2e-not-a-secret":
+        return "", ""
     return token, chat_id
 
 
@@ -825,13 +790,16 @@ def send_lead_reply_notification(
 
 def send_morning_digest(conn, opener=None, now: str | None = None) -> dict:
     token, chat_id = _operator(conn)
+    clean_chat = str(chat_id or "").strip()
+    if not clean_chat:
+        raise ValueError(NO_OPERATOR)
     rows = open_today(conn, now)
     text, markup = build_digest(rows)
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {"chat_id": clean_chat, "text": text}
     if markup:
         payload["reply_markup"] = markup
     _post(SEND_URL.format(token=token), payload, opener)
-    return {"ok": True, "chat_id": chat_id, "text": text, "count": len(rows)}
+    return {"ok": True, "chat_id": clean_chat, "text": text, "count": len(rows)}
 
 
 def _store_active_reply_dialog(conn, dialog_id: int, chat_id: str | None = None) -> None:

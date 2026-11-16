@@ -668,8 +668,29 @@ def test_api_endpoints_crm_only_edit_and_media_and_bot_webhook(conn, tmp_path, m
     assert edited_msg["edited_at"] is not None
     assert "<strong>обновлённый API</strong>" in edited_msg["formatted_html"]
 
-    # 3. Upload voice via POST /api/dialogs/{id}/media and fetch via GET .../media
-    b64_audio = base64.b64encode(b"OggS-test-voice-stream").decode("ascii")
+    # 3. Upload REAL Ogg voice via POST /api/dialogs/{id}/media and fetch via GET .../media
+    import shutil as _shutil
+    import subprocess as _sp
+
+    ffmpeg_bin = _shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+    real_ogg_path = tmp_path / "real_tone.ogg"
+    _sp.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.25",
+            "-c:a",
+            "libopus",
+            str(real_ogg_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    real_ogg_bytes = real_ogg_path.read_bytes()
+    b64_audio = base64.b64encode(real_ogg_bytes).decode("ascii")
     r_media = client.post(
         f"/api/dialogs/{dlg_id}/media",
         json={
@@ -689,7 +710,7 @@ def test_api_endpoints_crm_only_edit_and_media_and_bot_webhook(conn, tmp_path, m
         f"/api/dialogs/{dlg_id}/messages/{m_json['telegram_message_id']}/media"
     )
     assert r_fetch_media.status_code == 200
-    assert r_fetch_media.content == b"OggS-test-voice-stream"
+    assert r_fetch_media.content == real_ogg_bytes
 
     r_fetch_playable = client.get(
         f"/api/dialogs/{dlg_id}/messages/{m_json['telegram_message_id']}/media?playable=1"
@@ -731,6 +752,7 @@ def test_api_endpoints_crm_only_edit_and_media_and_bot_webhook(conn, tmp_path, m
 
 def test_playwright_v6_rich_inbox_voice_edit_and_miniapp(tmp_path):
     import os
+    import shutil
     import socket
     import subprocess
     import sys
@@ -749,6 +771,7 @@ def test_playwright_v6_rich_inbox_voice_edit_and_miniapp(tmp_path):
     env["PORT"] = str(port)
     env["E2E_DB_PATH"] = str(db_path)
     env["PYTEST_CURRENT_TEST"] = "test_v6_ui_e2e"
+    env["PYTHONPATH"] = str(root)
 
     server = subprocess.Popen(
         [sys.executable, str(root / "e2e" / "serve.py")],
@@ -836,9 +859,18 @@ const {{ chromium }} = require('playwright');
   process.exit(1);
 }});
 """
+        node_env = dict(os.environ)
+        if not (root / "e2e" / "node_modules").exists():
+            venv_link = root / ".venv"
+            if venv_link.is_symlink():
+                main_nm = venv_link.resolve().parent / "e2e" / "node_modules"
+                if main_nm.exists():
+                    node_env["NODE_PATH"] = str(main_nm)
+        node_bin = shutil.which("node") or "/opt/homebrew/bin/node" or "/usr/local/bin/node"
         proc = subprocess.run(
-            ["node", "-e", pw_script],
+            [node_bin, "-e", pw_script],
             cwd=str(root / "e2e"),
+            env=node_env,
             capture_output=True,
             text=True,
             timeout=60,
