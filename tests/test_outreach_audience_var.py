@@ -152,9 +152,9 @@ def test_custom_followup2_template_with_audience_overrides_stale_csv_step3_text(
 
     csv_payload = (
         "Категория,Название,Контакт,Их угол,Первое касание,Фоллоуап 1,Фоллоуап 2\n"
-        "AI,pewpewpew,@game_founder,Free multiplayer space shooter game in browser,Hi game founder!,Step 2 old,Old generic step 3 text\n"
-        "Агентство,Verto Studio,@agency_founder,Помогает бизнесам увеличить поток клиентов,Hi agency!,Step 2 old,Old generic step 3 text\n"
-        "Медиа,PodCastHub,@pod_founder,Daily tech podcast episodes,Hi podcaster!,Step 2 old,Old generic step 3 text\n"
+        "AI,pewpewpew,@game_founder,Free multiplayer space shooter game in browser,Hi game founder! Saw pewpewpew — SoftUGC drives organic players.,Step 2 old,Old generic step 3 text\n"
+        "Агентство,Verto Studio,@agency_founder,Помогает бизнесам увеличить поток клиентов,Hi agency founder! Saw Verto Studio — SoftUGC scales client reach.,Step 2 old,Old generic step 3 text\n"
+        "Медиа,PodCastHub,@pod_founder,Daily tech podcast episodes,Hi podcaster! Saw PodCastHub — SoftUGC brings organic listeners.,Step 2 old,Old generic step 3 text\n"
     )
 
     with TestClient(app) as client:

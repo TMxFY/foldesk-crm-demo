@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,9 @@ import sqlite3
 import zipfile
 
 from app.db import as_dict, resolve_session, utc_now, utc_today
+
+logger = logging.getLogger(__name__)
+ORPHAN_DEAD_ACCOUNT_ERROR = "Цепочка остановлена: исходный аккаунт деавторизован (unauthorized)"
 from app.telegram_gateway import (
     SESSION_HEALTH,
     GatewayError,
@@ -213,6 +217,13 @@ def _unlink_account_refs(conn, account_ids: list[int]) -> None:
             conn.execute("UPDATE campaigns SET account_id = NULL WHERE account_id = ?", (aid,))
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute(
+                "UPDATE campaign_recipients SET assigned_account_id = NULL WHERE assigned_account_id = ?",
+                (aid,),
+            )
+        except sqlite3.OperationalError:
+            pass
 
 
 def _get_deleted_sessions(conn) -> set[str]:
@@ -277,6 +288,20 @@ def delete_account(conn, account_id: int, gateway=None) -> dict:
     )
     if gateway is not None and session_path and hasattr(gateway, "clear_session"):
         gateway.clear_session(session_path)
+    try:
+        conn.execute(
+            """
+            UPDATE campaign_recipients
+            SET status = 'completed',
+                error_text = ?,
+                updated_at = ?
+            WHERE status = 'in_progress'
+              AND (sent_account_id = ? OR (sent_account_id IS NULL AND assigned_account_id = ?))
+            """,
+            (ORPHAN_DEAD_ACCOUNT_ERROR, utc_now(), int(account_id), int(account_id)),
+        )
+    except sqlite3.OperationalError:
+        pass
     _unlink_account_refs(conn, [int(account_id)])
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     conn.commit()
@@ -1374,19 +1399,158 @@ def _clip_error(value) -> str | None:
     return text[:500]
 
 
-def _write_health(conn, account_id: int, health: str, last_error) -> None:
-    # health is the live session. accounts.status stays the login step.
+def record_account_health_transition(
+    conn,
+    account_id: int,
+    health: str,
+    last_error,
+    *,
+    opener=None,
+) -> bool:
     if health not in SESSION_HEALTH:
         raise ValueError("Неизвестный статус сессии")
+    now = utc_now()
+    clipped_err = _clip_error(last_error)
+    prev_row = conn.execute(
+        "SELECT id, phone, telegram_username, telegram_name, health FROM accounts WHERE id = ?",
+        (int(account_id),),
+    ).fetchone()
+    prev_dict = as_dict(prev_row) if prev_row is not None else {}
+    prev_health = str(prev_dict.get("health") or "")
+
     conn.execute(
         """
         UPDATE accounts
         SET health = ?, last_error = ?, updated_at = ?
         WHERE id = ?
         """,
-        (health, _clip_error(last_error), utc_now(), account_id),
+        (health, clipped_err, now, int(account_id)),
     )
+
+    alert_state_key = f"account_health_alert_state:{int(account_id)}"
+    if health == "active":
+        try:
+            conn.execute(
+                """
+                INSERT INTO kv_settings (key, value, updated_at)
+                VALUES (?, 'active', ?)
+                ON CONFLICT(key) DO UPDATE SET value = 'active', updated_at = excluded.updated_at
+                """,
+                (alert_state_key, now),
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        return False
+
+    if health not in ("unauthorized", "frozen", "banned"):
+        conn.commit()
+        return False
+
+    last_alerted = ""
+    try:
+        st_row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = ?",
+            (alert_state_key,),
+        ).fetchone()
+        if st_row is not None and st_row[0] is not None:
+            last_alerted = str(st_row[0]).strip()
+    except sqlite3.OperationalError:
+        last_alerted = prev_health
+
+    if last_alerted == health:
+        conn.commit()
+        return False
+
+    event = {
+        "account_id": int(account_id),
+        "phone": prev_dict.get("phone"),
+        "telegram_username": prev_dict.get("telegram_username"),
+        "telegram_name": prev_dict.get("telegram_name"),
+        "prev_health": prev_health or None,
+        "health": health,
+        "last_error": clipped_err,
+        "created_at": now,
+    }
+    try:
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (alert_state_key, health, now),
+        )
+        log_row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'account_health_alerts_log'"
+        ).fetchone()
+        history: list[dict] = []
+        if log_row is not None and log_row[0]:
+            try:
+                parsed_hist = json.loads(str(log_row[0]))
+                if isinstance(parsed_hist, list):
+                    history = [x for x in parsed_hist if isinstance(x, dict)]
+            except Exception:
+                history = []
+        history.append(event)
+        history = history[-100:]
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at)
+            VALUES ('account_health_alerts_log', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (json.dumps(history, ensure_ascii=False), now),
+        )
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
+
+    acc_label = (
+        (f"@{prev_dict['telegram_username']}" if prev_dict.get("telegram_username") else None)
+        or prev_dict.get("telegram_name")
+        or prev_dict.get("phone")
+        or f"#{account_id}"
+    )
+    logger.warning(
+        "Account health alert: account %s (id=%s) transitioned %s -> %s (%s)",
+        acc_label,
+        account_id,
+        prev_health or "none",
+        health,
+        clipped_err or "no error detail",
+    )
+
+    try:
+        import app.digest as digest_mod
+
+        token, chat_id = digest_mod.resolve_colleague_bot_credentials(conn, default_chat_id=True)
+        if token and chat_id:
+            in_pytest = "PYTEST_CURRENT_TEST" in os.environ
+            post_mocked = (
+                opener is not None
+                or getattr(digest_mod._post, "__module__", "") != "app.digest"
+                or getattr(digest_mod._default_urlopen, "__module__", "") != "app.digest"
+                or os.environ.get("ALLOW_LIVE_BOT_IN_TEST") == "1"
+            )
+            if not in_pytest or post_mocked:
+                alert_text = (
+                    f"⚠️ Аккаунт рассылки {acc_label} (ID {account_id}) перешёл в статус {health}.\n"
+                    f"Причина: {clipped_err or 'не указана'}"
+                )
+                digest_mod._post(
+                    digest_mod.SEND_URL.format(token=token),
+                    {"chat_id": str(chat_id), "text": alert_text},
+                    opener,
+                )
+    except Exception as exc:
+        logger.warning("Account health digest alert failed for id=%s: %s", account_id, exc)
+    return True
+
+
+def _write_health(conn, account_id: int, health: str, last_error) -> None:
+    # health is the live session. accounts.status stays the login step.
+    record_account_health_transition(conn, account_id, health, last_error)
 
 
 async def _probe_health(gateway, session_path: str) -> dict:

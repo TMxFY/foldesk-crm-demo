@@ -179,7 +179,7 @@ def test_followup_missing_input_entity_falls_back_to_username(tmp_path):
     import_campaign_csv(
         conn,
         camp["id"],
-        "username,name,category,step1_text\n@dariusiv,Darius,Gaming,Initial hello\n",
+        "username,name,category,step1_text\n@dariusiv,Darius,Gaming,Initial hello — saw your game and SoftUGC scales organic reach\n",
     )
     # Put recipient at step 1 (waiting for step 2 follow-up) with real telegram_user_id not in Telethon entity cache
     # Seed prior Step 1 outgoing message on account 33 so empty-chat follow-up guard recognizes legitimate prior touch
@@ -192,7 +192,7 @@ def test_followup_missing_input_entity_falls_back_to_username(tmp_path):
     conn.execute(
         """
         INSERT INTO messages (dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at)
-        VALUES (?, 1, 'out', 'Initial hello', '2026-10-01T10:00:00', '2026-10-01T10:00:00', '2026-10-01T10:00:00')
+        VALUES (?, 1, 'out', 'Initial hello — saw your game and SoftUGC scales organic reach', '2026-10-01T10:00:00', '2026-10-01T10:00:00', '2026-10-01T10:00:00')
         """,
         (int(cur_d.lastrowid),),
     )

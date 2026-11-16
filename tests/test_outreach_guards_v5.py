@@ -273,11 +273,12 @@ def test_v5_guard1_followup_never_switches_account_and_blocks_empty_chat(tmp_pat
     assert res_broken["sent"] == 0
     assert gw_broken_21.sent == []
     joseph_after_err = conn.execute(
-        "SELECT status, current_step, sent_account_id FROM campaign_recipients WHERE username = 'joseph0201'"
+        "SELECT status, current_step, sent_account_id, error_text FROM campaign_recipients WHERE username = 'joseph0201'"
     ).fetchone()
-    assert joseph_after_err["status"] == "in_progress"
+    assert joseph_after_err["status"] == "completed"
     assert joseph_after_err["current_step"] == 1
     assert joseph_after_err["sent_account_id"] == 21
+    assert joseph_after_err["error_text"] == "Цепочка остановлена: исходный аккаунт деавторизован (unauthorized)"
 
 
 # ---------------------------------------------------------------------------
@@ -1416,7 +1417,7 @@ def test_followup_never_sends_duplicate_when_already_in_db_or_live_telegram(tmp_
             campaign_id, telegram_user_id, username, name, company, category,
             step1_text, sent_account_id, assigned_account_id, current_step, status,
             last_sent_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'TestCo', 'SaaS', 'Hey, first touch', ?, ?, 2, 'in_progress', '2026-11-13T08:05:00', ?, ?)
+        ) VALUES (?, ?, ?, ?, 'TestCo', 'SaaS', 'Hey, saw TestCo — SoftUGC scales short-form video.', ?, ?, 2, 'in_progress', '2026-11-13T08:05:00', ?, ?)
         """,
         [
             (camp["id"], 50101, "already_in_db", "Already DB", 21, 21, now_iso, now_iso),
