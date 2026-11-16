@@ -251,8 +251,8 @@ def _requires_admin_role(path: str, method: str) -> bool:
         or path.startswith("/api/leads/bulk/")
         or path == "/api/outreach/autopilot"
         or path.startswith("/api/outreach/autopilot/")
-        or path == "/api/folders/sync-all"
-        or path.startswith("/api/folders/sync-all/")
+        or path == "/api/folders"
+        or path.startswith("/api/folders/")
         or bool(re.fullmatch(r"/api/campaigns/[^/]+/run/?", path))
     ):
         return True

@@ -481,6 +481,7 @@ def main() -> int:
 
         # Если писали напрямую в локальную SQLite БД (без HTTP MCP), синхронизируем R2 снэпшот только при активном lease
         if not a.mcp_url and resolved_db is not None:
+            from contextlib import closing
             from app.cloud_persistence import (
                 backup_to_cloud,
                 check_tg_runtime_lease_owned,
@@ -488,7 +489,7 @@ def main() -> int:
             from app.db import connect
 
             try:
-                with connect(resolved_db) as conn:
+                with closing(connect(resolved_db)) as conn:
                     if check_tg_runtime_lease_owned(conn):
                         backup_to_cloud(conn, Path(resolved_db))
             except Exception as exc:

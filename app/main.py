@@ -2662,11 +2662,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 target.read_bytes(),
                 cache_key=Path(safe_name).stem,
             )
-            return Response(
-                content=wav_bytes,
-                media_type="audio/wav",
-                headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
-            )
+            if wav_bytes:
+                return Response(
+                    content=wav_bytes,
+                    media_type="audio/wav",
+                    headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+                )
         return FileResponse(target, headers={"Content-Security-Policy": "sandbox"})
 
     @app.get("/api/dialogs/{dialog_id}/avatar")
@@ -2769,11 +2770,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 cache_key=f"dlg{dialog_id}_msg{telegram_message_id}",
                 text_hint=str(msg_row["text"] or ""),
             )
-            return Response(
-                content=wav_bytes,
-                media_type="audio/wav",
-                headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
-            )
+            if wav_bytes:
+                return Response(
+                    content=wav_bytes,
+                    media_type="audio/wav",
+                    headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+                )
 
         if resolved_local is not None and resolved_local.exists():
             return FileResponse(
@@ -2782,10 +2784,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 filename=resolved_filename or resolved_local.name,
             )
 
-        return Response(
-            content=b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00",
-            media_type=resolved_mime or ("audio/ogg" if mtype == "voice" else "application/octet-stream"),
-        )
+        raise HTTPException(status_code=404, detail="Медиафайл недоступен")
 
     @app.get("/api/outreach/schedule")
     def outreach_schedule_get(request: Request):

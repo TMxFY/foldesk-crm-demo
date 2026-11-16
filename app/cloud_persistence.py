@@ -167,13 +167,41 @@ def _sigv4_headers(
     return f"https://{host}{uri_path}", headers
 
 
+def _extract_conn_db_path(conn: sqlite3.Connection | None) -> Path | None:
+    if conn is None:
+        return None
+    try:
+        with locked_raw_connection(conn) as raw_c:
+            rows = raw_c.execute("PRAGMA database_list").fetchall()
+        for r in rows:
+            name = r[1] if not isinstance(r, dict) else r.get("name")
+            file_p = r[2] if not isinstance(r, dict) else r.get("file")
+            if name == "main" and file_p and str(file_p) != ":memory:":
+                return Path(str(file_p))
+    except Exception:
+        return None
+    return None
+
+
 def backup_to_cloud(
     conn: sqlite3.Connection | None = None,
-    db_path: Path = DEFAULT_DB,
+    db_path: Path | None = None,
 ) -> dict[str, Any]:
+    effective_db_path = db_path
+    if effective_db_path is None:
+        effective_db_path = _extract_conn_db_path(conn) or DEFAULT_DB
     in_bg_thread = threading.current_thread() is not threading.main_thread()
-    use_separate_conn = conn is None or in_bg_thread
-    cfg = _resolve_r2_config(None if use_separate_conn else conn)
+    use_separate_conn = (conn is None or in_bg_thread) and effective_db_path.exists()
+    cfg = _resolve_r2_config(conn if conn is not None else None)
+    if not cfg and use_separate_conn:
+        try:
+            tmp_cfg_conn = sqlite3.connect(effective_db_path, timeout=15.0)
+            try:
+                cfg = _resolve_r2_config(tmp_cfg_conn)
+            finally:
+                tmp_cfg_conn.close()
+        except Exception:
+            cfg = None
     if not cfg:
         return {"ok": False, "configured": False, "reason": "R2 credentials not set"}
 
@@ -184,7 +212,7 @@ def backup_to_cloud(
     active_session_names: set[str] = set()
     try:
         src_conn = (
-            sqlite3.connect(db_path, timeout=30.0)
+            sqlite3.connect(effective_db_path, timeout=30.0)
             if use_separate_conn
             else conn
         )
