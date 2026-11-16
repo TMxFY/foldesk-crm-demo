@@ -145,7 +145,7 @@ def test_mcp_ingest_discovered_leads_creates_leads_campaign_and_deduplicates(db_
                     "username": "@charlie_gamma",
                     "name": "Charlie",
                     "company": "GammaDev",
-                    "step1_text": "Hey Charlie!",
+                    "step1_text": "Hey Charlie,\n\nSaw GammaDev launch — great developer workflow tool!",
                 }
             ],
             "enroll_in_campaign": True,
@@ -250,14 +250,14 @@ def test_run_campaign_batch_calls_prewarm_before_step1_and_survives_prewarm_erro
                     "username": "@story_lead1",
                     "name": "Story Lead 1",
                     "company": "StoryCo",
-                    "step1_text": "Hey Story Lead 1! First touch.",
+                    "step1_text": "Hey Story Lead 1! Saw StoryCo launch — awesome AI product workflow.",
                     "step2_text": "Followup 1 for Story Lead 1.",
                 },
                 {
                     "username": "@story_lead2",
                     "name": "Story Lead 2",
                     "company": "StoryCo 2",
-                    "step1_text": "Hey Story Lead 2! First touch.",
+                    "step1_text": "Hey Story Lead 2! Saw StoryCo 2 launch — awesome AI product workflow.",
                 },
             ],
             "enroll_in_campaign": True,
@@ -298,6 +298,6 @@ def test_run_campaign_batch_calls_prewarm_before_step1_and_survives_prewarm_erro
     )
     assert batch2["sent"] == 1
     assert len(gateway.sent) == 2
-    assert gateway.sent[1]["text"] == "Hey Story Lead 2! First touch."
+    assert gateway.sent[1]["text"] == "Hey Story Lead 2! Saw StoryCo 2 launch — awesome AI product workflow."
     assert len(failing_client.requests) == 1
     assert failing_client.requests[0].__class__.__name__ == "GetPeerStoriesRequest"

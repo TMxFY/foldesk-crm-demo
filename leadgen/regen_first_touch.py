@@ -5,7 +5,7 @@ Standard (user directive):
   - «Первое касание»: greeting -> pain (from their product/niche) -> our presentation
     + case (183.5M views / 90 days, 13-40x cheaper) -> soft CTA. English, 3-4 sentences.
   - «Их угол»: concrete what/for-whom/model (>=40 chars, no fluff).
-  - «Наш угол»: which CreatorOS direction + how we help (already OK everywhere).
+  - «Наш угол»: which SoftUGC direction + how we help (already OK everywhere).
 
 NO Telegram resolving. Uses existing row data (name, category, their_angle, site).
 Rewrites first_touch where it's off-standard (short / missing 183.5M case),

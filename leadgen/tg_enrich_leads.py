@@ -19,11 +19,84 @@ UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 TIMEOUT = 8
 
-SOCIAL = ("x.com", "twitter.com", "linkedin.com", "instagram.com", "t.me",
-          "telegram.me", "telegram.dog", "youtube.com", "youtu.be", "linktr.ee",
-          "linktree", "facebook.com", "fb.com", "medium.com", "calendly.com",
-          "notion.site", "notion.so", "github.com", "discord.gg", "discord.com",
-          "gmail.com", "beacons.ai", "solo.to", "carrd.co")
+SOCIAL = (
+    "x.com",
+    "twitter.com",
+    "mobile.twitter.com",
+    "t.co",
+    "linkedin.com",
+    "instagram.com",
+    "t.me",
+    "telegram.me",
+    "telegram.dog",
+    "telegra.ph",
+    "youtube.com",
+    "youtu.be",
+    "linktr.ee",
+    "linktree.com",
+    "facebook.com",
+    "fb.com",
+    "medium.com",
+    "substack.com",
+    "calendly.com",
+    "notion.site",
+    "notion.so",
+    "github.com",
+    "gitlab.com",
+    "discord.gg",
+    "discord.com",
+    "gmail.com",
+    "beacons.ai",
+    "solo.to",
+    "carrd.co",
+    "lu.ma",
+    "luma.com",
+    "news.ycombinator.com",
+    "ycombinator.com",
+    "huggingface.co",
+    "itunes.apple.com",
+    "apps.apple.com",
+    "play.google.com",
+    "chromewebstore.google.com",
+    "docs.google.com",
+    "drive.google.com",
+    "forms.gle",
+    "typeform.com",
+    "producthunt.com",
+    "reddit.com",
+    "tiktok.com",
+    "wa.me",
+    "whatsapp.com",
+)
+
+_BLOCKED_PROJECT_TOKENS = frozenset(
+    {
+        "lu",
+        "luma",
+        "news",
+        "huggingface",
+        "itunes",
+        "apps",
+        "play",
+        "linktr",
+        "linktree",
+        "notion",
+        "calendly",
+        "medium",
+        "substack",
+        "docs",
+        "drive",
+        "github",
+        "gitlab",
+        "ycombinator",
+        "telegram",
+        "twitter",
+        "linkedin",
+        "instagram",
+        "youtube",
+        "discord",
+    }
+)
 
 # ЦА categories (priority order)
 CATEGORIES = [
@@ -67,8 +140,14 @@ def classify_cat(bio):
 
 
 def is_social(url):
-    u = url.lower()
-    return any(s in u for s in SOCIAL)
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else "https://" + raw.lstrip("/"))
+    host = (parsed.hostname or "").lower().removeprefix("www.").rstrip(".")
+    if not host:
+        return False
+    return any(host == s or host.endswith("." + s) for s in SOCIAL)
 
 
 def pick_project_url(links):
@@ -79,15 +158,17 @@ def pick_project_url(links):
 
 
 def project_name_from(url, bio):
-    if url:
-        d = re.sub(r"^https?://", "", url)
-        d = re.sub(r"^www\.", "", d).split("/")[0]
-        name = d.split(".")[0]
-        if name:
-            return name
+    if url and not is_social(url):
+        parsed = urlparse(url if "://" in url else "https://" + url.lstrip("/"))
+        host = (parsed.hostname or "").lower().removeprefix("www.").rstrip(".")
+        parts = [p for p in host.split(".") if p]
+        if parts:
+            base = parts[-2] if len(parts) >= 3 and parts[0] in {"app", "get", "try", "use", "go", "my", "hey"} else parts[0]
+            if base and base not in _BLOCKED_PROJECT_TOKENS:
+                return base
     if bio:
         m = re.search(r"(?:founder|co[- ]?founder|ceo|cmo|building|of)\s*@([A-Za-z0-9_]{3,})", bio, re.IGNORECASE)
-        if m:
+        if m and m.group(1).lower() not in _BLOCKED_PROJECT_TOKENS:
             return "@" + m.group(1)
     return ""
 
@@ -235,7 +316,7 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
             and REVSHARE_OFFER_TEXT in raw_ft
             and "creatoros" not in raw_ft.lower()
             and "if your user growth has hit a ceiling" not in raw_ft.lower()
-            and "plug-and-play growth arm" not in raw_ft.lower()
+            and "plug-and-play" not in raw_ft.lower()
         )
         if already_canonical:
             aud = str(r.get("audience") or "").strip().lower() or infer_lead_audience(

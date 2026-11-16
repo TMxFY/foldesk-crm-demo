@@ -247,8 +247,22 @@ def key_of(r):
 def curate_rows(rows: list[dict]) -> list[dict]:
     try:
         from tg_enrich_leads import apply_vlad_sonnet_or_fallback
+        from supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_supply_side,
+        )
     except ImportError:
         from leadgen.tg_enrich_leads import apply_vlad_sonnet_or_fallback
+        from leadgen.supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_supply_side,
+        )
 
     out = []
     for r in rows:
@@ -267,9 +281,32 @@ def curate_rows(rows: list[dict]) -> list[dict]:
             proj = r.get("project") or ""
             url = r.get("project_url") or ""
             what = r.get("what_they_do") or ""
-        proj = proj or (r.get("project") or "")
+        proj = proj or (r.get("project") or r.get("company") or "")
         url = url or (r.get("project_url") or "")
         what = what or (r.get("what_they_do") or "")
+
+        if is_rejected_buyer_category(cat):
+            continue
+        role_val = str(r2.get("role") or "").strip()
+        if role_val and role_val in NON_BUYER_ROLES:
+            continue
+        blob = "\n".join(
+            str(x)
+            for x in (
+                r2.get("name") or "",
+                r2.get("username") or "",
+                r2.get("bio") or "",
+                r2.get("sample") or "",
+                proj,
+                what,
+            )
+            if x
+        )
+        if is_supply_side(blob) or has_insufficient_product_info(blob):
+            continue
+        if is_invalid_product_name(proj):
+            continue
+
         r2.update({"category": cat, "project": proj, "project_url": url, "what_they_do": what})
         out.append(r2)
 

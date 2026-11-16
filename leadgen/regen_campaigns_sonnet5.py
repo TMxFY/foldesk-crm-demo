@@ -54,7 +54,6 @@ def _load_env() -> None:
     for p in (
         ROOT / ".env",
         Path("/Users/timofei/dev/Python/new era/crmtg/.env"),
-        Path("/Users/timofei/dev/Python/new era/creatoros/.env"),
     ):
         if p.exists():
             for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -189,7 +188,7 @@ def _check_defects(
         errs.append("deterministic_fallback")
     if "creatoros" in step1_text.lower() or "creatoros" in followup1_text.lower():
         errs.append("has_creatoros")
-    if "if your user growth has hit a ceiling" in step1_text.lower():
+    if "if your user growth has hit a ceiling" in step1_text.lower() or "plug-and-play" in step1_text.lower():
         errs.append("has_ceiling_cliche")
     if "(generated)" in step1_text.lower() or "(generated)" in followup1_text.lower():
         errs.append("has_generated_tag")

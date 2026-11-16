@@ -190,12 +190,29 @@ def _iter_values(value: Any) -> Iterable[str]:
             yield from _iter_values(child)
 
 
+_SYNTHETIC_CANDIDATE_FIELDS = frozenset(
+    {
+        "telegram_candidates",
+        "candidates",
+        "social_candidates",
+        "guessed_telegram",
+    }
+)
+
+
 def extract_public_handles(row: Mapping[str, Any]) -> list[PublicHandle]:
-    """Extract handles only from explicit social/contact fields and URLs."""
+    """Extract handles only from explicit social/contact fields and URLs (never synthetic candidate lists)."""
     out: list[PublicHandle] = []
     seen: set[tuple[str, str]] = set()
     for raw_field, raw_value in row.items():
         field_name = str(raw_field).lower()
+        if field_name in _SYNTHETIC_CANDIDATE_FIELDS:
+            continue
+        if field_name == "telegram_verified" and isinstance(raw_value, list):
+            raw_value = [
+                item for item in raw_value
+                if isinstance(item, Mapping) and str(item.get("match") or "") in {"explicit", "explicit_telegram"}
+            ]
         platform = _SOCIAL_FIELDS.get(field_name, "")
         for value in _iter_values(raw_value):
             text = value.strip()
@@ -350,6 +367,14 @@ async def verify_telegram_candidates(
             else:
                 candidate.verification_status = "not_found"
                 candidate.verification_reason = "none of the exact public-handle variants resolved"
+            continue
+        if bool(getattr(entity, "bot", False)) or bool(getattr(entity, "deleted", False)):
+            candidate.verification_status = "rejected"
+            candidate.verification_reason = "Telegram entity is a bot or deleted account"
+            continue
+        if bool(getattr(entity, "broadcast", False)) or bool(getattr(entity, "megagroup", False)) or entity.__class__.__name__ in {"Channel", "Chat"}:
+            candidate.verification_status = "rejected"
+            candidate.verification_reason = "Telegram entity is a channel or group, not a user"
             continue
         actual = normalize_handle(getattr(entity, "username", ""))
         if not actual or handle_key(actual) != handle_key(candidate.username):

@@ -17,7 +17,9 @@ Replaces legacy CSV Telegram exports (csv_notify.py) with:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import csv
+import fcntl
 import io
 import json
 import os
@@ -26,7 +28,7 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -54,6 +56,13 @@ try:
         micro_ping_first_touch,
         upgrade_to_vlad_step1,
     )
+    from supply_side import (
+        NON_BUYER_ROLES,
+        has_insufficient_product_info,
+        is_invalid_product_name,
+        is_rejected_buyer_category,
+        is_supply_side,
+    )
 except ImportError:
     from leadgen.followup_agent import (
         clean_product_name,
@@ -74,6 +83,13 @@ except ImportError:
         micro_ping_first_touch,
         upgrade_to_vlad_step1,
     )
+    from leadgen.supply_side import (
+        NON_BUYER_ROLES,
+        has_insufficient_product_info,
+        is_invalid_product_name,
+        is_rejected_buyer_category,
+        is_supply_side,
+    )
 
 SHEET_ID = "1Z4KwmUMNuA9Q562y3Vvxa40AFcqGaMyAXAqr7QlbmOQ"
 TAB = "Все2"
@@ -84,11 +100,7 @@ TABS = (
 )
 THRESHOLD = int(os.environ.get("CRM_MCP_PUSH_THRESHOLD", os.environ.get("CSV_NOTIFY_THRESHOLD", "1")))
 
-_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or (
-    "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-    if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    else str(WORKTREE_ROOT / "data" / "leadgen_state")
-)
+_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or str(WORKTREE_ROOT / "data" / "leadgen_state")
 STATE_PATH = os.path.join(_DEFAULT_STATE_DIR, "crm_mcp_push_state.json")
 LEGACY_CSV_STATE_PATH = os.path.join(_DEFAULT_STATE_DIR, "csv_export_state.json")
 _SHEET_WIDTH = 15
@@ -139,11 +151,27 @@ def gsheets_token() -> str:
     )
 
 
+@contextmanager
+def acquire_push_state_lock(state_path: str = STATE_PATH) -> Iterator[None]:
+    lock_path = f"{state_path}.lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
 def read_state(state_path: str = STATE_PATH) -> dict[str, Any]:
     for candidate in (state_path, LEGACY_CSV_STATE_PATH):
         try:
             with open(candidate, encoding="utf-8") as f:
-                data = json.load(f)
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    data = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             if isinstance(data, dict):
                 return {
                     "last_sent_row": int(data.get("last_sent_row", 1)),
@@ -156,11 +184,19 @@ def read_state(state_path: str = STATE_PATH) -> dict[str, Any]:
 
 
 def write_state(state: dict[str, Any], state_path: str = STATE_PATH) -> None:
-    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(state_path)), exist_ok=True)
     payload = dict(state)
     payload["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    tmp_path = f"{state_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    os.replace(tmp_path, state_path)
 
 
 def sheet_rows(tab: str = TAB) -> list[list[str]]:
@@ -236,7 +272,7 @@ def _has_canonical_vlad_copy(text: str | None) -> bool:
     if (
         "creatoros" in low
         or "if your user growth has hit a ceiling" in low
-        or "plug-and-play growth arm" in low
+        or "plug-and-play" in low
     ):
         return False
     return "SoftUGC" in s and REVSHARE_OFFER_TEXT in s
@@ -613,14 +649,56 @@ def build_lead_payload_from_dict(
     }
 
 
-def pack_tab_leads_for_mcp(
+def _passes_sheet_buyer_gate(row: list[Any]) -> bool:
+    cat = _cell(row, 3)
+    name = _cell(row, 4)
+    site = _cell(row, 5)
+    angle = _cell(row, 7)
+    our_angle = _cell(row, 8)
+    first_touch = _cell(row, 10)
+    if is_rejected_buyer_category(cat):
+        return False
+    blob = f"{name}\n{angle}\n{our_angle}"
+    if is_supply_side(blob) or has_insufficient_product_info(blob) or has_insufficient_product_info(first_touch):
+        return False
+    clean_comp = clean_product_name(name, site, angle)
+    if is_invalid_product_name(clean_comp or name):
+        return False
+    return True
+
+
+def _passes_dict_buyer_gate(item: dict[str, Any]) -> bool:
+    src = str(item.get("lead_source") or item.get("source") or "")
+    cat = str(item.get("category") or item.get("niche") or "")
+    if _is_vacancy_source_or_cat(src, cat):
+        return True
+    if is_rejected_buyer_category(cat):
+        return False
+    roles = {str(x).strip() for x in (item.get("roles") or []) if str(x or "").strip()}
+    if item.get("role"):
+        roles.add(str(item["role"]).strip())
+    if roles and not (roles & {"Founder", "Marketing"}) and (roles & NON_BUYER_ROLES):
+        return False
+    name = str(item.get("name") or "")
+    comp = str(item.get("company") or item.get("project") or item.get("product") or name)
+    site = str(item.get("website") or item.get("site") or item.get("project_url") or "")
+    angle = str(item.get("their_angle") or item.get("one_liner") or item.get("bio") or item.get("what_they_do") or "")
+    blob = "\n".join(x for x in (name, comp, angle, str(item.get("bio") or ""), str(item.get("our_angle") or "")) if x)
+    if is_supply_side(blob) or has_insufficient_product_info(blob):
+        return False
+    clean_comp = clean_product_name(comp, site, angle)
+    if is_invalid_product_name(clean_comp or comp):
+        return False
+    return True
+
+
+def _pack_tab_leads_with_offsets(
     tab: str,
     body: list[list[Any]],
     *,
     use_llm: bool = False,
     touch_mode: str | None = None,
-) -> list[dict[str, Any]]:
-    """Filter non-RU sendable rows for a Google Sheet tab and pack them into MCP lead dicts."""
+) -> tuple[list[dict[str, Any]], list[int]]:
     if tab == "Все2":
         pred = contact_has_telegram
     elif tab == "X":
@@ -629,20 +707,24 @@ def pack_tab_leads_for_mcp(
         pred = contact_has_direct
 
     bases: list[list[str]] = []
-    for row in body:
+    consumed_offsets: list[int] = []
+    for offset_idx, row in enumerate(body, start=1):
         if not pred(row):
             continue
         name = _cell(row, 4)
         angle = _cell(row, 7)
         if market_of(_cell(row, 5), f"{name} {angle}") == "ru":
             continue
+        if not _passes_sheet_buyer_gate(row):
+            continue
         padded = [str(c) for c in list(row)[:_SHEET_WIDTH]]
         if len(padded) < _SHEET_WIDTH:
             padded.extend([""] * (_SHEET_WIDTH - len(padded)))
         bases.append(padded)
+        consumed_offsets.append(offset_idx)
 
     if not bases:
-        return []
+        return [], []
 
     lead_source = f"Google Sheet ({tab})"
     mode_resolved = _resolve_b2b_touch_mode(touch_mode)
@@ -675,26 +757,49 @@ def pack_tab_leads_for_mcp(
                         str(srec.get("followup_1") or followups_list[pos_i][0]),
                         VLAD_STEP3_TEXT,
                     )
-            return [
-                build_lead_payload_from_sheet_row(
-                    base,
-                    followups=fpair,
-                    touch_mode=touch_mode,
-                    lead_source=lead_source,
-                )
-                for base, fpair in zip(bases, followups_list)
-            ]
+            return (
+                [
+                    build_lead_payload_from_sheet_row(
+                        base,
+                        followups=fpair,
+                        touch_mode=touch_mode,
+                        lead_source=lead_source,
+                    )
+                    for base, fpair in zip(bases, followups_list)
+                ],
+                consumed_offsets,
+            )
 
     followups_list = generate_followups_for_rows(bases, use_llm=use_llm)
-    return [
-        build_lead_payload_from_sheet_row(
-            base,
-            followups=fpair,
-            touch_mode=touch_mode,
-            lead_source=lead_source,
-        )
-        for base, fpair in zip(bases, followups_list)
-    ]
+    return (
+        [
+            build_lead_payload_from_sheet_row(
+                base,
+                followups=fpair,
+                touch_mode=touch_mode,
+                lead_source=lead_source,
+            )
+            for base, fpair in zip(bases, followups_list)
+        ],
+        consumed_offsets,
+    )
+
+
+def pack_tab_leads_for_mcp(
+    tab: str,
+    body: list[list[Any]],
+    *,
+    use_llm: bool = False,
+    touch_mode: str | None = None,
+) -> list[dict[str, Any]]:
+    """Filter non-RU sendable Product-Buyer rows for a Google Sheet tab and pack into MCP lead dicts."""
+    leads, _offsets = _pack_tab_leads_with_offsets(
+        tab,
+        body,
+        use_llm=use_llm,
+        touch_mode=touch_mode,
+    )
+    return leads
 
 
 def load_leads_from_jsonl(
@@ -722,6 +827,8 @@ def load_leads_from_jsonl(
             angle = str(item.get("their_angle") or item.get("bio") or "")
             site = str(item.get("website") or item.get("site") or item.get("project_url") or "")
             if market_of(site, f"{name} {angle}") == "ru":
+                continue
+            if not _passes_dict_buyer_gate(item):
                 continue
             raw_dict_items.append(dict(item))
 
@@ -1044,99 +1151,105 @@ def main() -> int:
         )
         return 0
 
-    state = read_state()
-    targets = [t for t in TABS if not args.tab or t[0] == args.tab]
-    total_created = 0
-    total_updated = 0
-    total_enrolled = 0
-    remaining_quota = effective_quota if effective_quota > 0 else 999999
+    with acquire_push_state_lock(STATE_PATH):
+        state = read_state(STATE_PATH)
+        targets = [t for t in TABS if not args.tab or t[0] == args.tab]
+        total_created = 0
+        total_updated = 0
+        total_enrolled = 0
+        remaining_quota = effective_quota if effective_quota > 0 else 999999
 
-    for tab, state_key, _slug in targets:
-        if remaining_quota <= 0:
-            break
-        try:
-            rows = sheet_rows(tab)
-        except Exception as exc:
-            log(f"[{tab}] failed to read Google Sheet: {exc}")
-            continue
-        total = len(rows)
-        last = int(state.get(state_key, 1))
-        new_count = total - last
-        log(f"[{tab}] sheet rows: {total} (incl header), watermark: {last}, new: {new_count}")
-        if new_count <= 0 or total <= 1:
-            continue
+        for tab, state_key, _slug in targets:
+            if remaining_quota <= 0:
+                break
+            try:
+                rows = sheet_rows(tab)
+            except Exception as exc:
+                log(f"[{tab}] failed to read Google Sheet: {exc}")
+                continue
+            total = len(rows)
+            start_idx = int(state.get(state_key, 1))
+            new_count = total - start_idx
+            log(f"[{tab}] sheet rows: {total} (incl header), watermark: {start_idx}, new: {new_count}")
+            if new_count <= 0 or total <= 1:
+                continue
 
-        leads = pack_tab_leads_for_mcp(
-            tab,
-            rows[last:],
-            use_llm=args.use_llm,
-            touch_mode=args.touch_mode,
-        )
-        sendable = len(leads)
-        if sendable <= 0:
-            log(f"[{tab}] no foreign sendable leads in new range; advancing watermark to {total}")
-            state[state_key] = total
-            write_state(state)
-            continue
-        if sendable < THRESHOLD and not args.force:
-            log(f"[{tab}] {sendable} < {THRESHOLD} new leads, skipping (use --force to push anyway)")
-            continue
-
-        batch = leads[:remaining_quota]
-        if tab == "X":
-            res = push_leads_via_mcp(
-                batch,
-                enroll_in_campaign=False,
-                campaign_id=None,
-                campaign_name=args.campaign_name,
-                mcp_url=args.mcp_url or None,
+            leads, consumed_offsets = _pack_tab_leads_with_offsets(
+                tab,
+                rows[start_idx:],
+                use_llm=args.use_llm,
+                touch_mode=args.touch_mode,
             )
-        elif tab == "Direct":
-            wa_batch = [l for l in batch if l.get("provider") == "whatsapp" and l.get("phone")]
-            other_batch = [l for l in batch if not (l.get("provider") == "whatsapp" and l.get("phone"))]
-            res = {"created_leads": 0, "updated_leads": 0, "enrolled_in_campaign": 0}
-            if wa_batch:
-                r_wa = push_leads_via_mcp(
-                    wa_batch,
-                    enroll_in_campaign=enroll,
-                    campaign_id=args.campaign_id,
-                    campaign_name=args.campaign_name_wa,
-                    mcp_url=args.mcp_url or None,
-                )
-                for k in ("created_leads", "updated_leads", "enrolled_in_campaign"):
-                    res[k] += int(r_wa.get(k, 0))
-            if other_batch:
-                r_oth = push_leads_via_mcp(
-                    other_batch,
+            sendable = len(leads)
+            if sendable <= 0:
+                log(f"[{tab}] no foreign sendable leads in new range; advancing watermark to {total}")
+                state[state_key] = total
+                write_state(state, STATE_PATH)
+                continue
+            if sendable < THRESHOLD and not args.force:
+                log(f"[{tab}] {sendable} < {THRESHOLD} new leads, skipping (use --force to push anyway)")
+                continue
+
+            batch = leads[:remaining_quota]
+            if tab == "X":
+                res = push_leads_via_mcp(
+                    batch,
                     enroll_in_campaign=False,
                     campaign_id=None,
                     campaign_name=args.campaign_name,
                     mcp_url=args.mcp_url or None,
                 )
-                for k in ("created_leads", "updated_leads"):
-                    res[k] += int(r_oth.get(k, 0))
-        else:
-            res = push_leads_via_mcp(
-                batch,
-                enroll_in_campaign=enroll,
-                campaign_id=args.campaign_id,
-                campaign_name=args.campaign_name,
-                mcp_url=args.mcp_url or None,
+            elif tab == "Direct":
+                wa_batch = [l for l in batch if l.get("provider") == "whatsapp" and l.get("phone")]
+                other_batch = [l for l in batch if not (l.get("provider") == "whatsapp" and l.get("phone"))]
+                res = {"created_leads": 0, "updated_leads": 0, "enrolled_in_campaign": 0}
+                if wa_batch:
+                    r_wa = push_leads_via_mcp(
+                        wa_batch,
+                        enroll_in_campaign=enroll,
+                        campaign_id=args.campaign_id,
+                        campaign_name=args.campaign_name_wa,
+                        mcp_url=args.mcp_url or None,
+                    )
+                    for k in ("created_leads", "updated_leads", "enrolled_in_campaign"):
+                        res[k] += int(r_wa.get(k, 0))
+                if other_batch:
+                    r_oth = push_leads_via_mcp(
+                        other_batch,
+                        enroll_in_campaign=False,
+                        campaign_id=None,
+                        campaign_name=args.campaign_name,
+                        mcp_url=args.mcp_url or None,
+                    )
+                    for k in ("created_leads", "updated_leads"):
+                        res[k] += int(r_oth.get(k, 0))
+            else:
+                res = push_leads_via_mcp(
+                    batch,
+                    enroll_in_campaign=enroll,
+                    campaign_id=args.campaign_id,
+                    campaign_name=args.campaign_name,
+                    mcp_url=args.mcp_url or None,
+                )
+            if len(batch) < len(leads):
+                # Quota capped this batch -> advance ONLY to exact last processed row (start_idx + offset)!
+                new_watermark = start_idx + (consumed_offsets[len(batch) - 1] if consumed_offsets else len(batch))
+            else:
+                new_watermark = total
+            state[state_key] = new_watermark
+            write_state(state, STATE_PATH)
+            remaining_quota = max(0, remaining_quota - len(batch))
+            total_created += int(res.get("created_leads", 0))
+            total_updated += int(res.get("updated_leads", 0))
+            total_enrolled += int(res.get("enrolled_in_campaign", 0))
+            log(
+                f"[{tab}] CRM MCP push complete ({args.touch_mode}): "
+                f"rows {start_idx + 1}..{new_watermark} -> "
+                f"created={res.get('created_leads', 0)}, "
+                f"updated={res.get('updated_leads', 0)}, "
+                f"enrolled={res.get('enrolled_in_campaign', 0)}, "
+                f"watermark={new_watermark}"
             )
-        state[state_key] = total
-        write_state(state)
-        remaining_quota = max(0, remaining_quota - len(batch))
-        total_created += int(res.get("created_leads", 0))
-        total_updated += int(res.get("updated_leads", 0))
-        total_enrolled += int(res.get("enrolled_in_campaign", 0))
-        log(
-            f"[{tab}] CRM MCP push complete ({args.touch_mode}): "
-            f"rows {last + 1}..{total} -> "
-            f"created={res.get('created_leads', 0)}, "
-            f"updated={res.get('updated_leads', 0)}, "
-            f"enrolled={res.get('enrolled_in_campaign', 0)}, "
-            f"watermark={total}"
-        )
 
     log(
         f"CRM MCP summary: created_leads={total_created}, "

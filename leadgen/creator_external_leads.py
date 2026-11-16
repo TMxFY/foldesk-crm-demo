@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded external discovery for CreatorOS.
+"""Bounded external discovery for SoftUGC.
 
 Sources covered by this module:
 
@@ -12,11 +12,8 @@ The module only discovers public candidates.  It deliberately does not mass
 scrape profiles or send outreach.  Every source has a small hard limit and a
 failure in one source is isolated from the others.
 
-The output is JSONL in the same broad shape used by the existing CreatorOS
-enrichment/qualification scripts.  ``--qualify`` runs the shared Jev
-classifier from ``scripts.typesafe_leads``; TypeSafe failures are fail-open so
-we never throw away a candidate merely because the optional AI service is
-unavailable.
+The output is JSONL in the same broad shape used by the existing SoftUGC
+enrichment/qualification scripts.
 """
 from __future__ import annotations
 
@@ -77,8 +74,8 @@ except Exception:
 
 UA = {
     "User-Agent": (
-        "CreatorOS-lead-discovery/1.0 (+public bounded research; "
-        "contact: operations@example.invalid)"
+        "SoftUGC-lead-discovery/1.0 (+public bounded research; "
+        "contact: operations@softugc.com)"
     )
 }
 TIMEOUT = 20
@@ -260,17 +257,64 @@ def telegram_candidates(*values: str | Iterable[str]) -> list[dict[str, str]]:
     return result[:5]
 
 
+def _is_valid_personal_tme_page(html_text: str, username: str) -> bool:
+    handle = (username or "").strip().lstrip("@").lower()
+    if not handle or handle.endswith("bot") or handle.endswith("_bot"):
+        return False
+    raw = html_text or ""
+    if "tgme_page_extra" not in raw or "tgme_page_title" not in raw:
+        return False
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(raw, "html.parser")
+        title_node = soup.select_one(".tgme_page_title")
+        extra_node = soup.select_one(".tgme_page_extra")
+        action_node = soup.select_one(".tgme_action_button_new, .tgme_page_action")
+        if title_node is None or extra_node is None:
+            return False
+        title_txt = title_node.get_text(" ", strip=True)
+        extra_txt = extra_node.get_text(" ", strip=True).lower()
+        action_txt = action_node.get_text(" ", strip=True).lower() if action_node else ""
+        full_low = soup.get_text(" ", strip=True).lower()
+    else:
+        m_title = re.search(r'class="[^"]*\btgme_page_title\b[^"]*"[^>]*>(.*?)</div>', raw, re.I | re.S)
+        m_extra = re.search(r'class="[^"]*\btgme_page_extra\b[^"]*"[^>]*>(.*?)</div>', raw, re.I | re.S)
+        if not m_title or not m_extra:
+            return False
+        title_txt = re.sub(r"<[^>]+>", " ", m_title.group(1)).strip()
+        extra_txt = re.sub(r"<[^>]+>", " ", m_extra.group(1)).strip().lower()
+        action_txt = raw.lower()
+        full_low = raw.lower()
+
+    if not title_txt:
+        return False
+    if any(x in full_low for x in ("username is not found", "page not found", "this page doesn't exist")):
+        return False
+    # Channels show subscriber counts; groups show member/online counts; bots show bot/start bot/monthly users.
+    if any(tok in extra_txt for tok in ("subscriber", "подписчик", "member", "участник", "online", "monthly user")):
+        return False
+    if "start bot" in action_txt or "start bot" in full_low or re.search(r"\bbot\b", extra_txt):
+        return False
+    if f"@{handle}" not in extra_txt:
+        return False
+    return True
+
+
 def verify_telegram_candidates(candidates: list[dict[str, str]], *, max_checks: int = 3) -> list[dict[str, str]]:
-    """Verify only a few public t.me pages; never require Telegram auth."""
+    """Verify public t.me pages belong to a real personal user (not missing/redirect/bot/channel)."""
     verified: list[dict[str, str]] = []
     for candidate in candidates[:max_checks]:
+        uname = str(candidate.get("username") or "").strip().lstrip("@")
+        url = str(candidate.get("url") or "").strip()
+        if not uname or not url:
+            continue
         try:
-            text = _get_text(candidate["url"])
-            low = BeautifulSoup(text, "html.parser").get_text(" ", strip=True).lower() if BeautifulSoup else text.lower()
-            # Telegram's public landing page has an open/join marker.  Pages
-            # that are clearly not found are not treated as a hit.
-            not_found = any(x in low for x in ("username is not found", "page not found", "this page doesn't exist"))
-            if not not_found and ("telegram" in low or "tgme_page" in text):
+            response = requests.get(url, headers=UA, timeout=TIMEOUT, allow_redirects=False)
+            status = int(getattr(response, "status_code", 200) or 0)
+            is_redir = bool(getattr(response, "is_redirect", False)) or (300 <= status < 400) or bool((getattr(response, "headers", {}) or {}).get("Location"))
+            if status != 200 or is_redir:
+                continue
+            text = response.text or ""
+            if _is_valid_personal_tme_page(text, uname):
                 item = dict(candidate)
                 item["verified"] = "1"
                 verified.append(item)

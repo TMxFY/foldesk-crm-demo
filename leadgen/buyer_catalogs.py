@@ -22,11 +22,14 @@ except ImportError:
 
 try:
     from lead_market import market_of
+    from supply_side import is_supply_side
 except ImportError:
     try:
         from leadgen.lead_market import market_of
+        from leadgen.supply_side import is_supply_side
     except ImportError:
         from scripts.lead_market import market_of
+        from scripts.supply_side import is_supply_side
 
 CAP = 8
 TIMEOUT = 8
@@ -41,7 +44,8 @@ SOURCES = (
 _UA = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/json"}
 _CASINO = re.compile(r"casino|slots|betting", re.I)
 _DEVFORUM_SKIP = re.compile(
-    r"\[closed\]|\[volunteer|\bvolunteer\b|\bunpaid\b|looking for game testers",
+    r"\[closed\]|\[volunteer|\bvolunteers?\b|\bunpaid\b|looking for game testers|"
+    r"\[for\s*hire\]|\bfor\s+hire\b|\[commissions?\]|\bcommissions?\s+open\b",
     re.I,
 )
 _OPENASO_MEGACORP = re.compile(
@@ -198,7 +202,10 @@ def _row(source: str, page_url: str, name: str, blob: str, site: str) -> dict | 
     if len(name) < 2 or name.casefold() in _NAME_DENY:
         return None
     blob = blob or ""
-    if _CASINO.search(name) or _CASINO.search(blob) or (site and _CASINO.search(site)):
+    combined = f"{name}\n{blob}"
+    if _CASINO.search(combined) or (site and _CASINO.search(site)):
+        return None
+    if _DEVFORUM_SKIP.search(combined) or is_supply_side(combined):
         return None
     contacts = _contacts(blob)
     chosen = _ok_site(site, page_url) if site else ""

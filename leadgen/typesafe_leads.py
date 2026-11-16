@@ -29,14 +29,15 @@ except Exception:  # SDK is optional at runtime.
 MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
 ENABLED = os.getenv("TYPESAFE_ENABLED", "1").lower() not in {"0", "false", "no"}
 CONCURRENCY = max(1, int(os.getenv("TYPESAFE_CONCURRENCY", "16")))
-_DEFAULT_STATE_DIR = os.getenv("LEADGEN_STATE_DIR") or (
-    "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-    if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    else "data/leadgen_state"
-)
+_DEFAULT_STATE_DIR = os.getenv("LEADGEN_STATE_DIR") or "data/leadgen_state"
 CREATOR_CACHE = Path(os.getenv("TYPESAFE_CREATOR_CACHE", os.path.join(_DEFAULT_STATE_DIR, "typesafe_qualify_cache.json")))
 FOREX_CACHE = Path(os.getenv("TYPESAFE_FOREX_CACHE", "data/typesafe_channel_cache.json"))
 IDENTITY_CACHE = Path(os.getenv("TYPESAFE_IDENTITY_CACHE", os.path.join(_DEFAULT_STATE_DIR, "typesafe_identity_cache.json")))
+
+try:
+    from leadgen.supply_side import is_rejected_buyer_category
+except ImportError:
+    from supply_side import is_rejected_buyer_category  # type: ignore
 
 
 def _load_key() -> str:
@@ -225,20 +226,19 @@ def identity_filter(result: dict[str, Any] | None) -> str:
 
 
 def creator_filter(result: dict[str, Any] | None) -> str:
-    """Return ``keep``, ``drop`` or ``uncertain`` for routing."""
+    """Return ``keep``, ``drop`` or ``uncertain`` for strict Product-Buyer routing."""
     if not result:
         return "uncertain"
+    category = str(result.get("typesafe_category", ""))
+    if is_rejected_buyer_category(category):
+        return "drop"
     fit = float(result.get("typesafe_fit", 0.5))
-    if fit <= float(os.getenv("TYPESAFE_CREATOR_DROP", "0.18")):
+    if fit <= float(os.getenv("TYPESAFE_CREATOR_DROP", "0.30")):
         return "drop"
     role = str(result.get("typesafe_role", ""))
-    category = str(result.get("typesafe_category", ""))
-    target_role = role in {"Founder", "Marketing", "Community", "Creator/KOL"}
-    # Jev's calibrated noul is intentionally conservative for short bios.  A
-    # target buyer role plus a moderate fit is enough to use the typed result;
-    # this is what makes the fast path materially faster than OpenRouter.
-    if fit >= float(os.getenv("TYPESAFE_CREATOR_KEEP", "0.30")) and target_role:
-        return "keep"
-    if fit >= 0.50 and category not in {"Сервис / агентство"}:
+    if role in {"Community", "Creator/KOL", "Dev", "Trader", "Other"}:
+        return "drop" if fit < 0.45 else "uncertain"
+    target_role = role in {"Founder", "Marketing"}
+    if fit >= float(os.getenv("TYPESAFE_CREATOR_KEEP", "0.60")) and target_role:
         return "keep"
     return "uncertain"

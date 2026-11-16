@@ -408,16 +408,19 @@ async def scan_ad_channels(
 
 
 async def _async_main(args: argparse.Namespace) -> None:
+    raw_channels = args.channels or os.getenv("TG_AD_SPY_CHANNELS", "")
+    channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
+    if not channels:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8"):
+            pass
+        print("# tg_ad_spy: no channels configured; skipping (0 leads)", file=sys.stderr)
+        return
+
     api_id = int(os.getenv("TG_API_ID", "0"))
     api_hash = os.getenv("TG_API_HASH", "")
     if not api_id or not api_hash:
         print("TG_API_ID / TG_API_HASH not set", file=sys.stderr)
-        sys.exit(1)
-
-    raw_channels = args.channels or os.getenv("TG_AD_SPY_CHANNELS", "")
-    channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
-    if not channels:
-        print("No channels provided via --channels or TG_AD_SPY_CHANNELS", file=sys.stderr)
         sys.exit(1)
 
     client = TelegramClient(args.session, api_id, api_hash)

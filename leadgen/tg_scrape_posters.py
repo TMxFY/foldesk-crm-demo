@@ -24,19 +24,20 @@ from telethon.tl.types import Channel, InputPeerChannel, PeerChannel
 
 try:
     from outreach_copy import dm_allowed
+    from supply_side import is_platform_or_social_url, is_supply_side
     from tg_to_gsheet import first_touch_for
 except ImportError:
     try:
         from leadgen.outreach_copy import dm_allowed
+        from leadgen.supply_side import is_platform_or_social_url, is_supply_side
         from leadgen.tg_to_gsheet import first_touch_for
     except ImportError:
         from scripts.outreach_copy import dm_allowed
+        from scripts.supply_side import is_platform_or_social_url, is_supply_side
         from scripts.tg_to_gsheet import first_touch_for
 
-_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or (
-    "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-    if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "leadgen_state")
+_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "leadgen_state"
 )
 ENTITY_CACHE_PATH = os.path.join(_DEFAULT_STATE_DIR, "entity_cache.json")
 PROFILE_CACHE_PATH = os.environ.get(
@@ -139,11 +140,35 @@ ICP_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 LINK_RE = re.compile(r"(https?://[^\s]+|t\.me/[^\s]+|www\.[^\s]+)")
-SELL_ROLES = {"Founder", "Marketing", "Community", "Creator/KOL", "Dev"}
+SELL_ROLES = {"Founder", "Marketing"}
+PRODUCT_BUYER_SIGNAL_RE = re.compile(
+    r"\b("
+    r"founder|co[- ]?founder|ceo|cmo|head\s+of\s+(?:growth|marketing)|"
+    r"building|built|maker\s+of|creator\s+of|launched|launching|"
+    r"saas|b2b|mobile\s+app|ios\s+app|android\s+app|web\s+app|chrome\s+extension|"
+    r"our\s+(?:app|product|platform|startup|tool|protocol|exchange)|"
+    r"mrr|arr|paid\s+users|signups|"
+    r"основател\w*|соосновател\w*|строю|строим|запустил\w*|"
+    r"наш\s+(?:сервис|продукт|стартап)|наше\s+приложени\w*"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def extract_links(text):
     return list(dict.fromkeys(LINK_RE.findall(text))) if text else []
+
+
+def extract_product_links(text):
+    out = []
+    for raw in extract_links(text):
+        cleaned = raw.rstrip(".,;:!?)\"'>]")
+        if cleaned.lower().startswith("t.me/"):
+            continue
+        if is_platform_or_social_url(cleaned):
+            continue
+        out.append(cleaned)
+    return out
 
 
 def categorize(bio):
@@ -159,29 +184,41 @@ def categorize(bio):
 
 
 def is_match(bio, role, sample=""):
-    """Cheap admission into the Jev gate.
+    """Strict buyer/product admission gate.
 
-    Crypto keywords are not the decision. Anyone who left a real bio, a link,
-    or a substantive message is passed to Jev. Investors and empty profiles
-    are dropped here so Jev is not spent on them.
+    Bare social links (t.me / x.com) or long generic bios/messages are rejected.
+    Requires non-supply-side text plus a real Founder/Marketing/product signal.
     """
-    if role == "Investor":
+    if role in {"Investor", "Community", "Creator/KOL", "Dev", "Trader"}:
         return False
     text = (bio or "").strip()
     snippet = (sample or "").strip()
-    if extract_links(text) or extract_links(snippet):
+    combined = f"{text}\n{snippet}".strip()
+    if not combined or is_supply_side(combined):
+        return False
+    product_links = extract_product_links(text) or extract_product_links(snippet)
+    has_signal = bool(PRODUCT_BUYER_SIGNAL_RE.search(combined))
+    if role in SELL_ROLES and (product_links or has_signal) and (len(text) >= 12 or len(snippet) >= 24):
         return True
-    if role in SELL_ROLES and (len(text) >= 8 or len(snippet) >= 20):
-        return True
-    if len(text) >= 20 or len(snippet) >= 40:
+    if product_links and has_signal:
         return True
     return False
+
+
+def _enforce_rule5_no_direct_send(send: bool, allow_rule5_bypass: bool = False) -> None:
+    if send and not allow_rule5_bypass:
+        raise RuntimeError(
+            "Rule 5 violation: direct --send outside CRM is blocked without explicit --i-ran-rule5-dry-run. "
+            "Ingest leads into CRM via MCP and run outreach preview/dry-run first."
+        )
 
 
 async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
                        mode="members", member_limit=100,
                        send=False, send_delay=45.0, max_send=0, send_state=None,
-                       entity_cache=None, profile_cache=None, cursors=None):
+                       entity_cache=None, profile_cache=None, cursors=None,
+                       allow_rule5_bypass=False):
+    _enforce_rule5_no_direct_send(bool(send), bool(allow_rule5_bypass))
     if entity_cache is None:
         entity_cache = {}
     if profile_cache is None:
@@ -453,12 +490,16 @@ async def main():
     p.add_argument("--append", action="store_true", help="append to --output instead of replacing it")
     p.add_argument("--exclude", action="append", default=[],
                    help="jsonl files with previously scraped ids to skip")
-    p.add_argument("--send", action="store_true", help="DM ICP matches")
+    p.add_argument("--send", action="store_true", help="DM ICP matches (blocked unless --i-ran-rule5-dry-run)")
+    p.add_argument("--i-ran-rule5-dry-run", action="store_true",
+                   help="explicit operator attestation required for direct --send")
     p.add_argument("--send-delay", type=float, default=45.0)
     p.add_argument("--max-send", type=int, default=0, help="0 = no cap")
     p.add_argument("--sent-file", default="/tmp/tg_sent_ids.json",
                    help="tracks already-messaged user ids")
     args = p.parse_args()
+
+    _enforce_rule5_no_direct_send(bool(args.send), bool(args.i_ran_rule5_dry_run))
 
     api_id = int(os.getenv("TG_API_ID", "0"))
     api_hash = os.getenv("TG_API_HASH", "")
@@ -495,7 +536,8 @@ async def main():
                                           profile_cache=profile_cache,
                                           cursors=cursors,
                                           mode=args.mode,
-                                          member_limit=args.member_limit)
+                                          member_limit=args.member_limit,
+                                          allow_rule5_bypass=args.i_ran_rule5_dry_run)
                 matched = sum(1 for r in rows if r["icp_match"])
                 print(f"# {g}: {len(rows)} users, {matched} ICP-match", file=sys.stderr)
                 total += len(rows)

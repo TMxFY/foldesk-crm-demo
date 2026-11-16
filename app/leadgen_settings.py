@@ -27,9 +27,6 @@ def _resolve_state_dir() -> Path:
     custom = os.environ.get("LEADGEN_STATE_DIR", "").strip()
     if custom:
         return Path(custom)
-    creatoros_dir = Path("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    if creatoros_dir.is_dir() and "PYTEST_CURRENT_TEST" not in os.environ:
-        return creatoros_dir
     return ROOT / "data" / "leadgen_state"
 
 
@@ -727,7 +724,17 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     # 2. Local JSONL files in state_dir (*.treg.jsonl / *.final.jsonl / discovered_leads.jsonl)
     b2b_cfg = cfg["b2b"]
     if b2b_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
-        from leadgen.crm_mcp_push import load_leads_from_jsonl
+        from leadgen.crm_mcp_push import build_lead_payload_from_dict, pack_tab_leads_for_mcp
+        from leadgen.lead_market import market_of
+        from leadgen.supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_supply_side,
+        )
+        from leadgen.tg_enrich_leads import classify_role
+        from leadgen.tg_to_gsheet import keep_for_sheet
 
         jsonl_candidates = sorted(
             glob.glob(str(state_dir / "*.treg.jsonl"))
@@ -737,11 +744,79 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
         )
         if jsonl_candidates:
             latest_jsonl = Path(jsonl_candidates[-1])
-            leads = load_leads_from_jsonl(
-                latest_jsonl,
-                touch_mode=str(b2b_cfg.get("touch_mode") or "direct"),
-                use_llm=False,
-            )
+            touch_mode_val = str(b2b_cfg.get("touch_mode") or "direct")
+            leads: list[dict[str, Any]] = []
+            sheet_like: list[list[Any]] = []
+
+            for raw_line in latest_jsonl.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                if isinstance(item, list):
+                    sheet_like.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                cand = dict(item)
+                uname = str(cand.get("username") or cand.get("tg_username") or cand.get("telegram_username") or "").strip().lstrip("@")
+                if uname and not cand.get("username"):
+                    cand["username"] = uname
+                phone_val = str(cand.get("phone") or "").strip()
+                if phone_val and not cand.get("whatsapp"):
+                    digits = re.sub(r"\D", "", phone_val)
+                    if len(digits) >= 8:
+                        cand["whatsapp"] = f"https://wa.me/{digits}"
+                if not cand.get("project") and cand.get("company"):
+                    cand["project"] = cand["company"]
+                if not cand.get("project_url") and (cand.get("website") or cand.get("site") or cand.get("url")):
+                    cand["project_url"] = cand.get("website") or cand.get("site") or cand.get("url")
+                if not cand.get("roles") and not cand.get("role"):
+                    bio_txt = str(cand.get("bio") or "").strip()
+                    inferred_role = classify_role(bio_txt) if bio_txt else ""
+                    if inferred_role:
+                        cand["role"] = inferred_role
+                        cand["roles"] = [inferred_role]
+                    elif "group" not in cand and not is_invalid_product_name(cand.get("project") or cand.get("company")):
+                        cand["roles"] = ["Founder"]
+
+                name_s = str(cand.get("name") or cand.get("company") or cand.get("project") or "")
+                angle_s = str(cand.get("their_angle") or cand.get("what_they_do") or cand.get("bio") or "")
+                site_s = str(cand.get("project_url") or "")
+                if market_of(site_s, f"{name_s} {angle_s}") == "ru":
+                    continue
+                blob = "\n".join(
+                    str(x)
+                    for x in (
+                        name_s,
+                        str(cand.get("company") or ""),
+                        str(cand.get("project") or ""),
+                        angle_s,
+                        str(cand.get("bio") or ""),
+                        str(cand.get("our_angle") or ""),
+                    )
+                    if x
+                )
+                if (
+                    is_supply_side(blob)
+                    or has_insufficient_product_info(blob)
+                    or is_rejected_buyer_category(cand.get("category") or cand.get("niche"))
+                ):
+                    continue
+                roles_set = {str(x).strip() for x in (cand.get("roles") or []) if str(x or "").strip()}
+                if cand.get("role"):
+                    roles_set.add(str(cand["role"]).strip())
+                if roles_set and not (roles_set & {"Founder", "Marketing"}) and (roles_set & NON_BUYER_ROLES):
+                    continue
+                if not keep_for_sheet(cand):
+                    continue
+
+                built = build_lead_payload_from_dict(cand, touch_mode=touch_mode_val)
+                if any(built.get(k) for k in ("username", "phone", "telegram_user_id")):
+                    leads.append(built)
+
+            if sheet_like:
+                leads.extend(pack_tab_leads_for_mcp("Все2", sheet_like, use_llm=False, touch_mode=touch_mode_val))
             b2b_limit = min(remaining_quota, int(b2b_cfg.get("campaign_daily_limit") or 30))
             if leads and b2b_limit > 0:
                 batch = leads[:b2b_limit]

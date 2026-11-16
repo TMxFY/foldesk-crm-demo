@@ -69,10 +69,26 @@ SKIP_SITE_HOSTS = {
     "vc.ru",
     "habr.com",
     "medium.com",
+    "substack.com",
     "linkedin.com",
     "facebook.com",
     "bit.ly",
     "t.co",
+    "lu.ma",
+    "luma.com",
+    "news.ycombinator.com",
+    "ycombinator.com",
+    "huggingface.co",
+    "itunes.apple.com",
+    "apps.apple.com",
+    "play.google.com",
+    "linktr.ee",
+    "linktree.com",
+    "notion.site",
+    "notion.so",
+    "calendly.com",
+    "docs.google.com",
+    "drive.google.com",
 }
 
 NOISE_HANDLES = {
@@ -365,16 +381,19 @@ async def crawl_channel_graph(
 
 
 async def _async_main(args: argparse.Namespace) -> None:
+    raw_seeds = args.seeds or os.getenv("TG_GRAPH_SEED_CHANNELS", "")
+    seeds = [s.strip() for s in raw_seeds.split(",") if s.strip()]
+    if not seeds:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8"):
+            pass
+        print("# tg_channel_graph: no seed channels configured; skipping (0 leads)", file=sys.stderr)
+        return
+
     api_id = int(os.getenv("TG_API_ID", "0"))
     api_hash = os.getenv("TG_API_HASH", "")
     if not api_id or not api_hash:
         print("TG_API_ID / TG_API_HASH not set", file=sys.stderr)
-        sys.exit(1)
-
-    raw_seeds = args.seeds or os.getenv("TG_GRAPH_SEED_CHANNELS", "")
-    seeds = [s.strip() for s in raw_seeds.split(",") if s.strip()]
-    if not seeds:
-        print("No seed channels provided via --seeds or TG_GRAPH_SEED_CHANNELS", file=sys.stderr)
         sys.exit(1)
 
     client = TelegramClient(args.session, api_id, api_hash)

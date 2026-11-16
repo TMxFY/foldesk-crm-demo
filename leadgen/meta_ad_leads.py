@@ -229,7 +229,7 @@ def _scrape_site_contacts(project_url: str) -> dict[str, str]:
     try:
         resp = requests.get(
             project_url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; CreatorOS/1.0)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SoftUGC/1.0)"},
             timeout=8,
         )
         if not resp.ok:

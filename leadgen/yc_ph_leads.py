@@ -57,12 +57,25 @@ except ImportError:
             upgrade_to_vlad_step1,
         )
 
+try:
+    from supply_side import (
+        has_insufficient_product_info,
+        is_invalid_product_name,
+        is_platform_or_social_url,
+        is_supply_side,
+        is_truncated_or_bad_pitch,
+    )
+except ImportError:
+    from leadgen.supply_side import (
+        has_insufficient_product_info,
+        is_invalid_product_name,
+        is_platform_or_social_url,
+        is_supply_side,
+        is_truncated_or_bad_pitch,
+    )
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or (
-    "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-    if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    else os.path.join(ROOT, "data", "leadgen_state")
-)
+STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or os.path.join(ROOT, "data", "leadgen_state")
 SEEN_PATH = os.path.join(STATE_DIR, "yc_ph_seen.json")
 OUT_JSONL = "/tmp/yc_ph_leads.jsonl"
 PENDING_DIR = os.path.join(STATE_DIR, "pending_sheet_appends")
@@ -1155,7 +1168,7 @@ def has_outreach_contact(lead):
 
 
 def validate_lead(l, require_tg=True):
-    """Quality gate: all outreach fields must be non-empty and concrete."""
+    """Quality gate: all outreach fields must be non-empty, real product, and concrete."""
     problems = []
     if require_tg:
         if not (l.get("tg_username") or "").strip():
@@ -1163,24 +1176,97 @@ def validate_lead(l, require_tg=True):
     else:
         if not has_outreach_contact(l):
             problems.append("no contact")
+    prod_name = (l.get("name") or "").strip()
+    if is_invalid_product_name(prod_name):
+        problems.append("invalid/cohort/empty product name")
     ta = (l.get("their_angle") or "").strip()
     if len(ta) < 30:
         problems.append("their_angle empty/too short")
+    if has_insufficient_product_info(ta) or has_insufficient_product_info(l.get("our_angle")):
+        problems.append("insufficient product info")
+    if is_supply_side(f"{prod_name}\n{ta}"):
+        problems.append("supply-side/agency")
     if not (l.get("our_angle") or "").strip():
         problems.append("our_angle empty")
-    if not (l.get("first_touch") or "").strip():
-        problems.append("first_touch empty")
+    ft = (l.get("first_touch") or "").strip()
+    if is_truncated_or_bad_pitch(ft, min_len=40):
+        problems.append("first_touch empty/truncated/cohort")
     return problems
 
 
 # ---------------- Telegram lookup ----------------
 
-def tg_lookup(usernames):
-    """Check t.me/{username} existence via Telethon. Returns {username: tg_id}."""
+_GENERIC_COMPANY_STOPWORDS = frozenset(
+    {
+        "inc", "llc", "ltd", "corp", "co", "ai", "io", "app", "labs", "hq",
+        "tech", "the", "and", "for", "with", "software", "systems", "cloud",
+        "platform", "studio", "group", "yc",
+    }
+)
+
+
+def _company_and_domain_markers(lead: dict) -> list[str]:
+    markers: list[str] = []
+    raw_site = str(lead.get("site") or lead.get("website") or lead.get("project_url") or "").strip()
+    if raw_site and not is_platform_or_social_url(raw_site):
+        parsed = urllib.parse.urlparse(raw_site if "://" in raw_site else f"https://{raw_site}")
+        host = (parsed.hostname or "").lower().removeprefix("www.").rstrip(".")
+        if host and "." in host:
+            markers.append(host)
+            stem = host.split(".")[0]
+            if len(stem) >= 4 and stem not in _GENERIC_COMPANY_STOPWORDS:
+                markers.append(stem)
+
+    raw_name = re.sub(r"\(\s*YC\s+[A-Za-z0-9\s]+\)", "", str(lead.get("name") or ""), flags=re.I).strip()
+    clean_phrase = re.sub(r"[^a-z0-9\s]+", " ", raw_name.lower()).strip()
+    clean_phrase = " ".join(clean_phrase.split())
+    if len(clean_phrase) >= 4 and clean_phrase not in _GENERIC_COMPANY_STOPWORDS:
+        markers.append(clean_phrase)
+    compact = re.sub(r"[^a-z0-9]+", "", raw_name.lower())
+    if len(compact) >= 5 and compact not in _GENERIC_COMPANY_STOPWORDS:
+        markers.append(compact)
+    return list(dict.fromkeys(markers))
+
+
+def verify_yc_tg_candidate(ent, bio: str, lead: dict, candidate_username: str = "") -> bool:
+    """Reject bots, channels, deleted accounts, and unconfirmed namesake guesses (@davidscott)."""
+    from telethon.tl.types import User
+
+    if not isinstance(ent, User) or bool(getattr(ent, "bot", False)) or bool(getattr(ent, "deleted", False)):
+        return False
+
+    cand_low = (candidate_username or getattr(ent, "username", "") or "").strip().lstrip("@").lower()
+    site_tg = str((lead or {}).get("site_tg") or "").strip().lstrip("@").lower()
+    if site_tg and cand_low == site_tg:
+        return True
+
+    first = str(getattr(ent, "first_name", "") or "").strip()
+    last = str(getattr(ent, "last_name", "") or "").strip()
+    tg_blob = f"{first} {last} {bio or ''}".lower()
+    tg_compact = re.sub(r"[^a-z0-9]+", "", tg_blob)
+
+    markers = _company_and_domain_markers(lead or {})
+    if not markers:
+        return False
+
+    for marker in markers:
+        if "." in marker or " " in marker:
+            if marker in tg_blob:
+                return True
+        else:
+            if re.search(rf"\b{re.escape(marker)}\b", tg_blob) or (len(marker) >= 6 and marker in tg_compact):
+                return True
+    return False
+
+
+def tg_lookup(usernames, leads_by_username: dict[str, dict] | None = None):
+    """Check t.me/{username} existence & founder identity via Telethon. Returns {username: tg_id}."""
     if not usernames:
         return {}
     from telethon import TelegramClient
     from telethon.errors import FloodWaitError
+    from telethon.tl.functions.users import GetFullUserRequest
+    from telethon.tl.types import User
 
     api_id = int(os.environ["TG_API_ID"])
     api_hash = os.environ["TG_API_HASH"]
@@ -1193,8 +1279,21 @@ def tg_lookup(usernames):
             for u in usernames:
                 try:
                     ent = await client.get_entity(u)
+                    if not isinstance(ent, User) or bool(getattr(ent, "bot", False)) or bool(getattr(ent, "deleted", False)):
+                        log(f"  TG @{u}: skipped non-user/bot/deleted")
+                        continue
+                    bio = ""
+                    if leads_by_username and u in leads_by_username:
+                        try:
+                            full = await client(GetFullUserRequest(ent))
+                            bio = getattr(getattr(full, "full_user", None), "about", "") or ""
+                        except Exception:
+                            bio = ""
+                        if not verify_yc_tg_candidate(ent, bio, leads_by_username[u], u):
+                            log(f"  TG @{u}: rejected unconfirmed namesake (bio/name lacks company/domain)")
+                            continue
                     found[u] = getattr(ent, "id", None)
-                    log(f"  TG @{u}: FOUND id={found[u]}")
+                    log(f"  TG @{u}: FOUND verified User id={found[u]}")
                 except FloodWaitError as e:
                     log(f"  TG @{u}: flood wait {e.seconds}s, stopping TG lookups")
                     break
@@ -1536,11 +1635,14 @@ def main():
     # Telegram lookup
     if not args.no_tg and fresh:
         cand_map = {}  # username -> lead index
+        leads_by_uname = {}
         for i, l in enumerate(fresh):
             for c in tg_candidates(l):
-                cand_map.setdefault(c, i)
+                if c not in cand_map:
+                    cand_map[c] = i
+                    leads_by_uname[c] = l
         log(f"=== TG lookup: {len(cand_map)} candidates ===")
-        found = tg_lookup(list(cand_map.keys()))
+        found = tg_lookup(list(cand_map.keys()), leads_by_username=leads_by_uname)
         for u, tg_id in found.items():
             l = fresh[cand_map[u]]
             if not l.get("tg_username"):
