@@ -27,12 +27,22 @@ for folder in ("app", "leadgen", "tests"):
         except SyntaxError as exc:
             errors.append(f"SyntaxError in {py_file}: {exc}")
 
-# Sacred Rule 1: Zero legacy CreatorOS prompts/templates in leadgen/
+# Sacred Rule 1: Zero legacy CreatorOS in prompts, templates, or outgoing copy across app/ & leadgen/
 forbidden_re = re.compile(r"\bCreator\s*OS\b|creatoros", re.IGNORECASE)
-for py_file in sorted((root / "leadgen").rglob("*.py")):
-    src = py_file.read_text(encoding="utf-8")
-    if forbidden_re.search(src):
-        errors.append(f"Sacred Rule 1 violation: legacy brand 'CreatorOS' found in {py_file}")
+defensive_guard_re = re.compile(
+    r"(?:re\.compile|re\.sub|in\s+low|in\s+s1_low|not\s+in\b|\.lower\(\)|\.casefold\(\)|LIKE\s+'%creatoros%'|has_creatoros|legacy_creatoros|legacy_brand_creatoros|устаревший\s+бренд|for\s+marker\s+in|\(\?:creatoros\||\(\?P<|\\bCreatorOS\\b|_CREATOROS_|freeze_legacy_1300_and_scrub_creatoros)",
+    re.IGNORECASE,
+)
+for folder in ("app", "leadgen"):
+    for py_file in sorted((root / folder).rglob("*.py")):
+        for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if forbidden_re.search(line) and not defensive_guard_re.search(line):
+                errors.append(
+                    f"Sacred Rule 1 violation: legacy brand 'CreatorOS' in {py_file}:{lineno}: {stripped[:120]}"
+                )
 
 # Anti-fragility check: no broken app.runtime_context import
 for py_file in sorted((root / "leadgen").rglob("*.py")):

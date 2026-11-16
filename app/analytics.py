@@ -1348,7 +1348,7 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection) -> dict:
         {
             "step_order": 1,
             "key": "step1_personal_pitch",
-            "title": "Шаг 1: Персонализированный питч (SoftUGC / CreatorOS)",
+            "title": "Шаг 1: Персонализированный питч (SoftUGC)",
             "delay_label": "Сразу (0 ч)",
             "reached": s1_reached,
             "read": s1_read,
@@ -1359,7 +1359,7 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection) -> dict:
             "positive_of_replied_pct": round(s1_pos / max(1, len(s1_rep_list)) * 100, 1),
             "constructive": s1_constr,
             "constructive_pct": round(s1_constr / max(1, len(s1_rep_list)) * 100, 1),
-            "template_text": "Hey, Scaling community-driven growth often hits a wall with inconsistent organic reach and high content production costs. Our system, CreatorOS / SoftUGC, acts as a plug-and-play growth arm with AI production and our own account network. We generated 183.5M views in 90 days without live shoots...",
+            "template_text": "Hey, Saw {company}. At SoftUGC we run AI UGC production and a multi-account short-form network — 183.5M organic views in 90 days without live shoots...",
         },
         {
             "step_order": 2,

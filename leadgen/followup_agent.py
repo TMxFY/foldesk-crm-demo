@@ -103,7 +103,7 @@ Rules for EACH lead in the input JSON array:
 5. STRICT BANS:
    - NO dashes of any kind: no em-dash (—), no en-dash (–), no double dash (--), no spaced hyphen ( - ). Use commas or periods only.
    - NO AI clichés: ban "sharp hook", "strong hook", "tight demo", "high-retention", "concrete video angles", "wondering if", "curious if", "happy to", "teardown", "on your roadmap", "plug into", "walk you through how we can get that", "organic promotion of".
-   - Do NOT repeat "183.5M", "SoftUGC", or legacy "CreatorOS".
+   - Do NOT repeat "183.5M" or "SoftUGC".
 
 Respond with STRICT JSON only:
 [{"i": 0, "followup_1": "...", "followup_2": "..."}, ...]"""

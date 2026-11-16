@@ -24,7 +24,7 @@ STAGE_ORDER = (
 VARIANT_LABELS = {
     "sonnet5_vlad_v1": "SoftUGC · Sonnet 5 (новый)",
     "vlad_softugc_v1": "SoftUGC · Шаблон Влада",
-    "legacy_creatoros": "CreatorOS (старый архив)",
+    "legacy_creatoros": "Старый архив (до ребрендинга)",
     "legacy_ceiling_hook": "Growth Ceiling (старый архив)",
     "custom_other": "Прочие шаблоны",
 }
