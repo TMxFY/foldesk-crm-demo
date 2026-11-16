@@ -97,7 +97,7 @@ def _inspect_whatsmeow_db(session_path: str) -> dict | None:
                 return None
             raw_jid = str(row[0]).strip()
             user_part = raw_jid.split("@", 1)[0].split(":", 1)[0]
-            digits = re.sub(r"\D", "", user_part) or "79990000000"
+            digits = (re.sub(r"\D", "", user_part) or "79990000000")[-15:]
             push_name = str(row[1] or row[2] or "").strip()
             return {
                 "raw_jid": raw_jid,
@@ -342,7 +342,7 @@ class WhatsAppGateway(TelegramGateway):
         async def _on_pair(_client, ev):
             try:
                 user_part = str(getattr(getattr(ev, "ID", None), "User", "") or "")
-                digits = re.sub(r"\D", "", user_part)
+                digits = re.sub(r"\D", "", user_part)[-15:]
                 bname = str(getattr(ev, "BusinessName", "") or "").strip()
                 info = _inspect_whatsmeow_db(session_path) or {
                     "wa_jid": f"{digits}@s.whatsapp.net" if digits else None,
@@ -389,7 +389,7 @@ class WhatsAppGateway(TelegramGateway):
                 if str(getattr(peer_jid, "Server", "") or "").lower() == "g.us":
                     return
                 sender_user = str(getattr(peer_jid, "User", "") or "").split(":", 1)[0]
-                digits = re.sub(r"\D", "", sender_user)
+                digits = re.sub(r"\D", "", sender_user)[-15:]
                 if not digits:
                     return
                 msg_proto = getattr(ev, "Message", None)
@@ -579,7 +579,7 @@ class WhatsAppGateway(TelegramGateway):
         if upper_code not in valid_codes and nodash_code not in valid_codes:
             raise GatewayError("Неверный код сопряжения WhatsApp")
 
-        digits = re.sub(r"\D", "", clean_phone) or "79990000000"
+        digits = (re.sub(r"\D", "", clean_phone) or "79990000000")[-15:]
         int_from_phone = int(digits[-15:]) if digits else 79990000000
         wa_jid = f"{digits}@s.whatsapp.net"
 
@@ -605,7 +605,7 @@ class WhatsAppGateway(TelegramGateway):
     async def confirm_password(self, password: str, session_path: str) -> dict:
         pending = self._pending.get(session_path) or {}
         phone = pending.get("phone") or "+79990000000"
-        digits = re.sub(r"\D", "", phone) or "79990000000"
+        digits = (re.sub(r"\D", "", phone) or "79990000000")[-15:]
         return {
             "status": "connected",
             "telegram_user_id": int(digits[-15:]),
@@ -668,7 +668,7 @@ class WhatsAppGateway(TelegramGateway):
                     for crow in crows:
                         t_jid = str(crow[0] or "").strip()
                         u_part = t_jid.split("@", 1)[0].split(":", 1)[0]
-                        digits = re.sub(r"\D", "", u_part)
+                        digits = re.sub(r"\D", "", u_part)[-15:]
                         if not digits:
                             continue
                         peer_id = int(digits[-15:])
@@ -702,15 +702,19 @@ class WhatsAppGateway(TelegramGateway):
             if (item.get("peer_type") or "user") != "user":
                 continue
             peer_id = item.get("telegram_user_id")
+            if peer_id is None and item.get("phone"):
+                p_digits = re.sub(r"\D", "", str(item.get("phone")))[-15:]
+                if len(p_digits) >= 7:
+                    peer_id = int(p_digits)
             if peer_id is None:
                 continue
-            digits = re.sub(r"\D", "", str(item.get("phone") or jid or peer_id))
+            digits = re.sub(r"\D", "", str(item.get("phone") or jid or peer_id))[-15:]
             row = {
-                "telegram_user_id": int(peer_id),
+                "telegram_user_id": int(digits[-15:]) if len(digits) >= 7 and not (900000 <= int(peer_id) < 1000000) else int(peer_id),
                 "username": item.get("username"),
                 "name": item.get("name") or (f"WA +{digits}" if digits else ""),
                 "peer_type": "user",
-                "phone": item.get("phone") or (f"+{digits}" if digits else None),
+                "phone": f"+{digits}" if len(digits) >= 7 else item.get("phone"),
                 "wa_jid": jid or (f"{digits}@s.whatsapp.net" if digits else None),
             }
             if "unread_count" in item and item.get("unread_count") is not None:
@@ -748,7 +752,7 @@ class WhatsAppGateway(TelegramGateway):
             if len(matched) >= limit:
                 break
 
-        digits = re.sub(r"\D", "", q)
+        digits = re.sub(r"\D", "", q)[-15:]
         if digits and len(digits) >= 7 and not matched:
             peer_id = int(digits[-15:])
             matched.append(
@@ -930,7 +934,7 @@ class WhatsAppGateway(TelegramGateway):
     ) -> list[dict]:
         results = []
         for raw in phones or []:
-            digits = re.sub(r"\D", "", str(raw or ""))
+            digits = re.sub(r"\D", "", str(raw or ""))[-15:]
             if not digits or len(digits) < 7:
                 continue
             peer_id = int(digits[-15:])

@@ -404,8 +404,20 @@ def _phone_digits_id(phone: str | None) -> int | None:
         return None
     digits = re.sub(r"\D", "", str(phone))
     if len(digits) >= 7:
-        return int(digits[-12:])
+        return int(digits[-15:])
     return None
+
+
+def _normalize_e164_phone(phone: str | None) -> str | None:
+    if not phone:
+        return None
+    raw = str(phone).strip()
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 7:
+        return f"+{digits[-15:]}"
+    return raw
 
 
 def _find_dialog_lead(conn, account_id, telegram_user_id=None, phone=None, provider=None):
@@ -421,13 +433,20 @@ def _find_dialog_lead(conn, account_id, telegram_user_id=None, phone=None, provi
         if row is not None:
             return _public(row, conn)
     if phone and (provider == "whatsapp" or telegram_user_id is None):
+        norm_p = _normalize_e164_phone(phone)
+        p_peer = _phone_digits_id(phone)
         row = conn.execute(
             """
             SELECT * FROM leads
-            WHERE account_id IS ? AND phone = ?
+            WHERE account_id IS ?
+              AND (
+                  phone = ?
+                  OR (? IS NOT NULL AND phone = ?)
+                  OR (? IS NOT NULL AND telegram_user_id = ?)
+              )
             ORDER BY id LIMIT 1
             """,
-            (account_id, phone),
+            (account_id, phone, norm_p, norm_p, p_peer, p_peer),
         ).fetchone()
         if row is not None:
             return _public(row, conn)
@@ -490,16 +509,21 @@ def create_lead(
         raise ValueError("Укажите имя, username, телефон или telegram id")
 
     if resolved_provider == "whatsapp":
+        if phone:
+            phone = _normalize_e164_phone(phone)
         if telegram_user_id is None and phone:
             telegram_user_id = _phone_digits_id(phone)
         if phone:
+            p_peer = _phone_digits_id(phone)
             dup = conn.execute(
                 """
                 SELECT id FROM leads
-                WHERE account_id IS ? AND phone = ? AND COALESCE(provider, 'telegram') = 'whatsapp'
+                WHERE account_id IS ?
+                  AND (phone = ? OR (? IS NOT NULL AND telegram_user_id = ?))
+                  AND COALESCE(provider, 'telegram') = 'whatsapp'
                 LIMIT 1
                 """,
-                (account_id, phone),
+                (account_id, phone, p_peer, p_peer),
             ).fetchone()
             if dup is not None:
                 raise ValueError("Лид с таким телефоном уже есть")
@@ -879,10 +903,13 @@ def add_lead_from_dialog(
 
     resolved_provider = _resolve_provider(conn, provider, account_id)
     phone = (phone or "").strip() or None
-    if resolved_provider == "whatsapp" and not phone:
-        peer_str = str(telegram_user_id).strip()
-        if peer_str.isdigit() and 7 <= len(peer_str) <= 15 and not peer_str.startswith("900"):
-            phone = f"+{peer_str}"
+    if resolved_provider == "whatsapp":
+        if phone:
+            phone = _normalize_e164_phone(phone)
+        else:
+            peer_str = str(telegram_user_id).strip()
+            if peer_str.isdigit() and 7 <= len(peer_str) <= 15 and not peer_str.startswith("900"):
+                phone = f"+{peer_str}"
 
     existing = _find_dialog_lead(
         conn, account_id, telegram_user_id, phone=phone, provider=resolved_provider
@@ -1279,7 +1306,7 @@ def _norm_dup_phone(phone: str | None) -> str | None:
     if len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
     if len(digits) >= 7:
-        return digits
+        return digits[-15:]
     return raw
 
 

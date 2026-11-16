@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import sqlite3
 import tempfile
@@ -288,13 +289,101 @@ def restore_from_cloud(
         return {"ok": False, "restored": False, "configured": True}
 
     raw_db_bytes = base64.b64decode(db_b64)
-    saved_at = str(bundle.get("saved_at") or "")
+    if len(raw_db_bytes) < 4096 or raw_db_bytes[:16] != b"SQLite format 3\x00":
+        return {
+            "ok": False,
+            "restored": False,
+            "configured": True,
+            "reason": "corrupt_cloud_db",
+        }
+
+    saved_at = str(bundle.get("saved_at") or "").strip()
     saved_at_cmp = saved_at.rstrip("Z")
+    has_valid_saved_at = bool(
+        saved_at_cmp and re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}", saved_at_cmp)
+    )
+
+    cloud_step_sum = 0
+    cloud_camp_progress: dict[int, tuple[int, str]] = {}
+    cloud_max = ""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as ctmp:
+        ctmp_path = Path(ctmp.name)
+    try:
+        ctmp_path.write_bytes(raw_db_bytes)
+        cconn = sqlite3.connect(ctmp_path, timeout=5.0)
+        try:
+            qc = cconn.execute("PRAGMA quick_check").fetchone()
+            if not qc or str(qc[0] or "").strip().lower() != "ok":
+                return {
+                    "ok": False,
+                    "restored": False,
+                    "configured": True,
+                    "reason": "corrupt_cloud_db",
+                }
+            for tbl, col in (
+                ("leads", "updated_at"),
+                ("dialogs", "updated_at"),
+                ("messages", "sent_at"),
+                ("campaign_recipients", "last_sent_at"),
+                ("campaign_recipients", "updated_at"),
+                ("kv_settings", "updated_at"),
+                ("accounts", "created_at"),
+                ("accounts", "updated_at"),
+            ):
+                try:
+                    crow_ts = cconn.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()
+                    if crow_ts and crow_ts[0] and str(crow_ts[0]).rstrip("Z") > cloud_max:
+                        cloud_max = str(crow_ts[0]).rstrip("Z")
+                except sqlite3.OperationalError:
+                    pass
+            try:
+                crow = cconn.execute(
+                    "SELECT COALESCE(SUM(COALESCE(current_step, 0)), 0) FROM campaign_recipients"
+                ).fetchone()
+                if crow and crow[0] is not None:
+                    cloud_step_sum = int(crow[0])
+                for c_id, c_sum, c_last in cconn.execute(
+                    """
+                    SELECT campaign_id,
+                           COALESCE(SUM(COALESCE(current_step, 0)), 0),
+                           COALESCE(MAX(COALESCE(last_sent_at, '')), '')
+                    FROM campaign_recipients
+                    GROUP BY campaign_id
+                    """
+                ).fetchall():
+                    if c_id is not None:
+                        cloud_camp_progress[int(c_id)] = (
+                            int(c_sum or 0),
+                            str(c_last or "").rstrip("Z"),
+                        )
+            except sqlite3.OperationalError:
+                cloud_step_sum = 0
+        finally:
+            cconn.close()
+    except sqlite3.DatabaseError:
+        return {
+            "ok": False,
+            "restored": False,
+            "configured": True,
+            "reason": "corrupt_cloud_db",
+        }
+    finally:
+        if ctmp_path.exists():
+            ctmp_path.unlink()
+
     if not force and db_path.exists() and db_path.stat().st_size > 4096:
         try:
             local_conn = sqlite3.connect(db_path, timeout=5.0)
             try:
                 local_max = ""
+                local_rows_total = 0
+                for tbl in ("leads", "dialogs", "messages", "accounts", "campaign_recipients"):
+                    try:
+                        cnt_r = local_conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()
+                        if cnt_r and cnt_r[0]:
+                            local_rows_total += int(cnt_r[0])
+                    except sqlite3.OperationalError:
+                        pass
                 for tbl, col in (
                     ("leads", "updated_at"),
                     ("dialogs", "updated_at"),
@@ -309,7 +398,7 @@ def restore_from_cloud(
                         row = local_conn.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()
                         if row and row[0] and str(row[0]).rstrip("Z") > local_max:
                             local_max = str(row[0]).rstrip("Z")
-                    except Exception:
+                    except sqlite3.OperationalError:
                         pass
                 local_step_sum = 0
                 local_camp_progress: dict[int, tuple[int, str]] = {}
@@ -333,74 +422,58 @@ def restore_from_cloud(
                                 int(c_sum or 0),
                                 str(c_last or "").rstrip("Z"),
                             )
-                except Exception:
+                except sqlite3.OperationalError:
                     local_step_sum = 0
             finally:
                 local_conn.close()
+        except sqlite3.Error as exc:
+            return {
+                "ok": False,
+                "restored": False,
+                "configured": True,
+                "reason": "local_db_inspect_error",
+                "error": str(exc),
+            }
 
-            if local_step_sum > 0 or local_camp_progress:
-                cloud_step_sum: int | None = None
-                cloud_camp_progress: dict[int, tuple[int, str]] = {}
-                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as ctmp:
-                    ctmp_path = Path(ctmp.name)
-                try:
-                    ctmp_path.write_bytes(raw_db_bytes)
-                    cconn = sqlite3.connect(ctmp_path, timeout=5.0)
-                    try:
-                        crow = cconn.execute(
-                            "SELECT COALESCE(SUM(COALESCE(current_step, 0)), 0) FROM campaign_recipients"
-                        ).fetchone()
-                        if crow and crow[0] is not None:
-                            cloud_step_sum = int(crow[0])
-                        for c_id, c_sum, c_last in cconn.execute(
-                            """
-                            SELECT campaign_id,
-                                   COALESCE(SUM(COALESCE(current_step, 0)), 0),
-                                   COALESCE(MAX(COALESCE(last_sent_at, '')), '')
-                            FROM campaign_recipients
-                            GROUP BY campaign_id
-                            """
-                        ).fetchall():
-                            if c_id is not None:
-                                cloud_camp_progress[int(c_id)] = (
-                                    int(c_sum or 0),
-                                    str(c_last or "").rstrip("Z"),
-                                )
-                    finally:
-                        cconn.close()
-                except Exception:
-                    cloud_step_sum = None
-                finally:
-                    if ctmp_path.exists():
-                        ctmp_path.unlink()
-                ahead_campaign_id: int | None = None
-                for c_id, (l_sum, l_last) in local_camp_progress.items():
-                    c_sum, c_last = cloud_camp_progress.get(c_id, (0, ""))
-                    if l_sum > c_sum or (l_last and l_last > c_last):
-                        ahead_campaign_id = c_id
-                        break
-                if (cloud_step_sum is not None and local_step_sum > cloud_step_sum) or ahead_campaign_id is not None:
-                    return {
-                        "ok": True,
-                        "restored": False,
-                        "configured": True,
-                        "reason": "local_outreach_progress_ahead",
-                        "local_step_sum": local_step_sum,
-                        "cloud_step_sum": cloud_step_sum,
-                        "ahead_campaign_id": ahead_campaign_id,
-                    }
+        local_non_empty = local_rows_total > 0 or bool(local_max)
+        if local_non_empty and not has_valid_saved_at:
+            return {
+                "ok": False,
+                "restored": False,
+                "configured": True,
+                "reason": "invalid_cloud_metadata",
+            }
 
-            if saved_at_cmp and local_max and local_max > saved_at_cmp:
+        if local_step_sum > 0 or local_camp_progress:
+            ahead_campaign_id: int | None = None
+            for c_id, (l_sum, l_last) in local_camp_progress.items():
+                c_sum, c_last = cloud_camp_progress.get(c_id, (0, ""))
+                if l_sum > c_sum or (l_last and l_last > c_last):
+                    ahead_campaign_id = c_id
+                    break
+            if local_step_sum > cloud_step_sum or ahead_campaign_id is not None:
                 return {
                     "ok": True,
                     "restored": False,
                     "configured": True,
-                    "reason": "local_db_newer",
-                    "local_updated_at": local_max,
-                    "cloud_saved_at": saved_at,
+                    "reason": "local_outreach_progress_ahead",
+                    "local_step_sum": local_step_sum,
+                    "cloud_step_sum": cloud_step_sum,
+                    "ahead_campaign_id": ahead_campaign_id,
                 }
-        except Exception:
-            pass
+
+        if local_max and (
+            (has_valid_saved_at and local_max > saved_at_cmp)
+            or (cloud_max and local_max > cloud_max)
+        ):
+            return {
+                "ok": True,
+                "restored": False,
+                "configured": True,
+                "reason": "local_db_newer",
+                "local_updated_at": local_max,
+                "cloud_saved_at": saved_at,
+            }
 
     existing_auth_sessions: list[tuple] = []
     try:
@@ -539,6 +612,36 @@ def read_tg_runtime_lease(
         return {"_read_error": True}
 
 
+def _is_tg_runtime_lease_expired(
+    lease: dict[str, Any],
+    *,
+    now_epoch: float,
+    lease_ttl_seconds: float,
+) -> bool:
+    raw_exp = lease.get("expires_at")
+    if raw_exp is not None and str(raw_exp).strip() != "":
+        try:
+            return now_epoch >= float(raw_exp)
+        except (TypeError, ValueError):
+            try:
+                exp_str = str(raw_exp).strip()
+                if exp_str.endswith("Z"):
+                    exp_str = exp_str[:-1] + "+00:00"
+                exp_dt = datetime.datetime.fromisoformat(exp_str)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                return now_epoch >= exp_dt.timestamp()
+            except ValueError:
+                return False
+    try:
+        hb_epoch = float(lease.get("heartbeat_epoch") or 0)
+    except (TypeError, ValueError):
+        return False
+    if hb_epoch <= 0:
+        return False
+    return (now_epoch - hb_epoch) >= lease_ttl_seconds
+
+
 def check_tg_runtime_lease_owned(
     conn: sqlite3.Connection | None = None,
 ) -> bool:
@@ -546,8 +649,10 @@ def check_tg_runtime_lease_owned(
     if not cfg:
         return True
     lease = read_tg_runtime_lease(conn)
-    if lease is None or lease.get("_read_error"):
+    if lease is None:
         return True
+    if lease.get("_read_error"):
+        return False
     owner = lease.get("instance_id")
     if owner and owner != INSTANCE_ID and bool(lease.get("released")) is False:
         return False
@@ -558,14 +663,17 @@ def write_tg_runtime_lease(
     *,
     released: bool = False,
     conn: sqlite3.Connection | None = None,
+    lease_ttl_seconds: float = 45.0,
 ) -> bool:
     cfg = _resolve_r2_config(conn)
     if not cfg:
         return False
+    now_epoch = time.time()
     payload = json.dumps(
         {
             "instance_id": INSTANCE_ID,
-            "heartbeat_epoch": time.time(),
+            "heartbeat_epoch": now_epoch,
+            "expires_at": now_epoch + max(1.0, float(lease_ttl_seconds)),
             "updated_at": utc_now(),
             "released": bool(released),
         },
@@ -591,7 +699,7 @@ def wait_and_acquire_tg_runtime_lease(
     if not cfg:
         return True
     started = time.monotonic()
-    while time.monotonic() - started < max_wait_seconds:
+    while True:
         lease = read_tg_runtime_lease(conn)
         free = False
         if lease is None:
@@ -602,22 +710,18 @@ def wait_and_acquire_tg_runtime_lease(
             free = True
         elif bool(lease.get("released")) is True:
             free = True
-        else:
-            try:
-                hb_epoch = float(lease.get("heartbeat_epoch") or 0)
-            except (TypeError, ValueError):
-                hb_epoch = 0.0
-            if time.time() - hb_epoch >= lease_ttl_seconds:
-                free = True
+        elif _is_tg_runtime_lease_expired(
+            lease, now_epoch=time.time(), lease_ttl_seconds=lease_ttl_seconds
+        ):
+            free = True
         if free:
-            write_tg_runtime_lease(released=False, conn=conn)
-            return True
+            return write_tg_runtime_lease(
+                released=False, conn=conn, lease_ttl_seconds=lease_ttl_seconds
+            )
         remaining = max_wait_seconds - (time.monotonic() - started)
         if remaining <= 0:
-            break
+            return False
         time.sleep(min(poll_interval, max(0.01, remaining)))
-    write_tg_runtime_lease(released=False, conn=conn)
-    return True
 
 
 def release_tg_runtime_lease(conn: sqlite3.Connection | None = None) -> bool:

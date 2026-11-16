@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -19,185 +20,74 @@ from app.digest import _norm_ts, ensure_dialog_notify_columns
 from app.telegram_gateway import GatewayError, render_formatted_html
 
 
-DEFAULT_VOICE_RUSSIAN_SPEECH = (
-    "Привет! Посмотрели ваше предложение по видео креативам, "
-    "давайте обсудим запуск пилота сегодня в Зуме."
-)
-
-
-def _synthesize_harmonic_speech_wav(duration_sec: float = 3.2) -> bytes:
-    sample_rate = 24000
-    total_samples = int(sample_rate * duration_sec)
-    buf = io.BytesIO()
-    syllables = [
-        (0.06, 0.34, 165.0),
-        (0.39, 0.72, 196.0),
-        (0.78, 1.18, 220.0),
-        (1.26, 1.68, 185.0),
-        (1.75, 2.24, 207.65),
-        (2.32, 2.95, 174.61),
-    ]
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        frames = bytearray()
-        for i in range(total_samples):
-            t = i / sample_rate
-            val = 0.0
-            for s_start, s_end, f0 in syllables:
-                if s_start <= t <= s_end:
-                    local = (t - s_start) / max(0.01, (s_end - s_start))
-                    env = math.sin(math.pi * local) ** 0.7
-                    vib = 1.0 + 0.012 * math.sin(2.0 * math.pi * 5.4 * t)
-                    freq = f0 * vib
-                    sig = (
-                        0.55 * math.sin(2.0 * math.pi * freq * t)
-                        + 0.28 * math.sin(2.0 * math.pi * (freq * 2.0) * t)
-                        + 0.12 * math.sin(2.0 * math.pi * (freq * 3.0) * t)
-                        + 0.05 * math.sin(2.0 * math.pi * (freq * 4.0) * t)
-                    )
-                    val = env * sig
-                    break
-            sample = max(-32767, min(32767, int(val * 14500)))
-            frames.extend(struct.pack("<h", sample))
-        wf.writeframes(bytes(frames))
-    return buf.getvalue()
-
-
 def ensure_playable_voice_wav(
     raw_bytes: bytes | None,
     cache_key: str,
     text_hint: str = "",
-) -> bytes:
+) -> bytes | None:
+    _ = text_hint
     raw = bytes(raw_bytes or b"")
-    if len(raw) > 256 and raw[:4] == b"RIFF":
+    if len(raw) >= 44 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
         return raw
 
     playable_dir = INBOX_MEDIA_DIR / "playable"
     playable_dir.mkdir(parents=True, exist_ok=True)
     safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(cache_key or "voice"))[:80] or "voice"
     cached_wav = playable_dir / f"{safe_key}.wav"
-    if cached_wav.exists() and cached_wav.is_file() and cached_wav.stat().st_size > 256:
+    if cached_wav.exists() and cached_wav.is_file() and cached_wav.stat().st_size > 44:
         existing = cached_wav.read_bytes()
         if existing[:4] == b"RIFF":
             return existing
 
-    if len(raw) > 256:
-        src_path = playable_dir / f"{safe_key}.input"
-        try:
-            src_path.write_bytes(raw)
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(src_path),
-                    "-ar",
-                    "24000",
-                    "-ac",
-                    "1",
-                    "-f",
-                    "wav",
-                    str(cached_wav),
-                ],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            if cached_wav.exists() and cached_wav.stat().st_size > 256:
-                wav_data = cached_wav.read_bytes()
-                if wav_data[:4] == b"RIFF":
-                    return wav_data
-        except Exception:
-            pass
-        finally:
-            src_path.unlink(missing_ok=True)
+    if not raw:
+        return None
 
-    spoken_text = (text_hint or "").strip()
-    if not spoken_text or spoken_text.startswith("🎤") or len(spoken_text) < 10:
-        spoken_text = DEFAULT_VOICE_RUSSIAN_SPEECH
-    elif "Голосовое по запуску пилота" in spoken_text:
-        spoken_text = DEFAULT_VOICE_RUSSIAN_SPEECH
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        for cand in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
+            if Path(cand).exists():
+                ffmpeg_bin = cand
+                break
+    if not ffmpeg_bin:
+        return None
 
-    say_bin = Path("/usr/bin/say")
-    if say_bin.exists():
-        try:
-            subprocess.run(
-                [
-                    str(say_bin),
-                    "-v",
-                    "Milena",
-                    "--data-format=LEI16@24000",
-                    "-o",
-                    str(cached_wav),
-                    spoken_text,
-                ],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            if cached_wav.exists() and cached_wav.stat().st_size > 256:
-                wav_data = cached_wav.read_bytes()
-                if wav_data[:4] == b"RIFF":
-                    return wav_data
-        except Exception:
-            pass
-
-        aiff_path = playable_dir / f"{safe_key}.aiff"
-        try:
-            subprocess.run(
-                [str(say_bin), "-o", str(aiff_path), spoken_text],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            if aiff_path.exists() and aiff_path.stat().st_size > 256:
-                for cmd in (
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        str(aiff_path),
-                        "-ar",
-                        "24000",
-                        "-ac",
-                        "1",
-                        "-f",
-                        "wav",
-                        str(cached_wav),
-                    ],
-                    [
-                        "/usr/bin/afconvert",
-                        "-f",
-                        "WAVE",
-                        "-d",
-                        "LEI16@24000",
-                        "-c",
-                        "1",
-                        str(aiff_path),
-                        str(cached_wav),
-                    ],
-                ):
-                    try:
-                        subprocess.run(cmd, capture_output=True, timeout=15, check=False)
-                        if cached_wav.exists() and cached_wav.stat().st_size > 256:
-                            wav_data = cached_wav.read_bytes()
-                            if wav_data[:4] == b"RIFF":
-                                return wav_data
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        finally:
-            aiff_path.unlink(missing_ok=True)
-
-    wav_bytes = _synthesize_harmonic_speech_wav()
+    nonce = f"{os.getpid()}_{time.monotonic_ns()}"
+    src_path = playable_dir / f".tmp_{safe_key}_{nonce}.input"
+    tmp_wav = playable_dir / f".tmp_{safe_key}_{nonce}.wav"
     try:
-        cached_wav.write_bytes(wav_bytes)
+        src_path.write_bytes(raw)
+        proc = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(src_path),
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
+                "-f",
+                "wav",
+                str(tmp_wav),
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode == 0 and tmp_wav.exists() and tmp_wav.stat().st_size > 44:
+            wav_data = tmp_wav.read_bytes()
+            if wav_data[:4] == b"RIFF":
+                os.replace(tmp_wav, cached_wav)
+                return wav_data
     except Exception:
         pass
-    return wav_bytes
+    finally:
+        src_path.unlink(missing_ok=True)
+        tmp_wav.unlink(missing_ok=True)
+
+    return None
 
 
 def _media_preview_label(
@@ -381,7 +271,9 @@ def _extract_dialog_phone(item: dict, peer_id: int | None, provider: str) -> str
     if raw:
         digits = re.sub(r"\D", "", raw)
         if digits and len(digits) >= 7:
-            return raw if raw.startswith("+") else f"+{digits}"
+            if provider == "whatsapp":
+                return f"+{digits[-15:]}"
+            return raw if raw.startswith("+") else f"+{digits[-15:]}"
         return raw
     if provider == "whatsapp" and peer_id is not None:
         peer_str = str(peer_id).strip()
@@ -455,13 +347,16 @@ def stop_outreach_on_reply(
     clean_user = str(username).strip().lstrip("@") if username else None
     clean_phone = str(phone).strip() if phone else None
     phone_digits = re.sub(r"\D", "", clean_phone or "")
+    norm_e164_digits = phone_digits[-15:] if (phone_digits and len(phone_digits) >= 7) else ""
     phone_variants = set()
     if clean_phone:
         phone_variants.add(clean_phone)
-    if phone_digits and len(phone_digits) >= 7:
+    if norm_e164_digits:
         phone_variants.add(phone_digits)
         phone_variants.add(f"+{phone_digits}")
-    phone_peer_id = int(phone_digits[-12:]) if (phone_digits and len(phone_digits) >= 7) else None
+        phone_variants.add(norm_e164_digits)
+        phone_variants.add(f"+{norm_e164_digits}")
+    phone_peer_id = int(norm_e164_digits) if norm_e164_digits else None
     clean_peer_id = int(peer_id) if peer_id is not None else phone_peer_id
     clean_lead_id = int(lead_id) if lead_id is not None else None
 
@@ -472,6 +367,10 @@ def stop_outreach_on_reply(
         return 0
 
     ensure_dialog_notify_columns(conn)
+
+    sql_phone_digits_expr = (
+        "substr(replace(replace(replace(replace(replace(phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -15)"
+    )
 
     # Find matching leads first so we can also match campaign_recipients by lead_id
     lead_clauses = []
@@ -489,6 +388,9 @@ def stop_outreach_on_reply(
         ph_v = ",".join("?" for _ in phone_variants)
         lead_clauses.append(f"(phone IS NOT NULL AND phone IN ({ph_v}))")
         lead_params.extend(sorted(phone_variants))
+    if norm_e164_digits:
+        lead_clauses.append(f"(phone IS NOT NULL AND {sql_phone_digits_expr} = ?)")
+        lead_params.append(norm_e164_digits)
 
     matched_lead_ids: set[int] = set()
     prev_lead_statuses: dict[int, str] = {}
@@ -522,6 +424,9 @@ def stop_outreach_on_reply(
         ph_v = ",".join("?" for _ in phone_variants)
         rec_clauses.append(f"(phone IS NOT NULL AND phone IN ({ph_v}))")
         rec_params.extend(sorted(phone_variants))
+    if norm_e164_digits:
+        rec_clauses.append(f"(phone IS NOT NULL AND {sql_phone_digits_expr} = ?)")
+        rec_params.append(norm_e164_digits)
 
     stopped_count = 0
     stopped_campaign_ids: set[int] = set()
@@ -980,7 +885,7 @@ def _resolve_private_peer_id(item: dict) -> int | None:
     if peer_id is None and item.get("phone"):
         digits = re.sub(r"\D", "", str(item["phone"]))
         if len(digits) >= 7:
-            peer_id = int(digits[-12:])
+            peer_id = int(digits[-15:])
     return int(peer_id) if peer_id is not None else None
 
 
@@ -1373,8 +1278,36 @@ def _prepare_message_fields(conn, account_id: int, message: dict, now: str) -> d
 
 
 def _upsert_dialog_message_row(conn, dialog_id: int, direction: str, fields: dict, now: str) -> None:
-    mid = fields["mid"]
+    mid = fields.get("mid")
     if mid is None:
+        preview = fields.get("preview")
+        if preview is None and (fields.get("text") is not None or fields.get("media_type") is not None):
+            preview = _media_preview_label(
+                fields.get("media_type"),
+                fields.get("text"),
+                fields.get("media_filename"),
+            )
+        clean_preview = str(preview or "")[:120]
+        if clean_preview:
+            sent_at = str(fields.get("sent_at") or now)
+            dlg = conn.execute(
+                "SELECT last_message_at FROM dialogs WHERE id = ?",
+                (int(dialog_id),),
+            ).fetchone()
+            if dlg is not None:
+                prev_ts = _norm_ts(dlg["last_message_at"])
+                new_ts = _norm_ts(sent_at)
+                if not prev_ts or not new_ts or new_ts >= prev_ts:
+                    conn.execute(
+                        """
+                        UPDATE dialogs
+                        SET last_message_preview = ?,
+                            last_message_at = COALESCE(last_message_at, ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (clean_preview, sent_at, now, int(dialog_id)),
+                    )
         return
     body = None if fields["text"] is None else str(fields["text"])
     conn.execute(
@@ -1506,7 +1439,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
                 SET username = COALESCE(?, username),
                     title = CASE WHEN ? != '' THEN ? ELSE title END,
                     phone = COALESCE(?, phone),
-                    last_message_preview = ?,
+                    last_message_preview = CASE WHEN ? != '' THEN ? ELSE last_message_preview END,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -1515,6 +1448,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
                     fields["title"],
                     fields["title"],
                     fields["phone"],
+                    fields["preview"],
                     fields["preview"],
                     now,
                     int(prev_dlg["id"]),
@@ -1569,7 +1503,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
                 provider = COALESCE(excluded.provider, dialogs.provider),
                 unread_count = dialogs.unread_count + ?,
                 last_message_at = excluded.last_message_at,
-                last_message_preview = excluded.last_message_preview,
+                last_message_preview = CASE WHEN excluded.last_message_preview != '' THEN excluded.last_message_preview ELSE dialogs.last_message_preview END,
                 last_from_peer = 1,
                 updated_at = excluded.updated_at
             """,
@@ -1735,7 +1669,7 @@ def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
                     provider = COALESCE(?, provider),
                     unread_count = 0,
                     last_message_at = ?,
-                    last_message_preview = ?,
+                    last_message_preview = CASE WHEN ? != '' THEN ? ELSE last_message_preview END,
                     last_from_peer = 0,
                     last_read_at = ?,
                     reply_turn_seq = COALESCE(reply_turn_seq, 0) + ?,
@@ -1749,6 +1683,7 @@ def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
                     fields["phone"],
                     fields["provider"],
                     sent_at,
+                    fields["preview"],
                     fields["preview"],
                     eff_read_at,
                     turn_delta,
@@ -2347,10 +2282,10 @@ def open_dialog_by_lead(
         if lead_row is None:
             p_digits = re.sub(r"\D", "", clean_phone)
             if len(p_digits) >= 7:
-                p_peer_id = int(p_digits[-12:])
+                p_peer_id = int(p_digits[-15:])
                 lead_row = conn.execute(
                     "SELECT * FROM leads WHERE telegram_user_id = ? OR phone = ? OR phone = ? ORDER BY id LIMIT 1",
-                    (p_peer_id, p_digits, f"+{p_digits}"),
+                    (p_peer_id, p_digits[-15:], f"+{p_digits[-15:]}"),
                 ).fetchone()
 
     if lead_row is not None:
@@ -2384,7 +2319,7 @@ def open_dialog_by_lead(
     lead_provider = (lead.get("provider") or "telegram").strip().lower()
     lead_phone = (lead.get("phone") or "").strip() or None
     phone_digits = re.sub(r"\D", "", lead_phone or "")
-    wa_peer_id = int(phone_digits[-12:]) if (phone_digits and len(phone_digits) >= 7) else None
+    wa_peer_id = int(phone_digits[-15:]) if (phone_digits and len(phone_digits) >= 7) else None
 
     if explicit_acc is not None:
         wanted_provider = (explicit_acc.get("provider") or "telegram").strip().lower()
@@ -3005,32 +2940,39 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     sent_at = sent.get("sent_at") or now
     message_text = (sent.get("text") or body).strip() or body
     formatted_html = sent.get("formatted_html") or render_formatted_html(message_text, None)
-    try:
-        cur = conn.execute(
-            """
-            INSERT INTO messages (
-                dialog_id, telegram_message_id, direction, text, formatted_html,
-                sent_at, reply_to_telegram_message_id, created_at, updated_at
-            ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                dialog_id,
-                int(sent["telegram_message_id"]),
-                message_text,
-                formatted_html,
-                sent_at,
-                int(reply_to) if reply_to else None,
-                now,
-                now,
-            ),
-        )
-    except sqlite3.IntegrityError as exc:
-        conn.rollback()
-        raise ValueError("Такое сообщение уже есть") from exc
+    tg_mid = int(sent["telegram_message_id"])
+    conn.execute(
+        """
+        INSERT INTO messages (
+            dialog_id, telegram_message_id, direction, text, formatted_html,
+            sent_at, reply_to_telegram_message_id, created_at, updated_at
+        ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+            direction = 'out',
+            text = excluded.text,
+            formatted_html = excluded.formatted_html,
+            sent_at = excluded.sent_at,
+            reply_to_telegram_message_id = COALESCE(excluded.reply_to_telegram_message_id, messages.reply_to_telegram_message_id),
+            updated_at = excluded.updated_at
+        """,
+        (
+            int(dialog_id),
+            tg_mid,
+            message_text,
+            formatted_html,
+            sent_at,
+            int(reply_to) if reply_to else None,
+            now,
+            now,
+        ),
+    )
     preview = message_text[:120]
     _mark_dialog_replied_out(conn, int(dialog_id), sent_at, preview, now)
     conn.commit()
-    row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM messages WHERE dialog_id = ? AND telegram_message_id = ?",
+        (int(dialog_id), tg_mid),
+    ).fetchone()
     return as_dict(row)
 
 
@@ -3260,7 +3202,8 @@ async def send_dialog_media(
     sent_at = str(sent.get("sent_at") or now)
     msg_text = str(sent.get("text") if sent.get("text") is not None else clean_caption)
     formatted_html = sent.get("formatted_html") or render_formatted_html(msg_text, None)
-    cur = conn.execute(
+    tg_mid = int(sent["telegram_message_id"])
+    conn.execute(
         """
         INSERT INTO messages (
             dialog_id, telegram_message_id, direction, text, media_url,
@@ -3268,10 +3211,22 @@ async def send_dialog_media(
             formatted_html, sent_at, reply_to_telegram_message_id,
             created_at, updated_at
         ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+            direction = 'out',
+            text = excluded.text,
+            media_url = COALESCE(excluded.media_url, messages.media_url),
+            media_type = COALESCE(excluded.media_type, messages.media_type),
+            media_mime = COALESCE(excluded.media_mime, messages.media_mime),
+            media_filename = COALESCE(excluded.media_filename, messages.media_filename),
+            media_duration = COALESCE(excluded.media_duration, messages.media_duration),
+            formatted_html = excluded.formatted_html,
+            sent_at = excluded.sent_at,
+            reply_to_telegram_message_id = COALESCE(excluded.reply_to_telegram_message_id, messages.reply_to_telegram_message_id),
+            updated_at = excluded.updated_at
         """,
         (
             int(dialog_id),
-            int(sent["telegram_message_id"]),
+            tg_mid,
             msg_text,
             media_url,
             clean_mtype,
@@ -3288,7 +3243,10 @@ async def send_dialog_media(
     preview = _media_preview_label(clean_mtype, msg_text, safe_orig_name)
     _mark_dialog_replied_out(conn, int(dialog_id), sent_at, preview, now)
     conn.commit()
-    row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM messages WHERE dialog_id = ? AND telegram_message_id = ?",
+        (int(dialog_id), tg_mid),
+    ).fetchone()
     return as_dict(row)
 
 
@@ -3372,7 +3330,7 @@ async def start_direct_dialog(
             (username,),
         ).fetchone()
     if lead_row is None and phone:
-        phone_peer_id = int(digits[-12:]) if (digits and len(digits) >= 7) else None
+        phone_peer_id = int(digits[-15:]) if (digits and len(digits) >= 7) else None
         lead_row = conn.execute(
             """
             SELECT * FROM leads
@@ -3381,7 +3339,7 @@ async def start_direct_dialog(
                OR (? IS NOT NULL AND telegram_user_id = ?)
             ORDER BY id LIMIT 1
             """,
-            (phone, digits, phone_peer_id, phone_peer_id),
+            (phone, digits[-15:], phone_peer_id, phone_peer_id),
         ).fetchone()
         if lead_row is None and digits:
             for cand in conn.execute(
