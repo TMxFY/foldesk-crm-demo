@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Foldesk CRM / CreatorOS TG lead pipeline: scrape -> enrich -> curate -> append to sheet -> push to CRM via MCP.
-# Safe-paced; dedupes against all prior runs. Sends personalized DM if SEND=1.
-# The launchd entrypoint holds the shared Telethon-session lock before invoking
+# Foldesk CRM / SoftUGC TG lead pipeline: scrape -> enrich -> curate -> append to sheet -> push to CRM via MCP.
+# Safe-paced; dedupes against all prior runs. Direct outreach outside CRM is blocked (Rule 5).
+# The launchd entrypoint holds the shared Telethon-session locks before invoking
 # this script; keep direct runs available for explicit operator use.
 set -o pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="/usr/local/bin:$PATH"
 # tim2 already sits in the older chats. tim3 is only used for the new public set.
-# YC/PH lookup stays on tim2. The launchd lock covers tim2 so that lookup
-# does not collide with ForexSbor.
+# YC/PH lookup stays on tim2. The launchd lock covers both tim2 and tim3.
 SESSION_OLD="/Users/timofei/.claude/skill-telegram/tim2.session"
 SESSION_NEW="/Users/timofei/.claude/skill-telegram/tim3.session"
+export TG_SESSION="${TG_SESSION:-$SESSION_OLD}"
 # 14д raw→QUAL: выкинуты мёртвые и job/agency/local чаты.
 # tim3 вступил 2026-11-04 в shopifyeasy и productcircle_chat, сообщений не слал.
 # buildinpublic ответил заявкой, в список не ставим, пока админ не пустит.
@@ -21,11 +21,8 @@ TG_GROUPS_NEW="solofounderschat,shopifyeasy,productcircle_chat"
 SID="1Z4KwmUMNuA9Q562y3Vvxa40AFcqGaMyAXAqr7QlbmOQ"
 SHEET="Все2"
 
-DEFAULT_CREATOROS_STATE="/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
 if [ -n "${LEADGEN_STATE_DIR:-}" ]; then
   STATE_DIR="$LEADGEN_STATE_DIR"
-elif [ -d "$DEFAULT_CREATOROS_STATE" ]; then
-  STATE_DIR="$DEFAULT_CREATOROS_STATE"
 else
   STATE_DIR="$ROOT/data/leadgen_state"
 fi
@@ -36,7 +33,6 @@ mkdir -p "$PENDING_DIR"
 
 # env
 [ -f ~/.telegram/.env ] && set -a && source ~/.telegram/.env && set +a
-[ -f "/Users/timofei/dev/Python/new era/creatoros/.env" ] && set -a && source "/Users/timofei/dev/Python/new era/creatoros/.env" && set +a
 # repo .env (LLM keys, MCP_API_KEY, CRMTG_MCP_URL etc.); missing file is fine
 [ -f "$ROOT/.env" ] && set -a && source "$ROOT/.env" && set +a
 
@@ -111,7 +107,7 @@ append_pending_json() {
   local label="$2"
   local token response status sheet_enc routed key tab file failed posted
   local -a failed_files
-  routed="$(mktemp -d /tmp/creatoros-route.XXXXXX)"
+  routed="$(mktemp -d /tmp/softugc-route.XXXXXX)"
   if ! python3 - "$ROOT" "$payload" "$routed" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -133,7 +129,7 @@ PY
     file="$routed/${key}.json"
     [[ -f "$file" ]] || continue
     sheet_enc="$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$tab")"
-    response="$(mktemp /tmp/creatoros-sheet-response.XXXXXX)"
+    response="$(mktemp /tmp/softugc-sheet-response.XXXXXX)"
     status="$(curl -sS -o "$response" -w '%{http_code}' -X POST \
       "https://sheets.googleapis.com/v4/spreadsheets/$SID/values/${sheet_enc}%21A:S:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS" \
       --header "Authorization: Bearer $token" --header "Content-Type: application/json" \
@@ -182,18 +178,18 @@ done
 # build command args
 scrape() {
   local session="$1" groups="$2" append_flag="$3"
+  if [ "${SEND:-0}" = "1" ]; then
+    echo "ERROR: Direct SEND=1 in tg_pipeline.sh is forbidden by Sacred Rule 5; push to CRM and run dry-run first." >&2
+    return 1
+  fi
   local cmd=(python3 "$ROOT/leadgen/tg_scrape_posters.py"
     --session "$session" --groups "$groups"
-    --mode "${TG_SCRAPE_MODE:-posters}"
+    --mode "posters"
     --member-limit "${TG_MEMBER_LIMIT:-100}"
     --msg-limit "${MSG_LIMIT:-1800}" --delay "${TG_SCRAPE_DELAY:-0.25}"
     --output "$RAW")
   [ -n "$append_flag" ] && cmd+=(--append)
   [ -f "$MASTER" ] && cmd+=(--exclude "$MASTER")
-  # Лимит 5 личных, группы не писать.
-  if [ "${SEND:-0}" = "1" ]; then
-    cmd+=(--send --send-delay "${SEND_DELAY:-45}" --max-send "${MAX_SEND:-5}")
-  fi
   "${cmd[@]}"
 }
 
@@ -224,13 +220,6 @@ if [ "${SRC_TG_COMMENTS:-1}" = "1" ]; then
   fi
 fi
 
-# 1b3. Lurkers: member lists of the same groups, appended to the same RAW.
-# Profile cache (.tg_pipeline/profile_cache.json, TTL 7d) absorbs the repeat lookups.
-if [ "${SRC_TG_GROUPS:-1}" = "1" ]; then
-  [ -n "$TG_GROUPS_NEW" ] && TG_SCRAPE_MODE=members TG_MEMBER_LIMIT="${TG_LURKER_LIMIT:-1000}" scrape "$SESSION_NEW" "$TG_GROUPS_NEW" append
-  [ -n "$TG_GROUPS_OLD" ] && TG_SCRAPE_MODE=members TG_MEMBER_LIMIT="${TG_LURKER_LIMIT:-1000}" scrape "$SESSION_OLD" "$TG_GROUPS_OLD" append
-fi
-
 # 1b. Bounded public discovery. A failing source is non-fatal.
 # Admission is only admit_discovered_row: Telegram, else X, else LinkedIn/email/WhatsApp, else drop.
 python3 "$ROOT/leadgen/creator_external_leads.py" \
@@ -238,7 +227,7 @@ python3 "$ROOT/leadgen/creator_external_leads.py" \
   --limit "${CREATOR_EXTERNAL_LIMIT:-20}" \
   --verify-telegram --verify-telegram-telethon --no-qualify \
   >/dev/null 2>"$EXTERNAL.log" \
-  || echo "# external CreatorOS discovery failed (non-fatal)"
+  || echo "# external SoftUGC discovery failed (non-fatal)"
 
 # All buyer X queries plus competitor comments, and one subreddit. Same Jev gate.
 SOCIAL="$STATE_DIR/social_$TS.jsonl"

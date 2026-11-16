@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -22,6 +24,7 @@ from app.db import (
     ensure_airtable_pipeline_stages,
     init_db,
     list_pipeline_stages,
+    locked_conn,
     normalize_status,
     status_to_airtable,
     utc_now,
@@ -34,9 +37,21 @@ from app.outreach import (
     _clean_company_title,
     _clean_handle,
     _clean_step1_text,
+    _is_qa_campaign_name,
     _parse_account_ids,
     create_campaign,
+    is_legacy_exhausted_recipient,
     is_offline_non_icp_contact,
+)
+from leadgen.supply_side import (
+    NON_BUYER_ROLES,
+    PLATFORM_GARBAGE_COMPANY_NAMES,
+    has_insufficient_product_info,
+    is_raw_cohort_tag,
+    is_rejected_buyer_category,
+    is_platform_or_social_url,
+    is_supply_side,
+    is_truncated_or_bad_pitch,
 )
 from app.reminders import (
     complete_reminder,
@@ -400,6 +415,123 @@ def _normalize_iso_datetime(value: str | None) -> str:
     return normalize_due(text)
 
 
+_GENERIC_OR_ROLE_COMPANIES = frozenset(
+    {
+        "saas",
+        "ai",
+        "ai saas",
+        "b2b",
+        "b2b saas",
+        "web3",
+        "crypto",
+        "defi",
+        "dex",
+        "cex",
+        "fintech",
+        "gaming",
+        "media",
+        "edtech",
+        "ecom",
+        "ecommerce",
+        "startup",
+        "stealth",
+        "project",
+        "app",
+        "bot",
+        "channel",
+        "none",
+        "unknown",
+        "вакансия",
+        "рилсмейкер",
+        "монтажер",
+        "монтажёр",
+        "таргетолог",
+        "маркетолог",
+        "сценарист",
+        "дизайнер",
+        "копирайтер",
+        "продюсер",
+    }
+    | set(PLATFORM_GARBAGE_COMPANY_NAMES)
+)
+_ROLE_LIKE_COMPANY_RE = re.compile(
+    r"(?:рилсмейкер|ai[\-\s]?креатор|ugc[\-\s]?креатор|нейрокреатор|"
+    r"техническ\w*\s+специалист|специалист\s+по|менеджер\s+по|маркетолог|"
+    r"монтаж[её]р|сценарист|таргетолог|продюсер|ваканси[яи]|"
+    r"\b(?:video|reels|ugc|ai)\s+(?:creator|editor|producer)\b)",
+    re.I,
+)
+_COMPETITOR_DENYLIST_RE = re.compile(
+    r"\b(?:crmchat|matrixreach|firsay)\b|(?:crmchat|matrixreach|firsay)\.(?:ai|io|com|co|app|xyz)",
+    re.I,
+)
+_LEGACY_1300_DB_RE = re.compile(
+    r"(?:legacy[_\s-]*1300|old[_\s-]*base|(?:^|[^0-9])1300(?:\+|[^0-9]|$)|старая\s+база|отработанная\s+база)",
+    re.I,
+)
+
+
+def _is_non_mergeable_company(company: str | None) -> bool:
+    cleaned = " ".join(str(company or "").strip().split())
+    if len(cleaned) < 4:
+        return True
+    low = cleaned.lower()
+    if low in _GENERIC_OR_ROLE_COMPANIES:
+        return True
+    if is_raw_cohort_tag(cleaned):
+        return True
+    if _ROLE_LIKE_COMPANY_RE.search(cleaned):
+        return True
+    return False
+
+
+def _norm_dedup_domain(raw_url: str | None) -> str:
+    s = str(raw_url or "").strip()
+    if not s or is_platform_or_social_url(s):
+        return ""
+    parsed = urlparse(s if "://" in s else f"https://{s}")
+    host = (parsed.hostname or "").lower().removeprefix("www.").rstrip(".")
+    if not host or "." not in host:
+        return ""
+    base = host.split(".")[0]
+    if base in PLATFORM_GARBAGE_COMPANY_NAMES:
+        return ""
+    return host
+
+
+def _norm_phone_key(phone: str | None) -> str:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    return digits if len(digits) >= 7 else ""
+
+
+def _norm_company_key(company: str | None) -> str:
+    if _is_non_mergeable_company(company):
+        return ""
+    cleaned = re.sub(r"\(\s*YC\s+[A-Za-z0-9\s]+\)", "", str(company or ""), flags=re.I)
+    key = re.sub(r"[^a-z0-9а-яё]+", "", cleaned.lower())
+    return key if len(key) >= 3 and key not in _GENERIC_OR_ROLE_COMPANIES else ""
+
+
+def _norm_person_name_key(name: str | None, company: str | None = None) -> str:
+    raw = str(name or "").strip()
+    if not raw or raw.startswith("@") or "://" in raw:
+        return ""
+    if "|" in raw:
+        raw = raw.split("|", 1)[0].strip()
+    raw = re.sub(r"\(@[^)]+\)", "", raw).strip()
+    cleaned = re.sub(r"[^a-zа-яё\s\-]+", " ", raw.lower()).strip()
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+    if len(tokens) < 2:
+        return ""
+    joined = " ".join(tokens[:3])
+    comp_key = _norm_company_key(company)
+    if comp_key and re.sub(r"[^a-z0-9а-яё]+", "", joined) == comp_key:
+        return ""
+    if _ROLE_LIKE_COMPANY_RE.search(joined):
+        return ""
+    return joined
+
+
 def _find_lead_by_lookup(
     conn: sqlite3.Connection,
     *,
@@ -441,17 +573,18 @@ def _find_lead_by_lookup(
         ).fetchone()
         if row is not None:
             return as_dict(row)
-        row = conn.execute(
-            """
-            SELECT * FROM leads
-            WHERE (name IS NOT NULL AND lower(name) LIKE lower(?))
-               OR (company IS NOT NULL AND lower(company) LIKE lower(?))
-            ORDER BY id ASC LIMIT 1
-            """,
-            (f"%{clean_name}%", f"%{clean_name}%"),
-        ).fetchone()
-        if row is not None:
-            return as_dict(row)
+        if len(clean_name) >= 4 and clean_name.lower() not in _GENERIC_OR_ROLE_COMPANIES:
+            row = conn.execute(
+                """
+                SELECT * FROM leads
+                WHERE (name IS NOT NULL AND lower(name) LIKE lower(?))
+                   OR (company IS NOT NULL AND lower(company) LIKE lower(?))
+                ORDER BY id ASC LIMIT 1
+                """,
+                (f"%{clean_name}%", f"%{clean_name}%"),
+            ).fetchone()
+            if row is not None:
+                return as_dict(row)
     return None
 
 
@@ -1130,7 +1263,7 @@ def _auto_enrich_b2b_items_with_sonnet(items: list[dict]) -> list[dict]:
             and REVSHARE_OFFER_TEXT in raw_s1
             and "creatoros" not in raw_low
             and "if your user growth has hit a ceiling" not in raw_low
-            and "plug-and-play growth arm" not in raw_low
+            and "plug-and-play" not in raw_low
         )
         if already_canonical:
             continue
@@ -1265,17 +1398,178 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         acc_ids = _parse_account_ids(c_dict.get("account_id"), c_dict.get("account_ids_json"))
         acc_id = acc_ids[0] if acc_ids else c_dict.get("account_id")
         existing_rows = conn.execute(
-            "SELECT username, phone, lead_id, telegram_user_id FROM campaign_recipients WHERE campaign_id = ?",
+            "SELECT username, phone, lead_id, telegram_user_id, name, company, website FROM campaign_recipients WHERE campaign_id = ?",
             (resolved_cid,),
         ).fetchall()
         return {
             "campaign_id": resolved_cid,
             "camp_dict": c_dict,
             "account_id": acc_id,
+            "added_pending": 0,
             "seen_usernames": {str(r["username"]).lower() for r in existing_rows if r["username"]},
             "seen_phones": {str(r["phone"]) for r in existing_rows if r["phone"]},
             "seen_leads": {int(r["lead_id"]) for r in existing_rows if r["lead_id"]},
             "seen_tg_ids": {int(r["telegram_user_id"]) for r in existing_rows if r["telegram_user_id"]},
+        }
+
+    def _build_global_dedup_index() -> dict[str, set]:
+        g_tg_ids: set[int] = set()
+        g_usernames: set[str] = set()
+        g_phones: set[str] = set()
+        g_leads: set[int] = set()
+        g_domains: set[str] = set()
+        g_person_company: set[tuple[str, str]] = set()
+        archived_usernames: set[str] = set()
+        archived_tg_ids: set[int] = set()
+        archived_phones: set[str] = set()
+        archived_domains: set[str] = set()
+
+        # 1) All non-QA campaign_recipients across ALL campaigns
+        rec_rows = conn.execute(
+            """
+            SELECT cr.lead_id, cr.telegram_user_id, cr.username, cr.phone,
+                   cr.name, cr.company, cr.website, cr.note, cr.extra_json,
+                   c.name AS camp_name
+            FROM campaign_recipients cr
+            JOIN campaigns c ON c.id = cr.campaign_id
+            """
+        ).fetchall()
+        for r in rec_rows:
+            cname = str(r["camp_name"] or "")
+            if _is_qa_campaign_name(cname):
+                continue
+            if r["lead_id"]:
+                g_leads.add(int(r["lead_id"]))
+            tid = r["telegram_user_id"]
+            if tid and not (900000 <= int(tid) <= 999999):
+                g_tg_ids.add(int(tid))
+            u = (_clean_handle(r["username"]) or "").lower()
+            if u:
+                g_usernames.add(u)
+            pk = _norm_phone_key(r["phone"])
+            if pk:
+                g_phones.add(pk)
+            dom = _norm_dedup_domain(r["website"])
+            if dom:
+                g_domains.add(dom)
+            pk_name = _norm_person_name_key(r["name"], r["company"])
+            ck_comp = _norm_company_key(r["company"])
+            if pk_name and ck_comp:
+                g_person_company.add((pk_name, ck_comp))
+
+            if _LEGACY_1300_DB_RE.search(f"{cname} {r['note'] or ''} {r['extra_json'] or ''}"):
+                if u:
+                    archived_usernames.add(u)
+                if tid and not (900000 <= int(tid) <= 999999):
+                    archived_tg_ids.add(int(tid))
+                if pk:
+                    archived_phones.add(pk)
+                if dom:
+                    archived_domains.add(dom)
+
+        # 2) Outbound messages in dialogs + leads (already contacted outside/inside campaigns)
+        out_dlg_rows = conn.execute(
+            """
+            SELECT DISTINCT d.peer_id, d.username, d.phone, d.lead_id
+            FROM dialogs d
+            JOIN messages m ON m.dialog_id = d.id
+            WHERE m.direction = 'out'
+            """
+        ).fetchall()
+        for r in out_dlg_rows:
+            if r["lead_id"]:
+                g_leads.add(int(r["lead_id"]))
+            pid = r["peer_id"]
+            if pid is not None and str(pid).lstrip("-").isdigit():
+                tid_i = int(pid)
+                if tid_i > 0 and not (900000 <= tid_i <= 999999):
+                    g_tg_ids.add(tid_i)
+            u = (_clean_handle(r["username"]) or "").lower()
+            if u:
+                g_usernames.add(u)
+            pk = _norm_phone_key(r["phone"])
+            if pk:
+                g_phones.add(pk)
+
+        out_lead_rows = conn.execute(
+            """
+            SELECT DISTINCT l.id, l.telegram_user_id, l.username, l.phone, l.name, l.company, l.url
+            FROM leads l
+            JOIN dialogs d ON (d.lead_id = l.id OR d.id = l.dialog_id)
+            JOIN messages m ON m.dialog_id = d.id
+            WHERE m.direction = 'out'
+            """
+        ).fetchall()
+        for r in out_lead_rows:
+            g_leads.add(int(r["id"]))
+            tid = r["telegram_user_id"]
+            if tid and not (900000 <= int(tid) <= 999999):
+                g_tg_ids.add(int(tid))
+            u = (_clean_handle(r["username"]) or "").lower()
+            if u:
+                g_usernames.add(u)
+            pk = _norm_phone_key(r["phone"])
+            if pk:
+                g_phones.add(pk)
+            dom = _norm_dedup_domain(r["url"])
+            if dom:
+                g_domains.add(dom)
+            pk_name = _norm_person_name_key(r["name"], r["company"])
+            ck_comp = _norm_company_key(r["company"])
+            if pk_name and ck_comp:
+                g_person_company.add((pk_name, ck_comp))
+
+        # 3) Leads table archive 1300+ markers & person+company/domain index for existing leads
+        all_lead_rows = conn.execute(
+            "SELECT id, telegram_user_id, username, phone, name, company, url, note, description, lead_source FROM leads"
+        ).fetchall()
+        leads_by_person_company: dict[tuple[str, str], dict] = {}
+        leads_by_domain: dict[str, dict] = {}
+        for r in all_lead_rows:
+            ld = as_dict(r)
+            lid_i = int(ld["id"])
+            pk_name = _norm_person_name_key(ld.get("name"), ld.get("company"))
+            ck_comp = _norm_company_key(ld.get("company"))
+            if pk_name and ck_comp and (pk_name, ck_comp) not in leads_by_person_company:
+                leads_by_person_company[(pk_name, ck_comp)] = ld
+            dom = _norm_dedup_domain(ld.get("url"))
+            if dom and dom not in leads_by_domain:
+                leads_by_domain[dom] = ld
+
+            marker_blob = f"{ld.get('note') or ''} {ld.get('description') or ''} {ld.get('lead_source') or ''}"
+            if _LEGACY_1300_DB_RE.search(marker_blob):
+                g_leads.add(lid_i)
+                u = (_clean_handle(ld.get("username")) or "").lower()
+                if u:
+                    g_usernames.add(u)
+                    archived_usernames.add(u)
+                tid = ld.get("telegram_user_id")
+                if tid and not (900000 <= int(tid) <= 999999):
+                    g_tg_ids.add(int(tid))
+                    archived_tg_ids.add(int(tid))
+                pk = _norm_phone_key(ld.get("phone"))
+                if pk:
+                    g_phones.add(pk)
+                    archived_phones.add(pk)
+                if dom:
+                    g_domains.add(dom)
+                    archived_domains.add(dom)
+                if pk_name and ck_comp:
+                    g_person_company.add((pk_name, ck_comp))
+
+        return {
+            "tg_ids": g_tg_ids,
+            "usernames": g_usernames,
+            "phones": g_phones,
+            "leads": g_leads,
+            "domains": g_domains,
+            "person_company": g_person_company,
+            "archived_usernames": archived_usernames,
+            "archived_tg_ids": archived_tg_ids,
+            "archived_phones": archived_phones,
+            "archived_domains": archived_domains,
+            "leads_by_person_company": leads_by_person_company,
+            "leads_by_domain": leads_by_domain,
         }
 
     camp_cache: dict[str, dict[str, Any]] = {}
@@ -1297,6 +1591,8 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
     )
     if not is_primary_vacancy:
         raw_leads = _auto_enrich_b2b_items_with_sonnet(raw_leads)
+
+    global_dedup = _build_global_dedup_index()
 
     processed = 0
     created_leads = 0
@@ -1324,7 +1620,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         their_angle = (str(item.get("their_angle") or "").strip()) or None
         our_angle = (str(item.get("our_angle") or "").strip()) or None
         hook = (str(item.get("hook") or "").strip()) or None
-        lead_source = (str(item.get("lead_source") or "").strip()) or None
+        lead_source = (str(item.get("lead_source") or item.get("source") or "").strip()) or None
         raw_note = (str(item.get("note") or "").strip()) or None
         provider = (str(item.get("provider") or "telegram").strip().lower())
         if provider not in ("telegram", "whatsapp"):
@@ -1337,13 +1633,112 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 tg_id = int(str(tg_id_raw).strip())
             except ValueError:
                 tg_id = None
-        has_direct_messenger_handle = bool(
-            username or phone or (tg_id is not None and not (900000 <= tg_id <= 999999))
-        )
+        real_tg_id = tg_id if (tg_id is not None and not (900000 <= tg_id <= 999999)) else None
+        has_direct_messenger_handle = bool(username or phone or real_tg_id is not None)
 
         display_name = explicit_name or company or (f"{username} · {company}" if username and company else username) or phone
         if not any((display_name, username, phone, tg_id)):
             continue
+
+        # Determine target campaign BEFORE touching `leads` so all ICP/supply/denylist filters run first!
+        active_state = primary_state
+        is_item_vacancy = _is_vacancy_lead_item(item)
+        if (
+            enroll_in_campaign
+            and not explicit_cid_requested
+            and is_item_vacancy
+            and not is_primary_vacancy
+        ):
+            vac_key = "tg вакансии"
+            if vac_key not in camp_cache:
+                camp_cache[vac_key] = _get_or_create_camp_state(None, "TG Вакансии")
+            active_state = camp_cache[vac_key]
+
+        target_camp_dict = active_state["camp_dict"] if active_state is not None else camp_dict
+        target_campaign_id = int(active_state["campaign_id"]) if active_state is not None else campaign_id
+        target_camp_name = str((target_camp_dict or {}).get("name") or campaign_name or "")
+        is_qa_camp = _is_qa_campaign_name(target_camp_name)
+        is_b2b_camp = not is_item_vacancy and not any(
+            k in target_camp_name.lower() for k in ("ваканс", "vacanc", "job")
+        )
+
+        raw_s1 = item.get("step1_text") if item.get("step1_text") is not None else item.get("first_touch")
+        full_blob = " ".join(
+            str(x)
+            for x in (
+                username or "",
+                display_name or "",
+                company or "",
+                website_raw,
+                email or "",
+                their_angle or "",
+                our_angle or "",
+                raw_note or "",
+                str(raw_s1 or ""),
+            )
+            if x
+        )
+
+        # 1. Competitor denylist & archive 1300+ (blocked BEFORE `leads` insert!)
+        uname_low = username.lower() if username else ""
+        phone_key = _norm_phone_key(phone)
+        domain_key = _norm_dedup_domain(url_val or website_raw) if is_b2b_camp else ""
+        person_key = _norm_person_name_key(explicit_name or display_name, company) if is_b2b_camp else ""
+        comp_key = _norm_company_key(company) if is_b2b_camp else ""
+
+        if not is_qa_camp:
+            if _COMPETITOR_DENYLIST_RE.search(full_blob):
+                skipped_duplicates += 1
+                continue
+            if (
+                is_legacy_exhausted_recipient(item, campaign_name=target_camp_name)
+                or (uname_low and uname_low in global_dedup["archived_usernames"])
+                or (real_tg_id and real_tg_id in global_dedup["archived_tg_ids"])
+                or (phone_key and phone_key in global_dedup["archived_phones"])
+                or (domain_key and domain_key in global_dedup["archived_domains"])
+            ):
+                skipped_duplicates += 1
+                continue
+
+        # 2. Strict B2B Product-Buyer ICP / Offline / Supply-Side / Product-Reality gate BEFORE `leads` insert!
+        if is_b2b_camp and not is_qa_camp:
+            if is_offline_non_icp_contact(
+                username=username,
+                name=display_name,
+                company=company,
+                website=url_val,
+                their_angle=f"{their_angle or ''} {raw_s1 or ''}",
+            ):
+                continue
+            supply_blob = "\n".join(
+                str(x)
+                for x in (
+                    explicit_name or "",
+                    company or "",
+                    their_angle or "",
+                    str(item.get("bio") or ""),
+                    raw_note or "",
+                )
+                if x
+            )
+            if is_supply_side(supply_blob) or is_rejected_buyer_category(category):
+                continue
+            roles_set = {str(x).strip() for x in (item.get("roles") or []) if str(x or "").strip()}
+            if item.get("role"):
+                roles_set.add(str(item["role"]).strip())
+            if roles_set and not (roles_set & {"Founder", "Marketing"}) and (roles_set & NON_BUYER_ROLES):
+                continue
+            if (
+                has_insufficient_product_info(their_angle)
+                or has_insufficient_product_info(our_angle)
+                or has_insufficient_product_info(raw_note)
+                or has_insufficient_product_info(str(raw_s1 or ""))
+                or is_raw_cohort_tag(company)
+                or is_raw_cohort_tag(display_name)
+            ):
+                continue
+            if raw_s1 is not None and str(raw_s1).strip() != "" and is_truncated_or_bad_pitch(str(raw_s1), min_len=40):
+                continue
 
         processed += 1
 
@@ -1357,22 +1752,50 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         combined_note = "\n".join(note_parts).strip() or None
 
         existing = None
-        if tg_id is not None:
+        if real_tg_id is not None:
             row = conn.execute(
                 "SELECT * FROM leads WHERE telegram_user_id = ? ORDER BY id ASC LIMIT 1",
-                (tg_id,),
+                (real_tg_id,),
             ).fetchone()
             if row is not None:
                 existing = as_dict(row)
         if existing is None and (username or phone):
             existing = _find_lead_by_lookup(conn, username=username, phone=phone)
-        if existing is None and company:
+        if existing is None and is_b2b_camp and person_key and comp_key:
+            existing = global_dedup["leads_by_person_company"].get((person_key, comp_key))
+        if existing is None and is_b2b_camp and domain_key:
+            cand_dom_lead = global_dedup["leads_by_domain"].get(domain_key)
+            if cand_dom_lead is not None:
+                existing_u = (_clean_handle(cand_dom_lead.get("username")) or "").lower()
+                if not existing_u or not uname_low or existing_u == uname_low or domain_key in global_dedup["domains"]:
+                    existing = cand_dom_lead
+        if existing is None and is_b2b_camp and company and not _is_non_mergeable_company(company):
             row = conn.execute(
                 "SELECT * FROM leads WHERE company IS NOT NULL AND lower(company) = lower(?) ORDER BY id ASC LIMIT 1",
                 (company,),
             ).fetchone()
             if row is not None:
-                existing = as_dict(row)
+                cand_co = as_dict(row)
+                cand_u = (_clean_handle(cand_co.get("username")) or "").lower()
+                cand_person = _norm_person_name_key(cand_co.get("name"), cand_co.get("company"))
+                if not cand_u or not uname_low or cand_u == uname_low or (person_key and cand_person == person_key):
+                    existing = cand_co
+
+        # Check global cross-campaign / outbound-message dedup BEFORE creating a brand-new `leads` row!
+        is_global_dup = False
+        if not is_qa_camp:
+            existing_lid_check = int(existing["id"]) if existing is not None else None
+            is_global_dup = bool(
+                (existing_lid_check is not None and existing_lid_check in global_dedup["leads"])
+                or (real_tg_id is not None and real_tg_id in global_dedup["tg_ids"])
+                or (uname_low and uname_low in global_dedup["usernames"])
+                or (phone_key and phone_key in global_dedup["phones"])
+                or (is_b2b_camp and domain_key and domain_key in global_dedup["domains"])
+                or (is_b2b_camp and person_key and comp_key and (person_key, comp_key) in global_dedup["person_company"])
+            )
+            if is_global_dup and existing is None:
+                skipped_duplicates += 1
+                continue
 
         if existing is not None:
             lid = int(existing["id"])
@@ -1411,8 +1834,8 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             if upd_fields:
                 update_lead(conn, lid, **upd_fields)
             existing_tg_id = existing.get("telegram_user_id")
-            if existing_tg_id is None:
-                existing_tg_id = tg_id if tg_id is not None else (900000 + lid)
+            if existing_tg_id is None and has_direct_messenger_handle:
+                existing_tg_id = real_tg_id if real_tg_id is not None else (900000 + lid)
                 try:
                     conn.execute(
                         "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
@@ -1421,13 +1844,14 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     conn.commit()
                 except sqlite3.IntegrityError:
                     pass
-            tg_id = int(existing_tg_id)
-            updated_leads += 1
+            tg_id = int(existing_tg_id) if existing_tg_id is not None else None
+            if not is_global_dup or (uname_low and uname_low == (_clean_handle(existing.get("username")) or "").lower()):
+                updated_leads += 1
         else:
             created = create_lead(
                 conn,
                 account_id=account_id,
-                telegram_user_id=tg_id,
+                telegram_user_id=real_tg_id,
                 username=username,
                 name=display_name,
                 phone=phone,
@@ -1443,7 +1867,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 next_step="Отправить цепочку рассылки" if (enroll_in_campaign and has_direct_messenger_handle) else None,
             )
             lid = int(created["id"])
-            if tg_id is None:
+            if real_tg_id is None and has_direct_messenger_handle:
                 tg_id = created.get("telegram_user_id") or (900000 + lid)
                 try:
                     conn.execute(
@@ -1453,37 +1877,16 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     conn.commit()
                 except sqlite3.IntegrityError:
                     pass
-            tg_id = int(tg_id)
+                tg_id = int(tg_id)
+            else:
+                tg_id = real_tg_id
             created_leads += 1
+            if person_key and comp_key:
+                global_dedup["leads_by_person_company"].setdefault((person_key, comp_key), created)
+            if domain_key:
+                global_dedup["leads_by_domain"].setdefault(domain_key, created)
 
         lead_ids.append(lid)
-
-        active_state = primary_state
-        if (
-            enroll_in_campaign
-            and not explicit_cid_requested
-            and _is_vacancy_lead_item(item)
-            and not is_primary_vacancy
-        ):
-            vac_key = "tg вакансии"
-            if vac_key not in camp_cache:
-                camp_cache[vac_key] = _get_or_create_camp_state(None, "TG Вакансии")
-            active_state = camp_cache[vac_key]
-
-        target_camp_dict = active_state["camp_dict"] if active_state is not None else camp_dict
-        target_campaign_id = int(active_state["campaign_id"]) if active_state is not None else campaign_id
-        is_b2b_camp = bool(
-            target_camp_dict is not None
-            and not any(k in str(target_camp_dict.get("name") or "").lower() for k in ("ваканс", "vacanc", "job"))
-        )
-        if is_b2b_camp and is_offline_non_icp_contact(
-            username=username,
-            name=display_name,
-            company=company,
-            website=url_val,
-            their_angle=f"{their_angle or ''} {item.get('step1_text') or item.get('first_touch') or ''}",
-        ):
-            continue
 
         if enroll_in_campaign and active_state is not None and target_campaign_id is not None and has_direct_messenger_handle:
             seen_leads = active_state["seen_leads"]
@@ -1491,7 +1894,8 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             seen_usernames = active_state["seen_usernames"]
             seen_phones = active_state["seen_phones"]
             is_dup = (
-                lid in seen_leads
+                is_global_dup
+                or lid in seen_leads
                 or (tg_id and int(tg_id) in seen_tg_ids)
                 or (username and username.lower() in seen_usernames)
                 or (phone and phone in seen_phones)
@@ -1550,17 +1954,36 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 ),
             )
             seen_leads.add(lid)
+            global_dedup["leads"].add(lid)
             if tg_id:
                 seen_tg_ids.add(int(tg_id))
+                if not (900000 <= int(tg_id) <= 999999):
+                    global_dedup["tg_ids"].add(int(tg_id))
             if username:
                 seen_usernames.add(username.lower())
+                global_dedup["usernames"].add(username.lower())
             if phone:
                 seen_phones.add(phone)
+                if phone_key:
+                    global_dedup["phones"].add(phone_key)
+            if domain_key:
+                global_dedup["domains"].add(domain_key)
+            if person_key and comp_key:
+                global_dedup["person_company"].add((person_key, comp_key))
+            if rec_status == "pending":
+                active_state["added_pending"] = int(active_state.get("added_pending", 0)) + 1
             enrolled_in_campaign += 1
 
     if enroll_in_campaign:
         for st in camp_cache.values():
-            conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, int(st["campaign_id"])))
+            cid_u = int(st["campaign_id"])
+            if int(st.get("added_pending", 0)) > 0 and str(st["camp_dict"].get("status") or "").lower() == "completed":
+                conn.execute(
+                    "UPDATE campaigns SET status = 'running', updated_at = ? WHERE id = ? AND status = 'completed'",
+                    (now, cid_u),
+                )
+            else:
+                conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, cid_u))
     conn.commit()
 
     return {
@@ -1855,7 +2278,13 @@ def register_mcp_routes(app: FastAPI) -> None:
 
     @app.post("/mcp")
     async def mcp_http_endpoint(request: Request):
-        _verify_mcp_auth(request)
+        def _auth_sync() -> None:
+            app_state = getattr(getattr(request, "app", None), "state", None)
+            db_c = getattr(app_state, "conn", None) if app_state is not None else None
+            with locked_conn(db_c):
+                _verify_mcp_auth(request)
+
+        await asyncio.to_thread(_auth_sync)
         try:
             payload = await request.json()
         except Exception:
@@ -1867,11 +2296,22 @@ def register_mcp_routes(app: FastAPI) -> None:
                     "error": {"code": -32700, "message": "Parse error"},
                 },
             )
-        conn = getattr(request.app.state, "conn", None)
-        if conn is None:
-            conn = connect()
-            init_db(conn)
-        response_data = handle_jsonrpc_message(conn, payload)
+
+        def _exec_rpc_sync() -> dict | list | None:
+            app_state = getattr(getattr(request, "app", None), "state", None)
+            shared_conn = getattr(app_state, "conn", None) if app_state is not None else None
+            owns_conn = shared_conn is None
+            local_conn = connect() if owns_conn else shared_conn
+            try:
+                if owns_conn:
+                    init_db(local_conn)
+                with locked_conn(local_conn):
+                    return handle_jsonrpc_message(local_conn, payload)
+            finally:
+                if owns_conn and local_conn is not None:
+                    local_conn.close()
+
+        response_data = await asyncio.to_thread(_exec_rpc_sync)
         if response_data is None:
             return Response(status_code=202)
         return JSONResponse(content=response_data)

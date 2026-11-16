@@ -34,11 +34,15 @@ except ImportError:
 
 try:
     from leadgen import relay_route
+    from leadgen.tg_pipeline_locked import HeldSessionLocks, try_acquire_session_locks
 except ImportError:
     try:
         import relay_route
+        from tg_pipeline_locked import HeldSessionLocks, try_acquire_session_locks
     except ImportError:
         relay_route = None
+        HeldSessionLocks = None  # type: ignore
+        try_acquire_session_locks = None  # type: ignore
 
 VAULT = "/Users/timofei/obsidian/Second Brain"
 SESSION = os.environ.get(
@@ -46,11 +50,7 @@ SESSION = os.environ.get(
     os.path.expanduser("~/.claude/skill-telegram/tim2.session"),
 )
 
-_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or (
-    "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-    if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    else str(WORKTREE_ROOT / "data" / "leadgen_state")
-)
+_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or str(WORKTREE_ROOT / "data" / "leadgen_state")
 OUTDIR = _DEFAULT_STATE_DIR
 STATE = os.path.join(OUTDIR, "job_monitor_seen.json")
 LEGACY_STATE = os.path.join(VAULT, ".raw", "data", "job_monitor_seen.json")
@@ -219,7 +219,6 @@ def load_env():
     candidates = [
         WORKTREE_ROOT / ".env",
         Path("/Users/timofei/dev/Python/new era/crmtg/.env"),
-        Path("/Users/timofei/dev/Python/new era/creatoros/.env"),
         Path(os.path.expanduser("~/.telegram/.env")),
         Path(VAULT) / ".env",
     ]
@@ -479,7 +478,7 @@ def prefilter(posts, min_len=150):
         t = p["text"]
         if len(t) < min_len or NOISE_RX.match(t):
             continue
-        if RESUME_RX.search(t[:400]):
+        if RESUME_RX.search(t):
             continue
         if not CONTACT_RX.search(t):
             continue
@@ -504,11 +503,13 @@ def triage(posts, batch=12):
         items = "\n\n".join(f"[{i}] {p['text'][:420]}" for i, p in enumerate(chunk, 1))
         try:
             res = ask_llm(TRIAGE.format(n=len(chunk), items=items), timeout=240)
-        except Exception:
-            return chunk
+        except Exception as exc:
+            print(f"  ⚠ triage LLM failed ({type(exc).__name__}): fail-closed dropping chunk", file=sys.stderr)
+            return []
         nums = _json_block(res, want_list=True)
         if not isinstance(nums, list):
-            return chunk
+            print("  ⚠ triage returned non-JSON: fail-closed dropping chunk", file=sys.stderr)
+            return []
         return [chunk[i - 1] for i in nums if isinstance(i, int) and 1 <= i <= len(chunk)]
 
     chunks = [posts[i:i + batch] for i in range(0, len(posts), batch)]
@@ -649,16 +650,57 @@ def sidecar(fits):
     ]
 
 
-def lock():
+class _JobMonitorLockGuard:
+    def __init__(self, monitor_fh, session_locks) -> None:
+        self._monitor_fh = monitor_fh
+        self._session_locks = session_locks
+
+    def close(self) -> None:
+        import fcntl as _fcntl
+
+        if self._session_locks is not None:
+            self._session_locks.close()
+            self._session_locks = None
+        if self._monitor_fh is not None:
+            try:
+                _fcntl.flock(self._monitor_fh.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                self._monitor_fh.close()
+            except OSError:
+                pass
+            self._monitor_fh = None
+
+
+def lock() -> _JobMonitorLockGuard:
+    import fcntl as _fcntl
+
     os.makedirs(OUTDIR, exist_ok=True)
     path = os.path.join(OUTDIR, "job_monitor.lock")
-    if os.path.exists(path):
-        age = time.time() - os.path.getmtime(path)
-        if age < 3600:
-            sys.exit(f"монитор уже работает ({int(age / 60)} мин назад) — выхожу")
-        os.remove(path)
-    open(path, "w", encoding="utf-8").write(str(os.getpid()))
-    return path
+    fh = open(path, "a+", encoding="utf-8")
+    try:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        sys.exit("монитор уже работает (flock занят) — выхожу")
+
+    sess_held = None
+    if try_acquire_session_locks is not None:
+        sess_held = try_acquire_session_locks([SESSION])
+        if sess_held is None:
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+            sys.exit(f"сессия Telegram ({SESSION}) занята другим процессом — выхожу")
+
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"{os.getpid()}\n")
+    fh.flush()
+    return _JobMonitorLockGuard(fh, sess_held)
 
 
 def main():
@@ -671,9 +713,10 @@ def main():
     a = ap.parse_args()
 
     os.makedirs(OUTDIR, exist_ok=True)
+    held_lock = None
     if not a.sources:
-        path = lock()
-        atexit.register(lambda: os.path.exists(path) and os.remove(path))
+        held_lock = lock()
+        atexit.register(held_lock.close)
 
     load_env()
     from telethon.sync import TelegramClient

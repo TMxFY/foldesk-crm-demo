@@ -45,10 +45,8 @@ TABS = (
     ("X", "last_sent_row_x", "x"),
 )
 THRESHOLD = int(os.environ.get("CSV_NOTIFY_THRESHOLD", "1"))
-_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or (
-    "/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline"
-    if os.path.isdir("/Users/timofei/dev/Python/new era/creatoros/.tg_pipeline")
-    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "leadgen_state")
+_DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "leadgen_state"
 )
 STATE = os.path.join(_DEFAULT_STATE_DIR, "csv_export_state.json")
 TIM_ASSISTANT_ENV = "/Users/timofei/tim-assistant/.env"

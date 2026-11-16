@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape Telegram group members + bios, filter to CreatorOS ICP, save JSONL.
+"""Scrape Telegram group members + bios, filter to SoftUGC ICP, save JSONL.
 
 Safe pacing: gentle per-request delay, respects FloodWait (sleeps the requested
 time and slows down), writes incrementally so partial progress is kept.

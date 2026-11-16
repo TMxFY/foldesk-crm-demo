@@ -42,12 +42,33 @@ except ImportError:
         from scripts.relay_route import chain, note_failure
 
 try:
-    from supply_side import supply_reason
+    from supply_side import (
+        NON_BUYER_ROLES,
+        has_insufficient_product_info,
+        is_invalid_product_name,
+        is_rejected_buyer_category,
+        is_truncated_or_bad_pitch,
+        supply_reason,
+    )
 except ImportError:
     try:
-        from leadgen.supply_side import supply_reason
+        from leadgen.supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_truncated_or_bad_pitch,
+            supply_reason,
+        )
     except ImportError:
-        from scripts.supply_side import supply_reason
+        from scripts.supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_truncated_or_bad_pitch,
+            supply_reason,
+        )
 
 if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
     try:
@@ -74,16 +95,16 @@ CATEGORIES = ["SaaS / AI app", "CEX / биржа", "Проп трейдинг", 
               "Платёжки / финтех", "Web3 (общее)", "Сервис / агентство"]
 ROLES = ["Founder", "Marketing", "Community", "Creator/KOL", "Dev", "Trader", ""]
 
-SYSTEM_PROMPT = """You qualify Telegram leads for CreatorOS.
+SYSTEM_PROMPT = """You qualify Telegram leads for SoftUGC.
 
-CreatorOS sells organic short-form traffic (clipping + AI/UGC, paid short-form ads, physical products, 183.5M views in 90 days, revshare/CPA deals) to founders/growth/marketing of startups.
+SoftUGC sells organic short-form traffic (clipping + AI/UGC, paid short-form ads, physical products, 183.5M views in 90 days, revshare/CPA deals) to founders/growth/marketing of startups.
 
 Target categories: SaaS/AI apps, CEX/exchanges, prop trading, media/content, DeFi/DEX, Gaming/AI, payments/fintech, tokens/memecoins.
-Target roles (buyers): Founder, Marketing, Community, Creator/KOL.
-NOT customers: regular users with no project, spammers, pure traders/investors with no product, freelancers with no own product, devs with no product, custom dev/AI/SEO/marketing agencies selling services to clients (Сервис / агентство), open-source libraries/build tools, CSS/coding quizzes, and free fan hobby games without monetization.
+Target roles (buyers): Founder, Marketing.
+NOT customers: regular users with no project, spammers, pure traders/investors with no product, freelancers/UGC creators/ambassadors with no own product, community moderators/KOL managers/shillers, devs with no product, custom dev/AI/SEO/marketing/GTM agencies or consultancies selling services to clients (Сервис / агентство), open-source libraries/build tools, CSS/coding quizzes, and free fan hobby games without monetization.
 
 For EACH lead in the input array decide:
-- is_lead: true ONLY if this person is a founder/CEO/growth/marketing/BD/community lead with a REAL product/project that needs user traffic. False for pure traders, investors, job seekers, empty/nonsense bios, spammers, devs without a product, custom dev/AI/SEO/marketing agencies (Сервис / агентство), open-source tools, coding quizzes, or free hobby games.
+- is_lead: true ONLY if this person is a founder/CEO/CMO/growth/marketing lead with a REAL product/project that needs user traffic. False for pure traders, investors, job seekers, freelancers, community mods, empty/nonsense bios, spammers, devs without a product, custom dev/AI/SEO/marketing/GTM agencies (Сервис / агентство), open-source tools, coding quizzes, or free hobby games.
 - category: exactly one of [SaaS / AI app, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Gaming / AI, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
 - role: exactly one of [Founder, Marketing, Community, Creator/KOL, Dev, Trader, ""]
 - project: project/company name or ""
@@ -107,6 +128,9 @@ def lead_view(i, r):
 
 def call_llm(batch, model):
     """Send one batch to Relay Fast; return parsed list or raise."""
+    api_key = (os.getenv("RELAYFAST_API_KEY") or os.getenv("LLM_API_KEY") or API_KEY or "").strip()
+    if not api_key:
+        raise RuntimeError("RELAYFAST_API_KEY / LLM_API_KEY not configured")
     payload = {
         "model": model,
         "messages": [
@@ -118,7 +142,7 @@ def call_llm(batch, model):
     }
     resp = requests.post(
         f"{BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {API_KEY}",
+        headers={"Authorization": f"Bearer {api_key}",
                  "Content-Type": "application/json"},
         json=payload,
         timeout=TIMEOUT,
@@ -180,20 +204,57 @@ def norm_result(res):
     }
 
 
+_VOLUNTEER_OR_FOR_HIRE_RE = re.compile(
+    r"\[for\s*hire\]|\bfor\s+hire\b|\[volunteer|\bvolunteers?\b|\bunpaid\b",
+    re.I,
+)
+
+
 def lead_text(row):
     parts = []
-    for key in ("name", "username", "bio", "sample", "what_they_do", "project"):
+    for key in ("name", "username", "bio", "sample", "text", "what_they_do", "their_angle", "project", "company"):
         value = row.get(key)
         if isinstance(value, str) and value.strip():
             parts.append(value.strip())
     return "\n".join(parts)
 
 
+def _product_reality_reject_reason(row: dict) -> str:
+    cat = str(row.get("category") or "").strip()
+    if is_rejected_buyer_category(cat):
+        return f"rejected_category:{cat}"
+    role = str(row.get("role") or "").strip()
+    if role and role in NON_BUYER_ROLES:
+        return f"non_buyer_role:{role}"
+    proj = str(row.get("project") or row.get("company") or "").strip()
+    if is_invalid_product_name(proj):
+        return f"invalid_product:{proj!r}"
+    for angle_key in ("what_they_do", "their_angle", "our_angle"):
+        if has_insufficient_product_info(row.get(angle_key)):
+            return f"insufficient_product_info:{angle_key}"
+    raw_pitch = row.get("first_touch") if row.get("first_touch") is not None else row.get("step1_text")
+    if raw_pitch is not None and str(raw_pitch).strip() != "" and is_truncated_or_bad_pitch(str(raw_pitch)):
+        return "truncated_or_bad_pitch"
+    return ""
+
+
 def gate_before_model(rows):
-    """Drop supply-side authors before TypeSafe or Relay Fast see them."""
+    """Drop supply-side, volunteer/[FOR HIRE], and known agency rows across ALL sources."""
     kept, notes = [], []
     for row in rows or []:
-        reason = supply_reason(lead_text(row))
+        blob = lead_text(row)
+        reason = supply_reason(blob)
+        if not reason:
+            vm = _VOLUNTEER_OR_FOR_HIRE_RE.search(blob)
+            if vm:
+                reason = vm.group(0)
+        if not reason and is_rejected_buyer_category(row.get("category")):
+            reason = f"category={row.get('category')}"
+        if not reason and has_insufficient_product_info(blob):
+            reason = "insufficient_product_info"
+        raw_pitch = row.get("first_touch") if row.get("first_touch") is not None else row.get("step1_text")
+        if not reason and raw_pitch is not None and str(raw_pitch).strip() != "" and is_truncated_or_bad_pitch(str(raw_pitch)):
+            reason = "truncated_pitch"
         if reason:
             notes.append((row, reason))
             continue
@@ -201,36 +262,33 @@ def gate_before_model(rows):
     return kept, notes
 
 
-def qualify_loaded(rows, *, batch_size):
-    catalog_rows = []
-    pending = []
-    for row in rows:
-        source = str(row.get("source") or "")
-        if source.startswith("catalog_") or source in {"linkedin_jobs", "meta_ads"}:
-            catalog_rows.append(row)
-        else:
-            pending.append(row)
-    original = list(pending)
+def _quarantine_row(row: dict, reason: str, quarantine_list: list[dict]) -> None:
+    q = dict(row)
+    q["qualified"] = False
+    q["quarantine_reason"] = reason
+    quarantine_list.append(q)
+
+
+def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None):
+    original = [dict(r) for r in (rows or []) if isinstance(r, dict)]
+    input_total = len(original)
+    quarantine: list[dict] = quarantine_out if quarantine_out is not None else []
+
     kept, notes = gate_before_model(original)
     dropped = 0
     for row, reason in notes:
         dropped += 1
-        print(f"    - supply: {row.get('name')} (@{row.get('username') or '-'}) {reason}",
+        _quarantine_row(row, f"pre_gate:{reason}", quarantine)
+        print(f"    - supply/pre-gate: {row.get('name')} (@{row.get('username') or '-'}) {reason}",
               file=sys.stderr)
     rows = kept
-    input_total = len(original) + len(catalog_rows)
     print(f"Qualifying {input_total} leads in batches of {batch_size} "
           f"(route {' → '.join(chain())})", file=sys.stderr)
 
-    out = list(catalog_rows)
-    dropped = 0
-    # TypeSafe is the primary typed classifier.  KEEP/DROP are final routing
-    # decisions; only UNCERTAIN rows go through the slower Relay Fast check.
-    # Set TYPESAFE_FAST_PATH=0 to temporarily restore Relay Fast as the gate
-    # for every non-dropped row while validating a new prompt/threshold.
+    out = []
     fast_path = os.getenv("TYPESAFE_FAST_PATH", "1").lower() in {"1", "true", "yes"}
     ts_results = []
-    if qualify_creator_rows and os.getenv("TYPESAFE_ENABLED", "1").lower() not in {"0", "false", "no"}:
+    if rows and qualify_creator_rows and os.getenv("TYPESAFE_ENABLED", "1").lower() not in {"0", "false", "no"}:
         try:
             import asyncio
             ts_results = asyncio.run(qualify_creator_rows(rows))
@@ -244,32 +302,43 @@ def qualify_loaded(rows, *, batch_size):
         route = creator_filter(ts) if creator_filter else "uncertain"
         if route == "drop":
             dropped += 1
+            _quarantine_row(row, "typesafe_drop", quarantine)
             continue
         row = dict(row)
         if ts and route == "keep" and fast_path:
+            ts_cat = str(ts.get("typesafe_category") or row.get("category") or "")
+            ts_role = str(ts.get("typesafe_role") or row.get("role") or "")
+            if is_rejected_buyer_category(ts_cat) or (ts_role and ts_role in NON_BUYER_ROLES):
+                dropped += 1
+                _quarantine_row(row, f"fast_path_reject:{ts_cat}:{ts_role}", quarantine)
+                continue
             row["typesafe_qualified"] = True
+            row["qualified"] = True
             row["typesafe_fit"] = round(float(ts.get("typesafe_fit", 0.0)), 4)
-            if ts.get("typesafe_category"):
-                row["category"] = ts["typesafe_category"]
-            if ts.get("typesafe_role") and ts["typesafe_role"] != "Other":
-                row["role"] = ts["typesafe_role"]
-                row["roles"] = [ts["typesafe_role"]]
+            if ts_cat:
+                row["category"] = ts_cat
+            if ts_role and ts_role != "Other":
+                row["role"] = ts_role
+                row["roles"] = [ts_role]
+            bad_reason = _product_reality_reject_reason(row)
+            if bad_reason:
+                routed.append(row)
+                continue
             out.append(row)
             continue
         routed.append(row)
 
-    if routed:
-        rows_for_openrouter = routed
-    else:
-        rows_for_openrouter = []
-    # Keep the existing batched OpenRouter flow for uncertain cases only.
-    rows = rows_for_openrouter
+    rows = routed
     total = len(rows)
-    if total and not API_KEY:
-        print("ERROR: RELAYFAST_API_KEY not set (.env); keeping uncertain rows with existing enrichment", file=sys.stderr)
-        out.extend(rows)
+    api_key = (os.getenv("RELAYFAST_API_KEY") or os.getenv("LLM_API_KEY") or API_KEY or "").strip()
+    if total and not api_key:
+        print("ERROR: RELAYFAST_API_KEY not set; fail-closed quarantining uncertain rows", file=sys.stderr)
+        for r in rows:
+            dropped += 1
+            _quarantine_row(r, "missing_llm_api_key", quarantine)
         rows = []
         total = 0
+
     print(f"TypeSafe primary: {len(out)} KEEP, {dropped} DROP; Relay Fast recheck {total} UNCERTAIN"
           + (" (fast-path enabled)" if fast_path else " (legacy all-candidate mode)"), file=sys.stderr)
     for start in range(0, total, batch_size):
@@ -279,25 +348,31 @@ def qualify_loaded(rows, *, batch_size):
         try:
             results = call_llm_retry(batch)
         except Exception as e:
-            # batch failed hard: keep leads with their regex classification
-            # rather than losing them silently
-            print(f"  batch {bno}/{nbatches} FAILED ({e}); keeping batch unfiltered",
+            print(f"  batch {bno}/{nbatches} FAILED ({e}); fail-closed quarantining batch",
                   file=sys.stderr)
-            results = [None] * len(batch)
+            for r in batch:
+                dropped += 1
+                _quarantine_row(r, f"llm_batch_error:{e.__class__.__name__}", quarantine)
+            continue
 
-        if len(results) != len(batch):
-            print(f"  batch {bno}: length mismatch {len(results)} != {len(batch)}; "
-                  f"aligning conservatively", file=sys.stderr)
-            results = (list(results) + [None] * len(batch))[:len(batch)]
+        if not isinstance(results, list) or len(results) != len(batch):
+            got_len = len(results) if isinstance(results, list) else -1
+            print(f"  batch {bno}: length mismatch {got_len} != {len(batch)}; fail-closed quarantining batch",
+                  file=sys.stderr)
+            for r in batch:
+                dropped += 1
+                _quarantine_row(r, "llm_length_mismatch", quarantine)
+            continue
 
         for r, res in zip(batch, results):
             nr = norm_result(res) if res else None
             if nr is None:
-                # unparseable -> keep lead as-is (don't lose data)
-                out.append(r)
-                continue
-            if not nr["is_lead"] or nr["category"] == "Сервис / агентство":
                 dropped += 1
+                _quarantine_row(r, "unparseable_llm_item", quarantine)
+                continue
+            if not nr["is_lead"] or is_rejected_buyer_category(nr["category"]):
+                dropped += 1
+                _quarantine_row(r, "not_buyer_or_agency", quarantine)
                 print(f"    - drop: {r.get('name')} (@{r.get('username') or '-'})",
                       file=sys.stderr)
                 continue
@@ -310,10 +385,26 @@ def qualify_loaded(rows, *, batch_size):
                 "project_url": nr["project_url"] or r.get("project_url") or "",
                 "what_they_do": nr["what_they_do"] or r.get("what_they_do") or "",
                 "llm_qualified": True,
+                "qualified": True,
             })
+            bad_reason = _product_reality_reject_reason(r2)
+            if bad_reason:
+                dropped += 1
+                _quarantine_row(r2, bad_reason, quarantine)
+                continue
             out.append(r2)
         print(f"  batch {bno}/{nbatches}: kept {len(out)} so far, dropped {dropped}",
               file=sys.stderr)
+
+    state_dir = os.getenv("LEADGEN_STATE_DIR", "").strip()
+    if quarantine and state_dir and os.path.isdir(state_dir):
+        q_path = os.path.join(state_dir, "quarantined_unqualified.jsonl")
+        try:
+            with open(q_path, "a", encoding="utf-8") as qfh:
+                for qrow in quarantine:
+                    qfh.write(json.dumps(qrow, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            print(f"# warning: could not write quarantine file {q_path}: {exc}", file=sys.stderr)
 
     print(f"Qualified {len(out)}/{input_total} leads (dropped {dropped})", file=sys.stderr)
     return out, dropped

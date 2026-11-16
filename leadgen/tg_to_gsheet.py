@@ -32,8 +32,8 @@ CAT_LABEL = {
 GOOD = {"CEX / биржа", "Проп трейдинг", "Медиа / контент", "DeFi / DEX",
         "Токен / мемкоин", "Gaming / AI", "SaaS / AI app", "Платёжки / финтех"}
 
-# sellable roles (per SOP we sell to founders/growth/marketing/community/creators)
-SELL_ROLES = {"Founder", "Marketing", "Community", "Creator/KOL"}
+# sellable buyer roles (strictly Founder / Marketing)
+SELL_ROLES = {"Founder", "Marketing"}
 
 # "Наш угол" per category
 OUR_ANGLE = {
@@ -290,7 +290,7 @@ def _fetch_tco(url):
     import urllib.request
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "creatoros-lead-harvest"},
+        headers={"User-Agent": "softugc-lead-harvest"},
     )
     with urllib.request.urlopen(request, timeout=_TCO_TIMEOUT_S) as response:
         return response.geturl()
@@ -375,22 +375,76 @@ def hook_of(r):
 
 
 def keep_for_sheet(r):
-    """True when the row has a G contact and a sellable (or technical) role.
+    """True ONLY when the row has a G contact and passes the strict Product-Buyer gate."""
+    try:
+        from supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_supply_side,
+        )
+    except ImportError:
+        from leadgen.supply_side import (
+            NON_BUYER_ROLES,
+            has_insufficient_product_info,
+            is_invalid_product_name,
+            is_rejected_buyer_category,
+            is_supply_side,
+        )
 
-    A catalog_ row with any contact is kept even without a role.
-    """
     if not contact_of(r):
         return False
-    if str(r.get("source") or "").startswith("catalog_"):
+    cat = str(r.get("category") or r.get("niche") or "").strip()
+    if is_rejected_buyer_category(cat):
+        return False
+    blob = "\n".join(
+        str(x)
+        for x in (
+            r.get("name") or "",
+            r.get("company") or "",
+            r.get("project") or "",
+            r.get("bio") or "",
+            r.get("sample") or "",
+            r.get("what_they_do") or "",
+            r.get("their_angle") or "",
+        )
+        if x
+    )
+    if is_supply_side(blob) or has_insufficient_product_info(blob):
+        return False
+    proj = str(r.get("project") or r.get("company") or r.get("name") or "").strip()
+    if is_invalid_product_name(proj):
+        return False
+
+    roles = {str(x).strip() for x in (r.get("roles") or []) if str(x or "").strip()}
+    single_role = str(r.get("role") or "").strip()
+    if single_role:
+        roles.add(single_role)
+
+    if roles:
+        if roles & SELL_ROLES:
+            return True
+        if roles & NON_BUYER_ROLES:
+            return False
+        return False
+
+    source = str(r.get("source") or r.get("lead_source") or "").strip().lower()
+    if source.startswith("catalog_") or source in {
+        "yc",
+        "yc_ph",
+        "product hunt",
+        "betalist",
+        "microlaunch",
+        "uneed",
+        "indiehackers",
+        "meta_ads",
+        "tg_ad_spy",
+        "tg_channel_graph",
+        "linkedin_jobs",
+    }:
         return True
-    roles = set(r.get("roles") or [])
-    social_contact = any(r.get(k) for k in (
-        "founder_x", "founder_twitter", "x_url", "twitter_url",
-        "founder_linkedin", "linkedin_url",
-    )) or bool(r.get("social_verified") or r.get("social_contacts"))
-    typesafe_fit = float(r.get("typesafe_fit") or 0.0)
-    technical_owner = "Dev" in roles and social_contact and typesafe_fit >= 0.45
-    return bool(roles & SELL_ROLES) or technical_owner
+    return False
 
 
 _TG_RE = re.compile(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})", re.I)

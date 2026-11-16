@@ -66,11 +66,18 @@ _GENERIC_SITE_BASES = frozenset(
         "discord",
         "notion",
         "linktr",
+        "linktree",
         "beacons",
         "carrd",
         "docs",
         "drive",
         "chromewebstore",
+        "lu",
+        "luma",
+        "news",
+        "huggingface",
+        "calendly",
+        "ycombinator",
     }
 )
 _COMMON_FIRST_NAMES = frozenset(

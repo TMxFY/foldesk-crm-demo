@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Attach treg data to leads before they are written to a sheet.
 
-CreatorOS: work email, mailbox check, LinkedIn, plus a weekly US search-volume
+SoftUGC: work email, mailbox check, LinkedIn, plus a weekly US search-volume
 and competitor-ad note.
 ForexSbor: YouTube size and an X handle when the channel description already
 names them, plus the same weekly demand note.
