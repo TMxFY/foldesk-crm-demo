@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Foldesk CRM Leadgen Replenishment every 4 hours
+
+[Timer]
+OnCalendar=*-*-* 07,11,15,19:15:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

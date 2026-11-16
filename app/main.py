@@ -2,11 +2,14 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import os
 import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+_runtime_logger = logging.getLogger("crmtg.runtime")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response, StreamingResponse
@@ -644,7 +647,59 @@ async def _run_db_sync(conn, func, *args, **kwargs):
         return func(*args, **kwargs)
 
 
-def _sync_and_publish_dialogs_sync(conn, account_id: int, people: list[dict]):
+def _filter_people_to_existing_or_crm(
+    conn, account_id: int, people: list[dict]
+) -> list[dict]:
+    if not people:
+        return []
+    existing_peer_ids = {
+        int(r[0])
+        for r in conn.execute(
+            "SELECT peer_id FROM dialogs WHERE account_id = ? AND peer_id IS NOT NULL",
+            (int(account_id),),
+        ).fetchall()
+    }
+    crm_tg_ids = {
+        int(r[0])
+        for r in conn.execute(
+            """
+            SELECT telegram_user_id FROM leads WHERE telegram_user_id IS NOT NULL
+            UNION
+            SELECT telegram_user_id FROM campaign_recipients WHERE telegram_user_id IS NOT NULL
+            """
+        ).fetchall()
+    }
+    crm_usernames = {
+        str(r[0]).strip().lstrip("@").lower()
+        for r in conn.execute(
+            """
+            SELECT username FROM leads WHERE username IS NOT NULL AND username != ''
+            UNION
+            SELECT username FROM campaign_recipients WHERE username IS NOT NULL AND username != ''
+            """
+        ).fetchall()
+    }
+    filtered = []
+    for p in people:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("telegram_user_id") if p.get("telegram_user_id") is not None else p.get("peer_id")
+        try:
+            pid_int = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid_int = None
+        uname = str(p.get("username") or "").strip().lstrip("@").lower()
+        if (
+            (pid_int is not None and (pid_int in existing_peer_ids or pid_int in crm_tg_ids))
+            or (uname and uname in crm_usernames)
+        ):
+            filtered.append(p)
+    return filtered
+
+
+def _sync_and_publish_dialogs_sync(
+    conn, account_id: int, people: list[dict], *, crm_only: bool = False
+):
     load_all = getattr(_inbox_mod, "_query_inbox_rows", None)
     if load_all is not None:
         before_rows = load_all(conn, account_id=account_id)
@@ -655,7 +710,12 @@ def _sync_and_publish_dialogs_sync(conn, account_id: int, people: list[dict]):
         for row in before_rows
         if isinstance(row, dict) and row.get("id") is not None
     }
-    sync_inbox(conn, account_id, people)
+    effective_people = (
+        _filter_people_to_existing_or_crm(conn, account_id, people)
+        if crm_only
+        else people
+    )
+    sync_inbox(conn, account_id, effective_people)
     res = sync_dialog_read_receipts(conn, account_id, people)
     if load_all is not None:
         after_rows = load_all(conn, account_id=account_id)
@@ -671,9 +731,15 @@ def _sync_and_publish_dialogs_sync(conn, account_id: int, people: list[dict]):
     return res, changed
 
 
-async def _sync_and_publish_dialogs(app, conn, account_id: int, people: list[dict]):
+async def _sync_and_publish_dialogs(
+    app, conn, account_id: int, people: list[dict], *, crm_only: bool = False
+):
     res, changed = await _run_db_sync(
-        conn, _sync_and_publish_dialogs_sync, conn, account_id, people
+        conn,
+        lambda c: _sync_and_publish_dialogs_sync(
+            c, account_id, people, crm_only=crm_only
+        ),
+        conn,
     )
     hub = getattr(app.state, "inbox_hub", None)
     if hub is not None:
@@ -838,15 +904,47 @@ async def start_account_watch(app, account_id: int) -> None:
                 watch_kwargs["on_outgoing"] = on_outgoing
         except (TypeError, ValueError):
             watch_kwargs = {"on_read": on_read, "on_outgoing": on_outgoing}
-        try:
+        while True:
             try:
-                await gateway.watch_private(session_path, on_message, **watch_kwargs)
-            except TypeError:
-                await gateway.watch_private(session_path, on_message)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return
+                try:
+                    await gateway.watch_private(session_path, on_message, **watch_kwargs)
+                except TypeError:
+                    await gateway.watch_private(session_path, on_message)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                err_low = str(exc).lower()
+                if any(
+                    fatal in err_low
+                    for fatal in (
+                        "unauthorized",
+                        "auth_key_duplicated",
+                        "two different ip",
+                        "deactivated",
+                    )
+                ):
+                    _runtime_logger.error(
+                        "Permanent watch failure for account_id=%s: %s", account_id, exc
+                    )
+                    return
+                _runtime_logger.warning(
+                    "Transient watch disconnect for account_id=%s (%s), retrying...",
+                    account_id,
+                    exc,
+                )
+                retry_delay = float(getattr(app.state, "watch_retry_delay", 5.0) or 5.0)
+                await asyncio.sleep(retry_delay)
+                try:
+                    with locked_conn(app.state.conn):
+                        refreshed = load_account(app.state.conn, account_id)
+                    if refreshed.get("status") != "connected" or refreshed.get("health") in (
+                        "unauthorized",
+                        "banned",
+                    ):
+                        return
+                except Exception:
+                    return
 
     task = asyncio.create_task(runner())
     app.state.inbox_tasks[account_id] = task
@@ -920,7 +1018,9 @@ async def sync_live_tg_read_receipts_once(
         if not isinstance(people, list):
             continue
         try:
-            res = await _sync_and_publish_dialogs(app, conn, aid, people[:limit])
+            res = await _sync_and_publish_dialogs(
+                app, conn, aid, people[:limit], crm_only=True
+            )
             synced_accs += 1
             if isinstance(res, dict):
                 updated_recs += int(res.get("updated_recipients") or 0)
@@ -942,11 +1042,15 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
         try:
             await asyncio.sleep(interval_seconds)
             tick_counter += 1
-            tick_res = await run_autopilot_tick(
+            maybe_coro = run_autopilot_tick(
                 app.state.conn,
                 gateway=_resolve_app_gateway(app, "telegram"),
                 wa_gateway=_resolve_app_gateway(app, "whatsapp"),
             )
+            tick_res = (
+                await maybe_coro if inspect.isawaitable(maybe_coro) else maybe_coro
+            )
+            app.state.autopilot_last_tick_at = utc_now()
             dirty = isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
             if tick_counter % 2 == 0 and "PYTEST_CURRENT_TEST" not in os.environ:
                 with locked_conn(app.state.conn):
@@ -971,7 +1075,12 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
                 schedule_cloud_backup(app)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            app.state.autopilot_error_count = (
+                int(getattr(app.state, "autopilot_error_count", 0) or 0) + 1
+            )
+            app.state.autopilot_last_error = f"{type(exc).__name__}: {exc}"
+            _runtime_logger.exception("autopilot_loop tick failed")
             continue
 
 
@@ -1127,37 +1236,67 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 owned = await asyncio.to_thread(check_tg_runtime_lease_owned, None)
                 if not owned:
                     if is_vps_canonical:
-                        await asyncio.to_thread(
-                            wait_and_acquire_tg_runtime_lease,
-                            None,
-                            max_wait_seconds=10.0,
+                        reacquired = bool(
+                            await asyncio.to_thread(
+                                wait_and_acquire_tg_runtime_lease,
+                                None,
+                                max_wait_seconds=10.0,
+                            )
                         )
-                        app.state.tg_lease_ready = True
-                        continue
+                        if reacquired:
+                            app.state.tg_lease_ready = True
+                            await start_connected_watches(app)
+                            await start_autopilot_loop(app)
+                            continue
                     app.state.tg_lease_ready = False
                     await stop_autopilot_loop(app)
                     await stop_inbox_watches(app)
-                    return
+                    if not is_vps_canonical:
+                        return
+                    continue
                 await asyncio.to_thread(
                     write_tg_runtime_lease, released=False, conn=None
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                _runtime_logger.warning("tg_lease_heartbeat_loop error: %s", exc)
                 continue
 
     async def _leased_tg_runtime_boot(app: FastAPI) -> None:
         from app.cloud_persistence import (
+            _resolve_r2_config,
             schedule_cloud_backup,
             wait_and_acquire_tg_runtime_lease,
         )
 
-        try:
-            await asyncio.to_thread(wait_and_acquire_tg_runtime_lease, None)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
+        is_vps_canonical = os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        has_r2 = _resolve_r2_config(getattr(app.state, "conn", None)) is not None
+        acquired = True
+        if has_r2:
+            try:
+                acquired = bool(
+                    await asyncio.to_thread(wait_and_acquire_tg_runtime_lease, None)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _runtime_logger.error("Failed acquiring R2 TG lease on boot: %s", exc)
+                acquired = False
+        if not acquired:
+            app.state.tg_lease_ready = False
+            _runtime_logger.warning(
+                "Another host holds active R2 TG runtime lease; refusing to start local TG sessions to prevent AUTH_KEY_DUPLICATED."
+            )
+            if is_vps_canonical:
+                app.state.tg_lease_heartbeat_task = asyncio.create_task(
+                    _tg_lease_heartbeat_loop(app)
+                )
+            return
         app.state.tg_lease_ready = True
         if getattr(app.state, "_needs_initial_session_backup", False):
             app.state._needs_initial_session_backup = False
@@ -1306,6 +1445,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     app.state.tg_lease_ready = True
     app.state.tg_lease_boot_task = None
     app.state.tg_lease_heartbeat_task = None
+    app.state.autopilot_error_count = 0
+    app.state.autopilot_last_error = None
+    app.state.autopilot_last_tick_at = None
     app.state._needs_initial_session_backup = needs_initial_session_backup
     if needs_initial_session_backup:
         from app.cloud_persistence import schedule_cloud_backup
@@ -1334,9 +1476,87 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     register_security_middleware(app)
 
+    def _resolve_db_file_path(conn_obj) -> str | None:
+        if conn_obj is None:
+            return None
+        try:
+            with locked_conn(conn_obj):
+                rows = conn_obj.execute("PRAGMA database_list").fetchall()
+            for r in rows:
+                name = r[1] if not isinstance(r, dict) else r.get("name")
+                file_p = r[2] if not isinstance(r, dict) else r.get("file")
+                if name == "main" and file_p and str(file_p) != ":memory:":
+                    return str(file_p)
+        except Exception:
+            return None
+        return None
+
+    def _call_isolated_db(conn_obj, func, *args, **kwargs):
+        db_file = _resolve_db_file_path(conn_obj)
+        if not db_file:
+            return _call(func, conn_obj, *args, **kwargs)
+        iso_conn = connect(db_file)
+        try:
+            return _call(func, iso_conn, *args, **kwargs)
+        finally:
+            try:
+                iso_conn.close()
+            except Exception:
+                pass
+
     @app.get("/api/health")
-    def api_health():
-        return {"ok": True, "status": "healthy"}
+    def api_health(request: Request, deep: int = 0):
+        conn_obj = getattr(request.app.state, "conn", None)
+        db_ok = False
+        active_accounts = 0
+        healthy_accounts = 0
+        try:
+            if conn_obj is not None:
+                with locked_conn(conn_obj):
+                    conn_obj.execute("SELECT 1").fetchone()
+                    db_ok = True
+                    if deep:
+                        acc_row = conn_obj.execute(
+                            """
+                            SELECT
+                                COUNT(*) AS active_cnt,
+                                SUM(CASE WHEN coalesce(health, 'active') = 'active' THEN 1 ELSE 0 END) AS healthy_cnt
+                            FROM accounts
+                            WHERE status = 'connected'
+                            """
+                        ).fetchone()
+                        if acc_row is not None:
+                            active_accounts = int(acc_row["active_cnt"] or 0)
+                            healthy_accounts = int(acc_row["healthy_cnt"] or 0)
+        except Exception as exc:
+            return Response(
+                content=json.dumps(
+                    {"ok": False, "status": "unhealthy", "db_ok": False, "error": str(exc)}
+                ),
+                status_code=503,
+                media_type="application/json",
+            )
+        payload = {"ok": True, "status": "healthy", "db_ok": db_ok}
+        if deep:
+            ap_task = getattr(request.app.state, "autopilot_task", None)
+            payload.update(
+                {
+                    "tg_lease_ready": bool(getattr(request.app.state, "tg_lease_ready", True)),
+                    "autopilot_running": bool(ap_task is not None and not ap_task.done()),
+                    "autopilot_error_count": int(
+                        getattr(request.app.state, "autopilot_error_count", 0) or 0
+                    ),
+                    "autopilot_last_error": getattr(
+                        request.app.state, "autopilot_last_error", None
+                    ),
+                    "autopilot_last_tick_at": getattr(
+                        request.app.state, "autopilot_last_tick_at", None
+                    ),
+                    "active_accounts": active_accounts,
+                    "healthy_accounts": healthy_accounts,
+                }
+            )
+        return payload
 
     @app.get("/robots.txt", response_class=PlainTextResponse)
     def robots_txt():
@@ -2262,12 +2482,14 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             for r in rows:
                 aid = int(r["id"])
                 request.app.state.inbox_synced.discard(aid)
+                await ensure_private_inbox(request.app, aid)
                 await start_account_watch(request.app, aid)
             with locked_conn(conn):
                 dialogs = list_inbox(conn, 0, "", crm_only=crm_only)
             return {"synced": len(rows), "dialogs": dialogs}
         aid = int(target_id)
         request.app.state.inbox_synced.discard(aid)
+        await ensure_private_inbox(request.app, aid)
         await start_account_watch(request.app, aid)
         with locked_conn(conn):
             dialogs = list_inbox(conn, aid, "", crm_only=crm_only)
@@ -3020,7 +3242,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     def cloud_backup_run(request: Request):
         from app.cloud_persistence import backup_to_cloud
 
-        return _call(backup_to_cloud, request.app.state.conn)
+        return _call_isolated_db(request.app.state.conn, backup_to_cloud)
 
     @app.post("/api/cloud/restore")
     async def cloud_restore_run(request: Request):
@@ -3073,9 +3295,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
         direction = body.direction if body is not None else "both"
         client = getattr(request.app.state, "airtable_client", None)
-        return _call(
-            sync_airtable,
+        return _call_isolated_db(
             request.app.state.conn,
+            sync_airtable,
             direction=direction,
             client=client,
         )
@@ -3085,9 +3307,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         from app.airtable_sync import push_lead_to_airtable
 
         client = getattr(request.app.state, "airtable_client", None)
-        return _call(
-            push_lead_to_airtable,
+        return _call_isolated_db(
             request.app.state.conn,
+            push_lead_to_airtable,
             lead_id,
             client=client,
         )

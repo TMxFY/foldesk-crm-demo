@@ -1,0 +1,13 @@
+[Unit]
+Description=Foldesk Telegram CRM — Scheduled Leadgen & Strict ICP Replenishment
+After=network-online.target crmtg.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/crmtg
+EnvironmentFile=-/opt/crmtg/.env
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/crmtg/.venv/bin/python -c "from app.db import connect, init_db; from app.leadgen_settings import get_leadgen_config, push_discovered_now; conn = connect('/opt/crmtg/data/crm.db'); init_db(conn); cfg = get_leadgen_config(conn); res = push_discovered_now(conn) if cfg.get('enabled') and cfg.get('auto_push_to_crm') else {'skipped': 'disabled_in_config'}; conn.close(); print('crmtg-leadgen tick:', res)"
+TimeoutStartSec=600
