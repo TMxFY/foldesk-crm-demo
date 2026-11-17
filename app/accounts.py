@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import zipfile
 
-from app.db import as_dict, resolve_session, utc_now, utc_today
+from app.db import DEFAULT_DB, ROOT, as_dict, resolve_session, utc_now, utc_today
 
 logger = logging.getLogger(__name__)
 ORPHAN_DEAD_ACCOUNT_ERROR = "Цепочка остановлена: исходный аккаунт деавторизован (unauthorized)"
@@ -278,6 +278,29 @@ def _clear_deleted_session(conn, session_path: str | None = None, phone: str | N
         pass
 
 
+def _can_mutate_session_file_on_disk(conn, abs_p: Path) -> bool:
+    if os.environ.get("CRMTG_SKIP_GLOBAL_DB_FALLBACK") == "1":
+        return False
+    if os.getenv("BOT_TOKEN") == "e2e-not-a-secret":
+        return False
+    try:
+        db_file = None
+        if conn is not None:
+            for r in conn.execute("PRAGMA database_list").fetchall():
+                if str(r[1] or "") == "main" and str(r[2] or "").strip():
+                    db_file = Path(str(r[2])).resolve()
+                    break
+        default_resolved = DEFAULT_DB.resolve()
+        if db_file is not None and db_file != default_resolved:
+            global_data_dir = (ROOT / "data").resolve()
+            resolved_sess = abs_p.resolve()
+            if resolved_sess.is_relative_to(global_data_dir) and not resolved_sess.is_relative_to(db_file.parent):
+                return False
+    except Exception:
+        pass
+    return True
+
+
 def delete_account(conn, account_id: int, gateway=None) -> dict:
     current = _load(conn, account_id)
     session_path = str(current.get("session_path") or "").strip()
@@ -309,25 +332,24 @@ def delete_account(conn, account_id: int, gateway=None) -> dict:
     if (
         session_path
         and not session_path.startswith("data/sessions/demo")
-        and "PYTEST_CURRENT_TEST" not in os.environ
-        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
     ):
         try:
             abs_p = resolve_session(session_path)
-            if abs_p.exists() and abs_p.is_file():
+            if _can_mutate_session_file_on_disk(conn, abs_p) and abs_p.exists() and abs_p.is_file():
                 if _inspect_telethon_session(session_path) is not None:
                     backup_p = abs_p.parent / f"backup_{abs_p.name}"
                     shutil.move(str(abs_p), str(backup_p))
                 else:
                     abs_p.unlink()
-            if abs_p.name == "1.session":
+            if _can_mutate_session_file_on_disk(conn, abs_p) and abs_p.name == "1.session":
                 tim_backup = abs_p.parent / "backup_tim_cros.session"
                 if tim_backup.exists():
                     shutil.move(str(tim_backup), str(abs_p.parent / "backup_deleted_tim_cros.session"))
-            for suffix in ("-journal", "-wal", "-shm"):
-                sidecar = abs_p.with_name(abs_p.name + suffix)
-                if sidecar.exists():
-                    sidecar.unlink()
+            if _can_mutate_session_file_on_disk(conn, abs_p):
+                for suffix in ("-journal", "-wal", "-shm"):
+                    sidecar = abs_p.with_name(abs_p.name + suffix)
+                    if sidecar.exists():
+                        sidecar.unlink()
         except Exception:
             pass
     return {"deleted": True, "id": int(account_id), "session_path": session_path}
@@ -1525,24 +1547,16 @@ def record_account_health_transition(
         import app.digest as digest_mod
 
         token, chat_id = digest_mod.resolve_colleague_bot_credentials(conn, default_chat_id=True)
-        if token and chat_id:
-            in_pytest = "PYTEST_CURRENT_TEST" in os.environ
-            post_mocked = (
-                opener is not None
-                or getattr(digest_mod._post, "__module__", "") != "app.digest"
-                or getattr(digest_mod._default_urlopen, "__module__", "") != "app.digest"
-                or os.environ.get("ALLOW_LIVE_BOT_IN_TEST") == "1"
+        if token and chat_id and os.environ.get("DISABLE_BOT_ALERTS") != "1":
+            alert_text = (
+                f"⚠️ Аккаунт рассылки {acc_label} (ID {account_id}) перешёл в статус {health}.\n"
+                f"Причина: {clipped_err or 'не указана'}"
             )
-            if not in_pytest or post_mocked:
-                alert_text = (
-                    f"⚠️ Аккаунт рассылки {acc_label} (ID {account_id}) перешёл в статус {health}.\n"
-                    f"Причина: {clipped_err or 'не указана'}"
-                )
-                digest_mod._post(
-                    digest_mod.SEND_URL.format(token=token),
-                    {"chat_id": str(chat_id), "text": alert_text},
-                    opener,
-                )
+            digest_mod._post(
+                digest_mod.SEND_URL.format(token=token),
+                {"chat_id": str(chat_id), "text": alert_text},
+                opener,
+            )
     except Exception as exc:
         logger.warning("Account health digest alert failed for id=%s: %s", account_id, exc)
     return True
@@ -1611,12 +1625,21 @@ async def probe_account(conn, account_id: int, gateway) -> dict:
         if gateway is not None and hasattr(gateway, "probe_spambot"):
             sb = await gateway.probe_spambot(account["session_path"])
             try:
-                from app.outreach import _SPAMBOT_PROBE_CACHE, _spambot_cache_key
+                from app.outreach import (
+                    _SPAMBOT_PROBE_CACHE,
+                    _spambot_cache_key,
+                    clear_account_cooldown,
+                    set_account_cooldown_until,
+                )
 
                 _SPAMBOT_PROBE_CACHE.pop(
                     _spambot_cache_key(conn, account_id, account["session_path"]),
                     None,
                 )
+                if sb.get("limited") is False:
+                    clear_account_cooldown(conn, account_id)
+                elif sb.get("limited") is True and sb.get("limited_until_utc"):
+                    set_account_cooldown_until(conn, account_id, sb["limited_until_utc"])
             except Exception:
                 pass
             if sb.get("limited") is False:
