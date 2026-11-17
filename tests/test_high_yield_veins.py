@@ -956,3 +956,147 @@ def test_seam_end_to_end_high_yield_veins_through_enrich_curate_bridge_split_and
     }
     assert tg_users == {"clippulse_ceo", "tarotflow_ceo"}
     conn.close()
+
+
+def test_live_quality_hardening_rejects_noise_and_ungrounded_linkedin_and_resolves_brand_sites(monkeypatch):
+    from leadgen import tg_enrich_leads, treg_enrich
+
+    # 1) Noise placeholder & Whop docs rejection + LinkedIn-only without domain rejected
+    noise_whop_hits = {
+        "results": [
+            {
+                "url": "https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com/brands-terms",
+                "title": "Organization terms of service",
+                "snippet": "Budget: $1,000. CPM: $5.1",
+            },
+            {
+                "url": "https://whop.com/content-campaigns-access/",
+                "title": "Content Campaigns",
+                "snippet": "Budget: $1,000. CPM: $1.00 per 1,000 views",
+            },
+            {
+                "url": "https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com/discover/de8b89",
+                "title": "Slideshows [English]",
+                "snippet": "Post slideshows about Content Rewards, $1.00 CPM",
+            },
+            {
+                "url": "https://whop.com/discover/realbrand/",
+                "title": "Earn $2 per 1,000 Views Clipping RealBrandApp",
+                "snippet": "Budget: $2,500",
+            },
+        ]
+    }
+    whop_rows, _ = high_yield_veins.collect_whop_content_rewards(
+        limit=5,
+        day=date(2026, 11, 17),
+        seen={},
+        search_fn=lambda q: noise_whop_hits,
+        enrich_fn=lambda b, d: {"founder_linkedin": "https://www.linkedin.com/in/random-stranger"},
+        site_scrape_fn=lambda u: {},
+    )
+    # LinkedIn-only without domain/work_email/founder_x/username MUST be dropped cleanly!
+    assert whop_rows == []
+
+    # 2) TikTok Ads rejects "Not Mention" & "Sponsored", resolves brand website via web_search_fn
+    tt_ads, _ = high_yield_veins.collect_tiktok_creative_ads(
+        limit=5,
+        day=date(2026, 11, 17),
+        seen={},
+        ads_search_fn=lambda kw: {
+            "data": {
+                "materials": [
+                    {"brand_name": "Not Mention", "ad_title": "AI app test"},
+                    {"brand_name": "Sponsored", "ad_title": "AI video"},
+                    {"brand_name": "Jitt – App of Fame", "ad_title": "challenges, music challenge, dance challenge"},
+                ]
+            }
+        }
+        if kw == high_yield_veins.TIKTOK_AD_QUERIES[0]
+        else {"data": {"materials": []}},
+        web_search_fn=lambda q: {
+            "results": [
+                {"url": "https://apps.apple.com/us/app/jitt-app-of-fame/id6500001111", "title": "Jitt - App of Fame"}
+            ]
+        },
+        store_resolver_fn=lambda u: {
+            "developer": "Jitt Labs Inc.",
+            "website": "https://jitt.app",
+            "domain": "jitt.app",
+            "email": "founders@jitt.app",
+            "rating_count": 420,
+            "is_megacorp": False,
+        },
+        enrich_fn=lambda c, d: {},
+        site_scrape_fn=lambda u: {"founder_x": "https://x.com/jittapp"},
+    )
+    assert len(tt_ads) == 1
+    assert tt_ads[0]["name"] == "Jitt – App of Fame"
+    assert tt_ads[0]["project_url"] == "https://jitt.app"
+    assert tt_ads[0]["work_email"] == "founders@jitt.app"
+    # Bare "dance challenge" MUST NOT classify as Prop trading!
+    enriched_jitt = tg_enrich_leads.enrich_rows(tt_ads, fetch=False, skip_copy=True)
+    assert enriched_jitt[0]["category"] != "Проп трейдинг"
+    assert tg_enrich_leads.classify_cat("Prop trading challenge for funded traders") == "Проп трейдинг"
+
+    # 3) TikTok Shop resolves "POWERBIRTH" -> official site (ignoring Amazon) and rejects LinkedIn-only guess
+    shop_rows, _ = high_yield_veins.collect_tiktok_shop_brands(
+        limit=5,
+        day=date(2026, 11, 17),
+        seen={},
+        shop_search_fn=lambda kw: {
+            "products": [
+                {"title": "POWERBIRTH Sleep Gummies", "seller_info": {"shop_name": "POWERBIRTH"}},
+                {"title": "UnresolvedBrand Gummies", "seller_info": {"shop_name": "UnresolvedCo"}},
+            ]
+        }
+        if kw == high_yield_veins.TIKTOK_SHOP_QUERIES[0]
+        else {"products": []},
+        web_search_fn=lambda q: (
+            {
+                "results": [
+                    {"url": "https://www.amazon.com/powerbirth-gummies", "title": "POWERBIRTH on Amazon"},
+                    {"url": "https://powerbirth.com", "title": "POWERBIRTH Official Store"},
+                ]
+            }
+            if "POWERBIRTH" in q
+            else {"results": []}
+        ),
+        enrich_fn=lambda comp, dom: {"founder_linkedin": "https://www.linkedin.com/in/stranger"},
+        site_scrape_fn=lambda u: {"work_email": "hello@powerbirth.com"} if "powerbirth.com" in u else {},
+    )
+    assert len(shop_rows) == 1
+    assert shop_rows[0]["project"] == "POWERBIRTH"
+    assert shop_rows[0]["project_url"] == "https://powerbirth.com"
+    assert shop_rows[0]["work_email"] == "hello@powerbirth.com"
+
+    # 4) find_company_decision_maker rejects search hits that don't mention the brand/domain
+    monkeypatch.setattr(
+        treg_enrich,
+        "call",
+        lambda ep, query=None, **kw: {
+            "results": [
+                {
+                    "url": "https://www.linkedin.com/in/greg-moore-411a4b4",
+                    "title": "Greg Moore - Random Consultant",
+                    "snippet": "Helping SaaS teams grow",  # zero mention of Jitt!
+                }
+            ]
+        },
+    )
+    assert treg_enrich.find_company_decision_maker("Jitt – App of Fame", "") == {}
+
+    monkeypatch.setattr(
+        treg_enrich,
+        "call",
+        lambda ep, query=None, **kw: {
+            "results": [
+                {
+                    "url": "https://www.linkedin.com/in/tarotflow-ceo",
+                    "title": "Jane Doe - Founder at TarotFlow",
+                    "snippet": "Building tarotflow.app consumer AI app",
+                }
+            ]
+        },
+    )
+    matched = treg_enrich.find_company_decision_maker("TarotFlow", "tarotflow.app")
+    assert matched["founder_linkedin"] == "https://www.linkedin.com/in/tarotflow-ceo"

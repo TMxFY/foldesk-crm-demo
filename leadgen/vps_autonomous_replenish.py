@@ -1494,6 +1494,16 @@ def run_autonomous_replenish(
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        from app.runtime_config import should_skip_dotenv
+
+        if not should_skip_dotenv():
+            from dotenv import load_dotenv
+
+            load_dotenv(ROOT / ".env", override=False)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Autonomous Low-Water Mark Leadgen Replenishment for VPS"
     )

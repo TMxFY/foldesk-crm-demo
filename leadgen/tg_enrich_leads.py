@@ -113,7 +113,11 @@ _BLOCKED_PROJECT_TOKENS = frozenset(
 
 # ЦА categories (priority order)
 CATEGORIES = [
-    ("Проп трейдинг", r"\b(prop[- ]?trad\w*|prop[- ]?firm|funded|challenge|проп)\b"),
+    (
+        "Проп трейдинг",
+        r"\b(prop[- ]?trad\w*|prop[- ]?firm\w*|funded[- ]?trad\w*|funded[- ]?account\w*|"
+        r"(?:prop|funded|trading|forex|crypto)\s+challenge\w*|проп[- ]?(?:трейд\w*|фирм\w*)|проп)\b",
+    ),
     ("CEX / биржа", r"\b(exchange|cex\b|бирж\w*|trading platform|broker)\b"),
     ("DeFi / DEX", r"\b(defi|dex\b|tvl|staking|yield|liquidity|lending|borrow|swap|amm|perp\w*|vault\w*)\b"),
     ("Gaming / AI", r"\b(game\w*|gamefi|p2e|playto|ai[- ]?(agent|app|tool|video|startup)|\bai\b|agent\w*|ml\b|нейросет\w*|metaverse)\b"),
