@@ -700,6 +700,26 @@ def has_last_mile_icp_defect(
             return True
     if not is_vacancy_camp and profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
         return True
+    if not is_qa_camp:
+        from app.hygiene import _has_messenger_contact, sniper_lead_violation_reason
+
+        if not _has_messenger_contact(
+            username=rec.get("username"),
+            phone=rec.get("phone"),
+            telegram_user_id=rec.get("telegram_user_id"),
+        ):
+            return True
+        if sniper_lead_violation_reason(
+            name=str(rec.get("name") or ""),
+            company=str(rec.get("company") or ""),
+            niche=str(rec.get("category") or rec.get("lead_niche") or ""),
+            note=f"{rec.get('their_angle') or ''}\n{rec.get('note') or ''}\n{rec.get('lead_note') or ''}".strip(),
+            description=str(rec.get("lead_description") or ""),
+            url=str(rec.get("website") or rec.get("lead_url") or ""),
+            lead_source=str(rec.get("lead_source") or ""),
+            vacancies_enabled=is_vacancy_camp,
+        ):
+            return True
     if not is_qa_camp and is_offline_non_icp_contact(
         username=clean_uname,
         name=rec.get("name"),
@@ -4401,7 +4421,8 @@ async def run_campaign_batch(
     eligible_rows = conn.execute(
         """
         SELECT cr.*, l.niche AS lead_niche, l.created_at AS lead_created_at,
-               l.note AS lead_note, l.description AS lead_description
+               l.note AS lead_note, l.description AS lead_description,
+               l.url AS lead_url, l.lead_source AS lead_source
         FROM campaign_recipients cr
         LEFT JOIN leads l ON l.id = cr.lead_id
         WHERE cr.campaign_id = ?
@@ -4557,6 +4578,53 @@ async def run_campaign_batch(
             )
             conn.commit()
             continue
+
+        if not is_qa_camp:
+            from app.hygiene import _has_messenger_contact, sniper_lead_violation_reason
+
+            if not _has_messenger_contact(
+                username=clean_rec_uname,
+                phone=clean_rec_phone,
+                telegram_user_id=real_rec_peer_id,
+            ):
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = 'Остановлено Sniper ICP-фильтром: нет контакта получателя',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, rec["id"]),
+                )
+                conn.commit()
+                _release_followup_reservation(int(rec["id"]))
+                continue
+
+            sniper_reason = sniper_lead_violation_reason(
+                name=str(rec.get("name") or ""),
+                company=str(rec.get("company") or ""),
+                niche=str(rec.get("category") or rec.get("lead_niche") or ""),
+                note=f"{rec.get('their_angle') or ''}\n{rec.get('note') or ''}\n{rec.get('lead_note') or ''}".strip(),
+                description=str(rec.get("lead_description") or ""),
+                url=str(rec.get("website") or rec.get("lead_url") or ""),
+                lead_source=str(rec.get("lead_source") or ""),
+                vacancies_enabled=is_vacancy_campaign(camp),
+            )
+            if sniper_reason:
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (f"Остановлено Sniper ICP-фильтром: {sniper_reason}", now, rec["id"]),
+                )
+                conn.commit()
+                _release_followup_reservation(int(rec["id"]))
+                continue
 
         if step_idx == 0:
             if _is_stale_vacancy_step1(
@@ -5541,6 +5609,9 @@ async def run_autopilot_tick(
             "status": get_autopilot_status(conn, now_dt=effective_now),
         }
 
+    from app.hygiene import heal_crm_hygiene
+
+    heal_crm_hygiene(conn)
     heal_transient_failed_recipients(conn)
     heal_orphaned_followups_from_dead_accounts(conn)
     running_rows = conn.execute(
@@ -5872,7 +5943,8 @@ def preview_outreach_batch(
     rows = conn.execute(
         """
         SELECT cr.*, l.niche AS lead_niche, l.created_at AS lead_created_at, l.status AS lead_status,
-               l.note AS lead_note, l.description AS lead_description
+               l.note AS lead_note, l.description AS lead_description,
+               l.url AS lead_url, l.lead_source AS lead_source
         FROM campaign_recipients cr
         LEFT JOIN leads l ON l.id = cr.lead_id
         WHERE cr.campaign_id = ?
@@ -5887,6 +5959,9 @@ def preview_outreach_batch(
     legacy_skipped: list[int] = []
     previews: list[dict] = []
     valid_followup_count = 0
+    is_qa_preview = _is_qa_campaign_name(camp.get("name"))
+    is_vac_preview = is_vacancy_campaign(camp)
+    from app.hygiene import _has_messenger_contact, sniper_lead_violation_reason
 
     for row in rows:
         rec = as_dict(row)
@@ -5901,7 +5976,46 @@ def preview_outreach_batch(
         clean_phone = str(rec.get("phone") or "").strip()
         rec_lead_id = int(rec["lead_id"]) if rec.get("lead_id") is not None else None
 
+        rec_has_contact = _has_messenger_contact(
+            username=clean_uname,
+            phone=clean_phone,
+            telegram_user_id=real_peer_id,
+        )
+        rec_sniper_reason = (
+            ""
+            if is_qa_preview
+            else sniper_lead_violation_reason(
+                name=str(rec.get("name") or ""),
+                company=str(rec.get("company") or ""),
+                niche=str(rec.get("category") or rec.get("lead_niche") or ""),
+                note=f"{rec.get('their_angle') or ''}\n{rec.get('note') or ''}\n{rec.get('lead_note') or ''}".strip(),
+                description=str(rec.get("lead_description") or ""),
+                url=str(rec.get("website") or rec.get("lead_url") or ""),
+                lead_source=str(rec.get("lead_source") or ""),
+                vacancies_enabled=is_vac_preview,
+            )
+        )
+
         if step_idx >= 1 or rec.get("status") == "in_progress":
+            has_followup_defect = False
+            if not is_qa_preview and not rec_has_contact:
+                has_followup_defect = True
+                violations.append(
+                    {
+                        "code": "contactless_recipient",
+                        "recipient_id": int(rec["id"]),
+                        "message": f"У получателя #{rec['id']} отсутствуют контакты (username/phone/telegram_user_id)",
+                    }
+                )
+            if rec_sniper_reason:
+                has_followup_defect = True
+                violations.append(
+                    {
+                        "code": "sniper_icp_violation",
+                        "recipient_id": int(rec["id"]),
+                        "message": f"Получатель #{rec['id']} отклонён Sniper ICP-фильтром: {rec_sniper_reason}",
+                    }
+                )
             prior_acc = _lookup_prior_outgoing_account(
                 conn,
                 clean_uname=clean_uname.lower(),
@@ -5917,7 +6031,7 @@ def preview_outreach_batch(
                         "message": f"Получатель #{rec['id']} стоит на follow-up без отправленного Step 1",
                     }
                 )
-            else:
+            elif not has_followup_defect:
                 valid_followup_count += 1
             continue
 
@@ -5931,6 +6045,24 @@ def preview_outreach_batch(
             else ""
         )
         row_violations: list[str] = []
+        if not is_qa_preview and not rec_has_contact:
+            row_violations.append("contactless_recipient")
+            violations.append(
+                {
+                    "code": "contactless_recipient",
+                    "recipient_id": int(rec["id"]),
+                    "message": f"У получателя #{rec['id']} отсутствуют контакты (username/phone/telegram_user_id)",
+                }
+            )
+        if rec_sniper_reason:
+            row_violations.append("sniper_icp_violation")
+            violations.append(
+                {
+                    "code": "sniper_icp_violation",
+                    "recipient_id": int(rec["id"]),
+                    "message": f"Получатель #{rec['id']} отклонён Sniper ICP-фильтром: {rec_sniper_reason}",
+                }
+            )
         if _has_legacy_creatoros_brand(rendered_text):
             row_violations.append("legacy_brand_creatoros")
             violations.append(
