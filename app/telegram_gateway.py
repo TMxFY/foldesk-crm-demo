@@ -14,9 +14,28 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from datetime import timezone
+from datetime import datetime, timezone
 
 from app.db import DEFAULT_DB, resolve_session, utc_now
+
+
+def _should_use_global_db_fallback(session_path: str | None = None) -> bool:
+    if os.environ.get("CRMTG_SKIP_GLOBAL_DB_FALLBACK") == "1":
+        return False
+    if os.environ.get("BOT_TOKEN") == "e2e-not-a-secret":
+        return False
+    if not DEFAULT_DB.exists():
+        return False
+    if session_path:
+        sp = Path(session_path)
+        if sp.is_absolute():
+            try:
+                db_root = DEFAULT_DB.resolve().parent.parent
+                if not sp.resolve().is_relative_to(db_root):
+                    return False
+            except Exception:
+                pass
+    return True
 
 
 def _utf16_span_to_char_span(text: str, offset: int, length: int) -> tuple[int, int]:
@@ -433,9 +452,18 @@ class TelegramGateway(ABC):
         """Probe a saved session. Return health and last_error. Do not log in again."""
         raise GatewayError("Проверка сессии не подключена")
 
-    async def probe_spambot(self, session_path: str) -> dict:
+    async def probe_spambot(
+        self, session_path: str, *, now_utc: datetime | None = None
+    ) -> dict:
         """Send /start to @SpamBot to lift expired soft limits and check restriction state."""
-        return {"ok": False, "limited": None, "reply_text": ""}
+        return {
+            "ok": False,
+            "limited": None,
+            "limited_until_utc": None,
+            "is_expired_limit": False,
+            "expired_limit_cleared": False,
+            "reply_text": "",
+        }
 
     async def list_folders(self, session_path: str) -> list:
         """Own Telegram folders. Not members of groups or channels."""
@@ -479,11 +507,149 @@ def _clip_error(exc) -> str:
     return text[:500]
 
 
-def _parse_spambot_reply(text: str | None) -> bool | None:
-    blob = (text or "").strip().casefold()
-    if not blob:
+_SPAMBOT_MONTHS: dict[str, int] = {
+    "jan": 1,
+    "january": 1,
+    "янв": 1,
+    "января": 1,
+    "feb": 2,
+    "february": 2,
+    "фев": 2,
+    "февраля": 2,
+    "mar": 3,
+    "march": 3,
+    "мар": 3,
+    "марта": 3,
+    "apr": 4,
+    "april": 4,
+    "апр": 4,
+    "апреля": 4,
+    "may": 5,
+    "мая": 5,
+    "май": 5,
+    "jun": 6,
+    "june": 6,
+    "июн": 6,
+    "июня": 6,
+    "jul": 7,
+    "july": 7,
+    "июл": 7,
+    "июля": 7,
+    "aug": 8,
+    "august": 8,
+    "авг": 8,
+    "августа": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "сен": 9,
+    "сент": 9,
+    "сентября": 9,
+    "oct": 10,
+    "october": 10,
+    "окт": 10,
+    "октября": 10,
+    "nov": 11,
+    "november": 11,
+    "ноя": 11,
+    "нояб": 11,
+    "ноября": 11,
+    "dec": 12,
+    "december": 12,
+    "дек": 12,
+    "декабря": 12,
+}
+
+_SPAMBOT_UNTIL_DMY_RE = re.compile(
+    r"(?:until|до|до\s*—?|—\s*до)\s+(\d{1,2})\s+([A-Za-zА-Яа-яЁё]+)\.?\s+(\d{4})(?:[, ]+|\s+в\s+)(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:UTC|GMT)?",
+    re.IGNORECASE,
+)
+_SPAMBOT_UNTIL_ISO_RE = re.compile(
+    r"(?:until|до)\s+(\d{4})-(\d{2})-(\d{2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:UTC|GMT|Z)?",
+    re.IGNORECASE,
+)
+
+
+def _resolve_month_token(token: str) -> int | None:
+    clean = token.strip().rstrip(".").casefold()
+    if clean in _SPAMBOT_MONTHS:
+        return _SPAMBOT_MONTHS[clean]
+    if len(clean) >= 3 and clean[:3] in _SPAMBOT_MONTHS:
+        return _SPAMBOT_MONTHS[clean[:3]]
+    if len(clean) >= 4 and clean[:4] in _SPAMBOT_MONTHS:
+        return _SPAMBOT_MONTHS[clean[:4]]
+    return None
+
+
+def _parse_spambot_until_dt(text: str | None) -> datetime | None:
+    if not text:
         return None
-    if any(
+    m_dmy = _SPAMBOT_UNTIL_DMY_RE.search(text)
+    if m_dmy:
+        day = int(m_dmy.group(1))
+        month = _resolve_month_token(m_dmy.group(2))
+        year = int(m_dmy.group(3))
+        hour = int(m_dmy.group(4))
+        minute = int(m_dmy.group(5))
+        second = int(m_dmy.group(6) or 0)
+        if month is not None:
+            try:
+                return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    m_iso = _SPAMBOT_UNTIL_ISO_RE.search(text)
+    if m_iso:
+        try:
+            return datetime(
+                int(m_iso.group(1)),
+                int(m_iso.group(2)),
+                int(m_iso.group(3)),
+                int(m_iso.group(4)),
+                int(m_iso.group(5)),
+                int(m_iso.group(6) or 0),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            pass
+    return None
+
+
+def parse_spambot_details(
+    text: str | None, *, now_utc: datetime | None = None
+) -> dict:
+    raw = (text or "").strip()
+    blob = raw.casefold()
+    if not blob:
+        return {
+            "limited": None,
+            "limited_until_utc": None,
+            "is_expired_limit": False,
+        }
+
+    eff_now = now_utc if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
+    if eff_now.tzinfo is None:
+        eff_now = eff_now.replace(tzinfo=timezone.utc)
+    else:
+        eff_now = eff_now.astimezone(timezone.utc)
+
+    until_dt = _parse_spambot_until_dt(raw)
+    until_iso = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if until_dt is not None else None
+
+    has_clean_phrase = any(
+        phrase in blob
+        for phrase in (
+            "no limits are currently applied",
+            "free as a bird",
+            "аккаунт свободен",
+            "свободен от каких-либо ограничений",
+            "ограничений на ваш аккаунт сейчас нет",
+            "свободны как птица",
+            "обліковий запис вільний",
+            "обмежень немає",
+            "вільні як птах",
+        )
+    )
+    has_limit_phrase = any(
         phrase in blob
         for phrase in (
             "your account is now limited",
@@ -501,24 +667,44 @@ def _parse_spambot_reply(text: str | None) -> bool | None:
             "обліковий запис обмежено",
             "hesabınız şu anda sınırlandırılmıştır",
         )
-    ):
-        return True
-    if any(
-        phrase in blob
-        for phrase in (
-            "no limits are currently applied",
-            "free as a bird",
-            "аккаунт свободен",
-            "свободен от каких-либо ограничений",
-            "ограничений на ваш аккаунт сейчас нет",
-            "свободны как птица",
-            "обліковий запис вільний",
-            "обмежень немає",
-            "вільні як птах",
-        )
-    ):
-        return False
-    return None
+    )
+
+    if until_dt is not None:
+        if until_dt <= eff_now:
+            return {
+                "limited": False,
+                "limited_until_utc": until_iso,
+                "is_expired_limit": True,
+            }
+        return {
+            "limited": True,
+            "limited_until_utc": until_iso,
+            "is_expired_limit": False,
+        }
+
+    if has_limit_phrase:
+        return {
+            "limited": True,
+            "limited_until_utc": None,
+            "is_expired_limit": False,
+        }
+    if has_clean_phrase:
+        return {
+            "limited": False,
+            "limited_until_utc": None,
+            "is_expired_limit": False,
+        }
+    return {
+        "limited": None,
+        "limited_until_utc": None,
+        "is_expired_limit": False,
+    }
+
+
+def _parse_spambot_reply(
+    text: str | None, *, now_utc: datetime | None = None
+) -> bool | None:
+    return parse_spambot_details(text, now_utc=now_utc)["limited"]
 
 
 def _classify_session_error(exc: Exception) -> dict:
@@ -863,7 +1049,7 @@ def resolve_nodemaven_config(conn=None) -> dict | None:
 
     if conn is not None:
         _read_kv(conn)
-    elif (not user or not password) and "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+    elif (not user or not password) and _should_use_global_db_fallback():
         try:
             with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                 _read_kv(c)
@@ -1087,6 +1273,12 @@ class TelethonGateway(TelegramGateway):
         self._warmed_dialogs: set[str] = set()
         self._rpc_timeout: float = float(os.getenv("TG_RPC_TIMEOUT", "25.0") or "25.0")
         self._disconnect_timeout: float = 2.0
+        self._connect_retry_delay: float = float(
+            os.getenv("TG_CONNECT_RETRY_DELAY", "0.25") or "0.25"
+        )
+        self._spambot_poll_sleep: float = float(
+            os.getenv("TG_SPAMBOT_POLL_SLEEP", "0.8") or "0.8"
+        )
         self._avatar_timeout: float = float(os.getenv("TG_AVATAR_TIMEOUT", "4.0") or "4.0")
         self._avatar_lock_timeout: float = float(
             os.getenv("TG_AVATAR_LOCK_TIMEOUT", "0.25") or "0.25"
@@ -1156,7 +1348,7 @@ class TelethonGateway(TelegramGateway):
         cached = self._session_strings.get(session_path)
         if cached:
             return cached
-        if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+        if _should_use_global_db_fallback(session_path):
             try:
                 with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
                     row = conn.execute(
@@ -1185,7 +1377,7 @@ class TelethonGateway(TelegramGateway):
         extracted = extract_string_session_from_sqlite(resolve_session(session_path))
         if extracted:
             self._session_strings[session_path] = extracted
-            if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+            if _should_use_global_db_fallback(session_path):
                 try:
                     with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
                         conn.execute(
@@ -1261,7 +1453,7 @@ class TelethonGateway(TelegramGateway):
         cached = self._device_profiles.get(session_path)
         if cached:
             return {**defaults, **cached}
-        if "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+        if _should_use_global_db_fallback(session_path):
             try:
                 with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                     row = c.execute(
@@ -1347,7 +1539,7 @@ class TelethonGateway(TelegramGateway):
     def _credentials(self, session_path: str | None = None):
         if session_path and session_path in self._app_credentials:
             return self._app_credentials[session_path]
-        if session_path and "PYTEST_CURRENT_TEST" not in os.environ and DEFAULT_DB.exists():
+        if session_path and _should_use_global_db_fallback(session_path):
             try:
                 with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
                     acc_row = conn.execute(
@@ -1362,9 +1554,9 @@ class TelethonGateway(TelegramGateway):
                 pass
         api_id = os.getenv("TG_API_ID", "").strip()
         api_hash = os.getenv("TG_API_HASH", "").strip()
-        if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
-            try:
-                if DEFAULT_DB.exists():
+        if not api_id or not api_hash:
+            if _should_use_global_db_fallback(session_path):
+                try:
                     with sqlite3.connect(DEFAULT_DB, timeout=15.0) as conn:
                         rows = dict(
                             conn.execute(
@@ -1373,9 +1565,9 @@ class TelethonGateway(TelegramGateway):
                         )
                         api_id = api_id or str(rows.get("tg_api_id") or "").strip()
                         api_hash = api_hash or str(rows.get("tg_api_hash") or "").strip()
-            except Exception:
-                pass
-            if not api_id or not api_hash:
+                except Exception:
+                    pass
+            if (not api_id or not api_hash) and os.environ.get("TG_REQUIRE_EXPLICIT_API_CREDS") != "1":
                 api_id = "2040"
                 api_hash = "b18441a1ff607e10a989891a5462e627"
         if not api_id or not api_hash:
@@ -1481,7 +1673,7 @@ class TelethonGateway(TelegramGateway):
                 if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
                     break
                 if attempt == 0:
-                    await asyncio.sleep(0.01 if "PYTEST_CURRENT_TEST" in os.environ else 2.0)
+                    await asyncio.sleep(self._connect_retry_delay)
 
         if last_exc is not None:
             if _classify_session_error(last_exc).get("health") not in (
@@ -1704,22 +1896,33 @@ class TelethonGateway(TelegramGateway):
                             pass
             return {"health": "offline", "last_error": "Нет связи"}
 
-    async def probe_spambot(self, session_path: str) -> dict:
+    async def probe_spambot(
+        self, session_path: str, *, now_utc: datetime | None = None
+    ) -> dict:
         async with self._session_lock(session_path):
             try:
                 client, owned = await self._open(session_path)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
-            try:
+                return {
+                    "ok": False,
+                    "limited": None,
+                    "limited_until_utc": None,
+                    "is_expired_limit": False,
+                    "expired_limit_cleared": False,
+                    "reply_text": _clip_error(exc),
+                }
+
+            async def _send_start_and_read() -> str:
                 sent_msg = await asyncio.wait_for(
                     client.send_message("SpamBot", "/start"), timeout=self._rpc_timeout
                 )
                 sent_id = int(getattr(sent_msg, "id", 0) or 0)
-                reply_text = ""
+                text_found = ""
                 for _ in range(6):
-                    await asyncio.sleep(0.8)
+                    if self._spambot_poll_sleep > 0:
+                        await asyncio.sleep(self._spambot_poll_sleep)
                     msgs = await asyncio.wait_for(
                         client.get_messages("SpamBot", limit=4), timeout=self._rpc_timeout
                     )
@@ -1729,22 +1932,64 @@ class TelethonGateway(TelegramGateway):
                         mid = int(getattr(m, "id", 0) or 0)
                         txt = str(getattr(m, "message", None) or "").strip()
                         if txt and (mid > sent_id or sent_id == 0):
-                            reply_text = txt
+                            text_found = txt
                             break
-                    if reply_text:
+                    if text_found:
                         break
+                return text_found
+
+            try:
+                reply_text = await _send_start_and_read()
+                d1 = parse_spambot_details(reply_text, now_utc=now_utc)
+                if d1["is_expired_limit"]:
+                    reply2 = await _send_start_and_read()
+                    d2 = parse_spambot_details(reply2, now_utc=now_utc)
+                    if d2["limited"] is True and not d2["is_expired_limit"]:
+                        return {
+                            "ok": True,
+                            "limited": True,
+                            "expired_limit_cleared": False,
+                            "limited_until_utc": d2["limited_until_utc"],
+                            "is_expired_limit": False,
+                            "reply_text": reply2,
+                        }
+                    return {
+                        "ok": True,
+                        "limited": False,
+                        "expired_limit_cleared": True,
+                        "limited_until_utc": d2["limited_until_utc"] or d1["limited_until_utc"],
+                        "is_expired_limit": True,
+                        "reply_text": reply2 or reply_text,
+                    }
                 return {
                     "ok": bool(reply_text),
-                    "limited": _parse_spambot_reply(reply_text),
+                    "limited": d1["limited"],
+                    "expired_limit_cleared": False,
+                    "limited_until_utc": d1["limited_until_utc"],
+                    "is_expired_limit": False,
                     "reply_text": reply_text,
                 }
             except asyncio.CancelledError:
                 raise
             except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
                 await self._drop_zombie_client_unlocked(session_path)
-                return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
+                return {
+                    "ok": False,
+                    "limited": None,
+                    "limited_until_utc": None,
+                    "is_expired_limit": False,
+                    "expired_limit_cleared": False,
+                    "reply_text": _clip_error(exc),
+                }
             except Exception as exc:
-                return {"ok": False, "limited": None, "reply_text": _clip_error(exc)}
+                return {
+                    "ok": False,
+                    "limited": None,
+                    "limited_until_utc": None,
+                    "is_expired_limit": False,
+                    "expired_limit_cleared": False,
+                    "reply_text": _clip_error(exc),
+                }
             finally:
                 if owned:
                     try:
@@ -3126,27 +3371,58 @@ class FakeGateway(TelegramGateway):
             return {"health": "active", "last_error": None}
         return {"health": "unauthorized", "last_error": "Сессия не авторизована"}
 
-    async def probe_spambot(self, session_path: str) -> dict:
+    async def probe_spambot(
+        self, session_path: str, *, now_utc: datetime | None = None
+    ) -> dict:
         starts = getattr(self, "spambot_starts", None)
         if starts is None:
             self.spambot_starts = []
             starts = self.spambot_starts
-        starts.append(session_path)
         replies = getattr(self, "spambot_replies", None) or {}
-        reply_text = str(
-            replies.get(
-                session_path,
-                replies.get(
-                    "*",
-                    "Good news, no limits are currently applied to your account. You’re free as a bird!",
-                ),
-            )
-            or ""
-        ).strip()
+        default_free = (
+            "Good news, no limits are currently applied to your account. You’re free as a bird!"
+        )
+
+        def _next_fake_reply() -> str:
+            call_idx = sum(1 for s in starts if s == session_path)
+            starts.append(session_path)
+            raw_cfg = replies.get(session_path, replies.get("*", default_free))
+            if isinstance(raw_cfg, (list, tuple)):
+                if not raw_cfg:
+                    return ""
+                chosen = raw_cfg[min(call_idx, len(raw_cfg) - 1)]
+                return str(chosen or "").strip()
+            return str(raw_cfg or "").strip()
+
+        reply1 = _next_fake_reply()
+        d1 = parse_spambot_details(reply1, now_utc=now_utc)
+        if d1["is_expired_limit"]:
+            reply2 = _next_fake_reply()
+            d2 = parse_spambot_details(reply2, now_utc=now_utc)
+            if d2["limited"] is True and not d2["is_expired_limit"]:
+                return {
+                    "ok": True,
+                    "limited": True,
+                    "expired_limit_cleared": False,
+                    "limited_until_utc": d2["limited_until_utc"],
+                    "is_expired_limit": False,
+                    "reply_text": reply2,
+                }
+            return {
+                "ok": True,
+                "limited": False,
+                "expired_limit_cleared": True,
+                "limited_until_utc": d2["limited_until_utc"] or d1["limited_until_utc"],
+                "is_expired_limit": True,
+                "reply_text": reply2 or reply1,
+            }
         return {
-            "ok": bool(reply_text),
-            "limited": _parse_spambot_reply(reply_text),
-            "reply_text": reply_text,
+            "ok": bool(reply1),
+            "limited": d1["limited"],
+            "expired_limit_cleared": False,
+            "limited_until_utc": d1["limited_until_utc"],
+            "is_expired_limit": False,
+            "reply_text": reply1,
         }
 
     async def request_code(self, phone: str, session_path: str) -> str:

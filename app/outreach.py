@@ -30,12 +30,14 @@ from app.db import DEFAULT_DB, as_dict, safe_int, utc_now, utc_today
 logger = logging.getLogger(__name__)
 PREWARM_STORIES_TIMEOUT_SEC: float = 8.0
 ICP_GUARD_ERROR = "Остановлено ICP-фильтром: нерелевантный профиль или пустой продукт"
+QUARANTINED_SOURCE_ERROR = "Источник поставлен на авто-карантин из-за жалоб/низкого качества"
 from app.inbox import (
     _cache_messages,
     _is_synthetic_peer_id,
     _record_lead_event_safe,
     stop_outreach_on_reply,
 )
+from app.telegram_gateway import parse_spambot_details
 
 CAMPAIGN_STATUSES = ("draft", "running", "paused", "completed")
 RECIPIENT_STATUSES = ("pending", "in_progress", "completed", "replied", "failed")
@@ -1294,6 +1296,7 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
                     """,
                     (now, rec_id),
                 )
+                record_source_send_outcome(conn, rec, outcome="replied")
                 replied_now += 1
     if replied_now:
         conn.commit()
@@ -1412,6 +1415,38 @@ def set_account_cooldown(
     base_ts = _now_epoch_ts(now_iso=now_iso, now_dt=now_dt)
     until_ts = base_ts + max(float(wait_seconds or 0), 300.0)
     _ACCOUNT_COOLDOWN_UNTIL[(_db_ident(conn), int(account_id))] = until_ts
+    try:
+        _set_kv(conn, f"account_cooldown_until:{int(account_id)}", str(until_ts))
+    except Exception:
+        pass
+    return until_ts
+
+
+def set_account_cooldown_until(
+    conn,
+    account_id: int,
+    until_utc: str | datetime | float | None,
+) -> float | None:
+    if until_utc is None:
+        return None
+    until_ts: float | None = None
+    if isinstance(until_utc, (int, float)):
+        until_ts = float(until_utc)
+    elif isinstance(until_utc, datetime):
+        dt = until_utc if until_utc.tzinfo is not None else until_utc.replace(tzinfo=timezone.utc)
+        until_ts = dt.timestamp()
+    elif isinstance(until_utc, str):
+        parsed = _parse_iso_dt(until_utc)
+        if parsed is not None:
+            until_ts = parsed.timestamp()
+    if until_ts is None:
+        return None
+    _ACCOUNT_COOLDOWN_UNTIL[(_db_ident(conn), int(account_id))] = until_ts
+    try:
+        _set_kv(conn, f"account_cooldown_until:{int(account_id)}", str(until_ts))
+        conn.commit()
+    except Exception:
+        pass
     return until_ts
 
 
@@ -1424,16 +1459,200 @@ def get_account_cooldown_until(
 ) -> float | None:
     key = (_db_ident(conn), int(account_id))
     until_ts = _ACCOUNT_COOLDOWN_UNTIL.get(key)
+    if until_ts is None and conn is not None:
+        raw_kv = _get_kv(conn, f"account_cooldown_until:{int(account_id)}", None)
+        if raw_kv:
+            try:
+                until_ts = float(raw_kv)
+                _ACCOUNT_COOLDOWN_UNTIL[key] = until_ts
+            except (TypeError, ValueError):
+                until_ts = None
     if until_ts is None:
         return None
     if until_ts > _now_epoch_ts(now_iso=now_iso, now_dt=now_dt):
         return until_ts
     _ACCOUNT_COOLDOWN_UNTIL.pop(key, None)
+    try:
+        if conn is not None:
+            conn.execute(
+                "DELETE FROM kv_settings WHERE key = ?",
+                (f"account_cooldown_until:{int(account_id)}",),
+            )
+            conn.commit()
+    except Exception:
+        pass
     return None
 
 
 def clear_account_cooldown(conn, account_id: int) -> None:
     _ACCOUNT_COOLDOWN_UNTIL.pop((_db_ident(conn), int(account_id)), None)
+    try:
+        if conn is not None:
+            conn.execute(
+                "DELETE FROM kv_settings WHERE key = ?",
+                (f"account_cooldown_until:{int(account_id)}",),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+async def _call_probe_spambot(
+    gateway, session_path: str, *, now_utc: datetime | None = None
+) -> dict:
+    probe_fn = getattr(gateway, "probe_spambot")
+    accepts_now = False
+    try:
+        sig = inspect.signature(probe_fn)
+        accepts_now = "now_utc" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (TypeError, ValueError):
+        accepts_now = False
+
+    if accepts_now:
+        res = await probe_fn(session_path, now_utc=now_utc)
+    else:
+        res = await probe_fn(session_path)
+    if not isinstance(res, dict):
+        return {"ok": False, "limited": None, "limited_until_utc": None, "reply_text": ""}
+    out = dict(res)
+    reply_txt = str(out.get("reply_text") or "").strip()
+    if reply_txt and "limited_until_utc" not in out:
+        details = parse_spambot_details(reply_txt, now_utc=now_utc)
+        out.setdefault("limited_until_utc", details["limited_until_utc"])
+        out.setdefault("is_expired_limit", details["is_expired_limit"])
+        if details["is_expired_limit"]:
+            out["limited"] = False
+            out["expired_limit_cleared"] = True
+    return out
+
+
+_SOURCE_OUTCOMES = frozenset({"sent", "replied", "rejected_or_blocked", "spambot_hit"})
+
+
+def _normalize_source_key(value: str | None) -> str:
+    return str(value or "").strip().lstrip("@").casefold()
+
+
+def _extract_recipient_source(rec: dict | None) -> str | None:
+    if not isinstance(rec, dict):
+        return None
+    extra = _extract_extra_fields(rec)
+    lower_extra = {str(k).strip().lower(): str(v or "").strip() for k, v in extra.items()}
+    for field_name in ("source_chat", "group", "source"):
+        val = lower_extra.get(field_name) or str(rec.get(field_name) or "").strip()
+        if val:
+            return val
+    return None
+
+
+def get_quarantined_sources(conn) -> list[str]:
+    raw = _get_kv(conn, "quarantined_leadgen_sources", "[]")
+    try:
+        parsed = json.loads(raw or "[]")
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x or "").strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _is_recipient_source_quarantined(conn, rec: dict | None) -> bool:
+    src = _extract_recipient_source(rec)
+    if not src:
+        return False
+    quarantined = get_quarantined_sources(conn)
+    if not quarantined:
+        return False
+    norm_src = _normalize_source_key(src)
+    return any(
+        q == src or (norm_src and _normalize_source_key(q) == norm_src)
+        for q in quarantined
+    )
+
+
+def record_source_send_outcome(conn, rec: dict, *, outcome: str) -> dict | None:
+    if outcome not in _SOURCE_OUTCOMES:
+        raise ValueError(f"Unsupported source send outcome: {outcome}")
+    if conn is None:
+        return None
+    src = _extract_recipient_source(rec)
+    if not src:
+        return None
+
+    raw_stats = _get_kv(conn, "source_reputation_stats", "{}")
+    try:
+        stats = json.loads(raw_stats or "{}")
+        if not isinstance(stats, dict):
+            stats = {}
+    except Exception:
+        stats = {}
+
+    matched_key = src
+    norm_src = _normalize_source_key(src)
+    for existing_k in stats.keys():
+        if existing_k == src or (norm_src and _normalize_source_key(existing_k) == norm_src):
+            matched_key = existing_k
+            break
+
+    entry_raw = stats.get(matched_key)
+    entry = dict(entry_raw) if isinstance(entry_raw, dict) else {}
+    attempts = int(entry.get("attempts") or 0)
+    sent_cnt = int(entry.get("sent") or 0)
+    replied_cnt = int(entry.get("replied") or 0)
+    rejected_cnt = int(entry.get("rejected_or_blocked") or 0)
+    spambot_cnt = int(entry.get("spambot_hits") or 0)
+
+    if outcome == "sent":
+        attempts += 1
+        sent_cnt += 1
+    elif outcome == "rejected_or_blocked":
+        attempts += 1
+        rejected_cnt += 1
+    elif outcome == "spambot_hit":
+        attempts += 1
+        spambot_cnt += 1
+    elif outcome == "replied":
+        replied_cnt += 1
+
+    should_quarantine = bool(
+        attempts >= 15
+        and replied_cnt == 0
+        and (spambot_cnt >= 2 or (rejected_cnt / max(1, attempts)) >= 0.60)
+    )
+    updated_entry = {
+        "attempts": attempts,
+        "sent": sent_cnt,
+        "replied": replied_cnt,
+        "rejected_or_blocked": rejected_cnt,
+        "spambot_hits": spambot_cnt,
+        "quarantined": bool(entry.get("quarantined")) or should_quarantine,
+        "updated_at": utc_now(),
+    }
+    stats[matched_key] = updated_entry
+    _set_kv(conn, "source_reputation_stats", json.dumps(stats, ensure_ascii=False))
+
+    if should_quarantine:
+        quarantined = get_quarantined_sources(conn)
+        if not any(
+            q == src or (norm_src and _normalize_source_key(q) == norm_src)
+            for q in quarantined
+        ):
+            quarantined.append(src)
+            _set_kv(
+                conn,
+                "quarantined_leadgen_sources",
+                json.dumps(quarantined, ensure_ascii=False),
+            )
+    conn.commit()
+    return updated_entry
+
+
+def _least_loaded_account_key(st: dict) -> tuple[float, int, int]:
+    lim = max(1, int(st.get("daily_limit") or 1))
+    sent = int(st.get("sent_today") or 0)
+    return (sent / lim, sent, int(st["id"]))
 
 
 def _is_invalid_recipient_error(exc: BaseException | None) -> bool:
@@ -3192,32 +3411,38 @@ def _mark_cloud_persistence_dirty(conn, now_iso: str | None = None) -> None:
     )
     conn.commit()
     if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+        os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+        or os.environ.get("CRMTG_SKIP_GLOBAL_DB_FALLBACK") == "1"
+        or os.environ.get("CLOUD_BACKUP_ENABLED", "1").strip().lower() in ("0", "false", "no", "off")
     ):
         return
     try:
         from app.cloud_persistence import (
-            DEFAULT_DB,
+            DEFAULT_DB as CLOUD_DEFAULT_DB,
             _resolve_r2_config,
             backup_to_cloud,
             check_tg_runtime_lease_owned,
         )
         from app.main import should_enable_live_tg_runtime
 
-        if not _resolve_r2_config(conn):
-            return
-        if not should_enable_live_tg_runtime(conn, None):
-            return
-        db_file = DEFAULT_DB
+        db_file = CLOUD_DEFAULT_DB
+        has_explicit_db_file = False
         try:
             db_rows = conn.execute("PRAGMA database_list").fetchall()
             for r in db_rows:
                 if str(r[1] or "") == "main" and str(r[2] or "").strip():
                     db_file = Path(str(r[2]))
+                    has_explicit_db_file = True
                     break
         except Exception:
             pass
+        canonical_db = Path(os.environ.get("CRMTG_DB") or CLOUD_DEFAULT_DB).resolve()
+        if not has_explicit_db_file or db_file.resolve() != canonical_db:
+            return
+        if not _resolve_r2_config(conn):
+            return
+        if not should_enable_live_tg_runtime(conn, None):
+            return
 
         loop = asyncio.get_running_loop()
         if _CLOUD_BACKUP_BG_TASK is not None and not _CLOUD_BACKUP_BG_TASK.done():
@@ -3459,6 +3684,12 @@ async def run_campaign_batch(
     if not account_ids:
         raise ValueError("Выберите хотя бы один подключённый аккаунт для рассылки")
 
+    eff_now_dt = now_dt if isinstance(now_dt, datetime) else _parse_iso_dt(utc_now())
+    if eff_now_dt is None:
+        eff_now_dt = datetime.now(timezone.utc)
+    elif eff_now_dt.tzinfo is None:
+        eff_now_dt = eff_now_dt.replace(tzinfo=timezone.utc)
+
     connected_states = []
     for order_idx, aid in enumerate(account_ids):
         try:
@@ -3467,6 +3698,7 @@ async def run_campaign_batch(
             continue
         if acc_raw.get("status") != "connected":
             continue
+        acc_id_int = int(acc_raw["id"])
         health_val = str(acc_raw.get("health") or "active")
         is_spambot_warm_only = (
             health_val == "frozen"
@@ -3480,11 +3712,28 @@ async def run_campaign_batch(
             and not acc_sess_path.startswith("data/sessions/demo")
             and str(acc_raw.get("provider") or "telegram").strip().lower() == "telegram"
         ):
-            cache_key = _spambot_cache_key(conn, int(acc_raw["id"]), acc_sess_path)
+            cache_key = _spambot_cache_key(conn, acc_id_int, acc_sess_path)
             cached = _SPAMBOT_PROBE_CACHE.get(cache_key)
             now_mono = time.monotonic()
-            if cached is None or (now_mono - cached[0]) >= _SPAMBOT_WARM_RECHECK_SEC:
-                sb_res = await gateway.probe_spambot(acc_sess_path)
+            active_cd = get_account_cooldown_until(conn, acc_id_int, now_dt=eff_now_dt)
+            cache_expired_by_until = False
+            if cached is not None and isinstance(cached[1], dict):
+                cached_until_dt = _parse_iso_dt(cached[1].get("limited_until_utc"))
+                if cached_until_dt is not None and cached_until_dt <= eff_now_dt:
+                    cache_expired_by_until = True
+            err_details = parse_spambot_details(acc_raw.get("last_error"), now_utc=eff_now_dt)
+            if err_details["is_expired_limit"]:
+                cache_expired_by_until = True
+
+            should_reprobe = (
+                cache_expired_by_until
+                or (
+                    active_cd is None
+                    and (cached is None or (now_mono - cached[0]) >= _SPAMBOT_WARM_RECHECK_SEC)
+                )
+            )
+            if should_reprobe:
+                sb_res = await _call_probe_spambot(gateway, acc_sess_path, now_utc=eff_now_dt)
                 if sb_res.get("limited") is not None:
                     _SPAMBOT_PROBE_CACHE[cache_key] = (now_mono, sb_res)
                 else:
@@ -3493,15 +3742,14 @@ async def run_campaign_batch(
                         sb_res,
                     )
                 if sb_res.get("limited") is False:
-                    conn.execute(
-                        "UPDATE accounts SET health = 'active', last_error = NULL, updated_at = ? WHERE id = ?",
-                        (utc_now(), int(acc_raw["id"])),
-                    )
-                    conn.commit()
+                    clear_account_cooldown(conn, acc_id_int)
+                    record_account_health_transition(conn, acc_id_int, "active", None)
                     acc_raw["health"] = "active"
                     acc_raw["last_error"] = None
                     health_val = "active"
                     is_spambot_warm_only = False
+                elif sb_res.get("limited") is True and sb_res.get("limited_until_utc"):
+                    set_account_cooldown_until(conn, acc_id_int, sb_res["limited_until_utc"])
         if health_val in ("unauthorized", "banned") or (
             health_val == "frozen" and not is_spambot_warm_only
         ):
@@ -3509,7 +3757,7 @@ async def run_campaign_batch(
         acc_pub = public_account(acc_raw)
         acc_daily_lim = int(acc_pub["daily_limit"])
         acc_cd_until = get_account_cooldown_until(
-            conn, int(acc_raw["id"]), now_dt=now_dt
+            conn, acc_id_int, now_dt=eff_now_dt
         )
         acc_paced_lim = (
             _compute_paced_daily_allowance(conn, acc_daily_lim, now_dt=now_dt)
@@ -3518,7 +3766,7 @@ async def run_campaign_batch(
         )
         connected_states.append(
             {
-                "id": int(acc_raw["id"]),
+                "id": acc_id_int,
                 "order": order_idx,
                 "raw": acc_raw,
                 "daily_limit": acc_daily_lim,
@@ -3526,7 +3774,7 @@ async def run_campaign_batch(
                 "sent_today": int(acc_pub["sent_today"]),
                 "sent_in_batch": 0,
                 "reserved_followups": 0,
-                "disabled": acc_cd_until is not None,
+                "disabled": acc_cd_until is not None and not is_spambot_warm_only,
                 "cooldown_until": acc_cd_until,
                 "spambot_warm_only": is_spambot_warm_only,
             }
@@ -4059,6 +4307,19 @@ async def run_campaign_batch(
             continue
 
         if step_idx == 0:
+            if _is_recipient_source_quarantined(conn, rec):
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (QUARANTINED_SOURCE_ERROR, now, rec["id"]),
+                )
+                conn.commit()
+                continue
             if is_legacy_exhausted_recipient(
                 rec, step_idx=0, campaign_name=camp.get("name")
             ):
@@ -4397,12 +4658,12 @@ async def run_campaign_batch(
                 else:
                     chosen_state = min(
                         available,
-                        key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
+                        key=_least_loaded_account_key,
                     )
             else:
                 chosen_state = min(
                     available,
-                    key=lambda st: (st["sent_in_batch"], st["sent_today"], st["order"]),
+                    key=_least_loaded_account_key,
                 )
 
             if chosen_state is None:
@@ -4421,12 +4682,15 @@ async def run_campaign_batch(
 
             if not jitter_applied and jitter_range is not None and len(jitter_range) == 2:
                 jitter_applied = True
-                j_min = max(0.0, float(jitter_range[0]))
-                j_max = max(j_min, float(jitter_range[1]))
-                j_sec = random.uniform(j_min, j_max)
-                jitter_delays_ms.append(int(round(j_sec * 1000)))
-                if j_sec > 0:
-                    await asyncio.sleep(j_sec)
+                if os.environ.get("CRMTG_FORCE_NO_JITTER") == "1":
+                    jitter_delays_ms.append(0)
+                else:
+                    j_min = max(0.0, float(jitter_range[0]))
+                    j_max = max(j_min, float(jitter_range[1]))
+                    j_sec = random.uniform(j_min, j_max)
+                    jitter_delays_ms.append(int(round(j_sec * 1000)))
+                    if j_sec > 0:
+                        await asyncio.sleep(j_sec)
 
             replied_skipped = False
             dialog = None
@@ -4533,6 +4797,7 @@ async def run_campaign_batch(
                             "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
                             (now, rec["id"]),
                         )
+                        record_source_send_outcome(conn, rec, outcome="replied")
                         conn.commit()
                         replied_skipped = True
                         break
@@ -4656,11 +4921,22 @@ async def run_campaign_batch(
                     cache_key = _spambot_cache_key(conn, chosen_account_id, session_path)
                     now_mono = time.monotonic()
                     cached_sb = _SPAMBOT_PROBE_CACHE.get(cache_key)
-                    if cached_sb is not None and (now_mono - cached_sb[0]) < _SPAMBOT_PROBE_COOLDOWN_SEC:
+                    cached_until_expired = False
+                    if cached_sb is not None and isinstance(cached_sb[1], dict):
+                        cu_dt = _parse_iso_dt(cached_sb[1].get("limited_until_utc"))
+                        if cu_dt is not None and cu_dt <= eff_now_dt:
+                            cached_until_expired = True
+                    if (
+                        cached_sb is not None
+                        and not cached_until_expired
+                        and (now_mono - cached_sb[0]) < _SPAMBOT_PROBE_COOLDOWN_SEC
+                    ):
                         sb_probe = cached_sb[1]
                         fresh_probe = False
                     else:
-                        sb_probe = await active_gw.probe_spambot(session_path)
+                        sb_probe = await _call_probe_spambot(
+                            active_gw, session_path, now_utc=eff_now_dt
+                        )
                         if sb_probe.get("limited") is not None:
                             _SPAMBOT_PROBE_CACHE[cache_key] = (now_mono, sb_probe)
                         else:
@@ -4671,12 +4947,10 @@ async def run_campaign_batch(
                         fresh_probe = True
 
                     if sb_probe.get("limited") is False:
+                        clear_account_cooldown(conn, chosen_account_id)
+                        chosen_state["cooldown_until"] = None
                         if str(account_raw.get("health") or "") == "frozen":
-                            conn.execute(
-                                "UPDATE accounts SET health = 'active', last_error = NULL, updated_at = ? WHERE id = ?",
-                                (now, chosen_account_id),
-                            )
-                            conn.commit()
+                            record_account_health_transition(conn, chosen_account_id, "active", None)
                             account_raw["health"] = "active"
                             account_raw["last_error"] = None
                             chosen_state["spambot_warm_only"] = False
@@ -4693,6 +4967,10 @@ async def run_campaign_batch(
                     if sb_probe.get("limited") is True:
                         _cleanup_empty_step0_dialog(conn, step_idx, dialog)
                         chosen_state["spambot_warm_only"] = True
+                        if sb_probe.get("limited_until_utc"):
+                            chosen_state["cooldown_until"] = set_account_cooldown_until(
+                                conn, chosen_account_id, sb_probe["limited_until_utc"]
+                            )
                         if step_idx >= 1:
                             chosen_state["disabled"] = True
                             chosen_state["dead"] = True
@@ -4700,6 +4978,7 @@ async def run_campaign_batch(
                         reply_snip = str(sb_probe.get("reply_text") or "").strip()
                         err_str = f"@SpamBot: {reply_snip or str(exc)}"[:300]
                         record_account_health_transition(conn, chosen_account_id, "frozen", err_str)
+                        record_source_send_outcome(conn, rec, outcome="spambot_hit")
                         if step_idx >= 1:
                             break
                         continue
@@ -4734,6 +5013,8 @@ async def run_campaign_batch(
                             m in err_str.casefold()
                             for m in ("spambot", "cannot message non-contacts", "peerspam", "spam-reported")
                         )
+                        if is_spambot_only:
+                            record_source_send_outcome(conn, rec, outcome="spambot_hit")
                         if not is_spambot_only and active_gw is not None and hasattr(active_gw, "_close"):
                             try:
                                 await active_gw._close(session_path)
@@ -4751,6 +5032,7 @@ async def run_campaign_batch(
                     """,
                     (str(exc)[:300], now, rec["id"]),
                 )
+                record_source_send_outcome(conn, rec, outcome="rejected_or_blocked")
                 conn.commit()
                 _release_followup_reservation(int(rec["id"]))
                 if not _is_invalid_recipient_error(exc):
@@ -4802,6 +5084,8 @@ async def run_campaign_batch(
         chosen_state["sent_today"] += 1
         chosen_state["sent_in_batch"] += 1
         sent_by_account[str(chosen_account_id)] = sent_by_account.get(str(chosen_account_id), 0) + 1
+        if step_idx == 0:
+            record_source_send_outcome(conn, rec, outcome="sent")
         _release_followup_reservation(int(rec["id"]))
 
         next_step = step_idx + 1
@@ -5040,6 +5324,7 @@ async def run_autopilot_tick(
                 }
             )
 
+    slo_watchdog = check_outreach_slo_watchdog(conn, now_dt=effective_now)
     return {
         "ok": True,
         "ran": True,
@@ -5050,7 +5335,191 @@ async def run_autopilot_tick(
         "sent": total_sent,
         "results": results,
         "campaigns": results,
+        "slo_watchdog": slo_watchdog,
         "status": get_autopilot_status(conn, now_dt=effective_now),
+    }
+
+
+def check_outreach_slo_watchdog(
+    conn,
+    *,
+    now_dt: datetime | None = None,
+    min_healthy_accounts: int = 5,
+    silence_minutes: int = 90,
+    opener=None,
+) -> dict:
+    eff_now = now_dt if isinstance(now_dt, datetime) else _parse_iso_dt(utc_now())
+    if eff_now is None:
+        eff_now = datetime.now(timezone.utc)
+    elif eff_now.tzinfo is None:
+        eff_now = eff_now.replace(tzinfo=timezone.utc)
+    else:
+        eff_now = eff_now.astimezone(timezone.utc)
+
+    today_utc_str = eff_now.strftime("%Y-%m-%d")
+    kv_min_healthy = _get_kv(conn, "outreach_min_healthy_accounts", None)
+    eff_min_healthy = int(min_healthy_accounts)
+    if kv_min_healthy and min_healthy_accounts == 5:
+        try:
+            eff_min_healthy = max(1, int(kv_min_healthy))
+        except (TypeError, ValueError):
+            pass
+
+    sched = get_outreach_schedule(conn, now_dt=eff_now)
+    tz_name = str(sched.get("timezone") or "UTC").strip() or "UTC"
+    try:
+        tz_obj = ZoneInfo(tz_name)
+    except Exception:
+        tz_obj = timezone.utc
+
+    local_dt = eff_now.astimezone(tz_obj)
+    day_key = WEEKDAY_KEYS[local_dt.weekday()]
+    days = sched.get("days") if isinstance(sched.get("days"), dict) else DEFAULT_SCHEDULE_DAYS
+    today_cfg = days.get(day_key) if isinstance(days.get(day_key), dict) else DEFAULT_SCHEDULE_DAYS[day_key]
+    start_min = _parse_hhmm(str(today_cfg.get("start") or "09:00").strip(), 9 * 60)
+    end_min = _parse_hhmm(str(today_cfg.get("end") or "18:00").strip(), 18 * 60)
+    cur_min = local_dt.hour * 60 + local_dt.minute
+    if start_min < end_min:
+        window_minutes = max(1, end_min - start_min)
+        elapsed_minutes = max(0, min(window_minutes, cur_min - start_min))
+    else:
+        window_minutes = max(1, (1440 - start_min) + end_min)
+        raw_elapsed = (cur_min - start_min) if cur_min >= start_min else ((1440 - start_min) + cur_min)
+        elapsed_minutes = max(0, min(window_minutes, raw_elapsed))
+
+    within_window = bool(sched.get("within_window"))
+
+    acc_sent_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(CASE WHEN sent_date = ? THEN COALESCE(sent_today, 0) ELSE 0 END), 0)
+        FROM accounts
+        WHERE status = 'connected'
+        """,
+        (today_utc_str,),
+    ).fetchone()
+    acc_sent_today = int(acc_sent_row[0] or 0) if acc_sent_row is not None else 0
+
+    rec_sent_row = conn.execute(
+        """
+        SELECT COUNT(*) FROM campaign_recipients
+        WHERE substr(COALESCE(last_sent_at, ''), 1, 10) = ?
+        """,
+        (today_utc_str,),
+    ).fetchone()
+    rec_sent_today = int(rec_sent_row[0] or 0) if rec_sent_row is not None else 0
+    sent_today_total = max(acc_sent_today, rec_sent_today)
+
+    pending_row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM campaign_recipients cr
+        JOIN campaigns c ON c.id = cr.campaign_id
+        WHERE c.status = 'running' AND cr.status = 'pending'
+        """
+    ).fetchone()
+    running_pending_count = int(pending_row[0] or 0) if pending_row is not None else 0
+
+    tg_counts = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS connected_cnt,
+            COALESCE(SUM(CASE WHEN COALESCE(health, 'active') = 'active' THEN 1 ELSE 0 END), 0) AS healthy_cnt
+        FROM accounts
+        WHERE COALESCE(provider, 'telegram') = 'telegram' AND status = 'connected'
+        """
+    ).fetchone()
+    connected_tg = int(tg_counts[0] or 0) if tg_counts is not None else 0
+    healthy_tg = int(tg_counts[1] or 0) if tg_counts is not None else 0
+
+    reasons: list[str] = []
+    if (
+        within_window
+        and elapsed_minutes >= int(silence_minutes)
+        and running_pending_count > 0
+        and sent_today_total == 0
+    ):
+        reasons.append(
+            f"outreach_silence: прошло {elapsed_minutes} мин от старта окна, pending={running_pending_count}, sent_today_total=0"
+        )
+    if connected_tg >= eff_min_healthy and healthy_tg < eff_min_healthy:
+        reasons.append(
+            f"healthy_accounts_drop: активных TG-аккаунтов {healthy_tg}/{connected_tg} (< {eff_min_healthy})"
+        )
+
+    if not reasons:
+        return {
+            "ok": True,
+            "alert_triggered": False,
+            "reasons": [],
+            "sent_today_total": sent_today_total,
+            "running_pending": running_pending_count,
+            "healthy_accounts": healthy_tg,
+            "connected_accounts": connected_tg,
+            "elapsed_window_minutes": elapsed_minutes,
+        }
+
+    alert_kv_key = "outreach_slo_watchdog_alert_day"
+    last_alert_day = str(_get_kv(conn, alert_kv_key, "") or "").strip()
+    if last_alert_day == today_utc_str:
+        return {
+            "ok": False,
+            "alert_triggered": False,
+            "already_alerted_today": True,
+            "reasons": reasons,
+            "sent_today_total": sent_today_total,
+            "running_pending": running_pending_count,
+            "healthy_accounts": healthy_tg,
+            "connected_accounts": connected_tg,
+            "elapsed_window_minutes": elapsed_minutes,
+        }
+
+    alert_triggered = False
+    alert_text = (
+        "🚨 SLO Watchdog рассылки SoftUGC:\n"
+        + "\n".join(f"• {r}" for r in reasons)
+    )
+    try:
+        import app.digest as digest_mod
+
+        token, chat_id = digest_mod.resolve_colleague_bot_credentials(conn)
+        if token and chat_id and os.environ.get("DISABLE_BOT_ALERTS") != "1":
+            digest_mod._post(
+                digest_mod.SEND_URL.format(token=token),
+                {"chat_id": str(chat_id), "text": alert_text},
+                opener,
+            )
+            alert_triggered = True
+        elif not token or not chat_id:
+            alert_triggered = True
+    except Exception as exc:
+        logger.warning("Outreach SLO watchdog alert failed: %s", exc)
+        alert_triggered = False
+
+    if alert_triggered:
+        _set_kv(conn, alert_kv_key, today_utc_str)
+        _set_kv(
+            conn,
+            "outreach_slo_watchdog_last_event",
+            json.dumps(
+                {
+                    "day": today_utc_str,
+                    "reasons": reasons,
+                    "created_at": eff_now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        conn.commit()
+
+    return {
+        "ok": False,
+        "alert_triggered": alert_triggered,
+        "reasons": reasons,
+        "sent_today_total": sent_today_total,
+        "running_pending": running_pending_count,
+        "healthy_accounts": healthy_tg,
+        "connected_accounts": connected_tg,
+        "elapsed_window_minutes": elapsed_minutes,
     }
 
 
