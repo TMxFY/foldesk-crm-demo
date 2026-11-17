@@ -11,6 +11,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/crmtg
 EnvironmentFile=-/opt/crmtg/.env
+Environment="HOME=/root"
+Environment="PATH=/opt/crmtg/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONDONTWRITEBYTECODE=1"
 Environment="PYTHONUNBUFFERED=1"
 Environment="DEMO_AUTOSEED=0"

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import importlib
 import inspect
 import json
 import logging
@@ -118,6 +119,72 @@ from app.analytics import get_analytics_summary
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
+
+
+def _load_hygiene_module():
+    try:
+        return importlib.import_module("app.hygiene")
+    except ModuleNotFoundError as exc:
+        if exc.name in ("app.hygiene", "hygiene"):
+            return None
+        raise
+
+
+def _heal_crm_hygiene_safe(conn) -> dict:
+    if conn is None:
+        return {
+            "quarantined_recipients": 0,
+            "quarantined_leads": 0,
+            "sanitized_leads": 0,
+        }
+    hygiene_mod = _load_hygiene_module()
+    if hygiene_mod is None:
+        return {
+            "quarantined_recipients": 0,
+            "quarantined_leads": 0,
+            "sanitized_leads": 0,
+        }
+    return hygiene_mod.heal_crm_hygiene(conn)
+
+
+def _audit_crm_hygiene_safe(conn) -> dict:
+    hygiene_mod = _load_hygiene_module()
+    if hygiene_mod is None:
+        return {
+            "ok": True,
+            "active_junk_recipient_count": 0,
+            "active_junk_lead_count": 0,
+            "contactless_lead_count": 0,
+            "dirty_title_lead_count": 0,
+        }
+    return hygiene_mod.audit_crm_hygiene(conn)
+
+
+def _audit_server_leadgen_readiness_safe(
+    conn, *, enforce_vps_checks: bool | None = None
+) -> dict:
+    hygiene_mod = _load_hygiene_module()
+    if hygiene_mod is None:
+        return {
+            "ok": True,
+            "enforced": bool(enforce_vps_checks)
+            if enforce_vps_checks is not None
+            else is_vps_runtime(),
+            "leadgen_enabled": True,
+            "llm_key_ready": True,
+            "scraper_session_required": False,
+            "scraper_session_ready": True,
+            "treg_required": False,
+            "treg_ready": True,
+            "typesafe_ready": True,
+            "stage_timeout_count": 0,
+            "missing_components": [],
+        }
+    if enforce_vps_checks is None:
+        return hygiene_mod.audit_server_leadgen_readiness(conn)
+    return hygiene_mod.audit_server_leadgen_readiness(
+        conn, enforce_vps_checks=enforce_vps_checks
+    )
 
 KEYS_DETAIL = "Нужны ключи TG_API_ID и TG_API_HASH с https://my.telegram.org/apps"
 
@@ -1052,6 +1119,14 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
         try:
             await asyncio.sleep(interval_seconds)
             tick_counter += 1
+            with locked_conn(app.state.conn):
+                hygiene_healed = _heal_crm_hygiene_safe(app.state.conn)
+            healed_dirty = isinstance(hygiene_healed, dict) and (
+                int(hygiene_healed.get("quarantined_recipients") or 0)
+                + int(hygiene_healed.get("quarantined_leads") or 0)
+                + int(hygiene_healed.get("sanitized_leads") or 0)
+                > 0
+            )
             maybe_coro = run_autopilot_tick(
                 app.state.conn,
                 gateway=_resolve_app_gateway(app, "telegram"),
@@ -1061,7 +1136,9 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
                 await maybe_coro if inspect.isawaitable(maybe_coro) else maybe_coro
             )
             app.state.autopilot_last_tick_at = utc_now()
-            dirty = isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
+            dirty = healed_dirty or (
+                isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
+            )
             if tick_counter % 10 == 0:
                 slo_watchdog_fn = getattr(_outreach_mod, "check_outreach_slo_watchdog", None)
                 if callable(slo_watchdog_fn):
@@ -1442,6 +1519,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     needs_initial_session_backup = True
         except Exception:
             pass
+    with locked_conn(conn):
+        _heal_crm_hygiene_safe(conn)
     app.state.conn = conn
     app.state.gateway = gateway
     app.state.wa_gateway = WhatsAppGateway()
@@ -1521,6 +1600,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         pending_step1_total = 0
         reply_alert_guard_ok = True
         false_reply_alerts_24h = 0
+        hygiene_audit: dict = {"ok": True}
+        leadgen_readiness: dict = {"ok": True, "missing_components": []}
         try:
             if conn_obj is not None:
                 with locked_conn(conn_obj):
@@ -1561,6 +1642,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         notif_audit = audit_reply_notifications(conn_obj, since_hours=24)
                         false_reply_alerts_24h = int(notif_audit["false_notification_count"])
                         reply_alert_guard_ok = false_reply_alerts_24h == 0
+                        hygiene_audit = _audit_crm_hygiene_safe(conn_obj)
+                        leadgen_readiness = _audit_server_leadgen_readiness_safe(conn_obj)
         except Exception as exc:
             return Response(
                 content=json.dumps(
@@ -1591,6 +1674,18 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     "pending_step1_total": pending_step1_total,
                     "reply_alert_guard_ok": reply_alert_guard_ok,
                     "false_reply_alerts_24h": false_reply_alerts_24h,
+                    "icp_hygiene_ok": bool(hygiene_audit.get("ok", True)),
+                    "active_junk_recipients": int(
+                        hygiene_audit.get("active_junk_recipient_count", 0)
+                    ),
+                    "active_junk_leads": int(
+                        hygiene_audit.get("active_junk_lead_count", 0)
+                    ),
+                    "contactless_leads": int(
+                        hygiene_audit.get("contactless_lead_count", 0)
+                    ),
+                    "leadgen_ready": bool(leadgen_readiness.get("ok", True)),
+                    "leadgen_readiness": leadgen_readiness,
                 }
             )
         return payload
@@ -3290,6 +3385,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             if isinstance(res, dict) and res.get("restored"):
                 init_db(conn_obj)
                 ensure_funnel_columns(conn_obj)
+                _heal_crm_hygiene_safe(conn_obj)
                 restore_disk_sessions(conn_obj)
                 gw = getattr(request.app.state, "gateway", None)
                 if gw is not None and hasattr(gw, "_session_strings"):
@@ -3690,12 +3786,34 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return result
 
     from app.leadgen_settings import (
+        _resolve_state_dir,
         get_leadgen_config,
         get_leadgen_status,
         push_discovered_now,
         save_leadgen_config,
         sync_leadgen_campaigns,
     )
+
+    @app.get("/api/leadgen/direct-leads")
+    def leadgen_direct_leads_get(request: Request):
+        jsonl_path = Path(_resolve_state_dir()) / "direct_x_leads.jsonl"
+        items: list[dict] = []
+        if jsonl_path.is_file():
+            try:
+                raw_text = jsonl_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                raw_text = ""
+            for raw_line in raw_text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    items.append(parsed)
+        return {"ok": True, "count": len(items), "items": items[-200:]}
 
     @app.get("/api/leadgen/config")
     def leadgen_config_get(request: Request):

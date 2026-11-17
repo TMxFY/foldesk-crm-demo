@@ -90,11 +90,16 @@ jobs:
               fi
             fi
 
+            if [ -f "$APP_DIR/data/crm.db" ] && [ -f "$APP_DIR/scripts/proactive_audit.py" ]; then
+              "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/proactive_audit.py" --db "$APP_DIR/data/crm.db" --heal || true
+            fi
+
             systemctl restart crmtg.service
 
             healthy=0
+            hc_json=""
             for i in $(seq 1 60); do
-              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True else 1)'; then
+              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True and d.get("icp_hygiene_ok") is True and d.get("leadgen_ready") is True else 1)'; then
                 healthy=1
                 break
               fi
@@ -102,6 +107,7 @@ jobs:
             done
 
             if [ "$healthy" -ne 1 ]; then
+              echo "Last deep health payload: ${hc_json:-<unreachable>}"
               echo "::error::Healthcheck failed on 127.0.0.1:18084, rolling back to $PREV_SHA"
               git reset --hard "$PREV_SHA"
               "$APP_DIR/.venv/bin/pip" install -q -r requirements.txt

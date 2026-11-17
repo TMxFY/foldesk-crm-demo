@@ -210,6 +210,72 @@ if index_html_file.is_file():
             "Vacancy Gate violation: app/templates/index.html must not pre-check #leadgen-vacancies-enabled"
         )
 
+# Gate E: Sniper ICP Hygiene & Zero-Hollow-Pipe Server Readiness Gate
+main_py_file = root / "app" / "main.py"
+if main_py_file.is_file():
+    main_py_src = main_py_file.read_text(encoding="utf-8")
+    try:
+        main_tree = ast.parse(main_py_src, filename=str(main_py_file))
+    except SyntaxError:
+        main_tree = None
+    health_strs = set()
+    if main_tree is not None:
+        for node in ast.walk(main_tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "api_health":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        health_strs.add(sub.value)
+    if "icp_hygiene_ok" not in health_strs or "leadgen_ready" not in health_strs:
+        errors.append(
+            "Gate E violation in app/main.py: /api/health (api_health) must surface 'icp_hygiene_ok' and 'leadgen_ready'"
+        )
+
+proactive_audit_file = root / "scripts" / "proactive_audit.py"
+if proactive_audit_file.is_file():
+    pa_src = proactive_audit_file.read_text(encoding="utf-8")
+    if "icp_hygiene_ok" not in pa_src or "leadgen_ready" not in pa_src:
+        errors.append(
+            "Gate E violation in scripts/proactive_audit.py: must enforce 'icp_hygiene_ok' and 'leadgen_ready'"
+        )
+
+deploy_wf_file = root / ".github" / "workflows" / "deploy-vps.yml"
+if deploy_wf_file.is_file():
+    wf_src = deploy_wf_file.read_text(encoding="utf-8")
+    if "icp_hygiene_ok" not in wf_src or "leadgen_ready" not in wf_src:
+        errors.append(
+            "Gate E violation in .github/workflows/deploy-vps.yml: deep healthcheck must verify 'icp_hygiene_ok' and 'leadgen_ready'"
+        )
+
+for required_svc_name in ("crmtg.service", "crmtg-leadgen.service"):
+    req_svc = systemd_dir / required_svc_name
+    if req_svc.is_file():
+        svc_active_lines = [
+            ln.strip()
+            for ln in req_svc.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#") and not ln.strip().startswith(";")
+        ]
+        has_usr_local_path = any(
+            ln.startswith("Environment=") and "PATH=" in ln and "/usr/local/bin" in ln
+            for ln in svc_active_lines
+        )
+        if not has_usr_local_path:
+            errors.append(
+                f"Gate E violation in {req_svc}: missing Environment PATH= containing /usr/local/bin"
+            )
+
+hygiene_py_file = root / "app" / "hygiene.py"
+if hygiene_py_file.is_file():
+    hygiene_src = hygiene_py_file.read_text(encoding="utf-8")
+    for required_def in (
+        "def audit_crm_hygiene(",
+        "def heal_crm_hygiene(",
+        "def audit_server_leadgen_readiness(",
+    ):
+        if required_def not in hygiene_src:
+            errors.append(
+                f"Gate E violation in app/hygiene.py: missing required contract function '{required_def}'"
+            )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
