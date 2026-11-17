@@ -73,6 +73,14 @@ except Exception:
             candidate_state = generate_telegram_candidates = identity_filter = verify_identity_candidates = None
 
 
+try:
+    from leadgen.supply_side import sanitize_person_and_company, sniper_reject_reason
+except Exception:
+    try:
+        from supply_side import sanitize_person_and_company, sniper_reject_reason
+    except Exception:
+        sanitize_person_and_company = sniper_reject_reason = None
+
 UA = {
     "User-Agent": (
         "SoftUGC-lead-discovery/1.0 (+public bounded research; "
@@ -83,6 +91,8 @@ TIMEOUT = 4
 DEFAULT_LIMIT = 20
 MAX_VERIFY_WORKERS = 8
 MAX_VERIFY_CANDIDATES_TOTAL = 32
+DEFAULT_COMMERCIAL_SOURCES = ("app_stores", "launch_signals")
+DEV_SOURCES = frozenset({"github", "show_hn", "huggingface"})
 
 _X_HOSTS = {"x.com", "twitter.com"}
 _LINKEDIN_HOSTS = {"linkedin.com"}
@@ -433,7 +443,7 @@ def _base_row(*, name: str, bio: str, source: str, source_url: str, project: str
     return row
 
 
-def github_and_show_hn(limit: int) -> list[dict[str, Any]]:
+def github_candidates(limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     since = (date.today() - timedelta(days=30)).isoformat()
     try:
@@ -456,7 +466,11 @@ def github_and_show_hn(limit: int) -> list[dict[str, Any]]:
             ) | {"github_handle": owner.get("login") or "", "github_stars": repo.get("stargazers_count", 0)})
     except Exception as exc:
         log("github discovery failed:", exc)
+    return rows
 
+
+def hn_candidates(limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     try:
         payload = _get_json("https://hn.algolia.com/api/v1/search_by_date", params={
             "tags": "show_hn", "numericFilters": f"created_at_i>{int(time.time()) - 30 * 86400}",
@@ -480,6 +494,10 @@ def github_and_show_hn(limit: int) -> list[dict[str, Any]]:
     return rows
 
 
+def github_and_show_hn(limit: int) -> list[dict[str, Any]]:
+    return github_candidates(limit) + hn_candidates(limit)
+
+
 def huggingface(limit: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for endpoint, source, key in (("spaces", "huggingface_space", "spaces"), ("models", "huggingface_model", "models")):
@@ -494,6 +512,10 @@ def huggingface(limit: int) -> list[dict[str, Any]]:
         except Exception as exc:
             log(f"Hugging Face {endpoint} discovery failed:", exc)
     return rows
+
+
+def hf_candidates(limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    return huggingface(limit)
 
 
 def _parse_store_links(text: str, pattern: str) -> list[str]:
@@ -591,28 +613,84 @@ async def qualify(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def discover_all(
+    *,
+    limit: int = DEFAULT_LIMIT,
+    sources: Iterable[str] | str | None = None,
+    include_dev_sources: bool = False,
+) -> list[dict[str, Any]]:
+    bounded_limit = max(1, min(int(limit or DEFAULT_LIMIT), 100))
+    if sources is None:
+        selected = set(DEFAULT_COMMERCIAL_SOURCES)
+        if include_dev_sources:
+            selected |= set(DEV_SOURCES)
+    elif isinstance(sources, str):
+        selected = {x.strip() for x in sources.split(",") if x.strip()}
+    else:
+        selected = {str(x).strip() for x in sources if str(x).strip()}
+
+    if include_dev_sources and sources is None:
+        selected |= set(DEV_SOURCES)
+    elif not include_dev_sources:
+        selected -= set(DEV_SOURCES)
+
+    rows: list[dict[str, Any]] = []
+    if "github" in selected:
+        rows.extend(github_candidates(bounded_limit))
+    if "show_hn" in selected:
+        rows.extend(hn_candidates(bounded_limit))
+    if "huggingface" in selected:
+        rows.extend(hf_candidates(bounded_limit))
+    if "app_stores" in selected:
+        rows.extend(app_stores(bounded_limit))
+    if "launch_signals" in selected:
+        rows.extend(launch_signals(bounded_limit))
+
+    deduped = dedupe(rows)
+    filtered: list[dict[str, Any]] = []
+    for row in deduped:
+        item = dict(row)
+        if sanitize_person_and_company is not None:
+            clean_n, clean_p = sanitize_person_and_company(
+                item.get("name"),
+                item.get("project"),
+                site=item.get("project_url"),
+                bio=item.get("bio"),
+            )
+            if clean_n:
+                item["name"] = clean_n
+            if clean_p:
+                item["project"] = clean_p
+        if not include_dev_sources and sniper_reject_reason is not None and sniper_reject_reason(item):
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--sources", default="github,show_hn,huggingface,app_stores,launch_signals")
+    parser.add_argument("--sources", default="app_stores,launch_signals")
+    parser.add_argument(
+        "--include-dev-sources",
+        action="store_true",
+        help="explicitly include github, show_hn, and huggingface candidates",
+    )
     parser.add_argument("--no-qualify", action="store_true")
     parser.add_argument("--verify-telegram", action="store_true")
     parser.add_argument("--verify-telegram-telethon", action="store_true",
                         help="also resolve candidates with the authenticated Telethon session")
     args = parser.parse_args()
     limit = max(1, min(args.limit, 100))
-    selected = {x.strip() for x in args.sources.split(",") if x.strip()}
-    rows: list[dict[str, Any]] = []
-    if selected & {"github", "show_hn"}:
-        rows.extend(github_and_show_hn(limit))
-    if "huggingface" in selected:
-        rows.extend(huggingface(limit))
-    if "app_stores" in selected:
-        rows.extend(app_stores(limit))
-    if "launch_signals" in selected:
-        rows.extend(launch_signals(limit))
-    rows = dedupe(rows)
+    selected_sources = args.sources
+    if args.include_dev_sources and selected_sources == "app_stores,launch_signals":
+        selected_sources = "github,show_hn,huggingface,app_stores,launch_signals"
+    rows = discover_all(
+        limit=limit,
+        sources=selected_sources,
+        include_dev_sources=bool(args.include_dev_sources),
+    )
     if args.verify_telegram:
         # Bounded parallel t.me verification so external stage completes well under stage_timeout
         unique_cands: dict[str, dict[str, str]] = {}

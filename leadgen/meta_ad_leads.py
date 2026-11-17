@@ -24,12 +24,12 @@ except ImportError:
         from scripts.treg_client import call
 
 try:
-    from supply_side import is_supply_side
+    from supply_side import is_supply_side, sanitize_person_and_company, sniper_reject_reason
 except ImportError:
     try:
-        from leadgen.supply_side import is_supply_side
+        from leadgen.supply_side import is_supply_side, sanitize_person_and_company, sniper_reject_reason
     except ImportError:
-        from scripts.supply_side import is_supply_side
+        from scripts.supply_side import is_supply_side, sanitize_person_and_company, sniper_reject_reason
 
 try:
     from treg_enrich import domain_of, find_company_decision_maker
@@ -41,15 +41,29 @@ except ImportError:
 
 ENDPOINT = "scrapecreators.x.v1-facebook-adlibrary-search-ads"
 SEARCH_QUERIES = (
-    "AI note taker",
-    "AI video editor",
+    # Cluster 1: Gaming / Roblox / Fortnite / FiveM
+    "roblox game",
+    "fortnite map code",
+    "mobile RPG game",
+    "fivem roleplay server",
+    # Cluster 2: Consumer AI subscription apps (astrology, coaching, language, fitness, video)
     "AI coaching app",
-    "crypto wallet app",
-    "prop trading challenge",
+    "AI astrology app",
     "AI language learning",
     "fitness tracker app",
-    "shopify app",
-    "B2B SaaS CRM",
+    "calorie tracker AI",
+    "AI note taker",
+    "AI video editor",
+    # Cluster 3: E-com / Shopify D2C (cosmetics/skincare, supplements, household cleaning)
+    "skincare routine serum",
+    "daily supplement gummies",
+    "eco household detergent",
+    "shopify beauty brand",
+    # Cluster 4: Crypto B2C wallets, trackers & prop trading
+    "crypto wallet app",
+    "crypto portfolio tracker",
+    "prop trading challenge",
+    "funded trader challenge",
 )
 CAP = int(os.getenv("META_ADS_CAP", "15"))
 SEEN_DAYS = 90
@@ -177,7 +191,8 @@ def parse_ad_candidates(payload: dict | None) -> list[dict]:
         project_url, domain = _extract_project_url_and_domain(snapshot)
         if _is_giant_brand(page_name, domain):
             continue
-        if is_supply_side(f"{page_name} {body_text}"):
+        ad_blob = f"{page_name} {body_text}"
+        if is_supply_side(ad_blob) or sniper_reject_reason(ad_blob):
             continue
         cta_text = str(snapshot.get("cta_text") or "Video Ad").strip() or "Video Ad"
         if body_text:

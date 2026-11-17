@@ -22,19 +22,18 @@ except ImportError:
 
 try:
     from lead_market import market_of
-    from supply_side import is_supply_side
+    from supply_side import is_supply_side, sanitize_person_and_company, sniper_reject_reason
 except ImportError:
     try:
         from leadgen.lead_market import market_of
-        from leadgen.supply_side import is_supply_side
+        from leadgen.supply_side import is_supply_side, sanitize_person_and_company, sniper_reject_reason
     except ImportError:
         from scripts.lead_market import market_of
-        from scripts.supply_side import is_supply_side
+        from scripts.supply_side import is_supply_side, sanitize_person_and_company, sniper_reject_reason
 
 CAP = 8
 TIMEOUT = 8
 SOURCES = (
-    ("devforum", "https://devforum.roblox.com/c/collaboration/recruitment/82.json"),
     ("fivem", "https://fivem-server.org/servers/english"),
     ("gta", "https://6charts.com/gta-6-servers"),
     ("groover", "https://groover.co/en/influencer/list/tags/label/"),
@@ -44,7 +43,10 @@ SOURCES = (
 _UA = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/json"}
 _CASINO = re.compile(r"casino|slots|betting", re.I)
 _DEVFORUM_SKIP = re.compile(
-    r"\[closed\]|\[volunteer|\bvolunteers?\b|\bunpaid\b|looking for game testers|"
+    r"\[closed\]|\[open\]|\[(?:builder|modeler|scripter|animator)s?\s+needed\]|"
+    r"\[volunteer|\bvolunteers?\b|\bunpaid\b|looking for game testers|"
+    r"looking\s+for\s+(?:a\s+|an\s+)?(?:new\s+)?(?:experienced\s+)?(?:3d\s+modeler|modeler|builder|scripter)\b|"
+    r"design\s+an\s+asym\s+map|"
     r"\[for\s*hire\]|\bfor\s+hire\b|\[commissions?\]|\bcommissions?\s+open\b",
     re.I,
 )
@@ -205,7 +207,7 @@ def _row(source: str, page_url: str, name: str, blob: str, site: str) -> dict | 
     combined = f"{name}\n{blob}"
     if _CASINO.search(combined) or (site and _CASINO.search(site)):
         return None
-    if _DEVFORUM_SKIP.search(combined) or is_supply_side(combined):
+    if _DEVFORUM_SKIP.search(combined) or is_supply_side(combined) or sniper_reject_reason(combined):
         return None
     contacts = _contacts(blob)
     chosen = _ok_site(site, page_url) if site else ""
@@ -215,13 +217,16 @@ def _row(source: str, page_url: str, name: str, blob: str, site: str) -> dict | 
         contacts[key] for key in ("founder_x", "founder_linkedin", "username", "work_email")
     ):
         return None
+    clean_name, clean_proj = sanitize_person_and_company(name, name, site=chosen, bio=blob)
+    final_name = clean_name or name
+    final_proj = clean_proj or final_name
     links = []
     for item in (chosen, contacts["founder_x"], contacts["founder_linkedin"], contacts["tg_url"]):
         if item and item not in links:
             links.append(item)
     return {
-        "name": name,
-        "project": name,
+        "name": final_name,
+        "project": final_proj,
         "project_url": chosen,
         "source": f"catalog_{source}",
         "text": page_url,
@@ -259,7 +264,11 @@ def _parse_discourse(source: str, data: dict, page_url: str) -> list[dict]:
             continue
         title = str(topic.get("title") or "")
         excerpt = str(topic.get("excerpt") or "")
-        if _DEVFORUM_SKIP.search(title) or _DEVFORUM_SKIP.search(excerpt):
+        if (
+            _DEVFORUM_SKIP.search(title)
+            or _DEVFORUM_SKIP.search(excerpt)
+            or sniper_reject_reason(f"{title}\n{excerpt}")
+        ):
             continue
         featured = str(topic.get("featured_link") or "")
         blob = "\n".join(part for part in (title, excerpt, featured) if part)

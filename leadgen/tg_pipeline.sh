@@ -391,6 +391,18 @@ if [ -s "$NEW" ]; then
     cp "$RAW.rows.json" "$PENDING_DIR/${TS}_tg.json"
     echo "# current TG rows saved for retry: $PENDING_DIR/${TS}_tg.json"
   fi
+
+  # Split Direct/X leads (no personal TG/WA) into direct_x_leads.jsonl and keep only TG/WA sniper leads (>=80) in state_dir
+  rm -f "$RAW.final.jsonl"
+  python3 - "$ROOT" "$RAW.treg.jsonl" "$STATE_DIR/direct_x_leads.jsonl" <<'PY' || true
+import sys
+from pathlib import Path
+root, treg_p, dx_p = sys.argv[1:]
+sys.path.insert(0, root)
+from leadgen.vps_autonomous_replenish import split_tg_and_direct_x_leads
+res = split_tg_and_direct_x_leads(Path(treg_p), Path(dx_p))
+print(f"sniper tg/direct_x split: {res}")
+PY
 else
   echo "no new TG leads; skipping enrich/curate/sheet-append"
 fi
