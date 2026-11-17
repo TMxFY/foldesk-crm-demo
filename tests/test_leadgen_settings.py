@@ -108,16 +108,18 @@ def test_get_and_put_leadgen_config_persists_to_db_and_json(test_env):
 
 def test_sync_leadgen_campaigns_and_push_now(test_env):
     client = test_env["client"]
+    conn = test_env["conn"]
     state_dir = test_env["state_dir"]
 
+    # Without connected WhatsApp accounts or WA leads, empty Leadgen Auto (WA) must NOT be created
     res_sync = client.post("/api/leadgen/sync-campaigns")
     assert res_sync.status_code == 200
     sync_data = res_sync.json()
     assert sync_data["ok"] is True
-    assert sync_data["synced_count"] == 3
+    assert sync_data["synced_count"] == 2
     names = {c["name"]: c for c in sync_data["campaigns"]}
     assert "Leadgen Auto (TG)" in names
-    assert "Leadgen Auto (WA)" in names
+    assert "Leadgen Auto (WA)" not in names
     assert "TG Вакансии" in names
     tg_camp = names["Leadgen Auto (TG)"]
     assert tg_camp["leadgen_enabled"] is True
@@ -132,6 +134,22 @@ def test_sync_leadgen_campaigns_and_push_now(test_env):
     assert [s["delay_hours"] for s in tg_camp["steps"]] == [0, 24, 24]
     vac_camp = names["TG Вакансии"]
     assert [s["template_text"] for s in vac_camp["steps"]] == ["{first_touch}", "{followup_1}", "{followup_2}"]
+
+    # Once a connected WhatsApp account exists, sync-campaigns also creates Leadgen Auto (WA)
+    conn.execute(
+        """
+        INSERT INTO accounts (phone, session_path, status, created_at, health, provider)
+        VALUES ('+79990009988', 'wa_79990009988.session', 'connected', '2026-11-17T00:00:00', 'active', 'whatsapp')
+        """
+    )
+    conn.commit()
+    res_sync_wa = client.post("/api/leadgen/sync-campaigns")
+    assert res_sync_wa.status_code == 200
+    sync_wa_data = res_sync_wa.json()
+    assert sync_wa_data["synced_count"] == 3
+    names_wa = {c["name"]: c for c in sync_wa_data["campaigns"]}
+    assert "Leadgen Auto (WA)" in names_wa
+    assert len(names_wa["Leadgen Auto (WA)"]["steps"]) == 3
 
     # Write local ready vacancy monitor & replies to state_dir and test push-now without LLM
     mon_path = state_dir / "job_monitor_2026-11-06.json"
