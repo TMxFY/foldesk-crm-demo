@@ -794,7 +794,7 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
         return out
 
     monkeypatch.setenv("RELAYFAST_API_KEY", "test-relayfast-key")
-    monkeypatch.setenv("FORCE_AUTO_SONNET_IN_TEST", "1")
+    monkeypatch.setenv("CRMTG_AUTO_SONNET", "1")
     monkeypatch.setattr("leadgen.outreach_copy.generate_vlad_sonnet_batch", _fake_sonnet_batch)
     monkeypatch.setattr(crm_mcp_push, "generate_vlad_sonnet_batch", _fake_sonnet_batch)
 

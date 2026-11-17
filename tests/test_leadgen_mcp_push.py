@@ -260,3 +260,44 @@ def test_push_leads_via_mcp_local_and_http_mock_and_fallback(db_conn):
     assert res_fb["fallback"] is True
     assert res_fb["created_leads"] == 1
     assert calls_made == ["ingest_discovered_leads", "create_or_update_lead"]
+
+
+def test_crm_mcp_push_auto_sonnet_respects_crmtg_auto_sonnet_env(tmp_path, monkeypatch):
+    import leadgen.crm_mcp_push as crm_mcp_push
+    from leadgen.outreach_copy import REVSHARE_OFFER_TEXT, SOFTUGC_PITCH_TEXT
+
+    sonnet_invocations: list[int] = []
+
+    def _fake_sonnet(leads, *, api_key=None, base_url=None, model="claude-sonnet-5", timeout=90):
+        sonnet_invocations.append(len(leads))
+        return [
+            {
+                "audience": "users",
+                "step1_text": f"Hey,\n\nSaw {ld.get('company')}.\n\n{SOFTUGC_PITCH_TEXT}\n\n{REVSHARE_OFFER_TEXT}",
+            }
+            for ld in leads
+        ]
+
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    monkeypatch.setenv("CRMTG_AUTO_SONNET", "1")
+    monkeypatch.setattr(crm_mcp_push, "generate_vlad_sonnet_batch", _fake_sonnet)
+
+    jf = tmp_path / "sonnet_flag.jsonl"
+    jf.write_text(
+        json.dumps(
+            {
+                "username": "@sonnet_push_founder",
+                "company": "OrbitSaaS",
+                "site": "https://orbitsaas.io",
+                "category": "SaaS",
+                "their_angle": "Analytics for B2B SaaS",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_leads_from_jsonl(jf)
+    assert len(loaded) == 1
+    assert sonnet_invocations == [1]
+    assert "Saw OrbitSaaS." in loaded[0]["step1_text"]
+

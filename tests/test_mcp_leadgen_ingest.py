@@ -301,3 +301,42 @@ def test_run_campaign_batch_calls_prewarm_before_step1_and_survives_prewarm_erro
     assert gateway.sent[1]["text"] == "Hey Story Lead 2! Saw StoryCo 2 launch — awesome AI product workflow."
     assert len(failing_client.requests) == 1
     assert failing_client.requests[0].__class__.__name__ == "GetPeerStoriesRequest"
+
+
+def test_mcp_ingest_auto_sonnet_uses_crmtg_auto_sonnet_flag(db_conn, monkeypatch):
+    from leadgen.outreach_copy import REVSHARE_OFFER_TEXT, SOFTUGC_PITCH_TEXT
+
+    calls: list[int] = []
+
+    def _fake_sonnet(leads, *, api_key=None, base_url=None, model="claude-sonnet-5", timeout=90):
+        calls.append(len(leads))
+        return [
+            {
+                "audience": "users",
+                "step1_text": f"Hey,\n\nSaw {ld.get('company')}.\n\n{SOFTUGC_PITCH_TEXT}\n\n{REVSHARE_OFFER_TEXT}",
+            }
+            for ld in leads
+        ]
+
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    monkeypatch.setenv("CRMTG_AUTO_SONNET", "1")
+    monkeypatch.setattr("leadgen.outreach_copy.generate_vlad_sonnet_batch", _fake_sonnet)
+
+    res = _call_mcp(
+        db_conn,
+        "ingest_discovered_leads",
+        {
+            "leads": [
+                {
+                    "username": "@sonnet_flag_founder",
+                    "name": "Dana",
+                    "company": "NovaFlow",
+                    "category": "SaaS",
+                    "their_angle": "Workflow automation",
+                }
+            ],
+            "enroll_in_campaign": True,
+        },
+    )
+    assert res["ok"] is True
+    assert calls == [1]

@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Iterable
@@ -78,8 +79,10 @@ UA = {
         "contact: operations@softugc.com)"
     )
 }
-TIMEOUT = 20
+TIMEOUT = 4
 DEFAULT_LIMIT = 20
+MAX_VERIFY_WORKERS = 8
+MAX_VERIFY_CANDIDATES_TOTAL = 32
 
 _X_HOSTS = {"x.com", "twitter.com"}
 _LINKEDIN_HOSTS = {"linkedin.com"}
@@ -299,30 +302,48 @@ def _is_valid_personal_tme_page(html_text: str, username: str) -> bool:
     return True
 
 
-def verify_telegram_candidates(candidates: list[dict[str, str]], *, max_checks: int = 3) -> list[dict[str, str]]:
+def _verify_single_tme_candidate(candidate: dict[str, str]) -> dict[str, str] | None:
+    uname = str(candidate.get("username") or "").strip().lstrip("@")
+    url = str(candidate.get("url") or "").strip()
+    if not uname or not url:
+        return None
+    try:
+        response = requests.get(url, headers=UA, timeout=TIMEOUT, allow_redirects=False)
+        status = int(getattr(response, "status_code", 200) or 0)
+        is_redir = (
+            bool(getattr(response, "is_redirect", False))
+            or (300 <= status < 400)
+            or bool((getattr(response, "headers", {}) or {}).get("Location"))
+        )
+        if status != 200 or is_redir:
+            return None
+        text = response.text or ""
+        if _is_valid_personal_tme_page(text, uname):
+            item = dict(candidate)
+            item["verified"] = "1"
+            return item
+    except requests.RequestException:
+        return None
+    return None
+
+
+def verify_telegram_candidates(
+    candidates: list[dict[str, str]],
+    *,
+    max_checks: int = 3,
+    max_workers: int = MAX_VERIFY_WORKERS,
+) -> list[dict[str, str]]:
     """Verify public t.me pages belong to a real personal user (not missing/redirect/bot/channel)."""
-    verified: list[dict[str, str]] = []
-    for candidate in candidates[:max_checks]:
-        uname = str(candidate.get("username") or "").strip().lstrip("@")
-        url = str(candidate.get("url") or "").strip()
-        if not uname or not url:
-            continue
-        try:
-            response = requests.get(url, headers=UA, timeout=TIMEOUT, allow_redirects=False)
-            status = int(getattr(response, "status_code", 200) or 0)
-            is_redir = bool(getattr(response, "is_redirect", False)) or (300 <= status < 400) or bool((getattr(response, "headers", {}) or {}).get("Location"))
-            if status != 200 or is_redir:
-                continue
-            text = response.text or ""
-            if _is_valid_personal_tme_page(text, uname):
-                item = dict(candidate)
-                item["verified"] = "1"
-                verified.append(item)
-        except requests.RequestException:
-            continue
-        finally:
-            time.sleep(0.15)
-    return verified
+    sliced = list(candidates[:max_checks])
+    if not sliced:
+        return []
+    if len(sliced) == 1:
+        single = _verify_single_tme_candidate(sliced[0])
+        return [single] if single is not None else []
+    workers = max(1, min(int(max_workers or MAX_VERIFY_WORKERS), len(sliced)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_verify_single_tme_candidate, sliced))
+    return [r for r in results if r is not None]
 
 
 async def verify_telegram_with_telethon(rows: list[dict[str, Any]], session: str | None = None) -> None:
@@ -593,12 +614,36 @@ def main() -> None:
         rows.extend(launch_signals(limit))
     rows = dedupe(rows)
     if args.verify_telegram:
+        # Bounded parallel t.me verification so external stage completes well under stage_timeout
+        unique_cands: dict[str, dict[str, str]] = {}
         for row in rows:
-            verified = verify_telegram_candidates(row.get("telegram_candidates") or [])
-            row["telegram_verified"] = verified
-            if verified:
-                row["telegram_username"] = verified[0]["username"]
-                row["telegram_url"] = verified[0]["url"]
+            for cand in (row.get("telegram_candidates") or [])[:2]:
+                url_key = str(cand.get("url") or "").strip().lower()
+                if not url_key or url_key in unique_cands:
+                    continue
+                unique_cands[url_key] = cand
+                if len(unique_cands) >= MAX_VERIFY_CANDIDATES_TOTAL:
+                    break
+            if len(unique_cands) >= MAX_VERIFY_CANDIDATES_TOTAL:
+                break
+        verified_by_url: dict[str, dict[str, str]] = {}
+        if unique_cands:
+            cand_items = list(unique_cands.values())
+            workers = max(1, min(MAX_VERIFY_WORKERS, len(cand_items)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for res_item in pool.map(_verify_single_tme_candidate, cand_items):
+                    if res_item is not None:
+                        verified_by_url[str(res_item.get("url") or "").strip().lower()] = res_item
+        for row in rows:
+            row_verified: list[dict[str, str]] = []
+            for cand in (row.get("telegram_candidates") or [])[:2]:
+                hit = verified_by_url.get(str(cand.get("url") or "").strip().lower())
+                if hit is not None:
+                    row_verified.append(dict(hit))
+            row["telegram_verified"] = row_verified
+            if row_verified:
+                row["telegram_username"] = row_verified[0]["username"]
+                row["telegram_url"] = row_verified[0]["url"]
     if args.verify_telegram_telethon:
         asyncio.run(verify_telegram_with_telethon(rows))
         for row in rows:

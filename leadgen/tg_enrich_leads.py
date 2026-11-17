@@ -298,9 +298,17 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
         )
 
     api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
-    allow_sonnet = bool(api_key) and (
-        os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1" or os.environ.get("FORCE_AUTO_SONNET_IN_TEST") == "1"
-    )
+    try:
+        from app.runtime_config import should_allow_auto_sonnet as _allow_auto_sonnet
+
+        sonnet_runtime_ok = _allow_auto_sonnet()
+    except ImportError:
+        sonnet_runtime_ok = (
+            os.environ.get("CRMTG_VPS_RUNTIME") == "1"
+            or os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1"
+            or os.environ.get("CRMTG_AUTO_SONNET") == "1"
+        )
+    allow_sonnet = bool(api_key) and sonnet_runtime_ok
 
     need_idx: list[int] = []
     need_payloads: list[dict] = []

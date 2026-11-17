@@ -584,12 +584,17 @@ def test_verify_sh_static_gates_and_skill_adversarial_skeptic_section(tmp_path: 
     sb_verify.chmod(0o755)
     (sandbox / "app" / "static" / "app.js").write_text("const ok = 1;\n", encoding="utf-8")
     (sandbox / "app" / "ok.py").write_text("x = 1\n", encoding="utf-8")
-    (sandbox / "leadgen" / "vps_autonomous_replenish.py").write_text("y = 2\n", encoding="utf-8")
+    (sandbox / "leadgen" / "__init__.py").write_text("", encoding="utf-8")
+    (sandbox / "leadgen" / "vps_autonomous_replenish.py").write_text(
+        "import argparse\nif __name__ == '__main__': argparse.ArgumentParser().parse_args()\n",
+        encoding="utf-8",
+    )
     (sandbox / "tests" / "test_ok.py").write_text("def test_x(): assert True\n", encoding="utf-8")
 
-    # 1) Hollow push_discovered_now + missing -m module + PYTEST_CURRENT_TEST -> MUST exit 1
+    # 1) Hollow push_discovered_now + missing -m module + PYTEST_CURRENT_TEST + *_IN_TEST + missing CRMTG_VPS_RUNTIME=1 -> MUST exit 1
     (sandbox / "app" / "bad.py").write_text(
-        "import os\nif 'PYTEST_CURRENT_TEST' in os.environ: pass\n", encoding="utf-8"
+        "import os\nif 'PYTEST_CURRENT_TEST' in os.environ or os.getenv('FORCE_X_IN_TEST'): pass\n",
+        encoding="utf-8",
     )
     (sandbox / "deploy" / "systemd" / "hollow.service").write_text(
         "[Service]\nExecStart=/opt/crmtg/.venv/bin/python -c 'push_discovered_now(conn)'\n",
@@ -607,15 +612,17 @@ def test_verify_sh_static_gates_and_skill_adversarial_skeptic_section(tmp_path: 
     )
     assert bad_run.returncode == 1
     assert "Zero PYTEST_CURRENT_TEST Gate violation" in bad_run.stderr
+    assert "Zero *_IN_TEST Env Gate violation" in bad_run.stderr
+    assert "Systemd Runtime Gate violation" in bad_run.stderr
     assert "bare push_discovered_now without upstream discovery" in bad_run.stderr
     assert "missing repo module '-m leadgen.ghost_nonexistent'" in bad_run.stderr
 
-    # 2) Clean repo without PYTEST_CURRENT_TEST and with real -m module -> MUST exit 0
+    # 2) Clean repo without PYTEST_CURRENT_TEST / *_IN_TEST and with CRMTG_VPS_RUNTIME=1 + real -m module -> MUST exit 0
     (sandbox / "app" / "bad.py").unlink()
     (sandbox / "deploy" / "systemd" / "hollow.service").unlink()
     (sandbox / "deploy" / "systemd" / "missing_mod.service").unlink()
     (sandbox / "deploy" / "systemd" / "clean.service").write_text(
-        "[Service]\nExecStart=/opt/crmtg/.venv/bin/python -m leadgen.vps_autonomous_replenish\n",
+        '[Service]\nEnvironment="CRMTG_VPS_RUNTIME=1"\nExecStart=/opt/crmtg/.venv/bin/python -m leadgen.vps_autonomous_replenish\n',
         encoding="utf-8",
     )
     ok_run = subprocess.run(
