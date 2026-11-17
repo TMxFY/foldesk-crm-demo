@@ -70,7 +70,7 @@ except ImportError:
             supply_reason,
         )
 
-if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+if os.environ.get("CRMTG_SKIP_DOTENV") != "1":
     try:
         from dotenv import load_dotenv
         load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))

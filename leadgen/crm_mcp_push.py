@@ -290,7 +290,7 @@ def _should_auto_sonnet() -> bool:
     key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
     if not key:
         return False
-    if "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("FORCE_AUTO_SONNET_IN_TEST") != "1":
+    if os.environ.get("CRMTG_EPHEMERAL_RUNTIME") == "1" and os.environ.get("FORCE_AUTO_SONNET_IN_TEST") != "1":
         return False
     return True
 

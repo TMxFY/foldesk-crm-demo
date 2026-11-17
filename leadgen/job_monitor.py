@@ -214,7 +214,7 @@ EXTRACT = """Из вакансии ниже вытащи поля. Она уже
 
 
 def load_env():
-    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+    if os.environ.get("CRMTG_SKIP_DOTENV") == "1":
         return
     candidates = [
         WORKTREE_ROOT / ".env",

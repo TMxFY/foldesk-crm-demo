@@ -53,7 +53,7 @@ BATCH_SIZE = 10
 TIMEOUT = 90
 
 import sys
-if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+if os.environ.get("CRMTG_SKIP_DOTENV") != "1":
     try:
         from dotenv import load_dotenv
         load_dotenv(ROOT / ".env")

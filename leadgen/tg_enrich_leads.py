@@ -299,7 +299,7 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
 
     api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
     allow_sonnet = bool(api_key) and (
-        "PYTEST_CURRENT_TEST" not in os.environ or os.environ.get("FORCE_AUTO_SONNET_IN_TEST") == "1"
+        os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1" or os.environ.get("FORCE_AUTO_SONNET_IN_TEST") == "1"
     )
 
     need_idx: list[int] = []

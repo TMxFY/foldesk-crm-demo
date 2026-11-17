@@ -459,7 +459,7 @@ def main() -> int:
 
     if not a.no_crm and mcp_leads:
         resolved_db: str | Path | None = a.db_path or None
-        if resolved_db is None and "PYTEST_CURRENT_TEST" not in os.environ and PROD_LOCAL_DB.exists():
+        if resolved_db is None and os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1" and PROD_LOCAL_DB.exists():
             resolved_db = PROD_LOCAL_DB
 
         res = push_leads_via_mcp(

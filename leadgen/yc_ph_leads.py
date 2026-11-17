@@ -104,7 +104,7 @@ def log(*a):
 
 
 def load_env():
-    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+    if os.environ.get("CRMTG_SKIP_DOTENV") == "1":
         return
     # project .env (FIRECRAWL_API_KEY, LLM keys)
     try:
@@ -1035,7 +1035,7 @@ def llm_first_touch(lead):
     if (
         not ru
         and not llm_disabled
-        and "PYTEST_CURRENT_TEST" not in os.environ
+        and os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1"
         and (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY"))
     ):
         try:
