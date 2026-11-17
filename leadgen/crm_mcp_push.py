@@ -290,9 +290,16 @@ def _should_auto_sonnet() -> bool:
     key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
     if not key:
         return False
-    if os.environ.get("CRMTG_EPHEMERAL_RUNTIME") == "1" and os.environ.get("FORCE_AUTO_SONNET_IN_TEST") != "1":
-        return False
-    return True
+    try:
+        from app.runtime_config import should_allow_auto_sonnet
+
+        return should_allow_auto_sonnet()
+    except ImportError:
+        if os.environ.get("CRMTG_AUTO_SONNET") == "1" or os.environ.get("CRMTG_VPS_RUNTIME") == "1":
+            return True
+        if os.environ.get("CRMTG_EPHEMERAL_RUNTIME") == "1":
+            return False
+        return True
 
 
 def _apply_sonnet_batch_to_records(records: list[dict[str, Any]]) -> None:

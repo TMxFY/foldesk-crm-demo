@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from typing import Any, Callable
+import urllib.parse
+
+logger = logging.getLogger(__name__)
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKTREE_ROOT) not in sys.path:
@@ -150,6 +157,105 @@ def _session_path_variants(raw_path: str | Path) -> tuple[set[str], set[str]]:
     return path_tokens, name_tokens
 
 
+def _extract_sqlite_auth_key_sha256(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        if path.stat().st_size < 100:
+            return None
+        with path.open("rb") as fh:
+            magic = fh.read(16)
+        if not magic.startswith(b"SQLite format 3\x00"):
+            return None
+        uri = f"file:{urllib.parse.quote(str(path.resolve()))}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as sconn:
+            row = sconn.execute(
+                "SELECT auth_key FROM sessions WHERE auth_key IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if row and row[0]:
+            key_bytes = bytes(row[0])
+            if len(key_bytes) == 256:
+                return hashlib.sha256(key_bytes).hexdigest()
+    except Exception:
+        return None
+    return None
+
+
+def _extract_blob_auth_key_sha256(blob: Any) -> str | None:
+    if not blob:
+        return None
+    try:
+        raw = bytes(blob)
+    except Exception:
+        return None
+    if len(raw) < 100 or not raw.startswith(b"SQLite format 3\x00"):
+        return None
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".session", delete=False) as tf:
+            tf.write(raw)
+            tmp_path = Path(tf.name)
+        return _extract_sqlite_auth_key_sha256(tmp_path)
+    except Exception:
+        return None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _extract_string_session_auth_key_sha256(session_string: Any) -> str | None:
+    s = str(session_string or "").strip()
+    if len(s) < 300:
+        return None
+    try:
+        from telethon.sessions import StringSession
+
+        sess = StringSession(s)
+        ak = getattr(sess, "auth_key", None)
+        key = getattr(ak, "key", None) if ak is not None else None
+        if key and len(bytes(key)) == 256:
+            return hashlib.sha256(bytes(key)).hexdigest()
+    except Exception:
+        pass
+    # Telethon StringSession stores a 1-char version header ('1') followed by base64
+    # ending with the 256-byte MTProto auth_key (>B4sH256s or >B16sH256s).
+    for payload in (s[1:], s):
+        try:
+            padded = payload + "=" * (-len(payload) % 4)
+            decoded = base64.urlsafe_b64decode(padded)
+            if len(decoded) >= 256:
+                key_bytes = decoded[-256:]
+                if len(key_bytes) == 256:
+                    return hashlib.sha256(key_bytes).hexdigest()
+        except Exception:
+            continue
+    return None
+
+
+def _collect_outreach_session_dirs(conn: sqlite3.Connection) -> list[Path]:
+    dirs: list[Path] = [ROOT / "data" / "sessions"]
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            db_file = str(row[2] or "").strip()
+            if db_file:
+                db_parent = Path(db_file).resolve().parent
+                dirs.append(db_parent / "sessions")
+                dirs.append(db_parent / "data" / "sessions")
+    except Exception:
+        pass
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for d in dirs:
+        key = os.path.realpath(str(d))
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return unique
+
+
 def validate_isolated_scraper_session(
     conn: sqlite3.Connection,
     session_path: str | Path | None = None,
@@ -178,7 +284,7 @@ def validate_isolated_scraper_session(
 
     cand_paths, cand_names = _session_path_variants(candidate_raw)
     acc_rows = conn.execute(
-        "SELECT id, phone, session_path, telegram_username FROM accounts"
+        "SELECT id, phone, session_path, telegram_username, session_blob, session_string FROM accounts"
     ).fetchall()
     for row in acc_rows:
         acc_sess = str(row["session_path"] or "").strip()
@@ -195,7 +301,42 @@ def validate_isolated_scraper_session(
     if cand_resolved.suffix.lower() != ".session":
         with_suffix = Path(f"{cand_resolved}.session")
         if with_suffix.exists():
-            return with_suffix
+            cand_resolved = with_suffix
+
+    # Fingerprint guard: inspect 256-byte MTProto auth_key in read-only mode and compare SHA-256
+    # against (a) accounts.session_blob, (b) accounts.session_string, and (c) data/sessions/*.session on disk.
+    cand_auth_sha = _extract_sqlite_auth_key_sha256(cand_resolved)
+    if cand_auth_sha is not None:
+        live_auth_shas: set[str] = set()
+        for row in acc_rows:
+            blob_sha = _extract_blob_auth_key_sha256(row["session_blob"])
+            if blob_sha:
+                live_auth_shas.add(blob_sha)
+            str_sha = _extract_string_session_auth_key_sha256(row["session_string"])
+            if str_sha:
+                live_auth_shas.add(str_sha)
+            acc_sess = str(row["session_path"] or "").strip()
+            if acc_sess:
+                acc_p = resolve_session(str(Path(acc_sess).expanduser()))
+                if acc_p.suffix.lower() != ".session":
+                    acc_p_ext = Path(f"{acc_p}.session")
+                    if acc_p_ext.is_file():
+                        acc_p = acc_p_ext
+                file_sha = _extract_sqlite_auth_key_sha256(acc_p)
+                if file_sha:
+                    live_auth_shas.add(file_sha)
+
+        for sess_dir in _collect_outreach_session_dirs(conn):
+            if not sess_dir.is_dir():
+                continue
+            for disk_sess in sorted(sess_dir.glob("*.session")):
+                disk_sha = _extract_sqlite_auth_key_sha256(disk_sess)
+                if disk_sha:
+                    live_auth_shas.add(disk_sha)
+
+        if cand_auth_sha in live_auth_shas:
+            raise ValueError("Scraper session shares MTProto auth_key with outreach account")
+
     return cand_resolved
 
 
@@ -353,6 +494,16 @@ def _merge_discovered_jsonl_into_raw(
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(row, dict):
+                    row = dict(row)
+                    if not row.get("telegram_username") and (
+                        row.get("tg_username") or row.get("site_tg")
+                    ):
+                        row["telegram_username"] = row.get("tg_username") or row.get("site_tg")
+                    if not row.get("project_url") and row.get("site"):
+                        row["project_url"] = row.get("site")
+                    if not row.get("project") and row.get("company"):
+                        row["project"] = row.get("company")
                 admitted = admit_discovered_row(row)
                 if not admitted:
                     continue
@@ -360,6 +511,105 @@ def _merge_discovered_jsonl_into_raw(
                 out_fh.write(json.dumps(admitted, ensure_ascii=False) + "\n")
                 added += 1
     return added
+
+
+def _enforce_rule5_quarantine_on_new_recipients(
+    conn: sqlite3.Connection,
+    *,
+    campaign: dict[str, Any] | None,
+    pre_existing_ids: set[int],
+    stage_errors: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[int]]:
+    if campaign is None:
+        return None, []
+    camp_id = int(campaign["id"])
+    camp_name = str(campaign["name"])
+    current_ids = {
+        int(r[0])
+        for r in conn.execute(
+            "SELECT id FROM campaign_recipients WHERE campaign_id = ?", (camp_id,)
+        ).fetchall()
+    }
+    newly_inserted_ids = current_ids - pre_existing_ids
+    if not newly_inserted_ids:
+        return None, []
+
+    preview = preview_outreach_batch(conn, camp_id, strict=False)
+    violations = list(preview.get("violations") or [])
+    bad_new_ids: set[int] = set()
+    has_campaign_level_violation = False
+
+    if not preview.get("ok", True) or int(preview.get("forbidden_pattern_count") or 0) > 0:
+        for v in violations:
+            rid = v.get("recipient_id")
+            if rid is not None:
+                rid_int = int(rid)
+                if rid_int in newly_inserted_ids:
+                    bad_new_ids.add(rid_int)
+            elif v.get("code") not in ("no_fresh_untouched_leads", "legacy_1300_base_only"):
+                has_campaign_level_violation = True
+        if has_campaign_level_violation:
+            bad_new_ids |= newly_inserted_ids
+
+    # Also inspect raw persisted copy on newly inserted rows in case render-time scrubbing masked legacy CreatorOS
+    legacy_brand_re = re.compile(r"\bCreator\s*OS\b|creatoros", re.IGNORECASE)
+    placeholders = ",".join("?" for _ in newly_inserted_ids)
+    raw_new_rows = conn.execute(
+        f"SELECT id, step1_text, step2_text, step3_text, hook FROM campaign_recipients WHERE id IN ({placeholders})",
+        tuple(sorted(newly_inserted_ids)),
+    ).fetchall()
+    for r in raw_new_rows:
+        rid_int = int(r["id"])
+        combined_raw = "\n".join(
+            str(r[col] or "") for col in ("step1_text", "step2_text", "step3_text", "hook")
+        )
+        if legacy_brand_re.search(combined_raw):
+            bad_new_ids.add(rid_int)
+            violations.append(
+                {
+                    "code": "legacy_brand_creatoros",
+                    "recipient_id": rid_int,
+                    "message": f"В сыром тексте получателя #{rid_int} обнаружен устаревший бренд CreatorOS",
+                }
+            )
+
+    if bad_new_ids:
+        quarantined_ids = sorted(bad_new_ids)
+        now_q = utc_now()
+        conn.executemany(
+            """
+            UPDATE campaign_recipients
+            SET status = 'completed',
+                error_text = 'Карантин Rule 5 Dry-Run',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            [(now_q, rid) for rid in quarantined_ids],
+        )
+        conn.commit()
+        err_msg = "; ".join(str(v.get("message") or v.get("code") or "") for v in violations)
+        logger.error(
+            "Rule 5 Dry-Run quarantined %d newly inserted recipient(s) in campaign %s (#%d): %s",
+            len(quarantined_ids),
+            camp_name,
+            camp_id,
+            err_msg,
+        )
+        stage_errors.append(
+            {
+                "stage": "rule5_dry_run_quarantine",
+                "campaign_id": camp_id,
+                "campaign_name": camp_name,
+                "quarantined_recipient_ids": quarantined_ids,
+                "error": err_msg or "rule5_violation",
+                "at": now_q,
+            }
+        )
+        if _count_pending(conn, camp_id) > 0:
+            preview = preview_outreach_batch(conn, camp_id, strict=False)
+        return preview, quarantined_ids
+
+    return preview, []
 
 
 def run_autonomous_replenish(
@@ -419,9 +669,15 @@ def run_autonomous_replenish(
 
     ingested_total = 0
     stages_run: list[str] = []
+    stage_errors: list[dict[str, Any]] = []
     rule5_previews: dict[str, Any] = {}
+    rule5_quarantined: dict[str, list[int]] = {}
 
     if needs_b2b or needs_vac:
+        pre_existing_recipient_ids: set[int] = {
+            int(r[0]) for r in conn.execute("SELECT id FROM campaign_recipients").fetchall()
+        }
+
         # Step 1: Ingest any already-prepared local .jsonl / job_replies without mutating limits
         push_1 = push_discovered_now(conn)
         ingested_total += int(push_1.get("ingested") or 0)
@@ -462,8 +718,46 @@ def run_autonomous_replenish(
                         capture_output=True,
                         text=True,
                     )
-                    return int(getattr(proc, "returncode", 0) or 0) == 0
-                except Exception:
+                    rc = int(getattr(proc, "returncode", 0) or 0)
+                    if rc != 0:
+                        stderr_snip = str(getattr(proc, "stderr", "") or "").strip()[-500:]
+                        stage_errors.append(
+                            {
+                                "stage": stage_name,
+                                "returncode": rc,
+                                "error": stderr_snip or f"exit_code_{rc}",
+                                "at": utc_now(),
+                            }
+                        )
+                        logger.error(
+                            "Leadgen stage %s failed (rc=%d): %s", stage_name, rc, stderr_snip
+                        )
+                        return False
+                    return True
+                except subprocess.TimeoutExpired as exc:
+                    stage_errors.append(
+                        {
+                            "stage": stage_name,
+                            "returncode": -1,
+                            "timeout": stage_timeout,
+                            "error": f"timeout_after_{stage_timeout}s: {exc}",
+                            "at": utc_now(),
+                        }
+                    )
+                    logger.error(
+                        "Leadgen stage %s timed out after %ds", stage_name, stage_timeout
+                    )
+                    return False
+                except Exception as exc:
+                    stage_errors.append(
+                        {
+                            "stage": stage_name,
+                            "returncode": -1,
+                            "error": str(exc),
+                            "at": utc_now(),
+                        }
+                    )
+                    logger.error("Leadgen stage %s crashed: %s", stage_name, exc)
                     return False
 
             py_bin = sys.executable
@@ -475,6 +769,7 @@ def run_autonomous_replenish(
                 master_jsonl = state_dir / "master_ids.jsonl"
                 catalogs_out = state_dir / f"buyer_catalogs_{ts}.jsonl"
                 external_out = state_dir / f"external_{ts}.jsonl"
+                yc_ph_out = state_dir / f"yc_ph_{ts}.jsonl"
                 sources_cfg = b2b_cfg.get("sources") or {}
                 limits_cfg = b2b_cfg.get("limits") or {}
 
@@ -489,6 +784,40 @@ def run_autonomous_replenish(
                             str(catalogs_out),
                         ],
                     )
+                if (
+                    sources_cfg.get("yc_ph", True)
+                    and "yc_ph" not in quarantined
+                    and "yc_ph_leads" not in quarantined
+                ):
+                    yc_lim = max(1, min(30, int(limits_cfg.get("yc_limit") or 15)))
+                    ph_lim = max(0, min(20, int(limits_cfg.get("ph_limit") or 0)))
+                    yc_cmd = [
+                        py_bin,
+                        str(ROOT / "leadgen" / "yc_ph_leads.py"),
+                        "--yc-limit",
+                        str(yc_lim),
+                        "--ph-limit",
+                        str(ph_lim),
+                        "--betalist-limit",
+                        "5",
+                        "--microlaunch-limit",
+                        "5",
+                        "--uneed-limit",
+                        "5",
+                        "--indiehackers-limit",
+                        "5",
+                        "--no-llm",
+                        "--no-sheet",
+                    ]
+                    if isolated_session is None:
+                        yc_cmd.append("--no-tg")
+                    tmp_yc = Path("/tmp/yc_ph_leads.jsonl")
+                    prev_yc_mtime = tmp_yc.stat().st_mtime_ns if tmp_yc.is_file() else -1
+                    if _exec_stage("yc_ph_leads", yc_cmd) and tmp_yc.is_file():
+                        cur_yc_st = tmp_yc.stat()
+                        if cur_yc_st.st_size > 0 and cur_yc_st.st_mtime_ns != prev_yc_mtime:
+                            yc_ph_out.write_bytes(tmp_yc.read_bytes())
+
                 ext_limit = int(limits_cfg.get("external_limit") or 20)
                 if ext_limit > 0 and "creator_external_leads" not in quarantined:
                     _exec_stage(
@@ -535,7 +864,9 @@ def run_autonomous_replenish(
                         scrape_cmd.extend(["--exclude", str(master_jsonl)])
                     _exec_stage("tg_scrape_posters", scrape_cmd)
 
-                _merge_discovered_jsonl_into_raw([catalogs_out, external_out], raw_jsonl)
+                _merge_discovered_jsonl_into_raw(
+                    [catalogs_out, external_out, yc_ph_out], raw_jsonl
+                )
                 apply_master_merge(str(raw_jsonl), str(master_jsonl))
                 new_jsonl = Path(f"{raw_jsonl}.new")
                 if not new_jsonl.exists():
@@ -564,7 +895,7 @@ def run_autonomous_replenish(
                     if has_llm_key:
                         qualified_jsonl = state_dir / f"raw_{ts}.qualified.jsonl"
                         final_jsonl = state_dir / f"raw_{ts}.final.jsonl"
-                        _exec_stage(
+                        qual_ok = _exec_stage(
                             "tg_llm_qualify",
                             [
                                 py_bin,
@@ -575,23 +906,27 @@ def run_autonomous_replenish(
                                 str(qualified_jsonl),
                             ],
                         )
-                        qual_src = (
-                            qualified_jsonl
-                            if qualified_jsonl.is_file() and qualified_jsonl.stat().st_size > 0
-                            else enrich_src
-                        )
-                        _exec_stage(
-                            "tg_curate",
-                            [
-                                py_bin,
-                                str(ROOT / "leadgen" / "tg_curate.py"),
-                                "--input",
-                                str(qual_src),
-                                "--output",
-                                str(final_jsonl),
-                            ],
-                        )
-                        if final_jsonl.is_file() and final_jsonl.stat().st_size == 0:
+                        # Fail-Closed: if tg_llm_qualify failed or produced 0 qualified leads,
+                        # NEVER fall back to enrich_src — 0 leads advance to tg_curate / CRM!
+                        if (
+                            qual_ok
+                            and qualified_jsonl.is_file()
+                            and qualified_jsonl.stat().st_size > 0
+                        ):
+                            _exec_stage(
+                                "tg_curate",
+                                [
+                                    py_bin,
+                                    str(ROOT / "leadgen" / "tg_curate.py"),
+                                    "--input",
+                                    str(qualified_jsonl),
+                                    "--output",
+                                    str(final_jsonl),
+                                ],
+                            )
+                            if final_jsonl.is_file() and final_jsonl.stat().st_size == 0:
+                                final_jsonl.unlink()
+                        elif final_jsonl.is_file():
                             final_jsonl.unlink()
 
             # Vacancy scraper ONLY if valid isolated SCRAPER_TG_SESSION is available
@@ -632,18 +967,37 @@ def run_autonomous_replenish(
 
             b2b_camp = _find_campaign_by_name(conn, b2b_name)
             vac_camp = _find_campaign_by_name(conn, vac_name)
-            pending_b2b = _count_pending(conn, b2b_camp["id"] if b2b_camp else None)
-            pending_vac = _count_pending(conn, vac_camp["id"] if vac_camp else None)
 
-        # Step 3: Mandatory Rule 5 preview_outreach_batch(conn, campaign_id, strict=True) on replenished campaigns
-        if b2b_camp is not None and pending_b2b > pending_b2b_before and pending_b2b > 0:
-            rule5_previews[str(b2b_camp["name"])] = preview_outreach_batch(
-                conn, int(b2b_camp["id"]), strict=True
+        # Step 3: Rule 5 Dry-Run quarantine rollback BEFORE finalizing replenish state
+        for camp_obj in (b2b_camp, vac_camp):
+            if camp_obj is None:
+                continue
+            preview_obj, q_ids = _enforce_rule5_quarantine_on_new_recipients(
+                conn,
+                campaign=camp_obj,
+                pre_existing_ids=pre_existing_recipient_ids,
+                stage_errors=stage_errors,
             )
-        if vac_camp is not None and pending_vac > pending_vac_before and pending_vac > 0:
-            rule5_previews[str(vac_camp["name"])] = preview_outreach_batch(
-                conn, int(vac_camp["id"]), strict=True
-            )
+            if q_ids:
+                rule5_quarantined[str(camp_obj["name"])] = q_ids
+                ingested_total = max(0, ingested_total - len(q_ids))
+            if preview_obj is not None:
+                rule5_previews[str(camp_obj["name"])] = preview_obj
+
+        pending_b2b = _count_pending(conn, b2b_camp["id"] if b2b_camp else None)
+        pending_vac = _count_pending(conn, vac_camp["id"] if vac_camp else None)
+
+    # Persist stage_errors in kv_settings for observability
+    now_err_stamp = utc_now()
+    conn.execute(
+        """
+        INSERT INTO kv_settings (key, value, updated_at)
+        VALUES ('leadgen_stage_errors', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (json.dumps(stage_errors, ensure_ascii=False), now_err_stamp),
+    )
+    conn.commit()
 
     # 4. Early-Warning Alert 24h before queue exhaustion on active running B2B campaign
     low_water_alert: dict[str, Any] | None = None
@@ -682,7 +1036,9 @@ def run_autonomous_replenish(
         "pending_vacancies": pending_vac,
         "quarantined_sources": sorted(quarantined),
         "stages_run": stages_run,
+        "stage_errors": stage_errors,
         "rule5_previews": rule5_previews,
+        "rule5_quarantined": rule5_quarantined,
         "low_water_alert": low_water_alert,
     }
 

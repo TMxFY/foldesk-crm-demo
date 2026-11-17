@@ -56,8 +56,9 @@ def should_start_airtable_bg_sync() -> bool:
 
 def should_allow_auto_sonnet() -> bool:
     """Return True when automatic Sonnet copy generation on MCP B2B ingest is enabled."""
-    if _env_flag("FORCE_AUTO_SONNET_IN_TEST", False) or _env_flag(
-        "CRMTG_FORCE_AUTO_SONNET", False
-    ):
+    raw = os.getenv("CRMTG_AUTO_SONNET")
+    if raw is not None and raw.strip() != "":
+        return _env_flag("CRMTG_AUTO_SONNET", False)
+    if _env_flag("CRMTG_FORCE_AUTO_SONNET", False):
         return True
     return not is_ephemeral_runtime()

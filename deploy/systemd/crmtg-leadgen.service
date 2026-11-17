@@ -9,5 +9,6 @@ WorkingDirectory=/opt/crmtg
 EnvironmentFile=-/opt/crmtg/.env
 Environment="PYTHONDONTWRITEBYTECODE=1"
 Environment="PYTHONUNBUFFERED=1"
+Environment="CRMTG_VPS_RUNTIME=1"
 ExecStart=/opt/crmtg/.venv/bin/python -m leadgen.vps_autonomous_replenish --db /opt/crmtg/data/crm.db
 TimeoutStartSec=600

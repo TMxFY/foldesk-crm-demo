@@ -529,10 +529,15 @@ def sync_leadgen_campaigns(
     config: dict[str, Any] | None = None,
     *,
     sync_campaign_limits: bool = False,
+    sync_leadgen_enabled: bool = False,
 ) -> dict[str, Any]:
     allow_limit_sync = bool(
         sync_campaign_limits
         or (isinstance(config, dict) and config.get("sync_campaign_limits"))
+    )
+    allow_enabled_sync = bool(
+        sync_leadgen_enabled
+        or (isinstance(config, dict) and "sync_leadgen_enabled" in config)
     )
     cfg = _normalize_config(config) if isinstance(config, dict) else get_leadgen_config(conn)
     b2b = cfg["b2b"]
@@ -616,25 +621,30 @@ def sync_leadgen_campaigns(
             cid = int(matched_existing["id"])
             existing_status = str(matched_existing.get("status") or "").strip().lower()
             existing_daily_limit = int(matched_existing.get("daily_limit") or 0)
+            existing_leadgen_enabled = bool(int(matched_existing.get("leadgen_enabled") or 0))
             keep_paused_disabled = (
                 "softugc" in spec_name_low
                 and existing_status == "paused"
-                and int(matched_existing.get("leadgen_enabled") or 0) == 0
+                and not existing_leadgen_enabled
             )
-            if (
-                not allow_limit_sync
-                and (existing_status == "running" or keep_paused_disabled)
-                and spec["daily_limit"] < existing_daily_limit
-            ):
-                effective_daily_limit = existing_daily_limit
+            effective_daily_limit = (
+                spec["daily_limit"] if allow_limit_sync else existing_daily_limit
+            )
+            if allow_enabled_sync:
+                req_enabled = (
+                    bool(config.get("sync_leadgen_enabled"))
+                    if isinstance(config, dict) and "sync_leadgen_enabled" in config
+                    else True
+                )
+                effective_leadgen_enabled = False if keep_paused_disabled else req_enabled
             else:
-                effective_daily_limit = spec["daily_limit"]
+                effective_leadgen_enabled = existing_leadgen_enabled
 
             updated = update_campaign(
                 conn,
                 cid,
                 daily_limit=effective_daily_limit,
-                leadgen_enabled=(False if keep_paused_disabled else True),
+                leadgen_enabled=effective_leadgen_enabled,
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
             )
@@ -724,6 +734,37 @@ def _ingest_leads_without_campaign_limit_mutation(
     return added, created_valid
 
 
+def _load_push_watermark(conn: sqlite3.Connection) -> dict[str, Any]:
+    out: dict[str, Any] = {"files": {}, "vacancies": {}}
+    try:
+        row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'leadgen_push_watermark'"
+        ).fetchone()
+        if row and row["value"]:
+            parsed = json.loads(row["value"])
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("files"), dict):
+                    out["files"] = dict(parsed["files"])
+                if isinstance(parsed.get("vacancies"), dict):
+                    out["vacancies"] = dict(parsed["vacancies"])
+    except Exception:
+        pass
+    return out
+
+
+def _save_push_watermark(conn: sqlite3.Connection, watermark: dict[str, Any]) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO kv_settings (key, value, updated_at)
+        VALUES ('leadgen_push_watermark', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (json.dumps(watermark, ensure_ascii=False), now),
+    )
+    conn.commit()
+
+
 def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     cfg = get_leadgen_config(conn)
     if not cfg.get("enabled", True):
@@ -756,6 +797,10 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     state_dir = _resolve_state_dir()
     ingested_total = 0
     campaigns_created = 0
+    wm = _load_push_watermark(conn)
+    wm_files: dict[str, Any] = wm["files"]
+    wm_vac: dict[str, Any] = wm["vacancies"]
+    wm_dirty = False
     from app.mcp_server import call_mcp_tool_handler
 
     # 1. Ready vacancy replies (job_replies_*.json or job_monitor_*.json with prebuilt fields)
@@ -774,71 +819,114 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             glob.glob(str(state_dir / "job_monitor_[0-9]*.json")),
             key=lambda p: (os.path.basename(p), os.path.getmtime(p)),
         )
-        replies_by_hash: dict[str, dict[str, Any]] = {}
-        if reply_files:
-            try:
-                for r in json.loads(Path(reply_files[-1]).read_text(encoding="utf-8")):
-                    if isinstance(r, dict) and r.get("hash") and r.get("text"):
-                        replies_by_hash[str(r["hash"])] = r
-            except Exception:
-                pass
-
         if monitor_files:
-            try:
-                mon_items = json.loads(Path(monitor_files[-1]).read_text(encoding="utf-8"))
-            except Exception:
-                mon_items = []
-            enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
-            vac_leads: list[dict[str, Any]] = []
-            if isinstance(mon_items, list):
-                if vac_cfg.get("hot_priority", True):
-                    mon_items = sorted(mon_items, key=lambda x: not bool((x or {}).get("hot")))
-                for item in mon_items:
-                    if not isinstance(item, dict):
-                        continue
-                    layer = str(item.get("layer") or "AI-контент").strip()
-                    if enabled_layers and layer and layer not in enabled_layers:
-                        continue
-                    if vac_cfg.get("remote_only", True) and item.get("remote") is False:
-                        continue
-                    draft_obj = replies_by_hash.get(str(item.get("hash") or ""))
-                    if not draft_obj and item.get("text_reply"):
-                        f1, f2 = build_default_followups(item)
-                        draft_obj = {
-                            "text": str(item["text_reply"]),
-                            "followup_1": str(item.get("followup_1") or f1),
-                            "followup_2": str(item.get("followup_2") or f2),
-                        }
-                    if not draft_obj:
-                        continue
-                    mcp_lead = build_vacancy_mcp_lead(
-                        item,
-                        draft_obj,
-                        touch_mode=str(vac_cfg.get("touch_mode") or "direct"),
+            mon_path = Path(monitor_files[-1])
+            mon_st = mon_path.stat()
+            rep_path = Path(reply_files[-1]) if reply_files else None
+            rep_st = rep_path.stat() if rep_path and rep_path.is_file() else None
+            vac_sig = {
+                "mon_mtime_ns": int(mon_st.st_mtime_ns),
+                "mon_size": int(mon_st.st_size),
+                "rep_file": rep_path.name if rep_path else "",
+                "rep_mtime_ns": int(rep_st.st_mtime_ns) if rep_st else 0,
+                "rep_size": int(rep_st.st_size) if rep_st else 0,
+            }
+            prev_vac = wm_vac.get(mon_path.name) if isinstance(wm_vac.get(mon_path.name), dict) else None
+            vac_unchanged_done = bool(
+                prev_vac
+                and prev_vac.get("done") is True
+                and all(prev_vac.get(k) == v for k, v in vac_sig.items())
+            )
+            if not vac_unchanged_done:
+                replies_by_hash: dict[str, dict[str, Any]] = {}
+                if rep_path is not None:
+                    try:
+                        for r in json.loads(rep_path.read_text(encoding="utf-8")):
+                            if isinstance(r, dict) and r.get("hash") and r.get("text"):
+                                replies_by_hash[str(r["hash"])] = r
+                    except Exception:
+                        pass
+
+                try:
+                    mon_items = json.loads(mon_path.read_text(encoding="utf-8"))
+                except Exception:
+                    mon_items = []
+                enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
+                vac_leads: list[dict[str, Any]] = []
+                if isinstance(mon_items, list):
+                    if vac_cfg.get("hot_priority", True):
+                        mon_items = sorted(mon_items, key=lambda x: not bool((x or {}).get("hot")))
+                    for item in mon_items:
+                        if not isinstance(item, dict):
+                            continue
+                        layer = str(item.get("layer") or "AI-контент").strip()
+                        if enabled_layers and layer and layer not in enabled_layers:
+                            continue
+                        if vac_cfg.get("remote_only", True) and item.get("remote") is False:
+                            continue
+                        draft_obj = replies_by_hash.get(str(item.get("hash") or ""))
+                        if not draft_obj and item.get("text_reply"):
+                            f1, f2 = build_default_followups(item)
+                            draft_obj = {
+                                "text": str(item["text_reply"]),
+                                "followup_1": str(item.get("followup_1") or f1),
+                                "followup_2": str(item.get("followup_2") or f2),
+                            }
+                        if not draft_obj:
+                            continue
+                        mcp_lead = build_vacancy_mcp_lead(
+                            item,
+                            draft_obj,
+                            touch_mode=str(vac_cfg.get("touch_mode") or "direct"),
+                        )
+                        if mcp_lead is not None:
+                            vac_leads.append(mcp_lead)
+
+                vac_limit = min(remaining_quota, int(vac_cfg.get("daily_limit") or 20))
+                start_vac_idx = (
+                    min(max(0, int(prev_vac.get("offset") or 0)), len(vac_leads))
+                    if (
+                        prev_vac
+                        and not prev_vac.get("done")
+                        and all(prev_vac.get(k) == v for k, v in vac_sig.items())
                     )
-                    if mcp_lead is not None:
-                        vac_leads.append(mcp_lead)
-
-            vac_limit = min(remaining_quota, int(vac_cfg.get("daily_limit") or 20))
-            if vac_leads and vac_limit > 0:
-                added, created_c = _ingest_leads_without_campaign_limit_mutation(
-                    conn,
-                    call_mcp_tool_handler=call_mcp_tool_handler,
-                    leads_slice=vac_leads[:vac_limit],
-                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
-                    campaign_name=str(vac_cfg.get("campaign_name") or "TG Вакансии"),
-                    default_quota=max(0, min(500, int(vac_cfg.get("daily_limit") or 20))),
-                    default_sources=vac_enabled_layers,
+                    else 0
                 )
-                ingested_total += added
-                campaigns_created += created_c
-                remaining_quota = max(0, remaining_quota - added)
+                pending_vac_leads = vac_leads[start_vac_idx:]
+                if pending_vac_leads and vac_limit > 0:
+                    slice_vac = pending_vac_leads[:vac_limit]
+                    added, created_c = _ingest_leads_without_campaign_limit_mutation(
+                        conn,
+                        call_mcp_tool_handler=call_mcp_tool_handler,
+                        leads_slice=slice_vac,
+                        enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                        campaign_name=str(vac_cfg.get("campaign_name") or "TG Вакансии"),
+                        default_quota=max(0, min(500, int(vac_cfg.get("daily_limit") or 20))),
+                        default_sources=vac_enabled_layers,
+                    )
+                    ingested_total += added
+                    campaigns_created += created_c
+                    remaining_quota = max(0, remaining_quota - added)
+                    new_vac_offset = start_vac_idx + len(slice_vac)
+                    wm_vac[mon_path.name] = {
+                        **vac_sig,
+                        "offset": new_vac_offset,
+                        "done": new_vac_offset >= len(vac_leads),
+                    }
+                    wm_dirty = True
+                elif not pending_vac_leads:
+                    wm_vac[mon_path.name] = {
+                        **vac_sig,
+                        "offset": len(vac_leads),
+                        "done": True,
+                    }
+                    wm_dirty = True
 
-    # 2. Local JSONL files in state_dir (*.treg.jsonl / *.final.jsonl / discovered_leads.jsonl)
+    # 2. Local JSONL files in state_dir (*.treg.jsonl / *.final.jsonl / discovered_leads.jsonl) with per-file watermark
     b2b_cfg = cfg["b2b"]
     b2b_enabled_sources = [k for k, v in (b2b_cfg.get("sources") or {}).items() if v]
     if b2b_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
-        from leadgen.crm_mcp_push import build_lead_payload_from_dict, pack_tab_leads_for_mcp
+        import leadgen.crm_mcp_push as _crm_mcp_push
         from leadgen.lead_market import market_of
         from leadgen.supply_side import (
             NON_BUYER_ROLES,
@@ -859,17 +947,57 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             [p for p in raw_candidates if os.path.isfile(p) and os.path.getsize(p) > 0],
             key=os.path.getmtime,
         )
-        if jsonl_candidates:
-            latest_jsonl = Path(jsonl_candidates[-1])
-            touch_mode_val = str(b2b_cfg.get("touch_mode") or "direct")
-            leads: list[dict[str, Any]] = []
-            sheet_like: list[list[Any]] = []
+        b2b_limit = min(remaining_quota, int(b2b_cfg.get("campaign_daily_limit") or 30))
+        b2b_quota_default = max(0, min(500, int(b2b_cfg.get("campaign_daily_limit") or 30)))
+        touch_mode_val = str(b2b_cfg.get("touch_mode") or "direct")
+        leads: list[dict[str, Any]] = []
 
-            for raw_line in latest_jsonl.read_text(encoding="utf-8").splitlines():
-                line = raw_line.strip()
+        for cand_raw in jsonl_candidates:
+            if b2b_limit <= 0 or len(leads) >= b2b_limit:
+                break
+            cand_path = Path(cand_raw)
+            fname = cand_path.name
+            st = cand_path.stat()
+            cur_size = int(st.st_size)
+            cur_mtime_ns = int(st.st_mtime_ns)
+            prev_f = wm_files.get(fname) if isinstance(wm_files.get(fname), dict) else None
+            if (
+                prev_f is not None
+                and prev_f.get("done") is True
+                and int(prev_f.get("size") or -1) == cur_size
+                and int(prev_f.get("mtime_ns") or -1) == cur_mtime_ns
+            ):
+                continue
+
+            all_lines = cand_path.read_text(encoding="utf-8").splitlines()
+            if prev_f is not None and (
+                cur_size > int(prev_f.get("size") or 0)
+                or (
+                    cur_size == int(prev_f.get("size") or 0)
+                    and int(prev_f.get("mtime_ns") or -1) == cur_mtime_ns
+                    and not prev_f.get("done")
+                )
+            ):
+                start_offset = min(max(0, int(prev_f.get("offset") or 0)), len(all_lines))
+            else:
+                start_offset = 0
+
+            sheet_like: list[list[Any]] = []
+            next_offset = len(all_lines)
+            reached_end = True
+
+            for line_idx in range(start_offset, len(all_lines)):
+                if len(leads) >= b2b_limit and not sheet_like:
+                    next_offset = line_idx
+                    reached_end = False
+                    break
+                line = all_lines[line_idx].strip()
                 if not line:
                     continue
-                item = json.loads(line)
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 if isinstance(item, list):
                     sheet_like.append(item)
                     continue
@@ -928,47 +1056,61 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 if not keep_for_sheet(cand):
                     continue
 
-                built = build_lead_payload_from_dict(cand, touch_mode=touch_mode_val)
+                built = _crm_mcp_push.build_lead_payload_from_dict(cand, touch_mode=touch_mode_val)
                 if any(built.get(k) for k in ("username", "phone", "telegram_user_id")):
                     leads.append(built)
 
             if sheet_like:
-                leads.extend(pack_tab_leads_for_mcp("Все2", sheet_like, use_llm=False, touch_mode=touch_mode_val))
-            b2b_limit = min(remaining_quota, int(b2b_cfg.get("campaign_daily_limit") or 30))
-            b2b_quota_default = max(0, min(500, int(b2b_cfg.get("campaign_daily_limit") or 30)))
-            if leads and b2b_limit > 0:
-                batch = leads[:b2b_limit]
-                tg_leads = [l for l in batch if str(l.get("provider") or "telegram") != "whatsapp"]
-                wa_leads = [l for l in batch if str(l.get("provider") or "") == "whatsapp"]
-                if tg_leads:
-                    target_tg_camp = resolve_target_b2b_tg_campaign_name(
-                        conn,
-                        b2b_cfg.get("target_campaign_tg"),
-                        fallback_default="Leadgen Auto (TG)",
+                leads.extend(
+                    _crm_mcp_push.pack_tab_leads_for_mcp(
+                        "Все2", sheet_like, use_llm=False, touch_mode=touch_mode_val
                     )
-                    added_tg, created_tg = _ingest_leads_without_campaign_limit_mutation(
-                        conn,
-                        call_mcp_tool_handler=call_mcp_tool_handler,
-                        leads_slice=tg_leads,
-                        enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
-                        campaign_name=target_tg_camp,
-                        default_quota=b2b_quota_default,
-                        default_sources=b2b_enabled_sources,
-                    )
-                    ingested_total += added_tg
-                    campaigns_created += created_tg
-                if wa_leads:
-                    added_wa, created_wa = _ingest_leads_without_campaign_limit_mutation(
-                        conn,
-                        call_mcp_tool_handler=call_mcp_tool_handler,
-                        leads_slice=wa_leads,
-                        enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
-                        campaign_name=str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)"),
-                        default_quota=b2b_quota_default,
-                        default_sources=b2b_enabled_sources,
-                    )
-                    ingested_total += added_wa
-                    campaigns_created += created_wa
+                )
+
+            wm_files[fname] = {
+                "mtime_ns": cur_mtime_ns,
+                "size": cur_size,
+                "offset": next_offset,
+                "done": reached_end,
+            }
+            wm_dirty = True
+
+        if leads and b2b_limit > 0:
+            batch = leads[:b2b_limit]
+            tg_leads = [l for l in batch if str(l.get("provider") or "telegram") != "whatsapp"]
+            wa_leads = [l for l in batch if str(l.get("provider") or "") == "whatsapp"]
+            if tg_leads:
+                target_tg_camp = resolve_target_b2b_tg_campaign_name(
+                    conn,
+                    b2b_cfg.get("target_campaign_tg"),
+                    fallback_default="Leadgen Auto (TG)",
+                )
+                added_tg, created_tg = _ingest_leads_without_campaign_limit_mutation(
+                    conn,
+                    call_mcp_tool_handler=call_mcp_tool_handler,
+                    leads_slice=tg_leads,
+                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                    campaign_name=target_tg_camp,
+                    default_quota=b2b_quota_default,
+                    default_sources=b2b_enabled_sources,
+                )
+                ingested_total += added_tg
+                campaigns_created += created_tg
+            if wa_leads:
+                added_wa, created_wa = _ingest_leads_without_campaign_limit_mutation(
+                    conn,
+                    call_mcp_tool_handler=call_mcp_tool_handler,
+                    leads_slice=wa_leads,
+                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                    campaign_name=str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)"),
+                    default_quota=b2b_quota_default,
+                    default_sources=b2b_enabled_sources,
+                )
+                ingested_total += added_wa
+                campaigns_created += created_wa
+
+    if wm_dirty:
+        _save_push_watermark(conn, wm)
 
     return {
         "ok": True,

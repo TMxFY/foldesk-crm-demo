@@ -50,8 +50,9 @@ for py_file in sorted((root / "leadgen").rglob("*.py")):
     if "app.runtime_context" in src:
         errors.append(f"Broken import 'app.runtime_context' found in {py_file}")
 
-# Gate A: Zero PYTEST_CURRENT_TEST / sys.modules["pytest"] split-brain across all app/ & leadgen/
+# Gate A: Zero PYTEST_CURRENT_TEST / sys.modules["pytest"] / *_IN_TEST env split-brain across all app/ & leadgen/
 pytest_split_re = re.compile(r"PYTEST_CURRENT_TEST|[\"']pytest[\"']\s+(?:not\s+)?in\s+sys\.modules")
+in_test_env_re = re.compile(r"\b[A-Z][A-Z0-9_]*_IN_TEST\b")
 for folder in ("app", "leadgen"):
     for py_file in sorted((root / folder).rglob("*.py")):
         for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
@@ -59,8 +60,12 @@ for folder in ("app", "leadgen"):
                 errors.append(
                     f"Zero PYTEST_CURRENT_TEST Gate violation in {py_file}:{lineno}: {line.strip()[:120]}"
                 )
+            if in_test_env_re.search(line):
+                errors.append(
+                    f"Zero *_IN_TEST Env Gate violation in {py_file}:{lineno}: {line.strip()[:120]}"
+                )
 
-# Gate B: Systemd Hollow-Pipe & Missing Module Gate across deploy/systemd/*.service
+# Gate B: Systemd Hollow-Pipe, CRMTG_VPS_RUNTIME=1 & Missing Module Gate across deploy/systemd/*.service
 import importlib.util
 
 systemd_dir = root / "deploy" / "systemd"
@@ -88,6 +93,11 @@ for svc_file in sorted(systemd_dir.glob("*.service")):
             buf = ""
     if buf:
         logical_lines.append(buf.strip())
+
+    if 'Environment="CRMTG_VPS_RUNTIME=1"' not in logical_lines:
+        errors.append(
+            f'Systemd Runtime Gate violation in {svc_file}: missing Environment="CRMTG_VPS_RUNTIME=1"'
+        )
 
     exec_starts = [
         ln.split("=", 1)[1].strip()
@@ -133,9 +143,11 @@ if command -v node >/dev/null 2>&1; then
   echo "app/static/app.js syntax OK."
 fi
 
-echo "== [3/4] Design & launch gates =="
+echo "== [3/4] Design, launch & CLI smoke gates =="
 "$PYTHON_BIN" .claude/skills/replica-design/contrast.py replica/design/tokens.json
 "$PYTHON_BIN" .claude/skills/replica-launch/listing.py replica/launch/listing.json
+PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" -m leadgen.vps_autonomous_replenish --help >/dev/null
+echo "leadgen.vps_autonomous_replenish --help smoke check OK."
 
 if [ "${1:-}" = "--fast-checks-only" ]; then
   echo "== Fast static checks passed =="

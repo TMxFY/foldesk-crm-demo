@@ -1236,7 +1236,7 @@ def _is_vacancy_lead_item(item: dict) -> bool:
 
 
 def _auto_enrich_b2b_items_with_sonnet(items: list[dict]) -> list[dict]:
-    """Ensure every B2B item without canonical Vlad SoftUGC+revshare copy is drafted via claude-sonnet-5 when API key is configured."""
+    """Ensure every B2B item without canonical Vlad SoftUGC+revshare copy is drafted via claude-sonnet-5 when API key & CRMTG_AUTO_SONNET / VPS runtime allow it."""
     from leadgen.outreach_copy import (
         REVSHARE_OFFER_TEXT,
         VLAD_STEP3_TEXT,
