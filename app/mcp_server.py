@@ -1691,6 +1691,12 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             if _COMPETITOR_DENYLIST_RE.search(full_blob):
                 skipped_duplicates += 1
                 continue
+            if not is_b2b_camp:
+                from app.outreach import _VACANCY_JUNK_ROLE_RE
+
+                if _VACANCY_JUNK_ROLE_RE.search(full_blob):
+                    skipped_duplicates += 1
+                    continue
             if (
                 is_legacy_exhausted_recipient(item, campaign_name=target_camp_name)
                 or (uname_low and uname_low in global_dedup["archived_usernames"])
@@ -1921,6 +1927,18 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 else None
             )
 
+            rec_created_at = now
+            raw_posted = str(item.get("posted_at") or "").strip()
+            if raw_posted:
+                from datetime import datetime as _dt
+
+                try:
+                    p_norm = raw_posted[:-1] + "+00:00" if raw_posted.endswith(("Z", "z")) else raw_posted
+                    _dt.fromisoformat(p_norm)
+                    rec_created_at = raw_posted
+                except ValueError:
+                    pass
+
             conn.execute(
                 """
                 INSERT INTO campaign_recipients (
@@ -1950,7 +1968,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     mcp_extra_json,
                     rec_status,
                     error_reason,
-                    now,
+                    rec_created_at,
                     now,
                 ),
             )
@@ -1976,9 +1994,15 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             enrolled_in_campaign += 1
 
     if enroll_in_campaign:
+        from app.outreach import is_vacancy_campaign
+
         for st in camp_cache.values():
             cid_u = int(st["campaign_id"])
-            if int(st.get("added_pending", 0)) > 0 and str(st["camp_dict"].get("status") or "").lower() == "completed":
+            if (
+                int(st.get("added_pending", 0)) > 0
+                and str(st["camp_dict"].get("status") or "").lower() == "completed"
+                and not is_vacancy_campaign(st["camp_dict"])
+            ):
                 conn.execute(
                     "UPDATE campaigns SET status = 'running', updated_at = ? WHERE id = ? AND status = 'completed'",
                     (now, cid_u),

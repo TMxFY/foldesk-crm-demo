@@ -10,9 +10,17 @@
 """
 import concurrent.futures as futures
 import os
+import re
 import time
 
 import requests
+
+VACANCY_JUNK_RX = re.compile(
+    r"стори[сз][\s_-]*мейкер|story[\s_-]*mak|(?:оформлени|ведени|монтаж)\w*\s+стори[сз]"
+    r"|иллюстра(?:тор|ц)\w*[\s\S]{0,80}детск\w*\s+книг"
+    r"|(?:монтаж|нарезк|рилсмейкер)\w*[\s\S]{0,35}\bмем(?:ов|ы|ами|ам)?\b",
+    re.I,
+)
 
 API_URL = os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone")
 MODEL = os.environ.get("JEV_MODEL", "jev-1.13.0")
@@ -49,13 +57,12 @@ QUESTIONS = {
             "or role described, not the chat it appeared in."
         ),
         "criteria": {
-            "ai_content": "AI-generated content and SHORT VIDEO production: "
+            "ai_content": "AI-generated content and AI-driven SHORT VIDEO production: "
                           "AI/\"нейро\" creator, AI video generation, AI avatars "
-                          "and lipsync, UGC creators, clippers/cutters, video "
-                          "editing of Reels/Shorts/TikTok (with OR without AI "
-                          "mentioned: editing studios and ongoing editing work "
-                          "belong here), motion design, reels scriptwriting, "
-                          "AI design and visual.",
+                          "and lipsync, AI UGC production, ongoing Reels/Shorts/TikTok "
+                          "content pipelines using AI tools. NOT here: storymaking / "
+                          "сторисмейкер, meme cutting for beginners without AI, "
+                          "children's book illustration, cheap one-off manual tasks.",
             "automation": "AI automation and technical work: n8n/Make, Telegram "
                           "bots, sales funnels, ManyChat, AI agents, vibe-coding, "
                           "Claude Code, CRM integrations, parsing.",
@@ -195,6 +202,15 @@ def system_one(state, questions=None, timeout=60, retries=5):
 
 
 def verdict(text, source=""):
+    if VACANCY_JUNK_RX.search(text or ""):
+        return {
+            "fit": False,
+            "layer": "нет",
+            "mode": "",
+            "remote": False,
+            "hot": False,
+            "why": "отсеяно фильтром нерелевантных мелких вакансий",
+        }
     state = {"source_chat": source, "post": text}
     ans = system_one(state)["answers"]
     topic = ans["topic"]

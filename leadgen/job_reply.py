@@ -325,6 +325,7 @@ def build_vacancy_mcp_lead(
         "lead_source": f"TG Вакансии ({src})",
         "note": "\n".join(note_lines) if note_lines else None,
         "provider": contact_info["provider"] or "telegram",
+        "posted_at": str(item.get("posted_at") or item.get("date") or "").strip() or None,
     }
 
 
@@ -343,12 +344,14 @@ def main() -> int:
     vac_cfg = _load_vacancies_ui_config()
     default_touch = os.environ.get("JOBS_TOUCH_MODE") or str(vac_cfg.get("touch_mode") or "direct")
     default_camp = os.environ.get("JOBS_CAMPAIGN_NAME") or str(vac_cfg.get("campaign_name") or DEFAULT_CAMPAIGN_NAME)
-    default_limit = int(vac_cfg.get("daily_limit") or 0)
+    raw_cfg_limit = vac_cfg.get("daily_limit")
+    cfg_limit = int(raw_cfg_limit) if raw_cfg_limit is not None else None
 
     ap = argparse.ArgumentParser(description="Генерация откликов на вакансии и заливка в Foldesk CRM через MCP")
     ap.add_argument("report", nargs="?", help="job_monitor_<дата>.json; по умолчанию самый свежий")
     ap.add_argument("--from-replies", default="", help="Использовать уже готовый job_replies_<дата>.json без повторного вызова LLM")
-    ap.add_argument("--limit", type=int, default=default_limit)
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--force", action="store_true", help="Запустить даже если вакансии отключены в настройках")
     ap.add_argument("--out", default="", help="Куда сохранить JSON с черновиками")
     ap.add_argument(
         "--touch-mode",
@@ -365,6 +368,15 @@ def main() -> int:
     a = ap.parse_args()
 
     load_env()
+    if not a.force and "enabled" in vac_cfg and not bool(vac_cfg.get("enabled")):
+        print("отклики на вакансии отключены в настройках (используйте --force для ручного прогона)")
+        return 0
+
+    eff_limit = a.limit if a.limit is not None else cfg_limit
+    if eff_limit is not None and eff_limit <= 0 and not a.force:
+        print("дневной лимит вакансий = 0 — отклики остановлены")
+        return 0
+
     path = a.report or _find_latest_monitor_report()
     if not path or not os.path.exists(path):
         sys.exit("данных монитора нет — сначала запустите job_monitor.py")
@@ -381,8 +393,8 @@ def main() -> int:
         items = [it for it in items if it.get("remote") is not False]
     if vac_cfg.get("hot_priority", True):
         items = sorted(items, key=lambda it: not bool((it or {}).get("hot")))
-    if a.limit and a.limit > 0:
-        items = items[: a.limit]
+    if eff_limit is not None and eff_limit > 0:
+        items = items[:eff_limit]
     print(f"отчёт: {os.path.basename(path)} · вакансий: {len(items)}\n")
     if not items:
         print("откликать нечего")

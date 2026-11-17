@@ -685,18 +685,24 @@ def test_mcp_no_false_company_merge_for_vacancies_or_short_names_and_reopens_com
     assert vac_res["created_leads"] == 2
     assert vac_res["enrolled_in_campaign"] == 2
 
-    # C) Campaign in status 'completed' automatically returns to 'running' when valid pending recipients are added
+    # C) Vacancy campaign in status 'completed' MUST NOT auto-wake to 'running' on ingest
     updated_vac_camp = get_campaign(conn, vac_camp["id"])
-    assert updated_vac_camp["status"] == "running"
+    assert updated_vac_camp["status"] == "completed"
 
-    # B) Two B2B founders with generic company="SaaS" do not merge, and _find_lead_by_lookup ignores LIKE on <4 chars
+    # B) Two B2B founders with generic company="SaaS" do not merge, AND completed B2B campaign DOES auto-wake to 'running'
+    b2b_completed = create_campaign(
+        conn,
+        name="B2B Generic Co Test",
+        status="completed",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
     valid_pitch_1 = f"Hey,\n\nSaw AliceApp. Paid acquisition gets expensive.\n\n{SOFTUGC_PITCH_TEXT}\n\n{REVSHARE_OFFER_TEXT}"
     valid_pitch_2 = f"Hey,\n\nSaw BobApp. Paid acquisition gets expensive.\n\n{SOFTUGC_PITCH_TEXT}\n\n{REVSHARE_OFFER_TEXT}"
     b2b_res = _mcp_call(
         conn,
         "ingest_discovered_leads",
         {
-            "campaign_name": "B2B Generic Co Test",
+            "campaign_id": b2b_completed["id"],
             "enroll_in_campaign": True,
             "leads": [
                 {"username": "@alice_saas_1", "name": "Alice Carter", "company": "SaaS", "website": "https://aliceapp.io", "category": "SaaS", "their_angle": "Workflow SaaS for designers", "step1_text": valid_pitch_1},
@@ -704,6 +710,7 @@ def test_mcp_no_false_company_merge_for_vacancies_or_short_names_and_reopens_com
             ],
         },
     )
+    assert get_campaign(conn, b2b_completed["id"])["status"] == "running"
     assert b2b_res["created_leads"] == 2
     assert b2b_res["enrolled_in_campaign"] == 2
     assert _find_lead_by_lookup(conn, name="Ali") is None

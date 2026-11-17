@@ -72,7 +72,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         },
     },
     "vacancies": {
-        "enabled": True,
+        "enabled": False,
         "touch_mode": "direct",  # "direct" | "micro_ping"
         "campaign_name": "TG Вакансии",
         "daily_limit": 20,
@@ -191,7 +191,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merged["b2b"] = b2b
 
     vac = merged.get("vacancies") or {}
-    vac["enabled"] = bool(vac.get("enabled", True))
+    vac["enabled"] = bool(vac.get("enabled", False))
     vac_mode = str(vac.get("touch_mode") or "direct").strip().lower()
     if vac_mode == "full":
         vac_mode = "direct"
@@ -594,10 +594,12 @@ def sync_leadgen_campaigns(
                 }
             )
 
-    if vac.get("enabled", True):
+    raw_vac_lim = vac.get("daily_limit")
+    resolved_vac_lim = 20 if raw_vac_lim is None else int(raw_vac_lim)
+    if vac.get("enabled", False) and resolved_vac_lim > 0:
         vac_name = str(vac.get("campaign_name") or "TG Вакансии").strip()
-        vac_lim = max(1, min(500, int(vac.get("daily_limit") or 20)))
-        vac_quota = max(0, min(500, int(vac.get("daily_limit") or 20)))
+        vac_lim = max(1, min(500, resolved_vac_lim))
+        vac_quota = max(0, min(500, resolved_vac_lim))
         if vac_name:
             targets.append(
                 {
@@ -808,7 +810,11 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     vac_enabled_layers = [
         f"vacancies:{k}" for k, v in (vac_cfg.get("layers") or {}).items() if v
     ] or ["vacancies"]
-    if vac_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
+    raw_vac_push_lim = vac_cfg.get("daily_limit")
+    resolved_vac_push_lim = 20 if raw_vac_push_lim is None else int(raw_vac_push_lim)
+    if vac_cfg.get("enabled", False) and resolved_vac_push_lim > 0 and state_dir.is_dir() and remaining_quota > 0:
+        from datetime import datetime, timezone
+        from app.outreach import VACANCY_MAX_STEP1_AGE_HOURS, _VACANCY_JUNK_ROLE_RE
         from leadgen.job_reply import build_default_followups, build_vacancy_mcp_lead
 
         reply_files = sorted(
@@ -859,6 +865,20 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     for item in mon_items:
                         if not isinstance(item, dict):
                             continue
+                        posted_raw = str(item.get("posted_at") or item.get("date") or "").strip()
+                        if posted_raw:
+                            try:
+                                p_norm = posted_raw[:-1] + "+00:00" if posted_raw.endswith(("Z", "z")) else posted_raw
+                                p_dt = datetime.fromisoformat(p_norm)
+                                if p_dt.tzinfo is None:
+                                    p_dt = p_dt.replace(tzinfo=timezone.utc)
+                                if (datetime.now(timezone.utc) - p_dt).total_seconds() / 3600.0 > VACANCY_MAX_STEP1_AGE_HOURS:
+                                    continue
+                            except ValueError:
+                                pass
+                        item_blob = f"{item.get('role') or ''} {item.get('why') or ''} {item.get('text') or ''}"
+                        if _VACANCY_JUNK_ROLE_RE.search(item_blob):
+                            continue
                         layer = str(item.get("layer") or "AI-контент").strip()
                         if enabled_layers and layer and layer not in enabled_layers:
                             continue
@@ -882,7 +902,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                         if mcp_lead is not None:
                             vac_leads.append(mcp_lead)
 
-                vac_limit = min(remaining_quota, int(vac_cfg.get("daily_limit") or 20))
+                vac_limit = min(remaining_quota, resolved_vac_push_lim)
                 start_vac_idx = (
                     min(max(0, int(prev_vac.get("offset") or 0)), len(vac_leads))
                     if (

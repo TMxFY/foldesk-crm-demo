@@ -660,7 +660,7 @@ def run_autonomous_replenish(
     b2b_active = bool(b2b_cfg.get("enabled", True)) and (
         b2b_camp is None or str(b2b_camp.get("status") or "") != "completed"
     )
-    vac_active = bool(vac_cfg.get("enabled", True)) and (
+    vac_active = bool(vac_cfg.get("enabled", False)) and (
         vac_camp is None or str(vac_camp.get("status") or "") != "completed"
     )
 

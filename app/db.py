@@ -1088,6 +1088,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_false_reply_notifications_v1', '1', ?)",
                 (utc_now(),),
             )
+        vac_disabled_v6 = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'disable_vacancy_outreach_v6'"
+        ).fetchone()
+        if vac_disabled_v6 is None:
+            apply_disable_vacancy_outreach_v6(conn)
     conn.commit()
 
 
@@ -1813,6 +1818,151 @@ def apply_canonical_vlad_outreach_v5(conn: sqlite3.Connection, *, force: bool = 
         "backfilled_sent_account": backfilled_sent_account,
         "moved_to_vse2": moved_to_vse2,
         "dedup_deleted_from_auto": dedup_deleted_from_auto,
+    }
+
+
+def apply_disable_vacancy_outreach_v6(
+    conn: sqlite3.Connection, *, force: bool = False
+) -> dict:
+    import json
+    import re as _re
+
+    if not force:
+        done = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'disable_vacancy_outreach_v6'"
+        ).fetchone()
+        if done is not None:
+            return {"already_applied": True}
+
+    now_ts = utc_now()
+    vac_name_re = _re.compile(
+        r"(?:ваканс|vacanc|отклик\w*\s+на\s+ваканс|tg[\s_-]*jobs?\b)",
+        _re.IGNORECASE,
+    )
+    qa_name_re = _re.compile(r"(?:\[qa|qa\s+тест|тест\s+своих)", _re.IGNORECASE)
+
+    vac_cids: list[int] = []
+    for crow in conn.execute("SELECT id, name, leadgen_sources_json FROM campaigns").fetchall():
+        cname = str(crow["name"] or "")
+        lg_json = str(crow["leadgen_sources_json"] or "").lower()
+        is_vac = bool(vac_name_re.search(cname)) or ('"vacancies' in lg_json)
+        if is_vac and not qa_name_re.search(cname):
+            vac_cids.append(int(crow["id"]))
+
+    closed_pending = 0
+    closed_in_progress = 0
+    closed_failed = 0
+    if vac_cids:
+        placeholders = ",".join("?" for _ in vac_cids)
+        cur_p = conn.execute(
+            f"""
+            UPDATE campaign_recipients
+            SET status = 'completed',
+                error_text = 'Остановлено: рассылка по вакансиям отключена (устаревшая очередь)',
+                updated_at = ?
+            WHERE campaign_id IN ({placeholders})
+              AND status = 'pending'
+            """,
+            (now_ts, *vac_cids),
+        )
+        closed_pending = int(cur_p.rowcount or 0)
+
+        cur_ip = conn.execute(
+            f"""
+            UPDATE campaign_recipients
+            SET status = 'completed',
+                error_text = 'Остановлено: фоллоу-апы по вакансиям отменены',
+                updated_at = ?
+            WHERE campaign_id IN ({placeholders})
+              AND status = 'in_progress'
+            """,
+            (now_ts, *vac_cids),
+        )
+        closed_in_progress = int(cur_ip.rowcount or 0)
+
+        cur_f = conn.execute(
+            f"""
+            UPDATE campaign_recipients
+            SET status = 'completed',
+                error_text = COALESCE(error_text, 'Остановлено: рассылка по вакансиям отключена'),
+                updated_at = ?
+            WHERE campaign_id IN ({placeholders})
+              AND status = 'failed'
+            """,
+            (now_ts, *vac_cids),
+        )
+        closed_failed = int(cur_f.rowcount or 0)
+
+        conn.execute(
+            f"""
+            UPDATE campaigns
+            SET status = CASE WHEN status IN ('running', 'completed') THEN 'paused' ELSE status END,
+                account_id = NULL,
+                account_ids_json = '[]',
+                leadgen_enabled = 0,
+                leadgen_daily_quota = 0,
+                leadgen_sources_json = '[]',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now_ts, *vac_cids),
+        )
+
+    kv_row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = 'leadgen_config'"
+    ).fetchone()
+    if kv_row and kv_row["value"]:
+        try:
+            parsed_cfg = json.loads(kv_row["value"])
+            if isinstance(parsed_cfg, dict):
+                vac_sec = dict(parsed_cfg.get("vacancies") or {})
+                vac_sec["enabled"] = False
+                vac_sec["daily_limit"] = 0
+                parsed_cfg["vacancies"] = vac_sec
+                conn.execute(
+                    """
+                    UPDATE kv_settings
+                    SET value = ?, updated_at = ?
+                    WHERE key = 'leadgen_config'
+                    """,
+                    (json.dumps(parsed_cfg, ensure_ascii=False, indent=2), now_ts),
+                )
+        except Exception:
+            pass
+
+    try:
+        cfg_path = Path(
+            os.environ.get("LEADGEN_CONFIG_PATH") or (ROOT / "data" / "leadgen_config.json")
+        )
+        if cfg_path.is_file():
+            disk_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(disk_cfg, dict):
+                vac_disk = dict(disk_cfg.get("vacancies") or {})
+                vac_disk["enabled"] = False
+                vac_disk["daily_limit"] = 0
+                disk_cfg["vacancies"] = vac_disk
+                cfg_path.write_text(
+                    json.dumps(disk_cfg, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+    except Exception:
+        pass
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('disable_vacancy_outreach_v6', '1', ?)",
+        (now_ts,),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('cloud_persistence_dirty_at', ?, ?)",
+        (now_ts, now_ts),
+    )
+    conn.commit()
+    return {
+        "already_applied": False,
+        "paused_vacancy_campaigns": len(vac_cids),
+        "closed_pending": closed_pending,
+        "closed_in_progress": closed_in_progress,
+        "closed_failed": closed_failed,
     }
 
 

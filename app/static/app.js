@@ -11511,7 +11511,7 @@ function ensureLeadgenState() {
         },
       },
       vacancies: {
-        enabled: true,
+        enabled: false,
         touch_mode: "direct",
         campaign_name: "TG Вакансии",
         daily_limit: 20,
@@ -11701,7 +11701,7 @@ function applyLeadgenProfilePreset(profileCode) {
   } else if (profileCode === "safe_warmup") {
     setVal("#leadgen-total-quota", 15);
     setCheck("#leadgen-b2b-enabled", true);
-    setCheck("#leadgen-vacancies-enabled", true);
+    setCheck("#leadgen-vacancies-enabled", false);
     const safeB2b = new Set(["tg_groups", "yc_ph"]);
     document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
       cb.checked = safeB2b.has(cb.getAttribute("data-b2b-source"));
@@ -11761,7 +11761,7 @@ function renderLeadgenConfig() {
   setVal("#leadgen-limit-lurker", limits.lurker_limit ?? 1000);
   setVal("#leadgen-limit-external", limits.external_limit ?? 20);
 
-  setCheck("#leadgen-vacancies-enabled", vac.enabled !== false);
+  setCheck("#leadgen-vacancies-enabled", Boolean(vac.enabled));
   setCheck("#leadgen-vac-remote-only", vac.remote_only !== false);
   setCheck("#leadgen-vac-hot-priority", vac.hot_priority !== false);
   setVal("#leadgen-vac-touch-mode", vac.touch_mode || "direct");
@@ -11837,10 +11837,10 @@ function collectLeadgenFormPayload() {
       },
     },
     vacancies: {
-      enabled: getCheck("#leadgen-vacancies-enabled", true),
+      enabled: getCheck("#leadgen-vacancies-enabled", false),
       touch_mode: getVal("#leadgen-vac-touch-mode", "direct"),
       campaign_name: getVal("#leadgen-vac-campaign", "TG Вакансии"),
-      daily_limit: getNum("#leadgen-vac-daily-limit", 20, 1, 500),
+      daily_limit: getNum("#leadgen-vac-daily-limit", 20, 0, 500),
       remote_only: getCheck("#leadgen-vac-remote-only", true),
       hot_priority: getCheck("#leadgen-vac-hot-priority", true),
       layers,

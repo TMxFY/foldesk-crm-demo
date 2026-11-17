@@ -473,9 +473,181 @@ _BROKEN_STEP1_STUB_RE = re.compile(
 
 
 _VACANCY_CAMPAIGN_NAME_RE = re.compile(
-    r"(?:ваканс|vacanc|\bjobs?\b|найм|отклик)",
+    r"(?:ваканс|vacanc|отклик\w*\s+на\s+ваканс|tg[\s_-]*jobs?\b)",
     re.IGNORECASE,
 )
+_VACANCY_PROTECTED_USERNAMES = frozenset({"vladwilhelm"})
+_VACANCY_PROTECTED_NAMES = frozenset({"vladislav wilhelm"})
+VACANCY_MAX_STEP1_AGE_HOURS: float = 72.0
+_VACANCY_JUNK_ROLE_RE = re.compile(
+    r"(?:стори[сз][\s_-]*мейкер|story[\s_-]*mak|(?:оформлени|ведени|монтаж)\w*\s+стори[сз]|"
+    r"иллюстра(?:тор|ц)\w*[\s\S]{0,80}детск\w*\s+книг|"
+    r"(?:монтаж|нарезк|рилсмейкер)\w*[\s\S]{0,35}\bмем(?:ов|ы|ами|ам)?\b)",
+    re.IGNORECASE,
+)
+
+
+def is_vacancy_campaign_name(name: str | None) -> bool:
+    return bool(name and _VACANCY_CAMPAIGN_NAME_RE.search(str(name)))
+
+
+def is_vacancy_campaign(camp: dict | None, name_override: str | None = None) -> bool:
+    camp_name = str(
+        name_override
+        if name_override is not None
+        else ((camp or {}).get("name") or "")
+    )
+    if is_vacancy_campaign_name(camp_name):
+        return True
+    if not isinstance(camp, dict):
+        return False
+    raw_sources = camp.get("leadgen_sources")
+    if isinstance(raw_sources, list) and any(
+        str(s or "").strip().lower().startswith("vacancies") for s in raw_sources
+    ):
+        return True
+    raw_json = str(camp.get("leadgen_sources_json") or "")
+    if '"vacancies' in raw_json.lower():
+        return True
+    return False
+
+
+def find_vacancy_account_pool_violations(
+    conn,
+    campaign_id: int | None,
+    camp: dict | None = None,
+) -> list[dict]:
+    target_camp = (
+        camp
+        if isinstance(camp, dict)
+        else (get_campaign(conn, int(campaign_id)) if campaign_id is not None else {})
+    )
+    if not is_vacancy_campaign(target_camp):
+        return []
+
+    acc_ids = _parse_account_ids(
+        target_camp.get("account_id"),
+        target_camp.get("account_ids") or target_camp.get("account_ids_json"),
+    )
+    if not acc_ids:
+        return []
+
+    violations: list[dict] = []
+    placeholders = ",".join("?" for _ in acc_ids)
+    acc_rows = conn.execute(
+        f"SELECT id, telegram_username, telegram_name, phone FROM accounts WHERE id IN ({placeholders})",
+        tuple(acc_ids),
+    ).fetchall()
+    acc_by_id = {int(r["id"]): as_dict(r) for r in acc_rows}
+
+    for aid in acc_ids:
+        acc_obj = acc_by_id.get(int(aid)) or {}
+        uname_low = (_clean_handle(acc_obj.get("telegram_username")) or "").lower()
+        tname_low = str(acc_obj.get("telegram_name") or "").strip().lower()
+        if uname_low in _VACANCY_PROTECTED_USERNAMES or tname_low in _VACANCY_PROTECTED_NAMES:
+            label = f"@{uname_low}" if uname_low else (acc_obj.get("telegram_name") or f"#{aid}")
+            violations.append(
+                {
+                    "code": "vacancy_on_protected_account",
+                    "account_id": int(aid),
+                    "message": (
+                        f"Рассылка по вакансиям жёстко запрещена с защищённого аккаунта "
+                        f"{label} (#{aid}, vladwilhelm): используйте только отдельный выделенный аккаунт"
+                    ),
+                }
+            )
+
+    cid_val = int(campaign_id) if campaign_id is not None else -1
+    other_camps = conn.execute(
+        "SELECT id, name, status, account_id, account_ids_json, leadgen_sources_json FROM campaigns WHERE id != ?",
+        (cid_val,),
+    ).fetchall()
+    b2b_owners_by_acc: dict[int, list[str]] = {}
+    b2b_camp_ids: list[int] = []
+    for oc in other_camps:
+        oc_dict = as_dict(oc)
+        oc_name = str(oc_dict.get("name") or "")
+        if is_vacancy_campaign(oc_dict) or _is_qa_campaign_name(oc_name):
+            continue
+        b2b_camp_ids.append(int(oc_dict["id"]))
+        oc_acc_ids = _parse_account_ids(oc_dict.get("account_id"), oc_dict.get("account_ids_json"))
+        for baid in oc_acc_ids:
+            b2b_owners_by_acc.setdefault(int(baid), []).append(oc_name)
+
+    if b2b_camp_ids:
+        ph_b2b = ",".join("?" for _ in b2b_camp_ids)
+        used_rows = conn.execute(
+            f"""
+            SELECT DISTINCT cr.sent_account_id, cr.assigned_account_id, c.name AS camp_name
+            FROM campaign_recipients cr
+            JOIN campaigns c ON c.id = cr.campaign_id
+            WHERE cr.campaign_id IN ({ph_b2b})
+              AND (cr.sent_account_id IS NOT NULL OR cr.assigned_account_id IS NOT NULL)
+            """,
+            tuple(b2b_camp_ids),
+        ).fetchall()
+        for ur in used_rows:
+            cname = str(ur["camp_name"] or "B2B")
+            for col in ("sent_account_id", "assigned_account_id"):
+                if ur[col] is not None:
+                    baid = int(ur[col])
+                    if cname not in b2b_owners_by_acc.setdefault(baid, []):
+                        b2b_owners_by_acc[baid].append(cname)
+
+    for aid in acc_ids:
+        shared_camps = b2b_owners_by_acc.get(int(aid))
+        if shared_camps:
+            acc_obj = acc_by_id.get(int(aid)) or {}
+            uname_label = _clean_handle(acc_obj.get("telegram_username"))
+            acc_tag = f"@{uname_label} (#{aid})" if uname_label else f"#{aid}"
+            violations.append(
+                {
+                    "code": "vacancy_shares_b2b_account_pool",
+                    "account_id": int(aid),
+                    "message": (
+                        f"Рассылка по вакансиям не может использовать B2B-пул аккаунтов "
+                        f"({acc_tag} уже привязан к B2B-кампании «{shared_camps[0]}»): "
+                        f"разрешён только отдельный выделенный аккаунт под вакансии"
+                    ),
+                }
+            )
+    return violations
+
+
+def _earliest_recipient_dt(rec: dict) -> tuple[datetime | None, str | None]:
+    candidates: list[tuple[datetime, str]] = []
+    for key in ("lead_created_at", "created_at"):
+        raw = rec.get(key)
+        dt_val = _parse_iso_dt(raw)
+        if dt_val is not None:
+            candidates.append((dt_val, str(raw)))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[0]
+
+
+def _is_stale_vacancy_step1(
+    rec: dict,
+    *,
+    step_idx: int,
+    camp: dict | None = None,
+    campaign_name: str | None = None,
+    now_dt: datetime | None = None,
+) -> bool:
+    if step_idx != 0:
+        return False
+    cname = str(campaign_name if campaign_name is not None else ((camp or {}).get("name") or ""))
+    if not is_vacancy_campaign(camp, name_override=cname) or _is_qa_campaign_name(cname):
+        return False
+    created_dt, _ = _earliest_recipient_dt(rec)
+    if created_dt is None:
+        return False
+    ref_dt = now_dt if isinstance(now_dt, datetime) else datetime.now(timezone.utc)
+    if ref_dt.tzinfo is None:
+        ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+    age_hours = (ref_dt - created_dt).total_seconds() / 3600.0
+    return age_hours > VACANCY_MAX_STEP1_AGE_HOURS
 
 
 def has_last_mile_icp_defect(
@@ -487,6 +659,7 @@ def has_last_mile_icp_defect(
     steps: list[dict],
     is_qa_camp: bool = False,
     campaign_name: str | None = None,
+    camp: dict | None = None,
 ) -> bool:
     clean_uname = (_clean_handle(rec.get("username")) or "").lower()
     if clean_uname and (clean_uname == "matrixreach_bot" or clean_uname.endswith("_bot")):
@@ -520,9 +693,11 @@ def has_last_mile_icp_defect(
         )
         if val
     )
-    is_vacancy_camp = bool(
-        campaign_name and _VACANCY_CAMPAIGN_NAME_RE.search(str(campaign_name))
-    )
+    is_vacancy_camp = is_vacancy_campaign(camp, name_override=campaign_name)
+    if is_vacancy_camp:
+        vac_blob = f"{profile_blob} {_fix_mojibake(rendered_text)}"
+        if _VACANCY_JUNK_ROLE_RE.search(vac_blob):
+            return True
     if not is_vacancy_camp and profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
         return True
     if not is_qa_camp and is_offline_non_icp_contact(
@@ -1307,8 +1482,25 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
 
 def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> int:
     now = utc_now()
-    where_camp = "AND campaign_id = ?" if campaign_id is not None else ""
-    params: tuple = (now, int(campaign_id)) if campaign_id is not None else (now,)
+    all_camps = [
+        as_dict(r)
+        for r in conn.execute(
+            "SELECT id, name, leadgen_sources_json FROM campaigns"
+        ).fetchall()
+    ]
+    vac_cids = {int(c["id"]) for c in all_camps if is_vacancy_campaign(c)}
+    if campaign_id is not None:
+        if int(campaign_id) in vac_cids:
+            return 0
+        where_camp = "AND campaign_id = ?"
+        params: tuple = (now, int(campaign_id))
+    elif vac_cids:
+        ph_vac = ",".join("?" for _ in sorted(vac_cids))
+        where_camp = f"AND campaign_id NOT IN ({ph_vac})"
+        params = (now, *sorted(vac_cids))
+    else:
+        where_camp = ""
+        params = (now,)
     cur = conn.execute(
         f"""
         UPDATE campaign_recipients
@@ -1343,10 +1535,9 @@ def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> in
     )
     healed = int(cur.rowcount or 0)
     if healed > 0:
-        conn.execute(
+        cand_camps = conn.execute(
             f"""
-            UPDATE campaigns
-            SET status = 'running', updated_at = ?
+            SELECT id, name, leadgen_sources_json FROM campaigns
             WHERE status = 'completed'
               {"AND id = ?" if campaign_id is not None else ""}
               AND EXISTS (
@@ -1355,8 +1546,19 @@ def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> in
                     AND cr.status IN ('pending', 'in_progress')
               )
             """,
-            params,
-        )
+            (campaign_id,) if campaign_id is not None else (),
+        ).fetchall()
+        wake_ids = [
+            int(r["id"])
+            for r in cand_camps
+            if not is_vacancy_campaign(as_dict(r))
+        ]
+        if wake_ids:
+            ph_wake = ",".join("?" for _ in wake_ids)
+            conn.execute(
+                f"UPDATE campaigns SET status = 'running', updated_at = ? WHERE id IN ({ph_wake})",
+                (now, *wake_ids),
+            )
         conn.commit()
     return healed
 
@@ -2169,7 +2371,7 @@ def create_campaign(
 
     name_low = clean_name.lower()
     if leadgen_enabled is None:
-        lg_enabled_val = 1 if ("leadgen" in name_low or "ваканс" in name_low) else 0
+        lg_enabled_val = 1 if ("leadgen" in name_low and not is_vacancy_campaign_name(clean_name)) else 0
     else:
         lg_enabled_val = 1 if bool(leadgen_enabled) else 0
 
@@ -2187,6 +2389,20 @@ def create_campaign(
     else:
         raise ValueError("leadgen_sources должен быть списком строк")
     lg_sources_json = json.dumps(lg_sources_list, ensure_ascii=False)
+
+    if initial_status == "running" and resolved_ids:
+        cand_violations = find_vacancy_account_pool_violations(
+            conn,
+            None,
+            camp={
+                "name": clean_name,
+                "account_id": primary_account_id,
+                "account_ids": resolved_ids,
+                "leadgen_sources_json": lg_sources_json,
+            },
+        )
+        if cand_violations:
+            raise ValueError("; ".join(v["message"] for v in cand_violations))
 
     norm_steps = _normalize_steps(steps)
     now = utc_now()
@@ -2293,6 +2509,20 @@ def update_campaign(
         new_lg_sources_json = json.dumps(clean_src, ensure_ascii=False)
     else:
         raise ValueError("leadgen_sources должен быть списком строк")
+
+    if new_status == "running" and resolved_ids:
+        cand_violations = find_vacancy_account_pool_violations(
+            conn,
+            int(campaign_id),
+            camp={
+                "name": new_name,
+                "account_id": primary_account_id,
+                "account_ids": resolved_ids,
+                "leadgen_sources_json": new_lg_sources_json,
+            },
+        )
+        if cand_violations:
+            raise ValueError("; ".join(v["message"] for v in cand_violations))
 
     now = utc_now()
     conn.execute(
@@ -2610,19 +2840,28 @@ def set_autopilot_enabled(
     _set_kv(conn, "outreach_autopilot_enabled", "1" if enabled else "0")
     if enabled and activate_drafts:
         now = utc_now()
-        conn.execute(
+        cand_camps = conn.execute(
             """
-            UPDATE campaigns
-            SET status = 'running', updated_at = ?
+            SELECT id, name, leadgen_sources_json FROM campaigns
             WHERE status IN ('draft', 'paused')
               AND EXISTS (
                   SELECT 1 FROM campaign_recipients r
                   WHERE r.campaign_id = campaigns.id
                     AND r.status IN ('pending', 'in_progress')
               )
-            """,
-            (now,),
-        )
+            """
+        ).fetchall()
+        wake_ids = [
+            int(r["id"])
+            for r in cand_camps
+            if not is_vacancy_campaign(as_dict(r))
+        ]
+        if wake_ids:
+            ph_wake = ",".join("?" for _ in wake_ids)
+            conn.execute(
+                f"UPDATE campaigns SET status = 'running', updated_at = ? WHERE id IN ({ph_wake})",
+                (now, *wake_ids),
+            )
     conn.commit()
     return get_autopilot_status(conn, now_dt=now_dt)
 
@@ -3058,20 +3297,21 @@ def import_campaign_csv(
         )
     else:
         conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
-    conn.execute(
-        """
-        UPDATE campaigns
-        SET status = 'running', updated_at = ?
-        WHERE id = ?
-          AND status = 'completed'
-          AND EXISTS (
-              SELECT 1 FROM campaign_recipients cr
-              WHERE cr.campaign_id = campaigns.id
-                AND cr.status IN ('pending', 'in_progress')
-          )
-        """,
-        (now, campaign_id),
-    )
+    if not is_vacancy_campaign(as_dict(camp_row)):
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET status = 'running', updated_at = ?
+            WHERE id = ?
+              AND status = 'completed'
+              AND EXISTS (
+                  SELECT 1 FROM campaign_recipients cr
+                  WHERE cr.campaign_id = campaigns.id
+                    AND cr.status IN ('pending', 'in_progress')
+              )
+            """,
+            (now, campaign_id),
+        )
     conn.commit()
     updated_campaign = get_campaign(conn, campaign_id)
     return {
@@ -3229,22 +3469,25 @@ def enroll_leads_from_crm(
             seen_phones.add(phone)
         imported_count += 1
 
-    conn.execute(
-        """
-        UPDATE campaigns
-        SET status = CASE
-                WHEN status = 'completed' AND EXISTS (
-                    SELECT 1 FROM campaign_recipients cr
-                    WHERE cr.campaign_id = campaigns.id
-                      AND cr.status IN ('pending', 'in_progress')
-                ) THEN 'running'
-                ELSE status
-            END,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (now, campaign_id),
-    )
+    if not is_vacancy_campaign(camp):
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET status = CASE
+                    WHEN status = 'completed' AND EXISTS (
+                        SELECT 1 FROM campaign_recipients cr
+                        WHERE cr.campaign_id = campaigns.id
+                          AND cr.status IN ('pending', 'in_progress')
+                    ) THEN 'running'
+                    ELSE status
+                END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, campaign_id),
+        )
+    else:
+        conn.execute("UPDATE campaigns SET updated_at = ? WHERE id = ?", (now, campaign_id))
     conn.commit()
     updated_campaign = get_campaign(conn, campaign_id)
     return {
@@ -3683,6 +3926,9 @@ async def run_campaign_batch(
     heal_transient_failed_recipients(conn, int(campaign_id))
     heal_orphaned_followups_from_dead_accounts(conn, int(campaign_id))
     camp = get_campaign(conn, campaign_id)
+    pool_violations = find_vacancy_account_pool_violations(conn, int(campaign_id), camp=camp)
+    if pool_violations:
+        raise ValueError("; ".join(v["message"] for v in pool_violations))
     account_ids = camp.get("account_ids") or []
     if not account_ids:
         raise ValueError("Выберите хотя бы один подключённый аккаунт для рассылки")
@@ -4154,7 +4400,8 @@ async def run_campaign_batch(
 
     eligible_rows = conn.execute(
         """
-        SELECT cr.*, l.niche AS lead_niche, l.note AS lead_note, l.description AS lead_description
+        SELECT cr.*, l.niche AS lead_niche, l.created_at AS lead_created_at,
+               l.note AS lead_note, l.description AS lead_description
         FROM campaign_recipients cr
         LEFT JOIN leads l ON l.id = cr.lead_id
         WHERE cr.campaign_id = ?
@@ -4312,6 +4559,25 @@ async def run_campaign_batch(
             continue
 
         if step_idx == 0:
+            if _is_stale_vacancy_step1(
+                rec,
+                step_idx=step_idx,
+                camp=camp,
+                campaign_name=camp.get("name"),
+                now_dt=eff_now_dt,
+            ):
+                conn.execute(
+                    """
+                    UPDATE campaign_recipients
+                    SET status = 'completed',
+                        error_text = 'Пропущен: устаревшая вакансия (>72ч)',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, rec["id"]),
+                )
+                conn.commit()
+                continue
             if _is_recipient_source_quarantined(conn, rec):
                 conn.execute(
                     """
@@ -4539,6 +4805,7 @@ async def run_campaign_batch(
             steps=steps,
             is_qa_camp=is_qa_camp,
             campaign_name=camp.get("name"),
+            camp=camp,
         ):
             conn.execute(
                 """
@@ -5597,6 +5864,9 @@ def preview_outreach_batch(
 
     camp = get_campaign(conn, campaign_id)
     steps, violations = _validate_campaign_steps_for_preview(camp)
+    violations.extend(
+        find_vacancy_account_pool_violations(conn, int(campaign_id), camp=camp)
+    )
     step1 = steps[0] if steps else None
 
     rows = conn.execute(
@@ -5689,13 +5959,47 @@ def preview_outreach_batch(
                 }
             )
 
-        created_raw = rec.get("lead_created_at") or rec.get("created_at")
-        created_dt = _parse_iso_dt(created_raw)
+        created_dt, earliest_raw = _earliest_recipient_dt(rec)
+        created_raw = earliest_raw or rec.get("lead_created_at") or rec.get("created_at")
         age_hours = (
             round(max(0.0, (now_dt - created_dt).total_seconds() / 3600.0), 2)
             if created_dt is not None
             else None
         )
+        if is_vacancy_campaign(camp) and not _is_qa_campaign_name(
+            camp.get("name")
+        ):
+            vac_preview_blob = " ".join(
+                str(x or "")
+                for x in (
+                    rec.get("name"),
+                    rec.get("company"),
+                    rec.get("their_angle"),
+                    rec.get("note"),
+                    rendered_text,
+                )
+            )
+            if _VACANCY_JUNK_ROLE_RE.search(vac_preview_blob):
+                row_violations.append("vacancy_junk_role")
+                violations.append(
+                    {
+                        "code": "vacancy_junk_role",
+                        "recipient_id": int(rec["id"]),
+                        "message": f"Нерелевантная мелкая вакансия (сторисмейкер/мемы/иллюстрации) у получателя #{rec['id']}",
+                    }
+                )
+            if (
+                age_hours is not None
+                and age_hours > VACANCY_MAX_STEP1_AGE_HOURS
+            ):
+                row_violations.append("stale_vacancy_lead")
+                violations.append(
+                    {
+                        "code": "stale_vacancy_lead",
+                        "recipient_id": int(rec["id"]),
+                        "message": f"Устаревшая вакансия ({age_hours:.1f}ч > {VACANCY_MAX_STEP1_AGE_HOURS:.0f}ч) у получателя #{rec['id']}",
+                    }
+                )
         candidate_info = {
             "recipient_id": int(rec["id"]),
             "lead_id": rec_lead_id,

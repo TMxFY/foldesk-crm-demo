@@ -159,6 +159,57 @@ if (root / "app" / "inbox.py").is_file() and (
 ):
     errors.append("Harness Gate violation: missing scripts/proactive_audit.py or docs/VERIFICATION_PLAYBOOKS.md")
 
+# Gate D: Vacancy Outreach Default-Off & Hard B2B Account Pool Isolation Gate
+lg_settings_file = root / "app" / "leadgen_settings.py"
+if lg_settings_file.is_file():
+    lg_src = lg_settings_file.read_text(encoding="utf-8")
+    if re.search(r'"vacancies"\s*:\s*\{\s*"enabled"\s*:\s*True', lg_src):
+        errors.append(
+            "Vacancy Gate violation: DEFAULT_LEADGEN_CONFIG['vacancies']['enabled'] must be False by default"
+        )
+db_file = root / "app" / "db.py"
+if db_file.is_file():
+    db_src = db_file.read_text(encoding="utf-8")
+    if "def apply_disable_vacancy_outreach_v6(" not in db_src:
+        errors.append(
+            "Vacancy Gate violation: missing apply_disable_vacancy_outreach_v6 migration in app/db.py"
+        )
+outreach_file = root / "app" / "outreach.py"
+if outreach_file.is_file():
+    outreach_src = outreach_file.read_text(encoding="utf-8")
+    if "def find_vacancy_account_pool_violations(" not in outreach_src:
+        errors.append(
+            "Vacancy Gate violation: missing find_vacancy_account_pool_violations in app/outreach.py"
+        )
+    if outreach_src.count("find_vacancy_account_pool_violations(") < 4:
+        errors.append(
+            "Vacancy Gate violation: find_vacancy_account_pool_violations must guard create_campaign, update_campaign, run_campaign_batch, and preview_outreach_batch"
+        )
+    if "_VACANCY_JUNK_ROLE_RE" not in outreach_src or "l.created_at AS lead_created_at" not in outreach_src:
+        errors.append(
+            "Vacancy Gate violation: app/outreach.py must enforce _VACANCY_JUNK_ROLE_RE and select l.created_at AS lead_created_at"
+        )
+job_mon_file = root / "leadgen" / "job_monitor.py"
+if job_mon_file.is_file():
+    if "VACANCY_JUNK_RX" not in job_mon_file.read_text(encoding="utf-8"):
+        errors.append(
+            "Vacancy Gate violation: leadgen/job_monitor.py must enforce VACANCY_JUNK_RX"
+        )
+app_js_file = root / "app" / "static" / "app.js"
+if app_js_file.is_file():
+    app_js_src = app_js_file.read_text(encoding="utf-8")
+    if re.search(r"vacancies\s*:\s*\{\s*enabled\s*:\s*true", app_js_src):
+        errors.append(
+            "Vacancy Gate violation: app/static/app.js must default vacancies.enabled to false"
+        )
+index_html_file = root / "app" / "templates" / "index.html"
+if index_html_file.is_file():
+    index_html_src = index_html_file.read_text(encoding="utf-8")
+    if 'id="leadgen-vacancies-enabled" checked' in index_html_src:
+        errors.append(
+            "Vacancy Gate violation: app/templates/index.html must not pre-check #leadgen-vacancies-enabled"
+        )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

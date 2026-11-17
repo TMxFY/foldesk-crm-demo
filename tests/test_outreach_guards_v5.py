@@ -420,10 +420,10 @@ def test_v5_guard3_auto_upgrades_creatoros_and_ceiling_on_the_fly_and_scrubs_fol
     vac_camp = create_campaign(
         conn,
         name="TG Вакансии",
-        account_ids=[21],
+        account_ids=[31],
         steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
     )
-    now = "2026-11-11T11:00:00"
+    now = utc_now()
 
     # Insert raw legacy texts directly into SQLite (simulating uncleaned DB rows)
     conn.executemany(

@@ -183,6 +183,7 @@ def test_job_reply_cli_ingests_cached_replies_into_crm(tmp_path, monkeypatch):
             "TG Вакансии",
             "--touch-mode",
             "direct",
+            "--force",
         ],
     )
     rc = job_reply_main()

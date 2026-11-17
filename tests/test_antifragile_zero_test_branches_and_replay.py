@@ -344,6 +344,7 @@ def test_prod_shape_replay_all_three_archetypes_under_production_runtime_flags(
             (28, "+998901000028", "data/sessions/dead28.session", "banned", "telegram", 1028, "dead_28", "Dead 28", now, now),
             (31, "+998901000031", "data/sessions/live31.session", "active", "telegram", 1031, "vlad_live", "Vlad SoftUGC", now, now),
             (32, "+491510000032", "data/sessions/wa32.session", "active", "whatsapp", 491510000032, "wa_live", "WA Live", now, now),
+            (36, "+998901000036", "data/sessions/vac36.session", "active", "telegram", 1036, "vac_dedicated", "Dedicated Vac", now, now),
         ],
     )
     conn.commit()
@@ -410,7 +411,8 @@ def test_prod_shape_replay_all_three_archetypes_under_production_runtime_flags(
     )
     assert vac_push["ok"] is True
     vac_cid = int(vac_push["campaign_id"])
-    update_campaign(conn, vac_cid, status="running", account_id=31, account_ids=[21, 28, 31])
+    # Dedicated vacancy account #36 (isolated from B2B account #31; dead #21/#28 still skipped)
+    update_campaign(conn, vac_cid, status="running", account_id=36, account_ids=[36])
 
     # Archetype 3: WhatsApp 14-digit international number (+86 138 0013 8000 1 -> 14 digits)
     wa_camp = create_campaign(
@@ -509,9 +511,12 @@ def test_prod_shape_replay_all_three_archetypes_under_production_runtime_flags(
             assert post_health["running_campaigns"] == 3
             assert post_health["pending_step1_total"] == 0
 
-        # Verify all 3 archetypes dispatched cleanly through live healthy accounts
+        # Verify all 3 archetypes dispatched cleanly through live healthy isolated accounts
         assert len(tg_sent) == 2
-        assert all(s[0] == "data/sessions/live31.session" for s in tg_sent)
+        assert {s[0] for s in tg_sent} == {
+            "data/sessions/live31.session",
+            "data/sessions/vac36.session",
+        }
         b2b_texts = [s[2] for s in tg_sent if "PulseNote" in s[2] or SOFTUGC_PITCH_TEXT in s[2]]
         assert len(b2b_texts) == 1
         assert b2b_texts[0].endswith(REVSHARE_OFFER_TEXT)

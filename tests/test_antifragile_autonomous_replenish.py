@@ -158,7 +158,7 @@ def test_defect1b_sync_and_save_config_protect_running_daily_limit_and_empty_wa_
     assert get_campaign(conn, camp_running["id"])["daily_limit"] == 140
     names_no_wa = {c["name"] for c in sync_res["campaigns"]}
     assert "Leadgen Auto (WA)" not in names_no_wa
-    assert "TG Вакансии" in names_no_wa
+    assert "TG Вакансии" not in names_no_wa
 
     # Explicit sync_campaign_limits=True allows updating daily_limit to 30
     sync_explicit = sync_leadgen_campaigns(conn, saved_cfg, sync_campaign_limits=True)
