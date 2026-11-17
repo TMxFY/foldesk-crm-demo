@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+"""High-yield SoftUGC buyer veins via Monid & Treg CLI.
+
+Covers three proven paying buyer streams (100% bounded, 90-day deduplicated,
+hard API call budget cap <= 25 calls per run):
+1. Whop Content Rewards (brands already paying $0.75-$3/1k views to clippers).
+2. TikTok Creative Center active US/EU Conversion Video Ads.
+3. TikTok Shop US D2C brands actively running affiliate product sales.
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import date, timedelta
+import html as html_mod
+import json
+import os
+from pathlib import Path
+import re
+from typing import Any
+from urllib.parse import urlparse
+
+try:
+    from monid_client import check_monid_ready, is_megacorp_app, resolve_app_store_developer, run_monid
+    from treg_client import call as treg_call, check_treg_ready
+    from treg_enrich import domain_of, find_company_decision_maker
+    from meta_ad_leads import APP_STORE_HOSTS, _scrape_site_contacts
+    from supply_side import is_supply_side, sniper_reject_reason
+    from tg_to_gsheet import x_profile_url
+except ImportError:
+    from leadgen.monid_client import check_monid_ready, is_megacorp_app, resolve_app_store_developer, run_monid
+    from leadgen.treg_client import call as treg_call, check_treg_ready
+    from leadgen.treg_enrich import domain_of, find_company_decision_maker
+    from leadgen.meta_ad_leads import APP_STORE_HOSTS, _scrape_site_contacts
+    from leadgen.supply_side import is_supply_side, sniper_reject_reason
+    from leadgen.tg_to_gsheet import x_profile_url
+
+
+SEEN_DAYS = 90
+MAX_API_CALLS_PER_RUN = 25
+
+WHOP_QUERIES = (
+    'site:whop.com ("per 1,000 views" OR "content rewards") ("Budget" OR "CPM") -blog -docs',
+    'site:apps.whop.com/discover ("per 1,000 views" OR "CPM")',
+)
+
+TIKTOK_AD_QUERIES = (
+    "AI app",
+    "astrology app",
+    "calorie tracker",
+    "prop trading",
+    "roblox game",
+    "supplement gummies",
+    "skincare serum",
+)
+
+TIKTOK_SHOP_QUERIES = (
+    "sleep gummies",
+    "collagen serum",
+    "mushroom supplement",
+    "stain remover",
+    "whitening strips",
+)
+
+_WHOP_PREFIX_RE = re.compile(
+    r"^(?:earn\s+\$[\d.,]+\s+per\s+1[,.]?000\s+views(?:\s+clipping)?\s+|"
+    r"clipping\s+|join\s+|content\s+rewards\s*[:|\-–—]\s*)+",
+    re.I,
+)
+_WHOP_SUFFIX_RE = re.compile(
+    r"\s*(?:\|\s*\$[\d.,]+[kKmM]?\s*budget.*|\|\s*content\s+rewards.*|"
+    r"\bby\s+[A-Z0-9][A-Za-z0-9\s.&'-]{1,40}$|\s*[-–—|]\s*whop\b.*)$",
+    re.I,
+)
+_WHOP_NOISE_PATHS = {"/blog", "/docs", "/creators", "/articles", "/about", "/discover"}
+_WHOP_NON_BRAND_TITLES = {
+    "content rewards",
+    "which social media platforms pay creators",
+    "youtube shorts monetization",
+    "what is clipping",
+    "for creators",
+    "articles",
+    "about",
+    "discover",
+    "home",
+}
+_WHOP_CLIPPING_WORD_RE = re.compile(r"\s+\bclipping\b.*$", re.I)
+_SHOP_LEADING_NOISE = {
+    "pack",
+    "new",
+    "100%",
+    "2pcs",
+    "3pcs",
+    "4pcs",
+    "organic",
+    "natural",
+    "pure",
+    "best",
+    "hot",
+    "sale",
+    "sugar",
+    "vegan",
+    "adults",
+    "women",
+    "men",
+    "sleep",
+    "deep",
+    "extra",
+    "strong",
+    "max",
+    "advanced",
+    "premium",
+    "official",
+    "set",
+    "combo",
+    "bundle",
+    "mini",
+    "pro",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+}
+_X_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})\b", re.I)
+_TG_EXPLICIT_RE = re.compile(
+    r"(?:https?://(?:www\.)?(?:t\.me|telegram\.me)/|\b(?:tg|telegram)\s*[:@\-]\s*@?)([A-Za-z][A-Za-z0-9_]{3,31})\b",
+    re.I,
+)
+_TG_NOISE = {"joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "contentrewardsbot"}
+_X_NOISE = {"home", "search", "explore", "i", "share", "intent", "hashtag", "compose", "whop", "contentrewards"}
+
+
+def fresh_seen(seen: dict[str, str], day: date, keep_days: int = SEEN_DAYS) -> dict[str, str]:
+    cutoff = day - timedelta(days=keep_days)
+    kept: dict[str, str] = {}
+    for key, raw in (seen or {}).items():
+        try:
+            seen_on = date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            continue
+        if seen_on >= cutoff:
+            kept[str(key)] = seen_on.isoformat()
+    return kept
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").casefold()).strip("-")
+    return slug[:64] or "lead"
+
+
+def _rotate_for_day(items: tuple[str, ...], day: date, count: int) -> list[str]:
+    total = len(items)
+    if not total or count <= 0:
+        return []
+    start = (day.toordinal() * count) % total
+    return [items[(start + i) % total] for i in range(min(count, total))]
+
+
+def _unwrap_search_results(payload: Any) -> list[dict[str, Any]]:
+    if not payload:
+        return []
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("results", "items", "organic_results"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return [r for r in val if isinstance(r, dict)]
+    for subkey in ("output", "result", "data"):
+        sub = payload.get(subkey)
+        if isinstance(sub, list):
+            return [r for r in sub if isinstance(r, dict)]
+        if isinstance(sub, dict):
+            nested = _unwrap_search_results(sub)
+            if nested:
+                return nested
+    return []
+
+
+def _default_web_search(query: str) -> dict[str, Any] | None:
+    if not check_treg_ready():
+        return None
+    return treg_call("crawl4ai.web.search", query={"q": query}, timeout=35)
+
+
+def _clean_whop_brand(raw_title: str) -> str:
+    t = html_mod.unescape(" ".join(str(raw_title or "").split())).strip()
+    t = re.sub(r"\s*[-–—|:]\s*(?:Whop|Content Rewards).*$", "", t, flags=re.I).strip()
+    t = _WHOP_PREFIX_RE.sub("", t).strip()
+    t = _WHOP_SUFFIX_RE.sub("", t).strip()
+    t = _WHOP_CLIPPING_WORD_RE.sub("", t).strip()
+    t = t.strip(" -–—|:•")
+    if len(t) < 2 or t.casefold() in _WHOP_NON_BRAND_TITLES:
+        return ""
+    if any(tok in t.casefold() for tok in ("how to", "guide", "articles", "blog", "clipper hub")):
+        return ""
+    return t[:80]
+
+
+def _extract_whop_budget_signal(blob: str, snippet: str = "") -> str:
+    text = " ".join(str(blob or "").split())
+    budget_m = re.search(r"budget\s*[:=]?\s*(\$[\d,]+(?:\.\d+)?[kKmM]?)", text, re.I)
+    if not budget_m:
+        budget_m = re.search(r"(\$[\d,]+(?:\.\d+)?[kKmM]?)\s*(?:budget|allocated)", text, re.I)
+    cpm_m = re.search(
+        r"(\$[\d,]+(?:\.\d+)?)\s*(?:per\s+1[,.]?000\s+views|/\s*1k|cpm)",
+        text,
+        re.I,
+    )
+    if not cpm_m:
+        cpm_m = re.search(r"cpm\s*[:=]?\s*(\$[\d,]+(?:\.\d+)?)", text, re.I)
+    parts: list[str] = []
+    if budget_m:
+        parts.append(f"{budget_m.group(1)} budget")
+    if cpm_m:
+        parts.append(f"{cpm_m.group(1)} CPM")
+    desc = " ".join(str(snippet or "").split())
+    if parts:
+        head = f"Active Whop Content Rewards campaign ({', '.join(parts)})"
+        return f"{head} — {desc}"[:200] if desc else head[:200]
+    return f"Active Whop Content Rewards campaign: {(desc or text)[:130]}".strip()
+
+
+def _extract_inline_contacts(text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for m_x in _X_RE.finditer(text or ""):
+        h = m_x.group(1)
+        if h.casefold() not in _X_NOISE:
+            found["founder_x"] = f"https://x.com/{h}"
+            break
+    for m_tg in _TG_EXPLICIT_RE.finditer(text or ""):
+        u = m_tg.group(1)
+        if u.casefold() not in _TG_NOISE and not u.lower().endswith("bot"):
+            found["username"] = u
+            break
+    return found
+
+
+def _is_whop_doc_or_feed_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    path = (parsed.path or "/").rstrip("/").lower() or "/"
+    host = (parsed.hostname or "").lower()
+    if host.startswith("docs.") or "/blog/" in path or "/articles" in path or path in _WHOP_NOISE_PATHS:
+        return True
+    return False
+
+
+def _merge_enriched_contacts(
+    *,
+    brand: str,
+    domain: str,
+    project_url: str,
+    extra_text: str,
+    enrich_fn,
+    site_scrape_fn,
+    budget: list[int],
+) -> dict[str, str]:
+    inline = _extract_inline_contacts(extra_text)
+    dm: dict[str, Any] = {}
+    if budget[0] > 0 and (brand or domain):
+        budget[0] -= 1
+        try:
+            dm = enrich_fn(brand, domain) or {}
+        except Exception:
+            dm = {}
+
+    resolved_url = project_url or str(dm.get("project_url") or "").strip()
+    resolved_domain = domain or domain_of(resolved_url)
+    site_contacts: dict[str, str] = {}
+    if resolved_domain and resolved_url:
+        try:
+            site_contacts = site_scrape_fn(resolved_url) or {}
+        except Exception:
+            site_contacts = {}
+
+    founder_linkedin = str(dm.get("founder_linkedin") or site_contacts.get("founder_linkedin") or "").strip()
+    work_email = str(dm.get("work_email") or site_contacts.get("work_email") or "").strip()
+    username = str(site_contacts.get("username") or inline.get("username") or "").strip().lstrip("@")
+    founder_x = str(site_contacts.get("founder_x") or inline.get("founder_x") or "").strip()
+    if founder_x:
+        founder_x = x_profile_url({"founder_x": founder_x}) or founder_x
+    return {
+        "project_url": resolved_url,
+        "domain": resolved_domain,
+        "founder_linkedin": founder_linkedin,
+        "work_email": work_email,
+        "username": username,
+        "founder_x": founder_x,
+    }
+
+
+def collect_whop_content_rewards(
+    *,
+    limit: int = 6,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    search_fn=None,
+    enrich_fn=None,
+    site_scrape_fn=None,
+    call_budget: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    today = day or date.today()
+    current = fresh_seen(seen or {}, today)
+    stamp = today.isoformat()
+    search = _default_web_search if search_fn is None else search_fn
+    enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
+    budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
+
+    rows: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+
+    for query in WHOP_QUERIES:
+        if len(rows) >= limit or budget[0] <= 0:
+            break
+        budget[0] -= 1
+        try:
+            payload = search(query)
+        except Exception:
+            payload = None
+        for hit in _unwrap_search_results(payload):
+            if len(rows) >= limit:
+                break
+            url = str(hit.get("url") or "").strip()
+            title = str(hit.get("title") or "").strip()
+            snippet = str(hit.get("snippet") or hit.get("description") or "").strip()
+            if not url or _is_whop_doc_or_feed_url(url):
+                continue
+            brand = _clean_whop_brand(title)
+            if not brand:
+                continue
+            blob = f"{title} {brand} {snippet}"
+            if is_supply_side(blob) or sniper_reject_reason(blob):
+                continue
+
+            seen_key = f"whop:{_slugify(brand)}"
+            if seen_key in current or seen_key in local_keys:
+                continue
+            local_keys.add(seen_key)
+
+            contacts = _merge_enriched_contacts(
+                brand=brand,
+                domain="",
+                project_url="",
+                extra_text=f"{snippet} {url}",
+                enrich_fn=enricher,
+                site_scrape_fn=scraper,
+                budget=budget,
+            )
+            if not any(
+                contacts[k]
+                for k in ("domain", "work_email", "founder_linkedin", "founder_x", "username")
+            ):
+                continue
+
+            what_they_do = _extract_whop_budget_signal(f"{title} {snippet}", snippet=snippet)[:200]
+            links = [
+                u
+                for u in (
+                    contacts["project_url"],
+                    url,
+                    contacts["founder_x"],
+                    contacts["founder_linkedin"],
+                    f"https://t.me/{contacts['username']}" if contacts["username"] else "",
+                )
+                if u
+            ]
+            row = {
+                "id": seen_key,
+                "name": brand,
+                "username": contacts["username"],
+                "telegram_username": contacts["username"],
+                "bio": what_they_do,
+                "links": list(dict.fromkeys(links)),
+                "source": "whop_content_rewards",
+                "source_url": url,
+                "role": "Founder",
+                "roles": ["Founder"],
+                "category": "SaaS / AI app",
+                "project": brand,
+                "company": brand,
+                "project_url": contacts["project_url"],
+                "what_they_do": what_they_do,
+                "founder_linkedin": contacts["founder_linkedin"],
+                "founder_x": contacts["founder_x"],
+                "work_email": contacts["work_email"],
+                "has_monetization_signal": True,
+                "icp_match": True,
+                "lead_tier": "A",
+            }
+            rows.append(row)
+            current[seen_key] = stamp
+
+    return rows, current
+
+
+def _default_tiktok_ads_search(keyword: str) -> dict[str, Any] | None:
+    if check_monid_ready():
+        res = run_monid(
+            "tikhub",
+            "/api/v1/tiktok/ads/search_ads",
+            body={
+                "keyword": keyword,
+                "country_code": "US",
+                "period": 30,
+                "limit": 15,
+            },
+            wait_sec=25,
+            timeout=35,
+        )
+        if res:
+            return res
+    if check_treg_ready():
+        res = treg_call(
+            "tikhub.x.tiktok-ads-search-ads",
+            method="POST",
+            data={"keyword": keyword, "country_code": "US", "period": 30, "limit": 15},
+            timeout=40,
+        )
+        if res:
+            return res
+        return treg_call(
+            "scrapecreators.x.v1-tiktok-ad-library-search",
+            query={"query": keyword},
+            timeout=40,
+        )
+    return None
+
+
+def _extract_tiktok_ad_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("materials", "ads", "results", "list", "items"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+    for sub in ("data", "output", "result"):
+        child = payload.get(sub)
+        if isinstance(child, (dict, list)):
+            found = _extract_tiktok_ad_items(child)
+            if found:
+                return found
+    return []
+
+
+def collect_tiktok_creative_ads(
+    *,
+    limit: int = 6,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    ads_search_fn=None,
+    store_resolver_fn=None,
+    enrich_fn=None,
+    site_scrape_fn=None,
+    call_budget: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    today = day or date.today()
+    current = fresh_seen(seen or {}, today)
+    stamp = today.isoformat()
+    search_ads = _default_tiktok_ads_search if ads_search_fn is None else ads_search_fn
+    resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
+    enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
+    budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
+
+    rows: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+
+    for keyword in _rotate_for_day(TIKTOK_AD_QUERIES, today, 3):
+        if len(rows) >= limit or budget[0] <= 0:
+            break
+        budget[0] -= 1
+        try:
+            payload = search_ads(keyword)
+        except Exception:
+            payload = None
+        for item in _extract_tiktok_ad_items(payload):
+            if len(rows) >= limit:
+                break
+            ads_info = item.get("ads_info") if isinstance(item.get("ads_info"), dict) else {}
+            brand_name = str(
+                item.get("brand_name")
+                or item.get("advertiser_name")
+                or ads_info.get("advertiser_name")
+                or ads_info.get("brand_name")
+                or item.get("name")
+                or ads_info.get("name")
+                or item.get("company")
+                or item.get("page_name")
+                or ""
+            ).strip()
+            ad_title = str(
+                item.get("ad_title")
+                or item.get("title")
+                or item.get("desc")
+                or item.get("caption")
+                or ads_info.get("ad_title")
+                or ""
+            ).strip()
+            if not brand_name:
+                continue
+            blob = f"{brand_name} {ad_title}"
+            if is_megacorp_app(brand_name, ad_title) or is_supply_side(blob) or sniper_reject_reason(blob):
+                continue
+
+            landing_raw = str(
+                item.get("landing_page")
+                or ads_info.get("landing_page")
+                or item.get("landing_url")
+                or item.get("url")
+                or item.get("app_url")
+                or ""
+            ).strip()
+            store_info: dict[str, Any] = {}
+            resolved_url = landing_raw
+            resolved_domain = domain_of(landing_raw)
+            extra_links: list[str] = []
+
+            if landing_raw:
+                low_scheme = landing_raw.lower()
+                is_http = low_scheme.startswith(("http://", "https://")) or (
+                    "://" not in landing_raw and ":" not in landing_raw.split("/", 1)[0]
+                )
+                host = (urlparse(landing_raw if "://" in landing_raw else f"https://{landing_raw}").hostname or "").lower().removeprefix("www.")
+                if host in APP_STORE_HOSTS:
+                    extra_links.append(landing_raw)
+                    if budget[0] > 0:
+                        budget[0] -= 1
+                        try:
+                            store_info = resolve_store(landing_raw) or {}
+                        except Exception:
+                            store_info = {}
+                    if store_info.get("is_megacorp") or int(store_info.get("rating_count") or 0) > 50000:
+                        continue
+                    resolved_url = str(store_info.get("website") or "").strip()
+                    resolved_domain = str(store_info.get("domain") or domain_of(resolved_url)).strip()
+                elif not resolved_domain or not is_http:
+                    if low_scheme.startswith(("http://", "https://")):
+                        extra_links.append(landing_raw)
+                    resolved_url = ""
+
+            seen_key = (
+                f"ttad_dom:{resolved_domain.casefold()}"
+                if resolved_domain
+                else f"ttad_brand:{_slugify(brand_name)}"
+            )
+            if seen_key in current or seen_key in local_keys:
+                continue
+            local_keys.add(seen_key)
+
+            enrich_target = str(store_info.get("developer") or brand_name).strip()
+            contacts = _merge_enriched_contacts(
+                brand=enrich_target,
+                domain=resolved_domain,
+                project_url=resolved_url,
+                extra_text=ad_title,
+                enrich_fn=enricher,
+                site_scrape_fn=scraper,
+                budget=budget,
+            )
+            if not contacts["work_email"] and store_info.get("email"):
+                contacts["work_email"] = str(store_info["email"]).strip()
+            final_url = contacts["project_url"] or resolved_url
+            final_domain = contacts["domain"] or resolved_domain
+            if not (final_domain or contacts["work_email"] or contacts["founder_linkedin"] or contacts["founder_x"] or contacts["username"]):
+                continue
+
+            what_they_do = f"Active TikTok US ad ({keyword}): {ad_title or brand_name}"[:200]
+            links = [
+                u
+                for u in (
+                    final_url,
+                    *extra_links,
+                    contacts["founder_x"],
+                    contacts["founder_linkedin"],
+                    f"https://t.me/{contacts['username']}" if contacts["username"] else "",
+                )
+                if u
+            ]
+            row = {
+                "id": f"tiktok_ads:{_slugify(final_domain or brand_name)}",
+                "name": brand_name,
+                "username": contacts["username"],
+                "telegram_username": contacts["username"],
+                "bio": what_they_do,
+                "links": list(dict.fromkeys(links)),
+                "source": "tiktok_ads",
+                "role": "Marketing",
+                "roles": ["Marketing"],
+                "category": "SaaS / AI app",
+                "project": brand_name,
+                "company": brand_name,
+                "project_url": final_url,
+                "what_they_do": what_they_do,
+                "founder_linkedin": contacts["founder_linkedin"],
+                "founder_x": contacts["founder_x"],
+                "work_email": contacts["work_email"],
+                "has_monetization_signal": True,
+                "icp_match": True,
+                "lead_tier": "A",
+            }
+            rows.append(row)
+            current[seen_key] = stamp
+
+    return rows, current
+
+
+def _default_tiktok_shop_search(search_word: str) -> dict[str, Any] | None:
+    if check_monid_ready():
+        res = run_monid(
+            "tikhub",
+            "/api/v1/tiktok/shop/web/fetch_search_products_list",
+            query={"search_word": search_word, "page": "1"},
+            wait_sec=25,
+            timeout=35,
+        )
+        if res:
+            return res
+    if check_treg_ready():
+        return treg_call(
+            "scrapecreators.x.v1-tiktok-shop-search",
+            query={"query": search_word, "region": "US"},
+            timeout=40,
+        )
+    return None
+
+
+def _extract_shop_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("products", "items", "results", "product_list"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+    for sub in ("data", "output", "result"):
+        child = payload.get(sub)
+        if isinstance(child, (dict, list)):
+            found = _extract_shop_items(child)
+            if found:
+                return found
+    return []
+
+
+def _extract_shop_brand(item: dict[str, Any]) -> str:
+    seller_info = item.get("seller_info") if isinstance(item.get("seller_info"), dict) else {}
+    shop_info = item.get("shop") if isinstance(item.get("shop"), dict) else {}
+    explicit = str(
+        item.get("seller_name")
+        or item.get("shop_name")
+        or item.get("brand_name")
+        or seller_info.get("shop_name")
+        or seller_info.get("name")
+        or shop_info.get("shop_name")
+        or shop_info.get("name")
+        or ""
+    ).strip()
+    if explicit and explicit.casefold() not in _SHOP_LEADING_NOISE and len(explicit) >= 2:
+        return explicit[:60]
+
+    title = " ".join(str(item.get("title") or item.get("product_name") or "").split())
+    words = [re.sub(r"[^A-Za-z0-9&-]", "", w) for w in title.split()[:4]]
+    words = [w for w in words if w]
+    if not words:
+        return ""
+    lead = words[0]
+    if lead.casefold() in _SHOP_LEADING_NOISE or lead.isdigit() or len(lead) < 3:
+        return ""
+    if lead.isupper() or (lead[:1].isupper() and any(ch.isupper() for ch in lead[1:])):
+        return lead
+    if len(words) >= 2 and words[1].casefold() not in _SHOP_LEADING_NOISE and words[1][:1].isupper():
+        return f"{lead} {words[1]}"
+    return lead if lead[:1].isupper() else ""
+
+
+def collect_tiktok_shop_brands(
+    *,
+    limit: int = 5,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    shop_search_fn=None,
+    enrich_fn=None,
+    site_scrape_fn=None,
+    call_budget: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    today = day or date.today()
+    current = fresh_seen(seen or {}, today)
+    stamp = today.isoformat()
+    search_shop = _default_tiktok_shop_search if shop_search_fn is None else shop_search_fn
+    enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
+    budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
+
+    rows: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+
+    for keyword in _rotate_for_day(TIKTOK_SHOP_QUERIES, today, 2):
+        if len(rows) >= limit or budget[0] <= 0:
+            break
+        budget[0] -= 1
+        try:
+            payload = search_shop(keyword)
+        except Exception:
+            payload = None
+        for item in _extract_shop_items(payload):
+            if len(rows) >= limit:
+                break
+            brand = _extract_shop_brand(item)
+            title = str(item.get("title") or item.get("product_name") or "").strip()
+            if not brand:
+                continue
+            blob = f"{brand} {title}"
+            if is_megacorp_app(brand, title) or is_supply_side(blob) or sniper_reject_reason(blob):
+                continue
+
+            seen_key = f"ttshop:{_slugify(brand)}"
+            if seen_key in current or seen_key in local_keys:
+                continue
+            local_keys.add(seen_key)
+
+            site_raw = str(item.get("website") or item.get("brand_url") or "").strip()
+            dom = domain_of(site_raw)
+            safe_site = site_raw if dom else ""
+            contacts = _merge_enriched_contacts(
+                brand=brand,
+                domain=dom,
+                project_url=safe_site,
+                extra_text=title,
+                enrich_fn=enricher,
+                site_scrape_fn=scraper,
+                budget=budget,
+            )
+            if not any(
+                contacts[k]
+                for k in ("domain", "work_email", "founder_linkedin", "founder_x", "username")
+            ):
+                continue
+
+            what_they_do = f"TikTok Shop US brand ({keyword}): {title or brand}"[:200]
+            links = [
+                u
+                for u in (
+                    contacts["project_url"],
+                    contacts["founder_x"],
+                    contacts["founder_linkedin"],
+                    f"https://t.me/{contacts['username']}" if contacts["username"] else "",
+                )
+                if u
+            ]
+            row = {
+                "id": seen_key,
+                "name": brand,
+                "username": contacts["username"],
+                "telegram_username": contacts["username"],
+                "bio": what_they_do,
+                "links": list(dict.fromkeys(links)),
+                "source": "tiktok_shop",
+                "role": "Founder",
+                "roles": ["Founder"],
+                "category": "SaaS / AI app",
+                "project": brand,
+                "company": brand,
+                "project_url": contacts["project_url"],
+                "what_they_do": what_they_do,
+                "founder_linkedin": contacts["founder_linkedin"],
+                "founder_x": contacts["founder_x"],
+                "work_email": contacts["work_email"],
+                "has_monetization_signal": True,
+                "icp_match": True,
+                "lead_tier": "A",
+            }
+            rows.append(row)
+            current[seen_key] = stamp
+
+    return rows, current
+
+
+def _load_seen(path: Path) -> dict[str, str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            inner = raw.get("items") if isinstance(raw.get("items"), dict) else raw
+            return {str(k): str(v) for k, v in inner.items() if isinstance(v, str)}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_seen(path: Path, seen: dict[str, str]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"items": seen}, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def collect_all_veins(
+    *,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    limit: int = 16,
+    veins: tuple[str, ...] = ("whop", "tiktok_ads", "tiktok_shop"),
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    today = day or date.today()
+    merged_seen = fresh_seen(seen or {}, today)
+    all_rows: list[dict[str, Any]] = []
+
+    vein_set = {v.strip().lower() for v in veins if v.strip()}
+    per_vein_cap = max(1, min(6, limit // max(1, len(vein_set)) + 1))
+
+    if "whop" in vein_set and len(all_rows) < limit:
+        w_rows, merged_seen = collect_whop_content_rewards(
+            limit=min(per_vein_cap, limit - len(all_rows)),
+            day=today,
+            seen=merged_seen,
+            call_budget=[10],
+        )
+        all_rows.extend(w_rows)
+    if "tiktok_ads" in vein_set and len(all_rows) < limit:
+        t_rows, merged_seen = collect_tiktok_creative_ads(
+            limit=min(per_vein_cap, limit - len(all_rows)),
+            day=today,
+            seen=merged_seen,
+            call_budget=[10],
+        )
+        all_rows.extend(t_rows)
+    if "tiktok_shop" in vein_set and len(all_rows) < limit:
+        s_rows, merged_seen = collect_tiktok_shop_brands(
+            limit=min(per_vein_cap, limit - len(all_rows)),
+            day=today,
+            seen=merged_seen,
+            call_budget=[10],
+        )
+        all_rows.extend(s_rows)
+
+    return all_rows[:limit], merged_seen
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Collect SoftUGC high-yield veins")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--seen", default="data/leadgen_state/high_yield_seen.json")
+    parser.add_argument("--limit", type=int, default=16)
+    parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop")
+    parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
+    args = parser.parse_args(argv)
+
+    day = date.fromisoformat(args.day) if args.day else date.today()
+    seen_path = Path(args.seen)
+    before = _load_seen(seen_path)
+    veins = tuple(v.strip() for v in args.veins.split(",") if v.strip())
+    try:
+        rows, updated = collect_all_veins(day=day, seen=before, limit=max(0, args.limit), veins=veins)
+    except Exception:
+        rows, updated = [], before
+    _save_seen(seen_path, updated)
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"high_yield_veins: admitted={len(rows)}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

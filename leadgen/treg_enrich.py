@@ -35,6 +35,9 @@ SKIP_HOSTS = {
     "producthunt.com", "linkedin.com", "twitter.com", "x.com", "youtube.com",
     "youtu.be", "instagram.com", "facebook.com", "calendar.app.google",
     "notion.site", "notion.so", "github.com", "behance.net",
+    "apps.apple.com", "itunes.apple.com", "play.google.com", "tiktok.com",
+    "whop.com", "apps.whop.com", "fonts.googleapis.com", "fonts.gstatic.com",
+    "gstatic.com", "cloudflare.com", "cdn.jsdelivr.net",
 }
 CREATOR_KEYWORDS = ["AI UGC", "short form video ads", "prop firm challenge"]
 FOREX_KEYWORDS = ["forex trading signals", "crypto trading channel"]
@@ -42,10 +45,18 @@ AD_COMPANY = {"creator": "Creatify", "forex": "FTMO"}
 
 
 def domain_of(url: str) -> str:
-    if not url:
+    raw_in = str(url or "").strip()
+    if not raw_in:
         return ""
-    raw = url if "://" in url else "https://" + url
-    host = (urlparse(raw).hostname or "").lower().removeprefix("www.")
+    if "://" in raw_in:
+        parsed = urlparse(raw_in)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return ""
+    else:
+        if ":" in raw_in.split("/", 1)[0]:
+            return ""
+        parsed = urlparse("https://" + raw_in)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
     if not host or "." not in host:
         return ""
     if any(host == skip or host.endswith("." + skip) for skip in SKIP_HOSTS):

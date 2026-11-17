@@ -34,8 +34,6 @@ except ImportError:
 CAP = 8
 TIMEOUT = 8
 SOURCES = (
-    ("fivem", "https://fivem-server.org/servers/english"),
-    ("gta", "https://6charts.com/gta-6-servers"),
     ("groover", "https://groover.co/en/influencer/list/tags/label/"),
     ("gumroad", "https://gumroad.com/discover?query=fitness"),
 )
