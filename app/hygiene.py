@@ -142,6 +142,7 @@ _SNIPER_OSS_OR_DEVTOOL_RE = re.compile(
     r"|синхронизирует\s+ai[\s\-]*кодинг[\s\-]*агентов"
     r"|\bclaude\s+code,\s*codex,\s*cursor\b"
     r"|\bbacklink\s+indexing\s+service\b|\bbacklink\s+indexer\b"
+    r"|\b(?:matrixreach|matrixreach_bot|firsay|1win(?:\s+partners)?|1xbet|mostbet)\b"
     r")",
     re.IGNORECASE,
 )

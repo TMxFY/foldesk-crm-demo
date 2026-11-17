@@ -1984,6 +1984,44 @@ def apply_sniper_icp_cleanup_v7(
     from app.hygiene import heal_crm_hygiene
 
     heal_res = heal_crm_hygiene(conn, clear_stale_stage_errors=True)
+    # Upgrade persisted leadgen_config (if present) to Sniper ICP defaults:
+    # disable noisy agency/freelance TG chats & external GitHub/HN limit while keeping buyer/ad sources on.
+    try:
+        cfg_row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'leadgen_config'"
+        ).fetchone()
+        if cfg_row and cfg_row["value"]:
+            import json as _json
+            from app.leadgen_settings import _normalize_config, _resolve_config_json_path
+            from app.runtime_config import is_vps_runtime
+
+            existing_cfg = _json.loads(str(cfg_row["value"]))
+            if isinstance(existing_cfg, dict):
+                b2b = existing_cfg.setdefault("b2b", {})
+                sources = b2b.setdefault("sources", {})
+                sources["tg_groups"] = False
+                for buyer_src in ("meta_ads", "social_x_reddit", "tg_ad_spy", "channel_graph", "buyer_catalogs", "yc_ph"):
+                    sources.setdefault(buyer_src, True)
+                noisy_chats = {"shopifyeasy", "solofounders", "solofounderschat"}
+                for g_key in ("tg_groups_old", "tg_groups_new"):
+                    if isinstance(b2b.get(g_key), list):
+                        b2b[g_key] = [
+                            g for g in b2b[g_key] if str(g or "").strip().lstrip("@").lower() not in noisy_chats
+                        ]
+                limits = b2b.setdefault("limits", {})
+                limits["external_limit"] = 0
+                norm_cfg = _normalize_config(existing_cfg)
+                serialized_cfg = _json.dumps(norm_cfg, ensure_ascii=False, indent=2)
+                conn.execute(
+                    "UPDATE kv_settings SET value = ?, updated_at = ? WHERE key = 'leadgen_config'",
+                    (serialized_cfg, utc_now()),
+                )
+                if is_vps_runtime() or os.environ.get("LEADGEN_CONFIG_PATH", "").strip():
+                    cfg_p = _resolve_config_json_path()
+                    cfg_p.parent.mkdir(parents=True, exist_ok=True)
+                    cfg_p.write_text(serialized_cfg, encoding="utf-8")
+    except Exception:
+        pass
     now_ts = utc_now()
     conn.execute(
         "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('sniper_icp_cleanup_v7', '1', ?)",
