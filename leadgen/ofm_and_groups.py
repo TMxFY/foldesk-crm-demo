@@ -24,6 +24,7 @@ from pathlib import Path
 import re
 import ssl
 import sys
+import time
 from typing import Any, Callable, Iterable
 import urllib.error
 import urllib.request
@@ -218,7 +219,9 @@ _OFM_CASINO_RE = re.compile(
 )
 _OFM_RECRUITER_MIDDLEMAN_RE = re.compile(
     r"\brecruteur(?:s)?\s+(?:de\s+)?chatteur(?:s)?\b|"
-    r"\bchatter\s+recruiter\b|\bva\s+recruiter\b|\bi\s+recruit\s+chatters\b",
+    r"\bchatter\s+recruiter\b|\bva\s+recruiter\b|\bi\s+recruit\s+chatters\b|"
+    r"\bmodels?\s+marketplace\b|\bconnect(?:ed|ing)?\s+[\d,+]*\s*models\s+with\b|"
+    r"\bmodels?\s+available\s+for\s+agenc",
     re.I,
 )
 _OFM_JOB_SEEKER_RE = re.compile(
@@ -226,9 +229,12 @@ _OFM_JOB_SEEKER_RE = re.compile(
     r"\bavailable\s+(?:as\s+|for\s+)?(?:a\s+)?(?:va\b|instagram|threads|tiktok|reddit|x|chatting)|"
     r"\b(?:virtual\s+assistant|chatter)\s+available\b|"
     r"\blooking\s+for\s+(?:an?\s+)?(?:ofm\s+)?agenc(?:y|ies)\b|"
-    r"\blooking\s+for\s+(?:a\s+)?(?:job|work|chatter\s+(?:role|position|job)|va\s+(?:role|position|job)|clients?)\b|"
+    r"\blooking\s+for\s+(?:a\s+|an\s+)?(?:long[-\s]?term\s+|full[-\s]?time\s+|part[-\s]?time\s+|remote\s+)?(?:job|work|role|position|opportunity|chatter\s+(?:role|position|job)|va\s+(?:role|position|job)|clients?)\b|"
+    r"\bready\s+to\s+(?:promote|manage|grow|scale)\s+your\s+models?\b|"
+    r"\bare\s+(?:you\s+)?looking\s+for\s+(?:a\s+|an\s+)?[^?\n]{0,80}\b(?:virtual\s+assistant|va\b|chatter|chatteur|specialist|manager)\b|"
+    r"\b(?:do\s+you\s+)?need\s+(?:a\s+|an\s+)?[^?\n]{0,80}\b(?:virtual\s+assistant|va\b|chatter|chatteur|specialist)\b[^?\n]{0,60}\?|"
     r"\bseeking\b.{0,30}\b(?:agency|chatter\s+(?:role|job)|job|position|clients?)\b|"
-    r"\b(?:i\s+am|i'm|im|je\s+suis)\s+(?:a\s+|an\s+)?(?:experienced\s+)?(?:ofm\s+)?(?:chatter|chatteur|chatteuse|virtual\s+assistant|va\b)\b|"
+    r"\b(?:i\s+am|i['’]m|im|je\s+suis)\s+(?:a\s+|an\s+)?(?:experienced\s+|reliable\s+|results[-\s]driven\s+|dedicated\s+)?(?:ofm\s+|reddit\s+|dating\s+app\s+|instagram\s+|threads\s+|tiktok\s+|twitter\s+|social\s+media\s+)?(?:chatter|chatteur|chatteuse|virtual\s+assistant|va\b|specialist)\b|"
     r"\b(?:je\s+)?cherche\b.{0,35}\b(?:agence|poste|travail|mission|boulot|clients?)\b|"
     r"\bdispo(?:nible)?\s+(?:pour|as|for)\s+(?:chatting|chatter|chatteur|va|travail)\b|"
     r"\b(?:i\s+offer|je\s+propose\s+mes\s+services|dm\s+for\s+my\s+services)\b|"
@@ -667,14 +673,14 @@ def _post_chat_completions(
     api_key: str,
     model: str,
     messages: list[dict[str, str]],
-    timeout: int = 45,
+    timeout: int = 20,
 ) -> str:
     payload = json.dumps(
         {
             "model": model,
             "messages": messages,
             "temperature": 0,
-            "max_tokens": 1200,
+            "max_tokens": 2000,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -684,6 +690,7 @@ def _post_chat_completions(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "SoftUGC-Leadgen/1.0",
         },
         method="POST",
     )
@@ -701,7 +708,7 @@ Reject (is_buyer=false):
 - Job seekers, available VAs/chatters, chatter middleman recruiters ("recruteur de chatteurs"), KYC/fraud/emulator/payment hacks, L4L/SFS/F4F promo spam, account sellers, casino, or bots.
 
 Return STRICT JSON array only, matching the input indices:
-[{"index": 0, "is_buyer": true, "ofm_tier": "traffic_buyer", "icp_score": 92, "reason": "..."}]"""
+[{"index": 0, "is_buyer": true, "ofm_tier": "traffic_buyer", "icp_score": 92, "reason": "max 10 words"}]"""
 
 
 def refine_ofm_buyers_with_llm(
@@ -735,7 +742,8 @@ def refine_ofm_buyers_with_llm(
 
     batch_size = 12
     verified: list[dict[str, Any]] = []
-    models = _llm_model_chain()
+    models = _llm_model_chain()[:2]
+    deadline = time.monotonic() + 45.0
 
     for start in range(0, len(candidates), batch_size):
         chunk = candidates[start : start + batch_size]
@@ -758,12 +766,16 @@ def refine_ofm_buyers_with_llm(
 
         parsed_judgments: dict[int, dict[str, Any]] | None = None
         for model in models:
+            rem = deadline - time.monotonic()
+            if rem <= 3.0:
+                break
             try:
                 raw_content = _post_chat_completions(
                     base_url=eff_base,
                     api_key=eff_key,
                     model=model,
                     messages=messages,
+                    timeout=max(4, min(20, int(rem))),
                 )
                 cleaned = re.sub(
                     r"^```(?:json)?\s*|\s*```$", "", raw_content, flags=re.M
@@ -1358,6 +1370,7 @@ async def _collect_b2b_tg_groups_async(
     *,
     groups: Iterable[str] | None = None,
     state_dir: str | Path | None = None,
+    seen_path: str | Path | None = None,
     session_path: str = "",
     api_id: int = 0,
     api_hash: str = "",
@@ -1367,12 +1380,16 @@ async def _collect_b2b_tg_groups_async(
     max_full_user_lookups: int = 50,
     client: Any = None,
 ) -> list[dict[str, Any]]:
-    persist_seen = state_dir is not None or client is None
+    persist_seen = seen_path is not None or state_dir is not None or client is None
     resolved_state_dir = Path(state_dir) if state_dir is not None else _resolve_state_dir()
-    seen_path = resolved_state_dir / "b2b_tg_groups_seen.json"
+    eff_seen_path = (
+        Path(seen_path)
+        if seen_path is not None
+        else (resolved_state_dir / "b2b_tg_groups_seen.json")
+    )
     today = date.today()
     today_iso = today.isoformat()
-    seen = _load_seen_map(seen_path, today) if persist_seen else {}
+    seen = _load_seen_map(eff_seen_path, today) if persist_seen else {}
 
     own_client = client is None
     tg_client = client
@@ -1495,6 +1512,10 @@ async def _collect_b2b_tg_groups_async(
 
                 if market_of(project_url, combined) == "ru":
                     continue
+                if project_url and re.search(
+                    r"(?:^|/)(?:ru|rus)(?:/|$)", urlparse(project_url).path.lower()
+                ):
+                    continue
 
                 inferred_role = classify_role(bio) or classify_role(text)
                 if inferred_role in NON_BUYER_ROLES and not has_buyer_intent:
@@ -1597,7 +1618,7 @@ async def _collect_b2b_tg_groups_async(
                 pass
 
     if persist_seen:
-        _save_seen_map(seen_path, seen)
+        _save_seen_map(eff_seen_path, seen)
 
     return rows
 
@@ -1606,6 +1627,7 @@ def collect_b2b_tg_groups(
     *,
     groups: Iterable[str] | None = None,
     state_dir: str | Path | None = None,
+    seen_path: str | Path | None = None,
     session_path: str = "",
     api_id: int = 0,
     api_hash: str = "",
@@ -1620,6 +1642,7 @@ def collect_b2b_tg_groups(
         _collect_b2b_tg_groups_async(
             groups=groups,
             state_dir=state_dir,
+            seen_path=seen_path,
             session_path=session_path,
             api_id=api_id,
             api_hash=api_hash,
@@ -1638,7 +1661,7 @@ def _default_treg_caller(
     method: str | None = None,
     data: dict[str, Any] | None = None,
     query: dict[str, str] | None = None,
-    timeout: int = 45,
+    timeout: int = 20,
 ) -> dict[str, Any] | None:
     if not check_treg_ready():
         return None
@@ -1780,7 +1803,7 @@ def collect_facebook_groups(
     group_urls: Iterable[str] | None = None,
     state_dir: str | Path | None = None,
     limit: int = 20,
-    max_groups: int = 5,
+    max_groups: int = 3,
     treg_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Discover & scrape public Facebook groups via Treg, routing OFM vs B2B leads."""
@@ -2043,6 +2066,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seen", default="", help="Optional path to ofm_seen.json")
     parser.add_argument("--discover-groups", action="store_true")
     parser.add_argument("--llm-verify", action="store_true")
+    parser.add_argument("--no-llm-verify", action="store_true")
     parser.add_argument("--session", default="", help="Path to read-only Telethon .session file")
     args = parser.parse_args(argv)
 
@@ -2063,6 +2087,14 @@ def main(argv: list[str] | None = None) -> int:
 
     seen_arg = Path(args.seen) if args.seen else None
     eff_session = _default_tg_session(args.session)
+    eff_llm_verify = (
+        False
+        if args.no_llm_verify
+        else bool(
+            args.llm_verify
+            or (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
+        )
+    )
 
     b2b_rows: list[dict[str, Any]] = []
     ofm_rows: list[dict[str, Any]] = []
@@ -2077,7 +2109,7 @@ def main(argv: list[str] | None = None) -> int:
             msg_limit=args.msg_limit,
             limit=args.limit,
             discover_groups=args.discover_groups,
-            llm_verify=args.llm_verify,
+            llm_verify=eff_llm_verify,
         )
         ofm_rows.extend(ofm_res.get("rows") or [])
         summary["ofm_tg"] = {
@@ -2093,6 +2125,7 @@ def main(argv: list[str] | None = None) -> int:
         b2b_tg_rows = collect_b2b_tg_groups(
             groups=groups_arg,
             state_dir=state_dir,
+            seen_path=seen_arg if args.mode == "b2b_tg" else None,
             session_path=eff_session,
             msg_limit=args.msg_limit,
             limit=args.limit,

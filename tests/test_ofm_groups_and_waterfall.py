@@ -516,5 +516,60 @@ def test_ofm_france_classifier_tg_groups_and_facebook_groups(tmp_path: Path) -> 
     from leadgen import contact_waterfall
     assert contact_waterfall.is_personal_or_exec_email("autoreply@acme.ai", "acme.ai") is False
 
+    # - Rhetorical VA pitches, curly apostrophe job-seekers, and model brokers rejected
+    assert ofm_and_groups.classify_ofm_actor(
+        name="ASHER LEVI",
+        username="ASHER_LEVI4",
+        text="I’m a Reddit specialist looking for a long term job !! READY TO PROMOTE YOUR MODEL",
+    )["is_buyer"] is False
+    assert ofm_and_groups.classify_ofm_actor(
+        name="ma_taeo",
+        username="ma_taeo",
+        text="🚀 NEED A REDDIT & DATING APP VA WHO UNDERSTANDS TRAFFIC AND GROWTH? Hey, I’m Liam",
+    )["is_buyer"] is False
+    assert ofm_and_groups.classify_ofm_actor(
+        name="MargeOFM",
+        username="MargeOFM",
+        text="MODELS MARKETPLACE by MICHAELOFM1 💸 Since 2024, we’ve connected 2,000+ models with agencies",
+    )["is_buyer"] is False
+    assert ofm_and_groups.classify_ofm_actor(
+        name="Kris",
+        username="Krisnikole",
+        text="Are you Looking for a reliable Virtual Assistant for Threads, X & Instagram? I’m available",
+    )["is_buyer"] is False
+    assert ofm_and_groups.classify_ofm_actor(
+        name="Ray OFM",
+        username="rayofm2",
+        text="👾 Are Looking for a High-Performing Dating App Virtual Assistant? 👾 I’m a results-driven specialist",
+    )["is_buyer"] is False
+
+    # - collect_b2b_tg_groups honors custom seen_path & rejects /ru/ localized paths
+    custom_seen = tmp_path / "custom_btg_seen.json"
+    btg_res = ofm_and_groups.collect_b2b_tg_groups(
+        groups=["productcircle_chat"],
+        state_dir=state_dir,
+        seen_path=custom_seen,
+        delay=0.0,
+        client=FakeClient(
+            [
+                FakeMsg(
+                    id=201,
+                    message="Сделал 😍 https://calk.me/ru/",
+                    sender=FakeSender(id=201, username="ispbox", first_name="Ivan", last_name="", bot=False, deleted=False),
+                ),
+                FakeMsg(
+                    id=202,
+                    message="Founder of https://vibeling.app/ — AI language app, looking for UGC traffic",
+                    sender=FakeSender(id=202, username="vital_pavlenko", first_name="Vitaliy", last_name="Pavlenko", bot=False, deleted=False),
+                ),
+            ]
+        ),
+    )
+    assert custom_seen.is_file()
+    assert len(btg_res) == 1
+    assert btg_res[0]["username"] == "vital_pavlenko"
+    assert btg_res[0]["project_url"] == "https://vibeling.app/"
+
+
 
 
