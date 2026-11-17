@@ -39,8 +39,8 @@ SEEN_DAYS = 90
 MAX_API_CALLS_PER_RUN = 25
 
 WHOP_QUERIES = (
-    'site:whop.com ("per 1,000 views" OR "content rewards") ("Budget" OR "CPM") -blog -docs',
-    'site:apps.whop.com/discover ("per 1,000 views" OR "CPM")',
+    'site:whop.com/discover ("per 1,000 views" OR "content rewards") ("Budget" OR "CPM") -blog -docs -terms',
+    'site:apps.whop.com/discover ("per 1,000 views" OR "CPM") -terms',
 )
 
 TIKTOK_AD_QUERIES = (
@@ -71,9 +71,53 @@ _WHOP_SUFFIX_RE = re.compile(
     r"\bby\s+[A-Z0-9][A-Za-z0-9\s.&'-]{1,40}$|\s*[-–—|]\s*whop\b.*)$",
     re.I,
 )
-_WHOP_NOISE_PATHS = {"/blog", "/docs", "/creators", "/articles", "/about", "/discover"}
+_WHOP_NOISE_PATHS = {"/blog", "/docs", "/creators", "/articles", "/about", "/discover", "/brands-terms", "/terms", "/privacy"}
+_NOISE_BRAND_NAMES = frozenset({
+    "not mention",
+    "not mentioned",
+    "sponsored",
+    "advertisement",
+    "ad",
+    "ads",
+    "unknown",
+    "none",
+    "n/a",
+    "brand",
+    "official",
+    "tiktok",
+    "whop",
+    "content rewards",
+    "content campaigns",
+    "slideshows",
+})
+_NOISE_BRAND_SUBSTRINGS = (
+    "terms of service",
+    "privacy policy",
+    "content campaigns",
+    "content rewards",
+    "slideshows",
+    "clipper",
+    "how to",
+    "tutorial",
+    "template",
+    "platform fee",
+)
+_BRAND_TOKEN_STOPWORDS = frozenset({
+    "app", "apps", "inc", "llc", "ltd", "corp", "co", "the", "and", "for", "of",
+    "studio", "labs", "media", "shop", "store", "official", "fame", "pro",
+})
+_MARKETPLACE_NOISE_DOMAINS = frozenset({
+    "amazon.com", "amazon.co.uk", "walmart.com", "ebay.com", "etsy.com", "target.com",
+    "crunchbase.com", "zoominfo.com", "pitchbook.com", "apollo.io", "rocketreach.co",
+    "yelp.com", "trustpilot.com", "glassdoor.com", "indeed.com", "wikipedia.org",
+    "reddit.com", "quora.com", "medium.com", "substack.com", "pinterest.com",
+    "facebook.com", "instagram.com", "youtube.com", "tiktok.com", "x.com", "twitter.com",
+    "linkedin.com", "whop.com", "t.me", "telegram.me",
+})
 _WHOP_NON_BRAND_TITLES = {
     "content rewards",
+    "content campaigns",
+    "organization terms of service",
     "which social media platforms pay creators",
     "youtube shorts monetization",
     "what is clipping",
@@ -185,6 +229,96 @@ def _default_web_search(query: str) -> dict[str, Any] | None:
     return treg_call("crawl4ai.web.search", query={"q": query}, timeout=35)
 
 
+def _is_noise_brand(brand: str) -> bool:
+    low = re.sub(r"\s+", " ", str(brand or "").strip().casefold())
+    low_clean = re.sub(r"\s*\[[^\]]*\]\s*$", "", low).strip()
+    if not low_clean or len(low_clean) < 2:
+        return True
+    if low in _NOISE_BRAND_NAMES or low_clean in _NOISE_BRAND_NAMES:
+        return True
+    return any(sub in low for sub in _NOISE_BRAND_SUBSTRINGS)
+
+
+def _brand_distinctive_tokens(brand: str) -> list[str]:
+    primary = re.split(r"\s*[–—\-:|]\s*", str(brand or "").strip())[0].strip()
+    tokens: list[str] = []
+    for raw in (primary, brand):
+        for w in re.findall(r"[A-Za-z0-9]{3,}", str(raw or "").lower()):
+            if w not in _BRAND_TOKEN_STOPWORDS and w not in tokens:
+                tokens.append(w)
+    return tokens
+
+
+def _discover_brand_landing(
+    brand: str,
+    *,
+    search_fn,
+    store_resolver_fn,
+    budget: list[int],
+) -> tuple[str, str, dict[str, Any], list[str]]:
+    """Discover an official domain or App Store / Google Play listing for a brand."""
+    if search_fn is None or budget[0] <= 0 or _is_noise_brand(brand):
+        return "", "", {}, []
+    tokens = _brand_distinctive_tokens(brand)
+    if not tokens:
+        return "", "", {}, []
+    primary = re.split(r"\s*[–—\-:|]\s*", str(brand or "").strip())[0].strip() or brand
+    query = f'"{primary}" (official website OR apps.apple.com OR play.google.com)'
+    budget[0] -= 1
+    try:
+        payload = search_fn(query)
+    except Exception:
+        return "", "", {}, []
+
+    store_candidates: list[str] = []
+    site_candidates: list[tuple[int, str, str]] = []
+    for hit in _unwrap_search_results(payload):
+        url = str(hit.get("url") or "").strip()
+        if not url or not url.lower().startswith(("http://", "https://")):
+            continue
+        title = str(hit.get("title") or "").strip().lower()
+        snip = str(hit.get("snippet") or hit.get("description") or "").strip().lower()
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        if host in APP_STORE_HOSTS:
+            if any(tok in url.lower() or tok in title for tok in tokens):
+                store_candidates.append(url)
+            continue
+        dom = domain_of(url)
+        if not dom:
+            continue
+        if dom in _MARKETPLACE_NOISE_DOMAINS or any(
+            dom.endswith("." + bad) for bad in _MARKETPLACE_NOISE_DOMAINS
+        ):
+            continue
+        dom_hit = any(tok in dom.lower() for tok in tokens)
+        title_hit = any(tok in title or tok in snip for tok in tokens)
+        if dom_hit:
+            site_candidates.append((2, url, dom))
+        elif title_hit:
+            site_candidates.append((1, url, dom))
+
+    if site_candidates:
+        site_candidates.sort(key=lambda t: t[0], reverse=True)
+        _, best_url, best_dom = site_candidates[0]
+        return best_url, best_dom, {}, []
+
+    for s_url in store_candidates[:1]:
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
+        try:
+            st = store_resolver_fn(s_url) or {}
+        except Exception:
+            st = {}
+        if st.get("is_megacorp") or int(st.get("rating_count") or 0) > 50000:
+            return "", "", {"is_megacorp": True, "rating_count": st.get("rating_count", 0)}, [s_url]
+        w_url = str(st.get("website") or "").strip()
+        w_dom = str(st.get("domain") or domain_of(w_url)).strip()
+        return w_url, w_dom, st, [s_url]
+
+    return "", "", {}, []
+
+
 def _clean_whop_brand(raw_title: str) -> str:
     t = html_mod.unescape(" ".join(str(raw_title or "").split())).strip()
     t = re.sub(r"\s*[-–—|:]\s*(?:Whop|Content Rewards).*$", "", t, flags=re.I).strip()
@@ -192,7 +326,7 @@ def _clean_whop_brand(raw_title: str) -> str:
     t = _WHOP_SUFFIX_RE.sub("", t).strip()
     t = _WHOP_CLIPPING_WORD_RE.sub("", t).strip()
     t = t.strip(" -–—|:•")
-    if len(t) < 2 or t.casefold() in _WHOP_NON_BRAND_TITLES:
+    if len(t) < 2 or t.casefold() in _WHOP_NON_BRAND_TITLES or _is_noise_brand(t):
         return ""
     if any(tok in t.casefold() for tok in ("how to", "guide", "articles", "blog", "clipper hub")):
         return ""
@@ -242,7 +376,27 @@ def _is_whop_doc_or_feed_url(url: str) -> bool:
     parsed = urlparse(url or "")
     path = (parsed.path or "/").rstrip("/").lower() or "/"
     host = (parsed.hostname or "").lower()
-    if host.startswith("docs.") or "/blog/" in path or "/articles" in path or path in _WHOP_NOISE_PATHS:
+    if (
+        host.startswith("docs.")
+        or any(
+            tok in path
+            for tok in (
+                "/blog/",
+                "/articles",
+                "/terms",
+                "-terms",
+                "/privacy",
+                "/legal",
+                "/pricing",
+                "/login",
+                "/signup",
+                "/support",
+                "/help",
+                "/content-campaigns",
+            )
+        )
+        or path in _WHOP_NOISE_PATHS
+    ):
         return True
     return False
 
@@ -340,18 +494,29 @@ def collect_whop_content_rewards(
                 continue
             local_keys.add(seen_key)
 
+            land_url, land_dom, land_store, land_extra = _discover_brand_landing(
+                brand,
+                search_fn=search,
+                store_resolver_fn=resolve_app_store_developer,
+                budget=budget,
+            )
+            if land_store.get("is_megacorp") or int(land_store.get("rating_count") or 0) > 50000:
+                continue
+
             contacts = _merge_enriched_contacts(
-                brand=brand,
-                domain="",
-                project_url="",
+                brand=str(land_store.get("developer") or brand).strip(),
+                domain=land_dom,
+                project_url=land_url,
                 extra_text=f"{snippet} {url}",
                 enrich_fn=enricher,
                 site_scrape_fn=scraper,
                 budget=budget,
             )
+            if not contacts["work_email"] and land_store.get("email"):
+                contacts["work_email"] = str(land_store["email"]).strip()
             if not any(
                 contacts[k]
-                for k in ("domain", "work_email", "founder_linkedin", "founder_x", "username")
+                for k in ("domain", "work_email", "founder_x", "username")
             ):
                 continue
 
@@ -361,6 +526,7 @@ def collect_whop_content_rewards(
                 for u in (
                     contacts["project_url"],
                     url,
+                    *land_extra,
                     contacts["founder_x"],
                     contacts["founder_linkedin"],
                     f"https://t.me/{contacts['username']}" if contacts["username"] else "",
@@ -454,6 +620,7 @@ def collect_tiktok_creative_ads(
     seen: dict[str, str] | None = None,
     ads_search_fn=None,
     store_resolver_fn=None,
+    web_search_fn=None,
     enrich_fn=None,
     site_scrape_fn=None,
     call_budget: list[int] | None = None,
@@ -463,6 +630,7 @@ def collect_tiktok_creative_ads(
     stamp = today.isoformat()
     search_ads = _default_tiktok_ads_search if ads_search_fn is None else ads_search_fn
     resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
+    web_search = web_search_fn if web_search_fn is not None else (_default_web_search if ads_search_fn is None else None)
     enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
     scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
     budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
@@ -501,7 +669,7 @@ def collect_tiktok_creative_ads(
                 or ads_info.get("ad_title")
                 or ""
             ).strip()
-            if not brand_name:
+            if not brand_name or _is_noise_brand(brand_name):
                 continue
             blob = f"{brand_name} {ad_title}"
             if is_megacorp_app(brand_name, ad_title) or is_supply_side(blob) or sniper_reject_reason(blob):
@@ -543,6 +711,22 @@ def collect_tiktok_creative_ads(
                         extra_links.append(landing_raw)
                     resolved_url = ""
 
+            if not resolved_domain and web_search is not None:
+                disc_url, disc_dom, disc_store, disc_extra = _discover_brand_landing(
+                    brand_name,
+                    search_fn=web_search,
+                    store_resolver_fn=resolve_store,
+                    budget=budget,
+                )
+                if disc_store.get("is_megacorp") or int(disc_store.get("rating_count") or 0) > 50000:
+                    continue
+                if disc_dom:
+                    resolved_url = disc_url
+                    resolved_domain = disc_dom
+                if disc_store and not store_info:
+                    store_info = disc_store
+                extra_links.extend(disc_extra)
+
             seen_key = (
                 f"ttad_dom:{resolved_domain.casefold()}"
                 if resolved_domain
@@ -566,7 +750,7 @@ def collect_tiktok_creative_ads(
                 contacts["work_email"] = str(store_info["email"]).strip()
             final_url = contacts["project_url"] or resolved_url
             final_domain = contacts["domain"] or resolved_domain
-            if not (final_domain or contacts["work_email"] or contacts["founder_linkedin"] or contacts["founder_x"] or contacts["username"]):
+            if not (final_domain or contacts["work_email"] or contacts["founder_x"] or contacts["username"]):
                 continue
 
             what_they_do = f"Active TikTok US ad ({keyword}): {ad_title or brand_name}"[:200]
@@ -684,6 +868,8 @@ def collect_tiktok_shop_brands(
     day: date | None = None,
     seen: dict[str, str] | None = None,
     shop_search_fn=None,
+    web_search_fn=None,
+    store_resolver_fn=None,
     enrich_fn=None,
     site_scrape_fn=None,
     call_budget: list[int] | None = None,
@@ -692,6 +878,8 @@ def collect_tiktok_shop_brands(
     current = fresh_seen(seen or {}, today)
     stamp = today.isoformat()
     search_shop = _default_tiktok_shop_search if shop_search_fn is None else shop_search_fn
+    web_search = web_search_fn if web_search_fn is not None else (_default_web_search if shop_search_fn is None else None)
+    resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
     enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
     scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
     budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
@@ -712,7 +900,7 @@ def collect_tiktok_shop_brands(
                 break
             brand = _extract_shop_brand(item)
             title = str(item.get("title") or item.get("product_name") or "").strip()
-            if not brand:
+            if not brand or _is_noise_brand(brand):
                 continue
             blob = f"{brand} {title}"
             if is_megacorp_app(brand, title) or is_supply_side(blob) or sniper_reject_reason(blob):
@@ -726,6 +914,17 @@ def collect_tiktok_shop_brands(
             site_raw = str(item.get("website") or item.get("brand_url") or "").strip()
             dom = domain_of(site_raw)
             safe_site = site_raw if dom else ""
+            if not dom and web_search is not None:
+                disc_url, disc_dom, _, _ = _discover_brand_landing(
+                    brand,
+                    search_fn=web_search,
+                    store_resolver_fn=resolve_store,
+                    budget=budget,
+                )
+                if disc_dom:
+                    safe_site = disc_url
+                    dom = disc_dom
+
             contacts = _merge_enriched_contacts(
                 brand=brand,
                 domain=dom,
@@ -737,7 +936,7 @@ def collect_tiktok_shop_brands(
             )
             if not any(
                 contacts[k]
-                for k in ("domain", "work_email", "founder_linkedin", "founder_x", "username")
+                for k in ("domain", "work_email", "founder_x", "username")
             ):
                 continue
 

@@ -111,32 +111,92 @@ def _first_project_url(payload: dict) -> str:
     return ""
 
 
+_GENERIC_BRAND_STOPWORDS = frozenset({
+    "app", "apps", "inc", "llc", "ltd", "corp", "co", "com", "org", "net", "io", "ai",
+    "the", "and", "for", "with", "from", "of", "in", "on", "to", "studio", "studios",
+    "labs", "media", "shop", "store", "official", "content", "campaigns", "campaign",
+    "rewards", "organization", "terms", "service", "services", "policy", "privacy",
+    "sponsored", "not", "mention", "mentioned", "fame", "group", "team", "platform",
+    "online", "slideshow", "slideshows", "english",
+})
+
+
+def _search_hits_from_payload(payload: Any) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    containers: list[dict] = [payload]
+    for sub in ("output", "result", "data"):
+        child = payload.get(sub)
+        if isinstance(child, dict):
+            containers.append(child)
+    for container in containers:
+        for key in ("results", "items", "organic_results"):
+            rows = container.get(key)
+            if isinstance(rows, list):
+                return [r for r in rows if isinstance(r, dict)]
+    return []
+
+
+def _brand_match_tokens(company: str, domain: str) -> list[str]:
+    tokens: list[str] = []
+    dom_low = (domain or "").strip().lower().removeprefix("www.")
+    if dom_low and "." in dom_low:
+        tokens.append(dom_low)
+        root = dom_low.split(".", 1)[0]
+        if len(root) >= 3 and root not in _GENERIC_BRAND_STOPWORDS and root not in tokens:
+            tokens.append(root)
+    for word in re.findall(r"[A-Za-z0-9]{3,}", company or ""):
+        low = word.lower()
+        if low not in _GENERIC_BRAND_STOPWORDS and low not in tokens:
+            tokens.append(low)
+    return tokens
+
+
 def find_company_decision_maker(company: str, domain: str = "") -> dict:
     clean_company = (company or "").strip()
-    target = clean_company or domain
+    clean_domain = (domain or "").strip().lower().removeprefix("www.")
+    target = clean_company or clean_domain
     if not target:
+        return {}
+    tokens = _brand_match_tokens(clean_company, clean_domain)
+    if not tokens:
         return {}
     payload = call(
         "crawl4ai.web.search",
         query={
             "q": (
-                f'site:linkedin.com/in "{target}" '
+                f'site:linkedin.com/in "{clean_domain or clean_company}" '
                 "(Founder OR CEO OR CMO OR Marketing OR Growth)"
             ),
         },
     )
+    hits = _search_hits_from_payload(payload)
+    matched_hits: list[dict] = []
+    for hit in hits:
+        blob = " ".join(
+            str(hit.get(k) or "") for k in ("title", "snippet", "description", "url")
+        ).lower()
+        if not blob:
+            continue
+        if clean_domain and clean_domain in blob:
+            matched_hits.append(hit)
+        elif any(re.search(rf"\b{re.escape(tok)}", blob) for tok in tokens):
+            matched_hits.append(hit)
+    if not matched_hits:
+        return {}
+
+    matched_payload = {"results": matched_hits}
     found: dict[str, str] = {}
-    if payload:
-        linkedin = _first_linkedin(payload)
-        if linkedin:
-            found["founder_linkedin"] = linkedin
-        email = _first_email(payload)
-        if email:
-            found["work_email"] = email
-        if not domain:
-            site = _first_project_url(payload)
-            if site:
-                found["project_url"] = site
+    linkedin = _first_linkedin(matched_payload)
+    if linkedin:
+        found["founder_linkedin"] = linkedin
+    email = _first_email(matched_payload)
+    if email:
+        found["work_email"] = email
+    if not clean_domain:
+        site = _first_project_url(matched_payload)
+        if site:
+            found["project_url"] = site
     return {k: v for k, v in found.items() if v}
 
 
