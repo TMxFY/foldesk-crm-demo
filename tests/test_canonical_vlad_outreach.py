@@ -435,7 +435,9 @@ def test_apply_canonical_vlad_outreach_v4_migrates_existing_campaigns_without_un
     assert upgrade_to_vlad_step1(already_offered, company="Acme", category="SaaS").startswith("Hey,\n\n")
 
 
-def test_ingest_discovered_leads_skips_phantom_email_only_from_campaign_recipients(tmp_path):
+def test_ingest_discovered_leads_skips_phantom_email_only_from_campaign_recipients(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(state_dir))
     conn = connect(tmp_path / "ingest_phantom_guard.db")
     init_db(conn)
 
@@ -464,10 +466,14 @@ def test_ingest_discovered_leads_skips_phantom_email_only_from_campaign_recipien
         },
     )
     res = resp["result"]["structuredContent"]
-    assert res["created_leads"] == 1
+    assert res["created_leads"] == 0
     assert res["enrolled_in_campaign"] == 0
+    assert res.get("saved_direct_x_leads") == 1
+    lead_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM leads").fetchone()["cnt"]
     rec_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM campaign_recipients").fetchone()["cnt"]
+    assert lead_cnt == 0
     assert rec_cnt == 0
+    assert (state_dir / "direct_x_leads.jsonl").is_file()
 
 
 def test_generate_vlad_sonnet_batch_calls_claude_sonnet_5_and_enforces_vlad_format(monkeypatch):
