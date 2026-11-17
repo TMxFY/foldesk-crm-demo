@@ -1229,3 +1229,40 @@ def test_hardening_edge_cases_and_stdlib_dotenv(tmp_path: Path, monkeypatch) -> 
     assert os.environ.get("RELAYFAST_TEST_KEY") == "rf_secret_123"
     assert os.environ.get("OTHER_TEST_KEY") == "abc"
 
+    # 6) AAA gaming megacorp filter & rejection of weak title-only third-party URLs
+    assert monid_client.is_megacorp_app("Call of Duty - RICOCHET Enforcement", "", "callofduty.com") is True
+    cod_rows, _ = high_yield_veins.collect_whop_content_rewards(
+        limit=3,
+        day=date(2026, 11, 17),
+        seen={},
+        search_fn=lambda q: (
+            {"results": [
+                {"url": "https://whop.com/cod", "title": "Call of Duty - RICOCHET Enforcement", "snippet": "$10,000 budget"},
+            ]}
+            if q == high_yield_veins.WHOP_QUERIES[0]
+            else {"results": []}
+        ),
+        enrich_fn=lambda c, d: {"work_email": "team@callofduty.com"},
+        site_scrape_fn=lambda u: {},
+    )
+    assert cod_rows == []
+
+    weak_res = high_yield_veins._discover_brand_landing(
+        "Modo UGC | CCTV Games",
+        search_fn=lambda q: {
+            "results": [
+                {
+                    "url": "https://blog.br.playstation.com/2025/10/10/novo-modo-ugc/",
+                    "title": "Novo Modo UGC no Genshin Impact",
+                },
+                {
+                    "url": "https://random-news.example/article",
+                    "title": "Everything about Modo games",
+                },
+            ]
+        },
+        store_resolver_fn=lambda u: {},
+        budget=[5],
+    )
+    assert weak_res == ("", "", {}, [])
+

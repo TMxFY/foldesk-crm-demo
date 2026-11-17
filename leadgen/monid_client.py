@@ -57,7 +57,31 @@ MEGACORP_TOKENS = frozenset(
         "canva",
         "notion",
         "supercell",
+        "activision",
+        "blizzard",
+        "callofduty",
+        "playstation",
+        "xbox",
+        "nintendo",
+        "genshin",
+        "hoyoverse",
+        "mihoyo",
+        "fortnite",
+        "epicgames",
+        "roblox",
+        "minecraft",
+        "valorant",
+        "riotgames",
+        "ubisoft",
     }
+)
+MEGACORP_PHRASES = (
+    "call of duty",
+    "league of legends",
+    "grand theft auto",
+    "electronic arts",
+    "epic games",
+    "riot games",
 )
 
 _PRIVACY_NOISE_DOMAINS = frozenset(
@@ -274,6 +298,8 @@ def is_megacorp_app(developer: str = "", app_name: str = "", domain: str = "", r
         return False
     words = set(blob.split())
     if words & MEGACORP_TOKENS:
+        return True
+    if any(p in blob for p in MEGACORP_PHRASES):
         return True
     dom_root = (domain or "").lower().split(".")[0]
     return bool(dom_root and dom_root in MEGACORP_TOKENS)

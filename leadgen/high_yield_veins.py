@@ -112,7 +112,7 @@ _BRAND_TOKEN_STOPWORDS = frozenset({
     "app", "apps", "inc", "llc", "ltd", "corp", "co", "the", "and", "for", "of",
     "studio", "labs", "media", "shop", "store", "official", "fame", "pro",
     "get", "my", "try", "use", "hey", "join", "www", "web", "tiktok", "whop",
-    "unknown", "not",
+    "unknown", "not", "ugc",
 })
 _MARKETPLACE_NOISE_DOMAINS = frozenset({
     "amazon.com", "amazon.co.uk", "amazon.de", "walmart.com", "ebay.com", "ebay.co.uk",
@@ -120,6 +120,7 @@ _MARKETPLACE_NOISE_DOMAINS = frozenset({
     "crunchbase.com", "zoominfo.com", "pitchbook.com", "apollo.io", "rocketreach.co",
     "sensortower.com", "kalodata.com", "fastmoss.com", "pipiads.com",
     "apkpure.com", "uptodown.com", "softonic.com", "appbrain.com", "sites.google.com",
+    "playstation.com", "xbox.com", "nintendo.com",
     "yelp.com", "trustpilot.com", "glassdoor.com", "indeed.com", "wikipedia.org",
     "reddit.com", "quora.com", "medium.com", "substack.com", "pinterest.com",
     "facebook.com", "instagram.com", "youtube.com", "tiktok.com", "x.com", "twitter.com",
@@ -292,13 +293,11 @@ def _discover_brand_landing(
 
     store_candidates: list[str] = []
     dom_site_candidates: list[tuple[str, str]] = []
-    weak_site_candidates: list[tuple[str, str]] = []
     for hit in _unwrap_search_results(payload):
         url = str(hit.get("url") or "").strip()
         if not url or not url.lower().startswith(("http://", "https://")):
             continue
         title = str(hit.get("title") or "").strip().lower()
-        snip = str(hit.get("snippet") or hit.get("description") or "").strip().lower()
         host = (urlparse(url).hostname or "").lower().removeprefix("www.")
         if host in APP_STORE_HOSTS:
             if any(tok in url.lower() or tok in title for tok in tokens):
@@ -311,12 +310,8 @@ def _discover_brand_landing(
             dom.endswith("." + bad) for bad in _MARKETPLACE_NOISE_DOMAINS
         ):
             continue
-        dom_hit = any(tok in dom.lower() for tok in tokens)
-        title_hit = any(tok in title or tok in snip for tok in tokens)
-        if dom_hit:
+        if any(tok in dom.lower() for tok in tokens):
             dom_site_candidates.append((url, dom))
-        elif title_hit:
-            weak_site_candidates.append((url, dom))
 
     if dom_site_candidates:
         best_url, best_dom = dom_site_candidates[0]
@@ -335,10 +330,6 @@ def _discover_brand_landing(
         w_url = str(st.get("website") or "").strip()
         w_dom = str(st.get("domain") or domain_of(w_url)).strip()
         return w_url, w_dom, st, [s_url]
-
-    if weak_site_candidates:
-        best_url, best_dom = weak_site_candidates[0]
-        return best_url, best_dom, {}, []
 
     return "", "", {}, []
 
@@ -512,7 +503,7 @@ def collect_whop_content_rewards(
             if not brand:
                 continue
             blob = f"{title} {brand} {snippet}"
-            if is_supply_side(blob) or sniper_reject_reason(blob):
+            if is_megacorp_app(brand, title) or is_supply_side(blob) or sniper_reject_reason(blob):
                 continue
 
             seen_key = f"whop:{_slugify(brand)}"
@@ -526,7 +517,10 @@ def collect_whop_content_rewards(
                 store_resolver_fn=resolve_store,
                 budget=budget,
             )
-            if land_store.get("is_megacorp") or int(land_store.get("rating_count") or 0) > 50000:
+            if (
+                land_store.get("is_megacorp")
+                or is_megacorp_app(brand, title, land_dom, int(land_store.get("rating_count") or 0))
+            ):
                 continue
 
             contacts = _merge_enriched_contacts(
