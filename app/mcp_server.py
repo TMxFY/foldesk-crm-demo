@@ -361,6 +361,8 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                             "note": {"type": ["string", "null"]},
                             "telegram_user_id": {"type": ["integer", "string", "null"]},
                             "provider": {"type": ["string", "null"]},
+                            "x_url": {"type": ["string", "null"]},
+                            "icp_score": {"type": ["number", "integer", "null"]},
                         },
                     },
                 },
@@ -381,6 +383,28 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 },
             },
             "required": ["leads"],
+        },
+    },
+    {
+        "name": "list_direct_x_leads",
+        "description": (
+            "Прочитать сохранённых целевых B2B-лидов без Telegram/телефона (с email/X/сайтом) "
+            "из direct_x_leads.jsonl (ТОЛЬКО ЧТЕНИЕ)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Максимум возвращаемых записей.",
+                },
+                "query": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Поисковый фильтр по имени, компании, email или URL.",
+                },
+            },
         },
     },
 ]
@@ -1224,7 +1248,23 @@ def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict |
     if name == "ingest_discovered_leads":
         return _handle_ingest_discovered_leads(conn, args)
 
+    if name == "list_direct_x_leads":
+        return _handle_list_direct_x_leads(args)
+
     raise KeyError(f"Неизвестный MCP-инструмент: {name}")
+
+
+def _handle_list_direct_x_leads(args: dict) -> dict:
+    from app.hygiene import read_direct_x_leads
+    from app.leadgen_settings import _resolve_state_dir
+
+    raw_limit = args.get("limit", 50)
+    try:
+        limit = int(raw_limit) if raw_limit is not None else 50
+    except (TypeError, ValueError):
+        limit = 50
+    query = str(args.get("query") or "").strip()
+    return read_direct_x_leads(_resolve_state_dir(), limit=limit, query=query)
 
 
 def _is_vacancy_lead_item(item: dict) -> bool:
@@ -1250,11 +1290,36 @@ def _auto_enrich_b2b_items_with_sonnet(items: list[dict]) -> list[dict]:
     if not should_allow_auto_sonnet():
         return items
 
+    from app.hygiene import _has_messenger_contact, sniper_lead_violation_reason
+
     out_items = [dict(it) if isinstance(it, dict) else it for it in items]
     need_indices: list[int] = []
     need_payloads: list[dict] = []
     for idx, it in enumerate(out_items):
         if not isinstance(it, dict) or _is_vacancy_lead_item(it):
+            continue
+        if not _has_messenger_contact(
+            username=it.get("username"),
+            phone=it.get("phone"),
+            telegram_user_id=it.get("telegram_user_id"),
+        ):
+            continue
+        raw_icp = it.get("icp_score")
+        if raw_icp is not None and str(raw_icp).strip() != "":
+            try:
+                if float(raw_icp) < 80:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if sniper_lead_violation_reason(
+            name=str(it.get("name") or ""),
+            company=str(it.get("company") or it.get("project") or ""),
+            niche=str(it.get("category") or it.get("niche") or ""),
+            note=str(it.get("their_angle") or it.get("note") or ""),
+            url=str(it.get("website") or it.get("url") or ""),
+            lead_source=str(it.get("lead_source") or it.get("source") or ""),
+            vacancies_enabled=False,
+        ):
             continue
         raw_s1 = str(it.get("step1_text") or it.get("first_touch") or "").strip()
         raw_low = raw_s1.lower()
@@ -1593,13 +1658,24 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
     if not is_primary_vacancy:
         raw_leads = _auto_enrich_b2b_items_with_sonnet(raw_leads)
 
+    from app.hygiene import (
+        append_direct_x_lead,
+        clean_crm_lead_names,
+        sniper_lead_violation_reason,
+    )
+    from app.leadgen_settings import _resolve_state_dir
+
     global_dedup = _build_global_dedup_index()
+    state_dir = _resolve_state_dir()
 
     processed = 0
     created_leads = 0
     updated_leads = 0
     enrolled_in_campaign = 0
     skipped_duplicates = 0
+    skipped_non_icp = 0
+    quarantined = 0
+    saved_direct_x_leads = 0
     lead_ids: list[int] = []
     now = utc_now()
 
@@ -1607,10 +1683,11 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         if not isinstance(item, dict):
             continue
         username = _clean_handle(item.get("username"))
-        company = _clean_company_title(item.get("company"))
+        raw_company = _clean_company_title(item.get("company"))
         explicit_name = (str(item.get("name") or "").strip()) or None
         phone = (str(item.get("phone") or "").strip()) or None
         email = (str(item.get("email") or "").strip()) or None
+        x_url = (str(item.get("x_url") or item.get("twitter") or "").strip()) or None
         website_raw = (str(item.get("website") or item.get("url") or "").strip())
         website = website_raw or None
         url_val = None
@@ -1634,11 +1711,20 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 tg_id = int(str(tg_id_raw).strip())
             except ValueError:
                 tg_id = None
-        real_tg_id = tg_id if (tg_id is not None and not (900000 <= tg_id <= 999999)) else None
+        real_tg_id = tg_id if (tg_id is not None and tg_id > 0 and not (900000 <= tg_id <= 999999)) else None
         has_direct_messenger_handle = bool(username or phone or real_tg_id is not None)
 
-        display_name = explicit_name or company or (f"{username} · {company}" if username and company else username) or phone
-        if not any((display_name, username, phone, tg_id)):
+        company = raw_company
+        display_name = (
+            explicit_name
+            or company
+            or (f"{username} · {company}" if username and company else username)
+            or phone
+            or email
+            or x_url
+            or website
+        )
+        if not any((display_name, username, phone, tg_id, email, x_url, website)):
             continue
 
         # Determine target campaign BEFORE touching `leads` so all ICP/supply/denylist filters run first!
@@ -1662,6 +1748,17 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         is_b2b_camp = not is_item_vacancy and not any(
             k in target_camp_name.lower() for k in ("ваканс", "vacanc", "job")
         )
+
+        if is_b2b_camp:
+            cleaned_name, cleaned_comp = clean_crm_lead_names(
+                explicit_name or company or display_name,
+                company,
+                url_val or website_raw,
+            )
+            company = cleaned_comp
+            if explicit_name or cleaned_name:
+                explicit_name = cleaned_name or explicit_name
+                display_name = cleaned_name or display_name
 
         raw_s1 = item.get("step1_text") if item.get("step1_text") is not None else item.get("first_touch")
         full_blob = " ".join(
@@ -1707,8 +1804,35 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 skipped_duplicates += 1
                 continue
 
-        # 2. Strict B2B Product-Buyer ICP / Offline / Supply-Side / Product-Reality gate BEFORE `leads` insert!
+        # 2. Strict B2B Product-Buyer ICP / Sniper / Score / Contactless gate BEFORE `leads` insert!
         if is_b2b_camp and not is_qa_camp:
+            raw_icp_score = item.get("icp_score")
+            if raw_icp_score is not None and str(raw_icp_score).strip() != "":
+                try:
+                    if float(raw_icp_score) < 80:
+                        skipped_non_icp += 1
+                        quarantined += 1
+                        continue
+                except (TypeError, ValueError):
+                    skipped_non_icp += 1
+                    quarantined += 1
+                    continue
+
+            sniper_reason = sniper_lead_violation_reason(
+                name=display_name or "",
+                company=company or "",
+                niche=category or "",
+                note=f"{raw_note or ''}\n{their_angle or ''}\n{str(item.get('bio') or '')}".strip(),
+                description=str(item.get("description") or item.get("what_they_do") or ""),
+                url=url_val or website_raw or "",
+                lead_source=lead_source or "",
+                vacancies_enabled=False,
+            )
+            if sniper_reason:
+                skipped_non_icp += 1
+                quarantined += 1
+                continue
+
             if is_offline_non_icp_contact(
                 username=username,
                 name=display_name,
@@ -1716,6 +1840,8 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 website=url_val,
                 their_angle=f"{their_angle or ''} {raw_s1 or ''}",
             ):
+                skipped_non_icp += 1
+                quarantined += 1
                 continue
             supply_blob = "\n".join(
                 str(x)
@@ -1729,11 +1855,15 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 if x
             )
             if is_supply_side(supply_blob) or is_rejected_buyer_category(category):
+                skipped_non_icp += 1
+                quarantined += 1
                 continue
             roles_set = {str(x).strip() for x in (item.get("roles") or []) if str(x or "").strip()}
             if item.get("role"):
                 roles_set.add(str(item["role"]).strip())
             if roles_set and not (roles_set & {"Founder", "Marketing"}) and (roles_set & NON_BUYER_ROLES):
+                skipped_non_icp += 1
+                quarantined += 1
                 continue
             if (
                 has_insufficient_product_info(their_angle)
@@ -1743,8 +1873,33 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 or is_raw_cohort_tag(company)
                 or is_raw_cohort_tag(display_name)
             ):
+                skipped_non_icp += 1
+                quarantined += 1
                 continue
             if raw_s1 is not None and str(raw_s1).strip() != "" and is_truncated_or_bad_pitch(str(raw_s1), min_len=40):
+                skipped_non_icp += 1
+                quarantined += 1
+                continue
+
+            if not has_direct_messenger_handle:
+                if email or x_url or url_val or website:
+                    if append_direct_x_lead(
+                        state_dir,
+                        {
+                            "name": display_name,
+                            "company": company,
+                            "email": email,
+                            "x_url": x_url,
+                            "url": url_val or website,
+                            "category": category,
+                            "their_angle": their_angle,
+                            "lead_source": lead_source,
+                            "icp_score": raw_icp_score,
+                        },
+                    ):
+                        saved_direct_x_leads += 1
+                skipped_non_icp += 1
+                quarantined += 1
                 continue
 
         processed += 1
@@ -1913,7 +2068,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
 
             step1_text, error_reason = _clean_step1_text(
                 item.get("step1_text") or item.get("first_touch"),
-                item.get("company"),
+                company,
                 is_b2b=is_b2b_camp,
             )
             step2_text = (str(item.get("step2_text") or item.get("followup_1") or "").strip()) or None
@@ -2018,6 +2173,9 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         "updated_leads": updated_leads,
         "enrolled_in_campaign": enrolled_in_campaign,
         "skipped_duplicates": skipped_duplicates,
+        "skipped_non_icp": skipped_non_icp,
+        "quarantined": quarantined,
+        "saved_direct_x_leads": saved_direct_x_leads,
         "campaign_id": campaign_id,
         "lead_ids": lead_ids,
     }

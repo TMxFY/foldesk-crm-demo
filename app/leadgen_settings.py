@@ -60,15 +60,15 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "buyer_catalogs": True,
             "linkedin_jobs": True,
         },
-        "tg_groups_old": ["solofounders", "producthunt_heroes", "id1613398776"],
-        "tg_groups_new": ["solofounderschat", "shopifyeasy", "productcircle_chat"],
+        "tg_groups_old": ["producthunt_heroes", "id1613398776"],
+        "tg_groups_new": ["productcircle_chat"],
         "tg_comment_channels": [],
         "limits": {
             "yc_limit": 50,
             "ph_limit": 0,
             "msg_limit": 1800,
             "lurker_limit": 1000,
-            "external_limit": 20,
+            "external_limit": 0,
         },
     },
     "vacancies": {
@@ -413,11 +413,15 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
             except Exception:
                 pass
 
+    from app.hygiene import read_direct_x_leads
+
+    direct_x_leads_count = int(read_direct_x_leads(state_dir, limit=1).get("total") or 0)
     crm_counts = {
         "total_leadgen_leads": 0,
         "vacancies_leads": 0,
         "b2b_leads": 0,
         "active_leadgen_campaigns": 0,
+        "direct_x_leads_count": direct_x_leads_count,
     }
     if conn is not None:
         try:
@@ -474,6 +478,7 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
         "last_run_summary": last_run_summary,
         "latest_vacancy_report": latest_vacancy_report,
         "crm_leadgen_counts": crm_counts,
+        "direct_x_leads_count": direct_x_leads_count,
     }
 
 
@@ -946,6 +951,12 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     b2b_cfg = cfg["b2b"]
     b2b_enabled_sources = [k for k, v in (b2b_cfg.get("sources") or {}).items() if v]
     if b2b_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
+        from app.hygiene import (
+            _has_messenger_contact,
+            append_direct_x_lead,
+            clean_crm_lead_names,
+            sniper_lead_violation_reason,
+        )
         import leadgen.crm_mcp_push as _crm_mcp_push
         from leadgen.lead_market import market_of
         from leadgen.supply_side import (
@@ -964,7 +975,13 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             + glob.glob(str(state_dir / "discovered_leads*.jsonl"))
         )
         jsonl_candidates = sorted(
-            [p for p in raw_candidates if os.path.isfile(p) and os.path.getsize(p) > 0],
+            [
+                p
+                for p in raw_candidates
+                if os.path.isfile(p)
+                and os.path.getsize(p) > 0
+                and os.path.basename(p) != "direct_x_leads.jsonl"
+            ],
             key=os.path.getmtime,
         )
         b2b_limit = min(remaining_quota, int(b2b_cfg.get("campaign_daily_limit") or 30))
@@ -1062,10 +1079,30 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     )
                     if x
                 )
+                raw_score = cand.get("icp_score")
+                if raw_score is not None and str(raw_score).strip() != "":
+                    try:
+                        if float(raw_score) < 80:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
                 if (
                     is_supply_side(blob)
                     or has_insufficient_product_info(blob)
                     or is_rejected_buyer_category(cand.get("category") or cand.get("niche"))
+                    or bool(
+                        sniper_lead_violation_reason(
+                            name=name_s,
+                            company=str(cand.get("company") or cand.get("project") or ""),
+                            niche=str(cand.get("category") or cand.get("niche") or ""),
+                            note=f"{angle_s}\n{cand.get('bio') or ''}".strip(),
+                            description=str(cand.get("what_they_do") or ""),
+                            url=site_s,
+                            lead_source=str(cand.get("lead_source") or cand.get("source") or ""),
+                            vacancies_enabled=False,
+                        )
+                    )
                 ):
                     continue
                 roles_set = {str(x).strip() for x in (cand.get("roles") or []) if str(x or "").strip()}
@@ -1073,19 +1110,65 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     roles_set.add(str(cand["role"]).strip())
                 if roles_set and not (roles_set & {"Founder", "Marketing"}) and (roles_set & NON_BUYER_ROLES):
                     continue
+                if not _has_messenger_contact(
+                    username=cand.get("username"),
+                    phone=cand.get("phone"),
+                    telegram_user_id=cand.get("telegram_user_id"),
+                ):
+                    append_direct_x_lead(
+                        state_dir,
+                        {
+                            "name": cand.get("name") or cand.get("company") or cand.get("project"),
+                            "company": cand.get("company") or cand.get("project"),
+                            "email": cand.get("email"),
+                            "x_url": cand.get("x_url") or cand.get("twitter"),
+                            "url": site_s,
+                            "category": cand.get("category") or cand.get("niche"),
+                            "their_angle": angle_s,
+                            "lead_source": cand.get("lead_source") or cand.get("source"),
+                            "icp_score": cand.get("icp_score"),
+                        },
+                    )
+                    continue
                 if not keep_for_sheet(cand):
                     continue
 
                 built = _crm_mcp_push.build_lead_payload_from_dict(cand, touch_mode=touch_mode_val)
-                if any(built.get(k) for k in ("username", "phone", "telegram_user_id")):
+                c_name, c_comp = clean_crm_lead_names(
+                    built.get("name"), built.get("company"), built.get("url") or built.get("website")
+                )
+                if c_name:
+                    built["name"] = c_name
+                built["company"] = c_comp
+                if _has_messenger_contact(
+                    username=built.get("username"),
+                    phone=built.get("phone"),
+                    telegram_user_id=built.get("telegram_user_id"),
+                ):
                     leads.append(built)
 
             if sheet_like:
-                leads.extend(
-                    _crm_mcp_push.pack_tab_leads_for_mcp(
-                        "Все2", sheet_like, use_llm=False, touch_mode=touch_mode_val
-                    )
+                packed_sheet = _crm_mcp_push.pack_tab_leads_for_mcp(
+                    "Все2", sheet_like, use_llm=False, touch_mode=touch_mode_val
                 )
+                for p_item in packed_sheet:
+                    if not _has_messenger_contact(
+                        username=p_item.get("username"),
+                        phone=p_item.get("phone"),
+                        telegram_user_id=p_item.get("telegram_user_id"),
+                    ):
+                        continue
+                    if sniper_lead_violation_reason(
+                        name=str(p_item.get("name") or ""),
+                        company=str(p_item.get("company") or ""),
+                        niche=str(p_item.get("category") or p_item.get("niche") or ""),
+                        note=str(p_item.get("their_angle") or p_item.get("note") or ""),
+                        url=str(p_item.get("url") or p_item.get("website") or ""),
+                        lead_source=str(p_item.get("lead_source") or ""),
+                        vacancies_enabled=False,
+                    ):
+                        continue
+                    leads.append(p_item)
 
             wm_files[fname] = {
                 "mtime_ns": cur_mtime_ns,

@@ -1093,6 +1093,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if vac_disabled_v6 is None:
             apply_disable_vacancy_outreach_v6(conn)
+    sniper_cleanup_v7 = conn.execute(
+        "SELECT 1 FROM kv_settings WHERE key = 'sniper_icp_cleanup_v7'"
+    ).fetchone()
+    if sniper_cleanup_v7 is None:
+        apply_sniper_icp_cleanup_v7(conn)
     conn.commit()
 
 
@@ -1963,6 +1968,31 @@ def apply_disable_vacancy_outreach_v6(
         "closed_pending": closed_pending,
         "closed_in_progress": closed_in_progress,
         "closed_failed": closed_failed,
+    }
+
+
+def apply_sniper_icp_cleanup_v7(
+    conn: sqlite3.Connection, *, force: bool = False
+) -> dict:
+    if not force:
+        done = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'sniper_icp_cleanup_v7'"
+        ).fetchone()
+        if done is not None:
+            return {"already_applied": True}
+
+    from app.hygiene import heal_crm_hygiene
+
+    heal_res = heal_crm_hygiene(conn)
+    now_ts = utc_now()
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('sniper_icp_cleanup_v7', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {
+        "already_applied": False,
+        **heal_res,
     }
 
 
