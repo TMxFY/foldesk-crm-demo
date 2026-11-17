@@ -38,6 +38,10 @@ SKIP_HOSTS = {
     "apps.apple.com", "itunes.apple.com", "play.google.com", "tiktok.com",
     "whop.com", "apps.whop.com", "fonts.googleapis.com", "fonts.gstatic.com",
     "gstatic.com", "cloudflare.com", "cdn.jsdelivr.net",
+    "licdn.com", "googleusercontent.com", "sensortower.com", "kalodata.com",
+    "fastmoss.com", "pipiads.com", "apkpure.com", "uptodown.com",
+    "softonic.com", "appbrain.com", "crunchbase.com", "zoominfo.com",
+    "trustpilot.com", "amazon.com", "shop.app",
 }
 CREATOR_KEYWORDS = ["AI UGC", "short form video ads", "prop firm challenge"]
 FOREX_KEYWORDS = ["forex trading signals", "crypto trading channel"]
@@ -118,15 +122,20 @@ _GENERIC_BRAND_STOPWORDS = frozenset({
     "rewards", "organization", "terms", "service", "services", "policy", "privacy",
     "sponsored", "not", "mention", "mentioned", "fame", "group", "team", "platform",
     "online", "slideshow", "slideshows", "english",
+    "get", "my", "try", "use", "hey", "join", "www", "web", "tiktok", "whop", "unknown",
 })
 
 
 def _search_hits_from_payload(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
     if not isinstance(payload, dict):
         return []
     containers: list[dict] = [payload]
     for sub in ("output", "result", "data"):
         child = payload.get(sub)
+        if isinstance(child, list):
+            return [r for r in child if isinstance(r, dict)]
         if isinstance(child, dict):
             containers.append(child)
     for container in containers:
@@ -180,7 +189,7 @@ def find_company_decision_maker(company: str, domain: str = "") -> dict:
             continue
         if clean_domain and clean_domain in blob:
             matched_hits.append(hit)
-        elif any(re.search(rf"\b{re.escape(tok)}", blob) for tok in tokens):
+        elif any(re.search(rf"\b{re.escape(tok)}\b", blob) for tok in tokens):
             matched_hits.append(hit)
     if not matched_hits:
         return {}
@@ -195,7 +204,11 @@ def find_company_decision_maker(company: str, domain: str = "") -> dict:
         found["work_email"] = email
     if not clean_domain:
         site = _first_project_url(matched_payload)
-        if site:
+        site_dom = (domain_of(site) or "").lower() if site else ""
+        if site and any(
+            tok in site_dom or re.search(rf"\b{re.escape(tok)}\b", site.lower())
+            for tok in tokens
+        ):
             found["project_url"] = site
     return {k: v for k, v in found.items() if v}
 

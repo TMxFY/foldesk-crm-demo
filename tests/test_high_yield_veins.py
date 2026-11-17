@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -1100,3 +1101,131 @@ def test_live_quality_hardening_rejects_noise_and_ungrounded_linkedin_and_resolv
     )
     matched = treg_enrich.find_company_decision_maker("TarotFlow", "tarotflow.app")
     assert matched["founder_linkedin"] == "https://www.linkedin.com/in/tarotflow-ceo"
+
+
+def test_hardening_edge_cases_and_stdlib_dotenv(tmp_path: Path, monkeypatch) -> None:
+    from leadgen import high_yield_veins, treg_enrich, vps_autonomous_replenish
+
+    # 1) Noise brands & hyphen/how-to nuance
+    assert high_yield_veins._is_noise_brand("TikTok Shop")
+    assert high_yield_veins._is_noise_brand("Whop Official")
+    assert high_yield_veins._is_noise_brand("Unknown Brand")
+    assert high_yield_veins._is_noise_brand("How to scale clips")
+    assert not high_yield_veins._is_noise_brand("Show Today")
+    assert high_yield_veins._split_primary_brand("K-Beauty Labs – Skincare") == "K-Beauty Labs"
+    assert high_yield_veins._brand_distinctive_tokens("K-Beauty Labs") == ["beauty"]
+
+    # 2) App Store resolution outranks third-party title-hit aggregators (sensortower/weak blogs)
+    resolved_urls: list[str] = []
+    budget = [10]
+    url, dom, st, extra = high_yield_veins._discover_brand_landing(
+        "Jitt – App of Fame",
+        search_fn=lambda q: {
+            "results": [
+                {"url": "https://sensortower.com/ios/us/jitt/app/123", "title": "Jitt revenue"},
+                {"url": "https://blog-review-site.example/post", "title": "Jitt review 2026"},
+                {"url": "https://apps.apple.com/us/app/jitt/id123456", "title": "Jitt on App Store"},
+            ]
+        },
+        store_resolver_fn=lambda u: (
+            resolved_urls.append(u)
+            or {"website": "https://jitt.app", "domain": "jitt.app", "rating_count": 420, "is_megacorp": False}
+        ),
+        budget=budget,
+    )
+    assert url == "https://jitt.app"
+    assert dom == "jitt.app"
+    assert resolved_urls == ["https://apps.apple.com/us/app/jitt/id123456"]
+    assert extra == ["https://apps.apple.com/us/app/jitt/id123456"]
+
+    # 3) Word boundary prevents "jitt" matching "Jitters" and rejects unrelated snippet URLs (forbes.com)
+    monkeypatch.setattr(
+        treg_enrich,
+        "call",
+        lambda ep, query=None, **kw: {
+            "results": [
+                {
+                    "url": "https://www.linkedin.com/in/john-jitters",
+                    "title": "John Jitters - Advisor",
+                    "snippet": "Featured on https://forbes.com/story",
+                }
+            ]
+        },
+    )
+    assert treg_enrich.find_company_decision_maker("Jitt", "") == {}
+
+    monkeypatch.setattr(
+        treg_enrich,
+        "call",
+        lambda ep, query=None, **kw: [
+            {
+                "url": "https://www.linkedin.com/in/kbeauty-founder",
+                "title": "Min Seo - Founder at K-Beauty",
+                "snippet": "https://forbes.com/feature and https://kbeauty-labs.com",
+            }
+        ],
+    )
+    kb_hit = treg_enrich.find_company_decision_maker("K-Beauty", "")
+    assert kb_hit["founder_linkedin"] == "https://www.linkedin.com/in/kbeauty-founder"
+    assert kb_hit.get("project_url") != "https://forbes.com/feature"
+
+    # 4) Whop honors store_resolver_fn and TikTok Shop propagates store email/megacorp skip
+    whop_rows, _ = high_yield_veins.collect_whop_content_rewards(
+        limit=3,
+        day=date(2026, 11, 17),
+        seen={},
+        search_fn=lambda q: (
+            {"results": [{"url": "https://whop.com/pulsefit", "title": "PulseFit Rewards", "snippet": "$5,000 budget"}]}
+            if "site:whop.com" in q and "content" in q and q == high_yield_veins.WHOP_QUERIES[0]
+            else (
+                {"results": [{"url": "https://apps.apple.com/us/app/pulsefit/id99", "title": "PulseFit"}]}
+                if "PulseFit" in q
+                else {"results": []}
+            )
+        ),
+        store_resolver_fn=lambda u: {"website": "https://pulsefit.ai", "domain": "pulsefit.ai", "email": "founders@pulsefit.ai", "rating_count": 300, "is_megacorp": False},
+        enrich_fn=lambda c, d: {},
+        site_scrape_fn=lambda u: {},
+    )
+    assert len(whop_rows) == 1
+    assert whop_rows[0]["work_email"] == "founders@pulsefit.ai"
+
+    shop_rows, _ = high_yield_veins.collect_tiktok_shop_brands(
+        limit=3,
+        day=date(2026, 11, 17),
+        seen={},
+        shop_search_fn=lambda kw: (
+            {"products": [
+                {"title": "MegaFace Serum", "seller_info": {"shop_name": "MegaFace"}},
+                {"title": "GlowLab Drops", "seller_info": {"shop_name": "GlowLab"}},
+            ]}
+            if kw == high_yield_veins.TIKTOK_SHOP_QUERIES[0]
+            else {"products": []}
+        ),
+        web_search_fn=lambda q: {
+            "results": [{"url": f"https://apps.apple.com/us/app/{'megaface' if 'MegaFace' in q else 'glowlab'}/id1", "title": q}]
+        },
+        store_resolver_fn=lambda u: (
+            {"is_megacorp": True, "rating_count": 90000}
+            if "megaface" in u
+            else {"website": "https://glowlab.co", "domain": "glowlab.co", "email": "hi@glowlab.co", "rating_count": 120, "is_megacorp": False}
+        ),
+        enrich_fn=lambda c, d: {},
+        site_scrape_fn=lambda u: {},
+    )
+    assert len(shop_rows) == 1
+    assert shop_rows[0]["project"] == "GlowLab"
+    assert shop_rows[0]["work_email"] == "hi@glowlab.co"
+
+    # 5) _load_dotenv_if_allowed parses .env without python-dotenv installed
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("# comment\nexport RELAYFAST_TEST_KEY='rf_secret_123'\nOTHER_TEST_KEY=\"abc\"\n", encoding="utf-8")
+    monkeypatch.delenv("CRMTG_SKIP_DOTENV", raising=False)
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    monkeypatch.delenv("RELAYFAST_TEST_KEY", raising=False)
+    monkeypatch.delenv("OTHER_TEST_KEY", raising=False)
+    vps_autonomous_replenish._load_dotenv_if_allowed(fake_env)
+    assert os.environ.get("RELAYFAST_TEST_KEY") == "rf_secret_123"
+    assert os.environ.get("OTHER_TEST_KEY") == "abc"
+
