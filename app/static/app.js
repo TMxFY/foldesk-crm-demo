@@ -11493,11 +11493,15 @@ function ensureLeadgenState() {
           tg_comments: true,
           channel_graph: true,
           tg_ad_spy: true,
+          whop_content_rewards: true,
+          tiktok_ads: true,
+          tiktok_shop: true,
           meta_ads: true,
           yc_ph: true,
           social_x_reddit: true,
           buyer_catalogs: true,
           linkedin_jobs: true,
+          tg_identity_bridge: true,
         },
         tg_groups_old: ["solofounders", "producthunt_heroes", "id1613398776"],
         tg_groups_new: ["solofounderschat", "shopifyeasy", "productcircle_chat"],
@@ -11714,6 +11718,103 @@ function applyLeadgenProfilePreset(profileCode) {
   syncLeadgenSwitchBadges();
 }
 
+function renderLeadgenHarvest() {
+  const status = state.leadgenStatus || {};
+  const counts = status.crm_leadgen_counts || {};
+  const summary = status.last_run_summary || null;
+  const harvestBadge = document.querySelector("#leadgen-harvest-badge");
+  if (harvestBadge) {
+    const dxTotal = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
+    const b2bTotal = Number(counts.b2b_leads) || 0;
+    harvestBadge.textContent = `TG B2B: ${b2bTotal} · Direct/X: ${dxTotal}`;
+  }
+
+  const pillsHost = document.querySelector("#leadgen-harvest-sources-pills");
+  if (pillsHost) {
+    pillsHost.replaceChildren();
+    if (summary && summary.per_source_counts && typeof summary.per_source_counts === "object") {
+      const entries = Object.entries(summary.per_source_counts);
+      entries.forEach(([srcKey, cnt]) => {
+        pillsHost.append(
+          el("span", { className: "tag-chip" }, [
+            el("span", { className: "tag-chip-badge" }, [srcKey]),
+            el("span", { className: "tag-chip-text" }, [`${Number(cnt) || 0}`]),
+          ]),
+        );
+      });
+      if (summary.tg_bridged_count !== undefined) {
+        pillsHost.append(
+          el("span", { className: "tag-chip" }, [
+            el("span", { className: "tag-chip-badge" }, ["tg_bridge"]),
+            el("span", { className: "tag-chip-text" }, [`+${Number(summary.tg_bridged_count) || 0}`]),
+          ]),
+        );
+      }
+      if (summary.timestamp) {
+        pillsHost.append(
+          el("span", { className: "hint" }, [`Прогон: ${String(summary.timestamp).replace("T", " ").slice(0, 16)} UTC`]),
+        );
+      }
+    } else {
+      pillsHost.append(el("span", { className: "hint" }, ["Сводка последнего серверного прогона появится после следующего цикла."]));
+    }
+  }
+
+  const tgHost = document.querySelector("#leadgen-recent-tg-list");
+  if (tgHost) {
+    tgHost.replaceChildren();
+    const tgItems = Array.isArray(status.recent_b2b_leads) ? status.recent_b2b_leads : [];
+    if (!tgItems.length) {
+      tgHost.append(el("span", { className: "hint" }, ["Пока нет свежих B2B TG-лидов."]));
+    } else {
+      tgItems.slice(0, 8).forEach((item) => {
+        const comp = item.company || item.name || "Без названия";
+        const handle = item.username ? `@${String(item.username).replace(/^@/, "")}` : "—";
+        const src = item.lead_source || "leadgen";
+        const rowChildren = [
+          el("strong", {}, [comp]),
+          el("span", { className: "hint" }, [` · ${handle} · ${src}`]),
+        ];
+        const safeItemUrl = safeHref(item.url);
+        if (safeItemUrl) {
+          rowChildren.push(el("span", { className: "hint" }, [" · "]));
+          rowChildren.push(el("a", { href: safeItemUrl, target: "_blank", rel: "noopener" }, [String(safeItemUrl).replace(/^https?:\/\//, "").slice(0, 32)]));
+        }
+        tgHost.append(el("div", { className: "leadgen-harvest-item" }, rowChildren));
+      });
+    }
+  }
+
+  const dxHost = document.querySelector("#leadgen-recent-direct-list");
+  if (dxHost) {
+    dxHost.replaceChildren();
+    const dxItems = Array.isArray(status.recent_direct_x_leads) ? status.recent_direct_x_leads : [];
+    if (!dxItems.length) {
+      dxHost.append(el("span", { className: "hint" }, ["Пул Direct / X пока пуст."]));
+    } else {
+      dxItems.slice(0, 8).forEach((item) => {
+        const comp = item.company || item.project || item.name || "Проект";
+        const src = item.lead_source || item.source || "direct";
+        const score = item.icp_score ? `ICP ${item.icp_score}` : "";
+        const contactLink = item.x_url || item.founder_x || item.linkedin_url || item.url || "";
+        const contactLabel = item.email || (item.x_url ? String(item.x_url).replace(/^https?:\/\/(www\.)?x\.com\//, "x.com/") : (item.linkedin_url ? "LinkedIn" : "Сайт"));
+        const rowChildren = [
+          el("strong", {}, [comp]),
+          el("span", { className: "hint" }, [` · ${src}${score ? ` · ${score}` : ""}`]),
+        ];
+        const safeContactHref = safeHref(contactLink);
+        if (safeContactHref) {
+          rowChildren.push(el("span", { className: "hint" }, [" · "]));
+          rowChildren.push(el("a", { href: safeContactHref, target: "_blank", rel: "noopener" }, [String(contactLabel).slice(0, 32)]));
+        } else if (item.email) {
+          rowChildren.push(el("span", { className: "hint" }, [` · ${item.email}`]));
+        }
+        dxHost.append(el("div", { className: "leadgen-harvest-item" }, rowChildren));
+      });
+    }
+  }
+}
+
 function renderLeadgenConfig() {
   const cfg = ensureLeadgenState();
   const b2b = cfg.b2b || {};
@@ -11726,7 +11827,8 @@ function renderLeadgenConfig() {
     const totalInCrm = Number(counts.total_leadgen_leads) || 0;
     const vacInCrm = Number(counts.vacancies_leads) || 0;
     const b2bInCrm = Number(counts.b2b_leads) || 0;
-    statsBadge.textContent = `В CRM: ${totalInCrm} лидов (B2B: ${b2bInCrm} · Вакансии: ${vacInCrm})`;
+    const dxInPool = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
+    statsBadge.textContent = `В CRM: ${totalInCrm} (TG B2B: ${b2bInCrm} · Direct/X: ${dxInPool} · Вакансии: ${vacInCrm})`;
   }
 
   const setVal = (sel, val) => {
@@ -11778,6 +11880,7 @@ function renderLeadgenConfig() {
   });
 
   renderLeadgenGroupChips();
+  renderLeadgenHarvest();
   syncLeadgenSwitchBadges();
 }
 

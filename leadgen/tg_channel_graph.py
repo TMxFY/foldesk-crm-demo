@@ -31,6 +31,16 @@ DEFAULT_SESSION = (
     or "/Users/timofei/.claude/skill-telegram/tim3.session"
 )
 DEFAULT_STATE_PATH = "leadgen_state/channel_graph_seen.json"
+DEFAULT_GRAPH_SEED_CHANNELS: tuple[str, ...] = (
+    "startupoftheday",
+    "productradar_official",
+    "gonzo_ML",
+    "ai_newz",
+    "indiehackers_ru",
+    "neurochannel",
+    "gamedev_ru",
+    "ton_builders",
+)
 MAX_SUBSCRIBERS = 100_000
 
 CASINO_SPAM_RE = re.compile(
@@ -387,6 +397,8 @@ async def crawl_channel_graph(
 async def _async_main(args: argparse.Namespace) -> None:
     raw_seeds = args.seeds or os.getenv("TG_GRAPH_SEED_CHANNELS", "")
     seeds = [s.strip() for s in raw_seeds.split(",") if s.strip()]
+    if not seeds and not getattr(args, "no_default_seeds", False):
+        seeds = list(DEFAULT_GRAPH_SEED_CHANNELS)
     if not seeds:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8"):
@@ -397,8 +409,11 @@ async def _async_main(args: argparse.Namespace) -> None:
     api_id = int(os.getenv("TG_API_ID", "0"))
     api_hash = os.getenv("TG_API_HASH", "")
     if not api_id or not api_hash:
-        print("TG_API_ID / TG_API_HASH not set", file=sys.stderr)
-        sys.exit(1)
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8"):
+            pass
+        print("# tg_channel_graph: TG_API_ID / TG_API_HASH not set; skipping (0 leads)", file=sys.stderr)
+        return
 
     client = TelegramClient(args.session, api_id, api_hash)
     await client.start()
@@ -421,6 +436,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Recursive Telegram founder channel graph crawler")
     ap.add_argument("--session", default=DEFAULT_SESSION)
     ap.add_argument("--seeds", default=os.getenv("TG_GRAPH_SEED_CHANNELS", ""))
+    ap.add_argument("--no-default-seeds", action="store_true")
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--state", "--seen", dest="state", default=DEFAULT_STATE_PATH)

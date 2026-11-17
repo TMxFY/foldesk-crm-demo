@@ -442,6 +442,11 @@ def keep_for_sheet(r):
         "tg_ad_spy",
         "tg_channel_graph",
         "linkedin_jobs",
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+        "whop",
+        "app_store",
     }:
         return True
     return False
@@ -703,9 +708,20 @@ def _job_url_on_row(out):
 
 
 def _catalog_site_url(out):
-    """catalog_*, meta_ads, or tg_ad_spy project_url/site when it is a normal http(s) site, not a social host."""
+    """catalog_*, meta_ads, high-yield veins, or tg_ad_spy site when it is a normal http(s) site."""
     source = str(out.get("source") or "")
-    if not (source.startswith("catalog_") or source in ("meta_ads", "tg_ad_spy", "tg_channel_graph")):
+    if not (
+        source.startswith("catalog_")
+        or source
+        in (
+            "meta_ads",
+            "tg_ad_spy",
+            "tg_channel_graph",
+            "whop_content_rewards",
+            "tiktok_ads",
+            "tiktok_shop",
+        )
+    ):
         return ""
     try:
         from buyer_catalogs import is_public_site

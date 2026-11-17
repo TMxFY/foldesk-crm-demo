@@ -75,6 +75,8 @@ SOCIAL = (
     "producthunt.com",
     "reddit.com",
     "tiktok.com",
+    "whop.com",
+    "apps.whop.com",
     "wa.me",
     "whatsapp.com",
 )
@@ -88,6 +90,7 @@ _BLOCKED_PROJECT_TOKENS = frozenset(
         "itunes",
         "apps",
         "play",
+        "whop",
         "linktr",
         "linktree",
         "notion",
@@ -110,7 +113,7 @@ _BLOCKED_PROJECT_TOKENS = frozenset(
 
 # ЦА categories (priority order)
 CATEGORIES = [
-    ("Prop trading", r"\b(prop[- ]?trad\w*|prop[- ]?firm|funded|challenge|проп)\b"),
+    ("Проп трейдинг", r"\b(prop[- ]?trad\w*|prop[- ]?firm|funded|challenge|проп)\b"),
     ("CEX / биржа", r"\b(exchange|cex\b|бирж\w*|trading platform|broker)\b"),
     ("DeFi / DEX", r"\b(defi|dex\b|tvl|staking|yield|liquidity|lending|borrow|swap|amm|perp\w*|vault\w*)\b"),
     ("Gaming / AI", r"\b(game\w*|gamefi|p2e|playto|ai[- ]?(agent|app|tool|video|startup)|\bai\b|agent\w*|ml\b|нейросет\w*|metaverse)\b"),
@@ -246,6 +249,15 @@ def inspect_site_signals(html_text: str, page_url: str = "") -> dict:
     }
 
 
+_CF_CHALLENGE_PHRASES = (
+    "just a moment",
+    "attention required",
+    "enable javascript and cookies",
+    "verifying you are human",
+    "access denied",
+)
+
+
 def fetch_site_profile(url: str) -> dict:
     url = norm_url(url)
     empty = {"desc": "", "has_monetization_signal": False, "has_agency_signal": False}
@@ -253,14 +265,24 @@ def fetch_site_profile(url: str) -> dict:
         return empty
     try:
         r = requests.get(url, headers=UA, timeout=TIMEOUT, allow_redirects=True)
+        status = getattr(r, "status_code", 200)
+        if not getattr(r, "ok", status < 400) or (isinstance(status, int) and status >= 400):
+            return empty
         if "text/html" not in r.headers.get("Content-Type", ""):
             return empty
         info = inspect_site_signals(r.text or "", page_url=url)
+        if any(tok in (info.get("desc") or "").lower() for tok in _CF_CHALLENGE_PHRASES):
+            return empty
         pricing_url = info.get("pricing_url") or ""
         if pricing_url and pricing_url.rstrip("/") != url.rstrip("/"):
             try:
                 pr = requests.get(pricing_url, headers=UA, timeout=TIMEOUT, allow_redirects=True)
-                if "text/html" in pr.headers.get("Content-Type", ""):
+                p_status = getattr(pr, "status_code", 200)
+                if (
+                    getattr(pr, "ok", p_status < 400)
+                    and not (isinstance(p_status, int) and p_status >= 400)
+                    and "text/html" in pr.headers.get("Content-Type", "")
+                ):
                     p_info = inspect_site_signals(pr.text or "", page_url=pricing_url)
                     info["has_monetization_signal"] = bool(
                         info["has_monetization_signal"] or p_info["has_monetization_signal"]
@@ -323,20 +345,36 @@ def extract_social_contacts(links):
     }
 
 
-def merge_roles(row, bio):
-    """Keep non-empty roles when an empty bio classifies to nothing.
+_BUYER_ROLES = frozenset({"Founder", "Marketing"})
 
-    A row with no roles yet still gets only classify_role(bio), including [].
-    A non-empty classification replaces the previous list.
+
+def merge_roles(row, bio):
+    """Keep pre-tagged buyer roles or non-empty roles when bio classifies weakly.
+
+    A row with no buyer roles yet gets classify_role(bio) normally.
+    Pre-tagged Founder/Marketing roles are preserved when bio classifies empty or
+    to a non-buyer role (e.g., Trader/Creator/KOL/Dev in ad/reward copy).
     """
     classified = classify_role(bio)
     raw = row.get("roles") if isinstance(row, dict) else None
     existing = []
     if isinstance(raw, list):
         existing = [str(item) for item in raw if str(item or "").strip()]
-    if existing and not classified and not str(bio or "").strip():
-        role = str(row.get("role") or "").strip() or existing[0]
+    single_role = str(row.get("role") or "").strip() if isinstance(row, dict) else ""
+
+    if classified in _BUYER_ROLES:
+        return classified, [classified]
+
+    existing_buyer = next((r for r in [single_role, *existing] if r in _BUYER_ROLES), "")
+    if existing_buyer:
+        kept_roles = existing if existing_buyer in existing else [existing_buyer, *existing]
+        return existing_buyer, kept_roles
+
+    if existing and not classified:
+        role = single_role or existing[0]
         return role, existing
+    if not classified and single_role:
+        return single_role, [single_role]
     return classified, ([classified] if classified else [])
 
 
@@ -506,9 +544,29 @@ def enrich_rows(
     urls_to_fetch: list[str] = []
     seen_urls: set[str] = set()
 
+    strong_cats = {
+        "SaaS / AI app",
+        "CEX / биржа",
+        "Проп трейдинг",
+        "DeFi / DEX",
+        "Gaming / AI",
+        "Платёжки / финтех",
+    }
+    commercial_sources = {"whop_content_rewards", "tiktok_ads", "tiktok_shop", "meta_ads", "app_store"}
     for r in rows:
         bio = r.get("bio") or ""
-        cat = classify_cat(bio) if bio.strip() else (r.get("category") or classify_cat(bio))
+        existing_cat = str(r.get("category") or "").strip()
+        classified_cat = classify_cat(bio)
+        src_val = str(r.get("source") or "").strip()
+        if existing_cat in strong_cats and (
+            classified_cat == "Web3 (общее)"
+            or (src_val in commercial_sources and classified_cat == "Медиа / контент")
+        ):
+            cat = existing_cat
+        elif bio.strip():
+            cat = classified_cat
+        else:
+            cat = existing_cat or classified_cat
         purl = pick_project_url(r.get("links") or []) or (
             r.get("project_url") if (r.get("project_url") and not is_social(r.get("project_url"))) else ""
         )
@@ -539,7 +597,12 @@ def enrich_rows(
         detail = bio_detail(bio)
         r2 = dict(r)
         role, roles = merge_roles(r, bio)
-        final_purl = norm_purl or norm_url(r.get("project_url") or "")
+        raw_existing_purl = r.get("project_url") or ""
+        final_purl = norm_purl or (
+            norm_url(raw_existing_purl)
+            if raw_existing_purl and not is_social(raw_existing_purl)
+            else ""
+        )
         clean_name, clean_proj = sanitize_person_and_company(
             r.get("name"),
             pname or r.get("company"),

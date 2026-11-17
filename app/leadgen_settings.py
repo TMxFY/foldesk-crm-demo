@@ -54,11 +54,15 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "tg_comments": True,
             "channel_graph": True,
             "tg_ad_spy": True,
+            "whop_content_rewards": True,
+            "tiktok_ads": True,
+            "tiktok_shop": True,
             "meta_ads": True,
             "yc_ph": True,
             "social_x_reddit": True,
             "buyer_catalogs": True,
             "linkedin_jobs": True,
+            "tg_identity_bridge": True,
         },
         "tg_groups_old": ["producthunt_heroes", "id1613398776"],
         "tg_groups_new": ["productcircle_chat"],
@@ -165,9 +169,22 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     b2b["campaign_daily_limit"] = b2b_limit
 
     raw_sources = b2b.get("sources") or {}
+    caller_sources = ((cfg or {}).get("b2b") or {}).get("sources")
+    new_vein_keys = {"whop_content_rewards", "tiktok_ads", "tiktok_shop", "tg_identity_bridge"}
+    restricted_legacy_cfg = (
+        isinstance(caller_sources, dict)
+        and len(caller_sources) > 0
+        and caller_sources.get("meta_ads") is False
+        and caller_sources.get("social_x_reddit") is False
+    )
     norm_sources = {}
     for sk, default_v in DEFAULT_LEADGEN_CONFIG["b2b"]["sources"].items():
-        norm_sources[sk] = bool(raw_sources.get(sk, default_v))
+        if isinstance(caller_sources, dict) and sk in caller_sources:
+            norm_sources[sk] = bool(caller_sources[sk])
+        elif restricted_legacy_cfg and sk in new_vein_keys:
+            norm_sources[sk] = False
+        else:
+            norm_sources[sk] = bool(raw_sources.get(sk, default_v))
     for sk, sv in raw_sources.items():
         if sk not in norm_sources:
             norm_sources[str(sk)] = bool(sv)
@@ -334,6 +351,16 @@ def save_leadgen_config(
     inner = payload.get("config") if isinstance(payload.get("config"), dict) else payload
     current = get_leadgen_config(conn)
     merged = _deep_merge(current, inner)
+    inner_sources = (inner.get("b2b") or {}).get("sources")
+    new_vein_keys = ("whop_content_rewards", "tiktok_ads", "tiktok_shop", "tg_identity_bridge")
+    if (
+        isinstance(inner_sources, dict)
+        and inner_sources.get("meta_ads") is False
+        and inner_sources.get("social_x_reddit") is False
+        and not any(k in inner_sources for k in new_vein_keys)
+    ):
+        for new_k in new_vein_keys:
+            merged.setdefault("b2b", {}).setdefault("sources", {})[new_k] = False
     normalized = _normalize_config(merged)
 
     should_write_cases_file = bool(
@@ -415,7 +442,10 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
 
     from app.hygiene import read_direct_x_leads
 
-    direct_x_leads_count = int(read_direct_x_leads(state_dir, limit=1).get("total") or 0)
+    direct_x_payload = read_direct_x_leads(state_dir, limit=12)
+    direct_x_leads_count = int(direct_x_payload.get("total") or 0)
+    recent_direct_x_leads = list(direct_x_payload.get("items") or [])[-12:]
+    recent_b2b_leads: list[dict[str, Any]] = []
     crm_counts = {
         "total_leadgen_leads": 0,
         "vacancies_leads": 0,
@@ -430,32 +460,45 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
             ).fetchall()
             vac_c = 0
             b2b_c = 0
+            b2b_kws = (
+                "leadgen",
+                "google sheet",
+                "yc",
+                "product hunt",
+                "meta",
+                "tiktok",
+                "tg",
+                "ad spy",
+                "channel",
+                "social",
+                "reddit",
+                "whop",
+                "catalog",
+                "linkedin",
+                "app_store",
+            )
             for r in rows:
                 src = str(r["lead_source"] or "").lower()
                 if "ваканс" in src or "job" in src:
                     vac_c += 1
-                elif any(
-                    kw in src
-                    for kw in (
-                        "leadgen",
-                        "google sheet",
-                        "yc",
-                        "product hunt",
-                        "meta",
-                        "tg",
-                        "ad spy",
-                        "channel",
-                        "social",
-                        "reddit",
-                        "whop",
-                        "catalog",
-                        "linkedin",
-                    )
-                ):
+                elif any(kw in src for kw in b2b_kws):
                     b2b_c += 1
             crm_counts["vacancies_leads"] = vac_c
             crm_counts["b2b_leads"] = b2b_c
             crm_counts["total_leadgen_leads"] = vac_c + b2b_c
+
+            recent_rows = conn.execute(
+                """
+                SELECT id, name, company, username, url, niche, lead_source, status, created_at
+                FROM leads
+                WHERE lead_source IS NOT NULL AND trim(lead_source) != ''
+                  AND lower(lead_source) NOT LIKE '%ваканс%'
+                  AND lower(lead_source) NOT LIKE '%job%'
+                ORDER BY id DESC
+                LIMIT 12
+                """
+            ).fetchall()
+            recent_b2b_leads = [as_dict(rr) for rr in recent_rows]
 
             camp_rows = conn.execute(
                 "SELECT id, name, leadgen_enabled, status FROM campaigns"
@@ -479,6 +522,8 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
         "latest_vacancy_report": latest_vacancy_report,
         "crm_leadgen_counts": crm_counts,
         "direct_x_leads_count": direct_x_leads_count,
+        "recent_b2b_leads": recent_b2b_leads,
+        "recent_direct_x_leads": recent_direct_x_leads,
     }
 
 

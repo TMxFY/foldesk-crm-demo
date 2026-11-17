@@ -522,18 +522,41 @@ def _parse_store_links(text: str, pattern: str) -> list[str]:
     return list(dict.fromkeys(re.findall(pattern, html.unescape(text))))
 
 
+_MEGACORP_STORE_RE = re.compile(
+    r"\b(?:openai|chatgpt|grok|xai|google|gemini|meta|facebook|instagram|"
+    r"microsoft|anthropic|claude|apple|perplexity|notion|spotify|canva|adobe)\b",
+    re.I,
+)
+APP_STORE_TERMS = ("AI astrology", "AI fitness coach", "calorie tracker AI", "language tutor AI")
+
+
+def _is_megacorp_store_item(item: dict[str, Any]) -> bool:
+    try:
+        if int(item.get("userRatingCount") or 0) > 25000:
+            return True
+    except (TypeError, ValueError):
+        pass
+    blob = " ".join(
+        str(item.get(k) or "") for k in ("trackName", "artistName", "sellerName", "sellerUrl")
+    )
+    return bool(_MEGACORP_STORE_RE.search(blob))
+
+
 def app_stores(limit: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for term in ("AI app", "SaaS", "productivity"):
+    for term in APP_STORE_TERMS:
         try:
             payload = _get_json("https://itunes.apple.com/search", params={"term": term, "entity": "software", "country": "us", "limit": min(limit, 50)})
-            for item in payload.get("results", [])[:limit]:
+            for item in payload.get("results", []):
+                if _is_megacorp_store_item(item):
+                    continue
                 url = item.get("trackViewUrl") or ""
-                rows.append(_base_row(name=item.get("trackName") or "App Store app", bio=item.get("description") or item.get("primaryGenreName") or "", source="app_store", source_url=url, project=item.get("trackName") or "", project_url=item.get("sellerUrl") or url, links=[url, item.get("sellerUrl") or ""]) | {"app_store": "apple", "developer": item.get("artistName") or ""})
+                rows.append(_base_row(name=item.get("trackName") or "App Store app", bio=item.get("description") or item.get("primaryGenreName") or "", source="app_store", source_url=url, project=item.get("trackName") or "", project_url=item.get("sellerUrl") or url, links=[url, item.get("sellerUrl") or ""]) | {"app_store": "apple", "developer": item.get("artistName") or "", "rating_count": int(item.get("userRatingCount") or 0)})
+                if len(rows) >= limit * len(APP_STORE_TERMS):
+                    break
         except Exception as exc:
             log("App Store discovery failed:", exc)
-        # Three small, focused queries give better coverage than one generic
-        # store result page.  ``dedupe`` collapses the occasional overlap.
+        # Focused consumer subscription queries avoid mega-utilities like ChatGPT/Gemini.
 
     try:
         query = quote_plus("AI productivity")
@@ -547,6 +570,28 @@ def app_stores(limit: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _treg_launch_hits(query: str) -> list[dict[str, Any]]:
+    try:
+        from treg_client import call as treg_call, check_treg_ready
+    except ImportError:
+        try:
+            from leadgen.treg_client import call as treg_call, check_treg_ready
+        except ImportError:
+            return []
+    if not check_treg_ready():
+        return []
+    payload = treg_call("crawl4ai.web.search", query={"q": query}, timeout=30)
+    if not payload:
+        return []
+    if isinstance(payload, dict):
+        res = payload.get("results") or payload.get("result") or []
+        if isinstance(res, dict):
+            res = res.get("results") or []
+        if isinstance(res, list):
+            return [r for r in res if isinstance(r, dict)]
+    return []
+
+
 def launch_signals(limit: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     queries = (
@@ -554,20 +599,41 @@ def launch_signals(limit: int) -> list[dict[str, Any]]:
         'site:linkedin.com/in ("founder" OR "co-founder") ("launched" OR "now live") AI startup',
     )
     for query in queries:
+        treg_hits = _treg_launch_hits(query)
+        if treg_hits:
+            for hit in treg_hits[:limit]:
+                url = str(hit.get("url") or "").strip()
+                if not url:
+                    continue
+                title = str(hit.get("title") or url).strip()
+                bio = str(hit.get("snippet") or hit.get("description") or title).strip()
+                source = "x_launch" if "x.com" in url else "linkedin_launch"
+                rows.append(_base_row(name=title, bio=bio, source=source, source_url=url, project_url=url, links=[url]) | {"launch_query": query})
+            continue
         try:
             text = _get_text("https://html.duckduckgo.com/html/", params={"q": query})
             if BeautifulSoup:
                 soup = BeautifulSoup(text, "html.parser")
                 result_nodes = soup.select(".result")
                 for node in result_nodes[:limit]:
+                    classes = node.get("class") or []
+                    if "result--ad" in classes:
+                        continue
                     anchor = node.select_one("a.result__a")
                     if not anchor or not anchor.get("href"):
                         continue
                     url = unwrap_search_url(anchor["href"])
+                    title_txt = anchor.get_text(" ", strip=True)
+                    if (
+                        not url
+                        or "duckduckgo.com/y.js" in url
+                        or title_txt.casefold() in {"sponsored", "ad", "advertisement"}
+                    ):
+                        continue
                     snippet = node.select_one(".result__snippet")
-                    bio = snippet.get_text(" ", strip=True) if snippet else anchor.get_text(" ", strip=True)
+                    bio = snippet.get_text(" ", strip=True) if snippet else title_txt
                     source = "x_launch" if "x.com" in url else "linkedin_launch"
-                    rows.append(_base_row(name=anchor.get_text(" ", strip=True), bio=bio, source=source, source_url=url, project_url=url, links=[url]) | {"launch_query": query})
+                    rows.append(_base_row(name=title_txt, bio=bio, source=source, source_url=url, project_url=url, links=[url]) | {"launch_query": query})
         except Exception as exc:
             log("launch-signal discovery failed:", exc)
     return rows

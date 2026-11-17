@@ -34,3 +34,18 @@
    - Режим `--heal` автоматически карантинит не-ICP получателей/лидов и очищает битые заголовки через `heal_crm_hygiene(conn)`.
 3. **Live Deep Health & Deploy Rollback Gate (`python3 scripts/proactive_audit.py --health-url http://127.0.0.1:18084/api/health?deep=1`)**:
    - На живом сервере проверяет одновременно 5 инвариантов: `"db_ok": true`, `"reply_alert_guard_ok": true`, `"false_reply_alerts_24h": 0`, `"icp_hygiene_ok": true` и `"leadgen_ready": true`. Любое отклонение немедленно даёт `exit 1` с распечаткой `missing_components` и блокирует выкатку в `deploy-vps.yml`.
+
+## Playbook 3: High-Yield Veins, Non-Empty Seeds & Store/Telegram Bridge Gate
+Исключает потери целевых лидов из-за пустых дефолтных seed-каналов (`tg_ad_spy`, `tg_channel_graph`), мёртвых каталогов без контактов (`fivem`, `gta`), нераспакованных ссылок App Store / Google Play в рекламе Meta/TikTok и отсутствия моста `X / Сайт -> личный @telegram`.
+
+### Обязательные независимые перепроверки (3-of-3):
+1. **Static Gate G (`./scripts/verify.sh`)**:
+   - Проверяет наличие `leadgen/monid_client.py`, `leadgen/high_yield_veins.py` и `leadgen/tg_identity_bridge.py`.
+   - Проверяет непустые `DEFAULT_AD_SPY_CHANNELS` в `leadgen/tg_ad_spy.py` и `DEFAULT_GRAPH_SEED_CHANNELS` в `leadgen/tg_channel_graph.py`.
+   - Запрещает мёртвые хосты `fivem-server.org` и `6charts.com` в `buyer_catalogs.SOURCES`.
+   - Проверяет подключение `high_yield_veins.py`, `tg_identity_bridge.py` и сохранение `last_run_summary.json` в `leadgen/vps_autonomous_replenish.py`.
+2. **Identity Anti-Namesake & Megacorp Filter Tests (`pytest`)**:
+   - `tg_identity_bridge.py` обязан отклонять каналы, ботов и однофамильцев без подтверждения бренда/домена или полного имени фаундера на странице `t.me/<handle>`.
+   - `monid_client.resolve_app_store_developer` и `creator_external_leads.app_stores` обязаны отсекать мегакорпорации (`>25k–50k` оценок и список гигантов).
+3. **Live Harvest Visibility (`/api/leadgen/config` + UI `#leadgen-live-harvest-card`)**:
+   - `last_run_summary.json` отображает по-источниковую статистику прогона (`per_source_counts`, `tg_bridged_count`), а карточка «Свежий улов парсеров» в UI показывает целевые лиды в TG-кампании и пуле Direct/X.

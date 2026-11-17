@@ -514,6 +514,9 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
     monkeypatch.setenv("SCRAPER_SESSIONS_DIR", str(scraper_dir))
     monkeypatch.delenv("SCRAPER_TG_SESSION", raising=False)
     monkeypatch.delenv("TREG_API_KEY", raising=False)
+    monkeypatch.delenv("RELAYFAST_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("MONID_ENRICH", "0")
     monkeypatch.setenv("TREG_CONFIG_PATH", str(tmp_path / "missing_treg_config.json"))
 
     # 1) check_treg_ready() unit verification

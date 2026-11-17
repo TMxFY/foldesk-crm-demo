@@ -47,6 +47,20 @@ DEFAULT_SESSION = (
     or "/Users/timofei/.claude/skill-telegram/tim3.session"
 )
 DEFAULT_SEEN_PATH = "leadgen_state/ad_spy_seen.json"
+DEFAULT_AD_SPY_CHANNELS: tuple[str, ...] = (
+    "gonzo_ML",
+    "ai_newz",
+    "startupoftheday",
+    "productradar_official",
+    "indiehackers_ru",
+    "vc_blogs",
+    "toncoin_rus",
+    "forklog",
+    "rbc_crypto",
+    "gamedev_ru",
+    "neurochannel",
+    "ecom_digest",
+)
 
 AD_MARKER_RE = re.compile(
     r"(#реклама|#ad\b|#sponsored|\berid\s*[:=]?\s*[A-Za-z0-9\-]+|\bsponsored\b|"
@@ -154,7 +168,7 @@ def default_fetch_html(url: str) -> str:
         headers={"User-Agent": "Mozilla/5.0 (compatible; LeadgenAdSpy/1.0)"},
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
-        raw = resp.read(65536)
+        raw = resp.read(524288)
     return raw.decode("utf-8", errors="ignore")
 
 
@@ -276,6 +290,147 @@ async def _resolve_personal_user(client, username: str) -> dict:
         return {"id": 0, "name": "", "bio": ""}
 
 
+def _extract_post_texts(payload, limit: int) -> list[str]:
+    if not payload:
+        return []
+    candidates = None
+    if isinstance(payload, list):
+        candidates = payload
+    elif isinstance(payload, dict):
+        for container in (payload, payload.get("output"), payload.get("result"), payload.get("data")):
+            if not isinstance(container, dict):
+                continue
+            for key in ("rows", "posts", "messages", "items", "results", "list"):
+                val = container.get(key)
+                if isinstance(val, list):
+                    candidates = val
+                    break
+            if candidates is not None:
+                break
+    out: list[str] = []
+    for item in candidates or []:
+        if isinstance(item, str):
+            txt = item.strip()
+        elif isinstance(item, dict):
+            txt = str(item.get("text") or item.get("message") or item.get("content") or "").strip()
+        else:
+            txt = ""
+        if txt:
+            out.append(txt)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _parse_tme_s_html(html_text: str, limit: int) -> list[str]:
+    if not html_text:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        BeautifulSoup = None
+
+    out: list[str] = []
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for node in soup.select(".tgme_widget_message_text"):
+            for a_tag in node.find_all("a", href=True):
+                href = html.unescape(str(a_tag.get("href") or "")).strip()
+                label = a_tag.get_text(" ", strip=True)
+                if href.startswith(("http://", "https://")) and href not in label:
+                    a_tag.replace_with(f"{label} {href} ")
+            txt = " ".join(node.get_text(" ", strip=True).split())
+            if txt:
+                out.append(txt)
+        return out[-limit:] if limit > 0 else []
+
+    for m in re.finditer(r'class="[^"]*\btgme_widget_message_text\b[^"]*"[^>]*>(.*?)</div>', html_text, re.I | re.S):
+        inner = m.group(1)
+        inner = re.sub(
+            r'<a[^>]+href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>',
+            lambda am: f"{re.sub(r'<[^>]+>', ' ', am.group(2)).strip()} {html.unescape(am.group(1))} ",
+            inner,
+            flags=re.I | re.S,
+        )
+        txt = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", inner)).split())
+        if txt:
+            out.append(txt)
+    return out[-limit:] if limit > 0 else []
+
+
+def fetch_public_channel_posts_http(
+    channel: str,
+    limit: int = 30,
+    *,
+    monid_fn=None,
+    treg_fn=None,
+    http_get_fn=None,
+) -> list[str]:
+    """Fetch public channel posts without risking Telethon FloodWait."""
+    ch = str(channel or "").strip().lstrip("@")
+    if not ch:
+        return []
+    custom_mode = any(fn is not None for fn in (monid_fn, treg_fn, http_get_fn))
+
+    # 1) Monid litescrape /telegram/posts
+    try:
+        if monid_fn is not None:
+            m_payload = monid_fn(ch, limit)
+        elif not custom_mode:
+            try:
+                from leadgen.monid_client import check_monid_ready, run_monid
+            except ImportError:
+                from monid_client import check_monid_ready, run_monid
+            m_payload = (
+                run_monid("litescrape", "/telegram/posts", query={"channel": ch}, wait_sec=20, timeout=25)
+                if check_monid_ready()
+                else None
+            )
+        else:
+            m_payload = None
+        posts = _extract_post_texts(m_payload, limit)
+        if posts:
+            return posts
+    except Exception:
+        pass
+
+    # 2) Treg crawl4ai.telegram.channel.posts
+    try:
+        if treg_fn is not None:
+            t_payload = treg_fn(ch, limit)
+        elif not custom_mode:
+            try:
+                from leadgen.treg_client import call as treg_call, check_treg_ready
+            except ImportError:
+                from treg_client import call as treg_call, check_treg_ready
+            t_payload = (
+                treg_call("crawl4ai.telegram.channel.posts", method="POST", data={"channel": ch, "limit": limit}, timeout=25)
+                if check_treg_ready()
+                else None
+            )
+        else:
+            t_payload = None
+        posts = _extract_post_texts(t_payload, limit)
+        if posts:
+            return posts
+    except Exception:
+        pass
+
+    # 3) Public https://t.me/s/<channel> HTML fallback
+    try:
+        tme_url = f"https://t.me/s/{ch}"
+        if http_get_fn is not None:
+            html_txt = http_get_fn(tme_url) or ""
+        else:
+            html_txt = default_fetch_html(tme_url)
+        posts = _parse_tme_s_html(str(html_txt or ""), limit)
+        if posts:
+            return posts
+    except Exception:
+        pass
+    return []
+
+
 async def scan_ad_channels(
     client,
     channels: list[str],
@@ -284,7 +439,10 @@ async def scan_ad_channels(
     output_path: str = "ad_spy_leads.jsonl",
     delay: float = 1.0,
     fetch_html=default_fetch_html,
+    public_posts_fn=None,
 ) -> list[dict]:
+    from types import SimpleNamespace
+
     seen = _load_seen(seen_path)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered: list[dict] = []
@@ -294,15 +452,28 @@ async def scan_ad_channels(
             ch = raw_ch.strip().lstrip("@")
             if not ch:
                 continue
-            try:
-                entity = await client.get_entity(ch)
-                messages = await client.get_messages(entity, limit=msg_limit)
-            except FloodWaitError as fw:
-                await asyncio.sleep(min(fw.seconds, 60))
-                continue
-            except Exception as exc:
-                print(f"# ad_spy error reading {ch}: {exc}", file=sys.stderr)
-                continue
+            messages = None
+            if public_posts_fn is not None:
+                try:
+                    raw_posts = public_posts_fn(ch, msg_limit) or []
+                except Exception:
+                    raw_posts = []
+                if raw_posts:
+                    messages = [
+                        SimpleNamespace(id=idx + 1, message=str(txt))
+                        for idx, txt in enumerate(raw_posts[:msg_limit])
+                        if str(txt or "").strip()
+                    ]
+            if messages is None:
+                try:
+                    entity = await client.get_entity(ch)
+                    messages = await client.get_messages(entity, limit=msg_limit)
+                except FloodWaitError as fw:
+                    await asyncio.sleep(min(fw.seconds, 60))
+                    continue
+                except Exception as exc:
+                    print(f"# ad_spy error reading {ch}: {exc}", file=sys.stderr)
+                    continue
 
             for msg in messages or []:
                 text = (getattr(msg, "message", None) or "").strip()
@@ -414,6 +585,8 @@ async def scan_ad_channels(
 async def _async_main(args: argparse.Namespace) -> None:
     raw_channels = args.channels or os.getenv("TG_AD_SPY_CHANNELS", "")
     channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
+    if not channels and not getattr(args, "no_default_channels", False):
+        channels = list(DEFAULT_AD_SPY_CHANNELS)
     if not channels:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8"):
@@ -424,8 +597,11 @@ async def _async_main(args: argparse.Namespace) -> None:
     api_id = int(os.getenv("TG_API_ID", "0"))
     api_hash = os.getenv("TG_API_HASH", "")
     if not api_id or not api_hash:
-        print("TG_API_ID / TG_API_HASH not set", file=sys.stderr)
-        sys.exit(1)
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8"):
+            pass
+        print("# tg_ad_spy: TG_API_ID / TG_API_HASH not set; skipping (0 leads)", file=sys.stderr)
+        return
 
     client = TelegramClient(args.session, api_id, api_hash)
     await client.start()
@@ -437,6 +613,7 @@ async def _async_main(args: argparse.Namespace) -> None:
             seen_path=args.seen,
             output_path=args.output,
             delay=args.delay,
+            public_posts_fn=fetch_public_channel_posts_http,
         )
         print(f"# tg_ad_spy: discovered {len(rows)} advertiser leads -> {args.output}", file=sys.stderr)
     finally:
@@ -447,6 +624,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Telegram Ad-Spy lead scraper")
     ap.add_argument("--session", default=DEFAULT_SESSION)
     ap.add_argument("--channels", default=os.getenv("TG_AD_SPY_CHANNELS", ""))
+    ap.add_argument("--no-default-channels", action="store_true")
     ap.add_argument("--msg-limit", type=int, default=40)
     ap.add_argument("--seen", default=DEFAULT_SEEN_PATH)
     ap.add_argument("--output", required=True)

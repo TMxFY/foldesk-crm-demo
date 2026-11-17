@@ -98,14 +98,48 @@ def _curl(url: str) -> str:
     return proc.stdout
 
 
+def _whop_treg_search_rows() -> list[dict]:
+    try:
+        from treg_client import call as treg_call, check_treg_ready
+    except ImportError:
+        try:
+            from leadgen.treg_client import call as treg_call, check_treg_ready
+        except ImportError:
+            return []
+    if not check_treg_ready():
+        return []
+    payload = treg_call(
+        "crawl4ai.web.search",
+        query={"q": 'site:whop.com ("content rewards" OR "per 1,000 views") ("x.com" OR "t.me")'},
+        timeout=30,
+    )
+    if not isinstance(payload, dict):
+        return []
+    snippets: list[str] = []
+    results = payload.get("results") or payload.get("result") or []
+    if isinstance(results, dict):
+        results = results.get("results") or []
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict):
+                snippets.append(
+                    " ".join(str(item.get(k) or "") for k in ("url", "title", "snippet", "description"))
+                )
+    if not snippets:
+        return []
+    return owner_contacts("\n".join(snippets), source_url=DISCOVER_URL)
+
+
 def whop_rows(fetch_fn=None) -> list[dict]:
     fetch = fetch_fn or _curl
+    html = ""
     try:
         html = fetch(DISCOVER_URL)
     except Exception:
-        print("whop: skipped (fetch failed)", flush=True)
-        return []
+        html = ""
     rows = owner_contacts(html or "", source_url=DISCOVER_URL)
+    if not rows and fetch_fn is None:
+        rows = _whop_treg_search_rows()
     if not rows:
         print("whop: skipped (no owner with x.com or t.me)", flush=True)
     return rows

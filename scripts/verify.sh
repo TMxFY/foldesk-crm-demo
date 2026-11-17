@@ -287,6 +287,54 @@ for py_file in sorted((root / "leadgen").rglob("*.py")):
                 f"Gate F violation in {py_file}:{lineno}: hardcoded Mac .session path without TG_SESSION/SCRAPER_TG_SESSION env override"
             )
 
+# Gate G: High-Yield Veins, Non-Empty Ad-Spy/Graph Seeds & Store Bridge Gate
+def _has_nonempty_literal_assign(py_path: Path, target_name: str) -> bool:
+    if not py_path.is_file():
+        return True
+    try:
+        tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        val = None
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == target_name for t in node.targets):
+                val = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == target_name:
+                val = node.value
+        if val is not None:
+            if isinstance(val, (ast.Tuple, ast.List, ast.Set)) and len(val.elts) > 0:
+                return True
+            return False
+    return False
+
+ad_spy_file = root / "leadgen" / "tg_ad_spy.py"
+if not _has_nonempty_literal_assign(ad_spy_file, "DEFAULT_AD_SPY_CHANNELS"):
+    errors.append("Gate G violation in leadgen/tg_ad_spy.py: missing or empty DEFAULT_AD_SPY_CHANNELS literal")
+
+ch_graph_file = root / "leadgen" / "tg_channel_graph.py"
+if not _has_nonempty_literal_assign(ch_graph_file, "DEFAULT_GRAPH_SEED_CHANNELS"):
+    errors.append("Gate G violation in leadgen/tg_channel_graph.py: missing or empty DEFAULT_GRAPH_SEED_CHANNELS literal")
+
+catalogs_file = root / "leadgen" / "buyer_catalogs.py"
+if catalogs_file.is_file():
+    cat_src = catalogs_file.read_text(encoding="utf-8")
+    m_sources = re.search(r"SOURCES\s*=\s*\(([\s\S]*?)\n\)", cat_src)
+    if m_sources and ("fivem-server.org" in m_sources.group(1) or "6charts.com" in m_sources.group(1)):
+        errors.append("Gate G violation in leadgen/buyer_catalogs.py: dead 0%-contact fivem/gta hosts left in default SOURCES")
+
+repl_file = root / "leadgen" / "vps_autonomous_replenish.py"
+repl_src = repl_file.read_text(encoding="utf-8") if repl_file.is_file() else ""
+if (root / "leadgen" / "meta_ad_leads.py").is_file() or "def run_autonomous_replenish(" in repl_src:
+    for req_leadgen_mod in ("monid_client.py", "high_yield_veins.py", "tg_identity_bridge.py"):
+        if not (root / "leadgen" / req_leadgen_mod).is_file():
+            errors.append(f"Gate G violation: missing required module leadgen/{req_leadgen_mod}")
+    if "def run_autonomous_replenish(" in repl_src:
+        for req_stage in ("high_yield_veins.py", "tg_identity_bridge.py", "last_run_summary.json"):
+            if req_stage not in repl_src:
+                errors.append(f"Gate G violation in leadgen/vps_autonomous_replenish.py: missing '{req_stage}' wiring")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

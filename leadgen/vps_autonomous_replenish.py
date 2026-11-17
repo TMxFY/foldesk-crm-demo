@@ -42,6 +42,7 @@ from leadgen.tg_to_gsheet import (
     whatsapp_url,
     x_profile_url,
 )
+from leadgen.monid_client import check_monid_ready as _client_check_monid_ready, monid_bin
 from leadgen.treg_client import check_treg_ready as _client_check_treg_ready, treg_bin
 
 DEFAULT_DB_PATH = "/opt/crmtg/data/crm.db"
@@ -51,6 +52,34 @@ _NOISE_TG_HANDLES = frozenset({"joinchat", "share", "addstickers", "proxy", "iv"
 
 def check_treg_ready() -> bool:
     return _client_check_treg_ready(binary_fn=treg_bin)
+
+
+def check_monid_ready() -> bool:
+    return _client_check_monid_ready(binary_fn=monid_bin)
+
+
+def _count_personal_tg_rows(jsonl_path: Path) -> int:
+    if not jsonl_path.is_file():
+        return 0
+    cnt = 0
+    try:
+        lines = jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        cand = obj.get("username") or obj.get("telegram_username") or obj.get("tg_username")
+        if _is_real_personal_tg_handle(cand):
+            cnt += 1
+    return cnt
 
 
 def _is_real_personal_tg_handle(raw_username: Any) -> bool:
@@ -850,7 +879,10 @@ def run_autonomous_replenish(
     replenish_reasons: list[str] = []
     rule5_previews: dict[str, Any] = {}
     rule5_quarantined: dict[str, list[int]] = {}
+    per_source_counts: dict[str, int] = {}
+    tg_bridged_count = 0
     treg_ready = check_treg_ready()
+    monid_ready = check_monid_ready()
 
     if needs_b2b or needs_vac:
         pre_existing_recipient_ids: set[int] = {
@@ -948,6 +980,7 @@ def run_autonomous_replenish(
                 master_jsonl = state_dir / "master_ids.jsonl"
                 buyer_public_out = state_dir / f"buyer_public_{ts}.jsonl"
                 catalogs_out = state_dir / f"buyer_catalogs_{ts}.jsonl"
+                high_yield_out = state_dir / f"high_yield_{ts}.jsonl"
                 meta_ads_out = state_dir / f"meta_ads_{ts}.jsonl"
                 social_out = state_dir / f"social_{ts}.jsonl"
                 channel_graph_out = state_dir / f"channel_graph_{ts}.jsonl"
@@ -978,6 +1011,35 @@ def run_autonomous_replenish(
                             str(catalogs_out),
                         ],
                     )
+
+                enabled_veins: list[str] = []
+                if (
+                    sources_cfg.get("whop_content_rewards", False)
+                    and "whop_content_rewards" not in quarantined
+                ):
+                    enabled_veins.append("whop")
+                if sources_cfg.get("tiktok_ads", False) and "tiktok_ads" not in quarantined:
+                    enabled_veins.append("tiktok_ads")
+                if sources_cfg.get("tiktok_shop", False) and "tiktok_shop" not in quarantined:
+                    enabled_veins.append("tiktok_shop")
+                if enabled_veins and "high_yield_veins" not in quarantined:
+                    if treg_ready or monid_ready or runner is not subprocess.run:
+                        _exec_stage(
+                            "high_yield_veins",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "high_yield_veins.py"),
+                                "--output",
+                                str(high_yield_out),
+                                "--seen",
+                                str(state_dir / "high_yield_seen.json"),
+                                "--veins",
+                                ",".join(enabled_veins),
+                            ],
+                        )
+                    elif "missing_treg_cli" not in replenish_reasons:
+                        replenish_reasons.append("missing_treg_cli")
+
                 if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
                     if treg_ready or runner is not subprocess.run:
                         _exec_stage(
@@ -1126,10 +1188,33 @@ def run_autonomous_replenish(
                         ],
                     )
 
+                def _count_jsonl_lines(p: Path) -> int:
+                    if not p.is_file() or p.stat().st_size == 0:
+                        return 0
+                    try:
+                        return sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
+                    except OSError:
+                        return 0
+
+                per_source_counts["tg_groups"] = _count_jsonl_lines(raw_jsonl)
+                for src_label, src_path in (
+                    ("buyer_public", buyer_public_out),
+                    ("buyer_catalogs", catalogs_out),
+                    ("high_yield_veins", high_yield_out),
+                    ("meta_ads", meta_ads_out),
+                    ("social_x_reddit", social_out),
+                    ("external", external_out),
+                    ("yc_ph", yc_ph_out),
+                    ("channel_graph", channel_graph_out),
+                    ("tg_ad_spy", ad_spy_out),
+                ):
+                    per_source_counts[src_label] = _count_jsonl_lines(src_path)
+
                 _merge_discovered_jsonl_into_raw(
                     [
                         buyer_public_out,
                         catalogs_out,
+                        high_yield_out,
                         meta_ads_out,
                         social_out,
                         external_out,
@@ -1220,6 +1305,36 @@ def run_autonomous_replenish(
                                     treg_tmp_jsonl.replace(final_jsonl)
                                 elif treg_tmp_jsonl.is_file():
                                     treg_tmp_jsonl.unlink(missing_ok=True)
+                            if (
+                                (treg_ready or monid_ready or runner is not subprocess.run)
+                                and sources_cfg.get("tg_identity_bridge", True)
+                                and "tg_identity_bridge" not in quarantined
+                                and final_jsonl.is_file()
+                                and final_jsonl.stat().st_size > 0
+                            ):
+                                pre_tg_cnt = _count_personal_tg_rows(final_jsonl)
+                                bridge_tmp_jsonl = state_dir / f"raw_{ts}.bridge_tmp.jsonl"
+                                bridge_ok = _exec_stage(
+                                    "tg_identity_bridge",
+                                    [
+                                        py_bin,
+                                        str(ROOT / "leadgen" / "tg_identity_bridge.py"),
+                                        "--input",
+                                        str(final_jsonl),
+                                        "--output",
+                                        str(bridge_tmp_jsonl),
+                                    ],
+                                )
+                                if (
+                                    bridge_ok
+                                    and bridge_tmp_jsonl.is_file()
+                                    and bridge_tmp_jsonl.stat().st_size > 0
+                                ):
+                                    bridge_tmp_jsonl.replace(final_jsonl)
+                                    post_tg_cnt = _count_personal_tg_rows(final_jsonl)
+                                    tg_bridged_count = max(0, post_tg_cnt - pre_tg_cnt)
+                                elif bridge_tmp_jsonl.is_file():
+                                    bridge_tmp_jsonl.unlink(missing_ok=True)
                             if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
                                 split_res = split_tg_and_direct_x_leads(
                                     final_jsonl, state_dir / "direct_x_leads.jsonl"
@@ -1331,10 +1446,13 @@ def run_autonomous_replenish(
         )
         conn.commit()
 
-    return {
+    result_payload = {
         "ok": True,
+        "timestamp": utc_now(),
         "ingested_total": ingested_total,
         "direct_x_routed": direct_x_routed,
+        "tg_bridged_count": tg_bridged_count,
+        "per_source_counts": per_source_counts,
         "pending_b2b": pending_b2b,
         "pending_vacancies": pending_vac,
         "quarantined_sources": sorted(quarantined),
@@ -1345,6 +1463,34 @@ def run_autonomous_replenish(
         "rule5_quarantined": rule5_quarantined,
         "low_water_alert": low_water_alert,
     }
+    if stages_run or ingested_total > 0 or direct_x_routed > 0:
+        try:
+            st_dir = _resolve_state_dir()
+            st_dir.mkdir(parents=True, exist_ok=True)
+            summary_tmp = st_dir / "last_run_summary.json.tmp"
+            summary_tmp.write_text(
+                json.dumps(
+                    {
+                        "timestamp": result_payload["timestamp"],
+                        "ingested_total": ingested_total,
+                        "direct_x_routed": direct_x_routed,
+                        "tg_bridged_count": tg_bridged_count,
+                        "per_source_counts": per_source_counts,
+                        "pending_b2b": pending_b2b,
+                        "pending_vacancies": pending_vac,
+                        "stages_run": stages_run,
+                        "stage_error_count": len(stage_errors),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            summary_tmp.replace(st_dir / "last_run_summary.json")
+        except OSError:
+            pass
+
+    return result_payload
 
 
 def main(argv: list[str] | None = None) -> int:

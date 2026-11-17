@@ -169,7 +169,7 @@ _WARM_MANUAL_SOURCE_RE = re.compile(
 )
 _COLD_OUTREACH_OR_LEADGEN_SOURCE_RE = re.compile(
     r"(?:cold\s+outreach|leadgen|google\s+sheet|product\s+hunt|\byc\b|hacker\s+news|\bhn\b|"
-    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|catalog|linkedin|rea[\s_\-]*video|direct|scrape|github)",
+    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|tiktok|app_store|catalog|linkedin|rea[\s_\-]*video|direct|scrape|github)",
     re.IGNORECASE,
 )
 
@@ -911,6 +911,15 @@ def _check_treg_ready() -> bool:
         return False
 
 
+def _check_monid_ready() -> bool:
+    try:
+        from leadgen.monid_client import check_monid_ready
+
+        return check_monid_ready()
+    except ImportError:
+        return False
+
+
 def _parse_iso_ts_utc(raw: Any):
     from datetime import datetime, timezone
 
@@ -995,6 +1004,7 @@ def audit_server_leadgen_readiness(
     )
     typesafe_ready = bool(os.environ.get("TYPESAFE_API_KEY", "").strip())
     treg_ready = _check_treg_ready()
+    monid_ready = _check_monid_ready()
     stage_timeout_count = _count_stage_timeouts_or_errors(conn)
 
     b2b_cfg = cfg.get("b2b") or {}
@@ -1015,10 +1025,15 @@ def audit_server_leadgen_readiness(
             or bool(vac_cfg.get("enabled", False))
         )
     )
+    treg_only_required = any(
+        bool(sources.get(k))
+        for k in ("meta_ads", "social_x_reddit", "whop_content_rewards")
+    )
+    vein_needs_any_cli = any(bool(sources.get(k)) for k in ("tiktok_ads", "tiktok_shop"))
     treg_required = bool(
         leadgen_enabled
         and b2b_enabled
-        and any(bool(sources.get(k)) for k in ("meta_ads", "social_x_reddit"))
+        and (treg_only_required or (vein_needs_any_cli and not monid_ready))
     )
 
     scraper_session_ready = False
@@ -1080,6 +1095,7 @@ def audit_server_leadgen_readiness(
         "scraper_session_ready": scraper_session_ready,
         "treg_required": treg_required,
         "treg_ready": treg_ready,
+        "monid_ready": monid_ready,
         "typesafe_ready": typesafe_ready,
         "stage_timeout_count": stage_timeout_count,
         "missing_components": missing_components,
@@ -1107,15 +1123,29 @@ def _direct_x_canonical_keys(row: dict[str, Any]) -> set[str]:
     return keys
 
 
+def _safe_http_url(raw: Any) -> str | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+    if low.startswith(("http://", "https://")):
+        return text
+    if "://" in text or ":" in text.split("/", 1)[0]:
+        return None
+    return f"https://{text.lstrip('/')}"
+
+
 def _normalize_direct_x_record(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     comp = str(out.get("company") or out.get("project") or "").strip() or None
     email = str(out.get("email") or out.get("work_email") or "").strip() or None
-    x_url = str(out.get("x_url") or out.get("founder_x") or out.get("founder_twitter") or "").strip() or None
-    if x_url and "://" not in x_url:
-        x_url = f"https://x.com/{x_url.lstrip('@')}"
-    linkedin_url = str(out.get("linkedin_url") or out.get("founder_linkedin") or "").strip() or None
-    url = str(out.get("url") or out.get("website") or out.get("project_url") or out.get("site") or "").strip() or None
+    raw_x = str(out.get("x_url") or out.get("founder_x") or out.get("founder_twitter") or "").strip()
+    if raw_x and "://" not in raw_x and ":" not in raw_x.split("/", 1)[0]:
+        if raw_x.startswith("@") or "/" not in raw_x:
+            raw_x = f"https://x.com/{raw_x.lstrip('@')}"
+    x_url = _safe_http_url(raw_x)
+    linkedin_url = _safe_http_url(out.get("linkedin_url") or out.get("founder_linkedin") or "")
+    url = _safe_http_url(out.get("url") or out.get("website") or out.get("project_url") or out.get("site") or "")
     angle = str(out.get("their_angle") or out.get("what_they_do") or "").strip() or None
     lead_src = str(out.get("lead_source") or out.get("source") or "").strip() or None
     out["company"] = comp
@@ -1123,11 +1153,11 @@ def _normalize_direct_x_record(row: dict[str, Any]) -> dict[str, Any]:
     out["email"] = email
     out["work_email"] = email or out.get("work_email")
     out["x_url"] = x_url
-    out["founder_x"] = x_url or out.get("founder_x")
+    out["founder_x"] = x_url
     out["linkedin_url"] = linkedin_url
-    out["founder_linkedin"] = linkedin_url or out.get("founder_linkedin")
+    out["founder_linkedin"] = linkedin_url
     out["url"] = url
-    out["project_url"] = url or out.get("project_url")
+    out["project_url"] = url
     out["their_angle"] = angle
     out["what_they_do"] = angle or out.get("what_they_do")
     out["lead_source"] = lead_src

@@ -262,16 +262,150 @@ def _scrape_site_contacts(project_url: str) -> dict[str, str]:
     em = email_of_text(html)
     if em:
         out["work_email"] = em
-    x_match = re.search(
+    x_skip = {"home", "search", "explore", "i", "share", "intent", "hashtag", "compose"}
+    for x_match in re.finditer(
         r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})(?:[/?#\"'\s<>]|$)",
         html,
         re.I,
-    )
-    if x_match:
-        x_url = x_profile_url({"founder_x": x_match.group(0)})
+    ):
+        handle = x_match.group(1)
+        if handle.casefold() in x_skip:
+            continue
+        x_url = x_profile_url({"founder_x": f"https://x.com/{handle}"})
         if x_url:
             out["founder_x"] = x_url
+            break
     return out
+
+
+def _extract_apple_app_id(url: str) -> str:
+    m = re.search(r"/id(\d+)\b", str(url or ""))
+    return m.group(1) if m else ""
+
+
+def _builtin_store_resolver(store_url: str) -> dict:
+    import html as html_mod
+    from urllib.parse import parse_qs, unquote
+
+    import requests
+
+    raw = str(store_url or "").strip()
+    if not raw:
+        return {}
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    mega_re = re.compile(
+        r"\b(?:openai|chatgpt|google|gemini|meta|facebook|instagram|microsoft|apple|amazon|netflix|bytedance|tiktok|xai|grok|anthropic|claude|supercell)\b",
+        re.I,
+    )
+
+    if host in {"apps.apple.com", "itunes.apple.com"}:
+        app_id = _extract_apple_app_id(raw)
+        if not app_id:
+            return {}
+        try:
+            resp = requests.get(f"https://itunes.apple.com/lookup?id={app_id}", timeout=6)
+            data = resp.json() if hasattr(resp, "json") else json.loads(getattr(resp, "text", "{}") or "{}")
+            results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(results, list) or not results:
+                return {}
+            item = results[0] if isinstance(results[0], dict) else {}
+            dev = str(item.get("sellerName") or item.get("artistName") or "").strip()
+            app_name = str(item.get("trackName") or "").strip()
+            website = str(item.get("sellerUrl") or "").strip()
+            dom = domain_of(website)
+            rc = int(item.get("userRatingCount") or 0)
+            return {
+                "developer": dev,
+                "app_name": app_name,
+                "website": website,
+                "domain": dom,
+                "email": "",
+                "rating_count": rc,
+                "is_megacorp": bool(rc > 50000 or mega_re.search(f"{dev} {app_name} {dom}")),
+            }
+        except Exception:
+            return {}
+
+    if host == "play.google.com":
+        pkg = (parse_qs(parsed.query).get("id") or [""])[0].strip()
+        if not pkg:
+            return {}
+        try:
+            resp = requests.get(
+                f"https://play.google.com/store/apps/details?id={pkg}&hl=en&gl=US",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=6,
+            )
+            html_txt = str(getattr(resp, "text", "") or "")
+        except Exception:
+            return {}
+        developer = ""
+        app_name = ""
+        rating_count = 0
+        for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_txt, re.I | re.S):
+            try:
+                obj = json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                continue
+            nodes = obj if isinstance(obj, list) else [obj]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("name") and not app_name:
+                    app_name = str(node["name"]).strip()
+                auth = node.get("author")
+                if isinstance(auth, dict) and auth.get("name") and not developer:
+                    developer = str(auth["name"]).strip()
+                agg = node.get("aggregateRating")
+                if isinstance(agg, dict) and agg.get("ratingCount") is not None:
+                    try:
+                        rating_count = int(str(agg["ratingCount"]).replace(",", "").strip())
+                    except ValueError:
+                        pass
+        website = ""
+        dom = ""
+        for m_href in re.finditer(r'<a\b[^>]*\bhref=["\'](https?://[^"\']+)["\']', html_txt, re.I):
+            href = html_mod.unescape(m_href.group(1))
+            if "google.com/url" in href:
+                q_vals = parse_qs(urlparse(href).query).get("q") or []
+                if q_vals:
+                    href = unquote(q_vals[0]).strip()
+            cand_dom = domain_of(href)
+            if cand_dom and not any(bad in cand_dom for bad in ("play.google.com", "gstatic.com", "policies.google.com", "support.google.com")):
+                website = href
+                dom = cand_dom
+                break
+        email = ""
+        m_mail = re.search(r'href=["\']mailto:([^"\'?]+)', html_txt, re.I)
+        if m_mail:
+            email = html_mod.unescape(m_mail.group(1)).strip()
+        if not (developer or website or email):
+            return {}
+        return {
+            "developer": developer,
+            "app_name": app_name,
+            "website": website,
+            "domain": dom,
+            "email": email,
+            "rating_count": rating_count,
+            "is_megacorp": bool(rating_count > 50000 or mega_re.search(f"{developer} {app_name} {dom}")),
+        }
+
+    return {}
+
+
+def _default_store_resolver(store_url: str) -> dict:
+    try:
+        from leadgen.monid_client import resolve_app_store_developer
+    except ImportError:
+        try:
+            from monid_client import resolve_app_store_developer
+        except ImportError:
+            resolve_app_store_developer = None
+    if resolve_app_store_developer is not None:
+        return resolve_app_store_developer(store_url)
+    return _builtin_store_resolver(store_url)
 
 
 def collect(
@@ -281,12 +415,15 @@ def collect(
     cap: int = CAP,
     search_fn=None,
     enrich_fn=None,
+    store_resolver_fn=None,
 ) -> tuple[list[dict], dict[str, str]]:
     today = day or date.today()
     current = fresh_seen(seen or {}, today)
     stamp = today.isoformat()
     caller = _default_search if search_fn is None else search_fn
     enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    resolve_store = _default_store_resolver if store_resolver_fn is None else store_resolver_fn
+    allow_store_bridge = bool(store_resolver_fn is not None or enrich_fn is None)
 
     rows: list[dict] = []
     local_keys: set[str] = set()
@@ -303,6 +440,12 @@ def collect(
                 break
             page_name = cand["page_name"]
             domain = cand["domain"]
+            orig_project_url = cand["project_url"]
+            orig_host = (
+                urlparse(orig_project_url if "://" in orig_project_url else f"https://{orig_project_url}").hostname or ""
+            ).lower().removeprefix("www.")
+            store_url = orig_project_url if orig_host in APP_STORE_HOSTS else ""
+
             name_key = f"name:{page_name.casefold()}"
             dom_key = f"domain:{domain.casefold()}" if domain else ""
             if name_key in current or name_key in local_keys:
@@ -310,28 +453,58 @@ def collect(
             if dom_key and (dom_key in current or dom_key in local_keys):
                 continue
 
+            store_info: dict = {}
+            resolved_domain = domain
+            resolved_project_url = orig_project_url
+            if store_url and not domain and allow_store_bridge:
+                try:
+                    store_info = resolve_store(store_url) or {}
+                except Exception:
+                    store_info = {}
+                try:
+                    store_rating = int(store_info.get("rating_count") or 0)
+                except (TypeError, ValueError):
+                    store_rating = 0
+                if store_info.get("is_megacorp") or store_rating > 50000:
+                    continue
+                if store_info.get("website"):
+                    resolved_project_url = str(store_info["website"]).strip()
+                resolved_domain = str(store_info.get("domain") or domain_of(resolved_project_url)).strip()
+                if resolved_domain:
+                    res_dom_key = f"domain:{resolved_domain.casefold()}"
+                    if res_dom_key in current or res_dom_key in local_keys:
+                        continue
+
             local_keys.add(name_key)
             if dom_key:
                 local_keys.add(dom_key)
+            if resolved_domain:
+                local_keys.add(f"domain:{resolved_domain.casefold()}")
 
+            enrich_target = str(store_info.get("developer") or page_name).strip()
             try:
-                dm = enricher(page_name, domain) or {}
+                dm = enricher(enrich_target, resolved_domain) or {}
             except Exception:
                 dm = {}
 
             founder_linkedin = str(dm.get("founder_linkedin") or "").strip()
             work_email = str(dm.get("work_email") or "").strip()
-            project_url = cand["project_url"] or str(dm.get("project_url") or "").strip()
-            resolved_domain = domain or domain_of(project_url)
+            if resolved_project_url and resolved_project_url != store_url:
+                project_url = resolved_project_url
+            else:
+                project_url = str(dm.get("project_url") or "").strip() or orig_project_url
+            resolved_domain = resolved_domain or domain_of(project_url)
             site_contacts = (
                 _scrape_site_contacts(project_url)
-                if enrich_fn is None and resolved_domain
+                if (enrich_fn is None or store_resolver_fn is not None) and resolved_domain
                 else {}
             )
             if not founder_linkedin and site_contacts.get("founder_linkedin"):
                 founder_linkedin = site_contacts["founder_linkedin"]
             if not work_email and site_contacts.get("work_email"):
                 work_email = site_contacts["work_email"]
+            if not work_email and store_info.get("email"):
+                work_email = str(store_info["email"]).strip()
             username = site_contacts.get("username", "")
             founder_x = site_contacts.get("founder_x", "")
 
@@ -339,7 +512,7 @@ def collect(
                 continue
 
             slug = _slugify(resolved_domain or page_name)
-            links = [u for u in (project_url, founder_linkedin, founder_x) if u]
+            links = list(dict.fromkeys(u for u in (project_url, store_url, founder_linkedin, founder_x) if u))
             row = {
                 "id": f"meta_ads:{slug}",
                 "name": page_name,
