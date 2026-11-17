@@ -905,7 +905,7 @@ def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> l
     if rec.get("phone"):
         phone_str = str(rec["phone"]).strip()
         phone_digits = re.sub(r"\D", "", phone_str)
-        peer_cand = int(phone_digits[-12:]) if phone_digits and len(phone_digits) >= 7 else -1
+        peer_cand = int(phone_digits[-15:]) if phone_digits and len(phone_digits) >= 7 else -1
         match_clauses.append("(phone = ? OR peer_id = ?)")
         match_params.extend([phone_str, peer_cand])
 
@@ -2849,7 +2849,7 @@ def _resolve_or_create_lead(conn, account_id: int | None, item: dict, now: str) 
     if tg_id is None and provider == "whatsapp" and phone:
         digits = re.sub(r"\D", "", phone)
         if len(digits) >= 7:
-            tg_id = int(digits[-12:])
+            tg_id = int(digits[-15:])
 
     lead_row = None
     if tg_id is not None:
@@ -3160,7 +3160,7 @@ def enroll_leads_from_crm(
         if tg_id is None and lead_provider == "whatsapp" and phone:
             digits = re.sub(r"\D", "", phone)
             if len(digits) >= 7:
-                tg_id = int(digits[-12:])
+                tg_id = int(digits[-15:])
 
         if tg_id is None:
             tg_id = 900000 + lid
@@ -3262,7 +3262,7 @@ def _ensure_recipient_dialog(
     phone_digits = re.sub(r"\D", "", phone or "")
     if resolved_provider == "whatsapp":
         if phone_digits and len(phone_digits) >= 7:
-            peer_id = int(phone_digits[-12:])
+            peer_id = int(phone_digits[-15:])
             if not phone.startswith("+"):
                 phone = f"+{phone_digits}"
         elif rec.get("telegram_user_id"):
