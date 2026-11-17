@@ -470,6 +470,12 @@ _BROKEN_STEP1_STUB_RE = re.compile(
 )
 
 
+_VACANCY_CAMPAIGN_NAME_RE = re.compile(
+    r"(?:ваканс|vacanc|\bjobs?\b|найм|отклик)",
+    re.IGNORECASE,
+)
+
+
 def has_last_mile_icp_defect(
     rec: dict,
     *,
@@ -478,6 +484,7 @@ def has_last_mile_icp_defect(
     step: dict,
     steps: list[dict],
     is_qa_camp: bool = False,
+    campaign_name: str | None = None,
 ) -> bool:
     clean_uname = (_clean_handle(rec.get("username")) or "").lower()
     if clean_uname and (clean_uname == "matrixreach_bot" or clean_uname.endswith("_bot")):
@@ -511,7 +518,10 @@ def has_last_mile_icp_defect(
         )
         if val
     )
-    if profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
+    is_vacancy_camp = bool(
+        campaign_name and _VACANCY_CAMPAIGN_NAME_RE.search(str(campaign_name))
+    )
+    if not is_vacancy_camp and profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
         return True
     if not is_qa_camp and is_offline_non_icp_contact(
         username=clean_uname,
@@ -4262,6 +4272,7 @@ async def run_campaign_batch(
             step=step,
             steps=steps,
             is_qa_camp=is_qa_camp,
+            campaign_name=camp.get("name"),
         ):
             conn.execute(
                 """

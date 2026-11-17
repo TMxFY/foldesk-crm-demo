@@ -849,3 +849,36 @@ def test_cli_default_db_path_and_completed_campaign_auto_wakeup_on_import_and_en
     en_res = enroll_leads_from_crm(conn, camp["id"], status="new")
     assert en_res["imported_count"] == 1
     assert en_res["campaign"]["status"] == "running"
+
+
+def test_vacancy_campaign_allows_employer_hiring_ugc_creator_role(tmp_path):
+    """Live Canary repro: in 'TG Вакансии', company='UGC-креатор для AI-проекта' is the employer's open job role,
+    NOT a freelancer bio — must send cleanly while still blocking UGC creators in B2B campaigns."""
+    import asyncio
+    from app.outreach import run_campaign_batch
+    from app.telegram_gateway import FakeGateway
+
+    conn = connect(tmp_path / "vac_icp.db")
+    init_db(conn)
+    _seed_account(conn, 27, daily_limit=20)
+    vac_camp = create_campaign(
+        conn,
+        name="TG Вакансии",
+        account_ids=[27],
+        daily_limit=20,
+        status="running",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+    )
+    pitch = "Добрый день! По UGC-креатору в AI-проект. Предлагаю внедрить AI UGC с реалистичными ИИ-персонажами под ключ."
+    import_campaign_csv(
+        conn,
+        vac_camp["id"],
+        f"username,name,company,step1_text\n@wqwww90,UGC-креатор для AI-проекта (@wqwww90),UGC-креатор для AI-проекта,\"{pitch}\"\n",
+    )
+    gw = FakeGateway()
+    res = asyncio.run(run_campaign_batch(conn, vac_camp["id"], gateway=gw, max_send=1, respect_delays=False))
+    assert res["sent"] == 1
+    row = conn.execute("SELECT status, current_step, error_text FROM campaign_recipients WHERE username = 'wqwww90'").fetchone()
+    assert row["status"] == "completed" and row["current_step"] == 1 and not row["error_text"]
+    conn.close()
+
