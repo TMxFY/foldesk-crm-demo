@@ -485,7 +485,14 @@ def parse_airtable_contact(raw_contact: Any) -> tuple[str | None, str | None]:
     if not username and not phone and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,31}", text):
         username = text
 
-    return _clean_username(username), phone
+    cleaned_u = _clean_username(username)
+    if cleaned_u:
+        from app.digest import is_likely_telegram_bot_username
+
+        if is_likely_telegram_bot_username(cleaned_u):
+            cleaned_u = None
+
+    return cleaned_u, phone
 
 
 def format_airtable_contact(

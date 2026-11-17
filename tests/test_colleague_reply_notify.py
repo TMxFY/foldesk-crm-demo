@@ -429,13 +429,22 @@ def test_pull_username_from_dialogs_when_not_passed(conn, monkeypatch):
         phone="+79998887766",
         telegram_username="saabath",
     )
+    # Lead exists with telegram_user_id=6006 and NO username in leads table
+    create_lead(
+        conn,
+        name="Phoenix Person",
+        telegram_user_id=6006,
+        username=None,
+        status="waiting",
+        account_id=acc["id"],
+    )
     # Dialog has username 'phoenixIam'
     conn.execute(
         """
         INSERT INTO dialogs (
             account_id, peer_type, peer_id, username, title, last_from_peer,
-            created_at, updated_at
-        ) VALUES (?, 'user', 6006, 'phoenixIam', 'Phoenix Person', 1, '2026-11-12T10:00:00', '2026-11-12T10:00:00')
+            unread_count, created_at, updated_at
+        ) VALUES (?, 'user', 6006, 'phoenixIam', 'Phoenix Person', 1, 1, '2026-11-12T10:00:00', '2026-11-12T10:00:00')
         """,
         (acc["id"],),
     )

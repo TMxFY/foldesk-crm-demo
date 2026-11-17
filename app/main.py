@@ -1519,6 +1519,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         healthy_accounts = 0
         running_campaigns = 0
         pending_step1_total = 0
+        reply_alert_guard_ok = True
+        false_reply_alerts_24h = 0
         try:
             if conn_obj is not None:
                 with locked_conn(conn_obj):
@@ -1554,6 +1556,11 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         ).fetchone()
                         if p1_row is not None:
                             pending_step1_total = int(p1_row["cnt"] or 0)
+                        from app.digest import audit_reply_notifications
+
+                        notif_audit = audit_reply_notifications(conn_obj, since_hours=24)
+                        false_reply_alerts_24h = int(notif_audit["false_notification_count"])
+                        reply_alert_guard_ok = false_reply_alerts_24h == 0
         except Exception as exc:
             return Response(
                 content=json.dumps(
@@ -1582,6 +1589,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     "healthy_accounts": healthy_accounts,
                     "running_campaigns": running_campaigns,
                     "pending_step1_total": pending_step1_total,
+                    "reply_alert_guard_ok": reply_alert_guard_ok,
+                    "false_reply_alerts_24h": false_reply_alerts_24h,
                 }
             )
         return payload

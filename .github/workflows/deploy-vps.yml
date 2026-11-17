@@ -93,7 +93,7 @@ jobs:
 
             healthy=0
             for i in $(seq 1 60); do
-              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && echo "$hc_json" | grep -q '"db_ok": true'; then
+              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && echo "$hc_json" | grep -q '"db_ok": true' && echo "$hc_json" | grep -q '"reply_alert_guard_ok": true'; then
                 healthy=1
                 break
               fi

@@ -1,19 +1,291 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import ssl
 import threading
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.db import ROOT, as_dict, locked_conn, utc_now
 from app.reminders import complete_reminder, list_reminders, normalize_due
 
 logger = logging.getLogger(__name__)
+
+TELEGRAM_SERVICE_PEER_IDS = frozenset({777000, 178220800, 1271266957, 93372553})
+INTERNAL_TEAM_USERNAMES = frozenset(
+    {
+        "vladwilhelm",
+        "korznikov_timofei",
+        "tim_cros",
+        "tim_korznikov",
+        "realbyme_m",
+        "subscale",
+        "make1tlo",
+        "saburowe",
+        "saabath",
+        "otv73",
+        "bobkovartur",
+        "softugccollegabot",
+        "soctugcaccbot",
+        "spambot",
+        "botfather",
+        "replies",
+    }
+)
+CLOSED_LEAD_STATUSES = frozenset({"won", "lost"})
+CLOSED_AIRTABLE_STATUSES = frozenset({"signed", "cancelled", "closed won", "closed lost"})
+_BOT_USERNAME_SUFFIX_RE = re.compile(
+    r"(?:_bot|(?:collega|crm|outreach|notify|alert|helper|support|shop|futurology|acc)bot)$",
+    re.IGNORECASE,
+)
+
+
+def extract_bot_user_id_from_token(token: str | None) -> int | None:
+    raw = str(token or "").strip()
+    if ":" not in raw:
+        return None
+    prefix = raw.split(":", 1)[0].strip()
+    if prefix.isdigit():
+        val = int(prefix)
+        return val if val > 0 else None
+    return None
+
+
+def is_likely_telegram_bot_username(username: str | None) -> bool:
+    clean = str(username or "").strip().lstrip("@").lower()
+    if not clean:
+        return False
+    if clean in {"replies"}:
+        return True
+    if len(clean) >= 4 and clean.endswith("bot") and re.fullmatch(r"[a-z0-9_]{4,32}", clean):
+        return True
+    return bool(_BOT_USERNAME_SUFFIX_RE.search(clean))
+
+
+def is_closed_lead_status(
+    status: str | None,
+    airtable_status: str | None = None,
+    *,
+    won_only: bool = False,
+) -> bool:
+    st = str(status or "").strip().lower()
+    at = str(airtable_status or "").strip().lower()
+    if won_only:
+        return st == "won" or at in {"signed", "closed won"}
+    return st in CLOSED_LEAD_STATUSES or at in CLOSED_AIRTABLE_STATUSES
+
+
+def _extract_handle_username_and_phone(
+    handle: str | None,
+    *,
+    allow_bare_username: bool = False,
+) -> tuple[str | None, str | None]:
+    raw = str(handle or "").strip()
+    if not raw or raw.lower() == "unknown" or raw.startswith(("id:", "#")):
+        return None, None
+    if raw.startswith("@"):
+        u = raw[1:].strip()
+        if re.fullmatch(r"[A-Za-z0-9_]{3,32}", u):
+            return u, None
+        return None, None
+    digits = re.sub(r"\D", "", raw)
+    if (raw.startswith("+") or raw.isdigit()) and len(digits) >= 7:
+        return None, digits[-15:]
+    if allow_bare_username and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,31}", raw):
+        return raw, None
+    return None, None
+
+
+def _table_exists(conn, table: str) -> bool:
+    if conn is None:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def is_ineligible_reply_notify_peer(
+    conn,
+    *,
+    peer_id: int | None = None,
+    username: str | None = None,
+    lead_handle: str | None = None,
+    phone: str | None = None,
+    account_id: int | None = None,
+    account_handle: str | None = None,
+    is_bot: bool = False,
+) -> tuple[bool, str]:
+    """Single source of truth for peers that must NEVER trigger lead-reply alerts."""
+    if is_bot:
+        return True, "telegram_bot"
+
+    clean_peer = int(peer_id) if peer_id is not None else None
+    if clean_peer is not None and clean_peer in TELEGRAM_SERVICE_PEER_IDS:
+        return True, "telegram_service_peer"
+
+    raw_user, raw_u_phone = _extract_handle_username_and_phone(
+        username, allow_bare_username=True
+    )
+    hdl_user, hdl_phone = _extract_handle_username_and_phone(
+        lead_handle, allow_bare_username=False
+    )
+    candidate_users = [u for u in (raw_user, hdl_user) if u]
+
+    raw_phone_digits = re.sub(r"\D", "", str(phone or ""))
+    norm_phone_digits = (
+        raw_phone_digits[-15:]
+        if len(raw_phone_digits) >= 7
+        else (hdl_phone or raw_u_phone or "")
+    )
+
+    for cu in candidate_users:
+        if is_likely_telegram_bot_username(cu):
+            return True, "telegram_bot_username"
+
+    acc_user, acc_phone_digits = _extract_handle_username_and_phone(
+        account_handle, allow_bare_username=False
+    )
+    if acc_user and any(cu.lower() == acc_user.lower() for cu in candidate_users):
+        return True, "self_account_echo"
+    if norm_phone_digits and acc_phone_digits and norm_phone_digits == acc_phone_digits:
+        return True, "self_account_echo"
+
+    if any(cu.lower() in INTERNAL_TEAM_USERNAMES for cu in candidate_users):
+        return True, "internal_team_member"
+
+    token, chat_id = resolve_colleague_bot_credentials(conn)
+    bot_uid = extract_bot_user_id_from_token(token)
+    if bot_uid is not None and clean_peer is not None and clean_peer == bot_uid:
+        return True, "colleague_bot_self_echo"
+    if chat_id and str(chat_id).strip().lstrip("-").isdigit() and clean_peer is not None:
+        try:
+            if clean_peer == int(str(chat_id).strip()):
+                return True, "operator_chat_self_echo"
+        except ValueError:
+            pass
+
+    if conn is not None and _table_exists(conn, "accounts"):
+        acc_rows = conn.execute(
+            "SELECT id, telegram_user_id, telegram_username, phone FROM accounts"
+        ).fetchall()
+        cand_lower = {cu.lower() for cu in candidate_users}
+        for arow in acc_rows:
+            a_uid = arow["telegram_user_id"]
+            if clean_peer is not None and a_uid is not None and int(a_uid) == clean_peer:
+                return True, "crm_connected_account"
+            a_uname = str(arow["telegram_username"] or "").strip().lstrip("@").lower()
+            if a_uname and a_uname in cand_lower:
+                return True, "crm_connected_account"
+            a_pdigits = re.sub(r"\D", "", str(arow["phone"] or ""))
+            a_norm = a_pdigits[-15:] if len(a_pdigits) >= 7 else ""
+            if norm_phone_digits and a_norm and norm_phone_digits == a_norm:
+                return True, "crm_connected_account"
+
+    return False, ""
+
+
+def _check_lead_or_recipient_backing(
+    conn,
+    *,
+    lead_id: int | None,
+    peer_id: int | None,
+    username: str | None = None,
+    lead_handle: str | None = None,
+    phone: str | None = None,
+    require_backing: bool,
+) -> tuple[bool, str]:
+    """Verify lead status is open and (when peer/dialog-backed) peer is an actual lead or recipient."""
+    if conn is None:
+        return True, ""
+
+    clean_peer = int(peer_id) if peer_id is not None else None
+    raw_user, raw_u_phone = _extract_handle_username_and_phone(
+        username, allow_bare_username=True
+    )
+    hdl_user, hdl_phone = _extract_handle_username_and_phone(
+        lead_handle, allow_bare_username=False
+    )
+    clean_user = raw_user or hdl_user
+    raw_phone_digits = re.sub(r"\D", "", str(phone or ""))
+    norm_phone_digits = (
+        raw_phone_digits[-15:]
+        if len(raw_phone_digits) >= 7
+        else (hdl_phone or raw_u_phone or "")
+    )
+    sql_phone_expr = (
+        "substr(replace(replace(replace(replace(replace(phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -15)"
+    )
+
+    matched_leads = []
+    if _table_exists(conn, "leads"):
+        if lead_id is not None:
+            lrow = conn.execute(
+                "SELECT id, status, airtable_status FROM leads WHERE id = ?",
+                (int(lead_id),),
+            ).fetchone()
+            if lrow is not None:
+                matched_leads.append(lrow)
+        clauses = []
+        params: list = []
+        if clean_peer is not None:
+            clauses.append("telegram_user_id = ?")
+            params.append(clean_peer)
+        if clean_user:
+            clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+            params.append(clean_user)
+        if norm_phone_digits:
+            clauses.append(f"(phone IS NOT NULL AND {sql_phone_expr} = ?)")
+            params.append(norm_phone_digits)
+        if clauses:
+            seen_ids = {int(r["id"]) for r in matched_leads}
+            for r in conn.execute(
+                f"SELECT id, status, airtable_status FROM leads WHERE {' OR '.join(clauses)}",
+                params,
+            ).fetchall():
+                if int(r["id"]) not in seen_ids:
+                    matched_leads.append(r)
+                    seen_ids.add(int(r["id"]))
+
+    if matched_leads:
+        if any(is_closed_lead_status(r["status"], r["airtable_status"], won_only=True) for r in matched_leads):
+            return False, "closed_won_client"
+        if all(is_closed_lead_status(r["status"], r["airtable_status"]) for r in matched_leads):
+            return False, "closed_lost_lead"
+        return True, "open_lead"
+
+    if not require_backing:
+        return True, ""
+
+    if _table_exists(conn, "campaign_recipients"):
+        rc_clauses = []
+        rc_params: list = []
+        if clean_peer is not None:
+            rc_clauses.append("telegram_user_id = ?")
+            rc_params.append(clean_peer)
+        if clean_user:
+            rc_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+            rc_params.append(clean_user)
+        if norm_phone_digits:
+            rc_clauses.append(f"(phone IS NOT NULL AND {sql_phone_expr} = ?)")
+            rc_params.append(norm_phone_digits)
+        if rc_clauses:
+            found_rec = conn.execute(
+                f"SELECT 1 FROM campaign_recipients WHERE {' OR '.join(rc_clauses)} LIMIT 1",
+                rc_params,
+            ).fetchone()
+            if found_rec is not None:
+                return True, "campaign_recipient"
+
+    return False, "non_lead_dialog"
 
 _NOTIFY_INFLIGHT_GUARD = threading.Lock()
 _NOTIFY_INFLIGHT_LOCKS: dict[tuple, threading.Lock] = {}
@@ -275,7 +547,8 @@ def ensure_dialog_notify_columns(conn) -> None:
     c1 = _ensure_column_if_missing(conn, "dialogs", "last_read_at", "TEXT")
     c2 = _ensure_column_if_missing(conn, "dialogs", "read_inbox_max_id", "INTEGER DEFAULT 0")
     c3 = _ensure_column_if_missing(conn, "dialogs", "reply_turn_seq", "INTEGER DEFAULT 0")
-    if c1 or c2 or c3:
+    c4 = _ensure_column_if_missing(conn, "dialogs", "is_bot", "INTEGER DEFAULT 0")
+    if c1 or c2 or c3 or c4:
         conn.commit()
 
 
@@ -661,6 +934,10 @@ def send_lead_reply_notification(
             token, chat_id = resolve_colleague_bot_credentials(conn)
             if not token or not chat_id:
                 return False
+            peek_dlg = None
+            dlg_is_bot = False
+            dlg_username = None
+            dlg_phone = None
             if conn is not None:
                 peek_dlg = _resolve_notify_dialog(
                     conn,
@@ -677,6 +954,40 @@ def send_lead_reply_notification(
                         resolved_peer_id = int(peek_dlg["peer_id"])
                     if resolved_lead_id is None and peek_dlg["lead_id"] is not None:
                         resolved_lead_id = int(peek_dlg["lead_id"])
+                    dlg_username = peek_dlg["username"]
+                    dlg_phone = peek_dlg["phone"]
+                    if "is_bot" in peek_dlg.keys():
+                        dlg_is_bot = bool(peek_dlg["is_bot"])
+
+            inelig, _ = is_ineligible_reply_notify_peer(
+                conn,
+                peer_id=resolved_peer_id,
+                username=dlg_username,
+                lead_handle=lead_handle,
+                phone=dlg_phone,
+                account_id=resolved_account_id,
+                account_handle=account_handle,
+                is_bot=dlg_is_bot,
+            )
+            if inelig:
+                return False
+
+            backed_ok, _ = _check_lead_or_recipient_backing(
+                conn,
+                lead_id=resolved_lead_id,
+                peer_id=resolved_peer_id,
+                username=dlg_username,
+                lead_handle=lead_handle,
+                phone=dlg_phone,
+                require_backing=bool(
+                    peek_dlg is not None
+                    or resolved_dialog_id is not None
+                    or resolved_peer_id is not None
+                    or resolved_lead_id is not None
+                ),
+            )
+            if not backed_ok:
+                return False
 
         inflight_lock = _get_notify_inflight_lock(
             str(chat_id),
@@ -916,3 +1227,167 @@ def callback_data_from_update(update: dict) -> str:
     if not isinstance(data, str) or not data.strip():
         raise ValueError("Неизвестное действие")
     return data
+
+
+def audit_reply_notifications(conn, *, since_hours: int | None = None) -> dict:
+    """Audit persisted `bot_reply_notifications` and `leads` for echo/bot/non-lead/closed-client leaks."""
+    if conn is None:
+        return {
+            "ok": True,
+            "false_notification_count": 0,
+            "bot_username_lead_count": 0,
+            "false_notifications": [],
+            "bot_username_leads": [],
+        }
+
+    cutoff = ""
+    if since_hours is not None and since_hours > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=int(since_hours))).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+
+    false_notifications: list[dict] = []
+    bot_username_leads: list[dict] = []
+
+    with locked_conn(conn):
+        has_dialogs = _table_exists(conn, "dialogs")
+        if _table_exists(conn, "bot_reply_notifications"):
+            rows = conn.execute(
+                "SELECT * FROM bot_reply_notifications ORDER BY created_at DESC"
+            ).fetchall()
+            for r in rows:
+                created_norm = _norm_ts(r["created_at"])
+                if cutoff and created_norm and created_norm < cutoff:
+                    continue
+                dlg_row = None
+                if has_dialogs and r["dialog_id"] is not None:
+                    dlg_row = conn.execute(
+                        "SELECT * FROM dialogs WHERE id = ?",
+                        (int(r["dialog_id"]),),
+                    ).fetchone()
+                elif has_dialogs and r["account_id"] is not None and r["peer_id"] is not None:
+                    dlg_row = conn.execute(
+                        "SELECT * FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?",
+                        (int(r["account_id"]), int(r["peer_id"])),
+                    ).fetchone()
+
+                dlg_user = dlg_row["username"] if dlg_row is not None else None
+                dlg_phone = dlg_row["phone"] if dlg_row is not None else None
+                dlg_lead_id = dlg_row["lead_id"] if dlg_row is not None else None
+                dlg_is_bot = (
+                    bool(dlg_row["is_bot"])
+                    if (dlg_row is not None and "is_bot" in dlg_row.keys())
+                    else False
+                )
+
+                inelig, reason = is_ineligible_reply_notify_peer(
+                    conn,
+                    peer_id=r["peer_id"],
+                    username=dlg_user,
+                    lead_handle=r["lead_handle"],
+                    phone=dlg_phone,
+                    account_id=r["account_id"],
+                    account_handle=r["account_handle"],
+                    is_bot=dlg_is_bot,
+                )
+                if not inelig:
+                    eff_lead_id = (
+                        int(r["lead_id"])
+                        if r["lead_id"] is not None
+                        else (int(dlg_lead_id) if dlg_lead_id is not None else None)
+                    )
+                    eff_peer_id = (
+                        int(r["peer_id"])
+                        if r["peer_id"] is not None
+                        else (int(dlg_row["peer_id"]) if dlg_row is not None and dlg_row["peer_id"] is not None else None)
+                    )
+                    backed, back_reason = _check_lead_or_recipient_backing(
+                        conn,
+                        lead_id=eff_lead_id,
+                        peer_id=eff_peer_id,
+                        username=dlg_user,
+                        lead_handle=r["lead_handle"],
+                        phone=dlg_phone,
+                        require_backing=True,
+                    )
+                    if not backed:
+                        inelig = True
+                        reason = back_reason
+
+                if inelig:
+                    false_notifications.append(
+                        {
+                            "chat_id": str(r["chat_id"]),
+                            "bot_message_id": int(r["bot_message_id"]),
+                            "lead_handle": r["lead_handle"],
+                            "account_handle": r["account_handle"],
+                            "peer_id": r["peer_id"],
+                            "lead_id": r["lead_id"],
+                            "created_at": r["created_at"],
+                            "reason": reason,
+                        }
+                    )
+
+        if _table_exists(conn, "leads"):
+            for lr in conn.execute(
+                "SELECT id, name, username, status FROM leads WHERE username IS NOT NULL AND trim(username) != ''"
+            ).fetchall():
+                if is_likely_telegram_bot_username(lr["username"]):
+                    bot_username_leads.append(
+                        {
+                            "id": int(lr["id"]),
+                            "name": lr["name"],
+                            "username": lr["username"],
+                            "status": lr["status"],
+                        }
+                    )
+
+    ok = len(false_notifications) == 0 and len(bot_username_leads) == 0
+    return {
+        "ok": ok,
+        "false_notification_count": len(false_notifications),
+        "bot_username_lead_count": len(bot_username_leads),
+        "false_notifications": false_notifications,
+        "bot_username_leads": bot_username_leads,
+    }
+
+
+def heal_reply_notifications(conn) -> dict:
+    """Self-heal persisted false reply notifications and bot-username leads."""
+    if conn is None:
+        return {"purged_notifications": 0, "scrubbed_bot_leads": 0}
+
+    with locked_conn(conn):
+        report = audit_reply_notifications(conn)
+        purged = 0
+        for item in report["false_notifications"]:
+            cur = conn.execute(
+                "DELETE FROM bot_reply_notifications WHERE chat_id = ? AND bot_message_id = ?",
+                (item["chat_id"], int(item["bot_message_id"])),
+            )
+            purged += max(0, int(cur.rowcount or 0))
+
+        scrubbed = 0
+        now_ts = utc_now()
+        for bl in report["bot_username_leads"]:
+            row = conn.execute(
+                "SELECT note, username FROM leads WHERE id = ?",
+                (int(bl["id"]),),
+            ).fetchone()
+            if row is None:
+                continue
+            old_u = str(row["username"] or "").strip().lstrip("@")
+            old_note = str(row["note"] or "").strip()
+            marker = f"[bot-handle: @{old_u}]"
+            new_note = old_note
+            if old_u and marker.lower() not in old_note.lower():
+                new_note = f"{old_note}\n{marker}".strip() if old_note else marker
+            conn.execute(
+                "UPDATE leads SET username = NULL, note = ?, updated_at = ? WHERE id = ?",
+                (new_note or None, now_ts, int(bl["id"])),
+            )
+            scrubbed += 1
+
+        if purged or scrubbed:
+            conn.commit()
+    return {"purged_notifications": purged, "scrubbed_bot_leads": scrubbed}

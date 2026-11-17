@@ -1239,6 +1239,8 @@ def _stop_outreach_from_dialog_sync(
         kwargs["incoming_sent_at"] = incoming_sent_at
     if "source" in params:
         kwargs["source"] = "outreach_sync"
+    if "is_bot" in params:
+        kwargs["is_bot"] = bool(matched_dlg.get("is_bot")) if matched_dlg else False
 
     stopped = stop_outreach_on_reply(conn, **kwargs)
     if isinstance(stopped, int) and not isinstance(stopped, bool) and stopped == 0:

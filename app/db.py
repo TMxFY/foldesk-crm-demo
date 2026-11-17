@@ -1077,6 +1077,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if vlad_canonical_v5 is None:
             apply_canonical_vlad_outreach_v5(conn)
+        from app.digest import heal_reply_notifications
+
+        heal_reply_notifications(conn)
+        false_alerts_healed_v1 = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'purge_false_reply_notifications_v1'"
+        ).fetchone()
+        if false_alerts_healed_v1 is None:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('purge_false_reply_notifications_v1', '1', ?)",
+                (utc_now(),),
+            )
     conn.commit()
 
 

@@ -16,7 +16,12 @@ import wave
 import weakref
 
 from app.db import INBOX_MEDIA_DIR, as_dict, normalize_status, safe_int, utc_now
-from app.digest import _norm_ts, ensure_dialog_notify_columns
+from app.digest import (
+    _norm_ts,
+    ensure_dialog_notify_columns,
+    is_closed_lead_status,
+    is_ineligible_reply_notify_peer,
+)
 from app.telegram_gateway import GatewayError, render_formatted_html
 
 
@@ -341,6 +346,7 @@ def stop_outreach_on_reply(
     telegram_message_id: int | None = None,
     incoming_sent_at: str | None = None,
     source: str | None = None,
+    is_bot: bool = False,
 ) -> int:
     now = utc_now()
     clean_min_sent = str(min_sent_at).strip() if min_sent_at else None
@@ -360,7 +366,15 @@ def stop_outreach_on_reply(
     clean_peer_id = int(peer_id) if peer_id is not None else phone_peer_id
     clean_lead_id = int(lead_id) if lead_id is not None else None
 
-    if clean_peer_id in (777000, 178220800):
+    ineligible_peer, _ = is_ineligible_reply_notify_peer(
+        conn,
+        peer_id=clean_peer_id,
+        username=clean_user,
+        phone=clean_phone,
+        account_id=account_id,
+        is_bot=bool(is_bot),
+    )
+    if ineligible_peer:
         return 0
 
     if not any((clean_lead_id, clean_peer_id, clean_user, phone_variants)):
@@ -394,18 +408,20 @@ def stop_outreach_on_reply(
 
     matched_lead_ids: set[int] = set()
     prev_lead_statuses: dict[int, str] = {}
+    prev_lead_airtable_statuses: dict[int, str] = {}
     if clean_lead_id is not None:
         matched_lead_ids.add(clean_lead_id)
 
     if lead_clauses:
         lead_rows = conn.execute(
-            f"SELECT id, status FROM leads WHERE {' OR '.join(lead_clauses)}",
+            f"SELECT id, status, airtable_status FROM leads WHERE {' OR '.join(lead_clauses)}",
             lead_params,
         ).fetchall()
         for lr in lead_rows:
             lid = int(lr["id"])
             matched_lead_ids.add(lid)
             prev_lead_statuses[lid] = str(lr["status"] or "")
+            prev_lead_airtable_statuses[lid] = str(lr["airtable_status"] or "")
 
     # Also find matching campaign_recipients
     rec_clauses = []
@@ -455,9 +471,15 @@ def stop_outreach_on_reply(
                 lid_existing = int(rr["lead_id"])
                 matched_lead_ids.add(lid_existing)
                 if lid_existing not in prev_lead_statuses:
-                    lrow_ex = conn.execute("SELECT status FROM leads WHERE id = ?", (lid_existing,)).fetchone()
+                    lrow_ex = conn.execute(
+                        "SELECT status, airtable_status FROM leads WHERE id = ?",
+                        (lid_existing,),
+                    ).fetchone()
                     if lrow_ex is not None:
                         prev_lead_statuses[lid_existing] = str(lrow_ex["status"] or "")
+                        prev_lead_airtable_statuses[lid_existing] = str(
+                            lrow_ex["airtable_status"] or ""
+                        )
             if rr["username"]:
                 u = str(rr["username"]).strip().lstrip("@")
                 if u and u not in candidate_usernames:
@@ -492,9 +514,13 @@ def stop_outreach_on_reply(
                 lid = int(rr["lead_id"])
                 matched_lead_ids.add(lid)
                 if lid not in prev_lead_statuses:
-                    lrow = conn.execute("SELECT status FROM leads WHERE id = ?", (lid,)).fetchone()
+                    lrow = conn.execute(
+                        "SELECT status, airtable_status FROM leads WHERE id = ?",
+                        (lid,),
+                    ).fetchone()
                     if lrow is not None:
                         prev_lead_statuses[lid] = str(lrow["status"] or "")
+                        prev_lead_airtable_statuses[lid] = str(lrow["airtable_status"] or "")
             if rr["campaign_id"]:
                 stopped_campaign_ids.add(int(rr["campaign_id"]))
             conn.execute(
@@ -604,13 +630,14 @@ def stop_outreach_on_reply(
         except sqlite3.IntegrityError:
             if auto_tg_id is not None:
                 ex_row = conn.execute(
-                    "SELECT id, status FROM leads WHERE telegram_user_id = ? ORDER BY id LIMIT 1",
+                    "SELECT id, status, airtable_status FROM leads WHERE telegram_user_id = ? ORDER BY id LIMIT 1",
                     (auto_tg_id,),
                 ).fetchone()
                 if ex_row is not None:
                     ex_lid = int(ex_row["id"])
                     matched_lead_ids.add(ex_lid)
                     prev_lead_statuses[ex_lid] = str(ex_row["status"] or "")
+                    prev_lead_airtable_statuses[ex_lid] = str(ex_row["airtable_status"] or "")
 
     effective_incoming_sent_at = (
         str(incoming_sent_at).strip()
@@ -657,15 +684,16 @@ def stop_outreach_on_reply(
             )
 
         ph = ",".join("?" for _ in matched_lead_ids)
+        open_at_guard = "lower(coalesce(airtable_status, '')) NOT IN ('signed', 'cancelled', 'closed won', 'closed lost')"
         conn.execute(
             f"""
             UPDATE leads
-            SET status = CASE WHEN status IN ('new', 'waiting') THEN 'talking' ELSE status END,
-                airtable_status = CASE WHEN status IN ('new', 'waiting') THEN 'In conversation' ELSE airtable_status END,
+            SET status = CASE WHEN status IN ('new', 'waiting') AND {open_at_guard} THEN 'talking' ELSE status END,
+                airtable_status = CASE WHEN status IN ('new', 'waiting') AND {open_at_guard} THEN 'In conversation' ELSE airtable_status END,
                 next_step = CASE
-                    WHEN status IN ('new', 'waiting')
+                    WHEN status IN ('new', 'waiting') AND {open_at_guard}
                     THEN 'Клиент ответил — цепочка остановлена, ответьте вручную'
-                    WHEN status NOT IN ('won', 'lost')
+                    WHEN status NOT IN ('won', 'lost') AND {open_at_guard}
                     THEN COALESCE(next_step, 'Клиент ответил — цепочка остановлена, ответьте вручную')
                     ELSE next_step
                 END,
@@ -685,7 +713,10 @@ def stop_outreach_on_reply(
 
         for lid in sorted(matched_lead_ids):
             old_status = prev_lead_statuses.get(lid)
-            status_moved = old_status in ("new", "waiting")
+            old_at = prev_lead_airtable_statuses.get(lid)
+            status_moved = old_status in ("new", "waiting") and not is_closed_lead_status(
+                old_status, old_at
+            )
             if status_moved:
                 any_lead_status_moved = True
             if stopped_count > 0 or status_moved or force_event:
@@ -728,10 +759,25 @@ def stop_outreach_on_reply(
                     now=now,
                 )
 
-    base_notify_trigger = (
+    has_won_lead = any(
+        is_closed_lead_status(
+            prev_lead_statuses.get(lid), prev_lead_airtable_statuses.get(lid), won_only=True
+        )
+        for lid in matched_lead_ids
+    )
+    has_open_lead = any(
+        not is_closed_lead_status(
+            prev_lead_statuses.get(lid), prev_lead_airtable_statuses.get(lid)
+        )
+        for lid in matched_lead_ids
+    )
+    base_notify_trigger = (not has_won_lead) and (
         stopped_count > 0
         or any_lead_status_moved
-        or (force_event and (bool(matched_lead_ids) or has_any_recipient or (dlg_row is not None)))
+        or (
+            force_event
+            and (has_open_lead or (has_any_recipient and not matched_lead_ids))
+        )
     )
     should_notify_colleague = bool(notify) and base_notify_trigger
     allow_read_flag = bool(
@@ -1107,19 +1153,21 @@ def _upsert_snapshot_dialog(
         if unread == 0 and sent_at:
             new_last_read_at = sent_at
 
+    snap_is_bot = 1 if person.get("is_bot") else 0
     conn.execute(
         """
         INSERT INTO dialogs (
             account_id, peer_type, peer_id, username, title, phone, provider,
-            is_group, unread_count, last_message_at, last_message_preview,
+            is_group, is_bot, unread_count, last_message_at, last_message_preview,
             last_from_peer, muted, last_read_at, read_inbox_max_id, reply_turn_seq,
             created_at, updated_at
-        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?)
+        ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?)
         ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
             username = COALESCE(excluded.username, dialogs.username),
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
             phone = COALESCE(excluded.phone, dialogs.phone),
             provider = COALESCE(excluded.provider, dialogs.provider),
+            is_bot = MAX(COALESCE(dialogs.is_bot, 0), excluded.is_bot),
             unread_count = COALESCE(?, dialogs.unread_count),
             last_message_at = COALESCE(?, dialogs.last_message_at),
             last_message_preview = COALESCE(?, dialogs.last_message_preview),
@@ -1136,6 +1184,7 @@ def _upsert_snapshot_dialog(
             title,
             phone,
             provider,
+            snap_is_bot,
             0 if effective_unread is None else effective_unread,
             effective_sent_at,
             effective_preview,
@@ -1162,6 +1211,7 @@ def _upsert_snapshot_dialog(
     ).fetchone()
     if row and int(row["last_from_peer"] or 0) == 1:
         has_explicit_unread = unread is not None and int(row["unread_count"] or 0) > 0
+        row_is_bot = bool(snap_is_bot or ("is_bot" in row.keys() and row["is_bot"]))
         stop_outreach_on_reply(
             conn,
             account_id=account_id,
@@ -1175,6 +1225,7 @@ def _upsert_snapshot_dialog(
             incoming_unread=has_explicit_unread,
             incoming_sent_at=sent_at or (str(row["last_message_at"]) if row["last_message_at"] else None),
             source=source,
+            is_bot=row_is_bot,
         )
         row = conn.execute(
             "SELECT * FROM dialogs WHERE id = ?",
@@ -1274,6 +1325,7 @@ def _prepare_message_fields(conn, account_id: int, message: dict, now: str) -> d
         "has_explicit_sent_at": explicit_sent_at is not None and str(explicit_sent_at).strip() != "",
         "sent_at": sent_at,
         "mid": mid,
+        "is_bot": bool(message.get("is_bot")),
     }
 
 
@@ -1489,18 +1541,20 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
         row = prev_dlg
     else:
         unread_inc = 0 if (is_edit or is_already_read_mid) else 1
+        is_bot_int = 1 if fields.get("is_bot") else 0
         conn.execute(
             """
             INSERT INTO dialogs (
                 account_id, peer_type, peer_id, username, title, phone, provider,
-                is_group, unread_count, last_message_at, last_message_preview,
+                is_group, is_bot, unread_count, last_message_at, last_message_preview,
                 last_from_peer, muted, created_at, updated_at
-            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, 0, ?, ?)
+            ) VALUES (?, 'user', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 1, 0, ?, ?)
             ON CONFLICT(account_id, peer_type, peer_id) DO UPDATE SET
                 username = COALESCE(excluded.username, dialogs.username),
                 title = CASE WHEN excluded.title != '' THEN excluded.title ELSE dialogs.title END,
                 phone = COALESCE(excluded.phone, dialogs.phone),
                 provider = COALESCE(excluded.provider, dialogs.provider),
+                is_bot = MAX(COALESCE(dialogs.is_bot, 0), excluded.is_bot),
                 unread_count = dialogs.unread_count + ?,
                 last_message_at = excluded.last_message_at,
                 last_message_preview = CASE WHEN excluded.last_message_preview != '' THEN excluded.last_message_preview ELSE dialogs.last_message_preview END,
@@ -1514,6 +1568,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
                 fields["title"],
                 fields["phone"],
                 fields["provider"],
+                is_bot_int,
                 unread_inc,
                 sent_at,
                 fields["preview"],
@@ -1538,6 +1593,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
 
     if not is_edit:
         should_notify = not is_already_read_mid and not is_stale_backfill
+        row_is_bot = bool(fields.get("is_bot") or (row is not None and "is_bot" in row.keys() and row["is_bot"]))
         stop_outreach_on_reply(
             conn,
             account_id=account_id,
@@ -1553,6 +1609,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
             telegram_message_id=mid,
             incoming_sent_at=sent_at,
             source="apply_incoming",
+            is_bot=row_is_bot,
         )
         row = conn.execute(
             "SELECT * FROM dialogs WHERE id = ?",

@@ -1,0 +1,6 @@
+# Proactive Backlog — `crmtg`
+
+| Где | На что влияет | Предложение фикса |
+| --- | --- | --- |
+| Контур `@softugccollegabot` (`softugcbot.service` long polling) ↔ `crmtg` (`/api/bot/webhook`, кнопки `reply_dlg:` / Reply на алерт лида) | **Скорость ответа лиду**: `softugcbot.service` забирает `getUpdates` токена `@softugccollegabot`, поэтому нажатие `✍️ Ответить` (`reply_dlg:`) или свайп Reply на `You received a response from ...` в чате с Коллегой не проксируется в `http://127.0.0.1:18084/api/bot/webhook` и попадает в LLM-агента вместо отправки лиду | Добавить в `softugcbot/bot/handlers.py` перехват `callback_query` с префиксом `reply_dlg:`/`reply_lead:` и Reply на сообщения `You received a response from ...` с локальным пробросом в `http://127.0.0.1:18084/api/bot/webhook` (разрешив loopback `127.0.0.1` в `crmtg/app/security.py`). |
+| `leadgen_low_water_alert` (`missing_scraper_tg_session`) и `tg_enrich_leads` (`timeout_after_180s` в `kv_settings`) | **Охваты / пополнение базы Step 1**: стадия обогащения `tg_enrich_leads.py --fetch` упирается в 180s таймаут без выделенной `SCRAPER_TG_SESSION` | Выделить отдельную сессию `SCRAPER_TG_SESSION` для скрейпера и ограничить размер батча `--fetch` за один тик таймера `crmtg-leadgen.timer`. |

@@ -7,6 +7,14 @@ cd "$ROOT_DIR"
 PYTHON_BIN="python3"
 if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+else
+  COMMON_GIT_DIR="$(git -C "$ROOT_DIR" rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$COMMON_GIT_DIR" ]; then
+    MAIN_REPO_ROOT="$(cd "$ROOT_DIR" && cd "$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)"
+    if [ -n "$MAIN_REPO_ROOT" ] && [ -x "$MAIN_REPO_ROOT/.venv/bin/python" ]; then
+      PYTHON_BIN="$MAIN_REPO_ROOT/.venv/bin/python"
+    fi
+  fi
 fi
 
 echo "== [1/4] Python AST & Sacred Rules static harness =="
@@ -130,6 +138,27 @@ for svc_file in sorted(systemd_dir.glob("*.service")):
                         f"Systemd Hollow-Pipe Gate violation in {svc_file}: unresolvable module '-m {mod_name}'"
                     )
 
+# Gate C: Reply-Alert Eligibility & Anti-Echo Invariant Gate
+if (root / "app" / "inbox.py").is_file():
+    inbox_src = (root / "app" / "inbox.py").read_text(encoding="utf-8")
+    if re.search(r"base_notify_trigger\s*=\s*\([\s\S]{0,400}dlg_row\s+is\s+not\s+None", inbox_src):
+        errors.append("Reply-Alert Gate violation in app/inbox.py: bare 'dlg_row is not None' in base_notify_trigger spams non-leads")
+    if "is_ineligible_reply_notify_peer" not in inbox_src:
+        errors.append("Reply-Alert Gate violation: missing canonical is_ineligible_reply_notify_peer guard in app/inbox.py")
+if (root / "app" / "digest.py").is_file():
+    digest_src = (root / "app" / "digest.py").read_text(encoding="utf-8")
+    if "is_ineligible_reply_notify_peer" not in digest_src or "extract_bot_user_id_from_token" not in digest_src:
+        errors.append("Reply-Alert Gate violation: missing is_ineligible_reply_notify_peer / extract_bot_user_id_from_token guard in app/digest.py")
+if (root / "app" / "telegram_gateway.py").is_file():
+    tg_gw_src = (root / "app" / "telegram_gateway.py").read_text(encoding="utf-8")
+    if 'getattr(peer, "bot", False)' not in tg_gw_src or 'getattr(entity, "bot", False)' not in tg_gw_src:
+        errors.append("Reply-Alert Gate violation in app/telegram_gateway.py: missing bot peer filter in _private_payload / _load_private")
+if (root / "app" / "inbox.py").is_file() and (
+    not (root / "scripts" / "proactive_audit.py").is_file()
+    or not (root / "docs" / "VERIFICATION_PLAYBOOKS.md").is_file()
+):
+    errors.append("Harness Gate violation: missing scripts/proactive_audit.py or docs/VERIFICATION_PLAYBOOKS.md")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
@@ -147,7 +176,10 @@ echo "== [3/4] Design, launch & CLI smoke gates =="
 "$PYTHON_BIN" .claude/skills/replica-design/contrast.py replica/design/tokens.json
 "$PYTHON_BIN" .claude/skills/replica-launch/listing.py replica/launch/listing.json
 PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" -m leadgen.vps_autonomous_replenish --help >/dev/null
-echo "leadgen.vps_autonomous_replenish --help smoke check OK."
+if [ -f "$ROOT_DIR/scripts/proactive_audit.py" ]; then
+  PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" scripts/proactive_audit.py --help >/dev/null
+fi
+echo "leadgen.vps_autonomous_replenish & proactive_audit --help smoke checks OK."
 
 if [ "${1:-}" = "--fast-checks-only" ]; then
   echo "== Fast static checks passed =="

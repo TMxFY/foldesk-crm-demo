@@ -2103,7 +2103,15 @@ class TelethonGateway(TelegramGateway):
             entity = getattr(dialog, "entity", None)
             if not isinstance(entity, User):
                 continue
-            if int(getattr(entity, "id", 0) or 0) == 178220800 or str(getattr(entity, "username", "") or "").lower() == "spambot":
+            ent_id = int(getattr(entity, "id", 0) or 0)
+            ent_user = str(getattr(entity, "username", "") or "").strip()
+            if (
+                getattr(entity, "is_self", False)
+                or getattr(entity, "bot", False)
+                or ent_id in (777000, 178220800, 1271266957, 93372553)
+                or ent_user.lower() == "replies"
+                or (len(ent_user) >= 4 and ent_user.lower().endswith("bot"))
+            ):
                 continue
             message = getattr(dialog, "message", None)
             preview = None
@@ -2769,9 +2777,11 @@ class TelethonGateway(TelegramGateway):
         username = None
         name = ""
         if isinstance(peer, User):
-            if is_out and getattr(peer, "is_self", False):
+            if getattr(peer, "is_self", False) or getattr(peer, "bot", False):
                 return None
             peer_id_val = int(getattr(peer, "id", 0) or 0)
+            if self_id and peer_id_val == self_id:
+                return None
             username = getattr(peer, "username", None)
             name = _person_name(peer)
         elif is_out:
@@ -2788,7 +2798,12 @@ class TelethonGateway(TelegramGateway):
 
         if peer_id_val <= 0:
             return None
-        if peer_id_val == 178220800 or str(username or "").lower() == "spambot":
+        clean_uname = str(username or "").strip().lower()
+        if (
+            peer_id_val in (777000, 178220800, 1271266957, 93372553)
+            or clean_uname == "replies"
+            or (len(clean_uname) >= 4 and clean_uname.endswith("bot"))
+        ):
             return None
         raw_text = getattr(message, "message", None)
         media_info = _extract_message_media(message)
