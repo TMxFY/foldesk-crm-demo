@@ -42,11 +42,15 @@ from leadgen.tg_to_gsheet import (
     whatsapp_url,
     x_profile_url,
 )
-from leadgen.treg_client import check_treg_ready, treg_bin
+from leadgen.treg_client import check_treg_ready as _client_check_treg_ready, treg_bin
 
 DEFAULT_DB_PATH = "/opt/crmtg/data/crm.db"
 DEFAULT_SCRAPER_SESSIONS_DIR = "/opt/crmtg/data/scraper_sessions"
 _NOISE_TG_HANDLES = frozenset({"joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "socks"})
+
+
+def check_treg_ready() -> bool:
+    return _client_check_treg_ready(binary_fn=treg_bin)
 
 
 def _is_real_personal_tg_handle(raw_username: Any) -> bool:

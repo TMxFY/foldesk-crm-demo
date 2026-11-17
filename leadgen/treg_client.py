@@ -28,11 +28,12 @@ def treg_bin() -> str | None:
     return None
 
 
-def check_treg_ready() -> bool:
+def check_treg_ready(*, binary_fn=None) -> bool:
     """Return True iff treg CLI is installed, enabled, and backed by credentials."""
     if os.getenv("TREG_ENRICH", "1").lower() in {"0", "false", "no"}:
         return False
-    if not treg_bin():
+    resolve_bin = treg_bin if binary_fn is None else binary_fn
+    if not resolve_bin():
         return False
     if (os.environ.get("TREG_API_KEY") or "").strip():
         return True
