@@ -407,6 +407,28 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "list_ofm_review_leads",
+        "description": (
+            "Прочитать изолированную очередь OFM-байеров (@FranceOFM, TG/FB OFM группы) "
+            "из ofm_review_leads.jsonl для ручного ревью без добавления в рассылки (ТОЛЬКО ЧТЕНИЕ)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Максимум возвращаемых записей.",
+                },
+                "query": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Фильтр по @username, группе, рынку или сигналу.",
+                },
+            },
+        },
+    },
 ]
 
 RESOURCES_SCHEMA: list[dict[str, Any]] = [
@@ -1251,7 +1273,23 @@ def call_mcp_tool_handler(conn: sqlite3.Connection, name: str, arguments: dict |
     if name == "list_direct_x_leads":
         return _handle_list_direct_x_leads(args)
 
+    if name == "list_ofm_review_leads":
+        return _handle_list_ofm_review_leads(args)
+
     raise KeyError(f"Неизвестный MCP-инструмент: {name}")
+
+
+def _handle_list_ofm_review_leads(args: dict) -> dict:
+    from app.hygiene import read_ofm_review_leads
+    from app.leadgen_settings import _resolve_state_dir
+
+    raw_limit = args.get("limit", 50)
+    try:
+        limit = int(raw_limit) if raw_limit is not None else 50
+    except (TypeError, ValueError):
+        limit = 50
+    query = str(args.get("query") or "").strip()
+    return read_ofm_review_leads(_resolve_state_dir(), limit=limit, query=query)
 
 
 def _handle_list_direct_x_leads(args: dict) -> dict:
@@ -1807,6 +1845,18 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
 
         # 2. Strict B2B Product-Buyer ICP / Sniper / Score / Contactless gate BEFORE `leads` insert!
         if is_b2b_camp and not is_qa_camp:
+            if (
+                "ofm_tier" in item
+                or (lead_source or "").strip().lower().startswith("ofm")
+                or re.search(
+                    r"\b(?:onlyfans|only\s*fans|fanvue|chatteurs?|ofm\s+agency|agence\s+ofm)\b",
+                    full_blob,
+                    re.I,
+                )
+            ):
+                skipped_non_icp += 1
+                quarantined += 1
+                continue
             raw_icp_score = item.get("icp_score")
             if raw_icp_score is not None and str(raw_icp_score).strip() != "":
                 try:

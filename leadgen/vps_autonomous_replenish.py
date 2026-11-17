@@ -987,6 +987,10 @@ def run_autonomous_replenish(
                 ad_spy_out = state_dir / f"tg_ad_spy_{ts}.jsonl"
                 external_out = state_dir / f"external_{ts}.jsonl"
                 yc_ph_out = state_dir / f"yc_ph_{ts}.jsonl"
+                fb_groups_out = state_dir / f"fb_groups_{ts}.jsonl"
+                b2b_tg_groups_out = state_dir / f"b2b_tg_groups_{ts}.jsonl"
+                ofm_review_path = state_dir / "ofm_review_leads.jsonl"
+                pre_ofm_count = _count_jsonl_lines(ofm_review_path) if ofm_review_path.is_file() else 0
                 sources_cfg = b2b_cfg.get("sources") or {}
                 limits_cfg = b2b_cfg.get("limits") or {}
 
@@ -1022,6 +1026,12 @@ def run_autonomous_replenish(
                     enabled_veins.append("tiktok_ads")
                 if sources_cfg.get("tiktok_shop", False) and "tiktok_shop" not in quarantined:
                     enabled_veins.append("tiktok_shop")
+                if sources_cfg.get("app_stores", False) and "app_stores" not in quarantined:
+                    enabled_veins.append("app_stores")
+                if sources_cfg.get("ats_hiring", False) and "ats_hiring" not in quarantined:
+                    enabled_veins.append("ats_hiring")
+                if sources_cfg.get("ph_detailed", False) and "ph_detailed" not in quarantined:
+                    enabled_veins.append("ph_detailed")
                 if enabled_veins and "high_yield_veins" not in quarantined:
                     if treg_ready or monid_ready or runner is not subprocess.run:
                         _exec_stage(
@@ -1039,6 +1049,26 @@ def run_autonomous_replenish(
                         )
                     elif "missing_treg_cli" not in replenish_reasons:
                         replenish_reasons.append("missing_treg_cli")
+
+                if (
+                    sources_cfg.get("facebook_groups", False)
+                    and "facebook_groups" not in quarantined
+                    and (treg_ready or runner is not subprocess.run)
+                ):
+                    fb_cmd = [
+                        py_bin,
+                        str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                        "--mode",
+                        "fb_groups",
+                        "--output",
+                        str(fb_groups_out),
+                        "--ofm-out",
+                        str(ofm_review_path),
+                    ]
+                    fb_urls = [str(u).strip() for u in (b2b_cfg.get("fb_group_urls") or []) if str(u).strip()]
+                    if fb_urls:
+                        fb_cmd.extend(["--fb-urls", ",".join(fb_urls)])
+                    _exec_stage("facebook_groups", fb_cmd)
 
                 if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
                     if treg_ready or runner is not subprocess.run:
@@ -1150,6 +1180,53 @@ def run_autonomous_replenish(
                         scrape_cmd.extend(["--exclude", str(master_jsonl)])
                     _exec_stage("tg_scrape_posters", scrape_cmd)
 
+                    raw_b2b_new = b2b_cfg.get("tg_groups_new")
+                    b2b_group_list = _clean_chat_list(
+                        ["productcircle_chat", "solofounderschat", "saasfounders"]
+                        if raw_b2b_new is None
+                        else raw_b2b_new
+                    )
+                    if b2b_group_list:
+                        _exec_stage(
+                            "b2b_tg_groups",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                                "--mode",
+                                "b2b_tg",
+                                "--session",
+                                str(isolated_session),
+                                "--groups",
+                                ",".join(b2b_group_list),
+                                "--output",
+                                str(b2b_tg_groups_out),
+                                "--seen",
+                                str(state_dir / "b2b_tg_groups_seen.json"),
+                            ],
+                        )
+
+                if (
+                    isolated_session is not None
+                    and sources_cfg.get("ofm_groups", False)
+                    and "ofm_groups" not in quarantined
+                ):
+                    ofm_group_list = _clean_chat_list(b2b_cfg.get("ofm_tg_groups") or [])
+                    ofm_cmd = [
+                        py_bin,
+                        str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                        "--mode",
+                        "ofm_tg",
+                        "--session",
+                        str(isolated_session),
+                        "--ofm-out",
+                        str(ofm_review_path),
+                        "--seen",
+                        str(state_dir / "ofm_seen.json"),
+                    ]
+                    if ofm_group_list:
+                        ofm_cmd.extend(["--groups", ",".join(ofm_group_list)])
+                    _exec_stage("ofm_groups", ofm_cmd)
+
                 if (
                     isolated_session is not None
                     and sources_cfg.get("channel_graph", True)
@@ -1196,11 +1273,15 @@ def run_autonomous_replenish(
                     except OSError:
                         return 0
 
-                per_source_counts["tg_groups"] = _count_jsonl_lines(raw_jsonl)
+                per_source_counts["tg_groups"] = _count_jsonl_lines(raw_jsonl) + _count_jsonl_lines(b2b_tg_groups_out)
+                per_source_counts["ofm_groups"] = max(
+                    0, _count_jsonl_lines(ofm_review_path) - pre_ofm_count
+                )
                 for src_label, src_path in (
                     ("buyer_public", buyer_public_out),
                     ("buyer_catalogs", catalogs_out),
                     ("high_yield_veins", high_yield_out),
+                    ("facebook_groups", fb_groups_out),
                     ("meta_ads", meta_ads_out),
                     ("social_x_reddit", social_out),
                     ("external", external_out),
@@ -1215,6 +1296,8 @@ def run_autonomous_replenish(
                         buyer_public_out,
                         catalogs_out,
                         high_yield_out,
+                        fb_groups_out,
+                        b2b_tg_groups_out,
                         meta_ads_out,
                         social_out,
                         external_out,
@@ -1305,6 +1388,29 @@ def run_autonomous_replenish(
                                     treg_tmp_jsonl.replace(final_jsonl)
                                 elif treg_tmp_jsonl.is_file():
                                     treg_tmp_jsonl.unlink(missing_ok=True)
+                            if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
+                                wf_ok = _exec_stage(
+                                    "contact_waterfall",
+                                    [
+                                        py_bin,
+                                        str(ROOT / "leadgen" / "contact_waterfall.py"),
+                                        "--input",
+                                        str(final_jsonl),
+                                        "--output",
+                                        str(wf_tmp_jsonl),
+                                        "--max-budget-usd",
+                                        "0.08",
+                                    ],
+                                )
+                                if (
+                                    wf_ok
+                                    and wf_tmp_jsonl.is_file()
+                                    and wf_tmp_jsonl.stat().st_size > 0
+                                ):
+                                    wf_tmp_jsonl.replace(final_jsonl)
+                                elif wf_tmp_jsonl.is_file():
+                                    wf_tmp_jsonl.unlink(missing_ok=True)
                             if (
                                 (treg_ready or monid_ready or runner is not subprocess.run)
                                 and sources_cfg.get("tg_identity_bridge", True)
@@ -1446,11 +1552,13 @@ def run_autonomous_replenish(
         )
         conn.commit()
 
+    ofm_review_added = int(per_source_counts.get("ofm_groups") or 0)
     result_payload = {
         "ok": True,
         "timestamp": utc_now(),
         "ingested_total": ingested_total,
         "direct_x_routed": direct_x_routed,
+        "ofm_review_added": ofm_review_added,
         "tg_bridged_count": tg_bridged_count,
         "per_source_counts": per_source_counts,
         "pending_b2b": pending_b2b,
@@ -1463,7 +1571,7 @@ def run_autonomous_replenish(
         "rule5_quarantined": rule5_quarantined,
         "low_water_alert": low_water_alert,
     }
-    if stages_run or ingested_total > 0 or direct_x_routed > 0:
+    if stages_run or ingested_total > 0 or direct_x_routed > 0 or ofm_review_added > 0:
         try:
             st_dir = _resolve_state_dir()
             st_dir.mkdir(parents=True, exist_ok=True)
@@ -1474,6 +1582,7 @@ def run_autonomous_replenish(
                         "timestamp": result_payload["timestamp"],
                         "ingested_total": ingested_total,
                         "direct_x_routed": direct_x_routed,
+                        "ofm_review_added": ofm_review_added,
                         "tg_bridged_count": tg_bridged_count,
                         "per_source_counts": per_source_counts,
                         "pending_b2b": pending_b2b,

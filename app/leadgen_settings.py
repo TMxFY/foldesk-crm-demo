@@ -57,6 +57,11 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "whop_content_rewards": True,
             "tiktok_ads": True,
             "tiktok_shop": True,
+            "app_stores": True,
+            "ats_hiring": True,
+            "ph_detailed": True,
+            "ofm_groups": True,
+            "facebook_groups": True,
             "meta_ads": True,
             "yc_ph": True,
             "social_x_reddit": True,
@@ -65,8 +70,18 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "tg_identity_bridge": True,
         },
         "tg_groups_old": ["producthunt_heroes", "id1613398776"],
-        "tg_groups_new": ["productcircle_chat"],
+        "tg_groups_new": ["productcircle_chat", "solofounderschat", "saasfounders"],
         "tg_comment_channels": [],
+        "ofm_tg_groups": [
+            "FranceOFM",
+            "ofmfrancenetwork",
+            "networkOFM",
+            "mofmnetwork",
+            "RedditWorldOFM",
+            "aimodelnetwork",
+            "AdultDeskAI",
+        ],
+        "fb_group_urls": [],
         "limits": {
             "yc_limit": 50,
             "ph_limit": 0,
@@ -170,7 +185,17 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
     raw_sources = b2b.get("sources") or {}
     caller_sources = ((cfg or {}).get("b2b") or {}).get("sources")
-    new_vein_keys = {"whop_content_rewards", "tiktok_ads", "tiktok_shop", "tg_identity_bridge"}
+    new_vein_keys = {
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+        "tg_identity_bridge",
+        "app_stores",
+        "ats_hiring",
+        "ph_detailed",
+        "ofm_groups",
+        "facebook_groups",
+    }
     restricted_legacy_cfg = (
         isinstance(caller_sources, dict)
         and len(caller_sources) > 0
@@ -193,6 +218,17 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     b2b["tg_groups_old"] = _clean_chat_list(b2b.get("tg_groups_old", DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_old"]))
     b2b["tg_groups_new"] = _clean_chat_list(b2b.get("tg_groups_new", DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]))
     b2b["tg_comment_channels"] = _clean_chat_list(b2b.get("tg_comment_channels", []))
+    b2b["ofm_tg_groups"] = _clean_chat_list(b2b.get("ofm_tg_groups", DEFAULT_LEADGEN_CONFIG["b2b"]["ofm_tg_groups"]))
+    raw_fb_urls = b2b.get("fb_group_urls", [])
+    clean_fb: list[str] = []
+    if isinstance(raw_fb_urls, str):
+        raw_fb_urls = [u.strip() for u in re.split(r"[\s,]+", raw_fb_urls) if u.strip()]
+    if isinstance(raw_fb_urls, list):
+        for fb_u in raw_fb_urls:
+            s_fb = str(fb_u or "").strip()
+            if s_fb.startswith(("http://", "https://")) and "facebook.com/" in s_fb.lower() and s_fb not in clean_fb:
+                clean_fb.append(s_fb)
+    b2b["fb_group_urls"] = clean_fb
 
     raw_limits = b2b.get("limits") or {}
     norm_limits = {}
@@ -352,7 +388,17 @@ def save_leadgen_config(
     current = get_leadgen_config(conn)
     merged = _deep_merge(current, inner)
     inner_sources = (inner.get("b2b") or {}).get("sources")
-    new_vein_keys = ("whop_content_rewards", "tiktok_ads", "tiktok_shop", "tg_identity_bridge")
+    new_vein_keys = (
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+        "tg_identity_bridge",
+        "app_stores",
+        "ats_hiring",
+        "ph_detailed",
+        "ofm_groups",
+        "facebook_groups",
+    )
     if (
         isinstance(inner_sources, dict)
         and inner_sources.get("meta_ads") is False
@@ -440,11 +486,14 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
             except Exception:
                 pass
 
-    from app.hygiene import read_direct_x_leads
+    from app.hygiene import read_direct_x_leads, read_ofm_review_leads
 
     direct_x_payload = read_direct_x_leads(state_dir, limit=12)
     direct_x_leads_count = int(direct_x_payload.get("total") or 0)
     recent_direct_x_leads = list(direct_x_payload.get("items") or [])[-12:]
+    ofm_review_payload = read_ofm_review_leads(state_dir, limit=25)
+    ofm_review_count = int(ofm_review_payload.get("total") or 0)
+    recent_ofm_review_leads = list(ofm_review_payload.get("items") or [])[:25]
     recent_b2b_leads: list[dict[str, Any]] = []
     crm_counts = {
         "total_leadgen_leads": 0,
@@ -452,6 +501,7 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
         "b2b_leads": 0,
         "active_leadgen_campaigns": 0,
         "direct_x_leads_count": direct_x_leads_count,
+        "ofm_review_count": ofm_review_count,
     }
     if conn is not None:
         try:
@@ -476,6 +526,11 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                 "catalog",
                 "linkedin",
                 "app_store",
+                "app_stores",
+                "ats_hiring",
+                "ph_detailed",
+                "fb_groups",
+                "facebook_groups",
             )
             for r in rows:
                 src = str(r["lead_source"] or "").lower()
@@ -522,8 +577,10 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
         "latest_vacancy_report": latest_vacancy_report,
         "crm_leadgen_counts": crm_counts,
         "direct_x_leads_count": direct_x_leads_count,
+        "ofm_review_count": ofm_review_count,
         "recent_b2b_leads": recent_b2b_leads,
         "recent_direct_x_leads": recent_direct_x_leads,
+        "recent_ofm_review_leads": recent_ofm_review_leads,
     }
 
 
@@ -1025,7 +1082,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 for p in raw_candidates
                 if os.path.isfile(p)
                 and os.path.getsize(p) > 0
-                and os.path.basename(p) != "direct_x_leads.jsonl"
+                and os.path.basename(p) not in ("direct_x_leads.jsonl", "ofm_review_leads.jsonl")
             ],
             key=os.path.getmtime,
         )
@@ -1084,6 +1141,8 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     sheet_like.append(item)
                     continue
                 if not isinstance(item, dict):
+                    continue
+                if "ofm_tier" in item or str(item.get("source") or item.get("lead_source") or "").strip().lower().startswith("ofm"):
                     continue
                 cand = dict(item)
                 uname = str(cand.get("username") or cand.get("tg_username") or cand.get("telegram_username") or "").strip().lstrip("@")

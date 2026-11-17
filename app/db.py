@@ -1098,6 +1098,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if sniper_cleanup_v7 is None:
         apply_sniper_icp_cleanup_v7(conn)
+    ofm_veins_v8 = conn.execute(
+        "SELECT 1 FROM kv_settings WHERE key = 'ofm_and_top_veins_v8'"
+    ).fetchone()
+    if ofm_veins_v8 is None:
+        apply_ofm_and_top_veins_v8(conn)
     conn.commit()
 
 
@@ -2032,6 +2037,68 @@ def apply_sniper_icp_cleanup_v7(
         "already_applied": False,
         **heal_res,
     }
+
+
+def apply_ofm_and_top_veins_v8(
+    conn: sqlite3.Connection, *, force: bool = False
+) -> dict:
+    """Idempotently enable OFM review queue, FB/TG buyer groups, and top-3 high-yield veins."""
+    if not force:
+        done = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'ofm_and_top_veins_v8'"
+        ).fetchone()
+        if done is not None:
+            return {"already_applied": True}
+
+    try:
+        cfg_row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'leadgen_config'"
+        ).fetchone()
+        if cfg_row and cfg_row["value"]:
+            import json as _json
+            from app.leadgen_settings import DEFAULT_LEADGEN_CONFIG, _normalize_config, _resolve_config_json_path
+            from app.runtime_config import is_vps_runtime
+
+            existing_cfg = _json.loads(str(cfg_row["value"]))
+            if isinstance(existing_cfg, dict):
+                b2b = existing_cfg.setdefault("b2b", {})
+                sources = b2b.setdefault("sources", {})
+                for src_k in (
+                    "tg_groups",
+                    "ofm_groups",
+                    "facebook_groups",
+                    "app_stores",
+                    "ats_hiring",
+                    "ph_detailed",
+                ):
+                    sources[src_k] = True
+                if not b2b.get("ofm_tg_groups"):
+                    b2b["ofm_tg_groups"] = list(DEFAULT_LEADGEN_CONFIG["b2b"]["ofm_tg_groups"])
+                existing_new = [str(x).strip().lstrip("@") for x in (b2b.get("tg_groups_new") or []) if str(x).strip()]
+                for chat in ("productcircle_chat", "solofounderschat", "saasfounders"):
+                    if chat not in existing_new:
+                        existing_new.append(chat)
+                b2b["tg_groups_new"] = existing_new
+                norm_cfg = _normalize_config(existing_cfg)
+                serialized_cfg = _json.dumps(norm_cfg, ensure_ascii=False, indent=2)
+                conn.execute(
+                    "UPDATE kv_settings SET value = ?, updated_at = ? WHERE key = 'leadgen_config'",
+                    (serialized_cfg, utc_now()),
+                )
+                if is_vps_runtime() or os.environ.get("LEADGEN_CONFIG_PATH", "").strip():
+                    cfg_p = _resolve_config_json_path()
+                    cfg_p.parent.mkdir(parents=True, exist_ok=True)
+                    cfg_p.write_text(serialized_cfg, encoding="utf-8")
+    except Exception:
+        pass
+
+    now_ts = utc_now()
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('ofm_and_top_veins_v8', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {"already_applied": False}
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:

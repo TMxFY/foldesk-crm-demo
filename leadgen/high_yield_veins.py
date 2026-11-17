@@ -1020,6 +1020,552 @@ def _load_seen(path: Path) -> dict[str, str]:
     return {}
 
 
+APP_STORE_VEIN_QUERIES = (
+    "AI calorie tracker",
+    "AI language tutor",
+    "astrology horoscope",
+    "ADHD planner",
+    "habit tracker",
+    "AI workout coach",
+    "flashcards AI",
+    "sleep meditation",
+)
+
+ATS_HIRING_QUERIES = (
+    'site:jobs.ashbyhq.com ("UGC" OR "Short-Form" OR "TikTok" OR "Paid Social" OR "Creator Partnerships")',
+    'site:job-boards.greenhouse.io ("UGC" OR "Short-Form" OR "TikTok" OR "Paid Social" OR "Creator")',
+)
+
+_ATS_ROLE_RE = re.compile(
+    r"\b(ugc|short[- ]?form|tiktok|reels|paid\s+social|creator|performance\s+creative|influencer)\b",
+    re.I,
+)
+_CIS_LOCATION_RE = re.compile(
+    r"\b(russia|russian\s+federation|belarus|ukraine|kazakhstan|uzbekistan|moscow|minsk|kyiv)\b",
+    re.I,
+)
+_ATS_NO_BOARD = frozenset({"www", "jobs", "boards", "job-boards", "apply", "app", "embed"})
+
+
+def _default_apple_search(term: str) -> Any:
+    if not check_treg_ready():
+        return None
+    return treg_call(
+        "litescrape.app_store.search.apps",
+        query={"term": term, "country": "us", "lang": "en-us"},
+        timeout=35,
+    )
+
+
+def _default_play_search(term: str) -> Any:
+    if not check_treg_ready():
+        return None
+    return treg_call(
+        "litescrape.google_play.search.apps",
+        query={"q": term, "gl": "us", "hl": "en"},
+        timeout=35,
+    )
+
+
+def _extract_store_urls(payload: Any, store_kind: str) -> list[tuple[str, str]]:
+    items: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        items = [x for x in payload if isinstance(x, dict)]
+    elif isinstance(payload, dict):
+        for key in ("results", "apps", "items", "organic_results", "data", "output"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                items = [x for x in val if isinstance(x, dict)]
+                break
+            if isinstance(val, dict):
+                nested = _extract_store_urls(val, store_kind)
+                if nested:
+                    return nested
+    urls: list[tuple[str, str]] = []
+    seen_u: set[str] = set()
+    for it in items:
+        raw_url = str(
+            it.get("url")
+            or it.get("link")
+            or it.get("trackViewUrl")
+            or it.get("app_url")
+            or ""
+        ).strip()
+        if not raw_url:
+            if store_kind == "apple" and (it.get("trackId") or it.get("id")):
+                aid = re.sub(r"\D", "", str(it.get("trackId") or it.get("id")))
+                if aid:
+                    raw_url = f"https://apps.apple.com/us/app/id{aid}"
+            elif store_kind == "play" and (it.get("appId") or it.get("product_id")):
+                pkg = str(it.get("appId") or it.get("product_id")).strip()
+                if pkg:
+                    raw_url = f"https://play.google.com/store/apps/details?id={pkg}"
+        if raw_url and raw_url.startswith(("http://", "https://")) and raw_url not in seen_u:
+            seen_u.add(raw_url)
+            name_hint = str(it.get("title") or it.get("trackName") or it.get("name") or "").strip()
+            urls.append((raw_url, name_hint))
+    return urls
+
+
+def collect_scaling_store_apps(
+    *,
+    limit: int = 6,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    apple_search_fn=None,
+    play_search_fn=None,
+    store_resolver_fn=None,
+    enrich_fn=None,
+    site_scrape_fn=None,
+    call_budget: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Collect scaling subscription/IAP mobile apps in the 300..30,000 rating sweet spot."""
+    today = day or date.today()
+    current = fresh_seen(seen or {}, today)
+    stamp = today.isoformat()
+    apple_search = _default_apple_search if apple_search_fn is None else apple_search_fn
+    play_search = _default_play_search if play_search_fn is None else play_search_fn
+    resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
+    enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
+    budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
+
+    rows: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+    queries = _rotate_for_day(APP_STORE_VEIN_QUERIES, today, 2)
+
+    for kw in queries:
+        if len(rows) >= limit or budget[0] <= 0:
+            break
+        candidates: list[tuple[str, str]] = []
+        for kind, fn in (("apple", apple_search), ("play", play_search)):
+            if budget[0] <= 0 or fn is None:
+                continue
+            budget[0] -= 1
+            try:
+                res = fn(kw)
+            except Exception:
+                res = None
+            candidates.extend(_extract_store_urls(res, kind)[:6])
+
+        for s_url, title_hint in candidates:
+            if len(rows) >= limit or budget[0] <= 0:
+                break
+            budget[0] -= 1
+            try:
+                st = resolve_store(s_url) or {}
+            except Exception:
+                st = {}
+            app_name = str(st.get("app_name") or title_hint or "").strip()
+            dev = str(st.get("developer") or "").strip()
+            dom = str(st.get("domain") or "").strip()
+            website = str(st.get("website") or "").strip()
+            rc_raw = st.get("rating_count")
+            rc_digits = re.sub(r"\D", "", str(rc_raw)) if rc_raw is not None else ""
+            rcount = int(rc_digits) if rc_digits else 0
+            if rcount < 300 or rcount > 30000:
+                continue
+            if st.get("is_megacorp") or is_megacorp_app(dev, app_name, dom, rcount):
+                continue
+            blob = f"{app_name} {dev} {st.get('description') or ''}"
+            if is_supply_side(blob) or sniper_reject_reason(blob):
+                continue
+            seen_key = f"appstore:{_slugify(dom or app_name or s_url)}"
+            if seen_key in current or seen_key in local_keys:
+                continue
+            local_keys.add(seen_key)
+
+            contacts = _merge_enriched_contacts(
+                brand=dev or app_name,
+                domain=dom,
+                project_url=website,
+                extra_text=str(st.get("description") or ""),
+                enrich_fn=enricher,
+                site_scrape_fn=scraper,
+                budget=budget,
+            )
+            if not contacts["work_email"] and st.get("email"):
+                contacts["work_email"] = str(st.get("email")).strip()
+            if not any(contacts[k] for k in ("domain", "work_email", "founder_x", "username")):
+                continue
+
+            project_name = app_name or dev or dom
+            what_they_do = f"Scaling store app ({kw}, {rcount} ratings): {project_name}"[:200]
+            links = [
+                u
+                for u in (
+                    contacts["project_url"],
+                    s_url,
+                    contacts["founder_x"],
+                    contacts["founder_linkedin"],
+                    f"https://t.me/{contacts['username']}" if contacts["username"] else "",
+                )
+                if u
+            ]
+            rows.append(
+                {
+                    "id": seen_key,
+                    "name": dev or project_name,
+                    "username": contacts["username"],
+                    "telegram_username": contacts["username"],
+                    "bio": what_they_do,
+                    "links": list(dict.fromkeys(links)),
+                    "source": "app_stores",
+                    "source_url": s_url,
+                    "role": "Founder",
+                    "roles": ["Founder"],
+                    "category": "SaaS / AI app",
+                    "project": project_name,
+                    "company": dev or project_name,
+                    "project_url": contacts["project_url"],
+                    "what_they_do": what_they_do,
+                    "founder_linkedin": contacts["founder_linkedin"],
+                    "founder_x": contacts["founder_x"],
+                    "work_email": contacts["work_email"],
+                    "rating_count": rcount,
+                    "has_monetization_signal": True,
+                    "icp_match": True,
+                    "lead_tier": "A",
+                }
+            )
+            current[seen_key] = stamp
+
+    return rows, current
+
+
+def _default_ashby_jobs(board: str) -> Any:
+    if not check_treg_ready():
+        return None
+    return treg_call("ashby.companies.jobs", query={"board": board}, timeout=30)
+
+
+def _default_greenhouse_jobs(board_token: str) -> Any:
+    if not check_treg_ready():
+        return None
+    return treg_call("greenhouse.companies.jobs", query={"board_token": board_token}, timeout=30)
+
+
+def _unwrap_ats_jobs(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [j for j in payload if isinstance(j, dict)]
+    if isinstance(payload, dict):
+        for key in ("jobs", "results", "items", "data", "output"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return [j for j in val if isinstance(j, dict)]
+            if isinstance(val, dict):
+                nested = _unwrap_ats_jobs(val)
+                if nested:
+                    return nested
+    return []
+
+
+def collect_ats_ugc_hiring(
+    *,
+    limit: int = 5,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    search_fn=None,
+    ashby_fn=None,
+    greenhouse_fn=None,
+    store_resolver_fn=None,
+    enrich_fn=None,
+    site_scrape_fn=None,
+    call_budget: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Find funded startups on Ashby/Greenhouse hiring UGC, Short-Form, TikTok or Paid Social roles."""
+    today = day or date.today()
+    current = fresh_seen(seen or {}, today)
+    stamp = today.isoformat()
+    search = _default_web_search if search_fn is None else search_fn
+    get_ashby = _default_ashby_jobs if ashby_fn is None else ashby_fn
+    get_gh = _default_greenhouse_jobs if greenhouse_fn is None else greenhouse_fn
+    resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
+    enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
+    budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
+
+    rows: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+    boards: list[tuple[str, str, str]] = []
+
+    for q in ATS_HIRING_QUERIES:
+        if budget[0] <= 0 or search is None:
+            break
+        budget[0] -= 1
+        try:
+            payload = search(q)
+        except Exception:
+            payload = None
+        for hit in _unwrap_search_results(payload):
+            u = str(hit.get("url") or "").strip()
+            parsed = urlparse(u)
+            host = (parsed.hostname or "").lower()
+            parts = [p for p in parsed.path.split("/") if p]
+            if not parts:
+                continue
+            slug = parts[0].strip()
+            if slug.lower() in _ATS_NO_BOARD or len(slug) < 2:
+                continue
+            if "ashbyhq.com" in host:
+                boards.append(("ashby", slug, str(hit.get("title") or "")))
+            elif "greenhouse.io" in host:
+                boards.append(("greenhouse", slug, str(hit.get("title") or "")))
+
+    seen_boards: set[tuple[str, str]] = set()
+    for ats_kind, slug, title_hint in boards:
+        if len(rows) >= limit or budget[0] <= 0:
+            break
+        key_b = (ats_kind, slug.lower())
+        if key_b in seen_boards:
+            continue
+        seen_boards.add(key_b)
+        budget[0] -= 1
+        try:
+            board_payload = get_ashby(slug) if ats_kind == "ashby" else get_gh(slug)
+        except Exception:
+            board_payload = None
+        jobs = _unwrap_ats_jobs(board_payload)
+        if not jobs or len(jobs) > 150:
+            continue
+
+        matched_job = None
+        for job in jobs:
+            jtitle = str(job.get("title") or "")
+            loc = job.get("location")
+            if isinstance(loc, dict):
+                loc = loc.get("name") or ""
+            loc_str = str(loc or "")
+            if _ATS_ROLE_RE.search(jtitle) and not _CIS_LOCATION_RE.search(loc_str):
+                matched_job = job
+                break
+        if not matched_job:
+            continue
+
+        brand = re.sub(r"[-_]+", " ", slug).strip().title()
+        jtitle = str(matched_job.get("title") or "").strip()
+        if is_megacorp_app(brand, title_hint) or is_supply_side(f"{brand} {jtitle}"):
+            continue
+        seen_key = f"ats:{ats_kind}:{slug.lower()}"
+        if seen_key in current or seen_key in local_keys:
+            continue
+        local_keys.add(seen_key)
+
+        land_url, land_dom, _, land_extra = _discover_brand_landing(
+            brand,
+            search_fn=search,
+            store_resolver_fn=resolve_store,
+            budget=budget,
+        )
+        contacts = _merge_enriched_contacts(
+            brand=brand,
+            domain=land_dom,
+            project_url=land_url,
+            extra_text=str(matched_job.get("absolute_url") or matched_job.get("jobUrl") or ""),
+            enrich_fn=enricher,
+            site_scrape_fn=scraper,
+            budget=budget,
+        )
+        if not any(contacts[k] for k in ("domain", "work_email", "founder_x", "username")):
+            continue
+
+        job_url = str(
+            matched_job.get("absolute_url")
+            or matched_job.get("jobUrl")
+            or f"https://jobs.ashbyhq.com/{slug}"
+            if ats_kind == "ashby"
+            else f"https://job-boards.greenhouse.io/{slug}"
+        )
+        what_they_do = f"Hiring '{jtitle}' on {ats_kind.title()} ({len(jobs)} open roles)"[:200]
+        links = [
+            u
+            for u in (
+                contacts["project_url"],
+                job_url,
+                *land_extra,
+                contacts["founder_x"],
+                contacts["founder_linkedin"],
+                f"https://t.me/{contacts['username']}" if contacts["username"] else "",
+            )
+            if u
+        ]
+        rows.append(
+            {
+                "id": seen_key,
+                "name": brand,
+                "username": contacts["username"],
+                "telegram_username": contacts["username"],
+                "bio": what_they_do,
+                "links": list(dict.fromkeys(links)),
+                "source": "ats_hiring",
+                "source_url": job_url,
+                "role": "Marketing",
+                "roles": ["Marketing"],
+                "category": "SaaS / AI app",
+                "project": brand,
+                "company": brand,
+                "project_url": contacts["project_url"],
+                "what_they_do": what_they_do,
+                "founder_linkedin": contacts["founder_linkedin"],
+                "founder_x": contacts["founder_x"],
+                "work_email": contacts["work_email"],
+                "has_monetization_signal": True,
+                "icp_match": True,
+                "lead_tier": "A",
+            }
+        )
+        current[seen_key] = stamp
+
+    return rows, current
+
+
+def _default_ph_detailed() -> Any:
+    if not check_treg_ready():
+        return None
+    return treg_call(
+        "crawl4ai.producthunt.launches.today_detailed",
+        method="POST",
+        data={"limit": 15},
+        timeout=45,
+    )
+
+
+def _unwrap_ph_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("products", "launches", "items", "results", "data", "output"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                nested = _unwrap_ph_items(val)
+                if nested:
+                    return nested
+    return []
+
+
+def collect_producthunt_detailed(
+    *,
+    limit: int = 6,
+    day: date | None = None,
+    seen: dict[str, str] | None = None,
+    ph_fetch_fn=None,
+    web_search_fn=None,
+    store_resolver_fn=None,
+    enrich_fn=None,
+    site_scrape_fn=None,
+    call_budget: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Collect today's Product Hunt launches via treg today_detailed."""
+    today = day or date.today()
+    current = fresh_seen(seen or {}, today)
+    stamp = today.isoformat()
+    fetch_ph = _default_ph_detailed if ph_fetch_fn is None else ph_fetch_fn
+    web_search = web_search_fn if web_search_fn is not None else (_default_web_search if ph_fetch_fn is None else None)
+    resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
+    enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
+    scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
+    budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
+
+    if budget[0] <= 0 or fetch_ph is None:
+        return [], current
+    budget[0] -= 1
+    try:
+        payload = fetch_ph()
+    except Exception:
+        payload = None
+
+    rows: list[dict[str, Any]] = []
+    local_keys: set[str] = set()
+    for item in _unwrap_ph_items(payload):
+        if len(rows) >= limit:
+            break
+        name = str(item.get("name") or item.get("title") or "").strip()
+        tagline = str(item.get("tagline") or item.get("summary") or item.get("description") or "").strip()
+        if not name or _is_noise_brand(name):
+            continue
+        blob = f"{name} {tagline} {item.get('pricing') or ''} {item.get('category') or ''}"
+        if is_megacorp_app(name, tagline) or is_supply_side(blob) or sniper_reject_reason(blob):
+            continue
+
+        site_raw = str(item.get("website") or item.get("product_url") or item.get("url") or "").strip()
+        dom = domain_of(site_raw)
+        if not dom or "producthunt.com" in dom:
+            site_raw = ""
+            dom = ""
+        if not dom and web_search is not None:
+            land_url, land_dom, _, _ = _discover_brand_landing(
+                name,
+                search_fn=web_search,
+                store_resolver_fn=resolve_store,
+                budget=budget,
+            )
+            if land_dom:
+                site_raw = land_url
+                dom = land_dom
+
+        seen_key = f"ph_det:{_slugify(dom or name)}"
+        if seen_key in current or seen_key in local_keys:
+            continue
+        local_keys.add(seen_key)
+
+        makers_txt = json.dumps(item.get("makers") or "", ensure_ascii=False)
+        contacts = _merge_enriched_contacts(
+            brand=name,
+            domain=dom,
+            project_url=site_raw,
+            extra_text=f"{tagline} {makers_txt} {item.get('maker_x') or ''} {item.get('maker_tg') or ''}",
+            enrich_fn=enricher,
+            site_scrape_fn=scraper,
+            budget=budget,
+        )
+        if not any(contacts[k] for k in ("domain", "work_email", "founder_x", "username")):
+            continue
+
+        what_they_do = f"Product Hunt launch: {tagline or name}"[:200]
+        ph_url = str(item.get("ph_url") or item.get("url") or "").strip()
+        links = [
+            u
+            for u in (
+                contacts["project_url"],
+                ph_url if "producthunt.com" in ph_url else "",
+                contacts["founder_x"],
+                contacts["founder_linkedin"],
+                f"https://t.me/{contacts['username']}" if contacts["username"] else "",
+            )
+            if u
+        ]
+        rows.append(
+            {
+                "id": seen_key,
+                "name": name,
+                "username": contacts["username"],
+                "telegram_username": contacts["username"],
+                "bio": what_they_do,
+                "links": list(dict.fromkeys(links)),
+                "source": "ph_detailed",
+                "source_url": ph_url or contacts["project_url"],
+                "role": "Founder",
+                "roles": ["Founder"],
+                "category": "SaaS / AI app",
+                "project": name,
+                "company": name,
+                "project_url": contacts["project_url"],
+                "what_they_do": what_they_do,
+                "founder_linkedin": contacts["founder_linkedin"],
+                "founder_x": contacts["founder_x"],
+                "work_email": contacts["work_email"],
+                "has_monetization_signal": True,
+                "icp_match": True,
+                "lead_tier": "A",
+            }
+        )
+        current[seen_key] = stamp
+
+    return rows, current
+
+
 def _save_seen(path: Path, seen: dict[str, str]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1032,7 +1578,7 @@ def collect_all_veins(
     *,
     day: date | None = None,
     seen: dict[str, str] | None = None,
-    limit: int = 16,
+    limit: int = 24,
     veins: tuple[str, ...] = ("whop", "tiktok_ads", "tiktok_shop"),
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     today = day or date.today()
@@ -1040,7 +1586,7 @@ def collect_all_veins(
     all_rows: list[dict[str, Any]] = []
 
     vein_set = {v.strip().lower() for v in veins if v.strip()}
-    per_vein_cap = max(1, min(6, limit // max(1, len(vein_set)) + 1))
+    per_vein_cap = max(2, min(6, limit // max(1, len(vein_set)) + 1))
 
     if "whop" in vein_set and len(all_rows) < limit:
         w_rows, merged_seen = collect_whop_content_rewards(
@@ -1066,6 +1612,30 @@ def collect_all_veins(
             call_budget=[10],
         )
         all_rows.extend(s_rows)
+    if "app_stores" in vein_set and len(all_rows) < limit:
+        a_rows, merged_seen = collect_scaling_store_apps(
+            limit=min(per_vein_cap, limit - len(all_rows)),
+            day=today,
+            seen=merged_seen,
+            call_budget=[10],
+        )
+        all_rows.extend(a_rows)
+    if "ats_hiring" in vein_set and len(all_rows) < limit:
+        h_rows, merged_seen = collect_ats_ugc_hiring(
+            limit=min(per_vein_cap, limit - len(all_rows)),
+            day=today,
+            seen=merged_seen,
+            call_budget=[10],
+        )
+        all_rows.extend(h_rows)
+    if "ph_detailed" in vein_set and len(all_rows) < limit:
+        p_rows, merged_seen = collect_producthunt_detailed(
+            limit=min(per_vein_cap, limit - len(all_rows)),
+            day=today,
+            seen=merged_seen,
+            call_budget=[8],
+        )
+        all_rows.extend(p_rows)
 
     return all_rows[:limit], merged_seen
 
@@ -1074,8 +1644,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Collect SoftUGC high-yield veins")
     parser.add_argument("--output", required=True)
     parser.add_argument("--seen", default="data/leadgen_state/high_yield_seen.json")
-    parser.add_argument("--limit", type=int, default=16)
-    parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop")
+    parser.add_argument("--limit", type=int, default=24)
+    parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop,app_stores,ats_hiring,ph_detailed")
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
     args = parser.parse_args(argv)
 
