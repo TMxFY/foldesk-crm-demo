@@ -1013,8 +1013,8 @@ def run_autonomous_replenish(
                     and "yc_ph" not in quarantined
                     and "yc_ph_leads" not in quarantined
                 ):
-                    yc_lim = max(1, min(30, int(limits_cfg.get("yc_limit") or 15)))
-                    ph_lim = max(0, min(20, int(limits_cfg.get("ph_limit") or 0)))
+                    yc_lim = max(1, min(12, int(limits_cfg.get("yc_limit") or 12)))
+                    ph_lim = max(0, min(10, int(limits_cfg.get("ph_limit") or 0)))
                     yc_cmd = [
                         py_bin,
                         str(ROOT / "leadgen" / "yc_ph_leads.py"),
@@ -1042,7 +1042,7 @@ def run_autonomous_replenish(
                         if cur_yc_st.st_size > 0 and cur_yc_st.st_mtime_ns != prev_yc_mtime:
                             yc_ph_out.write_bytes(tmp_yc.read_bytes())
 
-                ext_limit = int(limits_cfg.get("external_limit") or 20)
+                ext_limit = min(10, max(0, int(limits_cfg.get("external_limit") or 10)))
                 if ext_limit > 0 and "creator_external_leads" not in quarantined:
                     _exec_stage(
                         "creator_external_leads",
@@ -1157,6 +1157,7 @@ def run_autonomous_replenish(
                             "--output",
                             str(enriched_jsonl),
                             "--fetch",
+                            "--skip-copy",
                         ],
                     )
                     enrich_src = (

@@ -41,7 +41,11 @@ except ImportError:
         parse_channel_founder_info,
     )
 
-DEFAULT_SESSION = "/Users/timofei/.claude/skill-telegram/tim3.session"
+DEFAULT_SESSION = (
+    os.environ.get("TG_SESSION")
+    or os.environ.get("SCRAPER_TG_SESSION")
+    or "/Users/timofei/.claude/skill-telegram/tim3.session"
+)
 DEFAULT_SEEN_PATH = "leadgen_state/ad_spy_seen.json"
 
 AD_MARKER_RE = re.compile(

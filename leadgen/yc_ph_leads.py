@@ -81,7 +81,11 @@ OUT_JSONL = "/tmp/yc_ph_leads.jsonl"
 PENDING_DIR = os.path.join(STATE_DIR, "pending_sheet_appends")
 SID = "1Z4KwmUMNuA9Q562y3Vvxa40AFcqGaMyAXAqr7QlbmOQ"
 SHEET = "Все2"
-SESSION = "/Users/timofei/.claude/skill-telegram/tim2.session"
+SESSION = (
+    os.environ.get("TG_SESSION")
+    or os.environ.get("SCRAPER_TG_SESSION")
+    or "/Users/timofei/.claude/skill-telegram/tim2.session"
+)
 GSHEETS_TOKEN_BIN = "/Users/timofei/.local/bin/gsheets-token"
 
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
@@ -1272,8 +1276,17 @@ def tg_lookup(usernames, leads_by_username: dict[str, dict] | None = None):
     api_hash = os.environ["TG_API_HASH"]
     found = {}
 
+    sess_path = (
+        os.environ.get("TG_SESSION")
+        or os.environ.get("SCRAPER_TG_SESSION")
+        or SESSION
+    )
+    if not os.path.isfile(sess_path) and not os.path.isfile(f"{sess_path}.session"):
+        log(f"  TG lookup skipped: session file not found ({sess_path})")
+        return {}
+
     async def run():
-        client = TelegramClient(SESSION, api_id, api_hash)
+        client = TelegramClient(sess_path, api_id, api_hash)
         await client.connect()
         try:
             for u in usernames:

@@ -495,7 +495,13 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
     return rows
 
 
-def enrich_rows(rows: list[dict], *, fetch: bool = False, max_workers: int = MAX_ENRICH_WORKERS) -> list[dict]:
+def enrich_rows(
+    rows: list[dict],
+    *,
+    fetch: bool = False,
+    max_workers: int = MAX_ENRICH_WORKERS,
+    skip_copy: bool = False,
+) -> list[dict]:
     prepared: list[tuple[dict, str, str, str, str]] = []
     urls_to_fetch: list[str] = []
     seen_urls: set[str] = set()
@@ -578,7 +584,8 @@ def enrich_rows(rows: list[dict], *, fetch: bool = False, max_workers: int = MAX
         tag = f"[{i}/{len(prepared)}]"
         print(f"{tag} {r2.get('name')} | {cat} | {clean_proj or '-'} | {final_purl or '-'}", file=sys.stderr)
 
-    apply_vlad_sonnet_or_fallback(out)
+    if not skip_copy:
+        apply_vlad_sonnet_or_fallback(out)
     return out
 
 
@@ -587,6 +594,7 @@ def main():
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--fetch", action="store_true", help="fetch project sites")
+    p.add_argument("--skip-copy", action="store_true", help="defer LLM copy generation to post-qualify curation")
     p.add_argument("--limit", type=int, default=0, help="debug limit")
     args = p.parse_args()
 
@@ -595,7 +603,12 @@ def main():
     if args.limit:
         rows = rows[:args.limit]
 
-    out = enrich_rows(rows, fetch=bool(args.fetch), max_workers=MAX_ENRICH_WORKERS)
+    out = enrich_rows(
+        rows,
+        fetch=bool(args.fetch),
+        max_workers=MAX_ENRICH_WORKERS,
+        skip_copy=bool(args.skip_copy),
+    )
 
     with open(args.output, "w") as f:
         for r in out:

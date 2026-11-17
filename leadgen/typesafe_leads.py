@@ -17,9 +17,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VENDOR = "/Users/timofei/.codex/vendor/typesafe-sdk"
-if VENDOR not in sys.path:
-    sys.path.insert(0, VENDOR)
+for _vendor_cand in ("/opt/crmtg/vendor/typesafe-sdk", "/Users/timofei/.codex/vendor/typesafe-sdk"):
+    if os.path.isdir(_vendor_cand) and _vendor_cand not in sys.path:
+        sys.path.insert(0, _vendor_cand)
 
 try:
     from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul

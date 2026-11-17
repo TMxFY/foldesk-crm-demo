@@ -26,7 +26,11 @@ import yc_ph_leads as Y  # reuse fetch_site_text, llm_angles_batch, llm_first_to
 
 SHEET_ID = "1Z4KwmUMNuA9Q562y3Vvxa40AFcqGaMyAXAqr7QlbmOQ"
 TAB = "Все2"
-SESSION = "/Users/timofei/.claude/skill-telegram/tim2.session"
+SESSION = (
+    os.environ.get("TG_SESSION")
+    or os.environ.get("SCRAPER_TG_SESSION")
+    or "/Users/timofei/.claude/skill-telegram/tim2.session"
+)
 
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 

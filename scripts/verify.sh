@@ -276,6 +276,17 @@ if hygiene_py_file.is_file():
                 f"Gate E violation in app/hygiene.py: missing required contract function '{required_def}'"
             )
 
+# Gate F: Zero Bare Mac Session Path Gate across leadgen/*.py
+bare_mac_session_re = re.compile(
+    r"^\s*(?:DEFAULT_)?SESSION\s*=\s*[\"']/Users/timofei/.*\.session[\"']"
+)
+for py_file in sorted((root / "leadgen").rglob("*.py")):
+    for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
+        if bare_mac_session_re.search(line):
+            errors.append(
+                f"Gate F violation in {py_file}:{lineno}: hardcoded Mac .session path without TG_SESSION/SCRAPER_TG_SESSION env override"
+            )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

@@ -25,7 +25,11 @@ from telethon.tl.functions.channels import (
 )
 from telethon.tl.functions.users import GetFullUserRequest
 
-DEFAULT_SESSION = "/Users/timofei/.claude/skill-telegram/tim3.session"
+DEFAULT_SESSION = (
+    os.environ.get("TG_SESSION")
+    or os.environ.get("SCRAPER_TG_SESSION")
+    or "/Users/timofei/.claude/skill-telegram/tim3.session"
+)
 DEFAULT_STATE_PATH = "leadgen_state/channel_graph_seen.json"
 MAX_SUBSCRIBERS = 100_000
 

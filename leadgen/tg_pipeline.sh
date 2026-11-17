@@ -369,7 +369,7 @@ fi
 
 if [ -s "$NEW" ]; then
   # 2. enrich (fetch sites)  3. LLM-qualify (batched)  4. curate (overrides+categories)
-  python3 "$ROOT/leadgen/tg_enrich_leads.py" --input "$NEW" --output "$RAW.enriched.jsonl" --fetch 2>/dev/null
+  python3 "$ROOT/leadgen/tg_enrich_leads.py" --input "$NEW" --output "$RAW.enriched.jsonl" --fetch --skip-copy 2>/dev/null
   python3 "$ROOT/leadgen/tg_llm_qualify.py" --input "$RAW.enriched.jsonl" --output "$RAW.qualified.jsonl"
   python3 "$ROOT/leadgen/tg_curate.py" --input "$RAW.qualified.jsonl" --output "$RAW.final.jsonl" 2>/dev/null
   # Work email, mailbox check, LinkedIn, search demand, competitor ads.
