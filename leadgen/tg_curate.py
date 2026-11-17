@@ -253,6 +253,8 @@ def curate_rows(rows: list[dict]) -> list[dict]:
             is_invalid_product_name,
             is_rejected_buyer_category,
             is_supply_side,
+            sanitize_person_and_company,
+            sniper_reject_reason,
         )
     except ImportError:
         from leadgen.tg_enrich_leads import apply_vlad_sonnet_or_fallback
@@ -262,10 +264,26 @@ def curate_rows(rows: list[dict]) -> list[dict]:
             is_invalid_product_name,
             is_rejected_buyer_category,
             is_supply_side,
+            sanitize_person_and_company,
+            sniper_reject_reason,
         )
 
     out = []
     for r in rows:
+        if r.get("qualified") is False:
+            continue
+        if str(r.get("monetization") or "").strip().lower() == "none":
+            continue
+        raw_score = r.get("icp_score")
+        try:
+            score = 85 if raw_score is None else int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            score = 0
+        if score < 80:
+            continue
+        if r.get("has_agency_signal") and not r.get("has_monetization_signal"):
+            continue
+
         k = key_of(r)
         ov = OVERRIDES.get(k)
         r2 = dict(r)
@@ -285,10 +303,31 @@ def curate_rows(rows: list[dict]) -> list[dict]:
         url = url or (r.get("project_url") or "")
         what = what or (r.get("what_they_do") or "")
 
+        clean_name, clean_proj = sanitize_person_and_company(
+            r2.get("name"),
+            proj,
+            site=url,
+            bio=r2.get("bio") or what,
+        )
+        if r2.get("name") is not None:
+            r2["name"] = clean_name
+        proj = clean_proj
+        if "company" in r2:
+            r2["company"] = clean_proj
+
         if is_rejected_buyer_category(cat):
             continue
         role_val = str(r2.get("role") or "").strip()
         if role_val and role_val in NON_BUYER_ROLES:
+            continue
+        r2.update({
+            "category": cat,
+            "project": proj,
+            "project_url": url,
+            "what_they_do": what,
+            "icp_score": score,
+        })
+        if sniper_reject_reason(r2, category=cat):
             continue
         blob = "\n".join(
             str(x)
@@ -307,7 +346,6 @@ def curate_rows(rows: list[dict]) -> list[dict]:
         if is_invalid_product_name(proj):
             continue
 
-        r2.update({"category": cat, "project": proj, "project_url": url, "what_they_do": what})
         out.append(r2)
 
     apply_vlad_sonnet_or_fallback(out)

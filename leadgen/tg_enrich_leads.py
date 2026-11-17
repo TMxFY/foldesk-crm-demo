@@ -6,18 +6,28 @@ Input: JSONL from tg_scrape_posters.py
 Output: enriched JSONL with extra fields.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from supply_side import sanitize_person_and_company
+except ImportError:
+    try:
+        from leadgen.supply_side import sanitize_person_and_company
+    except ImportError:
+        from scripts.supply_side import sanitize_person_and_company
+
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-TIMEOUT = 8
+TIMEOUT = 5
+MAX_ENRICH_WORKERS = 12
 
 SOCIAL = (
     "x.com",
@@ -181,24 +191,96 @@ def norm_url(url):
     return url
 
 
-def fetch_desc(url):
+_SITE_MONETIZATION_RE = re.compile(
+    r"\bpricing\b|\$\s*\d+(?:\.\d+)?\s*(?:/\s*(?:mo|month|yr|year|wk|week)|per\s+month)|"
+    r"\$\s*/\s*mo\b|\bper\s+month\b|\bsubscri(?:be|ption)\b|\bfree\s+trial\b|"
+    r"\badd\s+to\s+cart\b|\bcheckout\b|apps\.apple\.com|play\.google\.com|"
+    r"\bshopify\b|myshopify\.com|\bfunded\b|\bchallenge\b|\brevshare\b",
+    re.IGNORECASE,
+)
+_SITE_AGENCY_RE = re.compile(
+    r"\bour\s+clients\b|\bcase\s+studies\b|\bbook\s+a\s+discovery\s+call\b|"
+    r"\bmarketing\s+agenc\w*\b|\bpr\s+agenc\w*\b|"
+    r"\bsoftware\s+development\s+company\b|\bwe\s+build\s+custom\b",
+    re.IGNORECASE,
+)
+
+
+def inspect_site_signals(html_text: str, page_url: str = "") -> dict:
+    raw = (html_text or "")[:200000]
+    if not raw:
+        return {"desc": "", "has_monetization_signal": False, "has_agency_signal": False, "pricing_url": ""}
+    soup = BeautifulSoup(raw, "html.parser")
+    desc = ""
+    m = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    if m and m.get("content"):
+        desc = m["content"].strip()
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
+    out_desc = (desc or title)[:220]
+
+    visible_text = soup.get_text(" ", strip=True)
+    hrefs = [str(a.get("href") or "").strip() for a in soup.find_all("a", href=True)]
+    combined = f"{visible_text}\n" + "\n".join(hrefs)
+
+    pricing_url = ""
+    if page_url:
+        base_host = (urlparse(page_url).hostname or "").lower().removeprefix("www.")
+        for href in hrefs:
+            if not href:
+                continue
+            resolved = urljoin(page_url, href)
+            parsed_h = urlparse(resolved)
+            h_host = (parsed_h.hostname or "").lower().removeprefix("www.")
+            h_path = (parsed_h.path or "").rstrip("/").lower()
+            if h_path in {"/pricing", "/plans"} and (not base_host or h_host == base_host):
+                pricing_url = resolved
+                break
+
+    has_monetization = bool(_SITE_MONETIZATION_RE.search(combined) or pricing_url)
+    has_agency = bool(_SITE_AGENCY_RE.search(visible_text) or _SITE_AGENCY_RE.search(out_desc))
+    return {
+        "desc": out_desc,
+        "has_monetization_signal": has_monetization,
+        "has_agency_signal": has_agency,
+        "pricing_url": pricing_url,
+    }
+
+
+def fetch_site_profile(url: str) -> dict:
     url = norm_url(url)
+    empty = {"desc": "", "has_monetization_signal": False, "has_agency_signal": False}
     if not url:
-        return ""
+        return empty
     try:
         r = requests.get(url, headers=UA, timeout=TIMEOUT, allow_redirects=True)
         if "text/html" not in r.headers.get("Content-Type", ""):
-            return ""
-        soup = BeautifulSoup(r.text[:200000], "html.parser")
-        desc = ""
-        m = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
-        if m and m.get("content"):
-            desc = m["content"].strip()
-        title = (soup.title.string.strip() if soup.title and soup.title.string else "")
-        out = desc or title
-        return out[:220]
+            return empty
+        info = inspect_site_signals(r.text or "", page_url=url)
+        pricing_url = info.get("pricing_url") or ""
+        if pricing_url and pricing_url.rstrip("/") != url.rstrip("/"):
+            try:
+                pr = requests.get(pricing_url, headers=UA, timeout=TIMEOUT, allow_redirects=True)
+                if "text/html" in pr.headers.get("Content-Type", ""):
+                    p_info = inspect_site_signals(pr.text or "", page_url=pricing_url)
+                    info["has_monetization_signal"] = bool(
+                        info["has_monetization_signal"] or p_info["has_monetization_signal"]
+                    )
+                    info["has_agency_signal"] = bool(
+                        info["has_agency_signal"] or p_info["has_agency_signal"]
+                    )
+            except Exception:
+                pass
+        return {
+            "desc": info["desc"],
+            "has_monetization_signal": bool(info["has_monetization_signal"]),
+            "has_agency_signal": bool(info["has_agency_signal"]),
+        }
     except Exception:
-        return ""
+        return empty
+
+
+def fetch_desc(url):
+    return fetch_site_profile(url)["desc"]
 
 
 def bio_detail(bio):
@@ -413,6 +495,93 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
     return rows
 
 
+def enrich_rows(rows: list[dict], *, fetch: bool = False, max_workers: int = MAX_ENRICH_WORKERS) -> list[dict]:
+    prepared: list[tuple[dict, str, str, str, str]] = []
+    urls_to_fetch: list[str] = []
+    seen_urls: set[str] = set()
+
+    for r in rows:
+        bio = r.get("bio") or ""
+        cat = classify_cat(bio) if bio.strip() else (r.get("category") or classify_cat(bio))
+        purl = pick_project_url(r.get("links") or []) or (
+            r.get("project_url") if (r.get("project_url") and not is_social(r.get("project_url"))) else ""
+        )
+        norm_purl = norm_url(purl)
+        existing_project = str(r.get("project") or r.get("company") or "").strip()
+        pname = existing_project or project_name_from(norm_purl, bio) or ""
+        prepared.append((r, bio, cat, norm_purl, pname))
+        if fetch and norm_purl and norm_purl not in seen_urls:
+            seen_urls.add(norm_purl)
+            urls_to_fetch.append(norm_purl)
+
+    fetched_by_url: dict[str, dict] = {}
+    if fetch and urls_to_fetch:
+        workers = max(1, min(int(max_workers or MAX_ENRICH_WORKERS), len(urls_to_fetch)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for url_key, site_prof in zip(urls_to_fetch, pool.map(fetch_site_profile, urls_to_fetch)):
+                fetched_by_url[url_key] = site_prof
+
+    out: list[dict] = []
+    for i, (r, bio, cat, norm_purl, pname) in enumerate(prepared, 1):
+        site_prof = fetched_by_url.get(norm_purl) or {
+            "desc": "",
+            "has_monetization_signal": False,
+            "has_agency_signal": False,
+        }
+        desc = site_prof["desc"]
+        what = desc or bio_detail(bio)
+        detail = bio_detail(bio)
+        r2 = dict(r)
+        role, roles = merge_roles(r, bio)
+        final_purl = norm_purl or norm_url(r.get("project_url") or "")
+        clean_name, clean_proj = sanitize_person_and_company(
+            r.get("name"),
+            pname or r.get("company"),
+            site=final_purl,
+            bio=bio or what,
+        )
+        inline_blob = "\n".join(
+            str(x)
+            for x in (
+                bio,
+                r.get("what_they_do") or "",
+                " ".join(str(u) for u in (r.get("links") or [])),
+                final_purl,
+            )
+            if x
+        )
+        has_monetization = bool(
+            r.get("has_monetization_signal")
+            or site_prof["has_monetization_signal"]
+            or _SITE_MONETIZATION_RE.search(inline_blob)
+        )
+        has_agency = bool(
+            r.get("has_agency_signal")
+            or site_prof["has_agency_signal"]
+            or _SITE_AGENCY_RE.search(inline_blob)
+        )
+        r2.update({
+            "name": clean_name if r.get("name") is not None else clean_name,
+            "category": cat,
+            "role": role,
+            "roles": roles,
+            "project": clean_proj,
+            "project_url": final_purl,
+            "what_they_do": what or detail or (r.get("what_they_do") or ""),
+            "has_monetization_signal": has_monetization,
+            "has_agency_signal": has_agency,
+        })
+        if "company" in r2:
+            r2["company"] = clean_proj
+        r2.update(merge_social_fields(r2, extract_social_contacts(r.get("links") or [])))
+        out.append(r2)
+        tag = f"[{i}/{len(prepared)}]"
+        print(f"{tag} {r2.get('name')} | {cat} | {clean_proj or '-'} | {final_purl or '-'}", file=sys.stderr)
+
+    apply_vlad_sonnet_or_fallback(out)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
@@ -426,35 +595,7 @@ def main():
     if args.limit:
         rows = rows[:args.limit]
 
-    out = []
-    for i, r in enumerate(rows, 1):
-        bio = r.get("bio") or ""
-        cat = classify_cat(bio)
-        purl = pick_project_url(r.get("links") or [])
-        existing_project = str(r.get("project") or "").strip()
-        if existing_project and not bio.strip():
-            pname = r["project"]
-        else:
-            pname = project_name_from(purl, bio) or r.get("project") or ""
-        desc = fetch_desc(purl) if (args.fetch and purl) else ""
-        what = desc or bio_detail(bio)
-        detail = bio_detail(bio)
-        r2 = dict(r)
-        role, roles = merge_roles(r, bio)
-        r2.update({
-            "category": cat,
-            "role": role,
-            "roles": roles,
-            "project": pname,
-            "project_url": norm_url(purl) or norm_url(r.get("project_url") or ""),
-            "what_they_do": what or detail or (r.get("what_they_do") or ""),
-        })
-        r2.update(merge_social_fields(r2, extract_social_contacts(r.get("links") or [])))
-        out.append(r2)
-        tag = f"[{i}/{len(rows)}]"
-        print(f"{tag} {r.get('name')} | {cat} | {pname or '-'} | {purl or '-'}", file=sys.stderr)
-
-    apply_vlad_sonnet_or_fallback(out)
+    out = enrich_rows(rows, fetch=bool(args.fetch), max_workers=MAX_ENRICH_WORKERS)
 
     with open(args.output, "w") as f:
         for r in out:

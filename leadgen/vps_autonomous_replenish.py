@@ -33,10 +33,190 @@ from app.leadgen_settings import (
     resolve_target_b2b_tg_campaign_name,
 )
 from app.outreach import preview_outreach_batch
-from leadgen.tg_to_gsheet import admit_discovered_row, apply_master_merge
+from leadgen.supply_side import sanitize_person_and_company, sniper_reject_reason
+from leadgen.tg_to_gsheet import (
+    admit_discovered_row,
+    apply_master_merge,
+    email_of_text,
+    linkedin_of,
+    whatsapp_url,
+    x_profile_url,
+)
+from leadgen.treg_client import treg_bin
 
 DEFAULT_DB_PATH = "/opt/crmtg/data/crm.db"
 DEFAULT_SCRAPER_SESSIONS_DIR = "/opt/crmtg/data/scraper_sessions"
+_NOISE_TG_HANDLES = frozenset({"joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "socks"})
+
+
+def check_treg_ready() -> bool:
+    """Verify treg CLI binary exists and either TREG_API_KEY or non-empty ~/.treg/config.json is present."""
+    binary = treg_bin()
+    if not binary:
+        return False
+    if (os.environ.get("TREG_API_KEY") or "").strip():
+        return True
+    cfg_raw = (os.environ.get("TREG_CONFIG_PATH") or "").strip()
+    cfg_path = Path(cfg_raw).expanduser() if cfg_raw else Path("~/.treg/config.json").expanduser()
+    if not cfg_path.is_file():
+        return False
+    try:
+        content = cfg_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not content:
+        return False
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return any(bool(str(v or "").strip()) for v in parsed.values())
+        return bool(parsed)
+    except json.JSONDecodeError:
+        return True
+
+
+def _is_real_personal_tg_handle(raw_username: Any) -> bool:
+    u = str(raw_username or "").strip().lstrip("@")
+    if not u or len(u) < 4 or len(u) > 32:
+        return False
+    low = u.lower()
+    if low in _NOISE_TG_HANDLES or low.endswith("bot") or low.endswith("_bot"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u))
+
+
+def _direct_x_dedup_keys(row: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    em = email_of_text(row.get("work_email") or row.get("email") or "")
+    if em:
+        keys.append(f"email:{em.casefold()}")
+    fx = x_profile_url(row)
+    if fx:
+        keys.append(f"x:{fx.casefold()}")
+    fli = linkedin_of(row)
+    if fli:
+        keys.append(f"li:{fli.casefold()}")
+    purl = str(row.get("project_url") or row.get("website") or row.get("site") or "").strip()
+    if purl:
+        host = (urllib.parse.urlparse(purl if "://" in purl else f"https://{purl}").hostname or "").lower().removeprefix("www.")
+        if host and "." in host:
+            keys.append(f"dom:{host}")
+    return keys
+
+
+def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict[str, int]:
+    """Keep TG/WA leads (icp_score >= 80) in final_jsonl; move Email/X/LinkedIn-only leads to direct_x_leads.jsonl."""
+    if not final_jsonl.is_file() or final_jsonl.stat().st_size == 0:
+        if final_jsonl.is_file():
+            final_jsonl.unlink(missing_ok=True)
+        return {"tg_wa_kept": 0, "direct_x_added": 0, "dropped": 0}
+
+    existing_dx_keys: set[str] = set()
+    if direct_x_jsonl.is_file():
+        for line in direct_x_jsonl.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                prev_obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(prev_obj, dict):
+                existing_dx_keys.update(_direct_x_dedup_keys(prev_obj))
+
+    tg_wa_rows: list[dict[str, Any]] = []
+    new_direct_x_rows: list[dict[str, Any]] = []
+    dropped = 0
+
+    for raw_line in final_jsonl.read_text(encoding="utf-8").splitlines():
+        s = raw_line.strip()
+        if not s:
+            continue
+        try:
+            item = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        raw_score = row.get("icp_score")
+        try:
+            score = 85 if raw_score is None else int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            score = 0
+        if score < 80 or str(row.get("monetization") or "").strip().lower() == "none":
+            dropped += 1
+            continue
+        if sniper_reject_reason(row):
+            dropped += 1
+            continue
+
+        site_val = str(row.get("project_url") or row.get("website") or row.get("site") or "").strip()
+        clean_n, clean_p = sanitize_person_and_company(
+            row.get("name"),
+            row.get("project") or row.get("company"),
+            site=site_val,
+            bio=row.get("bio") or row.get("what_they_do") or row.get("their_angle"),
+        )
+        if row.get("name") is not None and clean_n:
+            row["name"] = clean_n
+        if clean_p:
+            row["project"] = clean_p
+            if "company" in row:
+                row["company"] = clean_p
+        row["icp_score"] = score
+
+        raw_tg = row.get("username") or row.get("telegram_username") or row.get("tg_username") or ""
+        has_real_tg = _is_real_personal_tg_handle(raw_tg)
+        wa = whatsapp_url(row.get("whatsapp") or (row.get("phone") if str(row.get("provider") or "") == "whatsapp" else "") or "")
+        if has_real_tg or wa:
+            if has_real_tg:
+                row["username"] = str(raw_tg).strip().lstrip("@")
+            tg_wa_rows.append(row)
+            continue
+
+        # No personal TG and no WhatsApp -> check Direct/X channels
+        row["username"] = ""
+        row.pop("telegram_username", None)
+        row.pop("tg_username", None)
+        em = email_of_text(row.get("work_email") or row.get("email") or "")
+        fx = x_profile_url(row)
+        fli = linkedin_of(row)
+        if em or fx or fli:
+            if em:
+                row["work_email"] = em
+            if fx:
+                row["founder_x"] = fx
+            if fli:
+                row["founder_linkedin"] = fli
+            row["route_channel"] = "x" if (fx and not em and not fli) else "direct"
+            d_keys = _direct_x_dedup_keys(row)
+            if d_keys and any(k in existing_dx_keys for k in d_keys):
+                continue
+            existing_dx_keys.update(d_keys)
+            new_direct_x_rows.append(row)
+        else:
+            dropped += 1
+
+    if new_direct_x_rows:
+        direct_x_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with direct_x_jsonl.open("a", encoding="utf-8") as dxfh:
+            for dx_row in new_direct_x_rows:
+                dxfh.write(json.dumps(dx_row, ensure_ascii=False) + "\n")
+
+    if tg_wa_rows:
+        final_jsonl.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in tg_wa_rows) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        final_jsonl.unlink(missing_ok=True)
+
+    return {
+        "tg_wa_kept": len(tg_wa_rows),
+        "direct_x_added": len(new_direct_x_rows),
+        "dropped": dropped,
+    }
 
 
 def _norm_quarantine_token(raw: Any) -> str:
@@ -393,6 +573,7 @@ def _emit_critical_low_water_alert(
     critical_low_mark: int,
     has_scraper_session: bool,
     has_llm_key: bool,
+    missing_treg_cli: bool = False,
     digest_opener: Any = None,
 ) -> dict[str, Any]:
     now_dt = datetime.now(timezone.utc)
@@ -406,6 +587,9 @@ def _emit_critical_low_water_alert(
     if not has_llm_key:
         reasons.append("missing_relayfast_api_key")
         reason_labels.append("нет RELAYFAST_API_KEY")
+    if missing_treg_cli:
+        reasons.append("missing_treg_cli")
+        reason_labels.append("нет treg CLI / TREG_API_KEY")
     if not reasons:
         reasons.append("sources_exhausted")
         reason_labels.append("источники исчерпаны")
@@ -668,10 +852,13 @@ def run_autonomous_replenish(
     needs_vac = vac_active and pending_vac < int(vac_low_water_mark)
 
     ingested_total = 0
+    direct_x_routed = 0
     stages_run: list[str] = []
     stage_errors: list[dict[str, Any]] = []
+    replenish_reasons: list[str] = []
     rule5_previews: dict[str, Any] = {}
     rule5_quarantined: dict[str, list[int]] = {}
+    treg_ready = check_treg_ready()
 
     if needs_b2b or needs_vac:
         pre_existing_recipient_ids: set[int] = {
@@ -767,7 +954,12 @@ def run_autonomous_replenish(
             if still_needs_b2b:
                 raw_jsonl = state_dir / f"raw_{ts}.jsonl"
                 master_jsonl = state_dir / "master_ids.jsonl"
+                buyer_public_out = state_dir / f"buyer_public_{ts}.jsonl"
                 catalogs_out = state_dir / f"buyer_catalogs_{ts}.jsonl"
+                meta_ads_out = state_dir / f"meta_ads_{ts}.jsonl"
+                social_out = state_dir / f"social_{ts}.jsonl"
+                channel_graph_out = state_dir / f"channel_graph_{ts}.jsonl"
+                ad_spy_out = state_dir / f"tg_ad_spy_{ts}.jsonl"
                 external_out = state_dir / f"external_{ts}.jsonl"
                 yc_ph_out = state_dir / f"yc_ph_{ts}.jsonl"
                 sources_cfg = b2b_cfg.get("sources") or {}
@@ -775,6 +967,16 @@ def run_autonomous_replenish(
 
                 # Web / API discovery stages (no TG session needed)
                 if sources_cfg.get("buyer_catalogs", True) and "buyer_catalogs" not in quarantined:
+                    if "buyer_public" not in quarantined:
+                        _exec_stage(
+                            "buyer_public",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "buyer_public.py"),
+                                "--output",
+                                str(buyer_public_out),
+                            ],
+                        )
                     _exec_stage(
                         "buyer_catalogs",
                         [
@@ -784,6 +986,36 @@ def run_autonomous_replenish(
                             str(catalogs_out),
                         ],
                     )
+                if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
+                    if treg_ready or runner is not subprocess.run:
+                        _exec_stage(
+                            "meta_ad_leads",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "meta_ad_leads.py"),
+                                "--output",
+                                str(meta_ads_out),
+                                "--seen",
+                                str(state_dir / "meta_ads_seen.json"),
+                            ],
+                        )
+                    elif "missing_treg_cli" not in replenish_reasons:
+                        replenish_reasons.append("missing_treg_cli")
+                if sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined:
+                    if treg_ready:
+                        _exec_stage(
+                            "treg_social_leads",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "treg_social_leads.py"),
+                                "--output",
+                                str(social_out),
+                                "--seen",
+                                str(state_dir / "treg_social_seen.json"),
+                            ],
+                        )
+                    elif runner is subprocess.run and "missing_treg_cli" not in replenish_reasons:
+                        replenish_reasons.append("missing_treg_cli")
                 if (
                     sources_cfg.get("yc_ph", True)
                     and "yc_ph" not in quarantined
@@ -834,7 +1066,7 @@ def run_autonomous_replenish(
                         ],
                     )
 
-                # TG group scraper ONLY if valid isolated SCRAPER_TG_SESSION is available
+                # TG scrapers ONLY if valid isolated SCRAPER_TG_SESSION is available
                 effective_groups: list[str] = []
                 for g in [*(b2b_cfg.get("tg_groups_new") or []), *(b2b_cfg.get("tg_groups_old") or [])]:
                     if g not in effective_groups:
@@ -864,8 +1096,56 @@ def run_autonomous_replenish(
                         scrape_cmd.extend(["--exclude", str(master_jsonl)])
                     _exec_stage("tg_scrape_posters", scrape_cmd)
 
+                if (
+                    isolated_session is not None
+                    and sources_cfg.get("channel_graph", True)
+                    and "channel_graph" not in quarantined
+                ):
+                    _exec_stage(
+                        "tg_channel_graph",
+                        [
+                            py_bin,
+                            str(ROOT / "leadgen" / "tg_channel_graph.py"),
+                            "--session",
+                            str(isolated_session),
+                            "--output",
+                            str(channel_graph_out),
+                            "--state",
+                            str(state_dir / "tg_channel_graph_seen.json"),
+                        ],
+                    )
+
+                if (
+                    isolated_session is not None
+                    and sources_cfg.get("tg_ad_spy", True)
+                    and "tg_ad_spy" not in quarantined
+                ):
+                    _exec_stage(
+                        "tg_ad_spy",
+                        [
+                            py_bin,
+                            str(ROOT / "leadgen" / "tg_ad_spy.py"),
+                            "--session",
+                            str(isolated_session),
+                            "--output",
+                            str(ad_spy_out),
+                            "--seen",
+                            str(state_dir / "tg_ad_spy_seen.json"),
+                        ],
+                    )
+
                 _merge_discovered_jsonl_into_raw(
-                    [catalogs_out, external_out, yc_ph_out], raw_jsonl
+                    [
+                        buyer_public_out,
+                        catalogs_out,
+                        meta_ads_out,
+                        social_out,
+                        external_out,
+                        yc_ph_out,
+                        channel_graph_out,
+                        ad_spy_out,
+                    ],
+                    raw_jsonl,
                 )
                 apply_master_merge(str(raw_jsonl), str(master_jsonl))
                 new_jsonl = Path(f"{raw_jsonl}.new")
@@ -924,10 +1204,38 @@ def run_autonomous_replenish(
                                     str(final_jsonl),
                                 ],
                             )
-                            if final_jsonl.is_file() and final_jsonl.stat().st_size == 0:
-                                final_jsonl.unlink()
+                            if treg_ready and final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
+                                treg_ok = _exec_stage(
+                                    "treg_enrich",
+                                    [
+                                        py_bin,
+                                        str(ROOT / "leadgen" / "treg_enrich.py"),
+                                        "--input",
+                                        str(final_jsonl),
+                                        "--output",
+                                        str(treg_tmp_jsonl),
+                                        "--cache",
+                                        str(state_dir / "treg_market.json"),
+                                    ],
+                                )
+                                if (
+                                    treg_ok
+                                    and treg_tmp_jsonl.is_file()
+                                    and treg_tmp_jsonl.stat().st_size > 0
+                                ):
+                                    treg_tmp_jsonl.replace(final_jsonl)
+                                elif treg_tmp_jsonl.is_file():
+                                    treg_tmp_jsonl.unlink(missing_ok=True)
+                            if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                split_res = split_tg_and_direct_x_leads(
+                                    final_jsonl, state_dir / "direct_x_leads.jsonl"
+                                )
+                                direct_x_routed += int(split_res.get("direct_x_added") or 0)
+                            elif final_jsonl.is_file():
+                                final_jsonl.unlink(missing_ok=True)
                         elif final_jsonl.is_file():
-                            final_jsonl.unlink()
+                            final_jsonl.unlink(missing_ok=True)
 
             # Vacancy scraper ONLY if valid isolated SCRAPER_TG_SESSION is available
             if still_needs_vac and isolated_session is not None:
@@ -1013,6 +1321,7 @@ def run_autonomous_replenish(
             critical_low_mark=int(critical_low_mark),
             has_scraper_session=(isolated_session is not None),
             has_llm_key=has_llm_key,
+            missing_treg_cli=("missing_treg_cli" in replenish_reasons),
             digest_opener=digest_opener,
         )
 
@@ -1032,11 +1341,13 @@ def run_autonomous_replenish(
     return {
         "ok": True,
         "ingested_total": ingested_total,
+        "direct_x_routed": direct_x_routed,
         "pending_b2b": pending_b2b,
         "pending_vacancies": pending_vac,
         "quarantined_sources": sorted(quarantined),
         "stages_run": stages_run,
         "stage_errors": stage_errors,
+        "reasons": replenish_reasons,
         "rule5_previews": rule5_previews,
         "rule5_quarantined": rule5_quarantined,
         "low_water_alert": low_water_alert,

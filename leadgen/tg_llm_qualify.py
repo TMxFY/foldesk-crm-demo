@@ -48,6 +48,8 @@ try:
         is_invalid_product_name,
         is_rejected_buyer_category,
         is_truncated_or_bad_pitch,
+        sanitize_person_and_company,
+        sniper_reject_reason,
         supply_reason,
     )
 except ImportError:
@@ -58,6 +60,8 @@ except ImportError:
             is_invalid_product_name,
             is_rejected_buyer_category,
             is_truncated_or_bad_pitch,
+            sanitize_person_and_company,
+            sniper_reject_reason,
             supply_reason,
         )
     except ImportError:
@@ -67,6 +71,8 @@ except ImportError:
             is_invalid_product_name,
             is_rejected_buyer_category,
             is_truncated_or_bad_pitch,
+            sanitize_person_and_company,
+            sniper_reject_reason,
             supply_reason,
         )
 
@@ -94,25 +100,37 @@ CATEGORIES = ["SaaS / AI app", "CEX / биржа", "Проп трейдинг", 
               "Медиа / контент", "Gaming / AI", "Токен / мемкоин",
               "Платёжки / финтех", "Web3 (общее)", "Сервис / агентство"]
 ROLES = ["Founder", "Marketing", "Community", "Creator/KOL", "Dev", "Trader", ""]
+VALID_MONETIZATIONS = ("subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none")
+MIN_ICP_SCORE = 80
 
-SYSTEM_PROMPT = """You qualify Telegram leads for SoftUGC.
+SYSTEM_PROMPT = """You qualify B2B/consumer product leads for SoftUGC (Sniper ICP Gate >= 80).
 
-SoftUGC sells organic short-form traffic (clipping + AI/UGC, paid short-form ads, physical products, 183.5M views in 90 days, revshare/CPA deals) to founders/growth/marketing of startups.
+SoftUGC sells organic short-form video user acquisition (AI UGC + clipping across owned account networks, 183.5M views in 90 days, revshare/CPA deals) ONLY to founders, CMOs, and marketing/growth leads who own a MONETIZED product with short-form viral potential.
 
-Target categories: SaaS/AI apps, CEX/exchanges, prop trading, media/content, DeFi/DEX, Gaming/AI, payments/fintech, tokens/memecoins.
-Target roles (buyers): Founder, Marketing.
-NOT customers: regular users with no project, spammers, pure traders/investors with no product, freelancers/UGC creators/ambassadors with no own product, community moderators/KOL managers/shillers, devs with no product, custom dev/AI/SEO/marketing/GTM agencies or consultancies selling services to clients (Сервис / агентство), open-source libraries/build tools, CSS/coding quizzes, and free fan hobby games without monetization.
+Golden ICP clusters (icp_score 80..100):
+1. Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, video/creator tools).
+2. Gaming / Roblox / Fortnite / FiveM / mobile & PC games with IAP, passes, or paid items.
+3. E-com / Shopify D2C brands (cosmetics/skincare, supplements/vitamins, household products).
+4. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, and prop trading challenges.
+
+REJECT (is_lead=false, icp_score < 80, or monetization="none"):
+- Agencies, PR firms (e.g. FINPR, Marketacross), GTM/marketing/SEO/dev consultancies, outsource studios, recruiters, B2B sales agencies, targetologists, mentors, storymakers ("Сервис / агентство").
+- Bot hosting / managed server hosting, pure B2D dev-only CLI/SDKs, open-source repos/tools without paid product monetization, ethical hacking/recovery APIs, coding quizzes, free hobby browser games.
+- Forum job seekers, freelancers, 3D modeler / Roblox builder recruitment threads, pure traders/investors, community mods.
 
 For EACH lead in the input array decide:
-- is_lead: true ONLY if this person is a founder/CEO/CMO/growth/marketing lead with a REAL product/project that needs user traffic. False for pure traders, investors, job seekers, freelancers, community mods, empty/nonsense bios, spammers, devs without a product, custom dev/AI/SEO/marketing/GTM agencies (Сервис / агентство), open-source tools, coding quizzes, or free hobby games.
-- category: exactly one of [SaaS / AI app, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Gaming / AI, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
-- role: exactly one of [Founder, Marketing, Community, Creator/KOL, Dev, Trader, ""]
-- project: project/company name or ""
-- project_url: website URL if present in bio/links (not t.me/twitter/linkedin), else ""
+- is_lead: true ONLY if Founder/Marketing/Growth of an own monetized product needing short-form traffic
+- icp_score: integer 0..100 (80+ ONLY for verified monetized products in target clusters)
+- monetization: one of ["subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none"]
+- short_form_fit: bool (true if product can convert from TikTok/Reels/Shorts)
+- category: one of [SaaS / AI app, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Gaming / AI, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
+- role: one of [Founder, Marketing, Community, Creator/KOL, Dev, Trader, ""]
+- project: clean product/brand name (strip "Show HN:", numbering, URLs, human names) or ""
+- project_url: product website URL (not t.me/twitter/linkedin), else ""
 - what_they_do: short description, max 90 chars, language of the bio
 
-Respond with STRICT JSON only: an array of objects in the SAME ORDER as input, one per lead:
-[{"is_lead": bool, "category": "...", "role": "...", "project": "...", "project_url": "...", "what_they_do": "..."}, ...]
+Respond with STRICT JSON only: an array of objects in the SAME ORDER as input:
+[{"is_lead": bool, "icp_score": 0, "monetization": "subscription", "short_form_fit": bool, "category": "...", "role": "...", "project": "...", "project_url": "...", "what_they_do": "..."}, ...]
 No markdown, no commentary, just the JSON array. The array length MUST equal the input length."""
 
 
@@ -122,6 +140,11 @@ def lead_view(i, r):
         "name": r.get("name") or "",
         "username": r.get("username") or "",
         "bio": (r.get("bio") or "")[:400],
+        "project": r.get("project") or r.get("company") or "",
+        "project_url": r.get("project_url") or "",
+        "what_they_do": (r.get("what_they_do") or "")[:200],
+        "has_monetization_signal": bool(r.get("has_monetization_signal")),
+        "has_agency_signal": bool(r.get("has_agency_signal")),
         "links": [l for l in (r.get("links") or []) if isinstance(l, str)][:5],
     }
 
@@ -184,18 +207,55 @@ def call_llm_retry(batch):
     raise last
 
 
+def _default_monetization_for_category(cat: str, is_lead: bool) -> str:
+    if not is_lead:
+        return "none"
+    if cat == "SaaS / AI app":
+        return "subscription"
+    if cat == "Gaming / AI":
+        return "iap"
+    if cat in {"Проп трейдинг", "CEX / биржа", "DeFi / DEX", "Платёжки / финтех"}:
+        return "cpa_deposit"
+    return "paid_product"
+
+
 def norm_result(res):
     """Coerce one LLM result into a safe dict; None if unusable."""
     if not isinstance(res, dict):
         return None
+    is_lead = bool(res.get("is_lead"))
     cat = res.get("category") if res.get("category") in CATEGORIES else "Web3 (общее)"
     role = res.get("role") if res.get("role") in ROLES else ""
     what = str(res.get("what_they_do") or "")[:90]
     url = str(res.get("project_url") or "")
     if url and not url.startswith(("http://", "https://")):
         url = ""
+
+    if "icp_score" not in res or res.get("icp_score") is None:
+        icp_score = 85 if is_lead else 0
+    else:
+        try:
+            icp_score = max(0, min(100, int(round(float(res["icp_score"])))))
+        except (TypeError, ValueError):
+            icp_score = 0
+
+    raw_mon = res.get("monetization")
+    if raw_mon is None or str(raw_mon).strip() == "":
+        monetization = _default_monetization_for_category(cat, is_lead)
+    else:
+        mon_norm = str(raw_mon).strip().lower()
+        monetization = mon_norm if mon_norm in VALID_MONETIZATIONS else "none"
+
+    if "short_form_fit" not in res or res.get("short_form_fit") is None:
+        short_form_fit = bool(is_lead)
+    else:
+        short_form_fit = bool(res.get("short_form_fit"))
+
     return {
-        "is_lead": bool(res.get("is_lead")),
+        "is_lead": is_lead,
+        "icp_score": icp_score,
+        "monetization": monetization,
+        "short_form_fit": short_form_fit,
         "category": cat,
         "role": role,
         "project": str(res.get("project") or "")[:80],
@@ -239,11 +299,11 @@ def _product_reality_reject_reason(row: dict) -> str:
 
 
 def gate_before_model(rows):
-    """Drop supply-side, volunteer/[FOR HIRE], and known agency rows across ALL sources."""
+    """Drop supply-side, volunteer/[FOR HIRE], and known agency/dev-OSS rows across ALL sources."""
     kept, notes = [], []
     for row in rows or []:
         blob = lead_text(row)
-        reason = supply_reason(blob)
+        reason = sniper_reject_reason(row) or supply_reason(blob)
         if not reason:
             vm = _VOLUNTEER_OR_FOR_HIRE_RE.search(blob)
             if vm:
@@ -269,7 +329,13 @@ def _quarantine_row(row: dict, reason: str, quarantine_list: list[dict]) -> None
     quarantine_list.append(q)
 
 
-def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None):
+def qualify_loaded(
+    rows,
+    *,
+    batch_size,
+    quarantine_out: list[dict] | None = None,
+    quarantine_dir: str | None = None,
+):
     original = [dict(r) for r in (rows or []) if isinstance(r, dict)]
     input_total = len(original)
     quarantine: list[dict] = quarantine_out if quarantine_out is not None else []
@@ -286,7 +352,7 @@ def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None
           f"(route {' → '.join(chain())})", file=sys.stderr)
 
     out = []
-    fast_path = os.getenv("TYPESAFE_FAST_PATH", "1").lower() in {"1", "true", "yes"}
+    fast_path = os.getenv("TYPESAFE_FAST_PATH", "0").lower() in {"1", "true", "yes"}
     ts_results = []
     if rows and qualify_creator_rows and os.getenv("TYPESAFE_ENABLED", "1").lower() not in {"0", "false", "no"}:
         try:
@@ -305,7 +371,16 @@ def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None
             _quarantine_row(row, "typesafe_drop", quarantine)
             continue
         row = dict(row)
-        if ts and route == "keep" and fast_path:
+        ts_fit = float(ts.get("typesafe_fit", 0.0)) if ts else 0.0
+        if (
+            ts
+            and route == "keep"
+            and fast_path
+            and ts_fit >= 0.80
+            and row.get("has_monetization_signal")
+            and not row.get("has_agency_signal")
+            and not sniper_reject_reason(row)
+        ):
             ts_cat = str(ts.get("typesafe_category") or row.get("category") or "")
             ts_role = str(ts.get("typesafe_role") or row.get("role") or "")
             if is_rejected_buyer_category(ts_cat) or (ts_role and ts_role in NON_BUYER_ROLES):
@@ -314,7 +389,10 @@ def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None
                 continue
             row["typesafe_qualified"] = True
             row["qualified"] = True
-            row["typesafe_fit"] = round(float(ts.get("typesafe_fit", 0.0)), 4)
+            row["typesafe_fit"] = round(ts_fit, 4)
+            row["icp_score"] = max(MIN_ICP_SCORE, min(100, int(round(ts_fit * 100))))
+            row.setdefault("monetization", _default_monetization_for_category(ts_cat, True))
+            row.setdefault("short_form_fit", True)
             if ts_cat:
                 row["category"] = ts_cat
             if ts_role and ts_role != "Other":
@@ -340,7 +418,7 @@ def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None
         total = 0
 
     print(f"TypeSafe primary: {len(out)} KEEP, {dropped} DROP; Relay Fast recheck {total} UNCERTAIN"
-          + (" (fast-path enabled)" if fast_path else " (legacy all-candidate mode)"), file=sys.stderr)
+          + (" (fast-path enabled)" if fast_path else " (sniper LLM gate)"), file=sys.stderr)
     for start in range(0, total, batch_size):
         batch = rows[start:start + batch_size]
         bno = start // batch_size + 1
@@ -370,41 +448,86 @@ def qualify_loaded(rows, *, batch_size, quarantine_out: list[dict] | None = None
                 dropped += 1
                 _quarantine_row(r, "unparseable_llm_item", quarantine)
                 continue
+            r2 = dict(r)
+            merged_url = nr["project_url"] or r.get("project_url") or ""
+            merged_what = nr["what_they_do"] or r.get("what_they_do") or ""
+            raw_proj = nr["project"] or r.get("project") or r.get("company") or ""
+            clean_name, clean_proj = sanitize_person_and_company(
+                r.get("name"),
+                raw_proj,
+                site=merged_url,
+                bio=r.get("bio") or merged_what,
+            )
+            r2.update({
+                "name": clean_name if r.get("name") is not None else clean_name,
+                "category": nr["category"],
+                "role": nr["role"] or r.get("role") or "",
+                "roles": [nr["role"]] if nr["role"] else (r.get("roles") or []),
+                "project": clean_proj,
+                "project_url": merged_url,
+                "what_they_do": merged_what,
+                "icp_score": nr["icp_score"],
+                "monetization": nr["monetization"],
+                "short_form_fit": nr["short_form_fit"],
+            })
+            if "company" in r2:
+                r2["company"] = clean_proj
+
             if not nr["is_lead"] or is_rejected_buyer_category(nr["category"]):
                 dropped += 1
-                _quarantine_row(r, "not_buyer_or_agency", quarantine)
+                _quarantine_row(r2, "not_buyer_or_agency", quarantine)
                 print(f"    - drop: {r.get('name')} (@{r.get('username') or '-'})",
                       file=sys.stderr)
                 continue
-            r2 = dict(r)
-            r2.update({
-                "category": nr["category"],
-                "role": nr["role"],
-                "roles": [nr["role"]] if nr["role"] else [],
-                "project": nr["project"] or r.get("project") or "",
-                "project_url": nr["project_url"] or r.get("project_url") or "",
-                "what_they_do": nr["what_they_do"] or r.get("what_they_do") or "",
-                "llm_qualified": True,
-                "qualified": True,
-            })
+
+            sniper_err = sniper_reject_reason(r2)
+            if sniper_err:
+                dropped += 1
+                _quarantine_row(r2, f"sniper_reject:{sniper_err}", quarantine)
+                continue
+
+            has_explicit_own_product = (
+                bool(r2.get("has_monetization_signal"))
+                and nr["monetization"] in {"subscription", "ecom", "iap", "cpa_deposit"}
+                and not is_invalid_product_name(clean_proj)
+            )
+            if r2.get("has_agency_signal") and not has_explicit_own_product:
+                dropped += 1
+                _quarantine_row(r2, "agency_site_signal", quarantine)
+                continue
+
+            if nr["monetization"] == "none":
+                dropped += 1
+                _quarantine_row(r2, "no_monetization", quarantine)
+                continue
+
+            if int(nr["icp_score"]) < MIN_ICP_SCORE:
+                dropped += 1
+                _quarantine_row(r2, f"low_icp_score:{nr['icp_score']}", quarantine)
+                continue
+
             bad_reason = _product_reality_reject_reason(r2)
             if bad_reason:
                 dropped += 1
                 _quarantine_row(r2, bad_reason, quarantine)
                 continue
+
+            r2["llm_qualified"] = True
+            r2["qualified"] = True
             out.append(r2)
         print(f"  batch {bno}/{nbatches}: kept {len(out)} so far, dropped {dropped}",
               file=sys.stderr)
 
-    state_dir = os.getenv("LEADGEN_STATE_DIR", "").strip()
-    if quarantine and state_dir and os.path.isdir(state_dir):
-        q_path = os.path.join(state_dir, "quarantined_unqualified.jsonl")
+    target_q_dir = (os.getenv("LEADGEN_STATE_DIR", "").strip() or (quarantine_dir or "").strip())
+    if quarantine and target_q_dir:
         try:
+            os.makedirs(target_q_dir, exist_ok=True)
+            q_path = os.path.join(target_q_dir, "quarantined_unqualified.jsonl")
             with open(q_path, "a", encoding="utf-8") as qfh:
                 for qrow in quarantine:
                     qfh.write(json.dumps(qrow, ensure_ascii=False) + "\n")
         except OSError as exc:
-            print(f"# warning: could not write quarantine file {q_path}: {exc}", file=sys.stderr)
+            print(f"# warning: could not write quarantine file: {exc}", file=sys.stderr)
 
     print(f"Qualified {len(out)}/{input_total} leads (dropped {dropped})", file=sys.stderr)
     return out, dropped
@@ -421,7 +544,8 @@ def main():
     rows = [json.loads(l) for l in open(args.input) if l.strip()]
     if args.limit:
         rows = rows[:args.limit]
-    out, _dropped = qualify_loaded(rows, batch_size=args.batch_size)
+    q_dir = os.getenv("LEADGEN_STATE_DIR", "").strip() or os.path.dirname(os.path.abspath(args.output))
+    out, _dropped = qualify_loaded(rows, batch_size=args.batch_size, quarantine_dir=q_dir)
     with open(args.output, "w") as f:
         for r in out:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
