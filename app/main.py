@@ -3778,6 +3778,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     items.append(parsed)
         return {"ok": True, "count": len(items), "items": items[-200:]}
 
+    @app.get("/api/leadgen/ofm-review")
+    def leadgen_ofm_review_get(request: Request, limit: int = 100, query: str = ""):
+        from app.hygiene import read_ofm_review_leads
+
+        return read_ofm_review_leads(_resolve_state_dir(), limit=limit, query=query)
+
     @app.get("/api/leadgen/config")
     def leadgen_config_get(request: Request):
         conn = request.app.state.conn

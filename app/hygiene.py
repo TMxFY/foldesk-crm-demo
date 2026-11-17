@@ -1257,3 +1257,181 @@ def read_direct_x_leads(state_dir: Path, *, limit: int = 50, query: str = "") ->
         "leads": sliced,
         "items": sliced,
     }
+
+
+_OFM_TG_HANDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+_OFM_RESERVED_TG = frozenset({"joinchat", "share", "addstickers", "proxy", "iv", "grouphelp", "rose"})
+
+
+def _clean_personal_tg_username(raw: Any) -> str:
+    handle = str(raw or "").strip().lstrip("@").strip()
+    if not handle or not _OFM_TG_HANDLE_RE.match(handle):
+        return ""
+    low = handle.casefold()
+    if low.endswith("bot") or low in _OFM_RESERVED_TG:
+        return ""
+    return handle
+
+
+def _ofm_review_canonical_keys(row: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    uname = _clean_personal_tg_username(row.get("username") or row.get("telegram_username"))
+    if uname:
+        keys.add(f"tg:{uname.casefold()}")
+    xu = str(row.get("x_url") or row.get("founder_x") or "").strip().lower().rstrip("/")
+    if xu:
+        keys.add(f"x:{xu}")
+    igu = str(row.get("instagram_url") or "").strip().lower().rstrip("/")
+    if igu:
+        keys.add(f"ig:{igu}")
+    em = str(row.get("email") or row.get("work_email") or "").strip().lower()
+    if em:
+        keys.add(f"email:{em}")
+    wa = str(row.get("whatsapp") or "").strip().lower()
+    if wa:
+        keys.add(f"wa:{wa}")
+    return keys
+
+
+def _normalize_ofm_review_record(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    uname = _clean_personal_tg_username(
+        out.get("username") or out.get("telegram_username") or out.get("tg_username")
+    )
+    tg_url = f"https://t.me/{uname}" if uname else ""
+    raw_x = str(out.get("x_url") or out.get("founder_x") or out.get("founder_twitter") or "").strip()
+    if raw_x and "://" not in raw_x and ":" not in raw_x.split("/", 1)[0]:
+        if raw_x.startswith("@") or "/" not in raw_x:
+            raw_x = f"https://x.com/{raw_x.lstrip('@')}"
+    x_url = _safe_http_url(raw_x)
+    raw_ig = str(out.get("instagram_url") or out.get("ig_url") or "").strip()
+    if raw_ig and "://" not in raw_ig and ":" not in raw_ig.split("/", 1)[0]:
+        if raw_ig.startswith("@") or "/" not in raw_ig:
+            raw_ig = f"https://instagram.com/{raw_ig.lstrip('@')}"
+    instagram_url = _safe_http_url(raw_ig)
+    email = str(out.get("email") or out.get("work_email") or "").strip() or None
+    whatsapp = str(out.get("whatsapp") or "").strip() or None
+    url = _safe_http_url(out.get("url") or out.get("project_url") or out.get("website") or "")
+    name = str(out.get("name") or out.get("company") or uname or "OFM Buyer").strip()[:160]
+    company = str(out.get("company") or out.get("project") or out.get("name") or "").strip()[:160] or None
+    source_group = str(out.get("source_group") or out.get("group") or "").strip().lstrip("@")
+    signal_summary = str(out.get("signal_summary") or out.get("what_they_do") or "").strip()[:240]
+    sample_msg = str(out.get("sample_message") or out.get("message") or "").strip()[:400]
+    out.update(
+        {
+            "name": name,
+            "company": company,
+            "project": company,
+            "username": uname or None,
+            "telegram_username": uname or None,
+            "tg_url": tg_url or None,
+            "x_url": x_url,
+            "founder_x": x_url,
+            "instagram_url": instagram_url,
+            "email": email,
+            "work_email": email,
+            "whatsapp": whatsapp,
+            "url": url,
+            "project_url": url,
+            "source": str(out.get("source") or "ofm_tg").strip(),
+            "source_group": source_group,
+            "ofm_tier": str(out.get("ofm_tier") or "traffic_buyer").strip(),
+            "icp_score": int(out.get("icp_score") or 85),
+            "market": str(out.get("market") or "").strip(),
+            "channels": [str(c) for c in (out.get("channels") or []) if str(c).strip()],
+            "signal_summary": signal_summary,
+            "sample_message": sample_msg,
+        }
+    )
+    return out
+
+
+def append_ofm_review_lead(state_dir: Path, payload: dict[str, Any]) -> bool:
+    """Append an OFM buyer lead with verified direct contact to isolated ofm_review_leads.jsonl."""
+    norm = _normalize_ofm_review_record(payload)
+    if not any((norm.get("username"), norm.get("x_url"), norm.get("instagram_url"), norm.get("email"), norm.get("whatsapp"))):
+        return False
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    target = state_dir / "ofm_review_leads.jsonl"
+    cand_keys = _ofm_review_canonical_keys(norm)
+    if target.is_file():
+        try:
+            for raw_line in target.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    existing = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(existing, dict):
+                    ex_keys = _ofm_review_canonical_keys(existing)
+                    if cand_keys and ex_keys and (cand_keys & ex_keys):
+                        return False
+        except OSError:
+            pass
+
+    norm.setdefault("saved_at", utc_now())
+    try:
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(norm, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def read_ofm_review_leads(state_dir: Path, *, limit: int = 100, query: str = "") -> dict[str, Any]:
+    """Read isolated OFM buyer leads (newest first) without touching campaign tables."""
+    target = state_dir / "ofm_review_leads.jsonl"
+    items: list[dict[str, Any]] = []
+    if target.is_file():
+        try:
+            for raw_line in target.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    items.append(_normalize_ofm_review_record(obj))
+        except OSError:
+            pass
+
+    items.reverse()
+    q_low = str(query or "").strip().lower()
+    if q_low:
+        items = [
+            it
+            for it in items
+            if q_low
+            in " ".join(
+                str(it.get(k) or "")
+                for k in (
+                    "name",
+                    "company",
+                    "username",
+                    "source_group",
+                    "signal_summary",
+                    "sample_message",
+                    "market",
+                    "x_url",
+                    "instagram_url",
+                    "email",
+                    "url",
+                )
+            ).lower()
+        ]
+
+    eff_limit = max(1, min(500, int(limit or 100)))
+    sliced = items[:eff_limit]
+    return {
+        "ok": True,
+        "path": str(target),
+        "total": len(items),
+        "count": len(sliced),
+        "leads": sliced,
+        "items": sliced,
+    }

@@ -11496,6 +11496,11 @@ function ensureLeadgenState() {
           whop_content_rewards: true,
           tiktok_ads: true,
           tiktok_shop: true,
+          app_stores: true,
+          ats_hiring: true,
+          ph_detailed: true,
+          ofm_groups: true,
+          facebook_groups: true,
           meta_ads: true,
           yc_ph: true,
           social_x_reddit: true,
@@ -11503,9 +11508,11 @@ function ensureLeadgenState() {
           linkedin_jobs: true,
           tg_identity_bridge: true,
         },
-        tg_groups_old: ["solofounders", "producthunt_heroes", "id1613398776"],
-        tg_groups_new: ["solofounderschat", "shopifyeasy", "productcircle_chat"],
+        tg_groups_old: ["producthunt_heroes", "id1613398776"],
+        tg_groups_new: ["productcircle_chat", "solofounderschat", "saasfounders"],
         tg_comment_channels: [],
+        ofm_tg_groups: ["FranceOFM", "ofmfrancenetwork", "networkOFM", "mofmnetwork", "RedditWorldOFM", "aimodelnetwork", "AdultDeskAI"],
+        fb_group_urls: [],
         limits: {
           yc_limit: 50,
           ph_limit: 0,
@@ -11726,7 +11733,8 @@ function renderLeadgenHarvest() {
   if (harvestBadge) {
     const dxTotal = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
     const b2bTotal = Number(counts.b2b_leads) || 0;
-    harvestBadge.textContent = `TG B2B: ${b2bTotal} · Direct/X: ${dxTotal}`;
+    const ofmTotal = Number(status.ofm_review_count ?? counts.ofm_review_count) || 0;
+    harvestBadge.textContent = `TG B2B: ${b2bTotal} · Direct/X: ${dxTotal} · OFM ревью: ${ofmTotal}`;
   }
 
   const pillsHost = document.querySelector("#leadgen-harvest-sources-pills");
@@ -11813,6 +11821,44 @@ function renderLeadgenHarvest() {
       });
     }
   }
+
+  const ofmBadge = document.querySelector("#leadgen-ofm-review-badge");
+  const ofmTotal = Number(status.ofm_review_count ?? counts.ofm_review_count) || 0;
+  if (ofmBadge) {
+    ofmBadge.textContent = `OFM ревью: ${ofmTotal}`;
+  }
+  const ofmHost = document.querySelector("#leadgen-recent-ofm-list");
+  if (ofmHost) {
+    ofmHost.replaceChildren();
+    const ofmItems = Array.isArray(status.recent_ofm_review_leads) ? status.recent_ofm_review_leads : [];
+    if (!ofmItems.length) {
+      ofmHost.append(el("span", { className: "hint" }, ["Пока нет OFM-лидов на ревью — запустите парсер @FranceOFM / FB-групп."]));
+    } else {
+      ofmItems.slice(0, 12).forEach((item) => {
+        const who = item.company || item.name || "OFM Buyer";
+        const handle = item.username ? `@${String(item.username).replace(/^@/, "")}` : "";
+        const grp = item.source_group ? `@${String(item.source_group).replace(/^@/, "")}` : (item.source || "ofm");
+        const score = item.icp_score ? `ICP ${item.icp_score}` : "";
+        const mkt = item.market ? ` · ${item.market}` : "";
+        const sig = item.signal_summary ? ` — ${String(item.signal_summary).slice(0, 110)}` : "";
+        const rowChildren = [
+          el("strong", {}, [who]),
+        ];
+        const tgLink = safeHref(item.tg_url || (item.username ? `https://t.me/${String(item.username).replace(/^@/, "")}` : ""));
+        if (tgLink && handle) {
+          rowChildren.push(el("span", { className: "hint" }, [" · "]));
+          rowChildren.push(el("a", { href: tgLink, target: "_blank", rel: "noopener" }, [handle]));
+        }
+        const extraHref = safeHref(item.x_url || item.instagram_url || item.url || "");
+        if (extraHref) {
+          rowChildren.push(el("span", { className: "hint" }, [" · "]));
+          rowChildren.push(el("a", { href: extraHref, target: "_blank", rel: "noopener" }, [item.x_url ? "X" : (item.instagram_url ? "IG" : "Сайт")]));
+        }
+        rowChildren.push(el("span", { className: "hint" }, [` · ${grp}${mkt}${score ? ` · ${score}` : ""}${sig}`]));
+        ofmHost.append(el("div", { className: "leadgen-harvest-item" }, rowChildren));
+      });
+    }
+  }
 }
 
 function renderLeadgenConfig() {
@@ -11828,7 +11874,8 @@ function renderLeadgenConfig() {
     const vacInCrm = Number(counts.vacancies_leads) || 0;
     const b2bInCrm = Number(counts.b2b_leads) || 0;
     const dxInPool = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
-    statsBadge.textContent = `В CRM: ${totalInCrm} (TG B2B: ${b2bInCrm} · Direct/X: ${dxInPool} · Вакансии: ${vacInCrm})`;
+    const ofmInReview = Number(status.ofm_review_count ?? counts.ofm_review_count) || 0;
+    statsBadge.textContent = `В CRM: ${totalInCrm} (TG B2B: ${b2bInCrm} · Direct/X: ${dxInPool} · OFM ревью: ${ofmInReview} · Вакансии: ${vacInCrm})`;
   }
 
   const setVal = (sel, val) => {
@@ -11931,6 +11978,8 @@ function collectLeadgenFormPayload() {
       tg_groups_old: Array.isArray(b2b.tg_groups_old) ? b2b.tg_groups_old : [],
       tg_groups_new: Array.isArray(b2b.tg_groups_new) ? b2b.tg_groups_new : [],
       tg_comment_channels: Array.isArray(b2b.tg_comment_channels) ? b2b.tg_comment_channels : [],
+      ofm_tg_groups: Array.isArray(b2b.ofm_tg_groups) ? b2b.ofm_tg_groups : [],
+      fb_group_urls: Array.isArray(b2b.fb_group_urls) ? b2b.fb_group_urls : [],
       limits: {
         yc_limit: getNum("#leadgen-limit-yc", 50, 0, 5000),
         ph_limit: getNum("#leadgen-limit-ph", 0, 0, 5000),
