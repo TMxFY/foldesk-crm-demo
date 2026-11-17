@@ -34,6 +34,13 @@ from app.accounts import (
 from app.accounts import _load as load_account
 from app.tg_web_proxy import register_tg_web_routes
 import app.inbox as _inbox_mod
+import app.outreach as _outreach_mod
+from app.runtime_config import (
+    is_ephemeral_runtime,
+    is_vps_runtime,
+    should_skip_dotenv,
+    should_start_airtable_bg_sync,
+)
 from app.db import (
     INBOX_MEDIA_DIR,
     ROOT,
@@ -116,9 +123,7 @@ KEYS_DETAIL = "Нужны ключи TG_API_ID и TG_API_HASH с https://my.tele
 
 
 def load_env_file() -> None:
-    import sys
-
-    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+    if should_skip_dotenv():
         return
     path = ROOT / ".env"
     if not path.exists():
@@ -403,7 +408,7 @@ def _resolve_tg_creds(conn=None) -> tuple[str, str]:
                 api_hash = api_hash or str(rows.get("tg_api_hash") or "").strip()
             except Exception:
                 pass
-        if (not api_id or not api_hash) and "PYTEST_CURRENT_TEST" not in os.environ:
+        if (not api_id or not api_hash) and not should_skip_dotenv():
             api_id = "2040"
             api_hash = "b18441a1ff607e10a989891a5462e627"
     return api_id, api_hash
@@ -414,13 +419,10 @@ def should_enable_live_tg_runtime(conn=None, gateway=None) -> bool:
         return False
     if gateway is not None:
         return True
-    if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.getenv("BOT_TOKEN") == "e2e-not-a-secret"
-    ):
+    if is_ephemeral_runtime():
         return False
     if (
-        os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in ("1", "true", "yes")
+        is_vps_runtime()
         or os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes")
         or os.getenv("ALLOW_LOCAL_TG_SESSIONS", "").strip().lower() in ("1", "true", "yes")
     ):
@@ -483,10 +485,7 @@ def _gateway(request: Request):
     conn = getattr(request.app.state, "conn", None)
     with locked_conn(conn):
         enable_live = should_enable_live_tg_runtime(conn, None)
-    if (
-        not enable_live
-        and "PYTEST_CURRENT_TEST" not in os.environ
-    ):
+    if not enable_live and not is_ephemeral_runtime():
         raise HTTPException(
             status_code=409,
             detail="Локальное подключение Telegram отключено для защиты прод-сессий на Render от AUTH_KEY_DUPLICATED. Задайте ALLOW_LOCAL_TG_SESSIONS=1 для явного локального входа.",
@@ -748,6 +747,10 @@ async def _sync_and_publish_dialogs(
     return res
 
 
+def _is_dead_account_health(health: object) -> bool:
+    return str(health or "active").strip().lower() in ("unauthorized", "banned")
+
+
 async def ensure_private_inbox(app, account_id: int) -> None:
     # One successful pull per process. A later page open reads SQLite.
     synced = app.state.inbox_synced
@@ -763,10 +766,12 @@ async def ensure_private_inbox(app, account_id: int) -> None:
             return
         if account["status"] != "connected":
             return
+        if _is_dead_account_health(account.get("health")):
+            return
         if str(account.get("session_path") or "").startswith("data/sessions/demo"):
             synced.add(account_id)
             return
-        if "PYTEST_CURRENT_TEST" not in os.environ and isinstance(
+        if not is_ephemeral_runtime() and isinstance(
             getattr(app.state, "gateway", None), (type(None), TelethonGateway)
         ):
             with locked_conn(app.state.conn):
@@ -802,12 +807,14 @@ async def start_account_watch(app, account_id: int) -> None:
         return
     if account["status"] != "connected":
         return
+    if _is_dead_account_health(account.get("health")):
+        return
     if str(account.get("session_path") or "").startswith("data/sessions/demo") and isinstance(
         getattr(app.state, "gateway", None), (type(None), TelethonGateway)
     ):
         return
     if (
-        "PYTEST_CURRENT_TEST" not in os.environ
+        not is_ephemeral_runtime()
         and os.getenv("ENABLE_TG_PERSISTENT_WATCHES") != "1"
         and isinstance(getattr(app.state, "gateway", None), (type(None), TelethonGateway))
     ):
@@ -957,9 +964,11 @@ async def start_account_watch(app, account_id: int) -> None:
 async def start_connected_watches(app) -> None:
     with locked_conn(app.state.conn):
         rows = app.state.conn.execute(
-            "SELECT id, provider FROM accounts WHERE status = 'connected'"
+            "SELECT id, provider, health FROM accounts WHERE status = 'connected'"
         ).fetchall()
     for row in rows:
+        if _is_dead_account_health(row["health"]):
+            continue
         provider = str(row["provider"] or "telegram").strip().lower()
         if provider != "whatsapp" and _resolve_app_gateway(app, "telegram") is None:
             continue
@@ -994,17 +1003,18 @@ async def sync_live_tg_read_receipts_once(
     with locked_conn(conn):
         if account_id is not None:
             acc_rows = conn.execute(
-                "SELECT id, session_path, provider, status FROM accounts WHERE id = ? AND status = 'connected'",
+                "SELECT id, session_path, provider, status, health FROM accounts WHERE id = ? AND status = 'connected'",
                 (int(account_id),),
             ).fetchall()
         else:
             acc_rows = conn.execute(
-                "SELECT id, session_path, provider, status FROM accounts WHERE status = 'connected' ORDER BY id"
+                "SELECT id, session_path, provider, status, health FROM accounts WHERE status = 'connected' ORDER BY id"
             ).fetchall()
     tg_accs = [
         r
         for r in acc_rows
         if str(r["provider"] or "telegram").strip().lower() == "telegram"
+        and not _is_dead_account_health(r["health"])
         and not str(r["session_path"] or "").startswith("data/sessions/demo")
     ]
     synced_accs = 0
@@ -1052,15 +1062,25 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
             )
             app.state.autopilot_last_tick_at = utc_now()
             dirty = isinstance(tick_res, dict) and int(tick_res.get("sent") or 0) > 0
-            if tick_counter % 2 == 0 and "PYTEST_CURRENT_TEST" not in os.environ:
+            if tick_counter % 10 == 0:
+                slo_watchdog_fn = getattr(_outreach_mod, "check_outreach_slo_watchdog", None)
+                if callable(slo_watchdog_fn):
+                    try:
+                        maybe_wd = slo_watchdog_fn(app.state.conn)
+                        if inspect.isawaitable(maybe_wd):
+                            await maybe_wd
+                    except Exception:
+                        _runtime_logger.exception("check_outreach_slo_watchdog failed")
+            if tick_counter % 2 == 0 and not is_ephemeral_runtime():
                 with locked_conn(app.state.conn):
                     tg_rows = app.state.conn.execute(
-                        "SELECT id, session_path, provider FROM accounts WHERE status = 'connected' ORDER BY id"
+                        "SELECT id, session_path, provider, health FROM accounts WHERE status = 'connected' ORDER BY id"
                     ).fetchall()
                 tg_ids = [
                     int(r["id"])
                     for r in tg_rows
                     if str(r["provider"] or "telegram").strip().lower() == "telegram"
+                    and not _is_dead_account_health(r["health"])
                     and not str(r["session_path"] or "").startswith("data/sessions/demo")
                 ]
                 if tg_ids:
@@ -1089,7 +1109,7 @@ async def start_autopilot_loop(app: FastAPI) -> None:
         enable = should_enable_live_tg_runtime(
             getattr(app.state, "conn", None), getattr(app.state, "gateway", None)
         )
-    if not enable and "PYTEST_CURRENT_TEST" not in os.environ:
+    if not enable and not is_ephemeral_runtime():
         return
     existing = getattr(app.state, "autopilot_task", None)
     if existing is not None and not existing.done():
@@ -1110,10 +1130,7 @@ async def stop_autopilot_loop(app: FastAPI) -> None:
 
 
 def _schedule_airtable_push_lead(app: FastAPI, lead_id: int) -> None:
-    if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
-    ):
+    if not should_start_airtable_bg_sync():
         return
     try:
         from app.airtable_sync import get_airtable_config, push_lead_to_airtable
@@ -1149,10 +1166,7 @@ def _schedule_airtable_push_lead(app: FastAPI, lead_id: int) -> None:
 
 
 def _run_airtable_sync_once(app: FastAPI) -> None:
-    if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
-    ):
+    if not should_start_airtable_bg_sync():
         return
     from app.airtable_sync import get_airtable_config, sync_airtable
 
@@ -1190,10 +1204,7 @@ async def airtable_sync_loop(app: FastAPI, interval_seconds: float = 180.0) -> N
 
 
 async def start_airtable_sync_loop(app: FastAPI) -> None:
-    if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
-    ):
+    if not should_start_airtable_bg_sync():
         return
     existing = getattr(app.state, "airtable_sync_task", None)
     if existing is not None and not existing.done():
@@ -1310,9 +1321,10 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         live_tg_enabled = False
-        if "PYTEST_CURRENT_TEST" in os.environ or gateway is not None:
+        ephemeral = is_ephemeral_runtime()
+        if ephemeral or gateway is not None:
             if os.getenv("DISABLE_TG_WATCHES") != "1":
-                if "PYTEST_CURRENT_TEST" in os.environ:
+                if ephemeral or not isinstance(gateway, (type(None), TelethonGateway)):
                     await start_connected_watches(app)
                 else:
                     asyncio.create_task(start_connected_watches(app))
@@ -1362,8 +1374,6 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     except (asyncio.CancelledError, Exception):
                         pass
             try:
-                from app import outreach as _outreach_mod
-
                 obt = getattr(_outreach_mod, "_CLOUD_BACKUP_BG_TASK", None)
                 if obt is not None and not obt.done():
                     await asyncio.wait_for(obt, timeout=10.0)
@@ -1377,8 +1387,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 pass
             if (
                 live_tg_enabled
-                and "PYTEST_CURRENT_TEST" not in os.environ
-                and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+                and not is_ephemeral_runtime()
                 and os.getenv("CLOUD_BACKUP_ENABLED", "1").strip().lower()
                 not in ("0", "false", "no", "off")
             ):
@@ -1396,8 +1405,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     )
     if (
         conn is None
-        and "PYTEST_CURRENT_TEST" not in os.environ
-        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+        and not is_ephemeral_runtime()
         and cloud_backup_enabled
     ):
         try:
@@ -1412,8 +1420,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
     ensure_funnel_columns(conn)
     needs_initial_session_backup = False
     if (
-        "PYTEST_CURRENT_TEST" not in os.environ
-        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
+        not is_ephemeral_runtime()
         and cloud_backup_enabled
     ):
         restore_disk_sessions(conn)
@@ -1510,6 +1517,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         db_ok = False
         active_accounts = 0
         healthy_accounts = 0
+        running_campaigns = 0
+        pending_step1_total = 0
         try:
             if conn_obj is not None:
                 with locked_conn(conn_obj):
@@ -1528,6 +1537,23 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                         if acc_row is not None:
                             active_accounts = int(acc_row["active_cnt"] or 0)
                             healthy_accounts = int(acc_row["healthy_cnt"] or 0)
+                        rc_row = conn_obj.execute(
+                            "SELECT COUNT(*) AS cnt FROM campaigns WHERE status = 'running'"
+                        ).fetchone()
+                        if rc_row is not None:
+                            running_campaigns = int(rc_row["cnt"] or 0)
+                        p1_row = conn_obj.execute(
+                            """
+                            SELECT COUNT(*) AS cnt
+                            FROM campaign_recipients cr
+                            JOIN campaigns c ON c.id = cr.campaign_id
+                            WHERE c.status = 'running'
+                              AND cr.status = 'pending'
+                              AND COALESCE(cr.current_step, 0) = 0
+                            """
+                        ).fetchone()
+                        if p1_row is not None:
+                            pending_step1_total = int(p1_row["cnt"] or 0)
         except Exception as exc:
             return Response(
                 content=json.dumps(
@@ -1554,6 +1580,8 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                     ),
                     "active_accounts": active_accounts,
                     "healthy_accounts": healthy_accounts,
+                    "running_campaigns": running_campaigns,
+                    "pending_step1_total": pending_step1_total,
                 }
             )
         return payload
@@ -3180,7 +3208,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         if not isinstance(items, list):
             raise HTTPException(status_code=400, detail="items list is required")
         res = _call(sync_untouched_recipient_drafts, request.app.state.conn, items)
-        if int(res.get("updated") or 0) > 0 and "PYTEST_CURRENT_TEST" not in os.environ:
+        if int(res.get("updated") or 0) > 0 and not is_ephemeral_runtime():
             from app.cloud_persistence import schedule_cloud_backup
 
             schedule_cloud_backup(request.app)
@@ -3420,7 +3448,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
             new_start_at=body.new_start_at,
             new_end_at=body.new_end_at,
         )
-        if res.get("needs_airtable_push") and "PYTEST_CURRENT_TEST" not in os.environ:
+        if res.get("needs_airtable_push") and not is_ephemeral_runtime():
             try:
                 from app.airtable_sync import get_airtable_config, push_calendar_date_to_airtable
 

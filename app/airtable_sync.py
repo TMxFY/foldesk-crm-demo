@@ -82,7 +82,9 @@ COMPUTED_READONLY_FIELDS = frozenset(
 
 
 def _read_dotenv_values() -> dict[str, str]:
-    if "PYTEST_CURRENT_TEST" in os.environ:
+    from app.runtime_config import should_skip_dotenv
+
+    if should_skip_dotenv():
         return {}
     env_path = ROOT / ".env"
     if not env_path.exists():
@@ -109,6 +111,8 @@ def _resolve_credentials(
     table_name: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> tuple[str | None, str | None, str]:
+    from app.runtime_config import is_ephemeral_runtime
+
     dotenv_vals = _read_dotenv_values()
     kv_vals: dict[str, str] = {}
     try:
@@ -118,8 +122,7 @@ def _resolve_credentials(
             ).fetchall()
             kv_vals = {str(r[0]): str(r[1] or "") for r in rows}
         elif (
-            "PYTEST_CURRENT_TEST" not in os.environ
-            and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
+            not is_ephemeral_runtime()
             and (ROOT / "data" / "crm.db").exists()
         ):
             with sqlite3.connect(ROOT / "data" / "crm.db") as c:

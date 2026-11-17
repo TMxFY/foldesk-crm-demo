@@ -14,6 +14,7 @@ import urllib.parse
 from pathlib import Path
 
 from app.db import DEFAULT_DB, resolve_session, utc_now
+from app.runtime_config import is_ephemeral_runtime
 from app.telegram_gateway import (
     SESSION_HEALTH,
     GatewayError,
@@ -62,11 +63,7 @@ except Exception:
 
 
 def _use_live_neonize() -> bool:
-    return bool(
-        HAS_NEONIZE
-        and "PYTEST_CURRENT_TEST" not in os.environ
-        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
-    )
+    return bool(HAS_NEONIZE and not is_ephemeral_runtime())
 
 
 def _render_real_qr_svg(qr_payload: str | bytes) -> str:

@@ -60,6 +60,7 @@ def test_leased_boot_refuses_to_start_when_another_host_owns_r2_lease(tmp_path, 
     _seed_account_and_crm_lead(conn)
 
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("CRMTG_EPHEMERAL_RUNTIME", raising=False)
     monkeypatch.setenv("CRMTG_VPS_RUNTIME", "0")
     monkeypatch.setenv("ALLOW_LOCAL_TG_SESSIONS", "1")
     monkeypatch.setenv("CLOUD_BACKUP_ENABLED", "0")
@@ -378,6 +379,7 @@ def test_cloud_backup_endpoint_backs_up_actual_isolated_db_not_default_db(tmp_pa
             return _FakeResp()
 
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("CRMTG_EPHEMERAL_RUNTIME", raising=False)
     for env_k in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET", "CLOUD_BACKUP_ENABLED", "BOT_TOKEN"):
         monkeypatch.delenv(env_k, raising=False)
     monkeypatch.setattr(cp, "_read_dotenv", lambda: {})

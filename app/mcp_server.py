@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.analytics import get_analytics_summary
 from app.crm_auth import resolve_request_crm_user
+from app.runtime_config import should_allow_auto_sonnet
 from app.security import is_auth_enforced
 from app.db import (
     ROOT,
@@ -1246,7 +1247,7 @@ def _auto_enrich_b2b_items_with_sonnet(items: list[dict]) -> list[dict]:
     api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
     if not api_key:
         return items
-    if "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("FORCE_AUTO_SONNET_IN_TEST") != "1":
+    if not should_allow_auto_sonnet():
         return items
 
     out_items = [dict(it) if isinstance(it, dict) else it for it in items]

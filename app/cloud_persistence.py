@@ -29,6 +29,7 @@ from app.db import (
     locked_raw_connection,
     utc_now,
 )
+from app.runtime_config import is_ephemeral_runtime, should_skip_dotenv
 
 R2_OBJECT_KEY = "foldesk-crm/crm_state.bundle.json.gz"
 R2_LEASE_KEY = "foldesk-crm/tg_runtime_lease.json"
@@ -36,7 +37,7 @@ INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def _read_dotenv() -> dict[str, str]:
-    if "PYTEST_CURRENT_TEST" in os.environ:
+    if should_skip_dotenv():
         return {}
     env_path = ROOT / ".env"
     if not env_path.exists():
@@ -56,8 +57,7 @@ def _read_dotenv() -> dict[str, str]:
 
 def _resolve_r2_config(conn: sqlite3.Connection | None = None) -> dict[str, str] | None:
     if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+        is_ephemeral_runtime()
         or os.environ.get("CLOUD_BACKUP_ENABLED", "1").strip().lower() in ("0", "false", "no", "off")
     ):
         return None
@@ -765,10 +765,7 @@ def release_tg_runtime_lease(conn: sqlite3.Connection | None = None) -> bool:
 
 
 def schedule_cloud_backup(app: Any, delay_seconds: float = 1.5) -> None:
-    if (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
-    ):
+    if is_ephemeral_runtime():
         return
     if not getattr(app.state, "tg_lease_ready", True):
         return

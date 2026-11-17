@@ -10,6 +10,8 @@ import sqlite3
 import threading
 import uuid
 
+from app.runtime_config import is_ephemeral_runtime
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "crm.db"
 OUTREACH_MEDIA_DIR = ROOT / "data" / "outreach_media"
@@ -1030,10 +1032,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             from app.snippets import seed_default_snippets
 
             seed_default_snippets(conn)
-    if (
-        "PYTEST_CURRENT_TEST" not in os.environ
-        and os.environ.get("BOT_TOKEN") != "e2e-not-a-secret"
-    ):
+    if not is_ephemeral_runtime():
         dead_sessions_fixed = conn.execute(
             "SELECT 1 FROM kv_settings WHERE key = 'purge_dead_tg_sessions_v1'"
         ).fetchone()
@@ -1807,11 +1806,8 @@ def apply_canonical_vlad_outreach_v5(conn: sqlite3.Connection, *, force: bool = 
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
-    is_test_env = (
-        "PYTEST_CURRENT_TEST" in os.environ
-        or os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
-    )
-    stages = DEFAULT_PIPELINE_STAGES if is_test_env else AIRTABLE_PIPELINE_STAGES
+    ephemeral = is_ephemeral_runtime()
+    stages = DEFAULT_PIPELINE_STAGES if ephemeral else AIRTABLE_PIPELINE_STAGES
     for key, label, position, color in stages:
         conn.execute(
             """
@@ -1820,7 +1816,7 @@ def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:
             """,
             (key, label, position, color),
         )
-    if not is_test_env:
+    if not ephemeral:
         ensure_airtable_pipeline_stages(conn)
 
 

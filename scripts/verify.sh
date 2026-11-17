@@ -50,6 +50,76 @@ for py_file in sorted((root / "leadgen").rglob("*.py")):
     if "app.runtime_context" in src:
         errors.append(f"Broken import 'app.runtime_context' found in {py_file}")
 
+# Gate A: Zero PYTEST_CURRENT_TEST / sys.modules["pytest"] split-brain across all app/ & leadgen/
+pytest_split_re = re.compile(r"PYTEST_CURRENT_TEST|[\"']pytest[\"']\s+(?:not\s+)?in\s+sys\.modules")
+for folder in ("app", "leadgen"):
+    for py_file in sorted((root / folder).rglob("*.py")):
+        for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
+            if pytest_split_re.search(line):
+                errors.append(
+                    f"Zero PYTEST_CURRENT_TEST Gate violation in {py_file}:{lineno}: {line.strip()[:120]}"
+                )
+
+# Gate B: Systemd Hollow-Pipe & Missing Module Gate across deploy/systemd/*.service
+import importlib.util
+
+systemd_dir = root / "deploy" / "systemd"
+discovery_markers = (
+    "vps_autonomous_replenish",
+    "tg_pipeline",
+    "yc_ph_leads",
+    "job_monitor",
+    "tg_channel_graph",
+    "discover_",
+)
+dash_m_re = re.compile(r"(?:^|\s)-m\s+([A-Za-z_][A-Za-z0-9_.]*)")
+for svc_file in sorted(systemd_dir.glob("*.service")):
+    raw_lines = svc_file.read_text(encoding="utf-8").splitlines()
+    logical_lines = []
+    buf = ""
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+            continue
+        if stripped.endswith("\\"):
+            buf += stripped[:-1].rstrip() + " "
+        else:
+            logical_lines.append((buf + stripped).strip())
+            buf = ""
+    if buf:
+        logical_lines.append(buf.strip())
+
+    exec_starts = [
+        ln.split("=", 1)[1].strip()
+        for ln in logical_lines
+        if ln.startswith("ExecStart=")
+    ]
+    if not exec_starts:
+        errors.append(f"Systemd Hollow-Pipe Gate violation in {svc_file}: missing ExecStart=")
+        continue
+    for exec_cmd in exec_starts:
+        if "push_discovered_now" in exec_cmd and not any(
+            m in exec_cmd for m in discovery_markers
+        ):
+            errors.append(
+                f"Systemd Hollow-Pipe Gate violation in {svc_file}: bare push_discovered_now without upstream discovery"
+            )
+        for mod_name in dash_m_re.findall(exec_cmd):
+            top_pkg = mod_name.split(".", 1)[0]
+            mod_rel = Path(*mod_name.split("."))
+            if (root / top_pkg).is_dir() or top_pkg in ("app", "leadgen", "scripts", "tests"):
+                py_target = (root / mod_rel).with_suffix(".py")
+                pkg_target = root / mod_rel / "__init__.py"
+                if not (py_target.is_file() or pkg_target.is_file()):
+                    errors.append(
+                        f"Systemd Hollow-Pipe Gate violation in {svc_file}: missing repo module '-m {mod_name}'"
+                    )
+            else:
+                if importlib.util.find_spec(mod_name) is None:
+                    errors.append(
+                        f"Systemd Hollow-Pipe Gate violation in {svc_file}: unresolvable module '-m {mod_name}'"
+                    )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

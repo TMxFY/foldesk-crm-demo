@@ -20,3 +20,10 @@ description: >-
 ## 3. MCP-сервер и интеграция с Airtable
 - Поддерживай MCP-интерфейс проекта, чтобы внешние агенты могли запрашивать сквозную статистику по клиентам, папкам и конверсиям.
 - Обеспечивай чистую синхронизацию целевых лидов и статусов с Airtable без дублей.
+
+## 4. Mandatory Adversarial Skeptic & Self-Hardening Gate
+- Перед любым финальным отчётом владельцу агент обязан полностью прогнать `./scripts/verify.sh` (статические инварианты AST/Sacred Rules, запрет `PYTEST_CURRENT_TEST` split-brain в `app/` и `leadgen/`, Systemd Hollow-Pipe Gate на `deploy/systemd/*.service`, проверка фронтенда и полный `pytest`).
+- Обязательно вызывай свежего независимого субагента `adversarial-skeptic` с прямым вопросом: *"Ты уверен в своей работе? Где пустые трубы, скрытые мутации и слепые зоны harness?"* — и закрывай все найденные им дыры до отчёта.
+- После каждого деплоя на VPS Contabo проверяй живой эндпоинт `/api/health?deep=1` (`db_ok`, `tg_lease_ready`, `autopilot_running`, `healthy_accounts`, `running_campaigns`, `pending_step1_total`).
+- Любой обнаруженный в проде или на ревью новый класс бага зашивай обратно в статический или регрессионный гейт `scripts/verify.sh`, чтобы станок больше никогда не пропускал этот паттерн.
+

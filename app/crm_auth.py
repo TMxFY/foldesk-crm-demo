@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.db import as_dict, locked_conn, utc_now
+from app.runtime_config import is_ephemeral_runtime
 from app.security import (
     MAX_TRACKED_IPS,
     _PUBLIC_EXACT_PATHS,
@@ -54,7 +55,7 @@ def _get_signing_secret(conn: sqlite3.Connection | None = None) -> bytes:
     env_secret = os.getenv("CRM_AUTH_SECRET", "").strip()
     if env_secret:
         return env_secret.encode("utf-8")
-    if "PYTEST_CURRENT_TEST" in os.environ and not is_auth_enforced():
+    if is_ephemeral_runtime() and not is_auth_enforced():
         return _TOKEN_SIGN_SECRET
     if conn is not None:
         try:

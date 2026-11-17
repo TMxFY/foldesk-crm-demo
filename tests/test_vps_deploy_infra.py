@@ -22,6 +22,7 @@ def test_should_enable_live_tg_runtime_prefers_vps_over_render(monkeypatch):
     from app.main import should_enable_live_tg_runtime
 
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("CRMTG_EPHEMERAL_RUNTIME", raising=False)
     monkeypatch.delenv("ALLOW_LOCAL_TG_SESSIONS", raising=False)
     monkeypatch.delenv("CRMTG_VPS_RUNTIME", raising=False)
     monkeypatch.delenv("RENDER", raising=False)
