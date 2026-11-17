@@ -9,5 +9,5 @@ WorkingDirectory=/opt/crmtg
 EnvironmentFile=-/opt/crmtg/.env
 Environment="PYTHONDONTWRITEBYTECODE=1"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/opt/crmtg/.venv/bin/python -c "from app.db import connect, init_db, utc_now; from app.leadgen_settings import get_leadgen_config, push_discovered_now; conn = connect('/opt/crmtg/data/crm.db'); init_db(conn); cfg = get_leadgen_config(conn); res = push_discovered_now(conn) if cfg.get('enabled') and cfg.get('auto_push_to_crm') else {'skipped': 'disabled_in_config'}; now = utc_now(); conn.execute(\"INSERT INTO kv_settings (key, value, updated_at) VALUES ('cloud_persistence_dirty_at', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at\", (now, now)) if isinstance(res, dict) and int(res.get('pushed') or res.get('enrolled_in_campaign') or 0) > 0 else None; conn.commit(); conn.close(); print('crmtg-leadgen tick:', res)"
+ExecStart=/opt/crmtg/.venv/bin/python -m leadgen.vps_autonomous_replenish --db /opt/crmtg/data/crm.db
 TimeoutStartSec=600

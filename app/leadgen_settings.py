@@ -325,6 +325,9 @@ def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]
 def save_leadgen_config(
     conn: sqlite3.Connection | None,
     payload: dict[str, Any],
+    *,
+    sync_cases_file: bool = False,
+    sync_campaign_limits: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Конфигурация должна быть объектом JSON")
@@ -333,9 +336,14 @@ def save_leadgen_config(
     merged = _deep_merge(current, inner)
     normalized = _normalize_config(merged)
 
+    should_write_cases_file = bool(
+        sync_cases_file
+        or payload.get("sync_cases_file")
+        or os.environ.get("LEADGEN_WRITE_CASES_BANK") == "1"
+    )
     if isinstance(inner.get("cases_bank_md"), str) and inner["cases_bank_md"].strip():
         normalized["cases_bank_md"] = inner["cases_bank_md"]
-        if "PYTEST_CURRENT_TEST" not in os.environ or os.environ.get("LEADGEN_WRITE_CASES_BANK") == "1":
+        if should_write_cases_file:
             try:
                 CASES_BANK_PATH.parent.mkdir(parents=True, exist_ok=True)
                 CASES_BANK_PATH.write_text(normalized["cases_bank_md"], encoding="utf-8")
@@ -355,6 +363,8 @@ def save_leadgen_config(
             (serialized, now),
         )
         conn.commit()
+        if bool(sync_campaign_limits or payload.get("sync_campaign_limits")):
+            sync_leadgen_campaigns(conn, normalized, sync_campaign_limits=True)
 
     json_path = _resolve_config_json_path()
     try:
@@ -494,10 +504,36 @@ DEFAULT_VACANCY_STEPS = [
 DEFAULT_LEADGEN_STEPS = DEFAULT_B2B_STEPS
 
 
+def _has_whatsapp_readiness(conn: sqlite3.Connection) -> bool:
+    try:
+        acc_cnt = conn.execute(
+            """
+            SELECT COUNT(*) FROM accounts
+            WHERE lower(COALESCE(provider, '')) = 'whatsapp'
+              AND status = 'connected'
+              AND COALESCE(health, 'active') NOT IN ('banned', 'frozen', 'unauthorized')
+            """
+        ).fetchone()[0]
+        if int(acc_cnt or 0) > 0:
+            return True
+        lead_cnt = conn.execute(
+            "SELECT COUNT(*) FROM leads WHERE lower(COALESCE(provider, '')) = 'whatsapp'"
+        ).fetchone()[0]
+        return int(lead_cnt or 0) > 0
+    except sqlite3.Error:
+        return False
+
+
 def sync_leadgen_campaigns(
     conn: sqlite3.Connection,
     config: dict[str, Any] | None = None,
+    *,
+    sync_campaign_limits: bool = False,
 ) -> dict[str, Any]:
+    allow_limit_sync = bool(
+        sync_campaign_limits
+        or (isinstance(config, dict) and config.get("sync_campaign_limits"))
+    )
     cfg = _normalize_config(config) if isinstance(config, dict) else get_leadgen_config(conn)
     b2b = cfg["b2b"]
     vac = cfg["vacancies"]
@@ -506,6 +542,15 @@ def sync_leadgen_campaigns(
     vac_enabled_layers = [f"vacancies:{k}" for k, v in (vac.get("layers") or {}).items() if v]
     if not vac_enabled_layers:
         vac_enabled_layers = ["vacancies"]
+
+    all_existing_camps = [
+        as_dict(r)
+        for r in conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
+    ]
+    existing_names_low = {
+        str(c.get("name") or "").strip().lower() for c in all_existing_camps
+    }
+    wa_ready = _has_whatsapp_readiness(conn)
 
     targets: list[dict[str, Any]] = []
     if b2b.get("enabled", True):
@@ -528,7 +573,11 @@ def sync_leadgen_campaigns(
                     "is_b2b": True,
                 }
             )
-        if wa_name and wa_name.lower() != tg_name.lower():
+        if (
+            wa_name
+            and wa_name.lower() != tg_name.lower()
+            and (wa_ready or wa_name.lower() in existing_names_low)
+        ):
             targets.append(
                 {
                     "name": wa_name,
@@ -556,10 +605,6 @@ def sync_leadgen_campaigns(
                 }
             )
 
-    all_existing_camps = [
-        as_dict(r)
-        for r in conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
-    ]
     synced_campaigns: list[dict[str, Any]] = []
     for spec in targets:
         spec_name_low = str(spec["name"] or "").strip().lower()
@@ -569,15 +614,26 @@ def sync_leadgen_campaigns(
         )
         if matched_existing is not None:
             cid = int(matched_existing["id"])
+            existing_status = str(matched_existing.get("status") or "").strip().lower()
+            existing_daily_limit = int(matched_existing.get("daily_limit") or 0)
             keep_paused_disabled = (
                 "softugc" in spec_name_low
-                and str(matched_existing.get("status") or "") == "paused"
+                and existing_status == "paused"
                 and int(matched_existing.get("leadgen_enabled") or 0) == 0
             )
+            if (
+                not allow_limit_sync
+                and (existing_status == "running" or keep_paused_disabled)
+                and spec["daily_limit"] < existing_daily_limit
+            ):
+                effective_daily_limit = existing_daily_limit
+            else:
+                effective_daily_limit = spec["daily_limit"]
+
             updated = update_campaign(
                 conn,
                 cid,
-                daily_limit=spec["daily_limit"],
+                daily_limit=effective_daily_limit,
                 leadgen_enabled=(False if keep_paused_disabled else True),
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
@@ -614,14 +670,67 @@ def sync_leadgen_campaigns(
     }
 
 
+def _ingest_leads_without_campaign_limit_mutation(
+    conn: sqlite3.Connection,
+    *,
+    call_mcp_tool_handler: Any,
+    leads_slice: list[dict[str, Any]],
+    enroll_in_campaign: bool,
+    campaign_name: str,
+    default_quota: int,
+    default_sources: list[str],
+) -> tuple[int, int]:
+    if not leads_slice:
+        return 0, 0
+    before_ids = {
+        int(r["id"]) for r in conn.execute("SELECT id FROM campaigns").fetchall()
+    }
+    res = call_mcp_tool_handler(
+        conn,
+        "ingest_discovered_leads",
+        {
+            "leads": leads_slice,
+            "enroll_in_campaign": enroll_in_campaign,
+            "campaign_name": campaign_name,
+        },
+    )
+    added = int(res.get("enrolled_in_campaign") or res.get("created_leads") or 0)
+    after_ids = {
+        int(r["id"]) for r in conn.execute("SELECT id FROM campaigns").fetchall()
+    }
+    new_cids = sorted(after_ids - before_ids)
+    created_valid = 0
+    for ncid in new_cids:
+        rec_cnt = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ?",
+                (ncid,),
+            ).fetchone()[0]
+            or 0
+        )
+        if rec_cnt == 0:
+            conn.execute("DELETE FROM campaign_steps WHERE campaign_id = ?", (ncid,))
+            conn.execute("DELETE FROM campaigns WHERE id = ?", (ncid,))
+            conn.commit()
+        else:
+            update_campaign(
+                conn,
+                ncid,
+                leadgen_enabled=True,
+                leadgen_daily_quota=default_quota,
+                leadgen_sources=default_sources,
+            )
+            created_valid += 1
+    return added, created_valid
+
+
 def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     cfg = get_leadgen_config(conn)
-    sync_res = sync_leadgen_campaigns(conn, cfg)
     if not cfg.get("enabled", True):
         return {
             "ok": True,
             "ingested": 0,
-            "campaigns_synced": sync_res["synced_count"],
+            "campaigns_synced": 0,
             "message": "Авто-лидген отключён в настройках",
         }
 
@@ -640,16 +749,20 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
         return {
             "ok": True,
             "ingested": 0,
-            "campaigns_synced": sync_res["synced_count"],
+            "campaigns_synced": 0,
             "message": f"Дневная квота лидгена ({total_quota}) на сегодня уже выбрана",
         }
 
     state_dir = _resolve_state_dir()
     ingested_total = 0
+    campaigns_created = 0
     from app.mcp_server import call_mcp_tool_handler
 
     # 1. Ready vacancy replies (job_replies_*.json or job_monitor_*.json with prebuilt fields)
     vac_cfg = cfg["vacancies"]
+    vac_enabled_layers = [
+        f"vacancies:{k}" for k, v in (vac_cfg.get("layers") or {}).items() if v
+    ] or ["vacancies"]
     if vac_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
         from leadgen.job_reply import build_default_followups, build_vacancy_mcp_lead
 
@@ -708,21 +821,22 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
 
             vac_limit = min(remaining_quota, int(vac_cfg.get("daily_limit") or 20))
             if vac_leads and vac_limit > 0:
-                res = call_mcp_tool_handler(
+                added, created_c = _ingest_leads_without_campaign_limit_mutation(
                     conn,
-                    "ingest_discovered_leads",
-                    {
-                        "leads": vac_leads[:vac_limit],
-                        "enroll_in_campaign": bool(cfg.get("auto_push_to_crm", True)),
-                        "campaign_name": str(vac_cfg.get("campaign_name") or "TG Вакансии"),
-                    },
+                    call_mcp_tool_handler=call_mcp_tool_handler,
+                    leads_slice=vac_leads[:vac_limit],
+                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                    campaign_name=str(vac_cfg.get("campaign_name") or "TG Вакансии"),
+                    default_quota=max(0, min(500, int(vac_cfg.get("daily_limit") or 20))),
+                    default_sources=vac_enabled_layers,
                 )
-                added = int(res.get("enrolled_in_campaign") or res.get("created_leads") or 0)
                 ingested_total += added
+                campaigns_created += created_c
                 remaining_quota = max(0, remaining_quota - added)
 
     # 2. Local JSONL files in state_dir (*.treg.jsonl / *.final.jsonl / discovered_leads.jsonl)
     b2b_cfg = cfg["b2b"]
+    b2b_enabled_sources = [k for k, v in (b2b_cfg.get("sources") or {}).items() if v]
     if b2b_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
         from leadgen.crm_mcp_push import build_lead_payload_from_dict, pack_tab_leads_for_mcp
         from leadgen.lead_market import market_of
@@ -736,10 +850,13 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
         from leadgen.tg_enrich_leads import classify_role
         from leadgen.tg_to_gsheet import keep_for_sheet
 
-        jsonl_candidates = sorted(
+        raw_candidates = (
             glob.glob(str(state_dir / "*.treg.jsonl"))
             + glob.glob(str(state_dir / "*.final.jsonl"))
-            + glob.glob(str(state_dir / "discovered_leads*.jsonl")),
+            + glob.glob(str(state_dir / "discovered_leads*.jsonl"))
+        )
+        jsonl_candidates = sorted(
+            [p for p in raw_candidates if os.path.isfile(p) and os.path.getsize(p) > 0],
             key=os.path.getmtime,
         )
         if jsonl_candidates:
@@ -818,6 +935,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             if sheet_like:
                 leads.extend(pack_tab_leads_for_mcp("Все2", sheet_like, use_llm=False, touch_mode=touch_mode_val))
             b2b_limit = min(remaining_quota, int(b2b_cfg.get("campaign_daily_limit") or 30))
+            b2b_quota_default = max(0, min(500, int(b2b_cfg.get("campaign_daily_limit") or 30)))
             if leads and b2b_limit > 0:
                 batch = leads[:b2b_limit]
                 tg_leads = [l for l in batch if str(l.get("provider") or "telegram") != "whatsapp"]
@@ -828,33 +946,35 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                         b2b_cfg.get("target_campaign_tg"),
                         fallback_default="Leadgen Auto (TG)",
                     )
-                    res_tg = call_mcp_tool_handler(
+                    added_tg, created_tg = _ingest_leads_without_campaign_limit_mutation(
                         conn,
-                        "ingest_discovered_leads",
-                        {
-                            "leads": tg_leads,
-                            "enroll_in_campaign": bool(cfg.get("auto_push_to_crm", True)),
-                            "campaign_name": target_tg_camp,
-                        },
+                        call_mcp_tool_handler=call_mcp_tool_handler,
+                        leads_slice=tg_leads,
+                        enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                        campaign_name=target_tg_camp,
+                        default_quota=b2b_quota_default,
+                        default_sources=b2b_enabled_sources,
                     )
-                    ingested_total += int(res_tg.get("enrolled_in_campaign") or res_tg.get("created_leads") or 0)
+                    ingested_total += added_tg
+                    campaigns_created += created_tg
                 if wa_leads:
-                    res_wa = call_mcp_tool_handler(
+                    added_wa, created_wa = _ingest_leads_without_campaign_limit_mutation(
                         conn,
-                        "ingest_discovered_leads",
-                        {
-                            "leads": wa_leads,
-                            "enroll_in_campaign": bool(cfg.get("auto_push_to_crm", True)),
-                            "campaign_name": str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)"),
-                        },
+                        call_mcp_tool_handler=call_mcp_tool_handler,
+                        leads_slice=wa_leads,
+                        enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                        campaign_name=str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)"),
+                        default_quota=b2b_quota_default,
+                        default_sources=b2b_enabled_sources,
                     )
-                    ingested_total += int(res_wa.get("enrolled_in_campaign") or res_wa.get("created_leads") or 0)
+                    ingested_total += added_wa
+                    campaigns_created += created_wa
 
     return {
         "ok": True,
         "ingested": ingested_total,
-        "campaigns_synced": sync_res["synced_count"],
+        "campaigns_synced": campaigns_created,
         "message": (
-            f"Синхронизировано рассылок: {sync_res['synced_count']}, залито лидов: {ingested_total}"
+            f"Создано новых рассылок: {campaigns_created}, залито лидов: {ingested_total}"
         ),
     }
