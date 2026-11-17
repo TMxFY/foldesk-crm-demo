@@ -229,6 +229,24 @@ def contact_has_direct(row: list[Any]) -> bool:
     return "t.me/" not in lowered and "telegram.me/" not in lowered
 
 
+def _normalize_e164_wa_phone(raw: Any) -> str:
+    """Normalize a wa.me link, api.whatsapp.com send link, or E.164 text into +<digits>."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    for pat in (
+        r"(?:wa\.me/(?:c/)?|\bphone=)(\+?[%\d][%\d\s().\-]{6,18})",
+        r"^\s*(\+\d[\d\s().\-]{6,18}\d)\s*$",
+        r"(?:whatsapp|wa)\s*(?:/\s*tel[^:\n]{0,18})?\s*[:\-–—]?\s*(\+\d[\d\s().\-]{6,18}\d)",
+    ):
+        m = re.search(pat, text, re.I)
+        if m:
+            digits = re.sub(r"\D", "", urllib.parse.unquote(m.group(1)))
+            if 8 <= len(digits) <= 15 and len(set(digits)) > 1:
+                return f"+{digits}"
+    return ""
+
+
 def _extract_contact_fields(contact_str: str, tg_col: str = "", email_col: str = "") -> dict[str, str]:
     """Parse username, phone, email, provider from sheet/JSONL contact strings."""
     out = {"username": "", "phone": "", "email": (email_col or "").strip(), "provider": "telegram"}
@@ -249,12 +267,11 @@ def _extract_contact_fields(contact_str: str, tg_col: str = "", email_col: str =
             out["username"] = candidate
             break
 
-    if "wa.me/" in raw_contact.lower():
-        m_wa = re.search(r"wa\.me/(\+?\d{7,15})", raw_contact, re.I)
-        if m_wa:
-            out["phone"] = m_wa.group(1)
-            if not out["username"]:
-                out["provider"] = "whatsapp"
+    norm_wa = _normalize_e164_wa_phone(raw_contact)
+    if norm_wa:
+        out["phone"] = norm_wa
+        if not out["username"]:
+            out["provider"] = "whatsapp"
 
     if not out["email"] and "@" in raw_contact and " " not in raw_contact and not raw_contact.startswith("@"):
         clean_mail = raw_contact.removeprefix("mailto:").strip()
@@ -556,7 +573,20 @@ def build_lead_payload_from_dict(
     ).strip()
     email_raw = str(record.get("email") or record.get("work_email") or "").strip()
     contact_info = _extract_contact_fields(username_raw, tg_col=username_raw, email_col=email_raw)
-    phone = str(record.get("phone") or record.get("whatsapp") or contact_info["phone"] or "").strip()
+    norm_wa_phone = _normalize_e164_wa_phone(record.get("whatsapp") or record.get("phone") or contact_info["phone"])
+    raw_plain_phone = str(record.get("phone") or "").strip()
+    if raw_plain_phone.lower().startswith(("http://", "https://")) or "wa.me/" in raw_plain_phone.lower():
+        raw_plain_phone = ""
+    phone = norm_wa_phone or raw_plain_phone or str(contact_info["phone"] or "").strip()
+    has_wa_signal = bool(
+        norm_wa_phone
+        and (
+            record.get("whatsapp")
+            or str(record.get("provider") or "").strip().lower() == "whatsapp"
+            or str(source).strip().lower() == "d2c_whatsapp"
+            or contact_info["provider"] == "whatsapp"
+        )
+    )
 
     clean_comp = clean_product_name(raw_company, site, their_angle)
     personal_first = _extract_personal_first_name(raw_name, clean_comp or raw_company)
@@ -652,7 +682,7 @@ def build_lead_payload_from_dict(
         "lead_source": source,
         "note": str(record.get("note") or "").strip() or None,
         "telegram_user_id": record.get("telegram_user_id") or record.get("user_id") or record.get("id"),
-        "provider": str(record.get("provider") or contact_info["provider"] or "telegram"),
+        "provider": "telegram" if contact_info["username"] else ("whatsapp" if has_wa_signal else (str(record.get("provider") or "").strip().lower() if str(record.get("provider") or "").strip().lower() in ("telegram", "whatsapp") else (contact_info["provider"] or "telegram"))),
     }
 
 
@@ -1134,6 +1164,35 @@ def main() -> int:
 
     enroll = bool(ui_cfg.get("auto_push_to_crm", True)) and not args.no_campaign
 
+    def _push_tg_wa_split(batch_items: list[dict[str, Any]], *, camp_id: int | None) -> dict[str, Any]:
+        wa_items = [l for l in batch_items if l.get("provider") == "whatsapp" and l.get("phone") and not l.get("username")]
+        tg_items = [l for l in batch_items if not (l.get("provider") == "whatsapp" and l.get("phone") and not l.get("username"))]
+        agg = {"processed": 0, "created_leads": 0, "updated_leads": 0, "enrolled_in_campaign": 0, "campaign_id": None}
+        if tg_items:
+            r_tg = push_leads_via_mcp(
+                tg_items,
+                enroll_in_campaign=enroll,
+                campaign_id=camp_id,
+                campaign_name=args.campaign_name,
+                mcp_url=args.mcp_url or None,
+            )
+            for k in ("processed", "created_leads", "updated_leads", "enrolled_in_campaign"):
+                agg[k] += int(r_tg.get(k, 0))
+            agg["campaign_id"] = r_tg.get("campaign_id")
+        if wa_items:
+            r_wa = push_leads_via_mcp(
+                wa_items,
+                enroll_in_campaign=enroll,
+                campaign_id=None,
+                campaign_name=args.campaign_name_wa,
+                mcp_url=args.mcp_url or None,
+            )
+            for k in ("processed", "created_leads", "updated_leads", "enrolled_in_campaign"):
+                agg[k] += int(r_wa.get(k, 0))
+            if agg["campaign_id"] is None:
+                agg["campaign_id"] = r_wa.get("campaign_id")
+        return agg
+
     if args.jsonl:
         leads = load_leads_from_jsonl(args.jsonl, touch_mode=args.touch_mode, use_llm=args.use_llm)
         if effective_quota > 0:
@@ -1141,13 +1200,7 @@ def main() -> int:
         if not leads:
             log(f"[jsonl] no sendable leads found in {args.jsonl}")
             return 0
-        res = push_leads_via_mcp(
-            leads,
-            enroll_in_campaign=enroll,
-            campaign_id=args.campaign_id,
-            campaign_name=args.campaign_name,
-            mcp_url=args.mcp_url or None,
-        )
+        res = _push_tg_wa_split(leads, camp_id=args.campaign_id)
         log(
             f"[jsonl] CRM MCP push complete ({args.touch_mode}): "
             f"processed={res.get('processed', 0)}, "
@@ -1231,13 +1284,7 @@ def main() -> int:
                     for k in ("created_leads", "updated_leads"):
                         res[k] += int(r_oth.get(k, 0))
             else:
-                res = push_leads_via_mcp(
-                    batch,
-                    enroll_in_campaign=enroll,
-                    campaign_id=args.campaign_id,
-                    campaign_name=args.campaign_name,
-                    mcp_url=args.mcp_url or None,
-                )
+                res = _push_tg_wa_split(batch, camp_id=args.campaign_id)
             if len(batch) < len(leads):
                 # Quota capped this batch -> advance ONLY to exact last processed row (start_idx + offset)!
                 new_watermark = start_idx + (consumed_offsets[len(batch) - 1] if consumed_offsets else len(batch))

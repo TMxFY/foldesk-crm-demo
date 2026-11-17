@@ -138,7 +138,7 @@ async def _run(states: list[tuple[str, dict[str, Any], dict[str, Any]]], cache_p
 
 
 async def qualify_creator_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
-    categories = ["SaaS / AI app", "CEX / биржа", "Проп трейдинг", "DeFi / DEX",
+    categories = ["SaaS / AI app", "E-com / D2C", "CEX / биржа", "Проп трейдинг", "DeFi / DEX",
                   "Медиа / контент", "Gaming / AI", "Токен / мемкоин",
                   "Платёжки / финтех", "Web3 (общее)", "Сервис / агентство"]
     roles = ["Founder", "Marketing", "Community", "Creator/KOL", "Dev", "Trader", "Other"]
@@ -148,9 +148,9 @@ async def qualify_creator_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
         if not state.get("source"):
             state["source"] = row.get("group") or ""
         states.append((_key(state), state, {"questions": {
-            "fit": Noul(instructions="Is this a buyer for short-form user acquisition: a founder, owner, marketing/growth lead, or creator with a real product? High for an AI SaaS, consumer app, fintech, prop firm, or any product that is naturally advertised with TikTok/Reels/Shorts. A public owner of a shipped product with an explicit X or LinkedIn profile counts even when the bio is technical. The source chat and sample message are context, not proof. Return low for a pure retail trader, signal caller, investor, job seeker, UGC freelancer with no product, visa/relocation chatter, local classifieds, OTC, spammer, or empty profile."),
+            "fit": Noul(instructions="Is this a buyer for short-form user acquisition: a founder, owner, marketing/growth lead, or creator with a real product? High for an AI SaaS, consumer app, Shopify/D2C e-commerce brand (skincare, cosmetics, supplements), fintech, prop firm, or any product that is naturally advertised with TikTok/Reels/Shorts. A public owner of a shipped product or verified D2C store with an explicit X, LinkedIn, or WhatsApp business contact counts even when the bio is short or technical. The source chat and sample message are context, not proof. Return low for a pure retail trader, signal caller, investor, job seeker, UGC freelancer with no product, visa/relocation chatter, local classifieds, clinic/salon, OTC, spammer, or empty profile."),
             "category": Choice(instructions="Which category best describes the person's actual product/project?", criteria={x: None for x in categories}),
-            "role": Choice(instructions="Which role best describes this person in relation to the product/project? Treat the public owner/maintainer of a shipped product with a direct social profile as Founder when no stronger evidence says otherwise; do not label them Dev only because the project is technical.", criteria={x: None for x in roles}),
+            "role": Choice(instructions="Which role best describes this person in relation to the product/project? Treat the public owner/maintainer of a shipped product with a direct social profile, or an official brand/Shopify store contact without a separate personal bio, as Founder when no stronger evidence says otherwise; do not label them Dev or Other only because the project is technical or store-facing.", criteria={x: None for x in roles}),
         }, "parse": lambda r: {
             "typesafe_fit": _prob(_answer(r, "fit")),
             "typesafe_category": _choice(_answer(r, "category")),

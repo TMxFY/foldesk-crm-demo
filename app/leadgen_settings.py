@@ -8,10 +8,12 @@ import re
 import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.db import CANONICAL_STEP3_IMAGE_URL, ROOT, as_dict, utc_now, utc_today
 from app.outreach import create_campaign, get_campaign, update_campaign
 from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
+from leadgen.tg_to_gsheet import whatsapp_url
 
 CASES_BANK_PATH = ROOT / "leadgen" / "job_cases_bank.md"
 
@@ -60,6 +62,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "app_stores": True,
             "ats_hiring": True,
             "ph_detailed": True,
+            "d2c_whatsapp": True,
             "ofm_groups": True,
             "facebook_groups": True,
             "meta_ads": True,
@@ -81,7 +84,13 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "aimodelnetwork",
             "AdultDeskAI",
         ],
-        "fb_group_urls": [],
+        "fb_group_urls": [
+            "https://www.facebook.com/groups/ShopifyStorePros",
+            "https://www.facebook.com/groups/UnofficialShopifyPodcast",
+            "https://www.facebook.com/groups/startugc",
+            "https://www.facebook.com/groups/278248382953814",
+            "https://www.facebook.com/groups/595540634883097",
+        ],
         "limits": {
             "yc_limit": 50,
             "ph_limit": 0,
@@ -193,6 +202,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "app_stores",
         "ats_hiring",
         "ph_detailed",
+        "d2c_whatsapp",
         "ofm_groups",
         "facebook_groups",
     }
@@ -226,8 +236,13 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_fb_urls, list):
         for fb_u in raw_fb_urls:
             s_fb = str(fb_u or "").strip()
-            if s_fb.startswith(("http://", "https://")) and "facebook.com/" in s_fb.lower() and s_fb not in clean_fb:
-                clean_fb.append(s_fb)
+            if not s_fb.startswith(("http://", "https://")):
+                continue
+            parsed_fb = urlparse(s_fb)
+            fb_host = (parsed_fb.hostname or "").lower().removeprefix("www.").rstrip(".")
+            if (fb_host == "facebook.com" or fb_host.endswith(".facebook.com") or fb_host == "fb.com") and "/groups/" in parsed_fb.path.lower():
+                if s_fb not in clean_fb:
+                    clean_fb.append(s_fb)
     b2b["fb_group_urls"] = clean_fb
 
     raw_limits = b2b.get("limits") or {}
@@ -396,6 +411,7 @@ def save_leadgen_config(
         "app_stores",
         "ats_hiring",
         "ph_detailed",
+        "d2c_whatsapp",
         "ofm_groups",
         "facebook_groups",
     )
@@ -495,10 +511,12 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
     ofm_review_count = int(ofm_review_payload.get("total") or 0)
     recent_ofm_review_leads = list(ofm_review_payload.get("items") or [])[:25]
     recent_b2b_leads: list[dict[str, Any]] = []
+    wa_leads_count = 0
     crm_counts = {
         "total_leadgen_leads": 0,
         "vacancies_leads": 0,
         "b2b_leads": 0,
+        "whatsapp_leads_count": 0,
         "active_leadgen_campaigns": 0,
         "direct_x_leads_count": direct_x_leads_count,
         "ofm_review_count": ofm_review_count,
@@ -506,7 +524,11 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
     if conn is not None:
         try:
             rows = conn.execute(
-                "SELECT lead_source FROM leads WHERE lead_source IS NOT NULL AND trim(lead_source) != ''"
+                """
+                SELECT lead_source, COALESCE(provider, 'telegram') AS provider, COALESCE(username, '') AS username
+                FROM leads
+                WHERE lead_source IS NOT NULL AND trim(lead_source) != ''
+                """
             ).fetchall()
             vac_c = 0
             b2b_c = 0
@@ -529,22 +551,34 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                 "app_stores",
                 "ats_hiring",
                 "ph_detailed",
+                "d2c_whatsapp",
+                "shopify",
                 "fb_groups",
                 "facebook_groups",
             )
             for r in rows:
                 src = str(r["lead_source"] or "").lower()
+                prov = str(r["provider"] or "telegram").strip().lower()
+                uname_val = str(r["username"] or "").strip()
                 if "ваканс" in src or "job" in src:
                     vac_c += 1
+                elif prov == "whatsapp" and not uname_val:
+                    continue
                 elif any(kw in src for kw in b2b_kws):
                     b2b_c += 1
             crm_counts["vacancies_leads"] = vac_c
             crm_counts["b2b_leads"] = b2b_c
             crm_counts["total_leadgen_leads"] = vac_c + b2b_c
 
+            wa_row = conn.execute(
+                "SELECT COUNT(*) FROM leads WHERE lower(COALESCE(provider, '')) = 'whatsapp' AND lower(COALESCE(status, '')) != 'lost'"
+            ).fetchone()
+            wa_leads_count = int(wa_row[0] or 0) if wa_row else 0
+            crm_counts["whatsapp_leads_count"] = wa_leads_count
+
             recent_rows = conn.execute(
                 """
-                SELECT id, name, company, username, url, niche, lead_source, status, created_at
+                SELECT id, name, company, username, phone, provider, url, niche, lead_source, status, created_at
                 FROM leads
                 WHERE lead_source IS NOT NULL AND trim(lead_source) != ''
                   AND lower(lead_source) NOT LIKE '%ваканс%'
@@ -577,6 +611,7 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
         "latest_vacancy_report": latest_vacancy_report,
         "crm_leadgen_counts": crm_counts,
         "direct_x_leads_count": direct_x_leads_count,
+        "whatsapp_leads_count": wa_leads_count,
         "ofm_review_count": ofm_review_count,
         "recent_b2b_leads": recent_b2b_leads,
         "recent_direct_x_leads": recent_direct_x_leads,
@@ -1148,11 +1183,25 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 uname = str(cand.get("username") or cand.get("tg_username") or cand.get("telegram_username") or "").strip().lstrip("@")
                 if uname and not cand.get("username"):
                     cand["username"] = uname
-                phone_val = str(cand.get("phone") or "").strip()
-                if phone_val and not cand.get("whatsapp"):
-                    digits = re.sub(r"\D", "", phone_val)
-                    if len(digits) >= 8:
-                        cand["whatsapp"] = f"https://wa.me/{digits}"
+                raw_phone = str(cand.get("phone") or "").strip()
+                wa_raw = str(cand.get("whatsapp") or "").strip()
+                canon_wa = whatsapp_url(wa_raw) or (whatsapp_url(raw_phone) if "wa.me" in raw_phone.lower() or "whatsapp" in raw_phone.lower() else "")
+                phone_digits = ""
+                if canon_wa:
+                    phone_digits = re.sub(r"\D", "", canon_wa)
+                elif raw_phone:
+                    cand_digits = re.sub(r"\D", "", raw_phone.split("?", 1)[0].split("#", 1)[0])
+                    if 8 <= len(cand_digits) <= 15:
+                        phone_digits = cand_digits
+                if phone_digits:
+                    phone_val = f"+{phone_digits}"
+                    cand["phone"] = phone_val
+                    if canon_wa or str(cand.get("provider") or "").strip().lower() == "whatsapp":
+                        cand["whatsapp"] = f"https://wa.me/{phone_digits}"
+                if uname:
+                    cand["provider"] = "telegram"
+                elif cand.get("phone") and (canon_wa or str(cand.get("provider") or "").lower() == "whatsapp"):
+                    cand["provider"] = "whatsapp"
                 if not cand.get("project") and cand.get("company"):
                     cand["project"] = cand["company"]
                 if not cand.get("project_url") and (cand.get("website") or cand.get("site") or cand.get("url")):

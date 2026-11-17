@@ -918,8 +918,10 @@ def _unwrap_person_dicts(payload: Any) -> list[dict[str, Any]]:
         return []
     for key in ("employees", "people", "profiles", "results", "items"):
         val = payload.get(key)
-        if isinstance(val, list):
-            return [item for item in val if isinstance(item, dict)]
+        if isinstance(val, list) and val:
+            dicts = [item for item in val if isinstance(item, dict)]
+            if dicts:
+                return dicts
     for sub_key in ("output", "result", "data"):
         child = payload.get(sub_key)
         if isinstance(child, (dict, list)):
@@ -1070,8 +1072,14 @@ def enrich_lead_contacts(
             out["founder_x"] = crawled["founder_x"]
     if not linkedin_in_url(out.get("founder_linkedin") or "") and crawled.get("founder_linkedin"):
         out["founder_linkedin"] = crawled["founder_linkedin"]
-    if not _extract_whatsapp_url(out.get("whatsapp") or "") and crawled.get("whatsapp"):
-        out["whatsapp"] = crawled["whatsapp"]
+    existing_wa = _extract_whatsapp_url(out.get("whatsapp") or out.get("phone") or "")
+    if not existing_wa and crawled.get("whatsapp"):
+        existing_wa = _extract_whatsapp_url(crawled["whatsapp"])
+    if existing_wa:
+        out["whatsapp"] = existing_wa
+        wa_digits = re.sub(r"\D", "", existing_wa)
+        if wa_digits and not str(out.get("phone") or "").strip():
+            out["phone"] = f"+{wa_digits}"
     if not str(out.get("instagram_url") or "").strip() and crawled.get("instagram_url"):
         out["instagram_url"] = crawled["instagram_url"]
 

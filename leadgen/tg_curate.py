@@ -232,7 +232,7 @@ OVERRIDES = {
 # username aliases with tricky case
 ALIASES = {"hitsahuja_bdm": "hiteshahuja_bdm"}
 
-CAT_PRIORITY = ["Проп трейдинг", "CEX / биржа", "Медиа / контент", "DeFi / DEX",
+CAT_PRIORITY = ["Проп трейдинг", "CEX / биржа", "E-com / D2C", "Медиа / контент", "DeFi / DEX",
                  "Токен / мемкоин", "Gaming / AI", "SaaS / AI app", "Платёжки / финтех",
                  "Инфраструктура / dev", "Сервис / агентство", "Низкий приоритет"]
 

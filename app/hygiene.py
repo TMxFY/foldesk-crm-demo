@@ -169,7 +169,8 @@ _WARM_MANUAL_SOURCE_RE = re.compile(
 )
 _COLD_OUTREACH_OR_LEADGEN_SOURCE_RE = re.compile(
     r"(?:cold\s+outreach|leadgen|google\s+sheet|product\s+hunt|\byc\b|hacker\s+news|\bhn\b|"
-    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|tiktok|app_store|catalog|linkedin|rea[\s_\-]*video|direct|scrape|github)",
+    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|tiktok|app_store|app_stores|ats_hiring|ph_detailed|"
+    r"d2c_whatsapp|fb_groups|facebook_groups|catalog|linkedin|rea[\s_\-]*video|direct|scrape|github)",
     re.IGNORECASE,
 )
 

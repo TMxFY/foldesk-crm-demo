@@ -96,7 +96,7 @@ API_KEY = os.getenv("RELAYFAST_API_KEY") or os.getenv("LLM_API_KEY") or ""
 BATCH_SIZE = 12
 TIMEOUT = 90
 
-CATEGORIES = ["SaaS / AI app", "CEX / биржа", "Проп трейдинг", "DeFi / DEX",
+CATEGORIES = ["SaaS / AI app", "E-com / D2C", "CEX / биржа", "Проп трейдинг", "DeFi / DEX",
               "Медиа / контент", "Gaming / AI", "Токен / мемкоин",
               "Платёжки / финтех", "Web3 (общее)", "Сервис / агентство"]
 ROLES = ["Founder", "Marketing", "Community", "Creator/KOL", "Dev", "Trader", ""]
@@ -123,7 +123,7 @@ For EACH lead in the input array decide:
 - icp_score: integer 0..100 (80+ ONLY for verified monetized products in target clusters)
 - monetization: one of ["subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none"]
 - short_form_fit: bool (true if product can convert from TikTok/Reels/Shorts)
-- category: one of [SaaS / AI app, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Gaming / AI, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
+- category: one of [SaaS / AI app, E-com / D2C, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Gaming / AI, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
 - role: one of [Founder, Marketing, Community, Creator/KOL, Dev, Trader, ""]
 - project: clean product/brand name (strip "Show HN:", numbering, URLs, human names) or ""
 - project_url: product website URL (not t.me/twitter/linkedin), else ""
@@ -212,6 +212,8 @@ def _default_monetization_for_category(cat: str, is_lead: bool) -> str:
         return "none"
     if cat == "SaaS / AI app":
         return "subscription"
+    if cat == "E-com / D2C":
+        return "ecom"
     if cat == "Gaming / AI":
         return "iap"
     if cat in {"Проп трейдинг", "CEX / биржа", "DeFi / DEX", "Платёжки / финтех"}:
@@ -219,12 +221,23 @@ def _default_monetization_for_category(cat: str, is_lead: bool) -> str:
     return "paid_product"
 
 
+_ECOM_CATEGORY_ALIASES = frozenset({"e-com", "ecom", "ecommerce", "e-commerce", "d2c", "dtc", "shopify", "e-com / d2c", "shopify / d2c"})
+
+
 def norm_result(res):
     """Coerce one LLM result into a safe dict; None if unusable."""
     if not isinstance(res, dict):
         return None
     is_lead = bool(res.get("is_lead"))
-    cat = res.get("category") if res.get("category") in CATEGORIES else "Web3 (общее)"
+    raw_cat = str(res.get("category") or "").strip()
+    raw_mon = res.get("monetization")
+    mon_norm_preview = str(raw_mon or "").strip().lower()
+    if raw_cat.lower() in _ECOM_CATEGORY_ALIASES or (mon_norm_preview == "ecom" and raw_cat in ("", "Web3 (общее)", "Медиа / контент")):
+        cat = "E-com / D2C"
+    elif raw_cat in CATEGORIES:
+        cat = raw_cat
+    else:
+        cat = "Web3 (общее)"
     role = res.get("role") if res.get("role") in ROLES else ""
     what = str(res.get("what_they_do") or "")[:90]
     url = str(res.get("project_url") or "")

@@ -1432,6 +1432,12 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
 
     dict_items = [it for it in raw_leads if isinstance(it, dict)]
     all_vacancies = bool(dict_items) and all(_is_vacancy_lead_item(it) for it in dict_items)
+    all_wa_only = bool(dict_items) and all(
+        str(it.get("provider") or "").strip().lower() == "whatsapp"
+        and not _clean_handle(it.get("username"))
+        and bool(str(it.get("phone") or "").strip())
+        for it in dict_items
+    )
 
     if campaign_id is None:
         raw_low = raw_camp_arg.lower()
@@ -1439,6 +1445,8 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             campaign_name = raw_camp_arg
         elif all_vacancies and raw_low in ("", "leadgen auto (tg)", "leadgen autopilot"):
             campaign_name = "TG Вакансии"
+        elif all_wa_only and not _is_qa_campaign_name(raw_camp_arg):
+            campaign_name = "Leadgen Auto (WA)"
         else:
             from app.leadgen_settings import resolve_target_b2b_tg_campaign_name
 
@@ -1769,6 +1777,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         # Determine target campaign BEFORE touching `leads` so all ICP/supply/denylist filters run first!
         active_state = primary_state
         is_item_vacancy = _is_vacancy_lead_item(item)
+        is_item_wa_only = (provider == "whatsapp" and not username and bool(phone))
         if (
             enroll_in_campaign
             and not explicit_cid_requested
@@ -1779,11 +1788,28 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             if vac_key not in camp_cache:
                 camp_cache[vac_key] = _get_or_create_camp_state(None, "TG Вакансии")
             active_state = camp_cache[vac_key]
+        elif (
+            enroll_in_campaign
+            and not explicit_cid_requested
+            and is_item_wa_only
+            and not is_item_vacancy
+        ):
+            primary_name_low = str((primary_state or {}).get("camp_dict", {}).get("name") or campaign_name or "").lower()
+            if "(wa)" not in primary_name_low and "whatsapp" not in primary_name_low and not _is_qa_campaign_name(primary_name_low):
+                wa_key = "leadgen auto (wa)"
+                if wa_key not in camp_cache:
+                    camp_cache[wa_key] = _get_or_create_camp_state(None, "Leadgen Auto (WA)")
+                active_state = camp_cache[wa_key]
 
         target_camp_dict = active_state["camp_dict"] if active_state is not None else camp_dict
         target_campaign_id = int(active_state["campaign_id"]) if active_state is not None else campaign_id
         target_camp_name = str((target_camp_dict or {}).get("name") or campaign_name or "")
         is_qa_camp = _is_qa_campaign_name(target_camp_name)
+        is_wa_target_camp = "(wa)" in target_camp_name.lower() or "whatsapp" in target_camp_name.lower()
+        if enroll_in_campaign and explicit_cid_requested and is_item_wa_only and not is_wa_target_camp and not is_qa_camp:
+            skipped_non_icp += 1
+            quarantined += 1
+            continue
         is_b2b_camp = not is_item_vacancy and not any(
             k in target_camp_name.lower() for k in ("ваканс", "vacanc", "job")
         )
@@ -1849,7 +1875,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 "ofm_tier" in item
                 or (lead_source or "").strip().lower().startswith("ofm")
                 or re.search(
-                    r"\b(?:onlyfans|only\s*fans|fanvue|chatteurs?|ofm\s+agency|agence\s+ofm)\b",
+                    r"\b(?:onlyfans|only[\s\-]?fans|fanvue|fansly|loyalfans|chatteurs?|ofm\s+agency|agence\s+ofm)\b|\bof\s+(?:model|agency|creator|traffic|page)\b",
                     full_blob,
                     re.I,
                 )

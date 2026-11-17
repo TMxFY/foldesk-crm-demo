@@ -23,6 +23,7 @@ CAT_LABEL = {
     "Токен / мемкоин": "Токен",
     "Gaming / AI": "AI",
     "SaaS / AI app": "SaaS",
+    "E-com / D2C": "D2C",
     "Платёжки / финтех": "Финтех",
     "Инфраструктура / dev": "Инфра",
     "Сервис / агентство": "Агентство",
@@ -30,7 +31,7 @@ CAT_LABEL = {
 }
 
 GOOD = {"CEX / биржа", "Проп трейдинг", "Медиа / контент", "DeFi / DEX",
-        "Токен / мемкоин", "Gaming / AI", "SaaS / AI app", "Платёжки / финтех"}
+        "Токен / мемкоин", "Gaming / AI", "SaaS / AI app", "E-com / D2C", "Платёжки / финтех"}
 
 # sellable buyer roles (strictly Founder / Marketing)
 SELL_ROLES = {"Founder", "Marketing"}
@@ -44,6 +45,7 @@ OUR_ANGLE = {
     "Токен / мемкоин": "Направление 2 (AI UGC) + 3 (клиппинг). Хайп-окно мемкоина ~2 дня, команда не успевает делать контент — наш продакшн + сетка выстреливает волной в тот же день.",
     "Gaming / AI": "Направление 2 (AI UGC) + 3 (клиппинг). Аудитория клип-нативная, частые запуски — запускаем AI UGC объёмом и рекламируем их оффер.",
     "SaaS / AI app": "Направление 2 (AI UGC) + 3 (клиппинг под инсталлы/подписки). SaaS/AI-приложение живёт на стоимости привлечения юзера — наша органическая сетка гонит инсталлы и подписки дешевле платного трафика, 183.5M просмотров за 90 дней на прошлом проекте.",
+    "E-com / D2C": "Направление 2 (AI UGC) + 3 (клиппинг на виральные рилсы). D2C/Shopify-бренд живёт на стоимости привлечения покупателя — массовый AI UGC и клип-сетка гонят органических покупателей дешевле платного таргета.",
     "Платёжки / финтех": "Направление 2 (UGC-демо) + 3 (клиппинг под регистрации). Консюмерский финтех живёт на объёме регистраций — демо-ролики + дешёвый клиппинг гонят сигнапы через реф-ссылку.",
     "Инфраструктура / dev": "Направление 3 (клиппинг). Dev-тулы и инфраструктура находят проекты через короткое видео — клиппинг по 10 аккаунтам.",
     "Сервис / агентство": "Партнёрская программа ($100/клиент). Агентство может перепродавать наш клиппинг/UGC своим клиентам.",
@@ -136,7 +138,7 @@ _TCO_RE = re.compile(r"https://t\.co/[A-Za-z0-9]+", re.I)
 _TCO_LIMIT = 4
 _TCO_TIMEOUT_S = 3
 _WA_ME_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?wa\.me/([%\d+][%\d\s().\-]*)",
+    r"(?:https?://)?(?:www\.)?wa\.me/(?:c/)?([%\d+][%\d\s().\-]*)",
     re.I,
 )
 _WA_PHONE_RE = re.compile(
@@ -144,30 +146,53 @@ _WA_PHONE_RE = re.compile(
     r"[^#]*?\bphone=(\+?[%\d][%\d\s().\-]{6,})",
     re.I,
 )
+_WA_TEXT_E164_RE = re.compile(
+    r"(?:whatsapp|wa)\s*(?:/\s*tel[^:\n]{0,18})?\s*[:\-–—]?\s*(\+\d[\d\s().\-]{6,17}\d)",
+    re.I,
+)
+_STANDALONE_E164_RE = re.compile(r"^\+\d[\d\s().\-]{6,17}\d$")
 
 
 def _digits(value):
     return re.sub(r"\D", "", unquote(str(value or "")))
 
 
-def whatsapp_url(value):
-    """https://wa.me/<digits> from wa.me or a WhatsApp send link. Groups are ignored."""
+_TOLLFREE_WA_PREFIXES = ("1800", "1833", "1844", "1855", "1866", "1877", "1888", "44800", "44808")
+
+
+def _is_plausible_wa_digits(digits: str) -> bool:
+    if not (8 <= len(digits) <= 15):
+        return False
+    if len(set(digits)) == 1 or digits.startswith("1234567") or digits.startswith(_TOLLFREE_WA_PREFIXES):
+        return False
+    return True
+
+
+def whatsapp_urls(value, *, exclude_prefixes: tuple[str, ...] = ()) -> list[str]:
+    """Ordered unique https://wa.me/<digits> candidates extracted from value."""
     raw = str(value or "")
     if not raw.strip():
-        return ""
+        return []
     found = []
-    for match in _WA_ME_RE.finditer(raw):
-        digits = _digits(match.group(1))
-        if len(digits) >= 8:
-            found.append((match.start(), digits))
-    for match in _WA_PHONE_RE.finditer(raw):
-        digits = _digits(match.group(1))
-        if len(digits) >= 8:
-            found.append((match.start(), digits))
+    for regex in (_WA_ME_RE, _WA_PHONE_RE, _WA_TEXT_E164_RE):
+        for match in regex.finditer(raw):
+            digits = _digits(match.group(1))
+            if _is_plausible_wa_digits(digits) and not (exclude_prefixes and digits.startswith(exclude_prefixes)):
+                found.append((match.start(), digits))
+    if not found and _STANDALONE_E164_RE.fullmatch(raw.strip()):
+        digits = _digits(raw)
+        if _is_plausible_wa_digits(digits) and not (exclude_prefixes and digits.startswith(exclude_prefixes)):
+            found.append((0, digits))
     if not found:
-        return ""
+        return []
     found.sort(key=lambda item: item[0])
-    return f"https://wa.me/{found[0][1]}"
+    return [f"https://wa.me/{d}" for _, d in found]
+
+
+def whatsapp_url(value):
+    """https://wa.me/<digits> from wa.me, api.whatsapp.com, or E.164 WhatsApp text. Groups ignored."""
+    urls = whatsapp_urls(value)
+    return urls[0] if urls else ""
 
 
 def email_of_text(value):
@@ -447,6 +472,11 @@ def keep_for_sheet(r):
         "tiktok_shop",
         "whop",
         "app_store",
+        "app_stores",
+        "ats_hiring",
+        "ph_detailed",
+        "d2c_whatsapp",
+        "fb_groups",
     }:
         return True
     return False
@@ -739,7 +769,7 @@ def _admit_direct_row(out, social_rows):
     No invented x.com or Telegram. A catalog row with only a public site is
     kept: contact_url is that site and contact_channels includes site.
     """
-    wa = whatsapp_url(out.get("whatsapp") or "")
+    wa = whatsapp_url(out.get("whatsapp") or out.get("phone") or "")
     email = email_of_text(str(out.get("work_email") or ""))
     linkedin = linkedin_in_url(out.get("founder_linkedin") or "") or linkedin_in_url(
         out.get("linkedin_url") or ""
@@ -787,6 +817,9 @@ def _admit_direct_row(out, social_rows):
     channels = []
     if wa:
         out["whatsapp"] = wa
+        wa_digits = re.sub(r"\D", "", wa)
+        if wa_digits:
+            out["phone"] = f"+{wa_digits}"
         links.append(wa)
         channels.append("whatsapp")
     if email:
@@ -881,6 +914,15 @@ def admit_discovered_row(row):
     out["founder_twitter"] = profile
     out["contact_url"] = profile
     channels = []
+    wa_on_x = whatsapp_url(out.get("whatsapp") or out.get("phone") or "")
+    if wa_on_x:
+        out["whatsapp"] = wa_on_x
+        wa_digits = re.sub(r"\D", "", wa_on_x)
+        if wa_digits:
+            out["phone"] = f"+{wa_digits}"
+        links.append(wa_on_x)
+        out["links"] = list(dict.fromkeys(links))
+        channels.append("whatsapp")
     for social in social_rows:
         platform = social.get("platform")
         if platform and platform != "telegram" and platform not in channels:

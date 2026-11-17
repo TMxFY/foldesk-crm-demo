@@ -84,8 +84,8 @@ DEFAULT_B2B_TG_GROUPS = (
     "producthunt_heroes",
 )
 DEFAULT_FB_GROUP_DISCOVERY_QUERIES = (
-    'site:facebook.com/groups ("OFM agency" OR "OnlyFans management" OR "OnlyFans agency")',
-    'site:facebook.com/groups ("Shopify brand owners" OR "SaaS founders" OR "UGC creators")',
+    'site:facebook.com/groups "Public group" ("OFM agency" OR "OnlyFans management" OR "OnlyFans agency")',
+    'site:facebook.com/groups "Public group" ("Shopify" OR "DTC" OR "Ecommerce" OR "UGC")',
 )
 OFM_DISCOVERY_QUERIES = (
     "OFM",
@@ -164,13 +164,13 @@ _IG_NOISE = frozenset(
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 _BAD_EMAIL_LOCAL = frozenset({"noreply", "no-reply", "donotreply"})
 _BAD_EMAIL_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
-_WA_ME_RE = re.compile(r"(?:https?://)?(?:www\.)?wa\.me/([%\d+][%\d\s().\-]*)", re.I)
+_WA_ME_RE = re.compile(r"(?:https?://)?(?:www\.)?wa\.me/(?:c/)?([%\d+][%\d\s().\-]*)", re.I)
 _WA_PHONE_RE = re.compile(
     r"https?://(?:www\.)?(?:api\.whatsapp\.com|whatsapp\.com)/send(?:/)?\?[^#]*?\bphone=(\+?[%\d][%\d\s().\-]{6,})",
     re.I,
 )
 _WA_TEXT_RE = re.compile(
-    r"(?:whatsapp|wa)\s*[:\-–—]?\s*(\+?\d[\d\s().\-]{7,18}\d)",
+    r"(?:whatsapp|wa)\s*(?:/\s*tel[^:\n]{0,18})?\s*[:\-–—]?\s*(\+?\d[\d\s().\-]{7,18}\d)",
     re.I,
 )
 _URL_RE = re.compile(r"(?:https?://[^\s<>()\[\]\"']+|www\.[^\s<>()\[\]\"']+)", re.I)
@@ -301,7 +301,8 @@ _OFM_AGENCY_OWNER_RE = re.compile(
     re.I,
 )
 _OFM_CONTEXT_RE = re.compile(
-    r"\b(?:ofm|onlyfans|only\s*fans|fanvue|mym|ai\s+model|mod[èe]le\s+ia|chatteur|chatteurs|chatter)\b",
+    r"\b(?:ofm|onlyfans|only[\s\-]?fans|fanvue|fansly|loyalfans|mym|ai\s+model|mod[èe]le\s+ia|chatteur|chatteurs|chatter)\b"
+    r"|\bof\s+(?:model|agency|creator|traffic|page)\b",
     re.I,
 )
 
@@ -1706,7 +1707,7 @@ def _unwrap_search_hits(payload: Any) -> list[dict[str, Any]]:
         return []
     for key in ("results", "items", "organic_results"):
         val = payload.get(key)
-        if isinstance(val, list):
+        if isinstance(val, list) and val:
             return [x for x in val if isinstance(x, dict)]
     for sub_key in ("output", "result", "data"):
         sub = payload.get(sub_key)
@@ -1724,7 +1725,7 @@ def _extract_fb_posts(payload: Any) -> list[dict[str, Any]]:
         return []
     for key in ("posts", "items", "results", "feed"):
         val = payload.get(key)
-        if isinstance(val, list):
+        if isinstance(val, list) and val:
             return [x for x in val if isinstance(x, dict)]
     for sub_key in ("output", "data", "result"):
         sub = payload.get(sub_key)
@@ -1803,7 +1804,7 @@ def collect_facebook_groups(
     group_urls: Iterable[str] | None = None,
     state_dir: str | Path | None = None,
     limit: int = 20,
-    max_groups: int = 3,
+    max_groups: int = 5,
     treg_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Discover & scrape public Facebook groups via Treg, routing OFM vs B2B leads."""

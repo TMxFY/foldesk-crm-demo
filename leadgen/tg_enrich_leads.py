@@ -122,6 +122,7 @@ CATEGORIES = [
     ("DeFi / DEX", r"\b(defi|dex\b|tvl|staking|yield|liquidity|lending|borrow|swap|amm|perp\w*|vault\w*)\b"),
     ("Gaming / AI", r"\b(game\w*|gamefi|p2e|playto|ai[- ]?(agent|app|tool|video|startup)|\bai\b|agent\w*|ml\b|нейросет\w*|metaverse)\b"),
     ("SaaS / AI app", r"\b(saas|b2b app|mobile app|ios app|android app|приложени\w*|app developer|indie\w*|micro[- ]?saas|product[- ]?hunt|software product|subscription app|ai app|ai tool|ai startup|gpt[- ]?app)\b"),
+    ("E-com / D2C", r"\b(shopify|e-?com(?:merce)?|d2c|dtc|skincare|cosmetics|supplements?|serum|gummies|collagen|haircare|fragrance|bodycare|online store|cosmetic brand|beauty brand)\b"),
     ("Медиа / контент", r"\b(podcast\w*|подкаст\w*|ama\b|media|медиа|newsletter|youtube|host\b|эфир\w*|content|show\b|канал)\b"),
 ]
 CAT_RE = [(name, re.compile(pat, re.IGNORECASE)) for name, pat in CATEGORIES]
@@ -550,21 +551,34 @@ def enrich_rows(
 
     strong_cats = {
         "SaaS / AI app",
+        "E-com / D2C",
         "CEX / биржа",
         "Проп трейдинг",
         "DeFi / DEX",
         "Gaming / AI",
         "Платёжки / финтех",
     }
-    commercial_sources = {"whop_content_rewards", "tiktok_ads", "tiktok_shop", "meta_ads", "app_store"}
+    commercial_sources = {
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+        "meta_ads",
+        "app_store",
+        "app_stores",
+        "d2c_whatsapp",
+        "fb_groups",
+        "facebook_groups",
+    }
     for r in rows:
         bio = r.get("bio") or ""
         existing_cat = str(r.get("category") or "").strip()
         classified_cat = classify_cat(bio)
-        src_val = str(r.get("source") or "").strip()
-        if existing_cat in strong_cats and (
+        src_val = str(r.get("source") or r.get("lead_source") or "").strip()
+        if existing_cat == "E-com / D2C" or str(r.get("monetization") or "").strip().lower() == "ecom":
+            cat = "E-com / D2C" if classified_cat in ("Web3 (общее)", "Медиа / контент", "E-com / D2C") else existing_cat or classified_cat
+        elif existing_cat in strong_cats and (
             classified_cat == "Web3 (общее)"
-            or (src_val in commercial_sources and classified_cat == "Медиа / контент")
+            or (src_val in commercial_sources and classified_cat in ("Медиа / контент", "E-com / D2C"))
         ):
             cat = existing_cat
         elif bio.strip():

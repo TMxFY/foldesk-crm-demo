@@ -1103,6 +1103,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if ofm_veins_v8 is None:
         apply_ofm_and_top_veins_v8(conn)
+    wa_d2c_v9 = conn.execute(
+        "SELECT 1 FROM kv_settings WHERE key = 'whatsapp_d2c_and_fb_groups_v9'"
+    ).fetchone()
+    if wa_d2c_v9 is None:
+        apply_whatsapp_d2c_and_fb_groups_v9(conn)
     conn.commit()
 
 
@@ -2095,6 +2100,59 @@ def apply_ofm_and_top_veins_v8(
     now_ts = utc_now()
     conn.execute(
         "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('ofm_and_top_veins_v8', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {"already_applied": False}
+
+
+def apply_whatsapp_d2c_and_fb_groups_v9(
+    conn: sqlite3.Connection, *, force: bool = False
+) -> dict:
+    """Idempotently enable d2c_whatsapp and default public Facebook groups in config."""
+    if not force:
+        done = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'whatsapp_d2c_and_fb_groups_v9'"
+        ).fetchone()
+        if done is not None:
+            return {"already_applied": True}
+
+    import json as _json
+    from app.leadgen_settings import DEFAULT_LEADGEN_CONFIG, _normalize_config, _resolve_config_json_path
+    from app.runtime_config import is_vps_runtime
+
+    cfg_row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = 'leadgen_config'"
+    ).fetchone()
+    cfg_p = _resolve_config_json_path()
+    existing_cfg = None
+    if cfg_row and cfg_row["value"]:
+        existing_cfg = _json.loads(str(cfg_row["value"]))
+    elif cfg_p.is_file():
+        existing_cfg = _json.loads(cfg_p.read_text(encoding="utf-8"))
+
+    if isinstance(existing_cfg, dict):
+        b2b = existing_cfg.setdefault("b2b", {})
+        sources = b2b.setdefault("sources", {})
+        sources["d2c_whatsapp"] = True
+        sources["facebook_groups"] = True
+        if not b2b.get("fb_group_urls"):
+            b2b["fb_group_urls"] = list(DEFAULT_LEADGEN_CONFIG["b2b"]["fb_group_urls"])
+        norm_cfg = _normalize_config(existing_cfg)
+        serialized_cfg = _json.dumps(norm_cfg, ensure_ascii=False, indent=2)
+        now_cfg_ts = utc_now()
+        if cfg_row:
+            conn.execute(
+                "UPDATE kv_settings SET value = ?, updated_at = ? WHERE key = 'leadgen_config'",
+                (serialized_cfg, now_cfg_ts),
+            )
+        if cfg_p.is_file() or is_vps_runtime() or os.environ.get("LEADGEN_CONFIG_PATH", "").strip():
+            cfg_p.parent.mkdir(parents=True, exist_ok=True)
+            cfg_p.write_text(serialized_cfg, encoding="utf-8")
+
+    now_ts = utc_now()
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('whatsapp_d2c_and_fb_groups_v9', '1', ?)",
         (now_ts,),
     )
     conn.commit()

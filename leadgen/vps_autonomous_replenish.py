@@ -175,10 +175,18 @@ def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict
 
         raw_tg = row.get("username") or row.get("telegram_username") or row.get("tg_username") or ""
         has_real_tg = _is_real_personal_tg_handle(raw_tg)
-        wa = whatsapp_url(row.get("whatsapp") or (row.get("phone") if str(row.get("provider") or "") == "whatsapp" else "") or "")
+        wa = whatsapp_url(row.get("whatsapp") or "") or (
+            whatsapp_url(row.get("phone") or "") if str(row.get("provider") or "").lower() == "whatsapp" else ""
+        )
         if has_real_tg or wa:
             if has_real_tg:
                 row["username"] = str(raw_tg).strip().lstrip("@")
+                row["provider"] = "telegram"
+            elif wa:
+                wa_digits = re.sub(r"\D", "", wa)
+                row["whatsapp"] = f"https://wa.me/{wa_digits}"
+                row["phone"] = f"+{wa_digits}"
+                row["provider"] = "whatsapp"
             tg_wa_rows.append(row)
             continue
 
@@ -1032,6 +1040,8 @@ def run_autonomous_replenish(
                     enabled_veins.append("ats_hiring")
                 if sources_cfg.get("ph_detailed", False) and "ph_detailed" not in quarantined:
                     enabled_veins.append("ph_detailed")
+                if sources_cfg.get("d2c_whatsapp", False) and "d2c_whatsapp" not in quarantined:
+                    enabled_veins.append("d2c_whatsapp")
                 if enabled_veins and "high_yield_veins" not in quarantined:
                     if treg_ready or monid_ready or runner is not subprocess.run:
                         _exec_stage(
@@ -1067,7 +1077,7 @@ def run_autonomous_replenish(
                     ]
                     fb_urls = [str(u).strip() for u in (b2b_cfg.get("fb_group_urls") or []) if str(u).strip()]
                     if fb_urls:
-                        fb_cmd.extend(["--fb-urls", ",".join(fb_urls)])
+                        fb_cmd.extend(["--fb-urls", ",".join(fb_urls), "--max-groups", str(max(5, len(fb_urls)))])
                     _exec_stage("facebook_groups", fb_cmd)
 
                 if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
@@ -1489,9 +1499,11 @@ def run_autonomous_replenish(
 
             b2b_camp = _find_campaign_by_name(conn, b2b_name)
             vac_camp = _find_campaign_by_name(conn, vac_name)
+            wa_name = str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)").strip() or "Leadgen Auto (WA)"
+            wa_camp = _find_campaign_by_name(conn, wa_name)
 
         # Step 3: Rule 5 Dry-Run quarantine rollback BEFORE finalizing replenish state
-        for camp_obj in (b2b_camp, vac_camp):
+        for camp_obj in (b2b_camp, vac_camp, wa_camp):
             if camp_obj is None:
                 continue
             preview_obj, q_ids = _enforce_rule5_quarantine_on_new_recipients(

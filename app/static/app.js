@@ -11499,6 +11499,7 @@ function ensureLeadgenState() {
           app_stores: true,
           ats_hiring: true,
           ph_detailed: true,
+          d2c_whatsapp: true,
           ofm_groups: true,
           facebook_groups: true,
           meta_ads: true,
@@ -11512,7 +11513,13 @@ function ensureLeadgenState() {
         tg_groups_new: ["productcircle_chat", "solofounderschat", "saasfounders"],
         tg_comment_channels: [],
         ofm_tg_groups: ["FranceOFM", "ofmfrancenetwork", "networkOFM", "mofmnetwork", "RedditWorldOFM", "aimodelnetwork", "AdultDeskAI"],
-        fb_group_urls: [],
+        fb_group_urls: [
+          "https://www.facebook.com/groups/ShopifyStorePros",
+          "https://www.facebook.com/groups/UnofficialShopifyPodcast",
+          "https://www.facebook.com/groups/startugc",
+          "https://www.facebook.com/groups/278248382953814",
+          "https://www.facebook.com/groups/595540634883097",
+        ],
         limits: {
           yc_limit: 50,
           ph_limit: 0,
@@ -11725,6 +11732,21 @@ function applyLeadgenProfilePreset(profileCode) {
   syncLeadgenSwitchBadges();
 }
 
+function _appendHarvestContactLink(children, item) {
+  const isWa = !item.username && (item.provider === "whatsapp" || item.phone);
+  const handle = item.username ? `@${String(item.username).replace(/^@/, "")}` : (item.phone ? `WA ${item.phone}` : "—");
+  const src = item.lead_source || "leadgen";
+  if (isWa && item.phone) {
+    const waDigits = String(item.phone).replace(/\D+/g, "");
+    const safeWaHref = waDigits ? safeHref(`https://wa.me/${waDigits}`) : "";
+    children.push(el("span", { className: "hint" }, [" · "]));
+    children.push(safeWaHref ? el("a", { href: safeWaHref, target: "_blank", rel: "noopener" }, [handle]) : el("span", { className: "hint" }, [handle]));
+    children.push(el("span", { className: "hint" }, [` · ${src}`]));
+  } else {
+    children.push(el("span", { className: "hint" }, [` · ${handle} · ${src}`]));
+  }
+}
+
 function renderLeadgenHarvest() {
   const status = state.leadgenStatus || {};
   const counts = status.crm_leadgen_counts || {};
@@ -11733,8 +11755,9 @@ function renderLeadgenHarvest() {
   if (harvestBadge) {
     const dxTotal = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
     const b2bTotal = Number(counts.b2b_leads) || 0;
+    const waTotal = Number(status.whatsapp_leads_count ?? counts.whatsapp_leads_count) || 0;
     const ofmTotal = Number(status.ofm_review_count ?? counts.ofm_review_count) || 0;
-    harvestBadge.textContent = `TG B2B: ${b2bTotal} · Direct/X: ${dxTotal} · OFM ревью: ${ofmTotal}`;
+    harvestBadge.textContent = `TG B2B: ${b2bTotal} · WA: ${waTotal} · Direct/X: ${dxTotal} · OFM ревью: ${ofmTotal}`;
   }
 
   const pillsHost = document.querySelector("#leadgen-harvest-sources-pills");
@@ -11777,12 +11800,8 @@ function renderLeadgenHarvest() {
     } else {
       tgItems.slice(0, 8).forEach((item) => {
         const comp = item.company || item.name || "Без названия";
-        const handle = item.username ? `@${String(item.username).replace(/^@/, "")}` : "—";
-        const src = item.lead_source || "leadgen";
-        const rowChildren = [
-          el("strong", {}, [comp]),
-          el("span", { className: "hint" }, [` · ${handle} · ${src}`]),
-        ];
+        const rowChildren = [el("strong", {}, [comp])];
+        _appendHarvestContactLink(rowChildren, item);
         const safeItemUrl = safeHref(item.url);
         if (safeItemUrl) {
           rowChildren.push(el("span", { className: "hint" }, [" · "]));
@@ -11873,9 +11892,10 @@ function renderLeadgenConfig() {
     const totalInCrm = Number(counts.total_leadgen_leads) || 0;
     const vacInCrm = Number(counts.vacancies_leads) || 0;
     const b2bInCrm = Number(counts.b2b_leads) || 0;
+    const waInCrm = Number(status.whatsapp_leads_count ?? counts.whatsapp_leads_count) || 0;
     const dxInPool = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
     const ofmInReview = Number(status.ofm_review_count ?? counts.ofm_review_count) || 0;
-    statsBadge.textContent = `В CRM: ${totalInCrm} (TG B2B: ${b2bInCrm} · Direct/X: ${dxInPool} · OFM ревью: ${ofmInReview} · Вакансии: ${vacInCrm})`;
+    statsBadge.textContent = `В CRM: ${totalInCrm} (TG B2B: ${b2bInCrm} · WA: ${waInCrm} · Direct/X: ${dxInPool} · OFM ревью: ${ofmInReview} · Вакансии: ${vacInCrm})`;
   }
 
   const setVal = (sel, val) => {

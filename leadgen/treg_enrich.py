@@ -141,8 +141,10 @@ def _search_hits_from_payload(payload: Any) -> list[dict]:
     for container in containers:
         for key in ("results", "items", "organic_results"):
             rows = container.get(key)
-            if isinstance(rows, list):
-                return [r for r in rows if isinstance(r, dict)]
+            if isinstance(rows, list) and rows:
+                dicts = [r for r in rows if isinstance(r, dict)]
+                if dicts:
+                    return dicts
     return []
 
 

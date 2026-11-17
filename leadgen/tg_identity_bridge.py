@@ -321,8 +321,10 @@ def _unwrap_search_hits(payload: Any) -> list[dict[str, Any]]:
         return []
     for k in ("results", "items", "organic_results"):
         val = payload.get(k)
-        if isinstance(val, list):
-            return [x for x in val if isinstance(x, dict)]
+        if isinstance(val, list) and val:
+            dicts = [x for x in val if isinstance(x, dict)]
+            if dicts:
+                return dicts
     for sub in ("output", "result", "data"):
         child = payload.get(sub)
         if isinstance(child, (dict, list)):
@@ -421,6 +423,7 @@ def bridge_lead_to_telegram(
         out["tg_username"] = nick
         out["telegram_url"] = tg_url
         out["tg_bridge_match"] = match_kind
+        out["provider"] = "telegram"
         channels = [str(c) for c in (out.get("contact_channels") or []) if str(c).strip()]
         if "telegram" not in channels:
             channels.insert(0, "telegram")

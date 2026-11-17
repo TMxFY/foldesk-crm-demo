@@ -349,6 +349,36 @@ if (root / "leadgen" / "meta_ad_leads.py").is_file() or "def run_autonomous_repl
     lg_settings_src = lg_settings_file.read_text(encoding="utf-8") if lg_settings_file.is_file() else ""
     if "ofm_review_leads.jsonl" not in lg_settings_src:
         errors.append("Gate G violation in app/leadgen_settings.py: push_discovered_now must exclude ofm_review_leads.jsonl")
+    hy_veins_file = root / "leadgen" / "high_yield_veins.py"
+    hy_veins_src = hy_veins_file.read_text(encoding="utf-8") if hy_veins_file.is_file() else ""
+    for d2c_label, d2c_src in (
+        ("leadgen/high_yield_veins.py", hy_veins_src),
+        ("leadgen/vps_autonomous_replenish.py", repl_src),
+        ("app/leadgen_settings.py", lg_settings_src),
+    ):
+        if "d2c_whatsapp" not in d2c_src:
+            errors.append(f"Gate G violation in {d2c_label}: missing 'd2c_whatsapp' wiring")
+    for ecom_path in (
+        root / "leadgen" / "tg_enrich_leads.py",
+        root / "leadgen" / "tg_llm_qualify.py",
+        root / "leadgen" / "tg_curate.py",
+        root / "leadgen" / "tg_to_gsheet.py",
+    ):
+        if ecom_path.is_file():
+            ecom_src = ecom_path.read_text(encoding="utf-8")
+            if "E-com / D2C" not in ecom_src:
+                errors.append(f"Gate G violation in {ecom_path.name}: missing 'E-com / D2C' category")
+    tg_enrich_file = root / "leadgen" / "tg_enrich_leads.py"
+    if tg_enrich_file.is_file():
+        tg_enrich_src = tg_enrich_file.read_text(encoding="utf-8")
+        if "d2c_whatsapp" not in tg_enrich_src or "fb_groups" not in tg_enrich_src:
+            errors.append("Gate G violation in leadgen/tg_enrich_leads.py: missing 'd2c_whatsapp' or 'fb_groups' protection")
+    mcp_push_file = root / "leadgen" / "crm_mcp_push.py"
+    if mcp_push_file.is_file() and "_push_tg_wa_split" not in mcp_push_file.read_text(encoding="utf-8"):
+        errors.append("Gate G violation in leadgen/crm_mcp_push.py: missing WA/TG split on --jsonl / Все2")
+    mcp_srv_file = root / "app" / "mcp_server.py"
+    if mcp_srv_file.is_file() and "is_item_wa_only" not in mcp_srv_file.read_text(encoding="utf-8"):
+        errors.append("Gate G violation in app/mcp_server.py: missing WA-only isolation in ingest_discovered_leads")
 
 if errors:
     for err in errors:
