@@ -94,7 +94,7 @@ jobs:
 
             healthy=0
             for i in $(seq 1 60); do
-              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && echo "$hc_json" | grep -q '"db_ok": true' && echo "$hc_json" | grep -q '"reply_alert_guard_ok": true'; then
+              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True else 1)'; then
                 healthy=1
                 break
               fi
