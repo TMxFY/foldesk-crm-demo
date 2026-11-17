@@ -209,6 +209,7 @@ async def sync_all_folders(
     conn, account_id: int, gateway, folder_ids: list[int] | None = None
 ) -> dict:
     if folder_ids is not None:
+        _connected(conn, account_id)
         target_ids = {
             fid for fid in (safe_int(raw_id) for raw_id in folder_ids) if fid is not None
         }
@@ -267,6 +268,8 @@ def _connected(conn, account_id: int) -> dict:
     account = load_account(conn, account_id)
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
+    if str(account.get("health") or "active").strip().lower() in ("unauthorized", "banned"):
+        raise ValueError("Аккаунт деавторизован, переподключите сессию")
     return account
 
 

@@ -1330,6 +1330,11 @@ def heal_transient_failed_recipients(conn, campaign_id: int | None = None) -> in
               OR error_text LIKE '%SpamBot%'
               OR error_text LIKE '%cannot message non-contacts%'
               OR error_text LIKE '%spam-reported%'
+              OR error_text LIKE '%limited until%'
+              OR error_text LIKE '%account is now limited%'
+              OR error_text LIKE '%PeerFlood%'
+              OR error_text LIKE '%PEER_FLOOD%'
+              OR error_text LIKE '%Too many requests%'
           )
         """,
         params,
@@ -1706,22 +1711,12 @@ def _cleanup_empty_step0_dialog(conn, step_idx: int, dialog: dict | None) -> Non
 
 def _is_spambot_or_peerflood_error(exc: Exception) -> bool:
     cause = getattr(exc, "__cause__", None)
-    blob = (
+    raw = (
         f"{exc.__class__.__name__} "
         f"{cause.__class__.__name__ if cause is not None else ''} "
         f"{cause or ''} {exc}"
-    ).casefold()
-    return any(
-        marker in blob
-        for marker in (
-            "spambot",
-            "spam-reported",
-            "cannot message non-contacts",
-            "peerspam",
-            "peerflood",
-            "peer_flood",
-        )
     )
+    return _is_spambot_restriction_error(raw)
 
 
 def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
@@ -1735,6 +1730,12 @@ def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
             "spam-reported",
             "cannot message non-contacts",
             "peerspam",
+            "limited until",
+            "account is now limited",
+            "while the account is limited",
+            "moderators have confirmed",
+            "ограничен до",
+            "временно ограничен",
         )
     ):
         return ("account_dead", "frozen")
@@ -1781,7 +1782,6 @@ def get_campaign(conn, campaign_id: int) -> dict:
     row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
     if row is None:
         raise LookupError("campaign")
-    heal_transient_failed_recipients(conn, int(campaign_id))
     camp = as_dict(row)
     if not camp:
         raise LookupError("campaign")
@@ -3678,6 +3678,7 @@ async def run_campaign_batch(
             respect_delays=respect_delays,
             strict=True,
         )
+    heal_transient_failed_recipients(conn, int(campaign_id))
     heal_orphaned_followups_from_dead_accounts(conn, int(campaign_id))
     camp = get_campaign(conn, campaign_id)
     account_ids = camp.get("account_ids") or []
@@ -3734,7 +3735,7 @@ async def run_campaign_batch(
             )
             if should_reprobe:
                 sb_res = await _call_probe_spambot(gateway, acc_sess_path, now_utc=eff_now_dt)
-                if sb_res.get("limited") is not None:
+                if sb_res.get("limited") is not None and sb_res.get("ok") is not False:
                     _SPAMBOT_PROBE_CACHE[cache_key] = (now_mono, sb_res)
                 else:
                     _SPAMBOT_PROBE_CACHE[cache_key] = (
@@ -3749,7 +3750,9 @@ async def run_campaign_batch(
                     health_val = "active"
                     is_spambot_warm_only = False
                 elif sb_res.get("limited") is True and sb_res.get("limited_until_utc"):
-                    set_account_cooldown_until(conn, acc_id_int, sb_res["limited_until_utc"])
+                    sb_until_dt = _parse_iso_dt(sb_res["limited_until_utc"])
+                    if sb_until_dt is not None and sb_until_dt > eff_now_dt:
+                        set_account_cooldown_until(conn, acc_id_int, sb_res["limited_until_utc"])
         if health_val in ("unauthorized", "banned") or (
             health_val == "frozen" and not is_spambot_warm_only
         ):

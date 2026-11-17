@@ -73,12 +73,26 @@ def _pick_account(conn, account_id: int | None) -> dict | None:
         row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
         if row is None:
             raise LookupError("account")
-        return as_dict(row)
+        acc = as_dict(row)
+        if str(acc.get("health") or "active").strip().lower() in ("unauthorized", "banned"):
+            raise ValueError("Аккаунт деавторизован, переподключите сессию")
+        return acc
     row = conn.execute(
-        "SELECT * FROM accounts WHERE status = 'connected' ORDER BY id LIMIT 1"
+        """
+        SELECT * FROM accounts
+        WHERE status = 'connected'
+          AND COALESCE(health, 'active') NOT IN ('unauthorized', 'banned')
+        ORDER BY id LIMIT 1
+        """
     ).fetchone()
     if row is None:
-        row = conn.execute("SELECT * FROM accounts ORDER BY id LIMIT 1").fetchone()
+        row = conn.execute(
+            """
+            SELECT * FROM accounts
+            WHERE COALESCE(health, 'active') NOT IN ('unauthorized', 'banned')
+            ORDER BY id LIMIT 1
+            """
+        ).fetchone()
     return as_dict(row) if row else None
 
 

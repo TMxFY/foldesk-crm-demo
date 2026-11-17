@@ -355,9 +355,56 @@ def delete_account(conn, account_id: int, gateway=None) -> dict:
     return {"deleted": True, "id": int(account_id), "session_path": session_path}
 
 
+_SPAMBOT_TERMINAL_DEAD_MARKERS = (
+    "user_deactivated",
+    "userdeactivated",
+    "phonenumberbanned",
+    "phone_number_banned",
+    "auth_key_unregistered",
+    "session_revoked",
+    "frozen_method_invalid",
+)
+
+_SPAMBOT_RESTRICTION_MARKERS = (
+    "spambot",
+    "cannot message non-contacts",
+    "peerspam",
+    "spam-reported",
+    "limited until",
+    "account is now limited",
+    "while the account is limited",
+    "currently limited",
+    "only send messages to mutual contacts",
+    "moderators have confirmed",
+    "account was blocked for violations",
+    "ограничен до",
+    "временно ограничен",
+    "аккаунт ограничен",
+    "наложены ограничения",
+    "пока действуют ограничения",
+    "писать первым вы пока не можете",
+    "ограничения будут сняты",
+    "обліковий запис обмежено",
+    "hesabınız şu anda sınırlandırılmıştır",
+    "peer_flood",
+    "peerflood",
+    "too many requests",
+)
+
+
 def _is_spambot_restriction_error(last_error: str | None) -> bool:
-    blob = str(last_error or "").casefold()
-    return any(m in blob for m in ("spambot", "cannot message non-contacts", "peerspam", "spam-reported"))
+    raw = str(last_error or "").strip()
+    if not raw:
+        return False
+    blob = raw.casefold()
+    if any(dead in blob for dead in _SPAMBOT_TERMINAL_DEAD_MARKERS):
+        return False
+    if any(m in blob for m in _SPAMBOT_RESTRICTION_MARKERS):
+        return True
+    from app.telegram_gateway import parse_spambot_details
+
+    details = parse_spambot_details(raw)
+    return bool(details.get("limited") is True or details.get("is_expired_limit"))
 
 
 def purge_dead_accounts(conn, gateway=None) -> dict:
@@ -372,7 +419,8 @@ def purge_dead_accounts(conn, gateway=None) -> dict:
     deleted_ids: list[int] = []
     deleted_paths: list[str] = []
     for row in rows:
-        if str(row[1] or "") == "frozen" and _is_spambot_restriction_error(row[2]):
+        health_val = str(row[1] or "").strip().lower()
+        if health_val == "frozen" and _is_spambot_restriction_error(row[2]):
             continue
         aid = int(row[0])
         try:
@@ -1664,12 +1712,17 @@ async def probe_account(conn, account_id: int, gateway) -> dict:
 reconnect_account = probe_account
 
 
-async def check_all_accounts(conn, gateway=None, wa_gateway=None) -> dict:
+async def check_all_accounts(
+    conn, gateway=None, wa_gateway=None, *, recheck_dead: bool = False
+) -> dict:
     rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
     wa_gw = wa_gateway or WhatsAppGateway()
     for row in rows:
         d = as_dict(row)
         if d.get("status") != "connected":
+            continue
+        health_val = str(d.get("health") or "active").strip().lower()
+        if not recheck_dead and health_val in ("unauthorized", "banned"):
             continue
         account_id = int(d["id"])
         session_path = str(d.get("session_path") or "")

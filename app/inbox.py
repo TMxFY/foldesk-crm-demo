@@ -2812,6 +2812,9 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
     cap = 50 if limit is None else max(1, min(int(limit), 50))
+    account_health = str(account.get("health") or "active").strip().lower()
+    if account_health in ("unauthorized", "banned"):
+        return list_messages(conn, dialog_id, cap)
     peer_id = int(dialog["peer_id"])
     if _is_synthetic_peer_id(peer_id) and dialog.get("username") and hasattr(gateway, "search_dialogs"):
         try:
@@ -3267,14 +3270,30 @@ async def start_direct_dialog(
         row = conn.execute("SELECT * FROM accounts WHERE id = ?", (int(account_id),)).fetchone()
         if row is not None:
             target_acc = as_dict(row)
+            if str(target_acc.get("health") or "active").strip().lower() in (
+                "unauthorized",
+                "banned",
+            ):
+                raise ValueError("Аккаунт деавторизован, переподключите сессию")
     if target_acc is None:
         row = conn.execute(
-            "SELECT * FROM accounts WHERE status = 'connected' ORDER BY id LIMIT 1"
+            """
+            SELECT * FROM accounts
+            WHERE status = 'connected'
+              AND COALESCE(health, 'active') NOT IN ('unauthorized', 'banned')
+            ORDER BY id LIMIT 1
+            """
         ).fetchone()
         if row is not None:
             target_acc = as_dict(row)
     if target_acc is None:
-        row = conn.execute("SELECT * FROM accounts ORDER BY id LIMIT 1").fetchone()
+        row = conn.execute(
+            """
+            SELECT * FROM accounts
+            WHERE COALESCE(health, 'active') NOT IN ('unauthorized', 'banned')
+            ORDER BY id LIMIT 1
+            """
+        ).fetchone()
         if row is not None:
             target_acc = as_dict(row)
     if target_acc is None:
@@ -3629,6 +3648,7 @@ async def get_dialog_avatar_with_cache(
         """
         SELECT d.*,
                a.session_path, a.status AS account_status, a.provider AS account_provider,
+               a.health AS account_health,
                l.name AS lead_name, l.company AS lead_company
         FROM dialogs d
         LEFT JOIN accounts a ON a.id = d.account_id
@@ -3650,6 +3670,7 @@ async def get_dialog_avatar_with_cache(
 
     session_path = str(data.get("session_path") or "").strip()
     provider = str(data.get("provider") or data.get("account_provider") or "telegram").strip().lower()
+    account_health = str(data.get("account_health") or "active").strip().lower()
     peer_id = data.get("peer_id")
     miss_marker = avatars_dir / f"dialog_{int(dialog_id)}.none"
 
@@ -3657,6 +3678,7 @@ async def get_dialog_avatar_with_cache(
         gateway is not None
         and hasattr(gateway, "download_profile_photo")
         and data.get("account_status") == "connected"
+        and account_health not in ("unauthorized", "banned")
         and provider == "telegram"
         and session_path
         and not session_path.startswith("data/sessions/demo")

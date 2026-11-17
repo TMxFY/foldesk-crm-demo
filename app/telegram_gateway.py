@@ -1914,15 +1914,16 @@ class TelethonGateway(TelegramGateway):
                     "reply_text": _clip_error(exc),
                 }
 
-            async def _send_start_and_read() -> str:
+            async def _send_start_and_read(min_prev_id: int = 0) -> tuple[str, int, int]:
                 sent_msg = await asyncio.wait_for(
                     client.send_message("SpamBot", "/start"), timeout=self._rpc_timeout
                 )
                 sent_id = int(getattr(sent_msg, "id", 0) or 0)
+                floor_id = max(sent_id, int(min_prev_id or 0))
                 text_found = ""
+                found_id = 0
                 for _ in range(6):
-                    if self._spambot_poll_sleep > 0:
-                        await asyncio.sleep(self._spambot_poll_sleep)
+                    await asyncio.sleep(max(0.0, float(self._spambot_poll_sleep)))
                     msgs = await asyncio.wait_for(
                         client.get_messages("SpamBot", limit=4), timeout=self._rpc_timeout
                     )
@@ -1931,20 +1932,54 @@ class TelethonGateway(TelegramGateway):
                             continue
                         mid = int(getattr(m, "id", 0) or 0)
                         txt = str(getattr(m, "message", None) or "").strip()
-                        if txt and (mid > sent_id or sent_id == 0):
+                        if txt and (mid > floor_id if floor_id > 0 else sent_id == 0):
                             text_found = txt
+                            found_id = mid
                             break
                     if text_found:
                         break
-                return text_found
+                return text_found, sent_id, found_id
 
             try:
-                reply_text = await _send_start_and_read()
+                reply_text, sent1_id, reply1_id = await _send_start_and_read(0)
                 d1 = parse_spambot_details(reply_text, now_utc=now_utc)
                 if d1["is_expired_limit"]:
-                    reply2 = await _send_start_and_read()
+                    try:
+                        reply2, _sent2_id, _reply2_id = await _send_start_and_read(
+                            max(sent1_id, reply1_id, 1)
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                        await self._drop_zombie_client_unlocked(session_path)
+                        return {
+                            "ok": False,
+                            "limited": True,
+                            "expired_limit_cleared": False,
+                            "limited_until_utc": d1["limited_until_utc"],
+                            "is_expired_limit": False,
+                            "reply_text": _clip_error(exc) or reply_text,
+                        }
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "limited": True,
+                            "expired_limit_cleared": False,
+                            "limited_until_utc": d1["limited_until_utc"],
+                            "is_expired_limit": False,
+                            "reply_text": _clip_error(exc) or reply_text,
+                        }
                     d2 = parse_spambot_details(reply2, now_utc=now_utc)
-                    if d2["limited"] is True and not d2["is_expired_limit"]:
+                    if d2["limited"] is None:
+                        return {
+                            "ok": False,
+                            "limited": True,
+                            "expired_limit_cleared": False,
+                            "limited_until_utc": d1["limited_until_utc"],
+                            "is_expired_limit": False,
+                            "reply_text": reply2 or reply_text,
+                        }
+                    if d2["limited"] is True:
                         return {
                             "ok": True,
                             "limited": True,
@@ -1959,7 +1994,7 @@ class TelethonGateway(TelegramGateway):
                         "expired_limit_cleared": True,
                         "limited_until_utc": d2["limited_until_utc"] or d1["limited_until_utc"],
                         "is_expired_limit": True,
-                        "reply_text": reply2 or reply_text,
+                        "reply_text": reply2,
                     }
                 return {
                     "ok": bool(reply_text),
@@ -3399,7 +3434,16 @@ class FakeGateway(TelegramGateway):
         if d1["is_expired_limit"]:
             reply2 = _next_fake_reply()
             d2 = parse_spambot_details(reply2, now_utc=now_utc)
-            if d2["limited"] is True and not d2["is_expired_limit"]:
+            if d2["limited"] is None:
+                return {
+                    "ok": False,
+                    "limited": True,
+                    "expired_limit_cleared": False,
+                    "limited_until_utc": d1["limited_until_utc"],
+                    "is_expired_limit": False,
+                    "reply_text": reply2 or reply1,
+                }
+            if d2["limited"] is True:
                 return {
                     "ok": True,
                     "limited": True,
@@ -3414,7 +3458,7 @@ class FakeGateway(TelegramGateway):
                 "expired_limit_cleared": True,
                 "limited_until_utc": d2["limited_until_utc"] or d1["limited_until_utc"],
                 "is_expired_limit": True,
-                "reply_text": reply2 or reply1,
+                "reply_text": reply2,
             }
         return {
             "ok": bool(reply1),
