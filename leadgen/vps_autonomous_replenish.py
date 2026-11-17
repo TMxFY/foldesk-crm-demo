@@ -42,37 +42,11 @@ from leadgen.tg_to_gsheet import (
     whatsapp_url,
     x_profile_url,
 )
-from leadgen.treg_client import treg_bin
+from leadgen.treg_client import check_treg_ready, treg_bin
 
 DEFAULT_DB_PATH = "/opt/crmtg/data/crm.db"
 DEFAULT_SCRAPER_SESSIONS_DIR = "/opt/crmtg/data/scraper_sessions"
 _NOISE_TG_HANDLES = frozenset({"joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "socks"})
-
-
-def check_treg_ready() -> bool:
-    """Verify treg CLI binary exists and either TREG_API_KEY or non-empty ~/.treg/config.json is present."""
-    binary = treg_bin()
-    if not binary:
-        return False
-    if (os.environ.get("TREG_API_KEY") or "").strip():
-        return True
-    cfg_raw = (os.environ.get("TREG_CONFIG_PATH") or "").strip()
-    cfg_path = Path(cfg_raw).expanduser() if cfg_raw else Path("~/.treg/config.json").expanduser()
-    if not cfg_path.is_file():
-        return False
-    try:
-        content = cfg_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return False
-    if not content:
-        return False
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict):
-            return any(bool(str(v or "").strip()) for v in parsed.values())
-        return bool(parsed)
-    except json.JSONDecodeError:
-        return True
 
 
 def _is_real_personal_tg_handle(raw_username: Any) -> bool:
@@ -183,12 +157,26 @@ def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict
         fx = x_profile_url(row)
         fli = linkedin_of(row)
         if em or fx or fli:
+            comp_val = str(row.get("company") or row.get("project") or "").strip()
+            angle_val = str(row.get("their_angle") or row.get("what_they_do") or "").strip()
+            if comp_val:
+                row["company"] = comp_val
+                row["project"] = comp_val
+            if site_val:
+                row["url"] = site_val
+                row["project_url"] = site_val
+            if angle_val:
+                row["their_angle"] = angle_val
+                row["what_they_do"] = angle_val
             if em:
                 row["work_email"] = em
+                row["email"] = em
             if fx:
                 row["founder_x"] = fx
+                row["x_url"] = fx
             if fli:
                 row["founder_linkedin"] = fli
+                row["linkedin_url"] = fli
             row["route_channel"] = "x" if (fx and not em and not fli) else "direct"
             d_keys = _direct_x_dedup_keys(row)
             if d_keys and any(k in existing_dx_keys for k in d_keys):

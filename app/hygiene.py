@@ -163,12 +163,12 @@ _VACANCY_SOURCE_OR_CAT_RE = re.compile(
     re.IGNORECASE,
 )
 _WARM_MANUAL_SOURCE_RE = re.compile(
-    r"(?:\breferral\b|реферал|\binbound\b|входящ|рекомендац)",
+    r"(?:\breferral\b|реферал|\binbound\b|входящ|рекомендац|\bmanual\b|ручн|\bother\b|\bairtable\b|\bpartner\b|партн[её]р)",
     re.IGNORECASE,
 )
 _COLD_OUTREACH_OR_LEADGEN_SOURCE_RE = re.compile(
     r"(?:cold\s+outreach|leadgen|google\s+sheet|product\s+hunt|\byc\b|hacker\s+news|\bhn\b|"
-    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|catalog|linkedin|rea[\s_\-]*video|direct|scrape)",
+    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|catalog|linkedin|rea[\s_\-]*video|direct|scrape|github)",
     re.IGNORECASE,
 )
 
@@ -322,46 +322,22 @@ def _call_external_sniper_reject(
 ) -> str:
     if _external_sniper_reject_reason is None:
         return ""
-    try:
-        sig = inspect.signature(_external_sniper_reject_reason)
-        params = sig.parameters
-        accepts_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
-        candidate_kwargs = {
-            "text": blob,
-            "name": name,
-            "company": company,
-            "category": niche,
-            "niche": niche,
-            "note": note,
-            "description": description,
-            "their_angle": description or note,
-            "url": url,
-            "website": url,
-            "lead_source": lead_source,
-            "source": lead_source,
-            "vacancies_enabled": vacancies_enabled,
-        }
-        if accepts_kwargs:
-            res = _external_sniper_reject_reason(**candidate_kwargs)
-        else:
-            pos_only = [
-                p
-                for p in params.values()
-                if p.kind
-                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            filtered_kw = {k: v for k, v in candidate_kwargs.items() if k in params}
-            if filtered_kw:
-                res = _external_sniper_reject_reason(**filtered_kw)
-            elif pos_only:
-                res = _external_sniper_reject_reason(blob)
-            else:
-                res = ""
-        return str(res or "").strip()
-    except Exception:
-        return ""
+    row_payload = {
+        "name": name,
+        "company": company,
+        "project": company,
+        "category": niche,
+        "niche": niche,
+        "note": note,
+        "description": description,
+        "their_angle": description or note,
+        "project_url": url,
+        "url": url,
+        "source": lead_source,
+        "text": blob,
+    }
+    res = _external_sniper_reject_reason(row_payload, category=niche or None)
+    return str(res or "").strip()
 
 
 def sniper_lead_violation_reason(
@@ -584,15 +560,30 @@ def is_protected_crm_deal(lead: dict[str, Any]) -> bool:
     return False
 
 
-def _is_cold_or_empty_source(lead_source: Any) -> bool:
-    src = str(lead_source or "").strip()
-    if not src:
-        return True
-    if _WARM_MANUAL_SOURCE_RE.search(src):
+def _is_cold_outreach_eligible_lead(
+    ld: dict[str, Any],
+    *,
+    outreach_lead_ids: set[int],
+    outreach_usernames: set[str],
+) -> bool:
+    """Return True ONLY for cold-outreach/leadgen leads; never touch manual, folder-synced, or 'Other' leads."""
+    if ld.get("folder_id") is not None:
         return False
-    if _COLD_OUTREACH_OR_LEADGEN_SOURCE_RE.search(src):
+    src = str(ld.get("lead_source") or "").strip()
+    if src and _WARM_MANUAL_SOURCE_RE.search(src):
+        return False
+    if src and _COLD_OUTREACH_OR_LEADGEN_SOURCE_RE.search(src):
         return True
-    return True
+    lid = int(ld.get("id") or 0)
+    uname = _clean_username_token(ld.get("username")).lower()
+    if lid in outreach_lead_ids or (uname and uname in outreach_usernames):
+        return True
+    if not src:
+        # Untouched newborn row without folder/dialog/source (e.g. unattributed raw insert)
+        status_low = str(ld.get("status") or "").strip().lower()
+        has_dialog = ld.get("dialog_id") is not None and int(ld.get("dialog_id") or 0) > 0
+        return status_low == "new" and not has_dialog
+    return False
 
 
 def _is_vacancy_or_qa_campaign(camp_name: str | None, leadgen_sources_json: str | None = None) -> bool:
@@ -612,6 +603,17 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
     active_junk_leads: list[tuple[int, str, dict[str, Any]]] = []
     dirty_title_leads: list[tuple[int, str, str | None, dict[str, Any]]] = []
 
+    outreach_lead_ids: set[int] = set()
+    outreach_usernames: set[str] = set()
+    for rr_link in conn.execute(
+        "SELECT lead_id, username FROM campaign_recipients"
+    ).fetchall():
+        if rr_link["lead_id"] is not None:
+            outreach_lead_ids.add(int(rr_link["lead_id"]))
+        u_tok = _clean_username_token(rr_link["username"]).lower()
+        if u_tok:
+            outreach_usernames.add(u_tok)
+
     lead_rows = conn.execute("SELECT * FROM leads ORDER BY id ASC").fetchall()
     leads_by_id: dict[int, dict[str, Any]] = {}
     for lr in lead_rows:
@@ -624,7 +626,11 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
 
         status_low = str(ld.get("status") or "").strip().lower()
         lead_source = str(ld.get("lead_source") or "").strip()
-        is_cold_src = _is_cold_or_empty_source(lead_source)
+        is_cold_src = _is_cold_outreach_eligible_lead(
+            ld,
+            outreach_lead_ids=outreach_lead_ids,
+            outreach_usernames=outreach_usernames,
+        )
 
         if status_low in _ACTIVE_COLD_LEAD_STATUSES and is_cold_src:
             has_contact = _has_messenger_contact(
@@ -782,7 +788,11 @@ def audit_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def heal_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
+def heal_crm_hygiene(
+    conn: sqlite3.Connection,
+    *,
+    clear_stale_stage_errors: bool = False,
+) -> dict[str, Any]:
     findings = _collect_hygiene_findings(conn)
     now_ts = utc_now()
 
@@ -863,7 +873,14 @@ def heal_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
             )
         sanitized_leads += int(cur.rowcount or 0)
 
-    if quarantined_recipients or quarantined_leads or sanitized_leads:
+    cleared_stage_errors = 0
+    if clear_stale_stage_errors:
+        cur_err = conn.execute(
+            "DELETE FROM kv_settings WHERE key = 'leadgen_stage_errors'"
+        )
+        cleared_stage_errors = int(cur_err.rowcount or 0)
+
+    if quarantined_recipients or quarantined_leads or sanitized_leads or cleared_stage_errors:
         conn.execute(
             """
             INSERT INTO kv_settings (key, value, updated_at)
@@ -874,55 +891,79 @@ def heal_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
         )
         conn.commit()
 
-    return {
+    res_dict: dict[str, Any] = {
         "quarantined_recipients": quarantined_recipients,
         "quarantined_leads": quarantined_leads,
         "sanitized_leads": sanitized_leads,
     }
+    if clear_stale_stage_errors:
+        res_dict["cleared_stage_errors"] = cleared_stage_errors
+    return res_dict
 
 
 def _check_treg_ready() -> bool:
-    bin_found = bool(shutil.which("treg"))
-    if not bin_found:
-        for cand in (Path("~/.local/bin/treg").expanduser(), Path("/usr/local/bin/treg")):
-            try:
-                if cand.is_file():
-                    bin_found = True
-                    break
-            except OSError:
-                continue
-    if not bin_found:
+    try:
+        from leadgen.treg_client import check_treg_ready
+
+        return check_treg_ready()
+    except ImportError:
         return False
 
-    if os.environ.get("TREG_API_KEY", "").strip():
-        return True
-    for cfg_cand in (Path("~/.treg/config.json").expanduser(), Path("/root/.treg/config.json")):
-        try:
-            if cfg_cand.is_file() and cfg_cand.stat().st_size > 2:
-                return True
-        except OSError:
-            continue
-    return False
+
+def _parse_iso_ts_utc(raw: Any):
+    from datetime import datetime, timezone
+
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        norm = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+        dt = datetime.fromisoformat(norm)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+STAGE_ERROR_TTL_SECONDS = 6 * 3600
 
 
 def _count_stage_timeouts_or_errors(conn: sqlite3.Connection) -> int:
+    from datetime import datetime, timezone
+
     try:
         row = conn.execute(
-            "SELECT value FROM kv_settings WHERE key = 'leadgen_stage_errors'"
+            "SELECT value, updated_at FROM kv_settings WHERE key = 'leadgen_stage_errors'"
         ).fetchone()
     except sqlite3.Error:
         return 0
     if not row or not row["value"]:
         return 0
+
+    now_dt = datetime.now(timezone.utc)
+    row_dt = _parse_iso_ts_utc(row["updated_at"])
     try:
         parsed = json.loads(str(row["value"]))
     except json.JSONDecodeError:
         return 0
+
+    if isinstance(parsed, dict):
+        if row_dt is not None and (now_dt - row_dt).total_seconds() > STAGE_ERROR_TTL_SECONDS:
+            return 0
+        cnt = 0
+        for v in parsed.values():
+            s = str(v or "").lower()
+            if "timeout" in s or "error" in s or "fail" in s:
+                cnt += 1
+        return cnt
+
     if not isinstance(parsed, list):
         return 0
     cnt = 0
     for item in parsed:
         if not isinstance(item, dict):
+            continue
+        item_dt = _parse_iso_ts_utc(item.get("at")) or row_dt
+        if item_dt is not None and (now_dt - item_dt).total_seconds() > STAGE_ERROR_TTL_SECONDS:
             continue
         has_timeout = bool(item.get("timeout")) or "timeout" in str(item.get("error") or "").lower()
         try:
@@ -1044,22 +1085,63 @@ def audit_server_leadgen_readiness(
     }
 
 
+def _direct_x_canonical_keys(row: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    em = str(row.get("email") or row.get("work_email") or "").strip().lower()
+    if em:
+        keys.add(f"email:{em}")
+    xu = str(row.get("x_url") or row.get("founder_x") or row.get("founder_twitter") or "").strip().lower().rstrip("/")
+    if xu:
+        if "://" not in xu and not xu.startswith("x.com/"):
+            xu = f"https://x.com/{xu.lstrip('@')}"
+        keys.add(f"x:{xu}")
+    lu = str(row.get("linkedin_url") or row.get("founder_linkedin") or "").strip().lower().rstrip("/")
+    if lu:
+        keys.add(f"li:{lu}")
+    raw_u = str(row.get("url") or row.get("website") or row.get("project_url") or row.get("site") or "").strip()
+    if raw_u and not _ss_is_platform_url(raw_u):
+        host = (urlparse(raw_u if "://" in raw_u else f"https://{raw_u}").hostname or "").lower().removeprefix("www.").rstrip(".")
+        if host and "." in host:
+            keys.add(f"dom:{host}")
+    return keys
+
+
+def _normalize_direct_x_record(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    comp = str(out.get("company") or out.get("project") or "").strip() or None
+    email = str(out.get("email") or out.get("work_email") or "").strip() or None
+    x_url = str(out.get("x_url") or out.get("founder_x") or out.get("founder_twitter") or "").strip() or None
+    if x_url and "://" not in x_url:
+        x_url = f"https://x.com/{x_url.lstrip('@')}"
+    linkedin_url = str(out.get("linkedin_url") or out.get("founder_linkedin") or "").strip() or None
+    url = str(out.get("url") or out.get("website") or out.get("project_url") or out.get("site") or "").strip() or None
+    angle = str(out.get("their_angle") or out.get("what_they_do") or "").strip() or None
+    lead_src = str(out.get("lead_source") or out.get("source") or "").strip() or None
+    out["company"] = comp
+    out["project"] = comp or out.get("project")
+    out["email"] = email
+    out["work_email"] = email or out.get("work_email")
+    out["x_url"] = x_url
+    out["founder_x"] = x_url or out.get("founder_x")
+    out["linkedin_url"] = linkedin_url
+    out["founder_linkedin"] = linkedin_url or out.get("founder_linkedin")
+    out["url"] = url
+    out["project_url"] = url or out.get("project_url")
+    out["their_angle"] = angle
+    out["what_they_do"] = angle or out.get("what_they_do")
+    out["lead_source"] = lead_src
+    return out
+
+
 def append_direct_x_lead(state_dir: Path, payload: dict[str, Any]) -> bool:
-    """Append a contactless direct/X/email ICP lead to state_dir/direct_x_leads.jsonl without duplicates."""
-    email = str(payload.get("email") or "").strip()
-    x_url = str(payload.get("x_url") or "").strip()
-    url = str(payload.get("url") or payload.get("website") or "").strip()
-    if not any((email, x_url, url)):
+    """Append a contactless direct/X/email/LinkedIn ICP lead to state_dir/direct_x_leads.jsonl without duplicates."""
+    norm = _normalize_direct_x_record(payload)
+    if not any((norm.get("email"), norm.get("x_url"), norm.get("linkedin_url"), norm.get("url"))):
         return False
 
     state_dir.mkdir(parents=True, exist_ok=True)
     target = state_dir / "direct_x_leads.jsonl"
-    dedup_key = (
-        email.lower(),
-        x_url.lower(),
-        url.lower(),
-        str(payload.get("company") or "").strip().lower(),
-    )
+    cand_keys = _direct_x_canonical_keys(norm)
 
     if target.is_file():
         try:
@@ -1073,32 +1155,16 @@ def append_direct_x_lead(state_dir: Path, payload: dict[str, Any]) -> bool:
                     continue
                 if not isinstance(existing, dict):
                     continue
-                ex_key = (
-                    str(existing.get("email") or "").strip().lower(),
-                    str(existing.get("x_url") or "").strip().lower(),
-                    str(existing.get("url") or existing.get("website") or "").strip().lower(),
-                    str(existing.get("company") or "").strip().lower(),
-                )
-                if ex_key == dedup_key:
+                ex_keys = _direct_x_canonical_keys(existing)
+                if cand_keys and ex_keys and (cand_keys & ex_keys):
                     return False
         except OSError:
             pass
 
-    record = {
-        "name": payload.get("name"),
-        "company": payload.get("company"),
-        "email": email or None,
-        "x_url": x_url or None,
-        "url": url or None,
-        "category": payload.get("category"),
-        "their_angle": payload.get("their_angle"),
-        "lead_source": payload.get("lead_source"),
-        "icp_score": payload.get("icp_score"),
-        "saved_at": utc_now(),
-    }
+    norm.setdefault("saved_at", utc_now())
     try:
         with target.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(norm, ensure_ascii=False) + "\n")
         return True
     except OSError:
         return False
@@ -1118,7 +1184,7 @@ def read_direct_x_leads(state_dir: Path, *, limit: int = 50, query: str = "") ->
                 except json.JSONDecodeError:
                     continue
                 if isinstance(obj, dict):
-                    items.append(obj)
+                    items.append(_normalize_direct_x_record(obj))
         except OSError:
             pass
 
@@ -1131,7 +1197,22 @@ def read_direct_x_leads(state_dir: Path, *, limit: int = 50, query: str = "") ->
             if q_low
             in " ".join(
                 str(it.get(k) or "")
-                for k in ("name", "company", "email", "x_url", "url", "category", "their_angle")
+                for k in (
+                    "name",
+                    "company",
+                    "project",
+                    "email",
+                    "work_email",
+                    "x_url",
+                    "founder_x",
+                    "linkedin_url",
+                    "founder_linkedin",
+                    "url",
+                    "project_url",
+                    "category",
+                    "their_angle",
+                    "what_they_do",
+                )
             ).lower()
         ]
 

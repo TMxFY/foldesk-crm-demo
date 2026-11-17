@@ -15,11 +15,53 @@ from typing import Any
 
 
 def treg_bin() -> str | None:
-    return shutil.which("treg") or (
-        os.path.expanduser("~/.local/bin/treg")
-        if os.path.isfile(os.path.expanduser("~/.local/bin/treg"))
-        else None
+    found = shutil.which("treg")
+    if found:
+        return found
+    for candidate in (
+        os.path.expanduser("~/.local/bin/treg"),
+        "/usr/local/bin/treg",
+        "/opt/crmtg/.venv/bin/treg",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def check_treg_ready() -> bool:
+    """Return True iff treg CLI is installed, enabled, and backed by credentials."""
+    if os.getenv("TREG_ENRICH", "1").lower() in {"0", "false", "no"}:
+        return False
+    if not treg_bin():
+        return False
+    if (os.environ.get("TREG_API_KEY") or "").strip():
+        return True
+    cfg_raw = (os.environ.get("TREG_CONFIG_PATH") or "").strip()
+    candidates = (
+        [os.path.expanduser(cfg_raw)]
+        if cfg_raw
+        else [os.path.expanduser("~/.treg/config.json"), "/root/.treg/config.json"]
     )
+    for cfg_path in candidates:
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path, encoding="utf-8") as fh:
+                content = fh.read().strip()
+        except OSError:
+            continue
+        if not content:
+            continue
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                if any(bool(str(v or "").strip()) for v in parsed.values()):
+                    return True
+            elif bool(parsed):
+                return True
+        except json.JSONDecodeError:
+            return True
+    return False
 
 
 def call(

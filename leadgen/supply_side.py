@@ -145,7 +145,6 @@ _UNCONDITIONAL_SUPPLY_OR_AGENCY = re.compile(
     r"\bngrok\s+alternative\b|\bcontainer\s+runtime\b|\bcodebase\s+knowledge\s+graph\b|"
     r"движок\s+графов\s+знаний(?:\s+кодовой\s+базы)?|"
     r"синхронизирует\s+ai[- ]кодинг[- ]агентов|\bкодинг[- ]агентов\b|"
-    r"\bgleanary\b|\bagentmash\b|"
     r"\baccount\s+recovery\s+apis?\b|\bethical\s+hacking\b|\bbacklink\s+indexing\b|"
     r"\btelegram\s+bot\s+setup\b|"
     r"\bjava\s+build\s+tool\b|\bold\s+css\s+hack\b|"

@@ -1983,7 +1983,7 @@ def apply_sniper_icp_cleanup_v7(
 
     from app.hygiene import heal_crm_hygiene
 
-    heal_res = heal_crm_hygiene(conn)
+    heal_res = heal_crm_hygiene(conn, clear_stale_stage_errors=True)
     now_ts = utc_now()
     conn.execute(
         "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('sniper_icp_cleanup_v7', '1', ?)",

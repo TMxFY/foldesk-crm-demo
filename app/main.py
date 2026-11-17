@@ -122,12 +122,7 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 
 def _load_hygiene_module():
-    try:
-        return importlib.import_module("app.hygiene")
-    except ModuleNotFoundError as exc:
-        if exc.name in ("app.hygiene", "hygiene"):
-            return None
-        raise
+    return importlib.import_module("app.hygiene")
 
 
 def _heal_crm_hygiene_safe(conn) -> dict:
@@ -137,49 +132,17 @@ def _heal_crm_hygiene_safe(conn) -> dict:
             "quarantined_leads": 0,
             "sanitized_leads": 0,
         }
-    hygiene_mod = _load_hygiene_module()
-    if hygiene_mod is None:
-        return {
-            "quarantined_recipients": 0,
-            "quarantined_leads": 0,
-            "sanitized_leads": 0,
-        }
-    return hygiene_mod.heal_crm_hygiene(conn)
+    return _load_hygiene_module().heal_crm_hygiene(conn)
 
 
 def _audit_crm_hygiene_safe(conn) -> dict:
-    hygiene_mod = _load_hygiene_module()
-    if hygiene_mod is None:
-        return {
-            "ok": True,
-            "active_junk_recipient_count": 0,
-            "active_junk_lead_count": 0,
-            "contactless_lead_count": 0,
-            "dirty_title_lead_count": 0,
-        }
-    return hygiene_mod.audit_crm_hygiene(conn)
+    return _load_hygiene_module().audit_crm_hygiene(conn)
 
 
 def _audit_server_leadgen_readiness_safe(
     conn, *, enforce_vps_checks: bool | None = None
 ) -> dict:
     hygiene_mod = _load_hygiene_module()
-    if hygiene_mod is None:
-        return {
-            "ok": True,
-            "enforced": bool(enforce_vps_checks)
-            if enforce_vps_checks is not None
-            else is_vps_runtime(),
-            "leadgen_enabled": True,
-            "llm_key_ready": True,
-            "scraper_session_required": False,
-            "scraper_session_ready": True,
-            "treg_required": False,
-            "treg_ready": True,
-            "typesafe_ready": True,
-            "stage_timeout_count": 0,
-            "missing_components": [],
-        }
     if enforce_vps_checks is None:
         return hygiene_mod.audit_server_leadgen_readiness(conn)
     return hygiene_mod.audit_server_leadgen_readiness(

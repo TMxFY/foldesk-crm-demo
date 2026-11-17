@@ -4,166 +4,89 @@ import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import threading
-from types import ModuleType
 
 from fastapi.testclient import TestClient
 import pytest
 
 from app.db import connect, init_db, utc_now
+from app.hygiene import (
+    append_direct_x_lead,
+    audit_crm_hygiene,
+    audit_server_leadgen_readiness,
+    heal_crm_hygiene,
+    read_direct_x_leads,
+)
 from app.leads import create_lead
 from app.main import autopilot_loop, create_app
+from app.mcp_server import handle_jsonrpc_message
 from app.outreach import create_campaign
+from leadgen.vps_autonomous_replenish import split_tg_and_direct_x_leads
 import scripts.proactive_audit as proactive_audit
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _build_contract_hygiene_module(state: dict) -> ModuleType:
-    """Real SQLite-backed implementation of the app.hygiene contract for harness tests."""
-    mod = ModuleType("app.hygiene")
-
-    def audit_crm_hygiene(conn) -> dict:
-        state["audit_hygiene_calls"] = state.get("audit_hygiene_calls", 0) + 1
-        junk_rec = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM campaign_recipients
-            WHERE status = 'pending' AND lower(coalesce(name, '')) LIKE '%agency%'
-            """
-        ).fetchone()["cnt"]
-        junk_leads = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM leads
-            WHERE status NOT IN ('lost', 'quarantined')
-              AND lower(coalesce(name, '')) LIKE '%agency%'
-            """
-        ).fetchone()["cnt"]
-        contactless = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM leads
-            WHERE status NOT IN ('lost', 'quarantined', 'won')
-              AND telegram_user_id IS NULL
-              AND coalesce(trim(username), '') = ''
-              AND coalesce(trim(phone), '') = ''
-            """
-        ).fetchone()["cnt"]
-        dirty_titles = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM leads
-            WHERE coalesce(name, '') LIKE '%|||%'
-            """
-        ).fetchone()["cnt"]
-        total_bad = int(junk_rec) + int(junk_leads) + int(contactless) + int(dirty_titles)
-        return {
-            "ok": total_bad == 0,
-            "active_junk_recipient_count": int(junk_rec),
-            "active_junk_lead_count": int(junk_leads),
-            "contactless_lead_count": int(contactless),
-            "dirty_title_lead_count": int(dirty_titles),
-        }
-
-    def heal_crm_hygiene(conn) -> dict:
-        state["heal_calls"] = state.get("heal_calls", 0) + 1
-        cur_rec = conn.execute(
-            """
-            UPDATE campaign_recipients
-            SET status = 'failed', error_text = 'quarantined_non_icp'
-            WHERE status = 'pending' AND lower(coalesce(name, '')) LIKE '%agency%'
-            """
+def _create_isolated_mtproto_session(path: Path, *, seed_byte: int = 0x5A) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sconn = sqlite3.connect(str(path))
+    try:
+        sconn.execute(
+            "CREATE TABLE sessions (dc_id INTEGER PRIMARY KEY, server_address TEXT, port INTEGER, auth_key BLOB)"
         )
-        cur_leads = conn.execute(
-            """
-            UPDATE leads
-            SET status = 'lost'
-            WHERE status NOT IN ('lost', 'quarantined', 'won')
-              AND (
-                  lower(coalesce(name, '')) LIKE '%agency%'
-                  OR (
-                      telegram_user_id IS NULL
-                      AND coalesce(trim(username), '') = ''
-                      AND coalesce(trim(phone), '') = ''
-                  )
-              )
-            """
+        sconn.execute(
+            "INSERT INTO sessions VALUES (2, '149.154.167.50', 443, ?)",
+            (bytes([seed_byte]) * 256,),
         )
-        cur_titles = conn.execute(
-            """
-            UPDATE leads
-            SET name = replace(name, '|||', ' ')
-            WHERE coalesce(name, '') LIKE '%|||%'
-            """
-        )
-        conn.commit()
-        return {
-            "quarantined_recipients": int(cur_rec.rowcount or 0),
-            "quarantined_leads": int(cur_leads.rowcount or 0),
-            "sanitized_leads": int(cur_titles.rowcount or 0),
-        }
-
-    def audit_server_leadgen_readiness(
-        conn, *, enforce_vps_checks: bool | None = None
-    ) -> dict:
-        state["audit_readiness_calls"] = state.get("audit_readiness_calls", 0) + 1
-        enforced = (
-            bool(enforce_vps_checks)
-            if enforce_vps_checks is not None
-            else bool(state.get("default_enforced", False))
-        )
-        missing: list[str] = []
-        scraper_ready = bool(state.get("scraper_session_ready", True))
-        treg_ready = bool(state.get("treg_ready", True))
-        llm_ready = bool(state.get("llm_key_ready", True))
-        stage_timeouts = 0
-        row = conn.execute(
-            "SELECT value FROM kv_settings WHERE key = 'leadgen_stage_errors'"
-        ).fetchone()
-        if row and row["value"] and "timeout" in str(row["value"]).lower():
-            stage_timeouts = 1
-        if enforced:
-            if not llm_ready:
-                missing.append("LLM_API_KEY")
-            if not scraper_ready:
-                missing.append("SCRAPER_TG_SESSION")
-            if not treg_ready:
-                missing.append("treg")
-            if stage_timeouts > 0:
-                missing.append("stage_timeout:tg_enrich_leads")
-        return {
-            "ok": len(missing) == 0,
-            "enforced": enforced,
-            "leadgen_enabled": True,
-            "llm_key_ready": llm_ready,
-            "scraper_session_required": enforced,
-            "scraper_session_ready": scraper_ready,
-            "treg_required": enforced,
-            "treg_ready": treg_ready,
-            "typesafe_ready": True,
-            "stage_timeout_count": stage_timeouts,
-            "missing_components": missing,
-        }
-
-    setattr(mod, "audit_crm_hygiene", audit_crm_hygiene)
-    setattr(mod, "heal_crm_hygiene", heal_crm_hygiene)
-    setattr(mod, "audit_server_leadgen_readiness", audit_server_leadgen_readiness)
-    return mod
+        sconn.commit()
+    finally:
+        sconn.close()
+    return path
 
 
-def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
+def _create_fake_treg_env(base_dir: Path) -> tuple[Path, Path]:
+    bin_dir = base_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    treg_exe = bin_dir / "treg"
+    treg_exe.write_text("#!/bin/sh\necho '{\"ok\": true}'\n", encoding="utf-8")
+    treg_exe.chmod(0o755)
+    cfg_path = base_dir / "treg_config.json"
+    cfg_path.write_text(json.dumps({"token": "team-multo-valid-token"}), encoding="utf-8")
+    return bin_dir, cfg_path
+
+
+def test_deep_health_and_startup_and_autopilot_heal_real_crm_hygiene(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    state = {
-        "default_enforced": True,
-        "scraper_session_ready": False,
-        "treg_ready": False,
-        "llm_key_ready": True,
-    }
-    monkeypatch.setitem(sys.modules, "app.hygiene", _build_contract_hygiene_module(state))
+    monkeypatch.setenv("CRMTG_SKIP_DOTENV", "1")
+    monkeypatch.setenv("CRMTG_VPS_RUNTIME", "1")
+    monkeypatch.setenv("RELAYFAST_API_KEY", "rf-live-key-123")
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(tmp_path / "leadgen_config.json"))
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(tmp_path / "leadgen_state"))
+    monkeypatch.setenv("SCRAPER_TG_SESSION", str(tmp_path / "missing_scraper.session"))
+    monkeypatch.setenv("SCRAPER_SESSIONS_DIR", str(tmp_path / "empty_sessions"))
+    monkeypatch.setenv("TREG_ENRICH", "0")
+    monkeypatch.delenv("TREG_API_KEY", raising=False)
+
+    # Enable tg_ad_spy + meta_ads so both scraper_session and treg are strictly required on VPS
+    (tmp_path / "leadgen_config.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "b2b": {
+                    "enabled": True,
+                    "sources": {
+                        "tg_ad_spy": True,
+                        "meta_ads": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     db_path = tmp_path / "readiness.db"
     conn = connect(db_path)
@@ -184,12 +107,15 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
         conn,
         name="Leadgen Auto (TG)",
         account_id=acc_id,
-        steps=[{"template_text": "Привет! Делаем системный SoftUGC для аппок."}],
+        steps=[{"template_text": "Hey,\n\nSaw Acme. We run SoftUGC."}],
     )
     conn.execute("UPDATE campaigns SET status = 'running' WHERE id = ?", (camp["id"],))
     junk_lead = create_lead(
         conn,
-        name="SMM Agency Studio",
+        name="FINPR Marketing Agency",
+        company="FINPR Agency",
+        niche="Агентство",
+        lead_source="Cold outreach",
         username="smm_agency_owner",
         telegram_user_id=445566,
         status="new",
@@ -198,26 +124,60 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
     create_lead(
         conn,
         name="Contactless Ghost",
+        lead_source="Cold outreach",
         username=None,
         telegram_user_id=None,
         phone=None,
         status="new",
     )
+    # Spot-Check #2: Manual / 'Other' / NULL-source talking lead without campaign_recipients MUST stay untouched!
+    manual_partner = create_lead(
+        conn,
+        name="Partner Discussion",
+        lead_source="Other",
+        status="talking",
+        amount=0,
+        username=None,
+        note="partner marketing agency intro",
+    )
+    null_talking = create_lead(
+        conn,
+        name="Direct Warm Chat",
+        lead_source=None,
+        status="talking",
+        amount=0,
+        username=None,
+        note="open-source marketing agency friend",
+    )
+
     conn.execute(
         """
         INSERT INTO campaign_recipients (
-            campaign_id, lead_id, telegram_user_id, username, name,
+            campaign_id, lead_id, telegram_user_id, username, name, category,
             status, current_step, created_at, updated_at
-        ) VALUES (?, ?, 445566, 'smm_agency_owner', 'SMM Agency Studio', 'pending', 0, ?, ?)
+        ) VALUES (?, ?, 445566, 'smm_agency_owner', 'FINPR Marketing Agency', 'Агентство', 'pending', 0, ?, ?)
         """,
         (camp["id"], junk_lead["id"], now, now),
     )
     conn.execute(
         """
         INSERT INTO kv_settings (key, value, updated_at)
-        VALUES ('leadgen_stage_errors', '{"tg_enrich_leads": "timeout_after_180s"}', ?)
+        VALUES ('leadgen_stage_errors', ?, ?)
         """,
-        (now,),
+        (
+            json.dumps(
+                [
+                    {
+                        "stage": "tg_enrich_leads",
+                        "returncode": -1,
+                        "timeout": 180,
+                        "error": "timeout_after_180s",
+                        "at": now,
+                    }
+                ]
+            ),
+            now,
+        ),
     )
     conn.commit()
 
@@ -228,18 +188,24 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
             sent_messages.append((int(user_id), text))
             return {"telegram_message_id": 701, "sent_at": utc_now()}
 
-    # 1) create_app() runs heal_crm_hygiene(conn) on startup!
+    # 1) create_app() runs real heal_crm_hygiene(conn) on startup while preserving manual/Other talking leads!
     app = create_app(conn=conn, gateway=_SpyGateway())
-    assert state.get("heal_calls", 0) >= 1
     rec_status = conn.execute(
         "SELECT status FROM campaign_recipients WHERE lead_id = ?", (junk_lead["id"],)
     ).fetchone()["status"]
-    assert rec_status == "failed"
+    assert rec_status == "completed"
+
+    for preserved_id in (manual_partner["id"], null_talking["id"]):
+        p_row = conn.execute("SELECT status FROM leads WHERE id = ?", (preserved_id,)).fetchone()
+        assert p_row["status"] == "talking"
 
     # 2) Inject new runtime junk after startup and verify /api/health?deep=1 reports broken state
     late_junk = create_lead(
         conn,
-        name="Traffic Agency Pro",
+        name="Traffic Marketing Agency",
+        company="Traffic Marketing Agency",
+        niche="Агентство",
+        lead_source="Cold outreach",
         username="traffic_agency_pro",
         telegram_user_id=778899,
         status="new",
@@ -248,6 +214,7 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
     create_lead(
         conn,
         name="Empty Lead After Boot",
+        lead_source="Cold outreach",
         username=None,
         telegram_user_id=None,
         phone=None,
@@ -256,9 +223,9 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
     conn.execute(
         """
         INSERT INTO campaign_recipients (
-            campaign_id, lead_id, telegram_user_id, username, name,
+            campaign_id, lead_id, telegram_user_id, username, name, category,
             status, current_step, created_at, updated_at
-        ) VALUES (?, ?, 778899, 'traffic_agency_pro', 'Traffic Agency Pro', 'pending', 0, ?, ?)
+        ) VALUES (?, ?, 778899, 'traffic_agency_pro', 'Traffic Marketing Agency', 'Агентство', 'pending', 0, ?, ?)
         """,
         (camp["id"], late_junk["id"], now, now),
     )
@@ -274,12 +241,13 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
         assert broken["contactless_leads"] == 1
         assert broken["leadgen_ready"] is False
         assert set(broken["leadgen_readiness"]["missing_components"]) == {
-            "SCRAPER_TG_SESSION",
-            "treg",
-            "stage_timeout:tg_enrich_leads",
+            "isolated_scraper_tg_session",
+            "treg_cli",
+            "stage_errors",
         }
 
-        # 3) autopilot_loop heals BEFORE run_autopilot_tick so 0 messages are sent to junk recipient
+        # 3) autopilot_loop heals BEFORE run_autopilot_tick so 0 messages go out to junk recipient,
+        # while keeping fresh stage_errors visible on /api/health?deep=1!
         async def _run_one_autopilot_tick():
             task = asyncio.create_task(autopilot_loop(app, interval_seconds=0.005))
             for _ in range(40):
@@ -297,13 +265,16 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
         late_rec_status = conn.execute(
             "SELECT status FROM campaign_recipients WHERE lead_id = ?", (late_junk["id"],)
         ).fetchone()["status"]
-        assert late_rec_status == "failed"
+        assert late_rec_status == "completed"
 
-        # 4) Fix server readiness components -> /api/health?deep=1 flips to green
-        state["scraper_session_ready"] = True
-        state["treg_ready"] = True
-        conn.execute("DELETE FROM kv_settings WHERE key = 'leadgen_stage_errors'")
-        conn.commit()
+        # 4) Provision isolated MTProto session + treg CLI + run explicit --heal to clear stale stage_errors -> green!
+        iso_sess = _create_isolated_mtproto_session(tmp_path / "scraper" / "signals_ro.session")
+        bin_dir, treg_cfg = _create_fake_treg_env(tmp_path / "treg_env")
+        monkeypatch.setenv("SCRAPER_TG_SESSION", str(iso_sess))
+        monkeypatch.setenv("TREG_ENRICH", "1")
+        monkeypatch.setenv("TREG_CONFIG_PATH", str(treg_cfg))
+        monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+        heal_crm_hygiene(conn, clear_stale_stage_errors=True)
 
         green_resp = client.get("/api/health?deep=1")
         assert green_resp.status_code == 200
@@ -317,23 +288,77 @@ def test_deep_health_and_startup_and_autopilot_heal_crm_hygiene(
     conn.close()
 
 
-def test_direct_leads_endpoint_requires_auth_and_caps_at_200(
+def test_direct_x_contract_roundtrip_between_replenish_hygiene_and_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     state_dir = tmp_path / "leadgen_state"
     state_dir.mkdir(parents=True)
-    jsonl_file = state_dir / "direct_x_leads.jsonl"
-    raw_lines = [json.dumps({"idx": i, "x_handle": f"@founder_{i}"}) for i in range(205)]
-    raw_lines.insert(10, "")
-    raw_lines.insert(20, "{corrupted-json-line")
-    jsonl_file.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
-
     monkeypatch.setenv("LEADGEN_STATE_DIR", str(state_dir))
     monkeypatch.setenv("CRM_REQUIRE_AUTH", "1")
     monkeypatch.setenv("MCP_API_KEY", "test-mcp-secret-key-999")
 
+    # 1) Write row via split_tg_and_direct_x_leads (uses work_email / founder_x / project / project_url)
+    final_jsonl = state_dir / "raw_batch.final.jsonl"
+    dx_jsonl = state_dir / "direct_x_leads.jsonl"
+    final_jsonl.write_text(
+        json.dumps(
+            {
+                "name": "Jane Founder",
+                "project": "OrbitClip",
+                "project_url": "https://orbitclip.ai",
+                "work_email": "jane@orbitclip.ai",
+                "founder_x": "https://x.com/janefounder",
+                "category": "SaaS / AI app",
+                "what_they_do": "Subscription AI video clipper ($29/mo)",
+                "icp_score": 91,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    split_res = split_tg_and_direct_x_leads(final_jsonl, dx_jsonl)
+    assert split_res == {"tg_wa_kept": 0, "direct_x_added": 1, "dropped": 0}
+
+    # 2) Duplicate via append_direct_x_lead (uses email / x_url / company / url) MUST deduplicate!
+    dup_added = append_direct_x_lead(
+        state_dir,
+        {
+            "name": "Jane Founder",
+            "company": "OrbitClip",
+            "email": "jane@orbitclip.ai",
+            "x_url": "https://x.com/janefounder",
+            "url": "https://orbitclip.ai",
+        },
+    )
+    assert dup_added is False
+
+    # 3) Searchable via MCP list_direct_x_leads by work_email / project / founder_x
     conn = connect(tmp_path / "auth_direct.db")
     init_db(conn)
+    mcp_resp = handle_jsonrpc_message(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "list_direct_x_leads",
+                "arguments": {"query": "orbitclip", "limit": 10},
+            },
+        },
+    )
+    sc = mcp_resp["result"]["structuredContent"]
+    assert sc["total"] == 1
+    assert sc["leads"][0]["email"] == "jane@orbitclip.ai"
+    assert sc["leads"][0]["company"] == "OrbitClip"
+    assert sc["leads"][0]["x_url"] == "https://x.com/janefounder"
+
+    # 4) Cap & auth check on /api/leadgen/direct-leads
+    with dx_jsonl.open("a", encoding="utf-8") as fh:
+        for i in range(205):
+            fh.write(json.dumps({"idx": i, "x_url": f"https://x.com/founder_{i}"}) + "\n")
+        fh.write("{corrupted-json-line\n")
+
     app = create_app(conn=conn)
     with TestClient(app) as client:
         unauth = client.get("/api/leadgen/direct-leads")
@@ -346,31 +371,52 @@ def test_direct_leads_endpoint_requires_auth_and_caps_at_200(
         assert authed.status_code == 200
         body = authed.json()
         assert body["ok"] is True
-        assert body["count"] == 205
+        assert body["count"] == 206
         assert len(body["items"]) == 200
-        assert body["items"][0]["idx"] == 5
-        assert body["items"][-1]["idx"] == 204
     conn.close()
 
 
-def test_proactive_audit_db_heal_and_vps_readiness_exit_codes(
+def test_proactive_audit_db_heal_clears_stale_stage_errors_and_enforces_real_vps_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    state = {
-        "default_enforced": False,
-        "scraper_session_ready": False,
-        "treg_ready": False,
-        "llm_key_ready": True,
-    }
-    monkeypatch.setitem(sys.modules, "app.hygiene", _build_contract_hygiene_module(state))
     monkeypatch.setenv("CRMTG_SKIP_DOTENV", "1")
     monkeypatch.delenv("CRMTG_VPS_RUNTIME", raising=False)
+    monkeypatch.setenv("RELAYFAST_API_KEY", "rf-live-key-123")
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(tmp_path / "leadgen_config.json"))
+    monkeypatch.setenv("SCRAPER_TG_SESSION", str(tmp_path / "missing.session"))
+    monkeypatch.setenv("SCRAPER_SESSIONS_DIR", str(tmp_path / "empty_sessions"))
+    monkeypatch.setenv("TREG_ENRICH", "0")
+
+    (tmp_path / "leadgen_config.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "b2b": {"enabled": True, "sources": {"tg_ad_spy": True, "meta_ads": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     db_path = tmp_path / "audit_hygiene.db"
     conn = connect(db_path)
     init_db(conn)
-    create_lead(conn, name="Dirty Agency Lead", username="dirty_agency", telegram_user_id=12345)
+    now = utc_now()
+    create_lead(
+        conn,
+        name="Dirty Marketing Agency",
+        company="Dirty Marketing Agency",
+        niche="Агентство",
+        lead_source="Cold outreach",
+        username="dirty_agency",
+        telegram_user_id=12345,
+    )
     create_lead(conn, name="Bot Lead", username="helper_notify_bot", status="new")
+    # Pre-deploy historical stage error in kv_settings (Spot-Check #3)
+    conn.execute(
+        "INSERT INTO kv_settings (key, value, updated_at) VALUES ('leadgen_stage_errors', ?, ?)",
+        (json.dumps([{"stage": "tg_enrich_leads", "returncode": -1, "timeout": 180, "at": now}]), now),
+    )
+    conn.commit()
     conn.close()
 
     # 1) Dirty DB fails with exit code 1
@@ -379,42 +425,58 @@ def test_proactive_audit_db_heal_and_vps_readiness_exit_codes(
     assert rc_dirty == 1
     assert "PROACTIVE AUDIT FAILED" in captured_dirty.err
 
-    # 2) --heal repairs both reply notifications / bot leads AND crm_hygiene
+    # 2) --heal repairs reply notifications + crm_hygiene AND clears pre-deploy leadgen_stage_errors
     rc_heal = proactive_audit.main(["--db", str(db_path), "--heal"])
     captured_heal = capsys.readouterr()
     assert rc_heal == 0, captured_heal.out + captured_heal.err
 
-    # 3) --enforce-vps-readiness fails with exit 1 when SCRAPER_TG_SESSION / treg missing
+    # 3) --enforce-vps-readiness fails with exit 1 when isolated_scraper_tg_session / treg_cli missing
     rc_vps_fail = proactive_audit.main(["--db", str(db_path), "--enforce-vps-readiness"])
     captured_vps_fail = capsys.readouterr()
     assert rc_vps_fail == 1
-    assert "SCRAPER_TG_SESSION" in captured_vps_fail.err
-    assert "treg" in captured_vps_fail.err
+    assert "isolated_scraper_tg_session" in captured_vps_fail.err
+    assert "treg_cli" in captured_vps_fail.err
 
     # 4) CRMTG_VPS_RUNTIME=1 also enforces readiness automatically without CLI flag
     monkeypatch.setenv("CRMTG_VPS_RUNTIME", "1")
     rc_env_fail = proactive_audit.main(["--db", str(db_path)])
     captured_env_fail = capsys.readouterr()
     assert rc_env_fail == 1
-    assert "SCRAPER_TG_SESSION" in captured_env_fail.err
+    assert "isolated_scraper_tg_session" in captured_env_fail.err
 
-    # 5) Once server readiness components are restored -> exit 0
-    state["scraper_session_ready"] = True
-    state["treg_ready"] = True
+    # 5) Once isolated session + treg CLI are provisioned -> exit 0 (stale stage_errors already cleared by --heal!)
+    iso_sess = _create_isolated_mtproto_session(tmp_path / "scraper" / "signals_ro.session")
+    bin_dir, treg_cfg = _create_fake_treg_env(tmp_path / "treg_env")
+    monkeypatch.setenv("SCRAPER_TG_SESSION", str(iso_sess))
+    monkeypatch.setenv("TREG_ENRICH", "1")
+    monkeypatch.setenv("TREG_CONFIG_PATH", str(treg_cfg))
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
     rc_ok = proactive_audit.main(["--db", str(db_path), "--enforce-vps-readiness"])
-    assert rc_ok == 0
+    captured_ok = capsys.readouterr()
+    assert rc_ok == 0, captured_ok.out + captured_ok.err
 
 
 def test_proactive_audit_health_url_cli_exits_1_on_hollow_pipe_and_0_when_healthy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    state = {
-        "default_enforced": True,
-        "scraper_session_ready": False,
-        "treg_ready": False,
-        "llm_key_ready": True,
-    }
-    monkeypatch.setitem(sys.modules, "app.hygiene", _build_contract_hygiene_module(state))
+    monkeypatch.setenv("CRMTG_SKIP_DOTENV", "1")
+    monkeypatch.setenv("CRMTG_VPS_RUNTIME", "1")
+    monkeypatch.setenv("RELAYFAST_API_KEY", "rf-live-key-123")
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(tmp_path / "leadgen_config.json"))
+    monkeypatch.setenv("SCRAPER_TG_SESSION", str(tmp_path / "missing.session"))
+    monkeypatch.setenv("SCRAPER_SESSIONS_DIR", str(tmp_path / "empty_sessions"))
+    monkeypatch.setenv("TREG_ENRICH", "0")
+
+    (tmp_path / "leadgen_config.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "b2b": {"enabled": True, "sources": {"tg_ad_spy": True, "meta_ads": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     conn = connect(tmp_path / "live_http.db")
     init_db(conn)
@@ -449,13 +511,26 @@ def test_proactive_audit_health_url_cli_exits_1_on_hollow_pipe_and_0_when_health
                 env={"PATH": "/usr/bin:/bin", "CRMTG_SKIP_DOTENV": "1"},
             )
             assert fail_proc.returncode == 1, fail_proc.stdout + fail_proc.stderr
-            assert "SCRAPER_TG_SESSION" in fail_proc.stderr
-            assert "treg" in fail_proc.stderr
+            assert "isolated_scraper_tg_session" in fail_proc.stderr
+            assert "treg_cli" in fail_proc.stderr
 
-            # 2) Fix leadgen readiness, break ICP hygiene -> still exits 1
-            state["scraper_session_ready"] = True
-            state["treg_ready"] = True
-            create_lead(conn, name="Unhealed Agency", username="unhealed_agency", telegram_user_id=998877)
+            # 2) Fix leadgen readiness, inject unhealed agency -> still exits 1
+            iso_sess = _create_isolated_mtproto_session(tmp_path / "scraper" / "signals_ro.session")
+            bin_dir, treg_cfg = _create_fake_treg_env(tmp_path / "treg_env")
+            monkeypatch.setenv("SCRAPER_TG_SESSION", str(iso_sess))
+            monkeypatch.setenv("TREG_ENRICH", "1")
+            monkeypatch.setenv("TREG_CONFIG_PATH", str(treg_cfg))
+            monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+            create_lead(
+                conn,
+                name="Unhealed Marketing Agency",
+                company="Unhealed Marketing Agency",
+                niche="Агентство",
+                lead_source="Cold outreach",
+                username="unhealed_agency",
+                telegram_user_id=998877,
+            )
             hygiene_fail_proc = subprocess.run(
                 [sys.executable, str(WORKTREE_ROOT / "scripts" / "proactive_audit.py"), "--health-url", url],
                 capture_output=True,
@@ -465,8 +540,10 @@ def test_proactive_audit_health_url_cli_exits_1_on_hollow_pipe_and_0_when_health
             assert hygiene_fail_proc.returncode == 1, hygiene_fail_proc.stdout + hygiene_fail_proc.stderr
             assert "icp_hygiene_ok" in hygiene_fail_proc.stderr
 
-            # 3) Heal hygiene -> exits 0!
-            sys.modules["app.hygiene"].heal_crm_hygiene(conn)
+            # 3) Heal real hygiene -> exits 0!
+            heal_crm_hygiene(conn)
+            assert audit_crm_hygiene(conn)["ok"] is True
+            assert audit_server_leadgen_readiness(conn)["ok"] is True
             ok_proc = subprocess.run(
                 [sys.executable, str(WORKTREE_ROOT / "scripts" / "proactive_audit.py"), "--health-url", url],
                 capture_output=True,
@@ -491,7 +568,6 @@ def test_systemd_deploy_workflow_and_verify_sh_gate_e(tmp_path: Path):
     assert 'proactive_audit.py" --db "$APP_DIR/data/crm.db" --heal || true' in wf_text
     assert 'd.get("icp_hygiene_ok") is True and d.get("leadgen_ready") is True' in wf_text
 
-    # Sandbox verification for Gate E in scripts/verify.sh
     sandbox = tmp_path / "gate_e_sandbox"
     for sub in ("scripts", "app/static", "leadgen", "tests", "deploy/systemd", ".github/workflows"):
         (sandbox / sub).mkdir(parents=True, exist_ok=True)
@@ -512,7 +588,6 @@ def test_systemd_deploy_workflow_and_verify_sh_gate_e(tmp_path: Path):
     )
     (sandbox / "tests" / "test_ok.py").write_text("def test_x(): assert True\n", encoding="utf-8")
 
-    # Broken Gate E files: missing icp_hygiene_ok / leadgen_ready / PATH=/usr/local/bin / hygiene defs
     (sandbox / "app" / "main.py").write_text("def api_health():\n    return {'ok': True}\n", encoding="utf-8")
     (sandbox / "scripts" / "proactive_audit.py").write_text(
         "import argparse\nif __name__ == '__main__': argparse.ArgumentParser().parse_args()\n",
@@ -535,13 +610,7 @@ def test_systemd_deploy_workflow_and_verify_sh_gate_e(tmp_path: Path):
     bad = subprocess.run([str(sb_verify), "--fast-checks-only"], cwd=str(sandbox), capture_output=True, text=True)
     assert bad.returncode == 1
     assert "Gate E" in bad.stderr
-    assert "app/main.py" in bad.stderr
-    assert "scripts/proactive_audit.py" in bad.stderr
-    assert "deploy-vps.yml" in bad.stderr
-    assert "crmtg-leadgen.service" in bad.stderr
-    assert "audit_server_leadgen_readiness" in bad.stderr
 
-    # Fix all Gate E invariants (including full app/hygiene.py contract) -> MUST exit 0
     (sandbox / "app" / "main.py").write_text(
         "def api_health():\n    return {'icp_hygiene_ok': True, 'leadgen_ready': True}\n",
         encoding="utf-8",

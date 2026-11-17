@@ -153,7 +153,7 @@ def test_custom_followup2_template_with_audience_overrides_stale_csv_step3_text(
     csv_payload = (
         "Категория,Название,Контакт,Их угол,Первое касание,Фоллоуап 1,Фоллоуап 2\n"
         "AI,pewpewpew,@game_founder,Free multiplayer space shooter game in browser,Hi game founder! Saw pewpewpew — SoftUGC drives organic players.,Step 2 old,Old generic step 3 text\n"
-        "Агентство,Verto Studio,@agency_founder,Помогает бизнесам увеличить поток клиентов,Hi agency founder! Saw Verto Studio — SoftUGC scales client reach.,Step 2 old,Old generic step 3 text\n"
+        "Ecommerce,GlowSkin,@b2b_founder,Organic skincare Shopify brand,Hi founder! Saw GlowSkin — SoftUGC scales buyer reach.,Step 2 old,Old generic step 3 text\n"
         "Медиа,PodCastHub,@pod_founder,Daily tech podcast episodes,Hi podcaster! Saw PodCastHub — SoftUGC brings organic listeners.,Step 2 old,Old generic step 3 text\n"
     )
 
@@ -199,7 +199,7 @@ def test_custom_followup2_template_with_audience_overrides_stale_csv_step3_text(
 
         inbox = {d["username"]: d["id"] for d in client.get("/api/inbox", params={"account_id": acc_id}).json()}
         game_msgs = client.get(f"/api/dialogs/{inbox['game_founder']}/messages").json()
-        agency_msgs = client.get(f"/api/dialogs/{inbox['agency_founder']}/messages").json()
+        agency_msgs = client.get(f"/api/dialogs/{inbox['b2b_founder']}/messages").json()
         pod_msgs = client.get(f"/api/dialogs/{inbox['pod_founder']}/messages").json()
 
         assert "(which equals highly qualified players)" in game_msgs[-1]["text"]

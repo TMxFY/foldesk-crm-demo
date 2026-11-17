@@ -1686,9 +1686,10 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         raw_company = _clean_company_title(item.get("company"))
         explicit_name = (str(item.get("name") or "").strip()) or None
         phone = (str(item.get("phone") or "").strip()) or None
-        email = (str(item.get("email") or "").strip()) or None
-        x_url = (str(item.get("x_url") or item.get("twitter") or "").strip()) or None
-        website_raw = (str(item.get("website") or item.get("url") or "").strip())
+        email = (str(item.get("email") or item.get("work_email") or "").strip()) or None
+        x_url = (str(item.get("x_url") or item.get("founder_x") or item.get("founder_twitter") or item.get("twitter") or "").strip()) or None
+        linkedin_url = (str(item.get("linkedin_url") or item.get("founder_linkedin") or "").strip()) or None
+        website_raw = (str(item.get("website") or item.get("url") or item.get("project_url") or "").strip())
         website = website_raw or None
         url_val = None
         if website_raw:
@@ -1882,7 +1883,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 continue
 
             if not has_direct_messenger_handle:
-                if email or x_url or url_val or website:
+                if email or x_url or linkedin_url or url_val or website:
                     if append_direct_x_lead(
                         state_dir,
                         {
@@ -1890,6 +1891,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                             "company": company,
                             "email": email,
                             "x_url": x_url,
+                            "linkedin_url": linkedin_url,
                             "url": url_val or website,
                             "category": category,
                             "their_angle": their_angle,
@@ -1901,6 +1903,11 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 skipped_non_icp += 1
                 quarantined += 1
                 continue
+
+        if not has_direct_messenger_handle and not is_qa_camp:
+            skipped_non_icp += 1
+            quarantined += 1
+            continue
 
         processed += 1
 

@@ -4591,11 +4591,11 @@ async def run_campaign_batch(
                     """
                     UPDATE campaign_recipients
                     SET status = 'completed',
-                        error_text = 'Остановлено Sniper ICP-фильтром: нет контакта получателя',
+                        error_text = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (now, rec["id"]),
+                    (ICP_GUARD_ERROR, now, rec["id"]),
                 )
                 conn.commit()
                 _release_followup_reservation(int(rec["id"]))
@@ -4620,7 +4620,7 @@ async def run_campaign_batch(
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (f"Остановлено Sniper ICP-фильтром: {sniper_reason}", now, rec["id"]),
+                    (ICP_GUARD_ERROR, now, rec["id"]),
                 )
                 conn.commit()
                 _release_followup_reservation(int(rec["id"]))

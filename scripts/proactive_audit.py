@@ -38,64 +38,15 @@ from app.main import load_env_file  # noqa: E402
 from app.runtime_config import is_vps_runtime  # noqa: E402
 
 
-def _load_hygiene_module():
-    try:
-        return importlib.import_module("app.hygiene")
-    except ModuleNotFoundError as exc:
-        if exc.name in ("app.hygiene", "hygiene"):
-            return None
-        raise
+from app.hygiene import (  # noqa: E402
+    audit_crm_hygiene as _audit_crm_hygiene,
+    audit_server_leadgen_readiness as _audit_server_leadgen_readiness,
+    heal_crm_hygiene as _raw_heal_crm_hygiene,
+)
 
 
 def _heal_crm_hygiene(conn) -> dict:
-    hygiene_mod = _load_hygiene_module()
-    if hygiene_mod is None:
-        return {
-            "quarantined_recipients": 0,
-            "quarantined_leads": 0,
-            "sanitized_leads": 0,
-        }
-    return hygiene_mod.heal_crm_hygiene(conn)
-
-
-def _audit_crm_hygiene(conn) -> dict:
-    hygiene_mod = _load_hygiene_module()
-    if hygiene_mod is None:
-        return {
-            "ok": True,
-            "active_junk_recipient_count": 0,
-            "active_junk_lead_count": 0,
-            "contactless_lead_count": 0,
-            "dirty_title_lead_count": 0,
-        }
-    return hygiene_mod.audit_crm_hygiene(conn)
-
-
-def _audit_server_leadgen_readiness(
-    conn, *, enforce_vps_checks: bool | None = None
-) -> dict:
-    hygiene_mod = _load_hygiene_module()
-    if hygiene_mod is None:
-        return {
-            "ok": True,
-            "enforced": bool(enforce_vps_checks)
-            if enforce_vps_checks is not None
-            else is_vps_runtime(),
-            "leadgen_enabled": True,
-            "llm_key_ready": True,
-            "scraper_session_required": False,
-            "scraper_session_ready": True,
-            "treg_required": False,
-            "treg_ready": True,
-            "typesafe_ready": True,
-            "stage_timeout_count": 0,
-            "missing_components": [],
-        }
-    if enforce_vps_checks is None:
-        return hygiene_mod.audit_server_leadgen_readiness(conn)
-    return hygiene_mod.audit_server_leadgen_readiness(
-        conn, enforce_vps_checks=enforce_vps_checks
-    )
+    return _raw_heal_crm_hygiene(conn, clear_stale_stage_errors=True)
 
 
 def _audit_local_db(

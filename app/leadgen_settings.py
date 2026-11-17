@@ -1120,8 +1120,9 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                         {
                             "name": cand.get("name") or cand.get("company") or cand.get("project"),
                             "company": cand.get("company") or cand.get("project"),
-                            "email": cand.get("email"),
-                            "x_url": cand.get("x_url") or cand.get("twitter"),
+                            "email": cand.get("email") or cand.get("work_email"),
+                            "x_url": cand.get("x_url") or cand.get("founder_x") or cand.get("founder_twitter") or cand.get("twitter"),
+                            "linkedin_url": cand.get("linkedin_url") or cand.get("founder_linkedin"),
                             "url": site_s,
                             "category": cand.get("category") or cand.get("niche"),
                             "their_angle": angle_s,
