@@ -62,6 +62,7 @@ try:
         is_invalid_product_name,
         is_rejected_buyer_category,
         is_supply_side,
+        pick_best_product_url,
     )
 except ImportError:
     from leadgen.followup_agent import (
@@ -89,6 +90,7 @@ except ImportError:
         is_invalid_product_name,
         is_rejected_buyer_category,
         is_supply_side,
+        pick_best_product_url,
     )
 
 SHEET_ID = "1Z4KwmUMNuA9Q562y3Vvxa40AFcqGaMyAXAqr7QlbmOQ"
@@ -544,13 +546,7 @@ def build_lead_payload_from_dict(
         or record.get("name")
         or ""
     ).strip()
-    site = str(
-        record.get("website")
-        or record.get("site")
-        or record.get("project_url")
-        or record.get("url")
-        or ""
-    ).strip()
+    site = pick_best_product_url(record)
     category = str(record.get("category") or record.get("niche") or "SaaS").strip()
     their_angle = str(
         record.get("their_angle")

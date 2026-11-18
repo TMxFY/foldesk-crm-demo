@@ -47,9 +47,32 @@ except ImportError:  # pragma: no cover
         "calendly.com",
         "medium.com",
         "substack.com",
+        "producthunt.com",
+        "whop.com",
+        "apps.whop.com",
+        "gumroad.com",
+        "skool.com",
+        "patreon.com",
+        "stan.store",
+        "taplink.cc",
+        "clck.ru",
+        "cutt.ly",
+        "ow.ly",
+        "buff.ly",
+        "rb.gy",
+        "is.gd",
+        "shorturl.at",
+        "lnkd.in",
+        "bento.me",
+        "bio.site",
+        "campsite.bio",
     )
     _SS_GARBAGE_COMPANIES = frozenset(
-        {"github", "gitlab", "telegram", "twitter", "linkedin", "instagram", "youtube", "notion", "medium", "substack"}
+        {
+            "github", "gitlab", "telegram", "twitter", "linkedin", "instagram", "youtube",
+            "notion", "medium", "substack", "producthunt", "whop", "gumroad", "skool",
+            "clck", "taplink",
+        }
     )
 
     def _ss_is_platform_url(url: str | None) -> bool:

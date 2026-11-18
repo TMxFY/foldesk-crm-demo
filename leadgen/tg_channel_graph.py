@@ -201,24 +201,49 @@ def parse_channel_founder_info(
     }
 
 
-def _load_seen(path: str) -> set[str]:
+def _load_graph_state(path: str) -> tuple[set[str], list[tuple[str, int]]]:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return {str(x).lower() for x in data}
+            return {str(x).lower() for x in data if str(x or "").strip()}, []
         if isinstance(data, dict):
-            return {str(x).lower() for x in data.get("seen_channels", [])}
+            raw_seen = data.get("seen") if "seen" in data else data.get("seen_channels", [])
+            seen = {str(x).lower() for x in (raw_seen or []) if str(x or "").strip()}
+            frontier: list[tuple[str, int]] = []
+            for item in data.get("frontier") or []:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    ch = str(item[0] or "").strip().lstrip("@").lower()
+                    if not ch:
+                        continue
+                    try:
+                        d = int(item[1])
+                    except (TypeError, ValueError):
+                        continue
+                    frontier.append((ch, d))
+            return seen, frontier
     except (OSError, ValueError):
         pass
-    return set()
+    return set(), []
 
 
-def _save_seen(path: str, seen: set[str]) -> None:
+def _load_seen(path: str) -> set[str]:
+    seen, _ = _load_graph_state(path)
+    return seen
+
+
+def _save_seen(
+    path: str,
+    seen: set[str],
+    frontier: list[tuple[str, int]] | None = None,
+) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
+    payload: dict[str, object] = {"seen": sorted(seen)}
+    if frontier:
+        payload["frontier"] = [[ch, int(d)] for ch, d in frontier]
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"seen_channels": sorted(seen)}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
 
@@ -273,10 +298,15 @@ async def crawl_channel_graph(
         state_dir = os.path.dirname(os.path.abspath(state_path))
         linked_chats_path = os.path.join(state_dir, "discovered_comment_channels.txt")
 
-    seen_channels = _load_seen(state_path)
+    seen_channels, saved_frontier = _load_graph_state(state_path)
     seen_founders: set[str] = set()
     queue: deque[tuple[object, int]] = deque()
     queued_keys: set[str] = set()
+
+    for ch_name, ch_depth in saved_frontier:
+        if ch_name and ch_name not in queued_keys and (ch_name not in seen_channels or ch_depth < depth):
+            queue.append((ch_name, ch_depth))
+            queued_keys.add(ch_name)
 
     for s in seeds:
         clean = s.strip().lstrip("@")
@@ -286,6 +316,8 @@ async def crawl_channel_graph(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered_rows: list[dict] = []
+    seen_expansions = 0
+    max_seen_expansions = 20
 
     with open(output_path, "w", encoding="utf-8") as out_fh:
         while queue and len(discovered_rows) < limit:
@@ -306,8 +338,12 @@ async def crawl_channel_graph(
 
             ch_username = (getattr(entity, "username", None) or target_key).lstrip("@")
             ch_key = ch_username.lower()
+            already_seen = ch_key in seen_channels
+            should_expand = (cur_depth < depth) and (
+                not already_seen or seen_expansions < max_seen_expansions
+            )
 
-            if ch_key not in seen_channels:
+            if not already_seen:
                 seen_channels.add(ch_key)
                 try:
                     full = await client(GetFullChannelRequest(channel=entity))
@@ -373,7 +409,9 @@ async def crawl_channel_graph(
                 except Exception as exc:
                     print(f"# channel_graph error on {ch_username}: {exc}", file=sys.stderr)
 
-            if cur_depth < depth and len(discovered_rows) < limit:
+            if should_expand and len(discovered_rows) < limit:
+                if already_seen:
+                    seen_expansions += 1
                 try:
                     recs = await client(GetChannelRecommendationsRequest(channel=entity))
                     for rec_chat in getattr(recs, "chats", []) or []:
@@ -381,7 +419,11 @@ async def crawl_channel_graph(
                             getattr(rec_chat, "username", None)
                             or f"id{getattr(rec_chat, 'id', '')}"
                         ).lower()
-                        if rec_uname and rec_uname not in seen_channels and rec_uname not in queued_keys:
+                        if (
+                            rec_uname
+                            and rec_uname not in queued_keys
+                            and (rec_uname not in seen_channels or (cur_depth + 1) < depth)
+                        ):
                             queued_keys.add(rec_uname)
                             queue.append((rec_chat, cur_depth + 1))
                 except Exception as exc:
@@ -390,7 +432,16 @@ async def crawl_channel_graph(
             if delay > 0:
                 await asyncio.sleep(delay)
 
-    _save_seen(state_path, seen_channels)
+    remaining_frontier: list[tuple[str, int]] = []
+    for q_target, q_depth in queue:
+        if isinstance(q_target, str):
+            q_clean = q_target.strip().lstrip("@").lower()
+        else:
+            q_clean = str(getattr(q_target, "username", "") or "").strip().lstrip("@").lower()
+        if q_clean and (q_clean not in seen_channels or q_depth < depth):
+            remaining_frontier.append((q_clean, int(q_depth)))
+
+    _save_seen(state_path, seen_channels, frontier=remaining_frontier[:500])
     return discovered_rows
 
 

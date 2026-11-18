@@ -1062,8 +1062,8 @@ def merge_master_rows(master_rows, raw_rows, legacy_ids=()):
     return master_new, downstream
 
 
-def apply_master_merge(raw_path, master_path):
-    """Append Telegram rows to master_ids. Write those plus X-only and direct-only to raw.new."""
+def apply_master_merge(raw_path, master_path, *, commit_master=True):
+    """Write unseen rows to raw.new; append Telegram rows to master_ids only when commit_master is True."""
     master_rows = []
     legacy_ids = set()
     try:
@@ -1099,9 +1099,10 @@ def apply_master_merge(raw_path, master_path):
                 continue
             raw_rows.append(json.loads(line))
     master_new, downstream = merge_master_rows(master_rows, raw_rows, legacy_ids=legacy_ids)
-    with open(master_path, "a") as handle:
-        for row in master_new:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if commit_master and master_new:
+        with open(master_path, "a") as handle:
+            for row in master_new:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     with open(raw_path + ".new", "w") as handle:
         for row in downstream:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")

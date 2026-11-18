@@ -452,6 +452,84 @@ if tests_dir.is_dir():
             if tok in tsrc:
                 errors.append(f"Gate H violation in {tpath}: forbidden fake test stub '{tok}'")
 
+# Gate I: Static AST check for calling/reading a nested `def <name>` before its definition in the same function scope
+def _check_local_def_use_before_def(py_path: Path) -> list[str]:
+    found: list[str] = []
+    try:
+        tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+    except SyntaxError:
+        return found
+
+    def _walk_scope_exprs(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+        yield node
+        for child in ast.iter_child_nodes(node):
+            yield from _walk_scope_exprs(child)
+
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        globals_or_nonlocals: set[str] = set()
+        arg_names = {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}
+        if fn.args.vararg:
+            arg_names.add(fn.args.vararg.arg)
+        if fn.args.kwarg:
+            arg_names.add(fn.args.kwarg.arg)
+        local_defs: dict[str, int] = {}
+        earliest_assigns: dict[str, int] = {}
+        loads: list[tuple[str, int]] = []
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop(0)
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                globals_or_nonlocals.update(node.names)
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local_defs[node.name] = min(local_defs.get(node.name, 10**9), node.lineno)
+                for dec in node.decorator_list:
+                    for sub in _walk_scope_exprs(dec):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                            loads.append((sub.id, sub.lineno))
+                continue
+            if isinstance(node, ast.ClassDef):
+                local_defs[node.name] = min(local_defs.get(node.name, 10**9), node.lineno)
+                continue
+            if isinstance(node, ast.Lambda):
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bound = (alias.asname or alias.name.split(".", 1)[0])
+                    if bound != "*":
+                        earliest_assigns[bound] = min(earliest_assigns.get(bound, 10**9), node.lineno)
+                continue
+            if isinstance(node, ast.ExceptHandler) and node.name:
+                earliest_assigns[node.name] = min(earliest_assigns.get(node.name, 10**9), node.lineno)
+            if isinstance(node, ast.Name):
+                if isinstance(node.ctx, ast.Store):
+                    earliest_assigns[node.id] = min(earliest_assigns.get(node.id, 10**9), node.lineno)
+                elif isinstance(node.ctx, ast.Load):
+                    loads.append((node.id, node.lineno))
+            for child in ast.iter_child_nodes(node):
+                stack.append(child)
+        for name, uline in loads:
+            if name in globals_or_nonlocals or name in arg_names:
+                continue
+            if name in local_defs:
+                ebind = min(local_defs[name], earliest_assigns.get(name, 10**9))
+                if uline < ebind:
+                    found.append(
+                        f"Gate I violation in {py_path}:{uline} ({fn.name}): local '{name}' used before def at line {local_defs[name]}"
+                    )
+    return found
+
+for folder in ("app", "leadgen"):
+    folder_path = root / folder
+    if not folder_path.is_dir():
+        continue
+    for py_file in sorted(folder_path.rglob("*.py")):
+        errors.extend(_check_local_def_use_before_def(py_file))
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

@@ -49,3 +49,5 @@
    - `monid_client.resolve_app_store_developer` и `creator_external_leads.app_stores` обязаны отсекать мегакорпорации (`>25k–50k` оценок и список гигантов).
 3. **Live Harvest Visibility (`/api/leadgen/config` + UI `#leadgen-live-harvest-card`)**:
    - `last_run_summary.json` отображает по-источниковую статистику прогона (`per_source_counts`, `tg_bridged_count`), а карточка «Свежий улов парсеров» в UI показывает целевые лиды в TG-кампании и пуле Direct/X.
+4. **AST Local Use-Before-Def Gate (`./scripts/verify.sh` — Gate I)**:
+   - Проверяет все функции в `app/` и `leadgen/` на чтение/вызов локального `def <name>` раньше его определения в том же scope (предотвращает `UnboundLocalError` в `crmtg-leadgen.service`), а `vps_autonomous_replenish.main()` фиксирует необработанные падения в `kv_settings['leadgen_stage_errors']`.

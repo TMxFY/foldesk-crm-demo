@@ -10,6 +10,7 @@ nothing and does not fail the Telegram batch.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import json
@@ -694,8 +695,13 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
     x_fail = 0
     errors = 0
     x_cands: list[tuple[str, dict | None]] = []
-    for query in buyer_queries(day):
-        payload = search_x_fn(query)
+    b_queries = buyer_queries(day)
+    if search_x_fn is search_x and len(b_queries) > 1:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            b_payloads = list(pool.map(search_x_fn, b_queries))
+    else:
+        b_payloads = [search_x_fn(q) for q in b_queries]
+    for query, payload in zip(b_queries, b_payloads):
         if payload is None:
             x_fail += 1
             errors += 1
@@ -734,8 +740,13 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
         current[key] = stamp
 
     comment_cands: list[tuple[str, dict | None]] = []
-    for query in comment_post_queries(day):
-        payload = search_x_fn(query)
+    c_queries = comment_post_queries(day)
+    if search_x_fn is search_x and len(c_queries) > 1:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            c_payloads = list(pool.map(search_x_fn, c_queries))
+    else:
+        c_payloads = [search_x_fn(q) for q in c_queries]
+    for query, payload in zip(c_queries, c_payloads):
         if payload is None:
             x_fail += 1
             errors += 1

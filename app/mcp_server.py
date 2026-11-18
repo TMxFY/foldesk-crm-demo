@@ -53,6 +53,7 @@ from leadgen.supply_side import (
     is_platform_or_social_url,
     is_supply_side,
     is_truncated_or_bad_pitch,
+    pick_best_product_url,
 )
 from app.reminders import (
     complete_reminder,
@@ -1738,7 +1739,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         email = (str(item.get("email") or item.get("work_email") or "").strip()) or None
         x_url = (str(item.get("x_url") or item.get("founder_x") or item.get("founder_twitter") or item.get("twitter") or "").strip()) or None
         linkedin_url = (str(item.get("linkedin_url") or item.get("founder_linkedin") or "").strip()) or None
-        website_raw = (str(item.get("website") or item.get("url") or item.get("project_url") or "").strip())
+        website_raw = pick_best_product_url(item)
         website = website_raw or None
         url_val = None
         if website_raw:

@@ -83,6 +83,25 @@ PLATFORM_AGGREGATOR_HOSTS = (
     "substack.com",
     "docs.google.com",
     "drive.google.com",
+    "producthunt.com",
+    "whop.com",
+    "apps.whop.com",
+    "gumroad.com",
+    "skool.com",
+    "patreon.com",
+    "stan.store",
+    "taplink.cc",
+    "clck.ru",
+    "cutt.ly",
+    "ow.ly",
+    "buff.ly",
+    "rb.gy",
+    "is.gd",
+    "shorturl.at",
+    "lnkd.in",
+    "bento.me",
+    "bio.site",
+    "campsite.bio",
 )
 
 PLATFORM_GARBAGE_COMPANY_NAMES = frozenset(
@@ -111,6 +130,12 @@ PLATFORM_GARBAGE_COMPANY_NAMES = frozenset(
         "instagram",
         "youtube",
         "discord",
+        "producthunt",
+        "whop",
+        "gumroad",
+        "skool",
+        "clck",
+        "taplink",
     }
 )
 
@@ -246,6 +271,19 @@ def is_platform_or_social_url(url: str | None) -> bool:
     if not host:
         return False
     return any(host == item or host.endswith("." + item) for item in PLATFORM_AGGREGATOR_HOSTS)
+
+
+def pick_best_product_url(record: Mapping[str, Any]) -> str:
+    """Choose the first real product URL over aggregator/shortener URLs across project_url/website/site/url."""
+    candidates = [
+        str(record.get(key) or "").strip()
+        for key in ("project_url", "website", "site", "url")
+    ]
+    non_empty = [u for u in candidates if u]
+    for candidate in non_empty:
+        if not is_platform_or_social_url(candidate):
+            return candidate
+    return non_empty[0] if non_empty else ""
 
 
 def is_invalid_product_name(name: str | None) -> bool:

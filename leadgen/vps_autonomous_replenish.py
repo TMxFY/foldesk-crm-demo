@@ -58,6 +58,15 @@ def check_monid_ready() -> bool:
     return _client_check_monid_ready(binary_fn=monid_bin)
 
 
+def _count_jsonl_lines(p: Path) -> int:
+    if not p.is_file() or p.stat().st_size == 0:
+        return 0
+    try:
+        return sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
+    except OSError:
+        return 0
+
+
 def _count_personal_tg_rows(jsonl_path: Path) -> int:
     if not jsonl_path.is_file():
         return 0
@@ -832,7 +841,7 @@ def run_autonomous_replenish(
     low_water_mark: int = 50,
     vac_low_water_mark: int = 10,
     critical_low_mark: int = 15,
-    stage_timeout: int = 180,
+    stage_timeout: int = 300,
     scraper_session: str | Path | None = None,
     digest_opener: Any = None,
 ) -> dict[str, Any]:
@@ -1275,14 +1284,6 @@ def run_autonomous_replenish(
                         ],
                     )
 
-                def _count_jsonl_lines(p: Path) -> int:
-                    if not p.is_file() or p.stat().st_size == 0:
-                        return 0
-                    try:
-                        return sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
-                    except OSError:
-                        return 0
-
                 per_source_counts["tg_groups"] = _count_jsonl_lines(raw_jsonl) + _count_jsonl_lines(b2b_tg_groups_out)
                 per_source_counts["ofm_groups"] = max(
                     0, _count_jsonl_lines(ofm_review_path) - pre_ofm_count
@@ -1317,15 +1318,17 @@ def run_autonomous_replenish(
                     ],
                     raw_jsonl,
                 )
-                apply_master_merge(str(raw_jsonl), str(master_jsonl))
+                apply_master_merge(str(raw_jsonl), str(master_jsonl), commit_master=False)
                 new_jsonl = Path(f"{raw_jsonl}.new")
                 if not new_jsonl.exists():
                     new_jsonl.write_text("", encoding="utf-8")
 
                 has_new_rows = new_jsonl.stat().st_size > 0
+                enrich_ok = False
+                qual_ok = False
                 if has_new_rows or runner is not subprocess.run:
                     enriched_jsonl = state_dir / f"raw_{ts}.enriched.jsonl"
-                    _exec_stage(
+                    enrich_ok = _exec_stage(
                         "tg_enrich_leads",
                         [
                             py_bin,
@@ -1460,6 +1463,8 @@ def run_autonomous_replenish(
                                 final_jsonl.unlink(missing_ok=True)
                         elif final_jsonl.is_file():
                             final_jsonl.unlink(missing_ok=True)
+                    if enrich_ok and (not has_llm_key or qual_ok) and raw_jsonl.is_file():
+                        apply_master_merge(str(raw_jsonl), str(master_jsonl), commit_master=True)
 
             # Vacancy scraper ONLY if valid isolated SCRAPER_TG_SESSION is available
             if still_needs_vac and isolated_session is not None:
@@ -1653,19 +1658,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--low-water-mark", type=int, default=50)
     parser.add_argument("--vacancies-low-water-mark", type=int, default=10)
     parser.add_argument("--critical-low-mark", type=int, default=15)
-    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--timeout", type=int, default=300)
     args = parser.parse_args(argv)
 
     conn = connect(args.db)
     init_db(conn)
     try:
-        res = run_autonomous_replenish(
-            conn,
-            low_water_mark=args.low_water_mark,
-            vac_low_water_mark=args.vacancies_low_water_mark,
-            critical_low_mark=args.critical_low_mark,
-            stage_timeout=args.timeout,
-        )
+        try:
+            res = run_autonomous_replenish(
+                conn,
+                low_water_mark=args.low_water_mark,
+                vac_low_water_mark=args.vacancies_low_water_mark,
+                critical_low_mark=args.critical_low_mark,
+                stage_timeout=args.timeout,
+            )
+        except Exception as exc:
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            err_payload = [
+                {
+                    "stage": "vps_autonomous_replenish_crash",
+                    "returncode": 1,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "at": utc_now(),
+                }
+            ]
+            try:
+                now_stamp = utc_now()
+                conn.execute(
+                    """
+                    INSERT INTO kv_settings (key, value, updated_at)
+                    VALUES ('leadgen_stage_errors', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (json.dumps(err_payload, ensure_ascii=False), now_stamp),
+                )
+                conn.commit()
+            except Exception:
+                pass
+            return 1
     finally:
         conn.close()
 

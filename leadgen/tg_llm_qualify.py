@@ -18,10 +18,12 @@ Env (.env in project root):
     LLM_CONCURRENCY         parallel first_touch calls (default: 12)
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
 import sys
+from typing import Any
 
 import requests
 
@@ -432,19 +434,34 @@ def qualify_loaded(
 
     print(f"TypeSafe primary: {len(out)} KEEP, {dropped} DROP; Relay Fast recheck {total} UNCERTAIN"
           + (" (fast-path enabled)" if fast_path else " (sniper LLM gate)"), file=sys.stderr)
-    for start in range(0, total, batch_size):
-        batch = rows[start:start + batch_size]
-        bno = start // batch_size + 1
-        nbatches = (total + batch_size - 1) // batch_size
+    batch_slices = [rows[start:start + batch_size] for start in range(0, total, batch_size)]
+    nbatches = len(batch_slices)
+    batch_outcomes: list[tuple[str, Any]] = []
+    if nbatches > 1:
+        chain()  # Warm catalog on main thread before submitting worker pool.
+        with ThreadPoolExecutor(max_workers=min(4, nbatches)) as pool:
+            futs = [pool.submit(call_llm_retry, b) for b in batch_slices]
+            for fut in futs:
+                try:
+                    batch_outcomes.append(("ok", fut.result()))
+                except Exception as exc:
+                    batch_outcomes.append(("err", exc))
+    elif nbatches == 1:
         try:
-            results = call_llm_retry(batch)
-        except Exception as e:
+            batch_outcomes.append(("ok", call_llm_retry(batch_slices[0])))
+        except Exception as exc:
+            batch_outcomes.append(("err", exc))
+
+    for bno, (batch, (status_tag, outcome)) in enumerate(zip(batch_slices, batch_outcomes), start=1):
+        if status_tag == "err":
+            e = outcome
             print(f"  batch {bno}/{nbatches} FAILED ({e}); fail-closed quarantining batch",
                   file=sys.stderr)
             for r in batch:
                 dropped += 1
                 _quarantine_row(r, f"llm_batch_error:{e.__class__.__name__}", quarantine)
             continue
+        results = outcome
 
         if not isinstance(results, list) or len(results) != len(batch):
             got_len = len(results) if isinstance(results, list) else -1

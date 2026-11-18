@@ -1103,8 +1103,10 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             NON_BUYER_ROLES,
             has_insufficient_product_info,
             is_invalid_product_name,
+            is_platform_or_social_url,
             is_rejected_buyer_category,
             is_supply_side,
+            pick_best_product_url,
         )
         from leadgen.tg_enrich_leads import classify_role
         from leadgen.tg_to_gsheet import keep_for_sheet
@@ -1207,8 +1209,11 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     cand["provider"] = "whatsapp"
                 if not cand.get("project") and cand.get("company"):
                     cand["project"] = cand["company"]
-                if not cand.get("project_url") and (cand.get("website") or cand.get("site") or cand.get("url")):
-                    cand["project_url"] = cand.get("website") or cand.get("site") or cand.get("url")
+                best_url = pick_best_product_url(cand)
+                if best_url and (
+                    not cand.get("project_url") or is_platform_or_social_url(cand.get("project_url"))
+                ):
+                    cand["project_url"] = best_url
                 if not cand.get("roles") and not cand.get("role"):
                     bio_txt = str(cand.get("bio") or "").strip()
                     inferred_role = classify_role(bio_txt) if bio_txt else ""
