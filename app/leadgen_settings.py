@@ -725,11 +725,14 @@ def sync_leadgen_campaigns(
             and wa_name.lower() != tg_name.lower()
             and (wa_ready or wa_name.lower() in existing_names_low)
         ):
+            from app.whatsapp_gateway import DEFAULT_WA_DAILY_LIMIT
+
+            wa_daily_lim = min(daily_lim, DEFAULT_WA_DAILY_LIMIT)
             targets.append(
                 {
                     "name": wa_name,
-                    "daily_limit": daily_lim,
-                    "leadgen_daily_quota": quota,
+                    "daily_limit": wa_daily_lim,
+                    "leadgen_daily_quota": min(quota, wa_daily_lim),
                     "leadgen_sources": b2b_enabled_sources,
                     "default_steps": DEFAULT_B2B_WA_STEPS,
                     "is_b2b": True,

@@ -4,15 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="python3"
-if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
-  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
-else
-  COMMON_GIT_DIR="$(git -C "$ROOT_DIR" rev-parse --git-common-dir 2>/dev/null || true)"
-  if [ -n "$COMMON_GIT_DIR" ]; then
-    MAIN_REPO_ROOT="$(cd "$ROOT_DIR" && cd "$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)"
-    if [ -n "$MAIN_REPO_ROOT" ] && [ -x "$MAIN_REPO_ROOT/.venv/bin/python" ]; then
-      PYTHON_BIN="$MAIN_REPO_ROOT/.venv/bin/python"
+if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "${PYTHON_BIN:-}" ]; then
+  PYTHON_BIN="python3"
+  if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+  else
+    COMMON_GIT_DIR="$(git -C "$ROOT_DIR" rev-parse --git-common-dir 2>/dev/null || true)"
+    if [ -n "$COMMON_GIT_DIR" ]; then
+      MAIN_REPO_ROOT="$(cd "$ROOT_DIR" && cd "$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)"
+      if [ -n "$MAIN_REPO_ROOT" ] && [ -x "$MAIN_REPO_ROOT/.venv/bin/python" ]; then
+        PYTHON_BIN="$MAIN_REPO_ROOT/.venv/bin/python"
+      fi
     fi
   fi
 fi
@@ -379,6 +381,75 @@ if (root / "leadgen" / "meta_ad_leads.py").is_file() or "def run_autonomous_repl
     mcp_srv_file = root / "app" / "mcp_server.py"
     if mcp_srv_file.is_file() and "is_item_wa_only" not in mcp_srv_file.read_text(encoding="utf-8"):
         errors.append("Gate G violation in app/mcp_server.py: missing WA-only isolation in ingest_discovered_leads")
+
+# Gate H: Zero Fake Data, Zero Session Stubs & WhatsApp Anti-Ban Gate
+forbidden_prod_tokens = (
+    "generate_pairing_code",
+    "generate_qr_svg",
+    "generateWaPairingCode",
+    "DEFAULT_WA_QR_SVG",
+    "WA84-",
+    "QR_SCANNED",
+    "SQLite format 3\\x00whatsapp",
+    "stub_bytes",
+    "PENDING:{json",
+    "_use_live_neonize",
+    "+79990001122",
+    "+79990000000",
+    "SAMPLE_SESSION_JSON",
+    "fill-sample-session-btn",
+    'f"+7999000',
+    "Math.floor(1000000",
+)
+for folder in ("app", "leadgen"):
+    folder_path = root / folder
+    if not folder_path.is_dir():
+        continue
+    for fpath in sorted(folder_path.rglob("*")):
+        if not fpath.is_file() or fpath.suffix not in (".py", ".js", ".html"):
+            continue
+        fsrc = fpath.read_text(encoding="utf-8")
+        for tok in forbidden_prod_tokens:
+            if tok in fsrc:
+                errors.append(f"Gate H violation in {fpath}: forbidden fake/stub token '{tok}'")
+
+wa_gw_file = root / "app" / "whatsapp_gateway.py"
+if (root / "app" / "accounts.py").is_file() and not wa_gw_file.is_file():
+    errors.append("Gate H violation: missing app/whatsapp_gateway.py")
+if wa_gw_file.is_file():
+    wa_gw_src = wa_gw_file.read_text(encoding="utf-8")
+    for req_wa_tok in (
+        "ProxySettings",
+        "is_on_whatsapp",
+        "send_chat_presence",
+        "CHAT_PRESENCE_COMPOSING",
+        "def apply_proxy(",
+    ):
+        if req_wa_tok not in wa_gw_src:
+            errors.append(f"Gate H violation in app/whatsapp_gateway.py: missing anti-ban contract '{req_wa_tok}'")
+
+    if main_py_file.is_file() and "apply_proxy" not in main_py_file.read_text(encoding="utf-8"):
+        errors.append("Gate H violation in app/main.py: missing WhatsApp apply_proxy wiring")
+
+    if outreach_file.is_file() and "сессия whatsapp не авторизована" not in outreach_file.read_text(encoding="utf-8"):
+        errors.append("Gate H violation in app/outreach.py: missing WhatsApp error classification")
+
+    if hygiene_py_file.is_file() and "healed_fake_accounts" not in hygiene_py_file.read_text(encoding="utf-8"):
+        errors.append("Gate H violation in app/hygiene.py: missing healed_fake_accounts self-healing")
+
+forbidden_test_tokens = (
+    "zip_session_bytes",
+    "1BVtsOHwButest_session_string",
+    "generate_pairing_code",
+    "SQLite format 3\\x00whatsapp",
+)
+tests_dir = root / "tests"
+if tests_dir.is_dir():
+    for tpath in sorted(tests_dir.rglob("*.py")):
+        tsrc = tpath.read_text(encoding="utf-8")
+        for tok in forbidden_test_tokens:
+            if tok in tsrc:
+                errors.append(f"Gate H violation in {tpath}: forbidden fake test stub '{tok}'")
 
 if errors:
     for err in errors:

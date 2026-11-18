@@ -1498,10 +1498,13 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                         },
                     ]
                 )
+                from app.whatsapp_gateway import DEFAULT_WA_DAILY_LIMIT
+
                 created_camp = create_campaign(
                     conn,
                     name=target_cname,
                     status="draft",
+                    daily_limit=DEFAULT_WA_DAILY_LIMIT if is_wa_camp else 20,
                     steps=default_steps,
                 )
                 resolved_cid = int(created_camp["id"])

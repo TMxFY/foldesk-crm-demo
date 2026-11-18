@@ -198,8 +198,9 @@ def whatsapp_url(value):
 def email_of_text(value):
     """First ordinary address. noreply, no-reply, and .png/.jpg names are skipped."""
     raw = str(value or "")
+    raw = re.sub(r"\\?u003[ec]", " ", raw, flags=re.I)
     for match in _EMAIL_RE.finditer(raw):
-        email = match.group(0).strip("._-")
+        email = re.sub(r"^(?:\\?u003[ec]|u003[ec]|[<>])+", "", match.group(0).strip("._-"), flags=re.I)
         local, sep, domain = email.partition("@")
         if not sep or not domain or not local:
             continue

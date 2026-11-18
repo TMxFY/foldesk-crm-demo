@@ -731,7 +731,7 @@
               <form id="login-form" class="compact-form">
                 <label for="phone">Телефон</label>
                 <div class="search-input-group">
-                  <input id="phone" name="phone" type="tel" autocomplete="tel" required placeholder="+79990000000">
+                  <input id="phone" name="phone" type="tel" autocomplete="tel" required placeholder="+31612345678">
                   <button type="submit" class="btn primary sm">Получить код</button>
                 </div>
                 <div class="auth-meta-grid">
@@ -784,7 +784,7 @@
                   <input id="session-import-file" type="file" accept=".zip,.session,.json" multiple>
                 </div>
                 <label for="session-import-text">Или вставьте JSON-профили / StringSession / список (phone, username, name)
-                  <textarea id="session-import-text" rows="3" placeholder='[{"phone":"+79995550101","username":"ivan_outreach","name":"Иван · Outreach","proxy":"EU Residential"}]'></textarea>
+                  <textarea id="session-import-text" rows="3" placeholder='[{"phone":"+31612345678","username":"ivan_outreach","name":"Иван · Outreach","session_string":"1BVts..."}]'></textarea>
                 </label>
                 <div class="auth-meta-grid">
                   <label for="session-proxy-select">Прокси для импорта
@@ -803,7 +803,6 @@
                   </label>
                 </div>
                 <div class="row">
-                  <button type="button" id="fill-sample-session-btn" class="btn secondary sm">Пример пакета Session + JSON</button>
                   <button type="button" id="import-session-btn" class="btn primary sm">Импортировать Session + JSON</button>
                 </div>
               </div>
@@ -812,11 +811,11 @@
             <div id="auth-pane-whatsapp" class="auth-tab-pane" hidden>
               <form id="wa-login-form" class="compact-form">
                 <label for="wa-phone-input">Номер WhatsApp
-                  <input id="wa-phone-input" name="phone" type="tel" autocomplete="tel" placeholder="+79990001122">
+                  <input id="wa-phone-input" name="phone" type="tel" autocomplete="tel" placeholder="+31612345678">
                 </label>
                 <div class="auth-meta-grid">
                   <label for="wa-proxy-input">Прокси (Proxy URL / Location)
-                    <input id="wa-proxy-input" name="proxy" type="text" autocomplete="off" placeholder="socks5://user:pass@host:1080 или auto">
+                    <input id="wa-proxy-input" name="proxy" type="text" autocomplete="off" placeholder="socks5://user:pass@host:1080">
                   </label>
                   <label for="wa-scope-select">Доступ (Access)
                     <select id="wa-scope-select" name="access">
@@ -833,7 +832,7 @@
 
               <div id="wa-pairing-box" class="wa-pairing-box stack" hidden>
                 <div id="wa-code-panel" class="wa-pairing-panel stack">
-                  <strong id="wa-pairing-code-display" class="wa-pairing-code-display">WA84-9201</strong>
+                  <strong id="wa-pairing-code-display" class="wa-pairing-code-display">—</strong>
                   <p class="hint">Откройте WhatsApp → Связанные устройства → Связать по номеру телефона</p>
                 </div>
                 <div id="wa-qr-panel" class="wa-pairing-panel stack" hidden>

@@ -21,10 +21,9 @@ from app.telegram_gateway import (
     mask_proxy_url,
 )
 from app.whatsapp_gateway import (
+    DEFAULT_WA_DAILY_LIMIT,
     WhatsAppGateway,
     _inspect_whatsmeow_db,
-    generate_pairing_code,
-    generate_qr_svg,
 )
 
 
@@ -179,6 +178,13 @@ def update_account_settings(
     new_proxy = current.get("proxy_url")
     if has_proxy or proxy_url is not None:
         new_proxy = (proxy_url or "").strip() or None
+        if str(current.get("provider") or "telegram").strip().lower() == "whatsapp":
+            from app.whatsapp_gateway import _validate_wa_proxy_url
+
+            try:
+                new_proxy = _validate_wa_proxy_url(new_proxy)
+            except GatewayError as exc:
+                raise ValueError(str(exc)) from exc
     new_scope = current.get("access_scope") or "workspace"
     if access_scope is not None:
         new_scope = (access_scope or "workspace").strip() or "workspace"
@@ -804,10 +810,12 @@ async def start_login(
     norm_provider = "whatsapp" if str(provider or "").strip().lower() == "whatsapp" else "telegram"
     norm_mode = "qr" if str(auth_mode or "").strip().lower() == "qr" else "code"
     phone = (phone or "").strip()
-    if norm_provider == "whatsapp" and not phone and norm_mode == "qr":
-        phone = "+79990000000"
-    if not phone:
+    if norm_provider == "whatsapp" and norm_mode == "qr" and not phone:
+        phone = f"wa-qr-pending-{os.urandom(4).hex()}"
+    elif not phone:
         raise ValueError("Укажите телефон")
+    if norm_provider == "whatsapp" and norm_mode == "code" and len(_phone_digits(phone)) < 8:
+        raise ValueError("Укажите номер телефона в международном формате (+...)")
     clean_proxy = (proxy_url or "").strip() or None
     clean_scope = (access_scope or "workspace").strip() or "workspace"
 
@@ -835,10 +843,16 @@ async def start_login(
     ]
     stale_ids = [int(r[0]) for r in stale_rows]
     if stale_ids:
-        if gateway is not None and hasattr(gateway, "clear_session"):
+        if gateway is not None:
             for r in stale_rows:
                 old_path = str(r[2] or "").strip() or f"data/sessions/{int(r[0])}.session"
-                gateway.clear_session(old_path)
+                if hasattr(gateway, "_close"):
+                    try:
+                        await gateway._close(old_path)
+                    except Exception:
+                        pass
+                if hasattr(gateway, "clear_session"):
+                    gateway.clear_session(old_path)
         _unlink_account_refs(conn, stale_ids)
         for sid in stale_ids:
             conn.execute("DELETE FROM accounts WHERE id = ?", (sid,))
@@ -891,11 +905,37 @@ async def start_login(
             (phone, utc_now(), clean_proxy, clean_scope, norm_provider),
         )
         account_id = cur.lastrowid
+    db_main_file = None
+    try:
+        for r_db in conn.execute("PRAGMA database_list").fetchall():
+            if str(r_db[1] or "") == "main" and str(r_db[2] or "").strip():
+                db_main_file = Path(str(r_db[2])).resolve()
+                break
+    except Exception:
+        db_main_file = None
+    is_non_default_db = db_main_file is not None and db_main_file != DEFAULT_DB.resolve()
+
     if norm_provider == "whatsapp":
-        session_path = f"data/sessions/wa_{account_id}.session"
+        if is_non_default_db:
+            session_path = str(db_main_file.parent / "sessions" / f"wa_{account_id}.session")
+        else:
+            session_path = f"data/sessions/wa_{account_id}.session"
     else:
         session_path = f"data/sessions/{account_id}.session"
-    resolve_session(session_path).parent.mkdir(parents=True, exist_ok=True)
+    abs_target_sess = resolve_session(session_path)
+    abs_target_sess.parent.mkdir(parents=True, exist_ok=True)
+    if norm_provider == "whatsapp" and not existing_connected and abs_target_sess.exists():
+        for orphan_p in (
+            abs_target_sess,
+            abs_target_sess.with_name(abs_target_sess.name + "-wal"),
+            abs_target_sess.with_name(abs_target_sess.name + "-shm"),
+            abs_target_sess.with_name(abs_target_sess.name + "-journal"),
+        ):
+            try:
+                if orphan_p.exists():
+                    orphan_p.unlink()
+            except Exception:
+                pass
     _clear_deleted_session(conn, session_path=session_path, phone=phone)
     conn.execute(
         "UPDATE accounts SET session_path = ? WHERE id = ?",
@@ -905,23 +945,21 @@ async def start_login(
 
     pairing_code = None
     qr_code = None
-    if norm_provider == "whatsapp":
-        pairing_code = generate_pairing_code(phone)
-        qr_code = generate_qr_svg(session_path, phone)
 
     req_sess_str: str | None = None
     try:
         if gateway is not None and hasattr(gateway, "set_proxy"):
             gateway.set_proxy(session_path, clean_proxy)
-        if norm_provider == "whatsapp" and isinstance(gateway, WhatsAppGateway):
+        if norm_provider == "whatsapp":
+            if gateway is None:
+                gateway = WhatsAppGateway()
+                gateway.set_proxy(session_path, clean_proxy)
             sent_res = await gateway.request_code(
                 phone, session_path, auth_mode=norm_mode
             )
-            p_info = (gateway._pending or {}).get(session_path) or {}
-            if p_info.get("pairing_code"):
-                pairing_code = p_info["pairing_code"]
-            if p_info.get("qr_code"):
-                qr_code = p_info["qr_code"]
+            p_info = (getattr(gateway, "_pending", None) or {}).get(session_path) or {}
+            pairing_code = p_info.get("pairing_code") or None
+            qr_code = p_info.get("qr_code") or None
         else:
             sent_res = await gateway.request_code(phone, session_path)
         if isinstance(sent_res, dict):
@@ -938,6 +976,39 @@ async def start_login(
         raise GatewayError(str(exc) or "Не удалось отправить код") from exc
     if req_sess_str and gateway is not None and hasattr(gateway, "set_session_string"):
         gateway.set_session_string(session_path, req_sess_str)
+    if norm_provider == "whatsapp" and str(phone_code_hash).startswith("wa:connected:"):
+        wa_info = _inspect_whatsmeow_db(session_path) or {}
+        conn.execute(
+            """
+            UPDATE accounts
+            SET phone_code_hash = ?, status = 'connected', health = 'active', last_error = NULL,
+                phone = COALESCE(?, phone), telegram_user_id = COALESCE(?, telegram_user_id),
+                telegram_name = COALESCE(?, telegram_name), wa_jid = COALESCE(?, wa_jid),
+                pairing_code = NULL, qr_code = NULL, provider = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                phone_code_hash,
+                wa_info.get("phone"),
+                wa_info.get("telegram_user_id"),
+                wa_info.get("name"),
+                wa_info.get("wa_jid"),
+                norm_provider,
+                utc_now(),
+                account_id,
+            ),
+        )
+        conn.commit()
+        _sync_session_blob(conn, account_id)
+        return {
+            "id": account_id,
+            "status": "connected",
+            "provider": norm_provider,
+            "pairing_code": None,
+            "qr_code": None,
+            "proxy_url": clean_proxy,
+            "access_scope": clean_scope,
+        }
     conn.execute(
         """
         UPDATE accounts
@@ -1108,16 +1179,22 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         digits = re.sub(r"\D", "", phone_str)
         if digits and len(digits) >= 7:
             phone = f"+{digits}"
-        elif phone_str:
-            phone = phone_str if phone_str.startswith("+") else f"+{phone_str}"
+        elif provider == "whatsapp":
+            phone = ""
         else:
-            phone = f"+7999000{idx:04d}"
+            raise ValueError(
+                "Укажите корректный номер телефона для импортируемой сессии Telegram"
+            )
 
-        phone_digits = re.sub(r"\D", "", phone) or f"7999000{idx:04d}"
+        phone_digits = re.sub(r"\D", "", phone)
         wa_jid = (
             str(raw_wa_jid).strip()
             if raw_wa_jid
-            else (f"{phone_digits}@s.whatsapp.net" if provider == "whatsapp" else None)
+            else (
+                f"{phone_digits}@s.whatsapp.net"
+                if (provider == "whatsapp" and phone_digits)
+                else None
+            )
         )
 
         username_raw = (
@@ -1133,7 +1210,11 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         first_name = str(entry.get("first_name") or jdata.get("first_name") or "").strip()
         last_name = str(entry.get("last_name") or jdata.get("last_name") or "").strip()
         combined_fl = " ".join(p for p in (first_name, last_name) if p).strip()
-        default_name = f"WhatsApp {phone}" if provider == "whatsapp" else (username or phone)
+        default_name = (
+            f"WhatsApp {phone}".strip()
+            if provider == "whatsapp"
+            else (username or phone)
+        )
         telegram_name = (
             str(entry.get("telegram_name") or entry.get("name") or "").strip()
             or combined_fl
@@ -1155,12 +1236,8 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                 tg_id = int(str(tg_id_raw).strip())
             except ValueError:
                 tg_id = None
-        if tg_id is None:
-            if provider == "whatsapp" and phone_digits.isdigit():
-                tg_id = int(phone_digits[-15:])
-            else:
-                seed_int = int(hashlib.md5(phone.encode("utf-8")).hexdigest()[:8], 16)
-                tg_id = 77000000 + (seed_int % 9000000)
+        if tg_id is None and provider == "whatsapp" and phone_digits.isdigit():
+            tg_id = int(phone_digits[-15:])
 
         proxy_url = (
             _format_proxy(entry.get("proxy_url"))
@@ -1169,6 +1246,13 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             or _format_proxy(jdata.get("proxy"))
             or default_proxy
         )
+        if provider == "whatsapp" and proxy_url:
+            from app.whatsapp_gateway import _validate_wa_proxy_url
+
+            try:
+                proxy_url = _validate_wa_proxy_url(proxy_url)
+            except GatewayError as exc:
+                raise ValueError(str(exc)) from exc
         access_scope = (
             str(entry.get("access_scope") or default_scope or "workspace").strip()
             or "workspace"
@@ -1182,7 +1266,18 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
         safe_stem = re.sub(r"[^A-Za-z0-9_+-]", "", raw_stem) or f"session_{idx}"
         if provider == "whatsapp" and not safe_stem.lower().startswith("wa_"):
             safe_stem = f"wa_{safe_stem}"
-        session_path = f"data/sessions/{safe_stem}.session"
+        imp_db_file = None
+        try:
+            for r_db in conn.execute("PRAGMA database_list").fetchall():
+                if str(r_db[1] or "") == "main" and str(r_db[2] or "").strip():
+                    imp_db_file = Path(str(r_db[2])).resolve()
+                    break
+        except Exception:
+            imp_db_file = None
+        if imp_db_file is not None and imp_db_file != DEFAULT_DB.resolve():
+            session_path = str(imp_db_file.parent / "sessions" / f"{safe_stem}.session")
+        else:
+            session_path = f"data/sessions/{safe_stem}.session"
         abs_session_path = resolve_session(session_path)
         abs_session_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1211,16 +1306,42 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
                     saved_session_str = s_val
 
         if not wrote_session and not saved_session_str:
-            if not (abs_session_path.exists() and abs_session_path.stat().st_size > 100):
-                if provider == "whatsapp":
-                    stub_bytes = f"SQLite format 3\x00whatsapp:{phone}".encode("utf-8")
-                    abs_session_path.write_bytes(stub_bytes)
-                else:
-                    stub_bytes = f"SQLite format 3\x00{phone}:{tg_id}".encode("utf-8")
-                    abs_session_path.write_bytes(stub_bytes)
+            raise ValueError(
+                "Загрузите реальный .session / WhatsApp session файл или укажите валидную session_string (синтетические заглушки запрещены)"
+            )
 
-        if provider == "telegram" and not saved_session_str and abs_session_path.exists():
-            saved_session_str = extract_string_session_from_sqlite(abs_session_path)
+        if provider == "whatsapp":
+            wm_info = _inspect_whatsmeow_db(session_path) if wrote_session else None
+            if wm_info is None:
+                if wrote_session and abs_session_path.exists():
+                    try:
+                        abs_session_path.unlink()
+                    except Exception:
+                        pass
+                raise ValueError(
+                    "Невалидный файл сессии WhatsApp: требуется реальная авторизованная БД whatsmeow_device"
+                )
+            phone = wm_info["phone"]
+            wa_jid = wm_info["wa_jid"]
+            tg_id = wm_info["telegram_user_id"]
+            if telegram_name.startswith("WhatsApp +") and wm_info.get("name"):
+                telegram_name = wm_info["name"]
+            if raw_limit is None and "daily_limit" not in entry:
+                daily_limit = DEFAULT_WA_DAILY_LIMIT
+        else:
+            if not saved_session_str and abs_session_path.exists():
+                saved_session_str = extract_string_session_from_sqlite(abs_session_path)
+            has_real_tg_sqlite = _inspect_telethon_session(session_path) is not None
+            has_real_tg_str = _is_valid_string_session(saved_session_str)
+            if not has_real_tg_sqlite and not has_real_tg_str:
+                if wrote_session and abs_session_path.exists():
+                    try:
+                        abs_session_path.unlink()
+                    except Exception:
+                        pass
+                raise ValueError(
+                    "Невалидная сессия Telegram: требуется реальный .session файл (auth_key 256 байт) или валидная StringSession"
+                )
 
         app_id_val = (
             entry.get("app_id")
@@ -1398,13 +1519,6 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             account_id = int(cur.lastrowid)
 
         _sync_session_blob(conn, account_id)
-
-        if gateway is not None and hasattr(gateway, "_pending") and isinstance(gateway._pending, dict):
-            gateway._pending[session_path] = {
-                "phone": phone,
-                "state": "connected",
-                "wa_jid": wa_jid,
-            }
 
         imported.append(_public(_load(conn, account_id)))
 
@@ -1750,7 +1864,7 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
         dup = _find_duplicate_account(
             conn,
             str(current.get("provider") or "telegram"),
-            phone=current.get("phone"),
+            phone=result.get("phone") or current.get("phone"),
             telegram_user_id=result.get("telegram_user_id"),
             exclude_id=account_id,
             connected_only=True,
@@ -1768,12 +1882,14 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
         conn.execute(
             """
             UPDATE accounts
-            SET status = ?, telegram_user_id = ?, telegram_username = ?, telegram_name = ?,
-                wa_jid = COALESCE(?, wa_jid), session_string = COALESCE(?, session_string)
+            SET status = ?, phone = COALESCE(?, phone), telegram_user_id = ?, telegram_username = ?, telegram_name = ?,
+                wa_jid = COALESCE(?, wa_jid), session_string = COALESCE(?, session_string),
+                pairing_code = NULL, qr_code = NULL
             WHERE id = ?
             """,
             (
                 status,
+                result.get("phone"),
                 result.get("telegram_user_id"),
                 result.get("telegram_username"),
                 result.get("telegram_name"),

@@ -3,11 +3,14 @@ import io
 import json
 import zipfile
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.db import connect, init_db, resolve_session
 from app.main import create_app
 from app.telegram_gateway import FakeGateway
+from real_session_helpers import make_real_telethon_sqlite_bytes, make_real_telethon_string_session
 
 
 def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
@@ -15,6 +18,9 @@ def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
     init_db(conn)
     gateway = FakeGateway(code="11111")
     app = create_app(conn=conn, gateway=gateway)
+
+    real_str_sess = make_real_telethon_string_session()
+    real_sqlite_bytes = make_real_telethon_sqlite_bytes(tmp_path, "79994445566")
 
     with TestClient(app) as client:
         # 1. Start login with proxy_url and access_scope
@@ -31,7 +37,22 @@ def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
         assert started["proxy_url"] == "socks5://127.0.0.1:1080"
         assert started["access_scope"] == "personal"
 
-        # 2. Import session via JSON sessions list
+        # 1b. Importing invalid stub StringSession or stub bytes MUST be rejected with 400
+        bad_str = client.post(
+            "/api/accounts/import-session",
+            json={
+                "sessions": [
+                    {
+                        "phone": "+79991112200",
+                        "username": "fake_stub",
+                        "session_string": "not_a_real_telethon_session",
+                    }
+                ]
+            },
+        )
+        assert bad_str.status_code == 400
+
+        # 2. Import session via JSON sessions list with real 256-byte Telethon StringSession
         imp_resp = client.post(
             "/api/accounts/import-session",
             json={
@@ -42,7 +63,7 @@ def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
                         "first_name": "Alex",
                         "last_name": "SoftUGC",
                         "telegram_user_id": 77001122,
-                        "session_string": "1BVtsOHwButest_session_string",
+                        "session_string": real_str_sess,
                         "filename": "test_79991112233.session",
                     }
                 ],
@@ -66,7 +87,7 @@ def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
         assert acc1["daily_limit"] == 35
         assert acc1["session_exists"] is True
 
-        # 3. Import session via ZIP archive (phone.json + phone.session)
+        # 3. Import session via ZIP archive with real Telethon SQLite .session file
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(
@@ -84,7 +105,7 @@ def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
                     }
                 ),
             )
-            zf.writestr("79994445566.session", b"SQLite format 3\x00zip_session_bytes")
+            zf.writestr("79994445566.session", real_sqlite_bytes)
         zip_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
         zip_resp = client.post(
@@ -126,11 +147,9 @@ def test_import_sessions_json_and_zip_plus_account_settings(tmp_path):
         all_accs = client.get("/api/accounts").json()
         assert len(all_accs) == 3
 
-        # Cleanup test session files created on disk
+        # Verify non-default DB imports never pollute repo ROOT/data/sessions
         for stem in ("test_79991112233", "79994445566"):
-            p = resolve_session(f"data/sessions/{stem}.session")
-            if p.exists():
-                p.unlink()
+            assert not resolve_session(f"data/sessions/{stem}.session").exists()
 
 
 def test_outreach_sending_schedule_get_and_put(tmp_path):

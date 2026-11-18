@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import sys
 import pytest
+
+_WORKTREE_ROOT = str(Path(__file__).resolve().parents[1])
+_TESTS_ROOT = str(Path(__file__).resolve().parent)
+for _p in (_TESTS_ROOT, _WORKTREE_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def pytest_configure(config: pytest.Config) -> None:

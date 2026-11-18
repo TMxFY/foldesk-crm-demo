@@ -830,16 +830,30 @@ def test_sync_campaign_replies_respects_newer_followup_and_tz_normalization(tmp_
 
 
 def test_whatsapp_gateway_synthetic_message_ids_never_collide_at_5001(tmp_path):
-    gw1 = WhatsAppGateway()
-    gw2 = WhatsAppGateway()
+    from app.telegram_gateway import GatewayError
+    from real_session_helpers import make_protocol_wa_client_factory, make_real_whatsmeow_db
+
+    s1 = tmp_path / "wa1.session"
+    s2 = tmp_path / "wa2.session"
+    make_real_whatsmeow_db(s1, jid="31611110001:1@s.whatsapp.net")
+    make_real_whatsmeow_db(s2, jid="31611110002:1@s.whatsapp.net")
+
+    factory, records = make_protocol_wa_client_factory(registered_phones={"+79001112233"})
+    gw1 = WhatsAppGateway(client_factory=factory)
+    gw2 = WhatsAppGateway(client_factory=factory)
 
     async def _run():
-        r1 = await gw1.send_message(str(tmp_path / "wa1.session"), "+79001112233", "msg 1")
-        r2 = await gw2.send_message(str(tmp_path / "wa2.session"), "+79001112233", "msg 2")
-        r3 = await gw1.send_message(str(tmp_path / "wa1.session"), "+79001112233", "msg 3")
+        # Unauthenticated session path must fail fast instead of returning fake IDs
+        with pytest.raises(GatewayError):
+            await gw1.send_message(str(tmp_path / "unauth.session"), "+79001112233", "must fail")
+
+        r1 = await gw1.send_message(str(s1), "+79001112233", "msg 1")
+        r2 = await gw2.send_message(str(s2), "+79001112233", "msg 2")
+        r3 = await gw1.send_message(str(s1), "+79001112233", "msg 3")
         return r1["telegram_message_id"], r2["telegram_message_id"], r3["telegram_message_id"]
 
     id1, id2, id3 = asyncio.run(_run())
+    assert len(records["sent_messages"]) == 3
     assert id1 >= 1_000_000_000
     assert id2 >= 1_000_000_000
     assert id3 >= 1_000_000_000

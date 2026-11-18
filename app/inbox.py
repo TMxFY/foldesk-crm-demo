@@ -2941,6 +2941,11 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     if account["status"] != "connected":
         raise ValueError("Аккаунт не подключён")
     if gateway is None:
+        from app.runtime_config import is_vps_runtime
+
+        is_demo = str(account.get("session_path") or "").startswith("data/sessions/demo")
+        if is_vps_runtime() and not is_demo:
+            raise GatewayError("Шлюз отправки недоступен для живой сессии")
         next_row = conn.execute(
             "SELECT COALESCE(MAX(telegram_message_id), 9000) + 1 AS next_id FROM messages WHERE dialog_id = ?",
             (dialog_id,),

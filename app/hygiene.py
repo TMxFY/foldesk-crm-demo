@@ -717,14 +717,72 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _collect_fake_session_accounts(conn: sqlite3.Connection) -> list[tuple[int, str, dict[str, Any]]]:
+    from app.accounts import _inspect_telethon_session, _is_valid_string_session
+    from app.db import resolve_session
+    from app.runtime_config import is_vps_runtime
+    from app.whatsapp_gateway import _inspect_whatsmeow_db
+
+    flagged: list[tuple[int, str, dict[str, Any]]] = []
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, phone, provider, status, session_path, session_string
+            FROM accounts
+            WHERE status = 'connected'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return flagged
+
+    vps_mode = is_vps_runtime()
+    for raw in rows:
+        d = as_dict(raw)
+        aid = int(d["id"])
+        prov = str(d.get("provider") or "telegram").strip().lower()
+        sess_path = str(d.get("session_path") or "").strip()
+        sess_str = str(d.get("session_string") or "").strip()
+        is_demo = sess_path.startswith("data/sessions/demo")
+        if is_demo:
+            if vps_mode:
+                flagged.append((aid, "демо-аккаунт в продовой БД", d))
+            continue
+        abs_p = resolve_session(sess_path) if sess_path else None
+        disk_exists = bool(abs_p is not None and abs_p.exists() and abs_p.is_file())
+        if not vps_mode and not disk_exists and not sess_str:
+            continue
+        if prov == "whatsapp":
+            if (vps_mode or disk_exists) and _inspect_whatsmeow_db(sess_path) is None:
+                flagged.append((aid, "отсутствует или подделана БД whatsmeow_device", d))
+        else:
+            has_real_str = _is_valid_string_session(sess_str)
+            has_real_sqlite = _inspect_telethon_session(sess_path) is not None if sess_path else False
+            if (vps_mode or disk_exists or bool(sess_str)) and not (has_real_str or has_real_sqlite):
+                flagged.append((aid, "отсутствует или подделана Telethon-сессия", d))
+    return flagged
+
+
 def audit_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
     findings = _collect_hygiene_findings(conn)
+    fake_accs = _collect_fake_session_accounts(conn)
     rec_ids = [rid for rid, _, _ in findings["active_junk_recipients"]]
     junk_lead_ids = [lid for lid, _, _ in findings["active_junk_leads"]]
     contactless_ids = [lid for lid, _, _ in findings["contactless_leads"]]
     dirty_ids = [lid for lid, _, _, _ in findings["dirty_title_leads"]]
+    fake_acc_ids = [aid for aid, _, _ in fake_accs]
 
     samples: list[dict[str, Any]] = []
+    for aid, reason, ad in fake_accs[:5]:
+        samples.append(
+            {
+                "kind": "fake_session_account",
+                "id": aid,
+                "phone": ad.get("phone"),
+                "provider": ad.get("provider"),
+                "reason": reason,
+            }
+        )
     for rid, reason, rd in findings["active_junk_recipients"][:5]:
         samples.append(
             {
@@ -775,6 +833,7 @@ def audit_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
         and len(junk_lead_ids) == 0
         and len(contactless_ids) == 0
         and len(dirty_ids) == 0
+        and len(fake_acc_ids) == 0
     )
     return {
         "ok": ok,
@@ -786,6 +845,8 @@ def audit_crm_hygiene(conn: sqlite3.Connection) -> dict[str, Any]:
         "contactless_lead_ids": contactless_ids,
         "dirty_title_lead_count": len(dirty_ids),
         "dirty_title_lead_ids": dirty_ids,
+        "fake_session_account_count": len(fake_acc_ids),
+        "fake_session_account_ids": fake_acc_ids,
         "samples": samples[:15],
     }
 
@@ -796,7 +857,24 @@ def heal_crm_hygiene(
     clear_stale_stage_errors: bool = False,
 ) -> dict[str, Any]:
     findings = _collect_hygiene_findings(conn)
+    fake_accs = _collect_fake_session_accounts(conn)
     now_ts = utc_now()
+
+    healed_fake_accounts = 0
+    for aid, reason, _ in fake_accs:
+        cur_acc = conn.execute(
+            """
+            UPDATE accounts
+            SET status = 'error',
+                health = 'unauthorized',
+                last_error = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND status = 'connected'
+            """,
+            (f"Карантин сессии: {reason}", now_ts, aid),
+        )
+        healed_fake_accounts += int(cur_acc.rowcount or 0)
 
     quarantined_recipients = 0
     for rid, reason, _ in findings["active_junk_recipients"]:
@@ -882,7 +960,13 @@ def heal_crm_hygiene(
         )
         cleared_stage_errors = int(cur_err.rowcount or 0)
 
-    if quarantined_recipients or quarantined_leads or sanitized_leads or cleared_stage_errors:
+    if (
+        healed_fake_accounts
+        or quarantined_recipients
+        or quarantined_leads
+        or sanitized_leads
+        or cleared_stage_errors
+    ):
         conn.execute(
             """
             INSERT INTO kv_settings (key, value, updated_at)
@@ -898,6 +982,8 @@ def heal_crm_hygiene(
         "quarantined_leads": quarantined_leads,
         "sanitized_leads": sanitized_leads,
     }
+    if healed_fake_accounts:
+        res_dict["healed_fake_accounts"] = healed_fake_accounts
     if clear_stale_stage_errors:
         res_dict["cleared_stage_errors"] = cleared_stage_errors
     return res_dict

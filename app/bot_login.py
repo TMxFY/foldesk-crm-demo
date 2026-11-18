@@ -496,7 +496,13 @@ def _resolve_dialog_id_for_bot_reply(
     return None
 
 
-async def handle_bot_reply_to_lead(conn, update: dict, gateway=None, opener=None) -> dict:
+async def handle_bot_reply_to_lead(
+    conn,
+    update: dict,
+    gateway=None,
+    wa_gateway=None,
+    opener=None,
+) -> dict:
     if not isinstance(update, dict):
         return {"ok": True, "replied": False, "dialog_id": None}
     message = update.get("message")
@@ -565,7 +571,18 @@ async def handle_bot_reply_to_lead(conn, update: dict, gateway=None, opener=None
     if dialog_id is None:
         return {"ok": True, "replied": False, "dialog_id": None}
 
-    sent_msg = await send_reply(conn, int(dialog_id), reply_text, gateway)
+    prov_row = conn.execute(
+        """
+        SELECT a.provider
+        FROM dialogs d
+        JOIN accounts a ON a.id = d.account_id
+        WHERE d.id = ?
+        """,
+        (int(dialog_id),),
+    ).fetchone()
+    dialog_provider = str((prov_row["provider"] if prov_row else None) or "telegram").strip().lower()
+    target_gateway = wa_gateway if dialog_provider == "whatsapp" else gateway
+    sent_msg = await send_reply(conn, int(dialog_id), reply_text, target_gateway)
 
     if used_active_key:
         keys_to_clear = ["bot_active_reply_dialog_default"]

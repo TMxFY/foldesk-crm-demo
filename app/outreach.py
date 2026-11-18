@@ -1909,6 +1909,8 @@ def _is_invalid_recipient_error(exc: BaseException | None) -> bool:
             "chatwriteforbidden",
             "allow_payment_required",
             "payment_required",
+            "не зарегистрирован в whatsapp",
+            "некорректный номер получателя whatsapp",
         )
     )
 
@@ -1960,10 +1962,15 @@ def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
             "moderators have confirmed",
             "ограничен до",
             "временно ограничен",
+            "аккаунт whatsapp ограничен",
         )
     ):
         return ("account_dead", "frozen")
-    if "userdeactivatedban" in blob or "phonenumberbanned" in blob:
+    if (
+        "userdeactivatedban" in blob
+        or "phonenumberbanned" in blob
+        or "аккаунт whatsapp заблокирован" in blob
+    ):
         return ("account_dead", "banned")
     if any(
         marker in blob
@@ -1978,6 +1985,11 @@ def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
             "userdeactivated",
             "сессия не авторизована",
             "сессия сброшена",
+            "сессия whatsapp не авторизована",
+            "сессия whatsapp недействительна",
+            "сессия whatsapp ожидает сопряжения",
+            "сессия whatsapp разлогинена",
+            "loggedout",
         )
     ):
         return ("account_dead", "unauthorized")
@@ -1996,6 +2008,12 @@ def _classify_outreach_send_error(exc: Exception) -> tuple[str, str]:
             "connection reset",
             "socks",
             "proxy",
+            "не удалось подключиться к whatsapp",
+            "не удалось проверить номера в whatsapp",
+            "движок whatsapp (neonize) не установлен",
+            "не удалось применить прокси",
+            "websocket",
+            "streamreplaced",
         )
     ):
         return ("account_transient", "offline")
@@ -4035,6 +4053,37 @@ async def run_campaign_batch(
             if pace_across_schedule
             else acc_daily_lim
         )
+        wa_last_cold_dt = None
+        wa_cold_blocked = False
+        if str(acc_pub.get("provider") or "telegram").strip().lower() == "whatsapp":
+            from app.whatsapp_gateway import WA_MIN_COLD_INTERVAL_SECONDS
+
+            last_row = conn.execute(
+                """
+                SELECT MAX(ts) AS max_sent FROM (
+                    SELECT MAX(last_sent_at) AS ts
+                    FROM campaign_recipients
+                    WHERE COALESCE(sent_account_id, assigned_account_id) = ?
+                      AND COALESCE(current_step, 0) >= 1
+                    UNION ALL
+                    SELECT MAX(m.sent_at) AS ts
+                    FROM messages m
+                    JOIN dialogs d ON d.id = m.dialog_id
+                    WHERE d.account_id = ?
+                      AND m.direction = 'out'
+                )
+                """,
+                (acc_id_int, acc_id_int),
+            ).fetchone()
+            if last_row and last_row["max_sent"]:
+                wa_last_cold_dt = _parse_iso_dt(str(last_row["max_sent"]))
+                if (
+                    wa_last_cold_dt is not None
+                    and not str(acc_raw.get("session_path") or "").startswith("data/sessions/demo")
+                    and os.environ.get("CRMTG_FORCE_NO_JITTER") != "1"
+                    and (eff_now_dt - wa_last_cold_dt).total_seconds() < WA_MIN_COLD_INTERVAL_SECONDS
+                ):
+                    wa_cold_blocked = True
         connected_states.append(
             {
                 "id": acc_id_int,
@@ -4048,6 +4097,8 @@ async def run_campaign_batch(
                 "disabled": acc_cd_until is not None and not is_spambot_warm_only,
                 "cooldown_until": acc_cd_until,
                 "spambot_warm_only": is_spambot_warm_only,
+                "wa_cold_blocked": wa_cold_blocked,
+                "wa_last_cold_dt": wa_last_cold_dt,
             }
         )
 
@@ -4922,6 +4973,7 @@ async def run_campaign_batch(
                     >= (new_lead_slots_today if step_idx == 0 else 1)
                 )
                 and (step_idx >= 1 or not st.get("spambot_warm_only"))
+                and (step_idx >= 1 or not st.get("wa_cold_blocked"))
             ]
             if not globally_available:
                 if step_idx == 0:
@@ -4975,6 +5027,7 @@ async def run_campaign_batch(
                 if (
                     not pinned_state.get("disabled")
                     and not pinned_state.get("spambot_warm_only")
+                    and not pinned_state.get("wa_cold_blocked")
                     and pinned_state["id"] not in recipient_excluded_accounts
                     and pinned_state["sent_today"] < pinned_state["paced_limit"]
                     and (
@@ -5014,10 +5067,24 @@ async def run_campaign_batch(
             acc_provider = (account_raw.get("provider") or "telegram").strip().lower()
             session_path = str(account_raw.get("session_path") or "")
             is_demo_session = session_path.startswith("data/sessions/demo")
-            active_gw = (wa_gateway if wa_gateway is not None else gateway) if acc_provider == "whatsapp" else gateway
+            active_gw = wa_gateway if acc_provider == "whatsapp" else gateway
             if not is_demo_session and active_gw is None:
                 chosen_state["disabled"] = True
                 continue
+            if (
+                acc_provider == "whatsapp"
+                and not is_demo_session
+                and step_idx == 0
+                and os.environ.get("CRMTG_FORCE_NO_JITTER") != "1"
+            ):
+                from app.whatsapp_gateway import WA_MIN_COLD_INTERVAL_SECONDS
+
+                last_cold_dt = chosen_state.get("wa_last_cold_dt")
+                if last_cold_dt is not None:
+                    elapsed_s = (eff_now_dt - last_cold_dt).total_seconds()
+                    if elapsed_s < WA_MIN_COLD_INTERVAL_SECONDS:
+                        chosen_state["wa_cold_blocked"] = True
+                        continue
             use_gateway = active_gw is not None and not is_demo_session
 
             if not jitter_applied and jitter_range is not None and len(jitter_range) == 2:
@@ -5188,6 +5255,8 @@ async def run_campaign_batch(
                         ).fetchone()
                         tg_mid = int(next_row["next_id"])
                         sent_at = now
+                    if step_idx == 0:
+                        chosen_state["wa_last_cold_dt"] = eff_now_dt
                 else:
                     next_step_order = step_idx + 1
                     if use_gateway:
@@ -5364,18 +5433,27 @@ async def run_campaign_batch(
                         break
                     continue
 
+                is_unregistered_wa = "не зарегистрирован в whatsapp" in str(exc or "").casefold()
+                if is_unregistered_wa:
+                    _cleanup_empty_step0_dialog(conn, step_idx, dialog)
                 conn.execute(
                     """
                     UPDATE campaign_recipients
-                    SET status = 'failed', error_text = ?, updated_at = ?
+                    SET status = ?, error_text = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (str(exc)[:300], now, rec["id"]),
+                    (
+                        "completed" if is_unregistered_wa else "failed",
+                        "Номер не зарегистрирован в WhatsApp" if is_unregistered_wa else str(exc)[:300],
+                        now,
+                        rec["id"],
+                    ),
                 )
-                record_source_send_outcome(conn, rec, outcome="rejected_or_blocked")
+                if not is_unregistered_wa:
+                    record_source_send_outcome(conn, rec, outcome="rejected_or_blocked")
                 conn.commit()
                 _release_followup_reservation(int(rec["id"]))
-                if not _is_invalid_recipient_error(exc):
+                if not is_unregistered_wa and not _is_invalid_recipient_error(exc):
                     failed_in_batch += 1
                 break
 
@@ -5423,6 +5501,10 @@ async def run_campaign_batch(
         increment_daily_sent(conn, chosen_account_id)
         chosen_state["sent_today"] += 1
         chosen_state["sent_in_batch"] += 1
+        if acc_provider == "whatsapp" and not is_demo_session:
+            chosen_state["wa_last_cold_dt"] = _parse_iso_dt(sent_at) or eff_now_dt
+            if os.environ.get("CRMTG_FORCE_NO_JITTER") != "1":
+                chosen_state["wa_cold_blocked"] = True
         sent_by_account[str(chosen_account_id)] = sent_by_account.get(str(chosen_account_id), 0) + 1
         if step_idx == 0:
             record_source_send_outcome(conn, rec, outcome="sent")

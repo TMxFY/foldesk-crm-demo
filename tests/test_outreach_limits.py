@@ -756,9 +756,11 @@ def test_tg_web_a_session_init_js_and_persistence(tmp_path):
         assert len(client.get("/api/accounts").json()) == 2
 
         # Importing an already-connected account also returns 400 error
+        from real_session_helpers import make_real_telethon_string_session
+
         imp_dup = client.post(
             "/api/accounts/import-session",
-            json={"phone": "+905346380943", "telegram_user_id": 5680938518, "session_string": "dup"},
+            json={"phone": "+905346380943", "telegram_user_id": 5680938518, "session_string": make_real_telethon_string_session()},
         )
         assert imp_dup.status_code == 400
         assert "уже добавлен" in imp_dup.json()["detail"].lower()

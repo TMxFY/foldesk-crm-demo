@@ -599,12 +599,16 @@ def test_r2_lease_never_steals_live_or_errored_lease_and_restore_protects_local_
 
 # 5. Единая нормализация WhatsApp номеров 13–15 цифр
 def test_whatsapp_13_to_15_digit_e164_unified_peer_id_and_stop_outreach(tmp_path: Path):
+    from real_session_helpers import make_protocol_wa_client_factory, make_real_whatsmeow_db
+
     conn = connect(tmp_path / "wa_e164.db")
     init_db(conn)
     wa_acc_id = _seed_connected_account(conn, phone="+4915100000001", provider="whatsapp", username="wa_mgr")
-    wa_gw = WhatsAppGateway()
+    wa_db = make_real_whatsmeow_db(tmp_path / "wa_e164.session", jid="4915100000001:1@s.whatsapp.net")
+    factory, _ = make_protocol_wa_client_factory(registered_phones={"+4915123456789"})
+    wa_gw = WhatsAppGateway(client_factory=factory, db_path=tmp_path / "wa_e164.db")
 
-    checked = asyncio.run(wa_gw.check_numbers("data/sessions/wa.session", ["+49 (151) 2345-6789"]))
+    checked = asyncio.run(wa_gw.check_numbers(str(wa_db), ["+49 (151) 2345-6789"]))
     assert checked[0]["telegram_user_id"] == 4915123456789
 
     lead = create_lead(

@@ -1015,12 +1015,15 @@ async def stop_inbox_watches(app) -> None:
         except (asyncio.CancelledError, Exception):
             pass
     app.state.inbox_tasks.clear()
-    gw = getattr(app.state, "gateway", None)
-    if gw is not None and hasattr(gw, "close_all"):
-        try:
-            await gw.close_all()
-        except Exception:
-            pass
+    for gw in (
+        getattr(app.state, "gateway", None),
+        getattr(app.state, "wa_gateway", None),
+    ):
+        if gw is not None and hasattr(gw, "close_all"):
+            try:
+                await gw.close_all()
+            except Exception:
+                pass
 
 
 async def sync_live_tg_read_receipts_once(
@@ -1266,7 +1269,7 @@ async def stop_airtable_sync_loop(app: FastAPI) -> None:
         app.state.airtable_sync_task = None
 
 
-def create_app(conn=None, gateway=None) -> FastAPI:
+def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     load_env_file()
 
     async def _tg_lease_heartbeat_loop(app: FastAPI) -> None:
@@ -1486,7 +1489,18 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         _heal_crm_hygiene_safe(conn)
     app.state.conn = conn
     app.state.gateway = gateway
-    app.state.wa_gateway = WhatsAppGateway()
+    if wa_gateway is not None:
+        app.state.wa_gateway = wa_gateway
+    else:
+        gw_db_path = None
+        try:
+            for db_row in conn.execute("PRAGMA database_list").fetchall():
+                if str(db_row[1] or "") == "main" and str(db_row[2] or "").strip():
+                    gw_db_path = str(db_row[2]).strip()
+                    break
+        except Exception:
+            gw_db_path = None
+        app.state.wa_gateway = WhatsAppGateway(db_path=gw_db_path)
     app.state.inbox_hub = InboxHub()
     app.state.inbox_tasks = {}
     app.state.inbox_synced = set()
@@ -1715,7 +1729,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         return {"imported": imported, "count": len(imported)}
 
     @app.patch("/api/accounts/{account_id}/settings")
-    def accounts_settings_patch(
+    async def accounts_settings_patch(
         account_id: int, body: AccountSettingsPatch, request: Request
     ):
         fields = body.model_dump(exclude_unset=True)
@@ -1730,14 +1744,24 @@ def create_app(conn=None, gateway=None) -> FastAPI:
         )
         with locked_conn(request.app.state.conn):
             row = request.app.state.conn.execute(
-                "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+                "SELECT provider, session_path FROM accounts WHERE id = ?", (account_id,)
             ).fetchone()
-        gw = getattr(request.app.state, "gateway", None)
-        if row and row["session_path"] and gw is not None and hasattr(gw, "set_proxy"):
-            try:
-                gw.set_proxy(row["session_path"], updated.get("proxy_url"))
-            except Exception:
-                pass
+        if row and row["session_path"]:
+            prov = str(row["provider"] or "telegram").strip().lower()
+            if prov == "whatsapp":
+                wa_gw = _resolve_app_gateway(request.app, "whatsapp")
+                if wa_gw is not None and hasattr(wa_gw, "apply_proxy"):
+                    try:
+                        await wa_gw.apply_proxy(row["session_path"], updated.get("proxy_url"))
+                    except GatewayError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+            else:
+                gw = getattr(request.app.state, "gateway", None)
+                if gw is not None and hasattr(gw, "set_proxy"):
+                    try:
+                        gw.set_proxy(row["session_path"], updated.get("proxy_url"))
+                    except Exception:
+                        pass
         return updated
 
     @app.post("/api/accounts/{account_id}/code")
@@ -2273,6 +2297,7 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 request.app.state.conn,
                 update,
                 gateway=gateway,
+                wa_gateway=_resolve_app_gateway(request.app, "whatsapp"),
                 opener=opener,
             )
             if res.get("replied"):
@@ -2668,17 +2693,12 @@ def create_app(conn=None, gateway=None) -> FastAPI:
                 """,
                 (dialog_id,),
             ).fetchone()
-            tg_id, tg_hash = _resolve_tg_creds(conn)
-        has_tg_creds = bool(tg_id and tg_hash)
         if demo_row and str(demo_row["provider"] or "telegram").strip().lower() == "whatsapp":
             return _gateway_for_provider(request, "whatsapp")
         if (
             demo_row
             and request.app.state.gateway is None
-            and (
-                str(demo_row["session_path"] or "").startswith("data/sessions/demo")
-                or not has_tg_creds
-            )
+            and str(demo_row["session_path"] or "").startswith("data/sessions/demo")
         ):
             return None
         return _gateway(request)
@@ -3830,7 +3850,9 @@ def create_app(conn=None, gateway=None) -> FastAPI:
 
     @app.post("/api/demo/seed")
     def demo_seed(request: Request):
-        if is_auth_enforced() and os.getenv("ALLOW_PROD_DEMO_SEED") != "1":
+        if is_vps_runtime() or (
+            is_auth_enforced() and os.getenv("ALLOW_PROD_DEMO_SEED") != "1"
+        ):
             raise HTTPException(
                 status_code=403, detail="Demo seed is disabled on production"
             )

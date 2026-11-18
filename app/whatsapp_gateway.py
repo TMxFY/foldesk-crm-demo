@@ -4,6 +4,8 @@ import io
 import json
 import mimetypes
 import os
+from pathlib import Path
+import random
 import re
 import sqlite3
 import sys
@@ -11,10 +13,8 @@ import threading
 import time
 import types
 import urllib.parse
-from pathlib import Path
 
 from app.db import DEFAULT_DB, resolve_session, utc_now
-from app.runtime_config import is_ephemeral_runtime
 from app.telegram_gateway import (
     SESSION_HEALTH,
     GatewayError,
@@ -41,40 +41,67 @@ try:
     import segno  # type: ignore
     import neonize  # type: ignore  # pragma: no cover
     import neonize.utils.ffmpeg as _neonize_ffmpeg  # type: ignore  # pragma: no cover
-    from neonize.aioze.client import NewAClient  # type: ignore  # pragma: no cover
+    from neonize._binder import ProxySettings  # type: ignore  # pragma: no cover
+    from neonize.aioze.client import NewAClient, _ensure_jid  # type: ignore  # pragma: no cover
     from neonize.aioze.events import (  # type: ignore  # pragma: no cover
         ConnectedEv,
         LoggedOutEv,
         MessageEv,
         PairStatusEv,
     )
+    from neonize.utils.enum import ChatPresence, ChatPresenceMedia  # type: ignore  # pragma: no cover
 
     _neonize_ffmpeg.check_ffmpeg_available = lambda: None
     HAS_NEONIZE = True
 except Exception:
     segno = None
     neonize = None
+    ProxySettings = None
     NewAClient = None
+    _ensure_jid = None
     ConnectedEv = None
     LoggedOutEv = None
     MessageEv = None
     PairStatusEv = None
+    ChatPresence = None
+    ChatPresenceMedia = None
     HAS_NEONIZE = False
 
-
-def _use_live_neonize() -> bool:
-    return bool(HAS_NEONIZE and not is_ephemeral_runtime())
+DEFAULT_WA_DAILY_LIMIT = 6
+WA_MIN_COLD_INTERVAL_SECONDS = 480
+_ALLOWED_PROXY_SCHEMES = ("socks5://", "socks5h://", "http://", "https://")
 
 
 def _render_real_qr_svg(qr_payload: str | bytes) -> str:
-    if segno is None:
-        raw = qr_payload.decode("utf-8", "replace") if isinstance(qr_payload, bytes) else str(qr_payload)
-        return generate_qr_svg(raw)
+    raw = (
+        qr_payload.decode("utf-8", "replace")
+        if isinstance(qr_payload, bytes)
+        else str(qr_payload or "")
+    ).strip()
+    if segno is None or not raw:
+        raise GatewayError("Генератор QR (segno) недоступен или пустой QR-токен")
     buf = io.BytesIO()
-    qr_obj = segno.make_qr(qr_payload)
+    qr_obj = segno.make_qr(raw)
     qr_obj.save(buf, kind="svg", scale=5, border=2, dark="#111b21", light="#ffffff")
     svg_text = buf.getvalue().decode("utf-8", "replace")
     return "data:image/svg+xml;utf8," + urllib.parse.quote(svg_text, safe=":/,;=()#@")
+
+
+def _validate_wa_proxy_url(proxy_url: str | None) -> str | None:
+    clean = str(proxy_url or "").strip()
+    if not clean:
+        return None
+    low = clean.lower()
+    if low == "auto" or not low.startswith(_ALLOWED_PROXY_SCHEMES):
+        raise GatewayError(
+            "Для WhatsApp укажите валидный SOCKS5/HTTP прокси вида socks5://user:pass@host:port"
+        )
+    parsed = urllib.parse.urlparse(clean)
+    if not parsed.hostname or parsed.port is None:
+        raise GatewayError(
+            "Для WhatsApp укажите прокси с хостом и портом вида socks5://user:pass@host:port"
+        )
+    return clean
 
 
 def _inspect_whatsmeow_db(session_path: str) -> dict | None:
@@ -94,7 +121,9 @@ def _inspect_whatsmeow_db(session_path: str) -> dict | None:
                 return None
             raw_jid = str(row[0]).strip()
             user_part = raw_jid.split("@", 1)[0].split(":", 1)[0]
-            digits = (re.sub(r"\D", "", user_part) or "79990000000")[-15:]
+            digits = re.sub(r"\D", "", user_part)[-15:]
+            if len(digits) < 7:
+                return None
             push_name = str(row[1] or row[2] or "").strip()
             return {
                 "raw_jid": raw_jid,
@@ -107,66 +136,16 @@ def _inspect_whatsmeow_db(session_path: str) -> dict | None:
         return None
 
 
-def generate_pairing_code(phone: str) -> str:
-    digits = re.sub(r"\D", "", str(phone or "")) or "79990000000"
-    digest = hashlib.sha256(f"wa-pair:{digits}".encode("utf-8")).hexdigest().upper()
-    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-    chars = []
-    for i in range(0, 16, 2):
-        val = int(digest[i : i + 2], 16)
-        chars.append(alphabet[val % len(alphabet)])
-    part1 = "WA" + "".join(chars[:2])
-    part2 = "".join(chars[2:6])
-    return f"{part1}-{part2}"
-
-
-def _is_finder_module(r: int, c: int, size: int) -> tuple[bool, bool]:
-    for top, left in ((0, 0), (0, size - 7), (size - 7, 0)):
-        if top <= r < top + 7 and left <= c < left + 7:
-            dr, dc = r - top, c - left
-            if dr in (0, 6) or dc in (0, 6):
-                return True, True
-            if 2 <= dr <= 4 and 2 <= dc <= 4:
-                return True, True
-            return True, False
-        if top - 1 <= r <= top + 7 and left - 1 <= c <= left + 7:
-            if 0 <= r < size and 0 <= c < size:
-                return True, False
-    return False, False
-
-
-def generate_qr_svg(session_path: str, phone: str = "") -> str:
-    seed = f"wa-md:{session_path}:{phone or ''}"
-    digest = hashlib.sha256(seed.encode("utf-8")).digest()
-    expanded = hashlib.sha512(digest).digest() + hashlib.sha512(digest[::-1]).digest()
-    size = 25
-    cell = 6
-    margin = 12
-    total = size * cell + margin * 2
-    rects = [
-        f'<rect width="{total}" height="{total}" rx="8" fill="#ffffff"/>'
-    ]
-    bit_idx = 0
-    for r in range(size):
-        for c in range(size):
-            in_finder, is_dark = _is_finder_module(r, c, size)
-            if not in_finder:
-                byte_val = expanded[(bit_idx // 8) % len(expanded)]
-                is_dark = bool((byte_val >> (bit_idx % 8)) & 1)
-                bit_idx += 1
-            if is_dark:
-                x = margin + c * cell
-                y = margin + r * cell
-                rects.append(
-                    f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="#111b21"/>'
-                )
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total} {total}" '
-        f'width="{total}" height="{total}">'
-        + "".join(rects)
-        + "</svg>"
-    )
-    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg, safe=":/,;=()#@")
+def _jid_to_str(jid_obj) -> str:
+    if jid_obj is None:
+        return ""
+    if isinstance(jid_obj, str):
+        return jid_obj.strip()
+    user = str(getattr(jid_obj, "User", "") or "").split(":", 1)[0].strip()
+    server = str(getattr(jid_obj, "Server", "") or "s.whatsapp.net").strip()
+    if not user:
+        return ""
+    return f"{user}@{server}"
 
 
 class WhatsAppGateway(TelegramGateway):
@@ -175,12 +154,12 @@ class WhatsAppGateway(TelegramGateway):
 
     def __init__(
         self,
-        code: str = "12345",
         dialogs: list | None = None,
         history: dict | None = None,
         health: str | None = None,
+        client_factory=None,
+        db_path: Path | str | None = None,
     ):
-        self.code = code
         self.health = health
         self.dialogs = [dict(item) for item in (dialogs or [])]
         self.history = {}
@@ -189,11 +168,13 @@ class WhatsAppGateway(TelegramGateway):
         self._pending = {}
         self.sent = []
         self.presence_log = []
+        self._db_path = Path(db_path) if db_path else DEFAULT_DB
+        self._client_factory = client_factory
         now_ms = int(time.time() * 1000)
         db_max = 0
         try:
-            if DEFAULT_DB.exists():
-                with sqlite3.connect(DEFAULT_DB) as conn:
+            if self._db_path.exists():
+                with sqlite3.connect(self._db_path) as conn:
                     row = conn.execute(
                         "SELECT COALESCE(MAX(telegram_message_id), 0) FROM messages"
                     ).fetchone()
@@ -202,7 +183,9 @@ class WhatsAppGateway(TelegramGateway):
         except Exception:
             pass
         with WhatsAppGateway._seq_lock:
-            floor = max(1_000_000_000, db_max, now_ms, WhatsAppGateway._global_last_seq)
+            floor = max(
+                1_000_000_000, db_max, now_ms, WhatsAppGateway._global_last_seq
+            )
             WhatsAppGateway._global_last_seq = floor
             self._message_seq = floor
         self._lock = threading.Lock()
@@ -212,9 +195,20 @@ class WhatsAppGateway(TelegramGateway):
         self._outgoing_backlog = {}
         self._loop = None
         self._neonize_clients = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._qr_events = {}
         self._pair_events = {}
         self._proxies = {}
+        self._active_proxies = {}
+        self._verified_wa_numbers = {}
+
+    def _get_session_lock(self, session_path: str) -> asyncio.Lock:
+        with self._lock:
+            lock = self._session_locks.get(session_path)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[session_path] = lock
+            return lock
 
     def _next_message_seq(self, used: set[int] | None = None) -> int:
         now_ms = int(time.time() * 1000)
@@ -234,19 +228,59 @@ class WhatsAppGateway(TelegramGateway):
     def set_proxy(self, session_path: str, proxy_url: str | None) -> None:
         if not session_path:
             return
-        clean = (proxy_url or "").strip() or None
-        if clean:
-            self._proxies[session_path] = clean
+        validated = _validate_wa_proxy_url(proxy_url)
+        if validated:
+            self._proxies[session_path] = validated
         else:
             self._proxies.pop(session_path, None)
 
-    @staticmethod
-    def generate_pairing_code(phone: str) -> str:
-        return generate_pairing_code(phone)
+    def clear_session(self, session_path: str) -> None:
+        if not session_path:
+            return
+        self._pending.pop(session_path, None)
+        self._proxies.pop(session_path, None)
+        self._active_proxies.pop(session_path, None)
 
-    @staticmethod
-    def generate_qr_svg(session_path: str, phone: str = "") -> str:
-        return generate_qr_svg(session_path, phone)
+    async def apply_proxy(self, session_path: str, proxy_url: str | None) -> None:
+        if not session_path:
+            return
+        validated = _validate_wa_proxy_url(proxy_url)
+        if validated:
+            self._proxies[session_path] = validated
+        else:
+            self._proxies.pop(session_path, None)
+        existing = self._neonize_clients.get(session_path)
+        if existing is not None and hasattr(existing, "set_proxy_address"):
+            try:
+                await existing.set_proxy_address(validated)
+                self._active_proxies[session_path] = validated
+            except Exception as exc:
+                raise GatewayError(
+                    f"Не удалось применить прокси к сессии WhatsApp: {exc}"
+                ) from exc
+
+    def _resolve_proxy_url(self, session_path: str) -> str | None:
+        try:
+            if self._db_path.exists():
+                with sqlite3.connect(self._db_path) as conn:
+                    row = conn.execute(
+                        "SELECT proxy_url FROM accounts WHERE session_path = ? LIMIT 1",
+                        (session_path,),
+                    ).fetchone()
+                    if row is not None:
+                        validated = _validate_wa_proxy_url(str(row[0] or ""))
+                        if validated:
+                            self._proxies[session_path] = validated
+                        else:
+                            self._proxies.pop(session_path, None)
+                        return validated
+        except GatewayError:
+            raise
+        except Exception:
+            pass
+        if session_path in self._proxies:
+            return _validate_wa_proxy_url(self._proxies[session_path])
+        return None
 
     def _sync_db_account_state(
         self,
@@ -255,12 +289,24 @@ class WhatsAppGateway(TelegramGateway):
         qr_code: str | None = None,
         pairing_code: str | None = None,
         connected_info: dict | None = None,
+        unauthorized_reason: str | None = None,
     ) -> None:
         try:
-            if not DEFAULT_DB.exists():
+            if not self._db_path.exists():
                 return
-            with sqlite3.connect(DEFAULT_DB) as conn:
-                if connected_info:
+            with sqlite3.connect(self._db_path) as conn:
+                if unauthorized_reason:
+                    conn.execute(
+                        """
+                        UPDATE accounts
+                        SET health = 'unauthorized',
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE session_path = ?
+                        """,
+                        (unauthorized_reason, utc_now(), session_path),
+                    )
+                elif connected_info:
                     conn.execute(
                         """
                         UPDATE accounts
@@ -271,6 +317,8 @@ class WhatsAppGateway(TelegramGateway):
                             telegram_user_id = COALESCE(?, telegram_user_id),
                             telegram_name = COALESCE(?, telegram_name),
                             wa_jid = COALESCE(?, wa_jid),
+                            pairing_code = NULL,
+                            qr_code = NULL,
                             updated_at = ?
                         WHERE session_path = ?
                         """,
@@ -298,318 +346,371 @@ class WhatsAppGateway(TelegramGateway):
         except Exception:
             pass
 
-    async def _ensure_neonize_client(self, session_path: str, fresh_qr: bool = False):
-        existing = self._neonize_clients.get(session_path)
-        if existing is not None and not fresh_qr:
-            return existing
-        if existing is not None and fresh_qr:
+    async def _close(self, session_path: str) -> None:
+        client = self._neonize_clients.pop(session_path, None)
+        self._pending.pop(session_path, None)
+        self._proxies.pop(session_path, None)
+        self._active_proxies.pop(session_path, None)
+        self._qr_events.pop(session_path, None)
+        self._pair_events.pop(session_path, None)
+        if client is not None and hasattr(client, "stop"):
             try:
-                await existing.stop()
+                await client.stop()
             except Exception:
                 pass
-            self._neonize_clients.pop(session_path, None)
+
+    async def close_all(self) -> None:
+        for sess in list(self._neonize_clients.keys()):
+            await self._close(sess)
+
+    async def _ensure_neonize_client(
+        self, session_path: str, fresh_qr: bool = False
+    ):
+        async with self._get_session_lock(session_path):
+            return await self._ensure_neonize_client_locked(
+                session_path, fresh_qr=fresh_qr
+            )
+
+    async def _ensure_neonize_client_locked(
+        self, session_path: str, fresh_qr: bool = False
+    ):
+        if self._client_factory is None and not HAS_NEONIZE:
+            raise GatewayError("Движок WhatsApp (neonize) не установлен")
+
+        proxy_url = self._resolve_proxy_url(session_path)
+        existing = self._neonize_clients.get(session_path)
+        if existing is not None and not fresh_qr:
+            if self._active_proxies.get(session_path) != proxy_url and hasattr(
+                existing, "set_proxy_address"
+            ):
+                try:
+                    await existing.set_proxy_address(proxy_url)
+                    self._active_proxies[session_path] = proxy_url
+                except Exception as exc:
+                    raise GatewayError(
+                        f"Не удалось применить прокси к сессии WhatsApp: {exc}"
+                    ) from exc
+            return existing
+        if existing is not None and fresh_qr:
+            await self._close(session_path)
 
         abs_path = resolve_session(session_path)
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         if fresh_qr and abs_path.exists() and _inspect_whatsmeow_db(session_path) is None:
-            try:
-                abs_path.unlink()
-            except Exception:
-                pass
+            for target in (
+                abs_path,
+                abs_path.with_name(abs_path.name + "-wal"),
+                abs_path.with_name(abs_path.name + "-shm"),
+                abs_path.with_name(abs_path.name + "-journal"),
+            ):
+                try:
+                    if target.exists():
+                        target.unlink()
+                except Exception:
+                    pass
 
         qr_ev = asyncio.Event()
         pair_ev = asyncio.Event()
         self._qr_events[session_path] = qr_ev
         self._pair_events[session_path] = pair_ev
 
-        client = NewAClient(str(abs_path))
+        factory = self._client_factory or NewAClient
+        client = factory(str(abs_path))
 
         async def _on_qr(_client, data_qr: bytes):
-            qr_str = data_qr.decode("utf-8", "replace")
-            svg_uri = _render_real_qr_svg(qr_str)
+            qr_str = (
+                data_qr.decode("utf-8", "replace")
+                if isinstance(data_qr, bytes)
+                else str(data_qr or "")
+            ).strip()
+            if not qr_str:
+                return
+            try:
+                svg_uri = _render_real_qr_svg(qr_str)
+            except GatewayError:
+                return
             p = self._pending.setdefault(session_path, {})
             p["qr_code"] = svg_uri
             p["qr_raw"] = qr_str
             qr_ev.set()
             self._sync_db_account_state(session_path, qr_code=svg_uri)
 
-        client.qr(_on_qr)
+        if hasattr(client, "qr"):
+            client.qr(_on_qr)
 
-        @client.event(PairStatusEv)
-        async def _on_pair(_client, ev):
-            try:
-                user_part = str(getattr(getattr(ev, "ID", None), "User", "") or "")
-                digits = re.sub(r"\D", "", user_part)[-15:]
-                bname = str(getattr(ev, "BusinessName", "") or "").strip()
-                info = _inspect_whatsmeow_db(session_path) or {
-                    "wa_jid": f"{digits}@s.whatsapp.net" if digits else None,
-                    "phone": f"+{digits}" if digits else None,
-                    "telegram_user_id": int(digits[-15:]) if digits else None,
-                    "name": bname or (f"WhatsApp +{digits}" if digits else "WhatsApp"),
-                }
+        if hasattr(client, "event") and PairStatusEv is not None:
+
+            @client.event(PairStatusEv)
+            async def _on_pair(_client, ev):
+                try:
+                    user_part = str(getattr(getattr(ev, "ID", None), "User", "") or "")
+                    digits = re.sub(r"\D", "", user_part)[-15:]
+                    bname = str(getattr(ev, "BusinessName", "") or "").strip()
+                    info = _inspect_whatsmeow_db(session_path) or (
+                        {
+                            "wa_jid": f"{digits}@s.whatsapp.net",
+                            "phone": f"+{digits}",
+                            "telegram_user_id": int(digits[-15:]),
+                            "name": bname or f"WhatsApp +{digits}",
+                        }
+                        if len(digits) >= 7
+                        else None
+                    )
+                    if info:
+                        p = self._pending.setdefault(session_path, {})
+                        p["state"] = "paired_ready"
+                        p["wa_jid"] = info.get("wa_jid")
+                        p["phone"] = info.get("phone") or p.get("phone")
+                        pair_ev.set()
+                        if p.get("auth_mode") == "qr":
+                            self._sync_db_account_state(
+                                session_path, pairing_code="QR-READY"
+                            )
+                except Exception:
+                    pair_ev.set()
+
+        if hasattr(client, "event") and ConnectedEv is not None:
+
+            @client.event(ConnectedEv)
+            async def _on_connected(_client, _ev):
+                info = _inspect_whatsmeow_db(session_path)
                 p = self._pending.setdefault(session_path, {})
-                p["state"] = "connected"
-                p["wa_jid"] = info.get("wa_jid")
-                p["phone"] = info.get("phone") or p.get("phone")
-                pair_ev.set()
-                self._sync_db_account_state(session_path, connected_info=info)
-            except Exception:
+                if info:
+                    p["state"] = "paired_ready"
+                    p["wa_jid"] = info.get("wa_jid")
+                    p["phone"] = info.get("phone") or p.get("phone")
+                    if p.get("auth_mode") == "qr":
+                        self._sync_db_account_state(
+                            session_path, pairing_code="QR-READY"
+                        )
                 pair_ev.set()
 
-        @client.event(ConnectedEv)
-        async def _on_connected(_client, _ev):
-            info = _inspect_whatsmeow_db(session_path)
-            p = self._pending.setdefault(session_path, {})
-            p["state"] = "connected"
-            if info:
-                p["wa_jid"] = info.get("wa_jid")
-                p["phone"] = info.get("phone") or p.get("phone")
-                self._sync_db_account_state(session_path, connected_info=info)
-            pair_ev.set()
+        if hasattr(client, "event") and LoggedOutEv is not None:
 
-        @client.event(MessageEv)
-        async def _on_message(_client, ev):
-            try:
-                info_proto = getattr(ev, "Info", None)
-                src = getattr(info_proto, "MessageSource", None)
-                if src is None or getattr(src, "IsGroup", False):
-                    return
-                is_from_me = bool(getattr(src, "IsFromMe", False))
-                if is_from_me:
-                    with self._lock:
-                        has_out_listener = session_path in self._outgoing_listeners
-                    if not has_out_listener:
+            @client.event(LoggedOutEv)
+            async def _on_logged_out(_client, _ev):
+                p = self._pending.setdefault(session_path, {})
+                p["state"] = "unauthorized"
+                self._sync_db_account_state(
+                    session_path,
+                    unauthorized_reason="Сессия WhatsApp разлогинена с телефона",
+                )
+
+        if hasattr(client, "event") and MessageEv is not None:
+
+            @client.event(MessageEv)
+            async def _on_message(_client, ev):
+                try:
+                    info_proto = getattr(ev, "Info", None)
+                    src = getattr(info_proto, "MessageSource", None)
+                    if src is None or getattr(src, "IsGroup", False):
                         return
-                    peer_jid = getattr(src, "Chat", None) or getattr(src, "Sender", None)
-                else:
-                    peer_jid = getattr(src, "Sender", None) or getattr(src, "Chat", None)
-                if str(getattr(peer_jid, "Server", "") or "").lower() == "g.us":
-                    return
-                sender_user = str(getattr(peer_jid, "User", "") or "").split(":", 1)[0]
-                digits = re.sub(r"\D", "", sender_user)[-15:]
-                if not digits:
-                    return
-                msg_proto = getattr(ev, "Message", None)
-                text = (
-                    getattr(msg_proto, "conversation", "")
-                    or getattr(getattr(msg_proto, "extendedTextMessage", None), "text", "")
-                    or ""
-                ).strip()
-                if not text:
-                    return
-                peer_id = int(digits[-15:])
-                if is_from_me:
-                    push_name = f"WA +{digits}"
-                else:
-                    push_name = str(getattr(info_proto, "Pushname", "") or f"WA +{digits}").strip()
-                seq_id = self._next_message_seq()
-                payload = {
-                    "telegram_user_id": peer_id,
-                    "username": None,
-                    "name": push_name,
-                    "phone": f"+{digits}",
-                    "wa_jid": f"{digits}@s.whatsapp.net",
-                    "telegram_message_id": seq_id,
-                    "external_message_id": str(getattr(info_proto, "ID", "") or f"WA{seq_id}"),
-                    "text": text,
-                    "sent_at": utc_now(),
-                    "direction": "out" if is_from_me else "in",
-                    "peer_type": "user",
-                }
-                self.history.setdefault(peer_id, []).append(dict(payload))
-                if is_from_me:
-                    self.push_outgoing(session_path, payload)
-                else:
-                    self.push_private(session_path, payload)
-            except Exception:
-                pass
+                    is_from_me = bool(getattr(src, "IsFromMe", False))
+                    if is_from_me:
+                        with self._lock:
+                            has_out_listener = session_path in self._outgoing_listeners
+                        if not has_out_listener:
+                            return
+                        peer_jid = getattr(src, "Chat", None) or getattr(src, "Sender", None)
+                    else:
+                        peer_jid = getattr(src, "Sender", None) or getattr(src, "Chat", None)
+                    if str(getattr(peer_jid, "Server", "") or "").lower() == "g.us":
+                        return
+                    sender_user = str(getattr(peer_jid, "User", "") or "").split(":", 1)[0]
+                    digits = re.sub(r"\D", "", sender_user)[-15:]
+                    if len(digits) < 7:
+                        return
+                    msg_proto = getattr(ev, "Message", None)
+                    text = (
+                        getattr(msg_proto, "conversation", "")
+                        or getattr(getattr(msg_proto, "extendedTextMessage", None), "text", "")
+                        or ""
+                    ).strip()
+                    if not text:
+                        return
+                    peer_id = int(digits[-15:])
+                    if is_from_me:
+                        push_name = f"WA +{digits}"
+                    else:
+                        push_name = str(
+                            getattr(info_proto, "Pushname", "") or f"WA +{digits}"
+                        ).strip()
+                    seq_id = self._next_message_seq()
+                    payload = {
+                        "telegram_user_id": peer_id,
+                        "username": None,
+                        "name": push_name,
+                        "phone": f"+{digits}",
+                        "wa_jid": f"{digits}@s.whatsapp.net",
+                        "telegram_message_id": seq_id,
+                        "external_message_id": str(
+                            getattr(info_proto, "ID", "") or f"WA{seq_id}"
+                        ),
+                        "text": text,
+                        "sent_at": utc_now(),
+                        "direction": "out" if is_from_me else "in",
+                        "peer_type": "user",
+                    }
+                    self.history.setdefault(peer_id, []).append(dict(payload))
+                    if is_from_me:
+                        self.push_outgoing(session_path, payload)
+                    else:
+                        self.push_private(session_path, payload)
+                except Exception:
+                    pass
 
-        await client.connect()
+        proxy_settings = (
+            ProxySettings(proxy_address=proxy_url)
+            if (proxy_url and ProxySettings is not None)
+            else None
+        )
+        try:
+            await client.connect(proxy_settings)
+        except Exception as exc:
+            if hasattr(client, "stop"):
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
+            raise GatewayError(
+                f"Не удалось подключиться к WhatsApp WebSocket: {exc}"
+            ) from exc
+
         self._neonize_clients[session_path] = client
+        self._active_proxies[session_path] = proxy_url
         return client
 
     async def request_code(
         self, phone: str, session_path: str, auth_mode: str = "code"
     ) -> str:
-        clean_phone = (phone or "").strip() or "+79990000000"
+        mode = "qr" if str(auth_mode or "").strip().lower() == "qr" else "code"
+        clean_phone = (phone or "").strip()
         digits = re.sub(r"\D", "", clean_phone)
 
-        if _use_live_neonize():
-            existing_info = _inspect_whatsmeow_db(session_path)
-            if existing_info:
-                self._pending[session_path] = {
-                    "phone": existing_info["phone"],
-                    "hash": f"wa:connected:{existing_info['wa_jid']}",
-                    "pairing_code": "CONNECTED",
-                    "qr_code": generate_qr_svg(session_path, existing_info["phone"]),
-                    "auth_mode": auth_mode or "code",
-                    "state": "connected",
-                    "wa_jid": existing_info["wa_jid"],
-                }
-                return f"wa:connected:{existing_info['wa_jid']}"
+        existing_info = _inspect_whatsmeow_db(session_path)
+        if existing_info:
+            self._pending[session_path] = {
+                "phone": existing_info["phone"],
+                "hash": f"wa:connected:{existing_info['wa_jid']}",
+                "pairing_code": None,
+                "qr_code": None,
+                "auth_mode": mode,
+                "state": "connected",
+                "wa_jid": existing_info["wa_jid"],
+            }
+            return f"wa:connected:{existing_info['wa_jid']}"
 
-            client = await self._ensure_neonize_client(session_path, fresh_qr=True)
-            qr_ev = self._qr_events.get(session_path)
-            if qr_ev is not None:
+        if mode == "code" and not (8 <= len(digits) <= 15):
+            raise GatewayError(
+                "Укажите номер WhatsApp в международном формате (+...)"
+            )
+
+        client = await self._ensure_neonize_client(session_path, fresh_qr=True)
+        qr_ev = self._qr_events.get(session_path)
+        p = self._pending.setdefault(session_path, {})
+
+        pairing_code: str | None = None
+        qr_code: str | None = p.get("qr_code")
+        qr_raw: str = str(p.get("qr_raw") or "")
+
+        if mode == "qr":
+            if qr_ev is not None and not qr_ev.is_set():
                 try:
-                    await asyncio.wait_for(qr_ev.wait(), timeout=8.0)
+                    await asyncio.wait_for(qr_ev.wait(), timeout=12.0)
                 except asyncio.TimeoutError:
                     pass
-
-            p = self._pending.setdefault(session_path, {})
-            qr_code = p.get("qr_code") or _render_real_qr_svg(f"https://wa.me/settings/linked_devices#{session_path}")
-            pairing_code = self.generate_pairing_code(clean_phone)
-
-            if (auth_mode or "code") == "code" and digits and digits != "79990000000":
+            qr_code = p.get("qr_code")
+            qr_raw = str(p.get("qr_raw") or "")
+            if not qr_code or len(qr_raw) < 20:
+                await self._close(session_path)
+                raise GatewayError(
+                    "Не удалось получить реальный QR-код от серверов WhatsApp"
+                )
+        else:
+            if qr_ev is not None and not qr_ev.is_set():
                 try:
-                    raw_code = await asyncio.wait_for(
-                        client.PairPhone(digits, show_push_notification=True),
-                        timeout=10.0,
-                    )
-                    if raw_code and str(raw_code).strip():
-                        pairing_code = str(raw_code).strip().upper()
-                except Exception as exc:
-                    raise GatewayError(
-                        f"Не удалось запросить код сопряжения WhatsApp для +{digits}: {exc}"
-                    ) from exc
-
-            phone_code_hash = f"wa:{pairing_code}:{hashlib.md5(qr_code.encode('utf-8')).hexdigest()[:12]}"
-            p.update(
-                {
-                    "phone": clean_phone,
-                    "hash": phone_code_hash,
-                    "pairing_code": pairing_code,
-                    "qr_code": qr_code,
-                    "auth_mode": auth_mode or "code",
-                    "state": "pending_code",
-                }
+                    await asyncio.wait_for(qr_ev.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+            try:
+                raw_code = await asyncio.wait_for(
+                    client.PairPhone(digits, show_push_notification=True),
+                    timeout=12.0,
+                )
+            except Exception as exc:
+                await self._close(session_path)
+                raise GatewayError(
+                    f"Не удалось запросить реальный код сопряжения WhatsApp для +{digits}: {exc}"
+                ) from exc
+            alnum = re.sub(r"[^A-Za-z0-9]", "", str(raw_code or "")).upper()
+            if len(alnum) < 6:
+                await self._close(session_path)
+                raise GatewayError(
+                    f"WhatsApp не вернул код сопряжения для +{digits}"
+                )
+            pairing_code = (
+                f"{alnum[:4]}-{alnum[4:]}" if len(alnum) == 8 else alnum
             )
-            self._sync_db_account_state(
-                session_path, qr_code=qr_code, pairing_code=pairing_code
-            )
-            return phone_code_hash
+            qr_code = p.get("qr_code")
 
-        pairing_code = self.generate_pairing_code(clean_phone)
-        qr_code = self.generate_qr_svg(session_path, clean_phone)
-        payload = {
-            "provider": "whatsapp",
-            "auth_mode": auth_mode or "code",
-            "phone": clean_phone,
-            "pairing_code": pairing_code,
-            "qr_code": qr_code,
-        }
-        phone_code_hash = f"wa:{pairing_code}:{hashlib.md5(qr_code.encode('utf-8')).hexdigest()[:12]}"
-        self._pending[session_path] = {
-            "phone": clean_phone,
-            "hash": phone_code_hash,
-            "pairing_code": pairing_code,
-            "qr_code": qr_code,
-            "auth_mode": auth_mode or "code",
-            "state": "pending_code",
-        }
-        path = resolve_session(session_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"PENDING:{json.dumps(payload)}".encode("utf-8"))
+        seed_token = pairing_code or qr_raw
+        phone_code_hash = (
+            f"wa:{mode}:{hashlib.sha256(seed_token.encode('utf-8')).hexdigest()[:16]}"
+        )
+        p.update(
+            {
+                "phone": f"+{digits}" if digits else clean_phone,
+                "hash": phone_code_hash,
+                "pairing_code": pairing_code,
+                "qr_code": qr_code,
+                "auth_mode": mode,
+                "state": "pending_code",
+            }
+        )
+        self._sync_db_account_state(
+            session_path, qr_code=qr_code, pairing_code=pairing_code
+        )
         return phone_code_hash
 
     async def confirm_code(
         self, phone: str, code: str, phone_code_hash: str, session_path: str
     ) -> dict:
-        clean_phone = (phone or "").strip() or "+79990000000"
-        raw_code = (code or "").strip()
-        if not raw_code:
+        if not (code or "").strip():
             raise GatewayError("Укажите код сопряжения или отсканируйте QR")
 
-        if _use_live_neonize():
+        info = _inspect_whatsmeow_db(session_path)
+        if not info:
+            pair_ev = self._pair_events.get(session_path)
+            if pair_ev is not None and not pair_ev.is_set():
+                try:
+                    await asyncio.wait_for(pair_ev.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    pass
             info = _inspect_whatsmeow_db(session_path)
-            if not info:
-                pair_ev = self._pair_events.get(session_path)
-                if pair_ev is not None and not pair_ev.is_set():
-                    try:
-                        await asyncio.wait_for(pair_ev.wait(), timeout=2.5)
-                    except asyncio.TimeoutError:
-                        pass
-                info = _inspect_whatsmeow_db(session_path)
-            if not info:
-                raise GatewayError(
-                    "Сначала отсканируйте QR-код или введите код сопряжения в WhatsApp на телефоне (Настройки → Связанные устройства)"
-                )
-            p = self._pending.setdefault(session_path, {})
-            p["state"] = "connected"
-            p["wa_jid"] = info["wa_jid"]
-            p["phone"] = info["phone"]
-            return {
-                "status": "connected",
-                "telegram_user_id": info["telegram_user_id"],
-                "telegram_username": None,
-                "telegram_name": info["name"],
-                "wa_jid": info["wa_jid"],
-            }
 
-        upper_code = raw_code.upper()
-        nodash_code = upper_code.replace("-", "").replace(" ", "")
+        if not info:
+            raise GatewayError(
+                "Устройство ещё не привязано в WhatsApp на телефоне (откройте WhatsApp → Связанные устройства и завершите привязку)"
+            )
 
-        pending = self._pending.get(session_path) or {}
-        expected_pairing = (
-            pending.get("pairing_code") or self.generate_pairing_code(clean_phone)
-        ).upper()
-        expected_nodash = expected_pairing.replace("-", "")
-
-        hash_pairing = ""
-        if phone_code_hash and phone_code_hash.startswith("wa:"):
-            parts = phone_code_hash.split(":")
-            if len(parts) >= 2:
-                hash_pairing = parts[1].upper()
-
-        valid_codes = {
-            expected_pairing,
-            expected_nodash,
-            "QR",
-            "QR_SCANNED",
-            "12345",
-            str(self.code).upper(),
-        }
-        if hash_pairing:
-            valid_codes.add(hash_pairing)
-            valid_codes.add(hash_pairing.replace("-", ""))
-
-        if upper_code not in valid_codes and nodash_code not in valid_codes:
-            raise GatewayError("Неверный код сопряжения WhatsApp")
-
-        digits = (re.sub(r"\D", "", clean_phone) or "79990000000")[-15:]
-        int_from_phone = int(digits[-15:]) if digits else 79990000000
-        wa_jid = f"{digits}@s.whatsapp.net"
-
-        path = resolve_session(session_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"SQLite format 3\x00whatsapp:{clean_phone}".encode("utf-8"))
-
-        self._pending[session_path] = {
-            "phone": clean_phone,
-            "hash": phone_code_hash,
-            "pairing_code": expected_pairing,
-            "state": "connected",
-            "wa_jid": wa_jid,
-        }
+        p = self._pending.setdefault(session_path, {})
+        p["state"] = "connected"
+        p["wa_jid"] = info["wa_jid"]
+        p["phone"] = info["phone"]
+        self._sync_db_account_state(session_path, connected_info=info)
         return {
             "status": "connected",
-            "telegram_user_id": int_from_phone,
+            "phone": info["phone"],
+            "telegram_user_id": info["telegram_user_id"],
             "telegram_username": None,
-            "telegram_name": f"WhatsApp {clean_phone}",
-            "wa_jid": wa_jid,
+            "telegram_name": info["name"],
+            "wa_jid": info["wa_jid"],
         }
 
     async def confirm_password(self, password: str, session_path: str) -> dict:
-        pending = self._pending.get(session_path) or {}
-        phone = pending.get("phone") or "+79990000000"
-        digits = (re.sub(r"\D", "", phone) or "79990000000")[-15:]
-        return {
-            "status": "connected",
-            "telegram_user_id": int(digits[-15:]),
-            "telegram_username": None,
-            "telegram_name": f"WhatsApp {phone}",
-            "wa_jid": f"{digits}@s.whatsapp.net",
-        }
+        raise GatewayError(
+            "WhatsApp Multi-Device использует привязку через QR или 8-значный код"
+        )
 
     async def session_health(self, session_path: str) -> dict:
         forced = self.health
@@ -625,32 +726,32 @@ class WhatsAppGateway(TelegramGateway):
             return {"health": forced, "last_error": text}
 
         pending = self._pending.get(session_path) or {}
-        if pending.get("state") == "connected":
+        if pending.get("state") == "unauthorized":
+            return {
+                "health": "unauthorized",
+                "last_error": "Сессия WhatsApp разлогинена с телефона",
+            }
+
+        if _inspect_whatsmeow_db(session_path) is not None:
             return {"health": "active", "last_error": None}
+
         if pending.get("state") == "pending_code":
-            return {"health": "unauthorized", "last_error": "Сессия WhatsApp ожидает сопряжения"}
+            return {
+                "health": "unauthorized",
+                "last_error": "Сессия WhatsApp ожидает сопряжения",
+            }
 
-        path = resolve_session(session_path)
-        if path.exists():
-            if _inspect_whatsmeow_db(session_path) is not None:
-                return {"health": "active", "last_error": None}
-            if not _use_live_neonize():
-                try:
-                    raw = path.read_bytes()
-                except Exception:
-                    raw = b""
-                if raw and not raw.startswith(b"PENDING:"):
-                    return {"health": "active", "last_error": None}
-
-        return {"health": "unauthorized", "last_error": "Сессия WhatsApp не авторизована"}
+        return {
+            "health": "unauthorized",
+            "last_error": "Сессия WhatsApp не авторизована",
+        }
 
     async def load_inbox(self, session_path: str, limit: int = 30) -> list:
         cap = _inbox_limit(limit)
         found = []
         seen_peers: set[int] = set()
-        # Load real contacts from whatsmeow_contacts SQLite table if present
-        path = resolve_session(session_path)
-        if path.exists() and _inspect_whatsmeow_db(session_path) is not None:
+        if _inspect_whatsmeow_db(session_path) is not None:
+            path = resolve_session(session_path)
             try:
                 with sqlite3.connect(path) as sconn:
                     crows = sconn.execute(
@@ -666,13 +767,15 @@ class WhatsAppGateway(TelegramGateway):
                         t_jid = str(crow[0] or "").strip()
                         u_part = t_jid.split("@", 1)[0].split(":", 1)[0]
                         digits = re.sub(r"\D", "", u_part)[-15:]
-                        if not digits:
+                        if len(digits) < 7:
                             continue
                         peer_id = int(digits[-15:])
                         if peer_id in seen_peers:
                             continue
                         seen_peers.add(peer_id)
-                        cname = str(crow[1] or crow[2] or crow[3] or crow[4] or f"WA +{digits}").strip()
+                        cname = str(
+                            crow[1] or crow[2] or crow[3] or crow[4] or f"WA +{digits}"
+                        ).strip()
                         hist = self.history.get(peer_id) or []
                         last_msg = hist[-1] if hist else None
                         found.append(
@@ -683,9 +786,19 @@ class WhatsAppGateway(TelegramGateway):
                                 "peer_type": "user",
                                 "phone": f"+{digits}",
                                 "wa_jid": f"{digits}@s.whatsapp.net",
-                                "last_message_preview": (last_msg.get("text") or "")[:120] if last_msg else None,
-                                "last_message_at": last_msg.get("sent_at") if last_msg else None,
-                                "last_from_peer": (1 if last_msg.get("direction") == "in" else 0) if last_msg else None,
+                                "last_message_preview": (
+                                    (last_msg.get("text") or "")[:120]
+                                    if last_msg
+                                    else None
+                                ),
+                                "last_message_at": (
+                                    last_msg.get("sent_at") if last_msg else None
+                                ),
+                                "last_from_peer": (
+                                    (1 if last_msg.get("direction") == "in" else 0)
+                                    if last_msg
+                                    else None
+                                ),
                             }
                         )
             except Exception:
@@ -707,7 +820,11 @@ class WhatsAppGateway(TelegramGateway):
                 continue
             digits = re.sub(r"\D", "", str(item.get("phone") or jid or peer_id))[-15:]
             row = {
-                "telegram_user_id": int(digits[-15:]) if len(digits) >= 7 and not (900000 <= int(peer_id) < 1000000) else int(peer_id),
+                "telegram_user_id": (
+                    int(digits[-15:])
+                    if len(digits) >= 7 and not (900000 <= int(peer_id) < 1000000)
+                    else int(peer_id)
+                ),
                 "username": item.get("username"),
                 "name": item.get("name") or (f"WA +{digits}" if digits else ""),
                 "peer_type": "user",
@@ -721,13 +838,83 @@ class WhatsAppGateway(TelegramGateway):
             if item.get("last_message_at") is not None:
                 row["last_message_at"] = str(item["last_message_at"])
             if "last_from_peer" in item and item.get("last_from_peer") is not None:
-                row["last_from_peer"] = 1 if item.get("last_from_peer") else 0
+                row["last_from_peer"] = 1 if item["last_from_peer"] else 0
             found.append(row)
             if len(found) >= cap:
                 break
         return found
 
-    async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
+    async def check_numbers(
+        self, session_path: str, phones: list[str]
+    ) -> list[dict]:
+        if _inspect_whatsmeow_db(session_path) is None:
+            raise GatewayError("Сессия WhatsApp не авторизована для проверки номеров")
+
+        clean_digits: list[str] = []
+        for raw in phones or []:
+            d = re.sub(r"\D", "", str(raw or ""))[-15:]
+            if len(d) >= 7 and d not in clean_digits:
+                clean_digits.append(d)
+        if not clean_digits:
+            return []
+
+        client = await self._ensure_neonize_client(session_path, fresh_qr=False)
+        try:
+            resp_seq = await asyncio.wait_for(
+                client.is_on_whatsapp(*[f"+{d}" for d in clean_digits]),
+                timeout=12.0,
+            )
+        except Exception as exc:
+            raise GatewayError(
+                f"Не удалось проверить номера в WhatsApp (IsOnWhatsApp): {exc}"
+            ) from exc
+
+        by_digits: dict[str, dict] = {}
+        for item in resp_seq or ():
+            q_digits = re.sub(r"\D", "", str(getattr(item, "Query", "") or ""))[-15:]
+            is_in = bool(getattr(item, "IsIn", False))
+            jid_str = _jid_to_str(getattr(item, "JID", None))
+            jid_digits = re.sub(r"\D", "", jid_str.split("@", 1)[0])[-15:]
+            key_d = q_digits or jid_digits
+            if not key_d:
+                continue
+            resolved_jid = jid_str or f"{key_d}@s.whatsapp.net"
+            if is_in:
+                self._verified_wa_numbers[key_d] = resolved_jid
+            by_digits[key_d] = {
+                "phone": f"+{key_d}",
+                "found": is_in,
+                "wa_jid": resolved_jid if is_in else None,
+                "telegram_user_id": int(key_d[-15:]),
+                "username": None,
+                "name": f"WA +{key_d}",
+            }
+
+        results = []
+        for d in clean_digits:
+            if d in by_digits:
+                results.append(by_digits[d])
+            else:
+                results.append(
+                    {
+                        "phone": f"+{d}",
+                        "found": False,
+                        "wa_jid": None,
+                        "telegram_user_id": int(d[-15:]),
+                        "username": None,
+                        "name": f"WA +{d}",
+                    }
+                )
+        return results
+
+    async def resolve_phones(
+        self, session_path: str, phones: list[str]
+    ) -> list[dict]:
+        return await self.check_numbers(session_path, phones)
+
+    async def search_dialogs(
+        self, session_path: str, query: str, limit: int = 30
+    ) -> list:
         q = (query or "").strip()
         needle = q.casefold()
         matched = []
@@ -750,18 +937,24 @@ class WhatsAppGateway(TelegramGateway):
                 break
 
         digits = re.sub(r"\D", "", q)[-15:]
-        if digits and len(digits) >= 7 and not matched:
-            peer_id = int(digits[-15:])
-            matched.append(
-                {
-                    "telegram_user_id": peer_id,
-                    "username": None,
-                    "name": f"WA +{digits}",
-                    "phone": f"+{digits}",
-                    "wa_jid": f"{digits}@s.whatsapp.net",
-                    "peer_type": "user",
-                }
-            )
+        if (
+            len(digits) >= 7
+            and not matched
+            and _inspect_whatsmeow_db(session_path) is not None
+        ):
+            checked = await self.check_numbers(session_path, [f"+{digits}"])
+            for item in checked:
+                if item.get("found"):
+                    matched.append(
+                        {
+                            "telegram_user_id": item["telegram_user_id"],
+                            "username": None,
+                            "name": item["name"],
+                            "phone": item["phone"],
+                            "wa_jid": item["wa_jid"],
+                            "peer_type": "user",
+                        }
+                    )
         return matched[:limit]
 
     async def send_message(
@@ -773,14 +966,34 @@ class WhatsAppGateway(TelegramGateway):
         simulate_typing: bool = True,
         image_path: str | None = None,
     ) -> dict:
+        del image_path
         body = (text or "").strip()
         if not body:
             raise GatewayError("Напишите сообщение")
-        if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit():
-            peer_key = int(peer_id)
-        else:
-            digits = re.sub(r"\D", "", str(peer_id))
-            peer_key = int(digits[-15:]) if digits else str(peer_id).strip()
+
+        if _inspect_whatsmeow_db(session_path) is None:
+            raise GatewayError(
+                "Сессия WhatsApp не авторизована: отправка невозможна"
+            )
+
+        target_digits = re.sub(r"\D", "", str(peer_id or ""))[-15:]
+        if len(target_digits) < 7:
+            raise GatewayError("Некорректный номер получателя WhatsApp")
+
+        peer_key = int(target_digits[-15:])
+        client = await self._ensure_neonize_client(session_path, fresh_qr=False)
+
+        if target_digits not in self._verified_wa_numbers:
+            checked = await self.check_numbers(session_path, [f"+{target_digits}"])
+            if not checked or not checked[0].get("found"):
+                raise GatewayError(
+                    f"Номер +{target_digits} не зарегистрирован в WhatsApp"
+                )
+
+        target_jid_str = (
+            self._verified_wa_numbers.get(target_digits)
+            or f"{target_digits}@s.whatsapp.net"
+        )
 
         if simulate_typing:
             self.presence_log.append(
@@ -790,33 +1003,60 @@ class WhatsAppGateway(TelegramGateway):
                     "presence": "composing",
                 }
             )
-            await asyncio.sleep(0.01)
+            jid_for_presence = (
+                _ensure_jid(target_jid_str)
+                if _ensure_jid is not None
+                else target_jid_str
+            )
+            if (
+                hasattr(client, "send_chat_presence")
+                and ChatPresence is not None
+                and ChatPresenceMedia is not None
+            ):
+                try:
+                    await client.send_chat_presence(
+                        jid_for_presence,
+                        ChatPresence.CHAT_PRESENCE_COMPOSING,
+                        ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT,
+                    )
+                except Exception:
+                    pass
+            delay_s = (
+                0.01
+                if os.environ.get("CRMTG_FORCE_NO_JITTER") == "1"
+                else min(5.5, max(1.2, len(body) * random.uniform(0.032, 0.048)))
+            )
+            await asyncio.sleep(delay_s)
+            if (
+                hasattr(client, "send_chat_presence")
+                and ChatPresence is not None
+                and ChatPresenceMedia is not None
+            ):
+                try:
+                    await client.send_chat_presence(
+                        jid_for_presence,
+                        ChatPresence.CHAT_PRESENCE_PAUSED,
+                        ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT,
+                    )
+                except Exception:
+                    pass
+
+        try:
+            send_resp = await client.send_message(target_jid_str, body)
+        except Exception as exc:
+            raise GatewayError(f"Ошибка отправки в WhatsApp: {exc}") from exc
+
+        external_message_id = str(getattr(send_resp, "ID", "") or "").strip()
+        if not external_message_id:
+            raise GatewayError(
+                "WhatsApp не подтвердил ID отправленного сообщения"
+            )
 
         used = {
             int(row.get("telegram_message_id") or 0)
             for row in self.history.get(peer_key, [])
         }
         seq_id = self._next_message_seq(used)
-
-        ext_hash = hashlib.sha1(
-            f"{session_path}:{peer_key}:{seq_id}:{body}".encode("utf-8")
-        ).hexdigest()[:16].upper()
-        external_message_id = f"3EB0{ext_hash}"
-
-        if _use_live_neonize() and _inspect_whatsmeow_db(session_path) is not None:
-            client = await self._ensure_neonize_client(session_path, fresh_qr=False)
-            target_digits = re.sub(r"\D", "", str(peer_id))
-            if not target_digits:
-                raise GatewayError("Некорректный номер получателя WhatsApp")
-            try:
-                send_resp = await client.send_message(
-                    f"{target_digits}@s.whatsapp.net", body
-                )
-                resp_id = getattr(send_resp, "ID", None)
-                if resp_id:
-                    external_message_id = str(resp_id)
-            except Exception as exc:
-                raise GatewayError(f"Ошибка отправки в WhatsApp: {exc}") from exc
 
         sent_item = {
             "peer_id": peer_key,
@@ -843,6 +1083,7 @@ class WhatsAppGateway(TelegramGateway):
     async def fetch_messages(
         self, session_path: str, peer_id: int, limit: int = 50
     ) -> list:
+        del session_path
         cap = _history_limit(limit)
         rows = self.history.get(int(peer_id), [])
         return [dict(row) for row in rows[-cap:]]
@@ -861,7 +1102,9 @@ class WhatsAppGateway(TelegramGateway):
         if running is loop:
             loop.create_task(self._invoke_cb(listener, item))
             return
-        asyncio.run_coroutine_threadsafe(self._invoke_cb(listener, item), loop).result(timeout=5)
+        asyncio.run_coroutine_threadsafe(
+            self._invoke_cb(listener, item), loop
+        ).result(timeout=5)
 
     def push_private(self, session_path: str, message: dict) -> None:
         if not _private_incoming(message):
@@ -896,8 +1139,9 @@ class WhatsAppGateway(TelegramGateway):
     async def watch_private(
         self, session_path: str, on_message, on_read=None, on_outgoing=None
     ) -> None:
+        del on_read
         self._loop = asyncio.get_running_loop()
-        if _use_live_neonize() and _inspect_whatsmeow_db(session_path) is not None:
+        if _inspect_whatsmeow_db(session_path) is not None:
             try:
                 await self._ensure_neonize_client(session_path, fresh_qr=False)
             except Exception:
@@ -907,7 +1151,11 @@ class WhatsAppGateway(TelegramGateway):
             if on_outgoing is not None:
                 self._outgoing_listeners[session_path] = on_outgoing
             batch = self._backlog.pop(session_path, [])
-            out_batch = self._outgoing_backlog.pop(session_path, []) if on_outgoing is not None else []
+            out_batch = (
+                self._outgoing_backlog.pop(session_path, [])
+                if on_outgoing is not None
+                else []
+            )
         try:
             for item in batch:
                 await self._invoke_cb(on_message, dict(item))
@@ -925,29 +1173,3 @@ class WhatsAppGateway(TelegramGateway):
                     and self._outgoing_listeners.get(session_path) is on_outgoing
                 ):
                     self._outgoing_listeners.pop(session_path, None)
-
-    async def check_numbers(
-        self, session_path: str, phones: list[str]
-    ) -> list[dict]:
-        results = []
-        for raw in phones or []:
-            digits = re.sub(r"\D", "", str(raw or ""))[-15:]
-            if not digits or len(digits) < 7:
-                continue
-            peer_id = int(digits[-15:])
-            results.append(
-                {
-                    "phone": f"+{digits}",
-                    "found": True,
-                    "wa_jid": f"{digits}@s.whatsapp.net",
-                    "telegram_user_id": peer_id,
-                    "username": None,
-                    "name": f"WA +{digits}",
-                }
-            )
-        return results
-
-    async def resolve_phones(
-        self, session_path: str, phones: list[str]
-    ) -> list[dict]:
-        return await self.check_numbers(session_path, phones)

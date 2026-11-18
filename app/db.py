@@ -1108,6 +1108,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if wa_d2c_v9 is None:
         apply_whatsapp_d2c_and_fb_groups_v9(conn)
+    zero_fake_v10 = conn.execute(
+        "SELECT 1 FROM kv_settings WHERE key = 'zero_fake_wa_antiban_v10'"
+    ).fetchone()
+    if zero_fake_v10 is None:
+        apply_zero_fake_wa_antiban_v10(conn)
     conn.commit()
 
 
@@ -2157,6 +2162,79 @@ def apply_whatsapp_d2c_and_fb_groups_v9(
     )
     conn.commit()
     return {"already_applied": False}
+
+
+def apply_zero_fake_wa_antiban_v10(
+    conn: sqlite3.Connection, *, force: bool = False
+) -> dict:
+    """Idempotently enforce WA anti-ban limit=6 and clean scraped D2C email/name HTML artifacts."""
+    if not force:
+        done = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'zero_fake_wa_antiban_v10'"
+        ).fetchone()
+        if done is not None:
+            return {"already_applied": True}
+
+    import re as _re
+
+    now_ts = utc_now()
+    wa_camp_updated = conn.execute(
+        """
+        UPDATE campaigns
+        SET daily_limit = 6,
+            leadgen_daily_quota = CASE WHEN COALESCE(leadgen_daily_quota, 0) > 6 THEN 6 ELSE leadgen_daily_quota END,
+            updated_at = ?
+        WHERE lower(trim(name)) = 'leadgen auto (wa)'
+          AND daily_limit > 6
+        """,
+        (now_ts,),
+    ).rowcount
+
+    emails_fixed = 0
+    for row in conn.execute(
+        "SELECT id, email FROM leads WHERE email IS NOT NULL AND trim(email) != ''"
+    ).fetchall():
+        raw_em = str(row["email"] or "").strip()
+        clean_em = _re.sub(r"^(?:\\?u003[ec]|u003[ec]|[<>])+", "", raw_em, flags=_re.I).strip()
+        if clean_em != raw_em:
+            conn.execute(
+                "UPDATE leads SET email = ?, updated_at = ? WHERE id = ?",
+                (clean_em, now_ts, int(row["id"])),
+            )
+            emails_fixed += 1
+
+    names_fixed = 0
+    generic_title_re = _re.compile(
+        r"^(?:contact(?:\s+(?:us|information))?|تواصل\s+معنا|about\s+us|get\s+in\s+touch)$",
+        _re.I,
+    )
+    for row in conn.execute(
+        """
+        SELECT id, name, company FROM leads
+        WHERE lower(COALESCE(lead_source, '')) = 'd2c_whatsapp'
+          AND company IS NOT NULL AND trim(company) != ''
+        """
+    ).fetchall():
+        nm = str(row["name"] or "").strip()
+        comp = str(row["company"] or "").strip()
+        if not nm or generic_title_re.match(nm) or (nm.lower().startswith("contact ") and len(nm) > len(comp)):
+            conn.execute(
+                "UPDATE leads SET name = ?, updated_at = ? WHERE id = ?",
+                (comp, now_ts, int(row["id"])),
+            )
+            names_fixed += 1
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('zero_fake_wa_antiban_v10', '1', ?)",
+        (now_ts,),
+    )
+    conn.commit()
+    return {
+        "already_applied": False,
+        "wa_campaigns_updated": int(wa_camp_updated or 0),
+        "emails_fixed": emails_fixed,
+        "names_fixed": names_fixed,
+    }
 
 
 def _ensure_default_pipeline_stages(conn: sqlite3.Connection) -> None:

@@ -1418,7 +1418,8 @@ def collect_d2c_whatsapp_brands(
             for blob_item in page_blobs:
                 if not blob_item:
                     continue
-                for raw_cand in re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", blob_item):
+                clean_blob = re.sub(r"\\?u003[ec]", " ", blob_item, flags=re.I)
+                for raw_cand in re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", clean_blob):
                     em_cand = email_of_text(raw_cand)
                     if em_cand and em_cand not in all_emails:
                         all_emails.append(em_cand)

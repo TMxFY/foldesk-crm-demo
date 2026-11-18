@@ -12,6 +12,20 @@ test.afterEach(() => {
   assertQuiet();
 });
 
+function buildRealTelethonStringSession(): string {
+  const buf = Buffer.alloc(263);
+  buf.writeUInt8(2, 0); // dc_id = 2
+  buf[1] = 149;
+  buf[2] = 154;
+  buf[3] = 167;
+  buf[4] = 50;
+  buf.writeUInt16BE(443, 5);
+  for (let i = 0; i < 256; i += 1) {
+    buf[7 + i] = ((i * 37 + 19) % 251) + 1;
+  }
+  return '1' + buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
 test('F21-H1 Session + JSON (ZIP) account import adds connected account with proxy and access metadata', async ({ page }) => {
   await page.locator('#toggle-view-mode').click();
   await expect(page.locator('#workspace-main')).toHaveAttribute('data-view-mode', 'sheet');
@@ -27,8 +41,17 @@ test('F21-H1 Session + JSON (ZIP) account import adds connected account with pro
 
   await page.locator('#session-proxy-select').selectOption('eu_residential');
   await page.locator('#session-access-select').selectOption('workspace');
-  await page.locator('#fill-sample-session-btn').click();
-  await expect(page.locator('#session-import-text')).toHaveValue(/foldesk_outreach_pro/);
+  await page.locator('#session-import-text').fill(
+    JSON.stringify([
+      {
+        phone: '+31612345678',
+        username: 'foldesk_outreach_pro',
+        first_name: 'Foldesk',
+        last_name: 'Session',
+        session_string: buildRealTelethonStringSession(),
+      },
+    ]),
+  );
 
   await page.locator('#import-session-btn').click();
   await expect(page.locator('#account-list')).toContainText('Foldesk Session');

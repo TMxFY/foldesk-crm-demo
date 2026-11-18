@@ -272,6 +272,7 @@ def test_import_session_accounts_persists_credentials_and_device_profile_in_sqli
     import app.telegram_gateway as gw_mod
     from app.accounts import import_session_accounts
     from app.telegram_gateway import TelethonGateway
+    from real_session_helpers import make_real_telethon_string_session
 
     sess_dir = tmp_path / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +282,7 @@ def test_import_session_accounts_persists_credentials_and_device_profile_in_sqli
         "resolve_session",
         lambda p: sess_dir if str(p).rstrip("/").endswith("data/sessions") else sess_dir / str(p).split("/")[-1],
     )
+    monkeypatch.setattr(acc_mod, "DEFAULT_DB", db_file)
     monkeypatch.setattr(gw_mod, "DEFAULT_DB", db_file)
 
     conn = connect(db_file)
@@ -294,6 +296,7 @@ def test_import_session_accounts_persists_credentials_and_device_profile_in_sqli
             "sessions": [
                 {
                     "filename": "79991234567.session",
+                    "session_string": make_real_telethon_string_session(),
                     "json_data": {
                         "phone": "+79991234567",
                         "id": 123456789,

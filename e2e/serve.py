@@ -13,9 +13,10 @@ os.environ["BOT_CHAT_ID"] = "900001"
 os.environ["CLOUD_BACKUP_ENABLED"] = "0"
 os.environ["DISABLE_TG_WATCHES"] = "1"
 
-from app.db import connect, init_db
+from app.db import connect, init_db, resolve_session
 from app.main import create_app, stop_inbox_watches
-from app.telegram_gateway import FakeGateway
+from app.telegram_gateway import FakeGateway, GatewayError
+from app.whatsapp_gateway import WhatsAppGateway, _render_real_qr_svg
 
 DIALOGS = [
     {"telegram_user_id": 42, "username": "ivan", "name": "Иван Петров"},
@@ -89,16 +90,135 @@ class DigestBox:
 digest_box = DigestBox()
 
 
+class E2EWhatsAppGateway(WhatsAppGateway):
+    """Isolated Playwright E2E double kept strictly out of production app/."""
+
+    async def request_code(
+        self, phone: str, session_path: str, auth_mode: str = "code"
+    ) -> str:
+        clean_phone = (phone or "").strip() or "+79995554433"
+        pcode = "WA00-9911"
+        qr_svg = _render_real_qr_svg(f"e2e:{session_path}:{clean_phone}")
+        h = f"wa:{auth_mode}:{pcode}"
+        self._pending[session_path] = {
+            "phone": clean_phone,
+            "hash": h,
+            "pairing_code": pcode,
+            "qr_code": qr_svg,
+            "auth_mode": auth_mode,
+            "state": "pending_code",
+        }
+        return h
+
+    async def confirm_code(
+        self, phone: str, code: str, phone_code_hash: str, session_path: str
+    ) -> dict:
+        import re as _re
+
+        clean_phone = (phone or "").strip() or "+79995554433"
+        digits = _re.sub(r"\D", "", clean_phone)[-15:] or "79995554433"
+        if not (code or "").strip():
+            raise GatewayError("Укажите код")
+        self._pending[session_path] = {
+            "phone": f"+{digits}",
+            "state": "connected",
+            "wa_jid": f"{digits}@s.whatsapp.net",
+        }
+        return {
+            "status": "connected",
+            "phone": f"+{digits}",
+            "telegram_user_id": int(digits),
+            "telegram_username": None,
+            "telegram_name": f"WhatsApp +{digits}",
+            "wa_jid": f"{digits}@s.whatsapp.net",
+        }
+
+    async def session_health(self, session_path: str) -> dict:
+        if (self._pending.get(session_path) or {}).get("state") == "connected":
+            return {"health": "active", "last_error": None}
+        return await super().session_health(session_path)
+
+    async def check_numbers(self, session_path: str, phones: list[str]) -> list[dict]:
+        import re as _re
+
+        out = []
+        for raw in phones or []:
+            d = _re.sub(r"\D", "", str(raw or ""))[-15:]
+            if len(d) >= 7:
+                out.append(
+                    {
+                        "phone": f"+{d}",
+                        "found": True,
+                        "wa_jid": f"{d}@s.whatsapp.net",
+                        "telegram_user_id": int(d),
+                        "username": None,
+                        "name": f"WA +{d}",
+                    }
+                )
+        return out
+
+    async def search_dialogs(self, session_path: str, query: str, limit: int = 30) -> list:
+        import re as _re
+
+        found = await super().search_dialogs(session_path, query, limit=limit)
+        if found:
+            return found
+        d = _re.sub(r"\D", "", str(query or ""))[-15:]
+        if len(d) >= 7:
+            return [
+                {
+                    "telegram_user_id": int(d),
+                    "username": None,
+                    "name": f"WA +{d}",
+                    "phone": f"+{d}",
+                    "wa_jid": f"{d}@s.whatsapp.net",
+                    "peer_type": "user",
+                }
+            ]
+        return []
+
+    async def send_message(
+        self,
+        session_path: str,
+        peer_id,
+        text: str,
+        reply_to=None,
+        simulate_typing: bool = True,
+        image_path: str | None = None,
+    ) -> dict:
+        import hashlib as _hs
+        import re as _re
+        from app.db import utc_now
+
+        d = _re.sub(r"\D", "", str(peer_id or ""))[-15:]
+        peer_key = int(d) if d else peer_id
+        seq_id = self._next_message_seq()
+        ext_id = f"3EB0E2E{_hs.sha1(text.encode()).hexdigest()[:12].upper()}"
+        rec = {
+            "telegram_message_id": seq_id,
+            "external_message_id": ext_id,
+            "text": text,
+            "sent_at": utc_now(),
+            "direction": "out",
+            "reply_to_telegram_message_id": int(reply_to) if reply_to else None,
+            "presence": "composing" if simulate_typing else "available",
+        }
+        self.sent.append({"peer_id": peer_key, "text": text, "session_path": session_path})
+        self.history.setdefault(peer_key, []).append(dict(rec))
+        return rec
+
+
 def build():
     if DB_PATH.exists():
         DB_PATH.unlink()
     conn = connect(DB_PATH)
     init_db(conn)
     gateway = E2EGateway()
+    wa_gateway = E2EWhatsAppGateway(db_path=DB_PATH)
     # Fake operator bot. Real BOT_TOKEN from the parent shell must not be used.
     os.environ["BOT_TOKEN"] = "e2e-not-a-secret"
     os.environ["BOT_CHAT_ID"] = "900001"
-    app = create_app(conn=conn, gateway=gateway)
+    app = create_app(conn=conn, gateway=gateway, wa_gateway=wa_gateway)
     app.state.digest_opener = digest_box
 
     @app.post("/api/test/reset")

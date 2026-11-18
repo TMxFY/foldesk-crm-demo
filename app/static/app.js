@@ -1111,18 +1111,19 @@ function resumeLogin(account) {
   state.loginId = account.id;
   if (normalizeProvider(account.provider) === "whatsapp") {
     waCurrentAccountId = account.id;
-    waCurrentPairingCode = account.pairing_code || generateWaPairingCode(account.phone);
+    waCurrentPairingCode = account.pairing_code || "";
     switchAuthTab("whatsapp");
     const pairingBox = document.querySelector("#wa-pairing-box");
     const codePanel = document.querySelector("#wa-code-panel");
     const qrPanel = document.querySelector("#wa-qr-panel");
     const codeDisplay = document.querySelector("#wa-pairing-code-display");
     const qrImage = document.querySelector("#wa-qr-image");
-    if (pairingBox) pairingBox.hidden = false;
-    if (codePanel) codePanel.hidden = false;
-    if (qrPanel) qrPanel.hidden = false;
-    if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode;
-    if (qrImage) qrImage.src = account.qr_code || account.qr_svg || DEFAULT_WA_QR_SVG;
+    const realQr = account.qr_code || account.qr_svg || "";
+    if (pairingBox) pairingBox.hidden = !(waCurrentPairingCode || realQr);
+    if (codePanel) codePanel.hidden = !waCurrentPairingCode;
+    if (qrPanel) qrPanel.hidden = !realQr;
+    if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode || "—";
+    if (qrImage) qrImage.src = realQr;
   } else {
     document.querySelector("#code-form").hidden = account.status !== "pending_code";
     document.querySelector("#password-form").hidden = account.status !== "pending_password";
@@ -5971,19 +5972,17 @@ if (authTabBtnWhatsapp) {
   authTabBtnWhatsapp.addEventListener("click", () => switchAuthTab("whatsapp"));
 }
 
-const DEFAULT_WA_QR_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><rect width="160" height="160" rx="12" fill="#ffffff"/><rect x="16" y="16" width="40" height="40" fill="none" stroke="#065f46" stroke-width="6"/><rect x="28" y="28" width="16" height="16" fill="#065f46"/><rect x="104" y="16" width="40" height="40" fill="none" stroke="#065f46" stroke-width="6"/><rect x="116" y="28" width="16" height="16" fill="#065f46"/><rect x="16" y="104" width="40" height="40" fill="none" stroke="#065f46" stroke-width="6"/><rect x="28" y="116" width="16" height="16" fill="#065f46"/><rect x="70" y="24" width="16" height="16" fill="#065f46"/><rect x="70" y="64" width="24" height="24" fill="#065f46"/><rect x="104" y="76" width="20" height="16" fill="#065f46"/><rect x="72" y="108" width="16" height="28" fill="#065f46"/><rect x="108" y="108" width="28" height="28" fill="#065f46"/></svg>'
-);
-
 let waCurrentAccountId = null;
 let waCurrentPairingCode = "";
 let waPollTimer = null;
+let waAutoConfirming = false;
 
 function stopWaPoll() {
   if (waPollTimer) {
     window.clearInterval(waPollTimer);
     waPollTimer = null;
   }
+  waAutoConfirming = false;
 }
 
 function startWaPoll(accountId) {
@@ -6003,10 +6002,31 @@ function startWaPoll(accountId) {
           const qrImage = document.querySelector("#wa-qr-image");
           if (qrImage && qrImage.src !== found.qr_code) qrImage.src = found.qr_code;
         }
-        if (found.pairing_code) {
+        if (found.pairing_code && found.pairing_code !== "QR-READY") {
           waCurrentPairingCode = found.pairing_code;
           const codeDisplay = document.querySelector("#wa-pairing-code-display");
           if (codeDisplay) codeDisplay.textContent = found.pairing_code;
+        }
+        if (found.status === "pending_code" && found.pairing_code === "QR-READY" && !waAutoConfirming) {
+          waAutoConfirming = true;
+          try {
+            const confRes = await api(`/api/accounts/${accountId}/code`, {
+              method: "POST",
+              body: { code: "QR-READY", provider: "whatsapp" },
+            });
+            if (confRes && confRes.status === "connected") {
+              stopWaPoll();
+              const pairingBox = document.querySelector("#wa-pairing-box");
+              if (pairingBox) pairingBox.hidden = true;
+              await loadAccounts();
+              await loadInbox();
+              closeSheetPopup();
+              toast("Аккаунт WhatsApp подключён", "ok");
+              return;
+            }
+          } finally {
+            waAutoConfirming = false;
+          }
         }
         if (found.status === "connected") {
           stopWaPoll();
@@ -6022,12 +6042,6 @@ function startWaPoll(accountId) {
   }, 3000);
 }
 
-function generateWaPairingCode(phone) {
-  const digits = String(phone || "").replace(/\D/g, "");
-  const tail = (digits.slice(-4) || "9201").padStart(4, "0"); // taste-skill-ignore
-  return `WA84-${tail}`;
-}
-
 async function startWhatsappLogin(mode) {
   showError(null);
   const phoneInput = document.querySelector("#wa-phone-input");
@@ -6039,7 +6053,7 @@ async function startWhatsappLogin(mode) {
     if (phoneInput) phoneInput.focus();
     return;
   }
-  const phone = rawPhone || "+79990001122";
+  const phone = rawPhone;
   const proxyUrl = (proxyInput && proxyInput.value.trim()) || null;
   const accessScope = (scopeSelect && scopeSelect.value) || "workspace";
   const btn = mode === "qr" ? document.querySelector("#wa-qr-btn") : document.querySelector("#wa-code-btn");
@@ -6070,17 +6084,25 @@ async function startWhatsappLogin(mode) {
       toast("Аккаунт WhatsApp подключён", "ok");
       return;
     }
-    waCurrentPairingCode = res.pairing_code || generateWaPairingCode(phone);
+    const pairingCode = res.pairing_code || "";
+    const qrSrc = res.qr_code || res.qr_svg || res.qr_url || "";
+    if (mode === "qr" && !qrSrc) {
+      throw new Error("Сервер не вернул реальный QR-код WhatsApp");
+    }
+    if (mode === "code" && !pairingCode) {
+      throw new Error("Сервер не вернул код сопряжения WhatsApp");
+    }
+    waCurrentPairingCode = pairingCode;
     const pairingBox = document.querySelector("#wa-pairing-box");
     const codePanel = document.querySelector("#wa-code-panel");
     const qrPanel = document.querySelector("#wa-qr-panel");
     const codeDisplay = document.querySelector("#wa-pairing-code-display");
     const qrImage = document.querySelector("#wa-qr-image");
     if (pairingBox) pairingBox.hidden = false;
-    if (codePanel) codePanel.hidden = false;
-    if (qrPanel) qrPanel.hidden = false;
-    if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode;
-    if (qrImage) qrImage.src = res.qr_code || res.qr_svg || res.qr_url || DEFAULT_WA_QR_SVG;
+    if (codePanel) codePanel.hidden = !pairingCode;
+    if (qrPanel) qrPanel.hidden = !qrSrc;
+    if (codeDisplay) codeDisplay.textContent = pairingCode || "—";
+    if (qrImage) qrImage.src = qrSrc;
     await loadAccounts();
     startWaPoll(res.id);
   } catch (error) {
@@ -6167,41 +6189,19 @@ bindBusy(document.querySelector("#login-form"), async (event) => {
   await loadAccounts();
 });
 
-const SAMPLE_SESSION_JSON = JSON.stringify({
-  app_id: 2040,
-  app_hash: "b18441a1ff607e10a989891a5462e627",
-  device: "MacBookPro18,3",
-  sdk: "macOS 14.5",
-  app_version: "4.16.8 x64",
-  phone: "+79995550199",
-  username: "foldesk_outreach_pro",
-  first_name: "Foldesk",
-  last_name: "Session",
-  session_file: "79995550199.session",
-}, null, 2);
-
-const fillSampleSessionBtn = document.querySelector("#fill-sample-session-btn");
-if (fillSampleSessionBtn) {
-  fillSampleSessionBtn.addEventListener("click", () => {
-    const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
-    if (area) area.value = SAMPLE_SESSION_JSON;
-    const dropText = document.querySelector("#session-dropzone-text");
-    if (dropText) dropText.textContent = "Подготовлен JSON сессии: 79995550199.session";
-    toast("Подставлен тестовый JSON сессии Telegram", "ok");
-  });
-}
-
 let uploadedSessionFilename = "";
+let uploadedSessionBase64 = "";
 const sessionArchiveFile = document.querySelector("#session-import-file") || document.querySelector("#session-archive-file");
 if (sessionArchiveFile) {
   sessionArchiveFile.addEventListener("change", (event) => {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
     uploadedSessionFilename = file.name;
+    uploadedSessionBase64 = "";
     const dropText = document.querySelector("#session-dropzone-text");
     if (dropText) dropText.textContent = `Выбран файл: ${file.name}`;
-    if (file.name.endsWith(".json")) {
-      const reader = new FileReader();
+    const reader = new FileReader();
+    if (file.name.toLowerCase().endsWith(".json")) {
       reader.onload = () => {
         const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
         if (area) area.value = String(reader.result || "");
@@ -6209,17 +6209,12 @@ if (sessionArchiveFile) {
       };
       reader.readAsText(file, "utf-8");
     } else {
-      const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
-      if (area && !area.value.trim()) {
-        area.value = JSON.stringify({
-          app_id: 2040,
-          device: "Telegram Desktop",
-          phone: "+7999" + String(Math.floor(1000000 + Math.random() * 8999999)),
-          username: file.name.replace(/\.(zip|session|json)$/i, "").replace(/[^a-zA-Z0-9_]/g, "_"),
-          session_file: file.name,
-        }, null, 2);
-      }
-      toast(`Архив сессии готов к импорту: ${file.name}`, "ok");
+      reader.onload = () => {
+        const dataUrl = String(reader.result || "");
+        uploadedSessionBase64 = dataUrl.includes(",") ? dataUrl.split(",", 2)[1] : dataUrl;
+        toast(`Бинарный файл сессии прочитан: ${file.name}`, "ok");
+      };
+      reader.readAsDataURL(file);
     }
   });
 }
@@ -6233,10 +6228,13 @@ if (importSessionBtn) {
     const proxy = document.querySelector("#session-proxy-select")?.value
       || document.querySelector("#account-proxy-select")?.value
       || "auto";
+    const effectiveProxy = provider === "whatsapp" && !/^(socks5h?|https?):\/\//i.test(String(proxy || "").trim())
+      ? null
+      : proxy;
     const access = document.querySelector("#session-access-select")?.value
       || document.querySelector("#account-access-select")?.value
       || "workspace";
-    if (!rawJson && !uploadedSessionFilename) {
+    if (!rawJson && !uploadedSessionBase64) {
       toast("Загрузите архив .zip / .session или вставьте JSON сессии", "error");
       if (area) area.focus();
       return;
@@ -6253,25 +6251,33 @@ if (importSessionBtn) {
           return;
         }
       }
+      const isZipUpload = uploadedSessionFilename.toLowerCase().endsWith(".zip");
+      const binaryFields = uploadedSessionBase64
+        ? (isZipUpload ? { zip_base64: uploadedSessionBase64 } : { session_base64: uploadedSessionBase64 })
+        : {};
       const bodyPayload = Array.isArray(parsed)
         ? {
           sessions: parsed,
           provider,
-          proxy_url: proxy,
+          proxy_url: effectiveProxy,
           access_scope: access,
+          ...binaryFields,
         }
         : {
           ...parsed,
           provider,
           json_data: parsed,
           filename: uploadedSessionFilename || parsed.session_file || "session.json",
-          proxy_url: proxy,
+          proxy_url: effectiveProxy,
           access_scope: access,
+          ...binaryFields,
         };
       const importedRes = await api("/api/accounts/import-session", {
         method: "POST",
         body: bodyPayload,
       });
+      uploadedSessionFilename = "";
+      uploadedSessionBase64 = "";
       const firstAcc = (importedRes && Array.isArray(importedRes.imported) && importedRes.imported[0])
         || importedRes
         || {};
