@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1276,7 +1277,11 @@ def run_autonomous_replenish(
                         "--mode",
                         "posters",
                         "--msg-limit",
-                        str(int(limits_cfg.get("msg_limit") or 1800)),
+                        str(min(400, max(50, int(limits_cfg.get("msg_limit") or 400)))),
+                        "--delay",
+                        "0.8",
+                        "--max-runtime-sec",
+                        "180",
                         "--output",
                         str(raw_jsonl),
                         "--append",
@@ -1446,6 +1451,7 @@ def run_autonomous_replenish(
                         if has_llm_key:
                             llm_failed_file.unlink(missing_ok=True)
                             qualified_jsonl = state_dir / f"raw_{ts}.qualified.jsonl"
+                            curated_jsonl = state_dir / f"raw_{ts}.curated_tmp.jsonl"
                             final_jsonl = state_dir / f"raw_{ts}.final.jsonl"
                             qual_ok = _exec_stage(
                                 "tg_llm_qualify",
@@ -1473,11 +1479,11 @@ def run_autonomous_replenish(
                                         "--input",
                                         str(qualified_jsonl),
                                         "--output",
-                                        str(final_jsonl),
+                                        str(curated_jsonl),
                                     ],
                                 )
                                 if curate_ok:
-                                    if treg_ready and final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                    if treg_ready and curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
                                         treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
                                         treg_ok = _exec_stage(
                                             "treg_enrich",
@@ -1485,7 +1491,7 @@ def run_autonomous_replenish(
                                                 py_bin,
                                                 str(ROOT / "leadgen" / "treg_enrich.py"),
                                                 "--input",
-                                                str(final_jsonl),
+                                                str(curated_jsonl),
                                                 "--output",
                                                 str(treg_tmp_jsonl),
                                                 "--cache",
@@ -1497,10 +1503,10 @@ def run_autonomous_replenish(
                                             and treg_tmp_jsonl.is_file()
                                             and treg_tmp_jsonl.stat().st_size > 0
                                         ):
-                                            treg_tmp_jsonl.replace(final_jsonl)
+                                            treg_tmp_jsonl.replace(curated_jsonl)
                                         elif treg_tmp_jsonl.is_file():
                                             treg_tmp_jsonl.unlink(missing_ok=True)
-                                    if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
                                         wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
                                         wf_ok = _exec_stage(
                                             "contact_waterfall",
@@ -1508,7 +1514,7 @@ def run_autonomous_replenish(
                                                 py_bin,
                                                 str(ROOT / "leadgen" / "contact_waterfall.py"),
                                                 "--input",
-                                                str(final_jsonl),
+                                                str(curated_jsonl),
                                                 "--output",
                                                 str(wf_tmp_jsonl),
                                                 "--max-budget-usd",
@@ -1520,17 +1526,17 @@ def run_autonomous_replenish(
                                             and wf_tmp_jsonl.is_file()
                                             and wf_tmp_jsonl.stat().st_size > 0
                                         ):
-                                            wf_tmp_jsonl.replace(final_jsonl)
+                                            wf_tmp_jsonl.replace(curated_jsonl)
                                         elif wf_tmp_jsonl.is_file():
                                             wf_tmp_jsonl.unlink(missing_ok=True)
                                     if (
                                         (treg_ready or monid_ready or runner is not subprocess.run)
                                         and sources_cfg.get("tg_identity_bridge", True)
                                         and "tg_identity_bridge" not in quarantined
-                                        and final_jsonl.is_file()
-                                        and final_jsonl.stat().st_size > 0
+                                        and curated_jsonl.is_file()
+                                        and curated_jsonl.stat().st_size > 0
                                     ):
-                                        pre_tg_cnt = _count_personal_tg_rows(final_jsonl)
+                                        pre_tg_cnt = _count_personal_tg_rows(curated_jsonl)
                                         bridge_tmp_jsonl = state_dir / f"raw_{ts}.bridge_tmp.jsonl"
                                         bridge_ok = _exec_stage(
                                             "tg_identity_bridge",
@@ -1538,7 +1544,7 @@ def run_autonomous_replenish(
                                                 py_bin,
                                                 str(ROOT / "leadgen" / "tg_identity_bridge.py"),
                                                 "--input",
-                                                str(final_jsonl),
+                                                str(curated_jsonl),
                                                 "--output",
                                                 str(bridge_tmp_jsonl),
                                             ],
@@ -1548,20 +1554,26 @@ def run_autonomous_replenish(
                                             and bridge_tmp_jsonl.is_file()
                                             and bridge_tmp_jsonl.stat().st_size > 0
                                         ):
-                                            bridge_tmp_jsonl.replace(final_jsonl)
-                                            post_tg_cnt = _count_personal_tg_rows(final_jsonl)
+                                            bridge_tmp_jsonl.replace(curated_jsonl)
+                                            post_tg_cnt = _count_personal_tg_rows(curated_jsonl)
                                             tg_bridged_count = max(0, post_tg_cnt - pre_tg_cnt)
                                         elif bridge_tmp_jsonl.is_file():
                                             bridge_tmp_jsonl.unlink(missing_ok=True)
-                                    if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
                                         split_res = split_tg_and_direct_x_leads(
-                                            final_jsonl, state_dir / "direct_x_leads.jsonl"
+                                            curated_jsonl, state_dir / "direct_x_leads.jsonl"
                                         )
                                         direct_x_routed += int(split_res.get("direct_x_added") or 0)
-                                    elif final_jsonl.is_file():
+                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                        curated_jsonl.replace(final_jsonl)
+                                    else:
+                                        curated_jsonl.unlink(missing_ok=True)
+                                        if final_jsonl.is_file():
+                                            final_jsonl.unlink(missing_ok=True)
+                                else:
+                                    curated_jsonl.unlink(missing_ok=True)
+                                    if final_jsonl.is_file():
                                         final_jsonl.unlink(missing_ok=True)
-                                elif final_jsonl.is_file():
-                                    final_jsonl.unlink(missing_ok=True)
                             elif final_jsonl.is_file():
                                 final_jsonl.unlink(missing_ok=True)
 
@@ -1801,6 +1813,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=300)
     args = parser.parse_args(argv)
 
+    def _handle_sigterm(_signum, _frame):
+        raise RuntimeError("crmtg-leadgen terminated by SIGTERM")
+
+    prev_sigterm = None
+    try:
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (ValueError, OSError):
+        pass
+
     conn = connect(args.db)
     init_db(conn)
     try:
@@ -1839,6 +1860,11 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             return 1
     finally:
+        if prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
+                pass
         conn.close()
 
     print(json.dumps(res, ensure_ascii=False))

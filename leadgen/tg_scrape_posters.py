@@ -217,7 +217,7 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
                        mode="members", member_limit=100,
                        send=False, send_delay=45.0, max_send=0, send_state=None,
                        entity_cache=None, profile_cache=None, cursors=None,
-                       allow_rule5_bypass=False):
+                       allow_rule5_bypass=False, max_runtime_deadline=None):
     _enforce_rule5_no_direct_send(bool(send), bool(allow_rule5_bypass))
     if entity_cache is None:
         entity_cache = {}
@@ -356,7 +356,15 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
 
     rows = []
     cur_delay = delay
-    for sid in sender_ids:
+    for idx, sid in enumerate(sender_ids):
+        if max_runtime_deadline is not None and time.monotonic() >= max_runtime_deadline:
+            for rem_sid in sender_ids[idx:]:
+                failed_message_ids.update(message_ids_by_sender.get(rem_sid, []))
+            print(
+                f"# {group}: runtime deadline reached after {idx}/{len(sender_ids)} senders",
+                file=sys.stderr,
+            )
+            break
         cache_key = str(sid)
         cached = profile_cache.get(cache_key)
         cache_ttl = max(60, int(os.environ.get("TG_PROFILE_CACHE_TTL", "604800")))
@@ -434,7 +442,8 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
             fh.flush()
             await asyncio.sleep(send_delay)
 
-        await asyncio.sleep(cur_delay)
+        if not fresh:
+            await asyncio.sleep(cur_delay)
     # Advance the cursor only after the whole group completed.  If Telegram
     # FloodWait or a transient profile failure interrupts the group, the next
     # run retries those messages instead of silently skipping them.
@@ -497,6 +506,9 @@ async def main():
     p.add_argument("--max-send", type=int, default=0, help="0 = no cap")
     p.add_argument("--sent-file", default="/tmp/tg_sent_ids.json",
                    help="tracks already-messaged user ids")
+    p.add_argument("--max-runtime-sec", type=float,
+                   default=float(os.getenv("TG_SCRAPE_BUDGET_SEC", "0")),
+                   help="Soft wall-clock budget in seconds across all groups (0 = unlimited)")
     args = p.parse_args()
 
     _enforce_rule5_no_direct_send(bool(args.send), bool(args.i_ran_rule5_dry_run))
@@ -521,11 +533,15 @@ async def main():
     entity_cache = load_entity_cache()
     profile_cache = load_json_state(PROFILE_CACHE_PATH)
     cursors = load_json_state(CURSOR_PATH)
+    deadline = (time.monotonic() + args.max_runtime_sec) if args.max_runtime_sec > 0 else None
     total = 0
     try:
         await client.start()
         with open(args.output, "a" if args.append else "w") as fh:
             for g in groups:
+                if deadline is not None and time.monotonic() >= deadline:
+                    print("# runtime budget exhausted; stopping group scan early", file=sys.stderr)
+                    break
                 print(f"# scraping {args.mode} in {g} ...", file=sys.stderr)
                 rows = await scrape_group(client, g, args.msg_limit, args.delay, fh,
                                           args.exclude, send=args.send,
@@ -537,13 +553,16 @@ async def main():
                                           cursors=cursors,
                                           mode=args.mode,
                                           member_limit=args.member_limit,
-                                          allow_rule5_bypass=args.i_ran_rule5_dry_run)
+                                          allow_rule5_bypass=args.i_ran_rule5_dry_run,
+                                          max_runtime_deadline=deadline)
                 matched = sum(1 for r in rows if r["icp_match"])
                 print(f"# {g}: {len(rows)} users, {matched} ICP-match", file=sys.stderr)
                 total += len(rows)
                 save_json_state(PROFILE_CACHE_PATH, profile_cache)
                 save_json_state(CURSOR_PATH, cursors)
     finally:
+        save_json_state(PROFILE_CACHE_PATH, profile_cache)
+        save_json_state(CURSOR_PATH, cursors)
         await client.disconnect()
         if send_state is not None:
             json.dump(sorted(send_state["sent"]), open(args.sent_file, "w"))

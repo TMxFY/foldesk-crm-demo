@@ -978,3 +978,246 @@ def test_tg_llm_qualify_handles_non_dict_json_gracefully(monkeypatch: pytest.Mon
         tg_llm_qualify.call_llm([{"username": "a", "name": "A", "bio": "b"}], "claude-haiku-5-5")
 
 
+def test_ofm_and_groups_accepts_max_groups_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from leadgen import ofm_and_groups
+
+    captured: dict[str, int] = {}
+
+    def fake_collect_fb(*, group_urls=None, state_dir=None, limit=20, max_groups=5, treg_fn=None):
+        captured["max_groups"] = max_groups
+        return {"b2b_rows": [], "ofm_rows": [], "ofm_added": 0}
+
+    monkeypatch.setattr(ofm_and_groups, "collect_facebook_groups", fake_collect_fb)
+    out_file = tmp_path / "fb.jsonl"
+    ofm_file = tmp_path / "ofm.jsonl"
+    rc = ofm_and_groups.main(
+        [
+            "--mode",
+            "fb_groups",
+            "--fb-urls",
+            "https://www.facebook.com/groups/ShopifyStorePros",
+            "--max-groups",
+            "7",
+            "--output",
+            str(out_file),
+            "--ofm-out",
+            str(ofm_file),
+        ]
+    )
+    assert rc == 0
+    assert captured["max_groups"] == 7
+
+
+def test_tg_scrape_posters_skips_sleep_on_cache_and_holds_cursor_on_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import asyncio
+    import time as _time
+    from types import SimpleNamespace
+    from leadgen import tg_scrape_posters
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(sec: float):
+        sleeps.append(sec)
+
+    monkeypatch.setattr(tg_scrape_posters.asyncio, "sleep", fake_sleep)
+
+    msgs = [
+        SimpleNamespace(id=101, sender_id=1001, message="Founder at https://app1.io", post=False, from_id=None, sender=None),
+        SimpleNamespace(id=102, sender_id=1002, message="Founder at https://app2.io", post=False, from_id=None, sender=None),
+    ]
+
+    class FakeClient:
+        async def get_entity(self, group):
+            return SimpleNamespace(id=77, title="Founders Chat")
+
+        async def get_messages(self, entity, limit=400):
+            return msgs
+
+        async def __call__(self, req):
+            raise AssertionError("GetFullUserRequest should not run when profile_cache is fresh")
+
+    now_ts = _time.time()
+    profile_cache = {
+        "1001": {
+            "fetched_at": now_ts,
+            "profile": {
+                "id": 1001,
+                "username": "founder_cached",
+                "first_name": "Alex",
+                "last_name": "One",
+                "bio": "Founder of App1 https://app1.io",
+                "bot": False,
+                "deleted": False,
+                "verified": False,
+                "premium": False,
+            },
+        },
+        "1002": {
+            "fetched_at": now_ts,
+            "profile": {
+                "id": 1002,
+                "username": "founder_late",
+                "first_name": "Bob",
+                "last_name": "Two",
+                "bio": "Founder of App2 https://app2.io",
+                "bot": False,
+                "deleted": False,
+                "verified": False,
+                "premium": False,
+            },
+        },
+    }
+    out_path = tmp_path / "scraped.jsonl"
+    cursors: dict[str, int] = {}
+
+    # All cached -> zero sleep
+    with open(out_path, "w", encoding="utf-8") as fh:
+        rows = asyncio.run(
+            tg_scrape_posters.scrape_group(
+                FakeClient(),
+                "founderschat",
+                50,
+                2.0,
+                fh,
+                [],
+                profile_cache=profile_cache,
+                cursors=cursors,
+                mode="posters",
+            )
+        )
+    assert len(rows) == 2
+    assert sleeps == []
+    assert cursors["founderschat"] == 102
+
+    # Expired deadline before second sender -> cursor held at 101 (min unvisited id 102 - 1)
+    cursors2: dict[str, int] = {}
+    with open(out_path, "w", encoding="utf-8") as fh:
+        rows2 = asyncio.run(
+            tg_scrape_posters.scrape_group(
+                FakeClient(),
+                "founderschat",
+                50,
+                2.0,
+                fh,
+                [],
+                profile_cache=profile_cache,
+                cursors=cursors2,
+                mode="posters",
+                max_runtime_deadline=_time.monotonic() - 1.0,
+            )
+        )
+    assert rows2 == []
+    assert cursors2["founderschat"] == 100
+
+
+def test_atomic_curated_tmp_not_exposed_on_bridge_fail_and_sigterm_records_error(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+):
+    import signal as _signal
+    from leadgen import vps_autonomous_replenish
+
+    conn = isolated_env["conn"]
+    state_dir: Path = isolated_env["state_dir"]
+    db_path: Path = isolated_env["db_path"]
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    monkeypatch.setenv("CRMTG_LEADGEN_STATE_DIR", str(state_dir))
+
+    # 1) When tg_curate fails, neither curated_tmp.jsonl nor .final.jsonl should remain
+    create_campaign(
+        conn,
+        name="SoftUGC — База Все2 (2 045 лидов)",
+        daily_limit=140,
+        status="running",
+        steps=DEFAULT_B2B_STEPS,
+        leadgen_enabled=True,
+    )
+    save_leadgen_config(
+        conn,
+        {
+            "enabled": True,
+            "b2b": {
+                "enabled": True,
+                "target_campaign_tg": "SoftUGC — База Все2 (2 045 лидов)",
+                "sources": {
+                    "buyer_catalogs": True,
+                    "tg_groups": False,
+                    "ofm_groups": False,
+                    "facebook_groups": False,
+                    "meta_ads": False,
+                    "social_x_reddit": False,
+                    "yc_ph": False,
+                    "channel_graph": False,
+                    "tg_ad_spy": False,
+                    "whop_content_rewards": False,
+                    "tiktok_ads": False,
+                    "tiktok_shop": False,
+                    "app_stores": False,
+                    "ats_hiring": False,
+                    "ph_detailed": False,
+                    "d2c_whatsapp": False,
+                    "tg_identity_bridge": True,
+                },
+                "limits": {"external_limit": 0},
+            },
+            "vacancies": {"enabled": False},
+        },
+        sync_cases_file=False,
+    )
+
+    sample = {
+        "username": "atomic_user",
+        "name": "Atomic User",
+        "project": "AtomicApp",
+        "company": "AtomicApp",
+        "project_url": "https://atomic.app",
+        "bio": "Founder of AtomicApp ($20/mo)",
+        "source": "catalog_test",
+    }
+
+    curated_cmd_seen: list[str] = []
+
+    def runner(cmd, **kwargs):
+        cmd_str = " ".join(str(x) for x in cmd)
+        if "buyer_catalogs.py" in cmd_str:
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            out_p.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_enrich_leads.py" in cmd_str:
+            inp_p = Path(cmd[cmd.index("--input") + 1])
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            out_p.write_text(inp_p.read_text(encoding="utf-8"), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_llm_qualify.py" in cmd_str:
+            inp_p = Path(cmd[cmd.index("--input") + 1])
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            r = json.loads(inp_p.read_text(encoding="utf-8").strip())
+            r.update({"is_lead": True, "qualified": True, "icp_score": 90})
+            out_p.write_text(json.dumps(r) + "\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_curate.py" in cmd_str:
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            curated_cmd_seen.append(out_p.name)
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="curate boom")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    res = vps_autonomous_replenish.run_autonomous_replenish(conn, runner=runner)
+    assert res["ok"] is True
+    assert curated_cmd_seen and curated_cmd_seen[0].endswith(".curated_tmp.jsonl")
+    assert not list(state_dir.glob("*.final.jsonl"))
+    assert not list(state_dir.glob("*.curated_tmp.jsonl"))
+
+    # 2) SIGTERM in main() records vps_autonomous_replenish_crash into kv_settings['leadgen_stage_errors']
+    def sigterm_trigger(*args, **kwargs):
+        _signal.raise_signal(_signal.SIGTERM)
+
+    monkeypatch.setattr(vps_autonomous_replenish, "run_autonomous_replenish", sigterm_trigger)
+    rc = vps_autonomous_replenish.main(["--db", str(db_path)])
+    assert rc == 1
+    row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = 'leadgen_stage_errors'"
+    ).fetchone()
+    assert row is not None and "SIGTERM" in row[0]
+
+

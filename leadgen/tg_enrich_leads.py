@@ -506,13 +506,29 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
 
     sonnet_done: set[int] = set()
     if allow_sonnet and need_payloads:
-        for start in range(0, len(need_payloads), 15):
-            chunk_i = need_idx[start : start + 15]
-            chunk_p = need_payloads[start : start + 15]
+        chunks = [
+            (need_idx[start : start + 15], need_payloads[start : start + 15])
+            for start in range(0, len(need_payloads), 15)
+        ]
+        if len(chunks) > 1:
+            with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as pool:
+                futs = [
+                    pool.submit(generate_vlad_sonnet_batch, chunk_p, model="claude-sonnet-5")
+                    for _, chunk_p in chunks
+                ]
+                chunk_results: list[list[dict]] = []
+                for fut in futs:
+                    try:
+                        chunk_results.append(fut.result())
+                    except Exception:
+                        chunk_results.append([])
+        else:
             try:
-                gen_list = generate_vlad_sonnet_batch(chunk_p, model="claude-sonnet-5")
+                chunk_results = [generate_vlad_sonnet_batch(chunks[0][1], model="claude-sonnet-5")]
             except Exception:
-                continue
+                chunk_results = [[]]
+
+        for (chunk_i, chunk_p), gen_list in zip(chunks, chunk_results):
             for row_i, gen_obj, pay in zip(chunk_i, gen_list, chunk_p):
                 if not isinstance(gen_obj, dict):
                     continue

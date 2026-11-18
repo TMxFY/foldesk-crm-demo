@@ -2060,6 +2060,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--groups", default="", help="Comma-separated Telegram group usernames")
     parser.add_argument("--fb-urls", default="", help="Comma-separated Facebook group URLs")
+    parser.add_argument("--max-groups", type=int, default=5, help="Max Facebook groups to scan")
     parser.add_argument("--msg-limit", type=int, default=250)
     parser.add_argument("--limit", type=int, default=40)
     parser.add_argument("--output", default="", help="Output JSONL path for B2B rows only")
@@ -2139,6 +2140,7 @@ def main(argv: list[str] | None = None) -> int:
             group_urls=fb_urls_arg,
             state_dir=state_dir,
             limit=args.limit,
+            max_groups=max(1, int(args.max_groups)),
         )
         fb_b2b = fb_res.get("b2b_rows") or []
         fb_ofm = fb_res.get("ofm_rows") or []
