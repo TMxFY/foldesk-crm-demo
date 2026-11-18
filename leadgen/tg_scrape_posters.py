@@ -390,8 +390,16 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
                 }
                 profile_cache[cache_key] = {"fetched_at": time.time(), "profile": profile}
         except FloodWaitError as fw:
-            failed_message_ids.update(message_ids_by_sender.get(sid, []))
             wait = min(fw.seconds, 120)
+            if max_runtime_deadline is not None and (max_runtime_deadline - time.monotonic()) <= wait:
+                for rem_sid in sender_ids[idx:]:
+                    failed_message_ids.update(message_ids_by_sender.get(rem_sid, []))
+                print(
+                    f"# {group}: FloodWait {fw.seconds}s exceeds runtime budget; stopping early",
+                    file=sys.stderr,
+                )
+                break
+            failed_message_ids.update(message_ids_by_sender.get(sid, []))
             print(f"# {group}: FloodWait {fw.seconds}s -> sleep {wait}s", file=sys.stderr)
             await asyncio.sleep(wait)
             cur_delay = min(cur_delay * 1.5, 6.0)

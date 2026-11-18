@@ -1208,16 +1208,33 @@ def test_atomic_curated_tmp_not_exposed_on_bridge_fail_and_sigterm_records_error
     assert not list(state_dir.glob("*.final.jsonl"))
     assert not list(state_dir.glob("*.curated_tmp.jsonl"))
 
-    # 2) SIGTERM in main() records vps_autonomous_replenish_crash into kv_settings['leadgen_stage_errors']
-    def sigterm_trigger(*args, **kwargs):
-        _signal.raise_signal(_signal.SIGTERM)
+    # 2) SIGTERM arriving INSIDE _exec_stage's runner must escape except-Exception,
+    # stop further stages from running, rollback, and record leadgen_stage_errors.
+    stages_seen: list[str] = []
 
-    monkeypatch.setattr(vps_autonomous_replenish, "run_autonomous_replenish", sigterm_trigger)
+    def sigterm_inside_runner(cmd, **kwargs):
+        cmd_str = " ".join(str(x) for x in cmd)
+        stages_seen.append(cmd_str)
+        if "--output" in cmd:
+            Path(cmd[cmd.index("--output") + 1]).write_text(
+                json.dumps(sample) + "\n", encoding="utf-8"
+            )
+        _signal.raise_signal(_signal.SIGTERM)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    orig_run = vps_autonomous_replenish.run_autonomous_replenish
+
+    def patched_run(conn_in, **kw):
+        kw["runner"] = sigterm_inside_runner
+        return orig_run(conn_in, **kw)
+
+    monkeypatch.setattr(vps_autonomous_replenish, "run_autonomous_replenish", patched_run)
     rc = vps_autonomous_replenish.main(["--db", str(db_path)])
     assert rc == 1
+    assert len(stages_seen) == 1
     row = conn.execute(
         "SELECT value FROM kv_settings WHERE key = 'leadgen_stage_errors'"
     ).fetchone()
-    assert row is not None and "SIGTERM" in row[0]
+    assert row is not None and "SIGTERM" in row[0] and "vps_autonomous_replenish_crash" in row[0]
 
 

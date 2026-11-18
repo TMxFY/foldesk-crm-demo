@@ -20,6 +20,10 @@ import urllib.parse
 
 logger = logging.getLogger(__name__)
 
+
+class _SigtermInterrupt(BaseException):
+    """Raised on SIGTERM so inner except-Exception handlers cannot swallow shutdown."""
+
 WORKTREE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKTREE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKTREE_ROOT))
@@ -1814,7 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     def _handle_sigterm(_signum, _frame):
-        raise RuntimeError("crmtg-leadgen terminated by SIGTERM")
+        raise _SigtermInterrupt("crmtg-leadgen terminated by SIGTERM")
 
     prev_sigterm = None
     try:
@@ -1833,7 +1837,7 @@ def main(argv: list[str] | None = None) -> int:
                 critical_low_mark=args.critical_low_mark,
                 stage_timeout=args.timeout,
             )
-        except Exception as exc:
+        except (Exception, _SigtermInterrupt) as exc:
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -1845,6 +1849,10 @@ def main(argv: list[str] | None = None) -> int:
                     "at": utc_now(),
                 }
             ]
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             try:
                 now_stamp = utc_now()
                 conn.execute(
