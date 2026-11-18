@@ -67,6 +67,81 @@ def _count_jsonl_lines(p: Path) -> int:
         return 0
 
 
+def _read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+    except OSError:
+        return []
+    return out
+
+
+def _lead_retry_keys(row: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    rid = row.get("id")
+    if rid not in (None, "", 0):
+        keys.add(f"id:{rid}")
+    uname = (
+        str(
+            row.get("username")
+            or row.get("telegram_username")
+            or row.get("tg_username")
+            or ""
+        )
+        .strip()
+        .lstrip("@")
+        .lower()
+    )
+    if uname:
+        keys.add(f"u:{uname}")
+    purl = (
+        str(row.get("project_url") or row.get("website") or row.get("site") or "")
+        .strip()
+        .rstrip("/")
+        .lower()
+    )
+    if purl:
+        keys.add(f"p:{purl}")
+    fx = x_profile_url(row)
+    if fx:
+        keys.add(f"x:{fx.lower()}")
+    return keys
+
+
+def _write_pending_qualify_queue(queue_path: Path, rows: list[dict[str, Any]]) -> None:
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rkeys = _lead_retry_keys(row)
+        if rkeys and (rkeys & seen_keys):
+            continue
+        seen_keys.update(rkeys)
+        deduped.append(row)
+    if not deduped:
+        queue_path.unlink(missing_ok=True)
+        return
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = queue_path.with_suffix(".jsonl.tmp")
+    tmp.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in deduped) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(queue_path)
+
+
 def _count_personal_tg_rows(jsonl_path: Path) -> int:
     if not jsonl_path.is_file():
         return 0
@@ -1302,8 +1377,11 @@ def run_autonomous_replenish(
                 ):
                     per_source_counts[src_label] = _count_jsonl_lines(src_path)
 
+                pending_qualify_queue = state_dir / "pending_qualify_queue.jsonl"
+                llm_failed_file = state_dir / "llm_failed_batches.jsonl"
                 _merge_discovered_jsonl_into_raw(
                     [
+                        pending_qualify_queue,
                         buyer_public_out,
                         catalogs_out,
                         high_yield_out,
@@ -1326,6 +1404,7 @@ def run_autonomous_replenish(
                 has_new_rows = new_jsonl.stat().st_size > 0
                 enrich_ok = False
                 qual_ok = False
+                curate_ok = True
                 if has_new_rows or runner is not subprocess.run:
                     enriched_jsonl = state_dir / f"raw_{ts}.enriched.jsonl"
                     enrich_ok = _exec_stage(
@@ -1341,130 +1420,180 @@ def run_autonomous_replenish(
                             "--skip-copy",
                         ],
                     )
-                    enrich_src = (
-                        enriched_jsonl
-                        if enriched_jsonl.is_file() and enriched_jsonl.stat().st_size > 0
-                        else new_jsonl
-                    )
-                    if has_llm_key:
-                        qualified_jsonl = state_dir / f"raw_{ts}.qualified.jsonl"
-                        final_jsonl = state_dir / f"raw_{ts}.final.jsonl"
-                        qual_ok = _exec_stage(
-                            "tg_llm_qualify",
-                            [
-                                py_bin,
-                                str(ROOT / "leadgen" / "tg_llm_qualify.py"),
-                                "--input",
-                                str(enrich_src),
-                                "--output",
-                                str(qualified_jsonl),
-                            ],
+                    if not enrich_ok:
+                        if has_new_rows:
+                            _write_pending_qualify_queue(
+                                pending_qualify_queue,
+                                _read_jsonl_dicts(new_jsonl),
+                            )
+                    else:
+                        enrich_src = (
+                            enriched_jsonl
+                            if enriched_jsonl.is_file() and enriched_jsonl.stat().st_size > 0
+                            else new_jsonl
                         )
-                        # Fail-Closed: if tg_llm_qualify failed or produced 0 qualified leads,
-                        # NEVER fall back to enrich_src — 0 leads advance to tg_curate / CRM!
-                        if (
-                            qual_ok
-                            and qualified_jsonl.is_file()
-                            and qualified_jsonl.stat().st_size > 0
-                        ):
-                            _exec_stage(
-                                "tg_curate",
+                        if has_llm_key:
+                            llm_failed_file.unlink(missing_ok=True)
+                            qualified_jsonl = state_dir / f"raw_{ts}.qualified.jsonl"
+                            final_jsonl = state_dir / f"raw_{ts}.final.jsonl"
+                            qual_ok = _exec_stage(
+                                "tg_llm_qualify",
                                 [
                                     py_bin,
-                                    str(ROOT / "leadgen" / "tg_curate.py"),
+                                    str(ROOT / "leadgen" / "tg_llm_qualify.py"),
                                     "--input",
-                                    str(qualified_jsonl),
+                                    str(enrich_src),
                                     "--output",
-                                    str(final_jsonl),
+                                    str(qualified_jsonl),
                                 ],
                             )
-                            if treg_ready and final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
-                                treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
-                                treg_ok = _exec_stage(
-                                    "treg_enrich",
-                                    [
-                                        py_bin,
-                                        str(ROOT / "leadgen" / "treg_enrich.py"),
-                                        "--input",
-                                        str(final_jsonl),
-                                        "--output",
-                                        str(treg_tmp_jsonl),
-                                        "--cache",
-                                        str(state_dir / "treg_market.json"),
-                                    ],
-                                )
-                                if (
-                                    treg_ok
-                                    and treg_tmp_jsonl.is_file()
-                                    and treg_tmp_jsonl.stat().st_size > 0
-                                ):
-                                    treg_tmp_jsonl.replace(final_jsonl)
-                                elif treg_tmp_jsonl.is_file():
-                                    treg_tmp_jsonl.unlink(missing_ok=True)
-                            if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
-                                wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
-                                wf_ok = _exec_stage(
-                                    "contact_waterfall",
-                                    [
-                                        py_bin,
-                                        str(ROOT / "leadgen" / "contact_waterfall.py"),
-                                        "--input",
-                                        str(final_jsonl),
-                                        "--output",
-                                        str(wf_tmp_jsonl),
-                                        "--max-budget-usd",
-                                        "0.08",
-                                    ],
-                                )
-                                if (
-                                    wf_ok
-                                    and wf_tmp_jsonl.is_file()
-                                    and wf_tmp_jsonl.stat().st_size > 0
-                                ):
-                                    wf_tmp_jsonl.replace(final_jsonl)
-                                elif wf_tmp_jsonl.is_file():
-                                    wf_tmp_jsonl.unlink(missing_ok=True)
+                            # Fail-Closed: if tg_llm_qualify failed or produced 0 qualified leads,
+                            # NEVER fall back to enrich_src — 0 leads advance to tg_curate / CRM!
                             if (
-                                (treg_ready or monid_ready or runner is not subprocess.run)
-                                and sources_cfg.get("tg_identity_bridge", True)
-                                and "tg_identity_bridge" not in quarantined
-                                and final_jsonl.is_file()
-                                and final_jsonl.stat().st_size > 0
+                                qual_ok
+                                and qualified_jsonl.is_file()
+                                and qualified_jsonl.stat().st_size > 0
                             ):
-                                pre_tg_cnt = _count_personal_tg_rows(final_jsonl)
-                                bridge_tmp_jsonl = state_dir / f"raw_{ts}.bridge_tmp.jsonl"
-                                bridge_ok = _exec_stage(
-                                    "tg_identity_bridge",
+                                curate_ok = _exec_stage(
+                                    "tg_curate",
                                     [
                                         py_bin,
-                                        str(ROOT / "leadgen" / "tg_identity_bridge.py"),
+                                        str(ROOT / "leadgen" / "tg_curate.py"),
                                         "--input",
-                                        str(final_jsonl),
+                                        str(qualified_jsonl),
                                         "--output",
-                                        str(bridge_tmp_jsonl),
+                                        str(final_jsonl),
                                     ],
                                 )
-                                if (
-                                    bridge_ok
-                                    and bridge_tmp_jsonl.is_file()
-                                    and bridge_tmp_jsonl.stat().st_size > 0
-                                ):
-                                    bridge_tmp_jsonl.replace(final_jsonl)
-                                    post_tg_cnt = _count_personal_tg_rows(final_jsonl)
-                                    tg_bridged_count = max(0, post_tg_cnt - pre_tg_cnt)
-                                elif bridge_tmp_jsonl.is_file():
-                                    bridge_tmp_jsonl.unlink(missing_ok=True)
-                            if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
-                                split_res = split_tg_and_direct_x_leads(
-                                    final_jsonl, state_dir / "direct_x_leads.jsonl"
-                                )
-                                direct_x_routed += int(split_res.get("direct_x_added") or 0)
+                                if curate_ok:
+                                    if treg_ready and final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                        treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
+                                        treg_ok = _exec_stage(
+                                            "treg_enrich",
+                                            [
+                                                py_bin,
+                                                str(ROOT / "leadgen" / "treg_enrich.py"),
+                                                "--input",
+                                                str(final_jsonl),
+                                                "--output",
+                                                str(treg_tmp_jsonl),
+                                                "--cache",
+                                                str(state_dir / "treg_market.json"),
+                                            ],
+                                        )
+                                        if (
+                                            treg_ok
+                                            and treg_tmp_jsonl.is_file()
+                                            and treg_tmp_jsonl.stat().st_size > 0
+                                        ):
+                                            treg_tmp_jsonl.replace(final_jsonl)
+                                        elif treg_tmp_jsonl.is_file():
+                                            treg_tmp_jsonl.unlink(missing_ok=True)
+                                    if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                        wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
+                                        wf_ok = _exec_stage(
+                                            "contact_waterfall",
+                                            [
+                                                py_bin,
+                                                str(ROOT / "leadgen" / "contact_waterfall.py"),
+                                                "--input",
+                                                str(final_jsonl),
+                                                "--output",
+                                                str(wf_tmp_jsonl),
+                                                "--max-budget-usd",
+                                                "0.08",
+                                            ],
+                                        )
+                                        if (
+                                            wf_ok
+                                            and wf_tmp_jsonl.is_file()
+                                            and wf_tmp_jsonl.stat().st_size > 0
+                                        ):
+                                            wf_tmp_jsonl.replace(final_jsonl)
+                                        elif wf_tmp_jsonl.is_file():
+                                            wf_tmp_jsonl.unlink(missing_ok=True)
+                                    if (
+                                        (treg_ready or monid_ready or runner is not subprocess.run)
+                                        and sources_cfg.get("tg_identity_bridge", True)
+                                        and "tg_identity_bridge" not in quarantined
+                                        and final_jsonl.is_file()
+                                        and final_jsonl.stat().st_size > 0
+                                    ):
+                                        pre_tg_cnt = _count_personal_tg_rows(final_jsonl)
+                                        bridge_tmp_jsonl = state_dir / f"raw_{ts}.bridge_tmp.jsonl"
+                                        bridge_ok = _exec_stage(
+                                            "tg_identity_bridge",
+                                            [
+                                                py_bin,
+                                                str(ROOT / "leadgen" / "tg_identity_bridge.py"),
+                                                "--input",
+                                                str(final_jsonl),
+                                                "--output",
+                                                str(bridge_tmp_jsonl),
+                                            ],
+                                        )
+                                        if (
+                                            bridge_ok
+                                            and bridge_tmp_jsonl.is_file()
+                                            and bridge_tmp_jsonl.stat().st_size > 0
+                                        ):
+                                            bridge_tmp_jsonl.replace(final_jsonl)
+                                            post_tg_cnt = _count_personal_tg_rows(final_jsonl)
+                                            tg_bridged_count = max(0, post_tg_cnt - pre_tg_cnt)
+                                        elif bridge_tmp_jsonl.is_file():
+                                            bridge_tmp_jsonl.unlink(missing_ok=True)
+                                    if final_jsonl.is_file() and final_jsonl.stat().st_size > 0:
+                                        split_res = split_tg_and_direct_x_leads(
+                                            final_jsonl, state_dir / "direct_x_leads.jsonl"
+                                        )
+                                        direct_x_routed += int(split_res.get("direct_x_added") or 0)
+                                    elif final_jsonl.is_file():
+                                        final_jsonl.unlink(missing_ok=True)
+                                elif final_jsonl.is_file():
+                                    final_jsonl.unlink(missing_ok=True)
                             elif final_jsonl.is_file():
                                 final_jsonl.unlink(missing_ok=True)
-                        elif final_jsonl.is_file():
-                            final_jsonl.unlink(missing_ok=True)
-                    if enrich_ok and (not has_llm_key or qual_ok) and raw_jsonl.is_file():
-                        apply_master_merge(str(raw_jsonl), str(master_jsonl), commit_master=True)
+
+                        pipeline_ok = enrich_ok and (not has_llm_key or (qual_ok and curate_ok))
+                        if pipeline_ok:
+                            failed_rows = _read_jsonl_dicts(llm_failed_file) if has_llm_key else []
+                            llm_failed_file.unlink(missing_ok=True)
+                            if failed_rows and raw_jsonl.is_file():
+                                failed_key_set: set[str] = set()
+                                for fr in failed_rows:
+                                    failed_key_set.update(_lead_retry_keys(fr))
+                                raw_commit_tmp = state_dir / f"raw_{ts}.commit_tmp.jsonl"
+                                kept_raw = [
+                                    r
+                                    for r in _read_jsonl_dicts(raw_jsonl)
+                                    if not (_lead_retry_keys(r) & failed_key_set)
+                                ]
+                                raw_commit_tmp.write_text(
+                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in kept_raw)
+                                    + ("\n" if kept_raw else ""),
+                                    encoding="utf-8",
+                                )
+                                try:
+                                    apply_master_merge(
+                                        str(raw_commit_tmp), str(master_jsonl), commit_master=True
+                                    )
+                                finally:
+                                    raw_commit_tmp.unlink(missing_ok=True)
+                                    Path(f"{raw_commit_tmp}.new").unlink(missing_ok=True)
+                                _write_pending_qualify_queue(pending_qualify_queue, failed_rows)
+                            else:
+                                if raw_jsonl.is_file():
+                                    apply_master_merge(
+                                        str(raw_jsonl), str(master_jsonl), commit_master=True
+                                    )
+                                pending_qualify_queue.unlink(missing_ok=True)
+                        elif has_new_rows:
+                            _write_pending_qualify_queue(
+                                pending_qualify_queue,
+                                _read_jsonl_dicts(new_jsonl),
+                            )
+                else:
+                    pending_qualify_queue.unlink(missing_ok=True)
 
             # Vacancy scraper ONLY if valid isolated SCRAPER_TG_SESSION is available
             if still_needs_vac and isolated_session is not None:

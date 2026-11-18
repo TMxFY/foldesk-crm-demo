@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -694,13 +695,33 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
     x_ok = 0
     x_fail = 0
     errors = 0
+    budget_sec = float(os.getenv("TREG_SOCIAL_BUDGET_SEC", "210"))
+    deadline = time.monotonic() + budget_sec
+
+    def _run_x_queries(queries: list[str] | tuple[str, ...]) -> list[dict | None]:
+        if not queries:
+            return []
+        if search_x_fn is search_x and len(queries) > 1:
+            out_payloads: list[dict | None] = [None] * len(queries)
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futs = [(idx, pool.submit(search_x_fn, q)) for idx, q in enumerate(queries)]
+                for idx, fut in futs:
+                    try:
+                        out_payloads[idx] = fut.result()
+                    except Exception:
+                        out_payloads[idx] = None
+            return out_payloads
+        res_payloads: list[dict | None] = []
+        for q in queries:
+            try:
+                res_payloads.append(search_x_fn(q))
+            except Exception:
+                res_payloads.append(None)
+        return res_payloads
+
     x_cands: list[tuple[str, dict | None]] = []
     b_queries = buyer_queries(day)
-    if search_x_fn is search_x and len(b_queries) > 1:
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            b_payloads = list(pool.map(search_x_fn, b_queries))
-    else:
-        b_payloads = [search_x_fn(q) for q in b_queries]
+    b_payloads = _run_x_queries(b_queries)
     for query, payload in zip(b_queries, b_payloads):
         if payload is None:
             x_fail += 1
@@ -741,25 +762,29 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
 
     comment_cands: list[tuple[str, dict | None]] = []
     c_queries = comment_post_queries(day)
-    if search_x_fn is search_x and len(c_queries) > 1:
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            c_payloads = list(pool.map(search_x_fn, c_queries))
-    else:
-        c_payloads = [search_x_fn(q) for q in c_queries]
-    for query, payload in zip(c_queries, c_payloads):
-        if payload is None:
-            x_fail += 1
-            errors += 1
-            continue
-        x_ok += 1
-        for url in reply_post_urls(payload):
-            thread = search_comments_fn(url)
-            if thread is None:
+    if not (search_x_fn is search_x and time.monotonic() >= deadline):
+        c_payloads = _run_x_queries(c_queries)
+        for query, payload in zip(c_queries, c_payloads):
+            if search_x_fn is search_x and time.monotonic() >= deadline:
+                break
+            if payload is None:
+                x_fail += 1
                 errors += 1
                 continue
-            comments += len(_posts(thread))
-            supply_keys.update(_comment_supply_keys(thread))
-            comment_cands.extend(comment_candidates(thread))
+            x_ok += 1
+            for url in reply_post_urls(payload):
+                if search_x_fn is search_x and time.monotonic() >= deadline:
+                    break
+                try:
+                    thread = search_comments_fn(url)
+                except Exception:
+                    thread = None
+                if thread is None:
+                    errors += 1
+                    continue
+                comments += len(_posts(thread))
+                supply_keys.update(_comment_supply_keys(thread))
+                comment_cands.extend(comment_candidates(thread))
     picked, remember = _take(comment_cands, seen=set(current), cap=comment_cap)
     rows.extend(picked)
     for key in remember:

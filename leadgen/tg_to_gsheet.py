@@ -14,6 +14,14 @@ import re
 import sys
 from urllib.parse import unquote, urlparse
 
+try:
+    from supply_side import is_platform_or_social_url
+except ImportError:
+    try:
+        from leadgen.supply_side import is_platform_or_social_url
+    except ImportError:
+        from scripts.supply_side import is_platform_or_social_url
+
 # category -> sheet "Категория" label
 CAT_LABEL = {
     "CEX / биржа": "CEX",
@@ -1027,12 +1035,14 @@ def merge_master_rows(master_rows, raw_rows, legacy_ids=()):
     for old in master_rows or []:
         if not isinstance(old, dict) or _skips_master(old):
             continue
-        seen.add(old.get("id"))
+        old_id = old.get("id")
+        if old_id not in (None, "", 0):
+            seen.add(old_id)
         username = str(old.get("username") or "").lstrip("@").lower()
         if username:
             seen_usernames.add(username)
         project = str(old.get("project_url") or "").rstrip("/").lower()
-        if project:
+        if project and not is_platform_or_social_url(project):
             seen_projects.add(project)
         seen_contacts.update(_contact_values(old))
     master_new = []
@@ -1045,13 +1055,17 @@ def merge_master_rows(master_rows, raw_rows, legacy_ids=()):
         if _skips_master(row):
             downstream.append(row)
             continue
+        row_id = row.get("id")
+        has_valid_id = row_id not in (None, "", 0)
         username = str(row.get("username") or "").lstrip("@").lower()
-        project = str(row.get("project_url") or "").rstrip("/").lower()
+        raw_project = str(row.get("project_url") or "").rstrip("/").lower()
+        project = "" if (not raw_project or is_platform_or_social_url(raw_project)) else raw_project
         contacts = _contact_values(row)
-        if (row.get("id") in seen or (username and username in seen_usernames)
+        if ((has_valid_id and row_id in seen) or (username and username in seen_usernames)
                 or (project and project in seen_projects) or contacts & seen_contacts):
             continue
-        seen.add(row.get("id"))
+        if has_valid_id:
+            seen.add(row_id)
         master_new.append(row)
         downstream.append(row)
         if username:

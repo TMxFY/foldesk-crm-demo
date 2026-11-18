@@ -102,6 +102,9 @@ PLATFORM_AGGREGATOR_HOSTS = (
     "bento.me",
     "bio.site",
     "campsite.bio",
+    "roblox.com",
+    "apps.shopify.com",
+    "store.steampowered.com",
 )
 
 PLATFORM_GARBAGE_COMPANY_NAMES = frozenset(
@@ -136,6 +139,9 @@ PLATFORM_GARBAGE_COMPANY_NAMES = frozenset(
         "skool",
         "clck",
         "taplink",
+        "roblox",
+        "shopify",
+        "steampowered",
     }
 )
 
@@ -273,17 +279,33 @@ def is_platform_or_social_url(url: str | None) -> bool:
     return any(host == item or host.endswith("." + item) for item in PLATFORM_AGGREGATOR_HOSTS)
 
 
+def _is_valid_http_or_domain_url(raw: str | None) -> bool:
+    s = str(raw or "").strip()
+    if not s or s.startswith("@") or " " in s:
+        return False
+    low = s.lower()
+    if low in {"n/a", "na", "none", "null", "-", "unknown", "tbd"}:
+        return False
+    if re.match(r"^(?:mailto|tel|javascript|data|tg):", low):
+        return False
+    if "://" in s and not re.match(r"^https?://", low):
+        return False
+    parsed = urlparse(s if "://" in s else f"https://{s}")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return bool(host and "." in host and not host.startswith(".") and not host.endswith("."))
+
+
 def pick_best_product_url(record: Mapping[str, Any]) -> str:
     """Choose the first real product URL over aggregator/shortener URLs across project_url/website/site/url."""
     candidates = [
         str(record.get(key) or "").strip()
         for key in ("project_url", "website", "site", "url")
     ]
-    non_empty = [u for u in candidates if u]
-    for candidate in non_empty:
+    valid_urls = [u for u in candidates if _is_valid_http_or_domain_url(u)]
+    for candidate in valid_urls:
         if not is_platform_or_social_url(candidate):
             return candidate
-    return non_empty[0] if non_empty else ""
+    return valid_urls[0] if valid_urls else ""
 
 
 def is_invalid_product_name(name: str | None) -> bool:

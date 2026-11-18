@@ -17,19 +17,34 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
-    from supply_side import sanitize_person_and_company
+    from supply_side import (
+        PLATFORM_AGGREGATOR_HOSTS,
+        PLATFORM_GARBAGE_COMPANY_NAMES,
+        is_platform_or_social_url,
+        sanitize_person_and_company,
+    )
 except ImportError:
     try:
-        from leadgen.supply_side import sanitize_person_and_company
+        from leadgen.supply_side import (
+            PLATFORM_AGGREGATOR_HOSTS,
+            PLATFORM_GARBAGE_COMPANY_NAMES,
+            is_platform_or_social_url,
+            sanitize_person_and_company,
+        )
     except ImportError:
-        from scripts.supply_side import sanitize_person_and_company
+        from scripts.supply_side import (
+            PLATFORM_AGGREGATOR_HOSTS,
+            PLATFORM_GARBAGE_COMPANY_NAMES,
+            is_platform_or_social_url,
+            sanitize_person_and_company,
+        )
 
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 TIMEOUT = 5
 MAX_ENRICH_WORKERS = 12
 
-SOCIAL = (
+SOCIAL = tuple(dict.fromkeys((
     "x.com",
     "twitter.com",
     "mobile.twitter.com",
@@ -79,7 +94,8 @@ SOCIAL = (
     "apps.whop.com",
     "wa.me",
     "whatsapp.com",
-)
+    *PLATFORM_AGGREGATOR_HOSTS,
+)))
 
 _BLOCKED_PROJECT_TOKENS = frozenset(
     {
@@ -108,6 +124,7 @@ _BLOCKED_PROJECT_TOKENS = frozenset(
         "instagram",
         "youtube",
         "discord",
+        *PLATFORM_GARBAGE_COMPANY_NAMES,
     }
 )
 
@@ -161,6 +178,8 @@ def is_social(url):
     raw = (url or "").strip()
     if not raw:
         return False
+    if is_platform_or_social_url(raw):
+        return True
     parsed = urlparse(raw if "://" in raw else "https://" + raw.lstrip("/"))
     host = (parsed.hostname or "").lower().removeprefix("www.").rstrip(".")
     if not host:

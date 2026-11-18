@@ -518,3 +518,304 @@ def test_static_ast_local_use_before_def_detector(tmp_path: Path):
     assert res.returncode == 1
     assert "_helper" in res.stderr
     assert "bad_order.py" in res.stderr
+
+
+def test_apply_master_merge_ignores_none_zero_ids_and_platform_project_urls(tmp_path: Path):
+    from leadgen.tg_to_gsheet import apply_master_merge
+
+    master = tmp_path / "master_ids.jsonl"
+    raw1 = tmp_path / "raw1.jsonl"
+    raw2 = tmp_path / "raw2.jsonl"
+
+    rows1 = [
+        {"id": None, "username": "u_none_1", "project_url": "https://www.producthunt.com/posts/app1"},
+        {"id": None, "username": "u_none_2", "project_url": "https://www.producthunt.com/posts/app2"},
+        {"id": 0, "username": "u_zero_3", "project_url": "https://whop.com/discover/brand1/"},
+    ]
+    raw1.write_text("\n".join(json.dumps(r) for r in rows1) + "\n", encoding="utf-8")
+    cnt1 = apply_master_merge(str(raw1), str(master), commit_master=True)
+    assert cnt1 == 3
+
+    rows2 = [
+        {"id": None, "username": "u_none_4", "project_url": "https://www.producthunt.com/posts/app3"},
+        {"id": 0, "username": "u_none_1", "project_url": "https://www.producthunt.com/posts/app1"},
+    ]
+    raw2.write_text("\n".join(json.dumps(r) for r in rows2) + "\n", encoding="utf-8")
+    cnt2 = apply_master_merge(str(raw2), str(master), commit_master=True)
+    assert cnt2 == 1
+    written_new = [json.loads(ln) for ln in Path(f"{raw2}.new").read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert [r["username"] for r in written_new] == ["u_none_4"]
+
+
+def test_pending_qualify_queue_recovers_on_enrich_fail_curate_fail_and_partial_llm_batch(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+):
+    conn = isolated_env["conn"]
+    state_dir: Path = isolated_env["state_dir"]
+    master_jsonl = state_dir / "master_ids.jsonl"
+    pending_queue = state_dir / "pending_qualify_queue.jsonl"
+    llm_failed_file = state_dir / "llm_failed_batches.jsonl"
+
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    create_campaign(
+        conn,
+        name="SoftUGC — База Все2 (2 045 лидов)",
+        daily_limit=140,
+        status="running",
+        steps=DEFAULT_B2B_STEPS,
+        leadgen_enabled=True,
+    )
+    save_leadgen_config(
+        conn,
+        {
+            "enabled": True,
+            "b2b": {
+                "enabled": True,
+                "target_campaign_tg": "SoftUGC — База Все2 (2 045 лидов)",
+                "sources": {
+                    "buyer_catalogs": True,
+                    "tg_groups": False,
+                    "ofm_groups": False,
+                    "facebook_groups": False,
+                    "meta_ads": False,
+                    "social_x_reddit": False,
+                    "yc_ph": False,
+                    "channel_graph": False,
+                    "tg_ad_spy": False,
+                    "whop_content_rewards": False,
+                    "tiktok_ads": False,
+                    "tiktok_shop": False,
+                    "app_stores": False,
+                    "ats_hiring": False,
+                    "ph_detailed": False,
+                    "d2c_whatsapp": False,
+                    "tg_identity_bridge": False,
+                },
+                "limits": {"external_limit": 0},
+            },
+            "vacancies": {"enabled": False},
+        },
+        sync_cases_file=False,
+    )
+
+    alice = {
+        "username": "alice_queue",
+        "name": "Alice Queue",
+        "project": "AliceApp",
+        "company": "AliceApp",
+        "project_url": "https://aliceapp.io",
+        "bio": "Founder of AliceApp ($19/mo subscription)",
+        "what_they_do": "AI subscription app ($19/mo)",
+        "category": "SaaS / AI app",
+        "role": "Founder",
+        "roles": ["Founder"],
+        "source": "catalog_test",
+    }
+    bob = {
+        "username": "bob_queue",
+        "name": "Bob Queue",
+        "project": "BobStore",
+        "company": "BobStore",
+        "project_url": "https://bobstore.shop",
+        "bio": "Founder of BobStore skincare brand",
+        "what_they_do": "D2C skincare e-commerce store",
+        "category": "E-com / D2C",
+        "role": "Founder",
+        "roles": ["Founder"],
+        "source": "catalog_test",
+    }
+
+    mode = {"phase": "enrich_fail"}
+
+    def runner(cmd, **kwargs):
+        cmd_str = " ".join(str(x) for x in cmd)
+        if "buyer_catalogs.py" in cmd_str:
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            if mode["phase"] == "enrich_fail":
+                out_p.write_text(json.dumps(alice) + "\n" + json.dumps(bob) + "\n", encoding="utf-8")
+            else:
+                out_p.write_text("", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_enrich_leads.py" in cmd_str:
+            if mode["phase"] == "enrich_fail":
+                return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="enrich error")
+            inp_p = Path(cmd[cmd.index("--input") + 1])
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            out_p.write_text(inp_p.read_text(encoding="utf-8"), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_llm_qualify.py" in cmd_str:
+            assert mode["phase"] != "enrich_fail", "Must not run qualify when enrich failed"
+            inp_p = Path(cmd[cmd.index("--input") + 1])
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            in_rows = [json.loads(ln) for ln in inp_p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            kept = []
+            failed = []
+            for r in in_rows:
+                if mode["phase"] == "partial_batch" and r.get("username") == "bob_queue":
+                    failed.append(r)
+                    continue
+                r["is_lead"] = True
+                r["qualified"] = True
+                r["icp_score"] = 90
+                r["monetization"] = "subscription"
+                kept.append(r)
+            out_p.write_text("\n".join(json.dumps(r) for r in kept) + ("\n" if kept else ""), encoding="utf-8")
+            if failed:
+                llm_failed_file.write_text("\n".join(json.dumps(r) for r in failed) + "\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_curate.py" in cmd_str:
+            if mode["phase"] == "curate_fail":
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="curate failed")
+            inp_p = Path(cmd[cmd.index("--input") + 1])
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            rows = [json.loads(ln) for ln in inp_p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for r in rows:
+                r["first_touch"] = (
+                    f"Hey {r.get('name')},\n\nSaw {r.get('project')}. We run SoftUGC, bringing 183.5M views "
+                    "in 90 days via AI short-form video on revshare. Want to see 3 sample reels?"
+                )
+            out_p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    # 1. Enrich fails -> queue saved, master_ids untouched
+    res1 = vps_autonomous_replenish.run_autonomous_replenish(conn, runner=runner)
+    assert res1["ok"] is True
+    assert res1["ingested_total"] == 0
+    assert not master_jsonl.exists()
+    assert pending_queue.is_file() and "alice_queue" in pending_queue.read_text(encoding="utf-8")
+
+    # 2. Curate fails -> queue still preserved, master_ids still untouched
+    mode["phase"] = "curate_fail"
+    res2 = vps_autonomous_replenish.run_autonomous_replenish(conn, runner=runner)
+    assert res2["ingested_total"] == 0
+    assert not master_jsonl.exists()
+    assert pending_queue.is_file() and "bob_queue" in pending_queue.read_text(encoding="utf-8")
+
+    # 3. Partial LLM batch failure -> alice commits & enters CRM; bob stays in queue, NOT in master_ids
+    mode["phase"] = "partial_batch"
+    res3 = vps_autonomous_replenish.run_autonomous_replenish(conn, runner=runner)
+    assert res3["ingested_total"] == 1
+    master_txt_3 = master_jsonl.read_text(encoding="utf-8")
+    assert "alice_queue" in master_txt_3 and "bob_queue" not in master_txt_3
+    assert pending_queue.is_file() and "bob_queue" in pending_queue.read_text(encoding="utf-8")
+
+    # 4. Final recovery -> bob commits, enters CRM, queue is cleaned up
+    mode["phase"] = "all_ok"
+    res4 = vps_autonomous_replenish.run_autonomous_replenish(conn, runner=runner)
+    assert res4["ingested_total"] == 1
+    assert "bob_queue" in master_jsonl.read_text(encoding="utf-8")
+    assert not pending_queue.exists()
+
+
+def test_tg_llm_qualify_null_content_parallel_batches_and_relay_route_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from leadgen import relay_route, tg_llm_qualify
+
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    monkeypatch.setenv("TYPESAFE_ENABLED", "0")
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(tg_llm_qualify, "API_KEY", "test-key")
+    relay_route.reset({"claude-sonnet-5", "claude-haiku-5-5"}, loaded=True)
+
+    calls: list[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=90):
+        model = (json or {}).get("model")
+        calls.append(model)
+        if model == "claude-sonnet-5":
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"choices": [{"message": {"content": None}}]},
+            )
+        rows_in = __import__("json").loads((json or {})["messages"][1]["content"])
+        reply = [
+            {
+                "is_lead": True,
+                "icp_score": 90,
+                "monetization": "subscription",
+                "short_form_fit": True,
+                "category": "SaaS / AI app",
+                "role": "Founder",
+                "project": item["project"],
+                "project_url": item["project_url"],
+                "what_they_do": "Subscription AI app ($19/mo)",
+            }
+            for item in rows_in
+        ]
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": __import__("json").dumps(reply)}}]},
+        )
+
+    monkeypatch.setattr(tg_llm_qualify.requests, "post", fake_post)
+    rows = [
+        {"name": "A", "username": "u_a", "project": "AppOne", "project_url": "https://appone.io", "bio": "Founder AppOne", "has_monetization_signal": True},
+        {"name": "B", "username": "u_b", "project": "AppTwo", "project_url": "https://apptwo.io", "bio": "Founder AppTwo", "has_monetization_signal": True},
+    ]
+    kept, dropped = tg_llm_qualify.qualify_loaded(rows, batch_size=1)
+    assert dropped == 0
+    assert [r["username"] for r in kept] == ["u_a", "u_b"]
+    assert "claude-haiku-5-5" in calls
+
+
+def test_treg_social_leads_parallel_pool_tolerates_single_query_exception(monkeypatch: pytest.MonkeyPatch):
+    from datetime import date
+    from leadgen import treg_social_leads
+
+    call_idx = {"n": 0}
+
+    def fake_search_x(q: str):
+        call_idx["n"] += 1
+        if "looking for clippers" in q:
+            raise RuntimeError("simulated worker crash")
+        if "need AI UGC" in q:
+            return {
+                "posts": [
+                    {
+                        "authorUsername": "cool_founder",
+                        "authorName": "Cool Founder",
+                        "text": "We need AI UGC videos for our SaaS https://coolsaas.io",
+                        "url": "https://x.com/cool_founder/status/123",
+                        "isReply": False,
+                    }
+                ]
+            }
+        return {"posts": []}
+
+    monkeypatch.setattr(treg_social_leads, "search_x", fake_search_x)
+    rows, _, stats = treg_social_leads.discover(
+        day=date(2026, 11, 18),
+        seen={},
+        cap=5,
+        search_x_fn=fake_search_x,
+        search_reddit_fn=lambda s, t: {"posts": []},
+        search_comments_fn=lambda u: {"posts": []},
+    )
+    assert stats["admitted"] >= 1
+    assert any(r.get("founder_x") == "https://x.com/cool_founder" for r in rows)
+
+
+def test_pick_best_product_url_and_tg_enrich_leads_is_social_sync():
+    from leadgen import tg_enrich_leads
+    from leadgen.supply_side import pick_best_product_url
+
+    assert (
+        pick_best_product_url(
+            {
+                "project_url": "N/A",
+                "website": "mailto:founder@realapp.io",
+                "site": "https://clck.ru/3FPm3j",
+                "url": "https://realapp.io",
+            }
+        )
+        == "https://realapp.io"
+    )
+    assert tg_enrich_leads.is_social("https://clck.ru/3FPm3j") is True
+    assert tg_enrich_leads.is_social("https://gumroad.com/l/course") is True
+    assert (
+        tg_enrich_leads.pick_project_url(["https://clck.ru/3FPm3j", "https://momeditation.app"])
+        == "https://momeditation.app"
+    )
+

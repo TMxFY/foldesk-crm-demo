@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import threading
 import urllib.error
 import urllib.request
 
@@ -32,6 +33,7 @@ _down: set[str] = set()
 _strikes: dict[str, int] = {}
 _catalog: set[str] | None = None
 _loaded = False
+_lock = threading.RLock()
 
 
 def preferred() -> str:
@@ -43,10 +45,11 @@ def preferred() -> str:
 def reset(catalog: set[str] | None = None, *, loaded: bool = True) -> None:
     """Test hook. Production loads the live catalog on the first chain()."""
     global _catalog, _loaded
-    _down.clear()
-    _strikes.clear()
-    _catalog = catalog
-    _loaded = loaded
+    with _lock:
+        _down.clear()
+        _strikes.clear()
+        _catalog = catalog
+        _loaded = loaded
 
 
 def _model_missing(body: str) -> bool:
@@ -73,12 +76,13 @@ def note_failure(model: str, status: int, body: str = "") -> bool:
         return False
     if not permanent and not transient:
         return False
-    if permanent:
-        _down.add(model)
-    else:
-        _strikes[model] = _strikes.get(model, 0) + 1
-        if _strikes[model] >= 2:
+    with _lock:
+        if permanent:
             _down.add(model)
+        else:
+            _strikes[model] = _strikes.get(model, 0) + 1
+            if _strikes[model] >= 2:
+                _down.add(model)
     return True
 
 
@@ -145,12 +149,14 @@ def chat(messages: list[dict], *, max_tokens: int = 400, temperature: float = 0.
 
 def _ensure_catalog() -> set[str] | None:
     global _catalog, _loaded
-    if _loaded:
-        return _catalog
-    _loaded = True
+    with _lock:
+        if _loaded:
+            return _catalog
+        _loaded = True
     key, base = endpoint()
     if not key:
-        _catalog = None
+        with _lock:
+            _catalog = None
         return None
     try:
         req = urllib.request.Request(
@@ -164,19 +170,22 @@ def _ensure_catalog() -> set[str] | None:
             for item in (payload.get("data") or [])
             if isinstance(item, dict)
         }
-        _catalog = {item for item in ids if item} or None
+        parsed = {item for item in ids if item} or None
     except (OSError, ValueError, json.JSONDecodeError):
-        _catalog = None
-    return _catalog
+        parsed = None
+    with _lock:
+        _catalog = parsed
+        return _catalog
 
 
 def chain() -> list[str]:
-    names: list[str] = []
-    for name in (preferred(), *FALLBACKS):
-        if name and name not in names and name not in _down:
-            names.append(name)
     live = _ensure_catalog()
-    if not live:
-        return names
-    listed = [name for name in names if name in live]
-    return listed or names
+    with _lock:
+        names: list[str] = []
+        for name in (preferred(), *FALLBACKS):
+            if name and name not in names and name not in _down:
+                names.append(name)
+        if not live:
+            return names
+        listed = [name for name in names if name in live]
+        return listed or names

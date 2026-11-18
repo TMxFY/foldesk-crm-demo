@@ -66,12 +66,15 @@ except ImportError:  # pragma: no cover
         "bento.me",
         "bio.site",
         "campsite.bio",
+        "roblox.com",
+        "apps.shopify.com",
+        "store.steampowered.com",
     )
     _SS_GARBAGE_COMPANIES = frozenset(
         {
             "github", "gitlab", "telegram", "twitter", "linkedin", "instagram", "youtube",
             "notion", "medium", "substack", "producthunt", "whop", "gumroad", "skool",
-            "clck", "taplink",
+            "clck", "taplink", "roblox", "shopify", "steampowered",
         }
     )
 

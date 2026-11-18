@@ -477,6 +477,7 @@ def _check_local_def_use_before_def(py_path: Path) -> list[str]:
         if fn.args.kwarg:
             arg_names.add(fn.args.kwarg.arg)
         local_defs: dict[str, int] = {}
+        local_imports: dict[str, int] = {}
         earliest_assigns: dict[str, int] = {}
         loads: list[tuple[str, int]] = []
         stack = list(fn.body)
@@ -501,6 +502,7 @@ def _check_local_def_use_before_def(py_path: Path) -> list[str]:
                 for alias in node.names:
                     bound = (alias.asname or alias.name.split(".", 1)[0])
                     if bound != "*":
+                        local_imports[bound] = min(local_imports.get(bound, 10**9), node.lineno)
                         earliest_assigns[bound] = min(earliest_assigns.get(bound, 10**9), node.lineno)
                 continue
             if isinstance(node, ast.ExceptHandler) and node.name:
@@ -515,11 +517,16 @@ def _check_local_def_use_before_def(py_path: Path) -> list[str]:
         for name, uline in loads:
             if name in globals_or_nonlocals or name in arg_names:
                 continue
-            if name in local_defs:
-                ebind = min(local_defs[name], earliest_assigns.get(name, 10**9))
+            if name in local_defs or name in local_imports:
+                ebind = min(
+                    local_defs.get(name, 10**9),
+                    local_imports.get(name, 10**9),
+                    earliest_assigns.get(name, 10**9),
+                )
                 if uline < ebind:
+                    bind_line = local_defs.get(name, local_imports.get(name, ebind))
                     found.append(
-                        f"Gate I violation in {py_path}:{uline} ({fn.name}): local '{name}' used before def at line {local_defs[name]}"
+                        f"Gate I violation in {py_path}:{uline} ({fn.name}): local '{name}' used before def/import at line {bind_line}"
                     )
     return found
 

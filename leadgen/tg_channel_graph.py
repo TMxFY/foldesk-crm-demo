@@ -25,6 +25,14 @@ from telethon.tl.functions.channels import (
 )
 from telethon.tl.functions.users import GetFullUserRequest
 
+try:
+    from supply_side import PLATFORM_AGGREGATOR_HOSTS as _SS_PLATFORM_HOSTS
+except ImportError:
+    try:
+        from leadgen.supply_side import PLATFORM_AGGREGATOR_HOSTS as _SS_PLATFORM_HOSTS
+    except ImportError:
+        _SS_PLATFORM_HOSTS = ()
+
 DEFAULT_SESSION = (
     os.environ.get("TG_SESSION")
     or os.environ.get("SCRAPER_TG_SESSION")
@@ -103,6 +111,7 @@ SKIP_SITE_HOSTS = {
     "calendly.com",
     "docs.google.com",
     "drive.google.com",
+    *_SS_PLATFORM_HOSTS,
 }
 
 NOISE_HANDLES = {
@@ -201,45 +210,55 @@ def parse_channel_founder_info(
     }
 
 
-def _load_graph_state(path: str) -> tuple[set[str], list[tuple[str, int]]]:
+def _load_graph_state(path: str) -> tuple[set[str], set[str], list[tuple[object, int]]]:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return {str(x).lower() for x in data if str(x or "").strip()}, []
+            return {str(x).lower() for x in data if str(x or "").strip()}, set(), []
         if isinstance(data, dict):
             raw_seen = data.get("seen") if "seen" in data else data.get("seen_channels", [])
             seen = {str(x).lower() for x in (raw_seen or []) if str(x or "").strip()}
-            frontier: list[tuple[str, int]] = []
+            expanded = {str(x).lower() for x in (data.get("expanded") or []) if str(x or "").strip()}
+            frontier: list[tuple[object, int]] = []
             for item in data.get("frontier") or []:
                 if isinstance(item, (list, tuple)) and len(item) == 2:
-                    ch = str(item[0] or "").strip().lstrip("@").lower()
-                    if not ch:
-                        continue
+                    raw_target = item[0]
+                    if isinstance(raw_target, int):
+                        ch_ref: object = raw_target
+                    else:
+                        ch_str = str(raw_target or "").strip().lstrip("@").lower()
+                        if not ch_str:
+                            continue
+                        ch_ref = int(ch_str[2:]) if (ch_str.startswith("id") and ch_str[2:].isdigit()) else ch_str
                     try:
                         d = int(item[1])
                     except (TypeError, ValueError):
                         continue
-                    frontier.append((ch, d))
-            return seen, frontier
+                    frontier.append((ch_ref, d))
+            return seen, expanded, frontier
     except (OSError, ValueError):
         pass
-    return set(), []
+    return set(), set(), []
 
 
 def _load_seen(path: str) -> set[str]:
-    seen, _ = _load_graph_state(path)
+    seen, _, _ = _load_graph_state(path)
     return seen
 
 
 def _save_seen(
     path: str,
     seen: set[str],
-    frontier: list[tuple[str, int]] | None = None,
+    frontier: list[tuple[object, int]] | None = None,
+    expanded: set[str] | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
-    payload: dict[str, object] = {"seen": sorted(seen)}
+    payload: dict[str, object] = {
+        "seen": sorted(seen),
+        "expanded": sorted(expanded or ()),
+    }
     if frontier:
         payload["frontier"] = [[ch, int(d)] for ch, d in frontier]
     with open(tmp, "w", encoding="utf-8") as f:
@@ -298,21 +317,42 @@ async def crawl_channel_graph(
         state_dir = os.path.dirname(os.path.abspath(state_path))
         linked_chats_path = os.path.join(state_dir, "discovered_comment_channels.txt")
 
-    seen_channels, saved_frontier = _load_graph_state(state_path)
+    seen_channels, expanded_channels, saved_frontier = _load_graph_state(state_path)
     seen_founders: set[str] = set()
     queue: deque[tuple[object, int]] = deque()
     queued_keys: set[str] = set()
+    deferred_frontier: list[tuple[object, int]] = []
 
-    for ch_name, ch_depth in saved_frontier:
-        if ch_name and ch_name not in queued_keys and (ch_name not in seen_channels or ch_depth < depth):
-            queue.append((ch_name, ch_depth))
-            queued_keys.add(ch_name)
+    def _target_key(obj: object) -> str:
+        if isinstance(obj, int):
+            return f"id{obj}"
+        if isinstance(obj, str):
+            return obj.strip().lstrip("@").lower()
+        uname = getattr(obj, "username", None)
+        if uname:
+            return str(uname).strip().lstrip("@").lower()
+        oid = getattr(obj, "id", None)
+        return f"id{oid}" if oid is not None else str(obj).strip().lstrip("@").lower()
+
+    for ch_ref, ch_depth in saved_frontier:
+        ch_key = _target_key(ch_ref)
+        if ch_key and ch_key not in queued_keys and (
+            ch_key not in seen_channels or (ch_depth < depth and ch_key not in expanded_channels)
+        ):
+            queue.append((ch_ref, ch_depth))
+            queued_keys.add(ch_key)
 
     for s in seeds:
         clean = s.strip().lstrip("@")
-        if clean and clean.lower() not in queued_keys:
-            queue.append((clean, 0))
-            queued_keys.add(clean.lower())
+        s_key = clean.lower()
+        if not clean or s_key in queued_keys:
+            continue
+        if saved_frontier and s_key in expanded_channels:
+            continue
+        if not saved_frontier and s_key in seen_channels and s_key in expanded_channels:
+            continue
+        queue.append((clean, 0))
+        queued_keys.add(s_key)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered_rows: list[dict] = []
@@ -322,15 +362,12 @@ async def crawl_channel_graph(
     with open(output_path, "w", encoding="utf-8") as out_fh:
         while queue and len(discovered_rows) < limit:
             target, cur_depth = queue.popleft()
-            target_key = (
-                getattr(target, "username", None)
-                or (f"id{target.id}" if hasattr(target, "id") else str(target))
-            )
-            target_key = str(target_key).lstrip("@").lower()
+            target_key = _target_key(target)
 
             try:
                 entity = target if hasattr(target, "id") else await client.get_entity(target)
             except FloodWaitError as fw:
+                deferred_frontier.append((target, cur_depth))
                 await asyncio.sleep(min(fw.seconds, 60))
                 continue
             except Exception:
@@ -339,18 +376,17 @@ async def crawl_channel_graph(
             ch_username = (getattr(entity, "username", None) or target_key).lstrip("@")
             ch_key = ch_username.lower()
             already_seen = ch_key in seen_channels
-            should_expand = (cur_depth < depth) and (
-                not already_seen or seen_expansions < max_seen_expansions
-            )
+            already_expanded = ch_key in expanded_channels
+            fetch_ok = already_seen
 
             if not already_seen:
-                seen_channels.add(ch_key)
                 try:
                     full = await client(GetFullChannelRequest(channel=entity))
                     about = getattr(full.full_chat, "about", "") or ""
                     chat_obj = full.chats[0] if getattr(full, "chats", None) else entity
                     ch_title = getattr(chat_obj, "title", "") or getattr(entity, "title", "") or ch_username
                     ch_username = getattr(chat_obj, "username", None) or ch_username
+                    ch_key = ch_username.lower()
                     subscribers = (
                         getattr(full.full_chat, "participants_count", None)
                         or getattr(chat_obj, "participants_count", None)
@@ -364,6 +400,8 @@ async def crawl_channel_graph(
                         for m in (msgs or [])
                         if (getattr(m, "message", None) or "").strip()
                     ]
+                    seen_channels.add(ch_key)
+                    fetch_ok = True
 
                     parsed = parse_channel_founder_info(
                         about=about,
@@ -405,43 +443,81 @@ async def crawl_channel_graph(
                                 out_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                                 out_fh.flush()
                 except FloodWaitError as fw:
+                    deferred_frontier.append((getattr(entity, "username", None) or target, cur_depth))
                     await asyncio.sleep(min(fw.seconds, 60))
+                    continue
                 except Exception as exc:
                     print(f"# channel_graph error on {ch_username}: {exc}", file=sys.stderr)
 
-            if should_expand and len(discovered_rows) < limit:
-                if already_seen:
-                    seen_expansions += 1
-                try:
-                    recs = await client(GetChannelRecommendationsRequest(channel=entity))
-                    for rec_chat in getattr(recs, "chats", []) or []:
-                        rec_uname = (
-                            getattr(rec_chat, "username", None)
-                            or f"id{getattr(rec_chat, 'id', '')}"
-                        ).lower()
-                        if (
-                            rec_uname
-                            and rec_uname not in queued_keys
-                            and (rec_uname not in seen_channels or (cur_depth + 1) < depth)
-                        ):
-                            queued_keys.add(rec_uname)
-                            queue.append((rec_chat, cur_depth + 1))
-                except Exception as exc:
-                    print(f"# recommendations error on {ch_username}: {exc}", file=sys.stderr)
+            should_expand = (cur_depth < depth) and not already_expanded and (
+                not already_seen or seen_expansions < max_seen_expansions
+            )
+            if should_expand:
+                if len(discovered_rows) >= limit:
+                    deferred_frontier.append((getattr(entity, "username", None) or target, cur_depth))
+                else:
+                    if already_seen:
+                        seen_expansions += 1
+                    try:
+                        recs = await client(GetChannelRecommendationsRequest(channel=entity))
+                        expanded_channels.add(ch_key)
+                        for rec_chat in getattr(recs, "chats", []) or []:
+                            rec_uname = (
+                                getattr(rec_chat, "username", None)
+                                or f"id{getattr(rec_chat, 'id', '')}"
+                            ).lower()
+                            if (
+                                rec_uname
+                                and rec_uname not in queued_keys
+                                and (
+                                    rec_uname not in seen_channels
+                                    or ((cur_depth + 1) < depth and rec_uname not in expanded_channels)
+                                )
+                            ):
+                                queued_keys.add(rec_uname)
+                                queue.append((rec_chat, cur_depth + 1))
+                    except FloodWaitError as fw:
+                        deferred_frontier.append((getattr(entity, "username", None) or target, cur_depth))
+                        await asyncio.sleep(min(fw.seconds, 60))
+                    except Exception as exc:
+                        print(f"# recommendations error on {ch_username}: {exc}", file=sys.stderr)
+            elif fetch_ok and cur_depth < depth and not already_expanded and len(discovered_rows) >= limit:
+                deferred_frontier.append((getattr(entity, "username", None) or target, cur_depth))
 
             if delay > 0:
                 await asyncio.sleep(delay)
 
-    remaining_frontier: list[tuple[str, int]] = []
-    for q_target, q_depth in queue:
-        if isinstance(q_target, str):
-            q_clean = q_target.strip().lstrip("@").lower()
+    remaining_frontier: list[tuple[object, int]] = []
+    seen_frontier_keys: set[str] = set()
+    for q_target, q_depth in [*deferred_frontier, *list(queue)]:
+        if isinstance(q_target, int):
+            q_ref: object = q_target
+        elif isinstance(q_target, str):
+            q_ref = q_target.strip().lstrip("@").lower()
         else:
-            q_clean = str(getattr(q_target, "username", "") or "").strip().lstrip("@").lower()
-        if q_clean and (q_clean not in seen_channels or q_depth < depth):
-            remaining_frontier.append((q_clean, int(q_depth)))
+            uname = getattr(q_target, "username", None)
+            oid = getattr(q_target, "id", None)
+            if uname:
+                q_ref = str(uname).strip().lstrip("@").lower()
+            elif oid is not None:
+                q_ref = int(oid)
+            else:
+                q_ref = ""
+        q_key = _target_key(q_ref) if q_ref != "" else ""
+        if (
+            q_key
+            and q_key not in seen_frontier_keys
+            and (q_key not in seen_channels or (q_depth < depth and q_key not in expanded_channels))
+        ):
+            seen_frontier_keys.add(q_key)
+            remaining_frontier.append((q_ref, int(q_depth)))
 
-    _save_seen(state_path, seen_channels, frontier=remaining_frontier[:500])
+    _save_seen(
+        state_path,
+        seen_channels,
+        frontier=remaining_frontier[:500],
+        expanded=expanded_channels,
+    )
     return discovered_rows
 
 

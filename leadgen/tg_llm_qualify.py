@@ -173,7 +173,14 @@ def call_llm(batch, model):
         timeout=TIMEOUT,
     )
     resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"].strip()
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        raise ValueError(f"missing choices in response: {str(data)[:200]}")
+    raw_content = (choices[0].get("message") or {}).get("content")
+    if not isinstance(raw_content, str) or not raw_content.strip():
+        raise ValueError(f"empty LLM content: {raw_content!r}")
+    content = raw_content.strip()
     # strip markdown fences if the model wraps anyway
     content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.MULTILINE).strip()
     # find the JSON array even if there's stray text
@@ -200,7 +207,7 @@ def call_llm_retry(batch):
                 print(f"    {model} unavailable ({status}), next model", file=sys.stderr)
                 continue
             raise
-        except (requests.Timeout, requests.ConnectionError, ValueError) as exc:
+        except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
             last = exc
             if note_failure(model, 0, ""):
                 print(f"    {model} failed ({exc.__class__.__name__}), next model", file=sys.stderr)
@@ -452,6 +459,7 @@ def qualify_loaded(
         except Exception as exc:
             batch_outcomes.append(("err", exc))
 
+    failed_batches_rows: list[dict] = []
     for bno, (batch, (status_tag, outcome)) in enumerate(zip(batch_slices, batch_outcomes), start=1):
         if status_tag == "err":
             e = outcome
@@ -459,6 +467,7 @@ def qualify_loaded(
                   file=sys.stderr)
             for r in batch:
                 dropped += 1
+                failed_batches_rows.append(dict(r))
                 _quarantine_row(r, f"llm_batch_error:{e.__class__.__name__}", quarantine)
             continue
         results = outcome
@@ -469,6 +478,7 @@ def qualify_loaded(
                   file=sys.stderr)
             for r in batch:
                 dropped += 1
+                failed_batches_rows.append(dict(r))
                 _quarantine_row(r, "llm_length_mismatch", quarantine)
             continue
 
@@ -549,6 +559,18 @@ def qualify_loaded(
               file=sys.stderr)
 
     target_q_dir = (os.getenv("LEADGEN_STATE_DIR", "").strip() or (quarantine_dir or "").strip())
+    if target_q_dir:
+        failed_path = os.path.join(target_q_dir, "llm_failed_batches.jsonl")
+        try:
+            if failed_batches_rows and api_key:
+                os.makedirs(target_q_dir, exist_ok=True)
+                with open(failed_path, "w", encoding="utf-8") as fbh:
+                    for frow in failed_batches_rows:
+                        fbh.write(json.dumps(frow, ensure_ascii=False) + "\n")
+            elif os.path.exists(failed_path):
+                os.unlink(failed_path)
+        except OSError as exc:
+            print(f"# warning: could not update llm_failed_batches file: {exc}", file=sys.stderr)
     if quarantine and target_q_dir:
         try:
             os.makedirs(target_q_dir, exist_ok=True)
