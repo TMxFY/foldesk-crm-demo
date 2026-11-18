@@ -865,17 +865,23 @@ def build_ofm_vlad_copy_batch(rows: list[dict]) -> list[dict]:
         sig = str(r.get("signal_summary") or "").strip()
         sample = str(r.get("sample_message") or r.get("their_angle") or "").strip()
         raw_comp = str(r.get("company") or r.get("project") or "").strip()
-        if raw_comp.lower() in {
-            "ofm",
-            "ofm agency",
-            "franceofm",
-            "ofmfrancenetwork",
-            "networkofm",
-            "mofmnetwork",
-            "redditworldofm",
-            "aimodelnetwork",
-            "adultdeskai",
-        }:
+        person_name = str(r.get("name") or "").strip()
+        if (
+            raw_comp.lower()
+            in {
+                "ofm",
+                "ofm agency",
+                "franceofm",
+                "ofmfrancenetwork",
+                "networkofm",
+                "mofmnetwork",
+                "redditworldofm",
+                "aimodelnetwork",
+                "adultdeskai",
+            }
+            or (person_name and raw_comp.casefold() == person_name.casefold())
+            or any(ord(ch) >= 0x2600 for ch in raw_comp)
+        ):
             raw_comp = ""
         angle_parts = [p for p in (sig, channels_txt and f"Channels: {channels_txt}", sample[:420]) if p]
         sonnet_payloads.append(
@@ -934,7 +940,7 @@ def build_ofm_vlad_copy_batch(rows: list[dict]) -> list[dict]:
             s1 = ofm_fallback_step1
         s1 = re.sub(r"\bCreatorOS\b", "SoftUGC", s1, flags=re.I)
         f1 = followup_one(
-            str(pay.get("company") or r.get("name") or "your agency"),
+            str(pay.get("company") or "").strip() or "your agency",
             str(pay.get("their_angle") or ""),
             audience=aud,
             category="OFM",

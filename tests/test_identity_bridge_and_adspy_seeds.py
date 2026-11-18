@@ -797,6 +797,7 @@ def test_tg_identity_bridge_batch_and_cli_respects_max_rows(monkeypatch, tmp_pat
     monkeypatch.setattr(tg_identity_bridge, "_default_x_profile", lambda h: {})
     monkeypatch.setattr(tg_identity_bridge, "_default_search", lambda q: {})
     monkeypatch.setattr(tg_identity_bridge, "_default_tme_fetch", lambda nick: pages.get(nick, ""))
+    monkeypatch.setattr(tg_identity_bridge, "_default_site_fetch", lambda _dom: "")
     monkeypatch.setattr(
         sys,
         "argv",

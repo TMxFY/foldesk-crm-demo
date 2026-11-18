@@ -80,7 +80,40 @@ _GENERIC_BRAND_WORDS = frozenset(
         "software",
         "tech",
         "stealthco",
+        "tools",
+        "tool",
+        "mobile",
+        "game",
+        "games",
+        "finance",
+        "platform",
+        "smart",
+        "cloud",
+        "data",
+        "flow",
+        "note",
+        "notes",
+        "work",
+        "works",
+        "chat",
+        "chats",
+        "play",
+        "link",
+        "links",
+        "next",
+        "open",
+        "fast",
+        "auto",
+        "core",
+        "base",
+        "sync",
+        "plus",
+        "pro",
     }
+)
+_SUPPORT_TG_HANDLE_RE = re.compile(
+    r"(?:^|_)(?:support|help|admin|manager|sales|care|news|channel|chat|community|group)(?:$|_)",
+    re.I,
 )
 _ROLE_EMAIL_PREFIXES = frozenset(
     {
@@ -372,9 +405,12 @@ def _distinctive_tokens(row: dict[str, Any], domain: str) -> list[str]:
 
 def _identity_confirmed_on_tme(title: str, bio: str, row: dict[str, Any], domain: str) -> bool:
     tme_blob = f"{title} {bio}".casefold()
-    # 1) Distinctive brand or domain token (>= 4 chars)
+    # 1) Distinctive brand or domain token (>= 4 chars, whole-word match for word tokens)
     for tok in _distinctive_tokens(row, domain):
-        if tok in tme_blob:
+        if "." in tok:
+            if tok in tme_blob:
+                return True
+        elif re.search(rf"\b{re.escape(tok)}\b", tme_blob):
             return True
     # 2) Full founder name (2+ alphabetic words, each >= 2 chars)
     raw_name = " ".join(str(row.get("founder_name") or row.get("name") or "").split()).strip()
@@ -441,23 +477,52 @@ def bridge_lead_to_telegram(
         brand = str(out.get("name") or "").strip()
     x_handle = _extract_x_handle(out)
 
-    # Candidates as (nick, match_kind, requires_identity_confirm)
-    candidates: list[tuple[str, str, bool]] = []
     seen_cands: set[str] = set()
 
-    def _add_cand(nick: str, kind: str, require_confirm: bool) -> None:
-        if not _is_valid_personal_tg_handle(nick):
-            return
-        low = nick.lower()
-        if low in seen_cands:
-            return
-        seen_cands.add(low)
-        candidates.append((nick, kind, require_confirm))
+    def _try_candidates(stage_cands: list[tuple[str, str, bool]]) -> dict[str, Any] | None:
+        for nick, match_kind, require_confirm in stage_cands:
+            if not _is_valid_personal_tg_handle(nick):
+                continue
+            low = nick.lower()
+            if low in seen_cands:
+                continue
+            seen_cands.add(low)
+            try:
+                resp = fetch_tme(nick)
+            except Exception:
+                resp = ""
+            ok, title, bio = _parse_tme_response(resp, nick)
+            if not ok:
+                continue
+            if require_confirm and not _identity_confirmed_on_tme(title, bio, out, domain):
+                continue
 
-    # 0) Explicit t.me handles already present in lead links/bio
+            tg_url = f"https://t.me/{nick}"
+            out["username"] = nick
+            out["telegram_username"] = nick
+            out["tg_username"] = nick
+            out["telegram_url"] = tg_url
+            out["tg_bridge_match"] = match_kind
+            out["provider"] = "telegram"
+            channels = [str(c) for c in (out.get("contact_channels") or []) if str(c).strip()]
+            if "telegram" not in channels:
+                channels.insert(0, "telegram")
+            out["contact_channels"] = channels
+            links = [str(u) for u in (out.get("links") or []) if str(u).strip()]
+            if tg_url not in links:
+                links.append(tg_url)
+            out["links"] = links
+            return out
+        return None
+
+    # 0) Explicit t.me handles already present in lead links/bio (no remote calls if valid personal DM)
     links_blob = " ".join(str(u) for u in (out.get("links") or []) if u)
-    for nick in _extract_tme_handles(f"{links_blob} {out.get('bio') or ''}"):
-        _add_cand(nick, "links_explicit", False)
+    stage0 = [
+        (nick, "links_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)))
+        for nick in _extract_tme_handles(f"{links_blob} {out.get('bio') or ''}")
+    ]
+    if hit := _try_candidates(stage0):
+        return hit
 
     # 1) Founder's own X profile bio
     if x_handle:
@@ -466,8 +531,12 @@ def bridge_lead_to_telegram(
         except Exception:
             x_prof = None
         bio_blob = _extract_x_bio_blob(x_prof)
-        for nick in _extract_tme_handles(bio_blob):
-            _add_cand(nick, "x_bio_explicit", False)
+        stage1 = [
+            (nick, "x_bio_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)))
+            for nick in _extract_tme_handles(bio_blob)
+        ]
+        if hit := _try_candidates(stage1):
+            return hit
 
     # 2) Direct product website HTML scan for explicit t.me handles
     if domain and do_site_fetch is not None:
@@ -475,8 +544,14 @@ def bridge_lead_to_telegram(
             site_html = do_site_fetch(domain)
         except Exception:
             site_html = ""
-        for nick in _extract_tme_handles(site_html):
-            _add_cand(nick, "website_direct", False)
+        site_nicks = _extract_tme_handles(site_html)
+        multi_site = len(site_nicks) > 1
+        stage2 = [
+            (nick, "website_direct", bool(multi_site or _SUPPORT_TG_HANDLE_RE.search(nick)))
+            for nick in site_nicks
+        ]
+        if hit := _try_candidates(stage2):
+            return hit
 
     # 3) Web search `site:t.me "<domain>"` or `"<brand>"`
     search_target = f'"{domain}"' if domain else (f'"{brand}"' if len(brand) >= 4 else "")
@@ -487,20 +562,25 @@ def bridge_lead_to_telegram(
             s_payload = do_search(query)
         except Exception:
             s_payload = None
-        for hit in _unwrap_search_hits(s_payload):
-            hit_url = str(hit.get("url") or "").strip()
-            hit_title = str(hit.get("title") or "").strip()
-            hit_snip = str(hit.get("snippet") or hit.get("description") or "").strip()
+        stage3a: list[tuple[str, str, bool]] = []
+        for search_hit in _unwrap_search_hits(s_payload):
+            hit_url = str(search_hit.get("url") or "").strip()
+            hit_title = str(search_hit.get("title") or "").strip()
+            hit_snip = str(search_hit.get("snippet") or search_hit.get("description") or "").strip()
             hit_blob = f"{hit_url} {hit_title} {hit_snip}"
             has_exact_domain = bool(domain and domain.lower() in hit_blob.lower())
             if has_exact_domain:
                 found_domain_explicit = True
             for nick in _extract_tme_handles(hit_blob):
-                _add_cand(
-                    nick,
-                    "domain_search_explicit" if has_exact_domain else "x_handle_verified",
-                    not has_exact_domain,
+                stage3a.append(
+                    (
+                        nick,
+                        "domain_search_explicit" if has_exact_domain else "x_handle_verified",
+                        bool((not has_exact_domain) or _SUPPORT_TG_HANDLE_RE.search(nick)),
+                    )
                 )
+        if hit := _try_candidates(stage3a):
+            return hit
 
     # 3b) Secondary person-name + brand search when multi-word founder name is known
     founder_raw = " ".join(str(out.get("founder_name") or out.get("name") or "").split()).strip()
@@ -515,46 +595,24 @@ def bridge_lead_to_telegram(
             s_payload_2 = do_search(f'site:t.me "{founder_raw}" "{brand}"')
         except Exception:
             s_payload_2 = None
-        for hit in _unwrap_search_hits(s_payload_2):
+        stage3b: list[tuple[str, str, bool]] = []
+        for search_hit in _unwrap_search_hits(s_payload_2):
             hit_blob = " ".join(
-                str(hit.get(k) or "").strip() for k in ("url", "title", "snippet", "description")
+                str(search_hit.get(k) or "").strip() for k in ("url", "title", "snippet", "description")
             )
             for nick in _extract_tme_handles(hit_blob):
-                _add_cand(nick, "founder_search_verified", True)
+                stage3b.append((nick, "founder_search_verified", True))
+        if hit := _try_candidates(stage3b):
+            return hit
 
     # 4) Same-handle / social / personal email candidates (strict anti-namesake confirmation required)
+    stage4: list[tuple[str, str, bool]] = []
     if x_handle:
-        _add_cand(x_handle, "x_handle_verified", True)
+        stage4.append((x_handle, "x_handle_verified", True))
     for social_nick, social_kind in _extract_social_or_email_candidates(out):
-        _add_cand(social_nick, social_kind, True)
-
-    for nick, match_kind, require_confirm in candidates:
-        try:
-            resp = fetch_tme(nick)
-        except Exception:
-            resp = ""
-        ok, title, bio = _parse_tme_response(resp, nick)
-        if not ok:
-            continue
-        if require_confirm and not _identity_confirmed_on_tme(title, bio, out, domain):
-            continue
-
-        tg_url = f"https://t.me/{nick}"
-        out["username"] = nick
-        out["telegram_username"] = nick
-        out["tg_username"] = nick
-        out["telegram_url"] = tg_url
-        out["tg_bridge_match"] = match_kind
-        out["provider"] = "telegram"
-        channels = [str(c) for c in (out.get("contact_channels") or []) if str(c).strip()]
-        if "telegram" not in channels:
-            channels.insert(0, "telegram")
-        out["contact_channels"] = channels
-        links = [str(u) for u in (out.get("links") or []) if str(u).strip()]
-        if tg_url not in links:
-            links.append(tg_url)
-        out["links"] = links
-        return out
+        stage4.append((social_nick, social_kind, True))
+    if hit := _try_candidates(stage4):
+        return hit
 
     return out
 
@@ -566,6 +624,7 @@ def enrich_rows_with_telegram_bridge(
     x_profile_fn=None,
     search_fn=None,
     tme_fetch_fn=None,
+    fetch_site_fn=None,
 ) -> list[dict[str, Any]]:
     """Run Telegram bridge on up to max_rows non-TG leads in batch."""
     out: list[dict[str, Any]] = []
@@ -587,6 +646,7 @@ def enrich_rows_with_telegram_bridge(
                 x_profile_fn=x_profile_fn,
                 search_fn=search_fn,
                 tme_fetch_fn=tme_fetch_fn,
+                fetch_site_fn=fetch_site_fn,
             )
         )
     return out

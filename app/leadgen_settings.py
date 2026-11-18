@@ -334,13 +334,15 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def find_existing_softugc_tg_campaign(conn: sqlite3.Connection | None) -> dict[str, Any] | None:
-    """Find existing non-vacancy, non-WA SoftUGC TG B2B campaign (preferring 'SoftUGC — База Все2*')."""
+    """Find existing non-vacancy, non-WA, non-OFM SoftUGC TG B2B campaign (preferring 'SoftUGC — База Все2*')."""
     if conn is None:
         return None
     try:
         rows = conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
     except Exception:
         return None
+
+    from app.hygiene import is_ofm_campaign_name
 
     fallback_softugc: dict[str, Any] | None = None
     for row in rows:
@@ -352,6 +354,8 @@ def find_existing_softugc_tg_campaign(conn: sqlite3.Connection | None) -> dict[s
         if any(k in cname_low for k in ("ваканс", "vacanc", "job")):
             continue
         if "(wa)" in cname_low or "whatsapp" in cname_low:
+            continue
+        if is_ofm_campaign_name(cname, cdict.get("leadgen_sources_json")):
             continue
         if cname_low.startswith("softugc — база все2"):
             return cdict
@@ -366,9 +370,14 @@ def resolve_target_b2b_tg_campaign_name(
     *,
     fallback_default: str = "Leadgen Auto (TG)",
 ) -> str:
-    """Resolve TG B2B campaign name: if empty/default, prefer existing 'SoftUGC — База Все2*' / 'SoftUGC*' in DB."""
+    """Resolve TG B2B campaign name: if empty/default, prefer existing 'SoftUGC — База Все2*' / non-OFM 'SoftUGC*' in DB."""
+    from app.hygiene import is_ofm_campaign_name
+
     clean_req = str(requested_name or "").strip()
     req_low = clean_req.lower()
+    if clean_req and is_ofm_campaign_name(clean_req):
+        clean_req = ""
+        req_low = ""
     if clean_req and req_low not in ("leadgen auto (tg)", "leadgen autopilot"):
         return clean_req
     found = find_existing_softugc_tg_campaign(conn)
@@ -708,7 +717,9 @@ def sync_leadgen_campaigns(
     b2b = cfg["b2b"]
     vac = cfg["vacancies"]
 
-    b2b_enabled_sources = [k for k, v in (b2b.get("sources") or {}).items() if v]
+    b2b_enabled_sources = [
+        k for k, v in (b2b.get("sources") or {}).items() if v and k != "ofm_groups"
+    ]
     vac_enabled_layers = [f"vacancies:{k}" for k, v in (vac.get("layers") or {}).items() if v]
     if not vac_enabled_layers:
         vac_enabled_layers = ["vacancies"]
@@ -722,15 +733,15 @@ def sync_leadgen_campaigns(
     }
     wa_ready = _has_whatsapp_readiness(conn)
 
+    tg_name = resolve_target_b2b_tg_campaign_name(
+        conn,
+        b2b.get("target_campaign_tg"),
+        fallback_default="Leadgen Auto (TG)",
+    )
     targets: list[dict[str, Any]] = []
     if b2b.get("enabled", True):
         daily_lim = max(1, min(500, int(b2b.get("campaign_daily_limit") or 30)))
         quota = max(0, min(500, int(b2b.get("campaign_daily_limit") or 30)))
-        tg_name = resolve_target_b2b_tg_campaign_name(
-            conn,
-            b2b.get("target_campaign_tg"),
-            fallback_default="Leadgen Auto (TG)",
-        )
         wa_name = str(b2b.get("target_campaign_wa") or "Leadgen Auto (WA)").strip()
         if tg_name:
             targets.append(
@@ -761,23 +772,24 @@ def sync_leadgen_campaigns(
                     "is_b2b": True,
                 }
             )
-        ofm_name = str(b2b.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip()
-        if (
-            b2b.get("ofm_outreach_enabled", False)
-            and ofm_name
-            and ofm_name.lower() != tg_name.lower()
-        ):
-            ofm_lim = max(1, min(500, int(b2b.get("ofm_daily_limit") or 25)))
-            targets.append(
-                {
-                    "name": ofm_name,
-                    "daily_limit": ofm_lim,
-                    "leadgen_daily_quota": ofm_lim,
-                    "leadgen_sources": ["ofm_groups"],
-                    "default_steps": DEFAULT_B2B_STEPS,
-                    "is_b2b": True,
-                }
-            )
+
+    ofm_name = str(b2b.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip()
+    if (
+        b2b.get("ofm_outreach_enabled", False)
+        and ofm_name
+        and ofm_name.lower() != tg_name.lower()
+    ):
+        ofm_lim = max(1, min(500, int(b2b.get("ofm_daily_limit") or 25)))
+        targets.append(
+            {
+                "name": ofm_name,
+                "daily_limit": ofm_lim,
+                "leadgen_daily_quota": ofm_lim,
+                "leadgen_sources": ["ofm_groups"],
+                "default_steps": DEFAULT_B2B_STEPS,
+                "is_b2b": True,
+            }
+        )
 
     raw_vac_lim = vac.get("daily_limit")
     resolved_vac_lim = 20 if raw_vac_lim is None else int(raw_vac_lim)
@@ -964,18 +976,26 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             "message": "Авто-лидген отключён в настройках",
         }
 
+    from app.hygiene import is_ofm_campaign_name
+
     total_quota = int(cfg.get("total_daily_quota") or 50)
     today = utc_today()
-    already_today = conn.execute(
+    today_rows = conn.execute(
         """
-        SELECT COUNT(*) FROM campaign_recipients cr
+        SELECT c.name, c.leadgen_sources_json, COUNT(*) AS cnt
+        FROM campaign_recipients cr
         JOIN campaigns c ON c.id = cr.campaign_id
         WHERE c.leadgen_enabled = 1
-          AND lower(COALESCE(c.name, '')) NOT LIKE '%ofm%'
           AND cr.created_at LIKE ?
+        GROUP BY c.id
         """,
         (f"{today}%",),
-    ).fetchone()[0]
+    ).fetchall()
+    already_today = sum(
+        int(r["cnt"] or 0)
+        for r in today_rows
+        if not is_ofm_campaign_name(r["name"], r["leadgen_sources_json"])
+    )
     remaining_quota = max(0, total_quota - int(already_today or 0))
     ofm_outreach_active = bool((cfg.get("b2b") or {}).get("ofm_outreach_enabled", False))
     if remaining_quota <= 0 and total_quota > 0 and not ofm_outreach_active:
@@ -1134,7 +1154,9 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
 
     # 2. Local JSONL files in state_dir (*.treg.jsonl / *.final.jsonl / discovered_leads.jsonl) with per-file watermark
     b2b_cfg = cfg["b2b"]
-    b2b_enabled_sources = [k for k, v in (b2b_cfg.get("sources") or {}).items() if v]
+    b2b_enabled_sources = [
+        k for k, v in (b2b_cfg.get("sources") or {}).items() if v and k != "ofm_groups"
+    ]
     if b2b_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
         from app.hygiene import (
             _has_messenger_contact,
@@ -1421,7 +1443,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
 
     # 3. OFM review leads -> separate isolated OFM campaign (only when explicitly enabled)
     ofm_path = state_dir / "ofm_review_leads.jsonl"
-    if ofm_outreach_active and b2b_cfg.get("enabled", True) and state_dir.is_dir() and ofm_path.is_file() and ofm_path.stat().st_size > 0:
+    if ofm_outreach_active and state_dir.is_dir() and ofm_path.is_file() and ofm_path.stat().st_size > 0:
         from app.hygiene import _normalize_ofm_review_record, _ofm_review_canonical_keys
         from leadgen.outreach_copy import build_ofm_vlad_copy_batch
 

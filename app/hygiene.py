@@ -705,11 +705,23 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
 
         status_low = str(ld.get("status") or "").strip().lower()
         lead_source = str(ld.get("lead_source") or "").strip()
+        niche_low = str(ld.get("niche") or "").strip().lower()
         uname_ld = _clean_username_token(ld.get("username")).lower()
+        is_fb_ofm_lead = (
+            lead_source.lower() == "fb_groups"
+            and (
+                niche_low.startswith("ofm")
+                or is_ofm_campaign_name(ld.get("niche"))
+            )
+        )
         is_ofm_lead = (
             (lid in ofm_lead_ids)
             or (bool(uname_ld) and uname_ld in ofm_usernames)
-            or (has_ofm_camp and lead_source.lower().startswith("ofm"))
+            or (
+                has_ofm_camp
+                and (lead_source.lower().startswith("ofm") or is_fb_ofm_lead)
+            )
+            or is_fb_ofm_lead
         )
         is_cold_src = _is_cold_outreach_eligible_lead(
             ld,

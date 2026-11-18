@@ -303,3 +303,278 @@ def test_default_tg_groups_and_graph_seeds_expanded() -> None:
         assert grp in DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]
     for seed in ("ai_founders", "microconf", "startups"):
         assert seed in tg_channel_graph.DEFAULT_GRAPH_SEED_CHANNELS
+
+
+def test_b2b_never_collides_with_ofm_on_default_target_and_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, state_dir = _setup_test_env(tmp_path, monkeypatch)
+
+    assert append_ofm_review_lead(
+        state_dir,
+        {
+            "username": "ofm_only_buyer",
+            "name": "Paul",
+            "source": "ofm_tg",
+            "source_group": "FranceOFM",
+            "ofm_tier": "traffic_buyer",
+            "market": "FR",
+            "signal_summary": "Hiring IG VA",
+        },
+    ) is True
+
+    # First create "SoftUGC — OFM (TG)" with b2b.enabled=False -> still syncs & ingests OFM
+    save_leadgen_config(
+        conn,
+        {
+            "enabled": True,
+            "total_daily_quota": 1,
+            "b2b": {
+                "enabled": False,
+                "ofm_outreach_enabled": True,
+                "target_campaign_ofm": "SoftUGC — OFM (TG)",
+                "ofm_daily_limit": 25,
+                "target_campaign_tg": "Leadgen Auto (TG)",
+                "campaign_daily_limit": 20,
+            },
+            "vacancies": {"enabled": False},
+        },
+        sync_cases_file=False,
+    )
+    sync_leadgen_campaigns(conn, sync_campaign_limits=True)
+    assert push_discovered_now(conn)["ingested"] == 1
+
+    # Enable B2B with default target_campaign_tg ("Leadgen Auto (TG)"), NO "База Все2" in DB,
+    # and ALL sources enabled including ofm_groups -> B2B MUST create/use "Leadgen Auto (TG)",
+    # MUST exclude "ofm_groups" from its leadgen_sources, and NEVER dump B2B leads into SoftUGC — OFM (TG).
+    save_leadgen_config(
+        conn,
+        {
+            "enabled": True,
+            "total_daily_quota": 1,
+            "b2b": {
+                "enabled": True,
+                "ofm_outreach_enabled": True,
+                "target_campaign_ofm": "SoftUGC — OFM (TG)",
+                "ofm_daily_limit": 25,
+                "target_campaign_tg": "Leadgen Auto (TG)",
+                "campaign_daily_limit": 20,
+            },
+            "vacancies": {"enabled": False},
+        },
+        sync_cases_file=False,
+    )
+    sync_leadgen_campaigns(conn, sync_campaign_limits=True)
+
+    b2b_final = state_dir / "raw_20261118_777777.final.jsonl"
+    b2b_final.write_text(
+        json.dumps(
+            {
+                "username": "saas_founder_clean",
+                "name": "MarkFounder",
+                "project": "MetricPulse",
+                "company": "MetricPulse",
+                "project_url": "https://metricpulse.io",
+                "category": "SaaS analytics",
+                "what_they_do": "B2B product analytics SaaS",
+                "icp_score": 91,
+                "first_touch": (
+                    "Hey,\n\nSaw MetricPulse. Paid ads cost too much early.\n\n"
+                    "We run SoftUGC. 183.5M views in 90 days, no shoots, 13 to 40x less than standard clippers.\n\n"
+                    f"{REVSHARE_OFFER_TEXT}"
+                ),
+                "source": "tg_groups",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    res_b2b = push_discovered_now(conn)
+    assert res_b2b["ingested"] == 1
+
+    b2b_camp = conn.execute("SELECT * FROM campaigns WHERE name = 'Leadgen Auto (TG)'").fetchone()
+    assert b2b_camp is not None
+    assert "ofm_groups" not in json.loads(b2b_camp["leadgen_sources_json"] or "[]")
+    b2b_recs = [
+        r["username"]
+        for r in conn.execute("SELECT username FROM campaign_recipients WHERE campaign_id = ?", (b2b_camp["id"],)).fetchall()
+    ]
+    assert b2b_recs == ["saas_founder_clean"]
+
+    ofm_camp = conn.execute("SELECT * FROM campaigns WHERE name = 'SoftUGC — OFM (TG)'").fetchone()
+    ofm_recs = [
+        r["username"]
+        for r in conn.execute("SELECT username FROM campaign_recipients WHERE campaign_id = ?", (ofm_camp["id"],)).fetchall()
+    ]
+    assert ofm_recs == ["ofm_only_buyer"]
+
+    # Custom OFM campaign name without 'ofm' substring still excluded from B2B daily quota via leadgen_sources
+    conn.execute(
+        "UPDATE campaigns SET name = 'Creator Agencies', leadgen_sources_json = '[\"ofm_groups\"]' WHERE id = ?",
+        (ofm_camp["id"],),
+    )
+    conn.execute(
+        "DELETE FROM campaign_recipients WHERE campaign_id = ? AND username = 'saas_founder_clean'",
+        (b2b_camp["id"],),
+    )
+    conn.commit()
+    b2b_final_2 = state_dir / "raw_20261118_777778.final.jsonl"
+    b2b_final_2.write_text(
+        json.dumps(
+            {
+                "username": "saas_founder_clean_2",
+                "name": "LenaFounder",
+                "project": "TrackFlow",
+                "company": "TrackFlow",
+                "project_url": "https://trackflow.dev",
+                "category": "SaaS",
+                "what_they_do": "Developer telemetry SaaS",
+                "icp_score": 90,
+                "first_touch": (
+                    "Hey,\n\nSaw TrackFlow.\n\n"
+                    "We run SoftUGC. 183.5M views in 90 days, no shoots, 13 to 40x less than standard clippers.\n\n"
+                    f"{REVSHARE_OFFER_TEXT}"
+                ),
+                "source": "tg_groups",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    save_leadgen_config(
+        conn,
+        {
+            "enabled": True,
+            "total_daily_quota": 1,
+            "b2b": {
+                "enabled": True,
+                "ofm_outreach_enabled": True,
+                "target_campaign_ofm": "Creator Agencies",
+                "target_campaign_tg": "Leadgen Auto (TG)",
+                "campaign_daily_limit": 20,
+            },
+            "vacancies": {"enabled": False},
+        },
+        sync_cases_file=False,
+    )
+    assert push_discovered_now(conn)["ingested"] == 1
+    conn.close()
+
+
+def test_ofm_last_mile_preview_send_parity_fb_hygiene_and_copy_emoji_strip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.outreach import has_last_mile_icp_defect
+    from leadgen import outreach_copy
+
+    ofm_camp = {"name": "SoftUGC — OFM (TG)", "leadgen_sources_json": '["ofm_groups"]'}
+    b2b_camp = {"name": "SoftUGC — База Все2 (2 045 лидов)", "leadgen_sources_json": '["tg_groups"]'}
+    valid_s1 = (
+        "Hey,\n\nSaw you're hiring IG VAs for creator scale.\n\n"
+        f"We run SoftUGC. 183.5M views in 90 days.\n\n{REVSHARE_OFFER_TEXT}"
+    )
+    rec = {
+        "username": "ofmninja",
+        "name": "OFM Ninja",
+        "company": "FranceOFM",
+        "category": "OFM / AI UGC",
+        "note": "Recruiting VAs — i can't write this one raw quote",
+        "step1_text": valid_s1,
+        "lead_source": "ofm_tg",
+    }
+    assert has_last_mile_icp_defect(rec, step_idx=0, rendered_text=valid_s1, step={}, steps=[{"template_text": "{step1_text}"}], camp=ofm_camp) is False
+    assert has_last_mile_icp_defect(rec, step_idx=0, rendered_text=valid_s1, step={}, steps=[{"template_text": "{step1_text}"}], camp=b2b_camp) is True
+    assert has_last_mile_icp_defect({**rec, "username": "spam_bot"}, step_idx=0, rendered_text=valid_s1, step={}, steps=[{"template_text": "{step1_text}"}], camp=ofm_camp) is True
+    assert has_last_mile_icp_defect({**rec, "note": "1win partners casino"}, step_idx=0, rendered_text=valid_s1, step={}, steps=[{"template_text": "{step1_text}"}], camp=ofm_camp) is True
+
+    # FB OFM lead saved before any OFM campaign exists -> passes hygiene
+    conn, _state = _setup_test_env(tmp_path, monkeypatch)
+    conn.execute(
+        """
+        INSERT INTO leads (name, username, company, niche, lead_source, note, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'new', '2026-11-18T10:00:00', '2026-11-18T10:00:00')
+        """,
+        ("Noa 🌸", "noa_vbe", "Noa 🌸", "OFM (FR)", "fb_groups", "Recruiting VA for OnlyFans model"),
+    )
+    conn.commit()
+    hyg = audit_crm_hygiene(conn)
+    assert hyg["active_junk_lead_count"] == 0, hyg
+    assert hyg["dirty_title_lead_count"] == 0, hyg
+    conn.close()
+
+    # Personal emoji display name stripped from Sonnet brand payload
+    captured_payloads: list[dict] = []
+
+    def fake_sonnet(payloads, model="claude-sonnet-5"):
+        captured_payloads.extend(payloads)
+        return [{"step1_text": valid_s1, "audience": "creators"}]
+
+    monkeypatch.setenv("CRMTG_AUTO_SONNET", "1")
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    monkeypatch.setattr(outreach_copy, "generate_vlad_sonnet_batch", fake_sonnet)
+    built = outreach_copy.build_ofm_vlad_copy_batch(
+        [{"name": "Noa 🌸", "company": "Noa 🌸", "source": "fb_groups", "signal_summary": "Scaling creator IG"}]
+    )
+    assert captured_payloads and captured_payloads[0]["company"] == ""
+    assert "Noa 🌸" not in built[0]["followup_1"]
+
+
+def test_tg_identity_bridge_word_boundary_and_lazy_short_circuit() -> None:
+    def ok_tme_html(nick: str, title: str, bio: str) -> str:
+        return (
+            "<html><body>"
+            f'<div class="tgme_page_title"><span>{title}</span></div>'
+            f'<div class="tgme_page_extra">@{nick}</div>'
+            f'<div class="tgme_page_description">{bio}</div>'
+            '<div class="tgme_page_action"><a class="tgme_action_button_new" href="tg://resolve">Send Message</a></div>'
+            "</body></html>"
+        )
+
+    # Generic token + substring collision guard: "Flow" MUST NOT match "Workflow", "tools" MUST NOT match "tools"
+    res_collision = tg_identity_bridge.bridge_lead_to_telegram(
+        {
+            "name": "Alex",
+            "company": "Aster",
+            "project_url": "https://aster.app",
+            "x_url": "https://x.com/alexdev99",
+        },
+        x_profile_fn=lambda _h: None,
+        search_fn=lambda _q: None,
+        fetch_site_fn=lambda _d: "",
+        tme_fetch_fn=lambda nick: ok_tme_html(nick, "Alex", "Master chef & faster workflow tools"),
+    )
+    assert not res_collision.get("username")
+
+    # Generic tokens alone ("FlowTools") also must not self-confirm on generic bio words ("tools")
+    res_generic = tg_identity_bridge.bridge_lead_to_telegram(
+        {
+            "name": "Alex",
+            "company": "Flow",
+            "project_url": "https://tools.app",
+            "x_url": "https://x.com/alexdev99",
+        },
+        x_profile_fn=lambda _h: None,
+        search_fn=lambda _q: None,
+        fetch_site_fn=lambda _d: "",
+        tme_fetch_fn=lambda nick: ok_tme_html(nick, "Alex", "Building workflow tools"),
+    )
+    assert not res_generic.get("username")
+
+    # Lazy stage short-circuit: explicit link in `links` resolves immediately without website/search/X calls
+    called = {"x": 0, "site": 0, "search": 0}
+    res_lazy = tg_identity_bridge.bridge_lead_to_telegram(
+        {
+            "name": "Sam Founder",
+            "company": "OrbitAI",
+            "project_url": "https://orbitai.dev",
+            "founder_x": "https://x.com/sam_orbit",
+            "links": ["https://t.me/sam_orbit_dm"],
+        },
+        x_profile_fn=lambda _h: (called.__setitem__("x", called["x"] + 1) or None),
+        fetch_site_fn=lambda _d: (called.__setitem__("site", called["site"] + 1) or ""),
+        search_fn=lambda _q: (called.__setitem__("search", called["search"] + 1) or None),
+        tme_fetch_fn=lambda nick: ok_tme_html(nick, "Sam", "OrbitAI founder") if nick == "sam_orbit_dm" else "",
+    )
+    assert res_lazy.get("username") == "sam_orbit_dm"
+    assert res_lazy.get("tg_bridge_match") == "links_explicit"
+    assert called == {"x": 0, "site": 0, "search": 0}

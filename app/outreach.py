@@ -682,14 +682,24 @@ def has_last_mile_icp_defect(
     if clean_uname and (clean_uname == "matrixreach_bot" or clean_uname.endswith("_bot")):
         return True
 
+    is_vacancy_camp = is_vacancy_campaign(camp, name_override=campaign_name)
+    is_ofm_camp = is_ofm_campaign(camp, name_override=campaign_name)
+
     text_fields = (
-        rec.get("note"),
-        rec.get("category"),
-        rec.get("their_angle"),
-        rec.get("our_angle"),
-        rec.get("step1_text"),
-        rec.get("lead_note"),
-        rec.get("lead_description"),
+        (
+            rec.get("step1_text"),
+            rec.get("our_angle"),
+        )
+        if is_ofm_camp
+        else (
+            rec.get("note"),
+            rec.get("category"),
+            rec.get("their_angle"),
+            rec.get("our_angle"),
+            rec.get("step1_text"),
+            rec.get("lead_note"),
+            rec.get("lead_description"),
+        )
     )
     for field_val in text_fields:
         fixed = _fix_mojibake(field_val)
@@ -710,8 +720,6 @@ def has_last_mile_icp_defect(
         )
         if val
     )
-    is_vacancy_camp = is_vacancy_campaign(camp, name_override=campaign_name)
-    is_ofm_camp = is_ofm_campaign(camp, name_override=campaign_name)
     if is_vacancy_camp:
         vac_blob = f"{profile_blob} {_fix_mojibake(rendered_text)}"
         if _VACANCY_JUNK_ROLE_RE.search(vac_blob):
@@ -739,7 +747,7 @@ def has_last_mile_icp_defect(
             ofm_enabled=is_ofm_camp,
         ):
             return True
-    if not is_qa_camp and is_offline_non_icp_contact(
+    if not is_qa_camp and not is_ofm_camp and is_offline_non_icp_contact(
         username=clean_uname,
         name=rec.get("name"),
         company=rec.get("company"),

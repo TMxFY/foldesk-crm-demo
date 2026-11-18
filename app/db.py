@@ -2085,7 +2085,7 @@ def apply_ofm_and_top_veins_v8(
                 if not b2b.get("ofm_tg_groups"):
                     b2b["ofm_tg_groups"] = list(DEFAULT_LEADGEN_CONFIG["b2b"]["ofm_tg_groups"])
                 existing_new = [str(x).strip().lstrip("@") for x in (b2b.get("tg_groups_new") or []) if str(x).strip()]
-                for chat in ("productcircle_chat", "solofounderschat", "saasfounders"):
+                for chat in DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]:
                     if chat not in existing_new:
                         existing_new.append(chat)
                 b2b["tg_groups_new"] = existing_new
