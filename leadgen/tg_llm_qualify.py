@@ -174,10 +174,13 @@ def call_llm(batch, model):
     )
     resp.raise_for_status()
     data = resp.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"non-dict response: {str(data)[:200]}")
     choices = data.get("choices") or []
-    if not choices or not isinstance(choices[0], dict):
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise ValueError(f"missing choices in response: {str(data)[:200]}")
-    raw_content = (choices[0].get("message") or {}).get("content")
+    msg = choices[0].get("message")
+    raw_content = msg.get("content") if isinstance(msg, dict) else None
     if not isinstance(raw_content, str) or not raw_content.strip():
         raise ValueError(f"empty LLM content: {raw_content!r}")
     content = raw_content.strip()

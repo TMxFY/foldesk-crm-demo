@@ -449,8 +449,11 @@ async def crawl_channel_graph(
                 except Exception as exc:
                     print(f"# channel_graph error on {ch_username}: {exc}", file=sys.stderr)
 
-            should_expand = (cur_depth < depth) and not already_expanded and (
-                not already_seen or seen_expansions < max_seen_expansions
+            should_expand = (
+                (already_seen or fetch_ok)
+                and (cur_depth < depth)
+                and not already_expanded
+                and (not already_seen or seen_expansions < max_seen_expansions)
             )
             if should_expand:
                 if len(discovered_rows) >= limit:

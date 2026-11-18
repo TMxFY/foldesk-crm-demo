@@ -819,3 +819,162 @@ def test_pick_best_product_url_and_tg_enrich_leads_is_social_sync():
         == "https://momeditation.app"
     )
 
+
+def test_missing_llm_key_does_not_commit_master_or_drop_pending_queue(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+):
+    from leadgen import vps_autonomous_replenish
+
+    conn = isolated_env["conn"]
+    state_dir: Path = isolated_env["state_dir"]
+    master_jsonl = state_dir / "master_ids.jsonl"
+    pending_queue = state_dir / "pending_qualify_queue.jsonl"
+
+    monkeypatch.delenv("RELAYFAST_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    create_campaign(
+        conn,
+        name="SoftUGC — База Все2 (2 045 лидов)",
+        daily_limit=140,
+        status="running",
+        steps=DEFAULT_B2B_STEPS,
+        leadgen_enabled=True,
+    )
+    save_leadgen_config(
+        conn,
+        {
+            "enabled": True,
+            "b2b": {
+                "enabled": True,
+                "target_campaign_tg": "SoftUGC — База Все2 (2 045 лидов)",
+                "sources": {
+                    "buyer_catalogs": True,
+                    "tg_groups": False,
+                    "ofm_groups": False,
+                    "facebook_groups": False,
+                    "meta_ads": False,
+                    "social_x_reddit": False,
+                    "yc_ph": False,
+                    "channel_graph": False,
+                    "tg_ad_spy": False,
+                    "whop_content_rewards": False,
+                    "tiktok_ads": False,
+                    "tiktok_shop": False,
+                    "app_stores": False,
+                    "ats_hiring": False,
+                    "ph_detailed": False,
+                    "d2c_whatsapp": False,
+                    "tg_identity_bridge": False,
+                },
+                "limits": {"external_limit": 0},
+            },
+            "vacancies": {"enabled": False},
+        },
+        sync_cases_file=False,
+    )
+
+    raw_row = {
+        "id": 9911,
+        "username": "no_key_founder",
+        "name": "No Key Founder",
+        "bio": "Founder of WaitApp https://waitapp.io",
+        "project_url": "https://waitapp.io",
+        "source": "catalog_test",
+        "has_monetization_signal": True,
+    }
+
+    def runner(cmd, **kwargs):
+        cmd_str = " ".join(str(x) for x in cmd)
+        if "buyer_catalogs.py" in cmd_str:
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            out_p.write_text(json.dumps(raw_row) + "\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "tg_enrich_leads.py" in cmd_str:
+            inp_p = Path(cmd[cmd.index("--input") + 1])
+            out_p = Path(cmd[cmd.index("--output") + 1])
+            out_p.write_text(inp_p.read_text(encoding="utf-8"), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    res = vps_autonomous_replenish.run_autonomous_replenish(conn, runner=runner)
+    assert res["ingested_total"] == 0
+    assert not master_jsonl.exists() or master_jsonl.read_text(encoding="utf-8").strip() == ""
+    assert pending_queue.is_file()
+    q_rows = [json.loads(line) for line in pending_queue.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(r.get("username") == "no_key_founder" for r in q_rows)
+
+
+def test_treg_social_leads_enforces_budget_inside_x_queries(monkeypatch: pytest.MonkeyPatch):
+    import time as _time
+    from datetime import date
+    from leadgen import treg_social_leads
+
+    calls = {"n": 0}
+
+    def slow_search_x(q: str):
+        calls["n"] += 1
+        _time.sleep(0.12)
+        return {"posts": []}
+
+    monkeypatch.setenv("TREG_SOCIAL_BUDGET_SEC", "0.08")
+    started = _time.monotonic()
+    rows, _, stats = treg_social_leads.discover(
+        day=date(2026, 11, 18),
+        seen={},
+        cap=5,
+        search_x_fn=slow_search_x,
+        search_reddit_fn=lambda s, t: {"posts": []},
+        search_comments_fn=lambda u: {"posts": []},
+    )
+    elapsed = _time.monotonic() - started
+    assert elapsed < 0.8
+    assert calls["n"] < len(treg_social_leads.buyer_queries(date(2026, 11, 18))) + 5
+
+
+def test_gate_i_catches_local_import_before_definition(tmp_path: Path):
+    import shutil
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent
+    verify_copy = tmp_path / "scripts" / "verify.sh"
+    verify_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(repo_root / "scripts" / "verify.sh", verify_copy)
+    (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "leadgen").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "leadgen" / "bad_import.py").write_text(
+        "def broken():\n    x = json.loads('{}')\n    import json\n    return x\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["bash", str(verify_copy), "--fast-checks-only"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + "\n" + proc.stderr
+    assert "local 'json' used before def/import" in combined
+
+
+def test_tg_llm_qualify_handles_non_dict_json_gracefully(monkeypatch: pytest.MonkeyPatch):
+    from leadgen import tg_llm_qualify
+
+    monkeypatch.setenv("RELAYFAST_API_KEY", "test-key")
+    monkeypatch.setattr(tg_llm_qualify, "chain", lambda: ["claude-haiku-5-5"])
+
+    class DummyResp:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
+    monkeypatch.setattr(tg_llm_qualify.requests, "post", lambda *a, **k: DummyResp(["not-a-dict"]))
+    with pytest.raises(ValueError, match="non-dict response"):
+        tg_llm_qualify.call_llm([{"username": "a", "name": "A", "bio": "b"}], "claude-haiku-5-5")
+
+

@@ -10,7 +10,7 @@ nothing and does not fail the Telegram batch.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import copy
 import hashlib
 import json
@@ -138,6 +138,9 @@ SKIP_HOSTS = {
     "youtu.be", "instagram.com", "facebook.com", "reddit.com", "redd.it",
     "github.com", "notion.so", "notion.site", "medium.com",
     "t.co", "buff.ly", "ow.ly", "cutt.ly", "rb.gy", "lnkd.in",
+    "clck.ru", "is.gd", "shorturl.at", "gumroad.com", "skool.com", "patreon.com",
+    "stan.store", "taplink.cc", "whop.com", "apps.whop.com", "bento.me",
+    "bio.site", "campsite.bio", "roblox.com", "apps.shopify.com", "store.steampowered.com",
 }
 X_NOISE = {"home", "search", "explore", "i", "share", "intent", "hashtag", "compose"}
 REDDIT_NOISE = {"automoderator", "deleted", "removed", "none", "[deleted]"}
@@ -701,18 +704,43 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
     def _run_x_queries(queries: list[str] | tuple[str, ...]) -> list[dict | None]:
         if not queries:
             return []
-        if search_x_fn is search_x and len(queries) > 1:
+        enforce_budget = budget_sec > 0
+        if enforce_budget and time.monotonic() >= deadline:
+            return [None] * len(queries)
+        if len(queries) > 1 and (search_x_fn is search_x or enforce_budget):
             out_payloads: list[dict | None] = [None] * len(queries)
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                futs = [(idx, pool.submit(search_x_fn, q)) for idx, q in enumerate(queries)]
-                for idx, fut in futs:
-                    try:
-                        out_payloads[idx] = fut.result()
-                    except Exception:
-                        out_payloads[idx] = None
+            pool = ThreadPoolExecutor(max_workers=5)
+            try:
+                batch_size = 5
+                for start in range(0, len(queries), batch_size):
+                    if enforce_budget and time.monotonic() >= deadline:
+                        break
+                    chunk = list(enumerate(queries[start : start + batch_size], start=start))
+                    fut_map = {pool.submit(search_x_fn, q): idx for idx, q in chunk}
+                    wait_timeout = (
+                        max(0.01, deadline - time.monotonic())
+                        if enforce_budget
+                        else None
+                    )
+                    done_futs, not_done = wait(fut_map.keys(), timeout=wait_timeout)
+                    for fut in done_futs:
+                        idx = fut_map[fut]
+                        try:
+                            out_payloads[idx] = fut.result()
+                        except Exception:
+                            out_payloads[idx] = None
+                    for fut in not_done:
+                        fut.cancel()
+                    if not_done:
+                        break
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
             return out_payloads
         res_payloads: list[dict | None] = []
         for q in queries:
+            if enforce_budget and time.monotonic() >= deadline:
+                res_payloads.append(None)
+                continue
             try:
                 res_payloads.append(search_x_fn(q))
             except Exception:
@@ -762,10 +790,10 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
 
     comment_cands: list[tuple[str, dict | None]] = []
     c_queries = comment_post_queries(day)
-    if not (search_x_fn is search_x and time.monotonic() >= deadline):
+    if not (budget_sec > 0 and time.monotonic() >= deadline):
         c_payloads = _run_x_queries(c_queries)
         for query, payload in zip(c_queries, c_payloads):
-            if search_x_fn is search_x and time.monotonic() >= deadline:
+            if budget_sec > 0 and time.monotonic() >= deadline:
                 break
             if payload is None:
                 x_fail += 1
@@ -773,7 +801,7 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
                 continue
             x_ok += 1
             for url in reply_post_urls(payload):
-                if search_x_fn is search_x and time.monotonic() >= deadline:
+                if budget_sec > 0 and time.monotonic() >= deadline:
                     break
                 try:
                     thread = search_comments_fn(url)

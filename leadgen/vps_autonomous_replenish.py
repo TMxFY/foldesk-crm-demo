@@ -89,9 +89,10 @@ def _read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
 
 def _lead_retry_keys(row: dict[str, Any]) -> set[str]:
     keys: set[str] = set()
-    rid = row.get("id")
-    if rid not in (None, "", 0):
-        keys.add(f"id:{rid}")
+    for id_field in ("id", "telegram_user_id"):
+        rid = row.get(id_field)
+        if rid not in (None, "", 0):
+            keys.add(f"{id_field}:{rid}")
     uname = (
         str(
             row.get("username")
@@ -106,7 +107,13 @@ def _lead_retry_keys(row: dict[str, Any]) -> set[str]:
     if uname:
         keys.add(f"u:{uname}")
     purl = (
-        str(row.get("project_url") or row.get("website") or row.get("site") or "")
+        str(
+            row.get("project_url")
+            or row.get("website")
+            or row.get("site")
+            or row.get("url")
+            or ""
+        )
         .strip()
         .rstrip("/")
         .lower()
@@ -116,6 +123,10 @@ def _lead_retry_keys(row: dict[str, Any]) -> set[str]:
     fx = x_profile_url(row)
     if fx:
         keys.add(f"x:{fx.lower()}")
+    for extra in ("email", "phone"):
+        val = str(row.get(extra) or "").strip().lower()
+        if val:
+            keys.add(f"{extra}:{val}")
     return keys
 
 
@@ -1554,7 +1565,7 @@ def run_autonomous_replenish(
                             elif final_jsonl.is_file():
                                 final_jsonl.unlink(missing_ok=True)
 
-                        pipeline_ok = enrich_ok and (not has_llm_key or (qual_ok and curate_ok))
+                        pipeline_ok = has_llm_key and enrich_ok and qual_ok and curate_ok
                         if pipeline_ok:
                             failed_rows = _read_jsonl_dicts(llm_failed_file) if has_llm_key else []
                             llm_failed_file.unlink(missing_ok=True)
