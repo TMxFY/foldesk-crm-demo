@@ -424,6 +424,7 @@ if wa_gw_file.is_file():
         "send_chat_presence",
         "CHAT_PRESENCE_COMPOSING",
         "def apply_proxy(",
+        "data:image/svg+xml;base64,",
     ):
         if req_wa_tok not in wa_gw_src:
             errors.append(f"Gate H violation in app/whatsapp_gateway.py: missing anti-ban contract '{req_wa_tok}'")

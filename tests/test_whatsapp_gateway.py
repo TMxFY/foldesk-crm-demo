@@ -41,8 +41,10 @@ def test_whatsapp_live_neonize_qr_and_fail_fast_confirm(tmp_path: Path, monkeypa
         assert data["provider"] == "whatsapp"
         assert data["status"] == "pending_code"
         assert data["pairing_code"] is None
-        assert data["qr_code"].startswith("data:image/svg+xml;utf8,")
+        assert data["qr_code"].startswith("data:image/svg+xml;base64,")
         assert len(data["qr_code"]) > 1200  # Dense Multi-Device cryptographic QR
+        svg_decoded = base64.b64decode(data["qr_code"].split(",", 1)[1]).decode("utf-8")
+        assert "<svg" in svg_decoded and "<path" in svg_decoded and "</svg>" in svg_decoded
 
         # Code confirmation BEFORE scanning on phone MUST fail fast (no fake stub!)
         early = client.post(f"/api/accounts/{acc_id}/code", json={"code": "qr"})
@@ -297,3 +299,93 @@ def test_gate_h_verify_sh_rejects_fake_session_and_stub_tokens(tmp_path: Path):
     assert res.returncode == 1
     assert "Gate H violation" in res.stderr
     assert "SAMPLE_SESSION_JSON" in res.stderr
+
+
+def test_stop_outreach_on_reply_quarantines_micro_vacancy_and_suppresses_false_alert(
+    tmp_path: Path, monkeypatch
+):
+    from app.digest import audit_reply_notifications
+    from app.inbox import stop_outreach_on_reply
+
+    db_path = tmp_path / "crm_reply_sniper.db"
+    conn = connect(db_path)
+    init_db(conn)
+    monkeypatch.setenv("COLLEAGUE_BOT_TOKEN", "123456:TESTTOKEN")
+    monkeypatch.setenv("COLLEAGUE_CHAT_ID", "978069541")
+    monkeypatch.delenv("DISABLE_BOT_ALERTS", raising=False)
+
+    now_iso = "2026-11-18T08:55:00"
+    conn.execute(
+        """
+        INSERT INTO accounts (id, phone, session_path, status, telegram_user_id, telegram_username, telegram_name, health, created_at)
+        VALUES (27, '+79088819595', 'data/sessions/27.session', 'connected', 270001, 'vladwilhelm', 'Vlad', 'active', ?)
+        """,
+        (now_iso,),
+    )
+    camp = create_campaign(conn, name="Vacancy Legacy", account_id=27, daily_limit=20, status="draft")
+    conn.execute(
+        """
+        INSERT INTO campaign_recipients (
+            campaign_id, lead_id, telegram_user_id, username, name, company,
+            status, current_step, assigned_account_id, sent_account_id, last_sent_at, created_at, updated_at
+        ) VALUES (?, NULL, 8772940400, 'asel_pest_hr', 'Иллюстратор детской книги на нейросетях (@asel_pest_hr)', 'Иллюстратор детской книги на нейросетях', 'completed', 1, 27, 27, '2026-11-17T09:31:25', ?, ?)
+        """,
+        (camp["id"], now_iso, now_iso),
+    )
+    dlg_cur = conn.execute(
+        """
+        INSERT INTO dialogs (
+            account_id, peer_id, username, title, peer_type, unread_count, last_from_peer, last_message_at, created_at, updated_at
+        ) VALUES (27, 8772940400, 'asel_pest_hr', 'Иллюстратор детской книги на нейросетях', 'user', 1, 1, '2026-11-18T08:55:00', ?, ?)
+        """,
+        (now_iso, now_iso),
+    )
+    dlg_id = int(dlg_cur.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO messages (dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at)
+        VALUES (?, 175355, 'in', 'Никакой вакансии не было. Мы вынужденно клепаем фейки. @trackly_official_bot', '2026-11-18T08:55:00', ?, ?)
+        """,
+        (dlg_id, now_iso, now_iso),
+    )
+    conn.commit()
+
+    spy_calls: list[tuple[str, bytes | None]] = []
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "result": {"message_id": 999}}'
+
+    def spy_opener(req, timeout=10):
+        spy_calls.append((req.full_url, req.data))
+        return _FakeResp()
+
+    stop_outreach_on_reply(
+        conn,
+        account_id=27,
+        peer_id=8772940400,
+        username="asel_pest_hr",
+        preview="Никакой вакансии не было. Мы вынужденно клепаем фейки. @trackly_official_bot",
+        notify=True,
+        incoming_unread=True,
+        telegram_message_id=175355,
+        incoming_sent_at="2026-11-18T08:55:00",
+        opener=spy_opener,
+    )
+
+    assert spy_calls == []
+    notif_count = conn.execute("SELECT COUNT(*) FROM bot_reply_notifications").fetchone()[0]
+    assert int(notif_count) == 0
+    lead_row = conn.execute("SELECT status, airtable_status, next_step FROM leads WHERE telegram_user_id = 8772940400").fetchone()
+    assert lead_row is not None
+    assert lead_row["status"] == "lost"
+    assert lead_row["airtable_status"] == "Cancelled"
+    assert audit_crm_hygiene(conn)["ok"] is True
+    assert audit_reply_notifications(conn)["ok"] is True
+    conn.close()

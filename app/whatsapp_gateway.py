@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -83,8 +84,7 @@ def _render_real_qr_svg(qr_payload: str | bytes) -> str:
     buf = io.BytesIO()
     qr_obj = segno.make_qr(raw)
     qr_obj.save(buf, kind="svg", scale=5, border=2, dark="#111b21", light="#ffffff")
-    svg_text = buf.getvalue().decode("utf-8", "replace")
-    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg_text, safe=":/,;=()#@")
+    return "data:image/svg+xml;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def _validate_wa_proxy_url(proxy_url: str | None) -> str | None:

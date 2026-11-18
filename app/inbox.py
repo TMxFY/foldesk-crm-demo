@@ -330,6 +330,47 @@ def _public(row) -> dict:
     return out
 
 
+_FAKE_VACANCY_BAIT_RE = re.compile(
+    r"(?:никакой\s+вакансии\s+не\s+было|клепаем\s+фейки|trackly_official_bot)",
+    re.IGNORECASE,
+)
+
+
+def _incoming_sniper_quarantine_reason(
+    conn,
+    *,
+    name: str = "",
+    company: str = "",
+    niche: str = "",
+    note: str = "",
+    description: str = "",
+    url: str = "",
+    lead_source: str = "",
+    preview: str = "",
+) -> str:
+    if preview and _FAKE_VACANCY_BAIT_RE.search(preview):
+        return "фейк-вакансия / спам-приманка в ответе"
+    try:
+        from app.hygiene import sniper_lead_violation_reason
+        from app.leadgen_settings import get_leadgen_config
+
+        vac_enabled = bool((get_leadgen_config(conn).get("vacancies") or {}).get("enabled", False))
+    except Exception:
+        from app.hygiene import sniper_lead_violation_reason
+
+        vac_enabled = False
+    return sniper_lead_violation_reason(
+        name=name,
+        company=company,
+        niche=niche,
+        note=note,
+        description=description,
+        url=url,
+        lead_source=lead_source,
+        vacancies_enabled=vac_enabled,
+    )
+
+
 def stop_outreach_on_reply(
     conn,
     account_id: int | None = None,
@@ -597,7 +638,24 @@ def stop_outreach_on_reply(
         if not auto_name:
             auto_name = auto_company or auto_user or auto_phone or (f"id:{auto_tg_id}" if auto_tg_id else "Контакт")
         auto_dlg_id = int(dlg_row["id"]) if dlg_row is not None else None
-        auto_next_step = "Клиент ответил — цепочка остановлена, ответьте вручную"
+        quarantine_reason = _incoming_sniper_quarantine_reason(
+            conn,
+            name=auto_name or "",
+            company=auto_company or "",
+            niche=auto_niche or "",
+            note=auto_note or "",
+            description=auto_company or "",
+            url=auto_url or "",
+            preview=str(preview or ""),
+        )
+        if quarantine_reason:
+            auto_status = "lost"
+            auto_airtable_status = "Cancelled"
+            auto_next_step = f"Авто-карантин Sniper ICP: {quarantine_reason}"
+        else:
+            auto_status = "talking"
+            auto_airtable_status = "In conversation"
+            auto_next_step = "Клиент ответил — цепочка остановлена, ответьте вручную"
         try:
             cur_lead = conn.execute(
                 """
@@ -605,7 +663,7 @@ def stop_outreach_on_reply(
                     account_id, telegram_user_id, username, name, phone,
                     status, airtable_status, company, description, niche, url,
                     note, next_step, dialog_id, provider, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'talking', 'In conversation', ?, ?, ?, ?, ?, ?, ?, 'telegram', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'telegram', ?, ?)
                 """,
                 (
                     auto_acc_id,
@@ -613,6 +671,8 @@ def stop_outreach_on_reply(
                     auto_user,
                     auto_name,
                     auto_phone,
+                    auto_status,
+                    auto_airtable_status,
                     auto_company,
                     auto_company,
                     auto_niche,
@@ -626,7 +686,9 @@ def stop_outreach_on_reply(
             )
             new_lid = int(cur_lead.lastrowid)
             matched_lead_ids.add(new_lid)
-            prev_lead_statuses[new_lid] = "talking"
+            prev_lead_statuses[new_lid] = auto_status
+            if quarantine_reason:
+                prev_lead_airtable_statuses[new_lid] = auto_airtable_status
         except sqlite3.IntegrityError:
             if auto_tg_id is not None:
                 ex_row = conn.execute(
@@ -651,6 +713,30 @@ def stop_outreach_on_reply(
 
     any_lead_status_moved = False
     if matched_lead_ids:
+        if preview and _FAKE_VACANCY_BAIT_RE.search(str(preview)):
+            ph_bait = ",".join("?" for _ in matched_lead_ids)
+            conn.execute(
+                f"""
+                UPDATE leads
+                SET status = 'lost',
+                    airtable_status = 'Cancelled',
+                    next_step = 'Авто-карантин Sniper ICP: фейк-вакансия / спам-приманка в ответе',
+                    updated_at = ?
+                WHERE id IN ({ph_bait})
+                  AND lower(coalesce(status, '')) NOT IN ('won', 'on_hold', 'call_scheduled')
+                  AND lower(coalesce(airtable_status, '')) NOT IN ('signed', 'on hold', 'call scheduled')
+                """,
+                [now, *sorted(matched_lead_ids)],
+            )
+            for lid in matched_lead_ids:
+                if (
+                    str(prev_lead_statuses.get(lid) or "").lower()
+                    not in ("won", "on_hold", "call_scheduled")
+                    and str(prev_lead_airtable_statuses.get(lid) or "").lower()
+                    not in ("signed", "on hold", "call scheduled")
+                ):
+                    prev_lead_statuses[lid] = "lost"
+                    prev_lead_airtable_statuses[lid] = "Cancelled"
         primary_lid = sorted(matched_lead_ids)[0]
         if has_any_recipient and all_rec_rows:
             rec_ids = [int(r["id"]) for r in all_rec_rows]
@@ -771,7 +857,13 @@ def stop_outreach_on_reply(
         )
         for lid in matched_lead_ids
     )
-    base_notify_trigger = (not has_won_lead) and (
+    all_matched_closed = bool(matched_lead_ids) and all(
+        is_closed_lead_status(
+            prev_lead_statuses.get(lid), prev_lead_airtable_statuses.get(lid)
+        )
+        for lid in matched_lead_ids
+    )
+    base_notify_trigger = (not has_won_lead and not all_matched_closed) and (
         stopped_count > 0
         or any_lead_status_moved
         or (
