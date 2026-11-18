@@ -1314,14 +1314,37 @@ def _is_vacancy_lead_item(item: dict) -> bool:
     )
 
 
-def _auto_enrich_b2b_items_with_sonnet(items: list[dict]) -> list[dict]:
+def _auto_enrich_b2b_items_with_sonnet(
+    items: list[dict],
+    *,
+    is_ofm_camp: bool = False,
+) -> list[dict]:
     """Ensure every B2B item without canonical Vlad SoftUGC+revshare copy is drafted via claude-sonnet-5 when API key & CRMTG_AUTO_SONNET / VPS runtime allow it."""
     from leadgen.outreach_copy import (
         REVSHARE_OFFER_TEXT,
         VLAD_STEP3_TEXT,
+        build_ofm_vlad_copy_batch,
         followup_one,
         generate_vlad_sonnet_batch,
     )
+
+    if is_ofm_camp:
+        ofm_items = [dict(it) if isinstance(it, dict) else it for it in items]
+        need_ofm_indices = [
+            idx
+            for idx, it in enumerate(ofm_items)
+            if isinstance(it, dict)
+            and not (
+                str(it.get("step1_text") or it.get("first_touch") or "").strip()
+                and "SoftUGC" in str(it.get("step1_text") or it.get("first_touch") or "")
+                and REVSHARE_OFFER_TEXT in str(it.get("step1_text") or it.get("first_touch") or "")
+            )
+        ]
+        if need_ofm_indices:
+            drafted_list = build_ofm_vlad_copy_batch([ofm_items[i] for i in need_ofm_indices])
+            for idx, drafted in zip(need_ofm_indices, drafted_list):
+                ofm_items[idx].update(drafted)
+        return ofm_items
 
     api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
     if not api_key:
@@ -1441,8 +1464,15 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
     )
 
     if campaign_id is None:
+        from app.hygiene import is_ofm_campaign_name
+
         raw_low = raw_camp_arg.lower()
-        if any(k in raw_low for k in ("ваканс", "vacanc", "job")) or "(wa)" in raw_low or "whatsapp" in raw_low:
+        if (
+            any(k in raw_low for k in ("ваканс", "vacanc", "job"))
+            or "(wa)" in raw_low
+            or "whatsapp" in raw_low
+            or is_ofm_campaign_name(raw_camp_arg)
+        ):
             campaign_name = raw_camp_arg
         elif all_vacancies and raw_low in ("", "leadgen auto (tg)", "leadgen autopilot"):
             campaign_name = "TG Вакансии"
@@ -1477,10 +1507,12 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 resolved_cid = int(c_dict["id"])
             else:
                 from app.db import CANONICAL_STEP3_IMAGE_URL
+                from app.hygiene import is_ofm_campaign_name
                 from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
 
                 is_vacancy_camp = any(k in target_cname.lower() for k in ("ваканс", "vacanc", "job"))
                 is_wa_camp = "(wa)" in target_cname.lower() or "whatsapp" in target_cname.lower()
+                is_ofm_camp = is_ofm_campaign_name(target_cname)
                 default_steps = (
                     [
                         {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
@@ -1505,7 +1537,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     conn,
                     name=target_cname,
                     status="draft",
-                    daily_limit=DEFAULT_WA_DAILY_LIMIT if is_wa_camp else 20,
+                    daily_limit=25 if is_ofm_camp else (DEFAULT_WA_DAILY_LIMIT if is_wa_camp else 20),
                     steps=default_steps,
                 )
                 resolved_cid = int(created_camp["id"])
@@ -1705,8 +1737,14 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         camp_dict is not None
         and any(k in str(camp_dict.get("name") or "").lower() for k in ("ваканс", "vacanc", "job"))
     )
+    from app.hygiene import is_ofm_campaign_name as _is_ofm_camp_name_fn
+
+    is_primary_ofm = bool(
+        camp_dict is not None
+        and _is_ofm_camp_name_fn(camp_dict.get("name"), camp_dict.get("leadgen_sources_json"))
+    )
     if not is_primary_vacancy:
-        raw_leads = _auto_enrich_b2b_items_with_sonnet(raw_leads)
+        raw_leads = _auto_enrich_b2b_items_with_sonnet(raw_leads, is_ofm_camp=is_primary_ofm)
 
     from app.hygiene import (
         append_direct_x_lead,
@@ -1814,8 +1852,16 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             skipped_non_icp += 1
             quarantined += 1
             continue
-        is_b2b_camp = not is_item_vacancy and not any(
-            k in target_camp_name.lower() for k in ("ваканс", "vacanc", "job")
+        from app.hygiene import is_ofm_campaign_name
+
+        is_ofm_target_camp = is_ofm_campaign_name(
+            target_camp_name,
+            (target_camp_dict or {}).get("leadgen_sources_json"),
+        )
+        is_b2b_camp = (
+            not is_item_vacancy
+            and not is_ofm_target_camp
+            and not any(k in target_camp_name.lower() for k in ("ваканс", "vacanc", "job"))
         )
 
         if is_b2b_camp:
@@ -1857,7 +1903,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             if _COMPETITOR_DENYLIST_RE.search(full_blob):
                 skipped_duplicates += 1
                 continue
-            if not is_b2b_camp:
+            if not is_b2b_camp and not is_ofm_target_camp:
                 from app.outreach import _VACANCY_JUNK_ROLE_RE
 
                 if _VACANCY_JUNK_ROLE_RE.search(full_blob):
@@ -1980,6 +2026,26 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                         },
                     ):
                         saved_direct_x_leads += 1
+                skipped_non_icp += 1
+                quarantined += 1
+                continue
+        elif is_ofm_target_camp and not is_qa_camp:
+            ofm_sniper_reason = sniper_lead_violation_reason(
+                name=display_name or "",
+                company=company or "",
+                niche=category or "",
+                note=f"{raw_note or ''}\n{their_angle or ''}\n{str(item.get('bio') or '')}".strip(),
+                description=str(item.get("description") or item.get("what_they_do") or ""),
+                url=url_val or website_raw or "",
+                lead_source=lead_source or "",
+                vacancies_enabled=False,
+                ofm_enabled=True,
+            )
+            if ofm_sniper_reason:
+                skipped_non_icp += 1
+                quarantined += 1
+                continue
+            if raw_s1 is not None and str(raw_s1).strip() != "" and is_truncated_or_bad_pitch(str(raw_s1), min_len=40):
                 skipped_non_icp += 1
                 quarantined += 1
                 continue
@@ -2156,7 +2222,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             step1_text, error_reason = _clean_step1_text(
                 item.get("step1_text") or item.get("first_touch"),
                 company,
-                is_b2b=is_b2b_camp,
+                is_b2b=(is_b2b_camp or is_ofm_target_camp),
             )
             step2_text = (str(item.get("step2_text") or item.get("followup_1") or "").strip()) or None
             step3_text = (str(item.get("step3_text") or item.get("followup_2") or "").strip()) or None

@@ -1662,9 +1662,13 @@ def run_autonomous_replenish(
             vac_camp = _find_campaign_by_name(conn, vac_name)
             wa_name = str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)").strip() or "Leadgen Auto (WA)"
             wa_camp = _find_campaign_by_name(conn, wa_name)
+            ofm_camp = None
+            if b2b_cfg.get("ofm_outreach_enabled", False):
+                ofm_name = str(b2b_cfg.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip() or "SoftUGC — OFM (TG)"
+                ofm_camp = _find_campaign_by_name(conn, ofm_name)
 
         # Step 3: Rule 5 Dry-Run quarantine rollback BEFORE finalizing replenish state
-        for camp_obj in (b2b_camp, vac_camp, wa_camp):
+        for camp_obj in (b2b_camp, vac_camp, wa_camp, ofm_camp):
             if camp_obj is None:
                 continue
             preview_obj, q_ids = _enforce_rule5_quarantine_on_new_recipients(

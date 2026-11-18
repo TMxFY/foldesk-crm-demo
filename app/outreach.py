@@ -512,6 +512,23 @@ def is_vacancy_campaign(camp: dict | None, name_override: str | None = None) -> 
     return False
 
 
+def is_ofm_campaign(camp: dict | None, name_override: str | None = None) -> bool:
+    from app.hygiene import is_ofm_campaign_name
+
+    camp_name = str(
+        name_override
+        if name_override is not None
+        else ((camp or {}).get("name") or "")
+    )
+    raw_sources = (camp or {}).get("leadgen_sources") if isinstance(camp, dict) else None
+    src_json = (
+        json.dumps(raw_sources, ensure_ascii=False)
+        if isinstance(raw_sources, list)
+        else ((camp or {}).get("leadgen_sources_json") if isinstance(camp, dict) else None)
+    )
+    return is_ofm_campaign_name(camp_name, src_json)
+
+
 def find_vacancy_account_pool_violations(
     conn,
     campaign_id: int | None,
@@ -694,11 +711,12 @@ def has_last_mile_icp_defect(
         if val
     )
     is_vacancy_camp = is_vacancy_campaign(camp, name_override=campaign_name)
+    is_ofm_camp = is_ofm_campaign(camp, name_override=campaign_name)
     if is_vacancy_camp:
         vac_blob = f"{profile_blob} {_fix_mojibake(rendered_text)}"
         if _VACANCY_JUNK_ROLE_RE.search(vac_blob):
             return True
-    if not is_vacancy_camp and profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
+    if not is_vacancy_camp and not is_ofm_camp and profile_blob and _LAST_MILE_NON_ICP_ROLE_RE.search(profile_blob):
         return True
     if not is_qa_camp:
         from app.hygiene import _has_messenger_contact, sniper_lead_violation_reason
@@ -718,6 +736,7 @@ def has_last_mile_icp_defect(
             url=str(rec.get("website") or rec.get("lead_url") or ""),
             lead_source=str(rec.get("lead_source") or ""),
             vacancies_enabled=is_vacancy_camp,
+            ofm_enabled=is_ofm_camp,
         ):
             return True
     if not is_qa_camp and is_offline_non_icp_contact(
@@ -4652,6 +4671,7 @@ async def run_campaign_batch(
                 _release_followup_reservation(int(rec["id"]))
                 continue
 
+            is_ofm_rec_camp = is_ofm_campaign(camp)
             sniper_reason = sniper_lead_violation_reason(
                 name=str(rec.get("name") or ""),
                 company=str(rec.get("company") or ""),
@@ -4661,6 +4681,7 @@ async def run_campaign_batch(
                 url=str(rec.get("website") or rec.get("lead_url") or ""),
                 lead_source=str(rec.get("lead_source") or ""),
                 vacancies_enabled=is_vacancy_campaign(camp),
+                ofm_enabled=is_ofm_rec_camp,
             )
             if sniper_reason:
                 conn.execute(
@@ -6043,6 +6064,7 @@ def preview_outreach_batch(
     valid_followup_count = 0
     is_qa_preview = _is_qa_campaign_name(camp.get("name"))
     is_vac_preview = is_vacancy_campaign(camp)
+    is_ofm_preview = is_ofm_campaign(camp)
     from app.hygiene import _has_messenger_contact, sniper_lead_violation_reason
 
     for row in rows:
@@ -6075,6 +6097,7 @@ def preview_outreach_batch(
                 url=str(rec.get("website") or rec.get("lead_url") or ""),
                 lead_source=str(rec.get("lead_source") or ""),
                 vacancies_enabled=is_vac_preview,
+                ofm_enabled=is_ofm_preview,
             )
         )
 

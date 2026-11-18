@@ -2,6 +2,7 @@
 """Canonical B2B SoftUGC outreach generator (Vlad's 3-step sequence via claude-sonnet-5 + deterministic fallback)."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -832,6 +833,125 @@ def generate_vlad_sonnet_batch(
                 site=str(l.get("website") or ""),
             )
         out.append({"step1_text": step1_text, "audience": aud})
+    return out
+
+
+def build_ofm_vlad_copy_batch(rows: list[dict]) -> list[dict]:
+    """Build Vlad's canonical 3-step English SoftUGC sequence for OFM agencies/buyers."""
+    try:
+        from app.runtime_config import should_allow_auto_sonnet as _allow_auto_sonnet
+
+        sonnet_ok = _allow_auto_sonnet()
+    except ImportError:
+        sonnet_ok = (
+            os.environ.get("CRMTG_VPS_RUNTIME") == "1"
+            or os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1"
+            or os.environ.get("CRMTG_AUTO_SONNET") == "1"
+        )
+    api_key = (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
+    allow_sonnet = bool(api_key) and sonnet_ok
+
+    ofm_fallback_step1 = (
+        "Hey,\n\n"
+        "Saw you're scaling creators and recruiting VAs for IG and X traffic. "
+        "Hiring and warming manual accounts takes weeks, burns budget, and still hits shadowbans before steady volume kicks in.\n\n"
+        f"{SOFTUGC_PITCH_TEXT}\n\n"
+        f"{REVSHARE_OFFER_TEXT}"
+    )
+
+    sonnet_payloads: list[dict] = []
+    for r in rows:
+        channels_txt = ", ".join(str(c) for c in (r.get("channels") or []) if str(c).strip())
+        sig = str(r.get("signal_summary") or "").strip()
+        sample = str(r.get("sample_message") or r.get("their_angle") or "").strip()
+        raw_comp = str(r.get("company") or r.get("project") or "").strip()
+        if raw_comp.lower() in {
+            "ofm",
+            "ofm agency",
+            "franceofm",
+            "ofmfrancenetwork",
+            "networkofm",
+            "mofmnetwork",
+            "redditworldofm",
+            "aimodelnetwork",
+            "adultdeskai",
+        }:
+            raw_comp = ""
+        angle_parts = [p for p in (sig, channels_txt and f"Channels: {channels_txt}", sample[:420]) if p]
+        sonnet_payloads.append(
+            {
+                "company": raw_comp,
+                "name": str(r.get("name") or "").strip(),
+                "website": str(r.get("project_url") or r.get("url") or "").strip(),
+                "category": "OFM Agency",
+                "their_angle": " | ".join(angle_parts)
+                or "OFM agency scaling Instagram and X creator traffic via VAs",
+                "source": str(r.get("source") or "ofm_tg"),
+            }
+        )
+
+    sonnet_results: list[dict[str, str]] = [{} for _ in rows]
+    if allow_sonnet and sonnet_payloads:
+        chunks = [
+            (list(range(start, min(start + 15, len(sonnet_payloads)))), sonnet_payloads[start : start + 15])
+            for start in range(0, len(sonnet_payloads), 15)
+        ]
+        if len(chunks) > 1:
+            with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as pool:
+                futs = [
+                    (idxs, pool.submit(generate_vlad_sonnet_batch, chunk_p, model="claude-sonnet-5"))
+                    for idxs, chunk_p in chunks
+                ]
+                for idxs, fut in futs:
+                    try:
+                        gen_list = fut.result()
+                    except Exception:
+                        gen_list = []
+                    for i, gen_obj in zip(idxs, gen_list):
+                        if isinstance(gen_obj, dict):
+                            sonnet_results[i] = gen_obj
+        else:
+            try:
+                gen_list = generate_vlad_sonnet_batch(chunks[0][1], model="claude-sonnet-5")
+            except Exception:
+                gen_list = []
+            for i, gen_obj in zip(chunks[0][0], gen_list):
+                if isinstance(gen_obj, dict):
+                    sonnet_results[i] = gen_obj
+
+    out: list[dict] = []
+    for r, pay, gen_obj in zip(rows, sonnet_payloads, sonnet_results):
+        s1 = str(gen_obj.get("step1_text") or "").strip()
+        aud = str(gen_obj.get("audience") or "").strip().lower()
+        if aud not in VALID_AUDIENCES:
+            aud = "buyers"
+        if (
+            not s1
+            or "SoftUGC" not in s1
+            or REVSHARE_OFFER_TEXT not in s1
+            or "Came across your project." in s1
+        ):
+            s1 = ofm_fallback_step1
+        s1 = re.sub(r"\bCreatorOS\b", "SoftUGC", s1, flags=re.I)
+        f1 = followup_one(
+            str(pay.get("company") or r.get("name") or "your agency"),
+            str(pay.get("their_angle") or ""),
+            audience=aud,
+            category="OFM",
+            site=str(pay.get("website") or ""),
+        )
+        out.append(
+            {
+                "first_touch": s1,
+                "step1_text": s1,
+                "hook": s1,
+                "audience": aud,
+                "followup_1": f1,
+                "step2_text": f1,
+                "followup_2": VLAD_STEP3_TEXT,
+                "step3_text": VLAD_STEP3_TEXT,
+            }
+        )
     return out
 
 

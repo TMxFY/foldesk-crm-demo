@@ -48,6 +48,9 @@ DEFAULT_GRAPH_SEED_CHANNELS: tuple[str, ...] = (
     "neurochannel",
     "gamedev_ru",
     "ton_builders",
+    "ai_founders",
+    "microconf",
+    "startups",
 )
 MAX_SUBSCRIBERS = 100_000
 

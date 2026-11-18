@@ -82,6 +82,35 @@ _GENERIC_BRAND_WORDS = frozenset(
         "stealthco",
     }
 )
+_ROLE_EMAIL_PREFIXES = frozenset(
+    {
+        "info",
+        "support",
+        "hello",
+        "hi",
+        "hey",
+        "contact",
+        "sales",
+        "team",
+        "admin",
+        "office",
+        "press",
+        "help",
+        "care",
+        "marketing",
+        "billing",
+        "privacy",
+        "legal",
+        "aso",
+        "research",
+        "jobs",
+        "careers",
+        "noreply",
+        "no-reply",
+        "founders",
+        "founder",
+    }
+)
 
 
 def _is_valid_personal_tg_handle(raw: Any) -> bool:
@@ -192,6 +221,50 @@ def _default_tme_fetch(nick: str) -> Any:
         )
     except requests.RequestException:
         return ""
+
+
+def _default_site_fetch(domain: str) -> str:
+    clean = str(domain or "").strip().lower().removeprefix("www.").strip("/")
+    if not clean or "." not in clean:
+        return ""
+    try:
+        resp = requests.get(
+            f"https://{clean}",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SoftUGC/1.0)"},
+            timeout=4,
+            allow_redirects=True,
+        )
+        if int(getattr(resp, "status_code", 0) or 0) == 200:
+            return str(getattr(resp, "text", "") or "")[:200_000]
+    except requests.RequestException:
+        pass
+    return ""
+
+
+def _extract_social_or_email_candidates(row: dict[str, Any]) -> list[tuple[str, str]]:
+    cands: list[tuple[str, str]] = []
+    ig = str(row.get("instagram_url") or row.get("instagram") or "").strip()
+    m_ig = re.search(r"instagram\.com/([A-Za-z0-9._]{3,32})", ig, re.I)
+    if m_ig:
+        h_ig = m_ig.group(1).strip(".").replace(".", "_")
+        if h_ig.lower() not in {"p", "reel", "reels", "explore", "stories"}:
+            cands.append((h_ig, "instagram_handle_confirmed"))
+    for lk_key in ("founder_linkedin", "linkedin_url", "linkedin"):
+        lk = str(row.get(lk_key) or "").strip()
+        m_li = re.search(r"linkedin\.com/in/([A-Za-z0-9\-_%]+)", lk, re.I)
+        if m_li:
+            slug = re.sub(r"-[0-9a-f]{6,}$", "", m_li.group(1), flags=re.I)
+            slug = re.sub(r"-\d+$", "", slug)
+            for variant in (slug.replace("-", "_"), slug.replace("-", "")):
+                cands.append((variant, "linkedin_handle_confirmed"))
+    for em_key in ("work_email", "email"):
+        em = str(row.get(em_key) or "").strip()
+        if "@" in em:
+            local = em.split("@", 1)[0].strip().lower()
+            if local and local not in _ROLE_EMAIL_PREFIXES:
+                for variant in (local.replace(".", "_"), local.replace(".", "")):
+                    cands.append((variant, "email_handle_confirmed"))
+    return cands
 
 
 def _parse_tme_response(resp: Any, nick: str) -> tuple[bool, str, str]:
@@ -340,6 +413,7 @@ def bridge_lead_to_telegram(
     x_profile_fn=None,
     search_fn=None,
     tme_fetch_fn=None,
+    fetch_site_fn=None,
 ) -> dict[str, Any]:
     """Attempt to resolve a verified personal Telegram handle for a non-TG lead."""
     out = dict(row)
@@ -350,6 +424,15 @@ def bridge_lead_to_telegram(
     get_x = _default_x_profile if x_profile_fn is None else x_profile_fn
     do_search = _default_search if search_fn is None else search_fn
     fetch_tme = _default_tme_fetch if tme_fetch_fn is None else tme_fetch_fn
+    do_site_fetch = (
+        fetch_site_fn
+        if fetch_site_fn is not None
+        else (
+            _default_site_fetch
+            if (x_profile_fn is None and search_fn is None and tme_fetch_fn is None)
+            else None
+        )
+    )
 
     raw_site = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
     domain = domain_of(raw_site)
@@ -371,6 +454,11 @@ def bridge_lead_to_telegram(
         seen_cands.add(low)
         candidates.append((nick, kind, require_confirm))
 
+    # 0) Explicit t.me handles already present in lead links/bio
+    links_blob = " ".join(str(u) for u in (out.get("links") or []) if u)
+    for nick in _extract_tme_handles(f"{links_blob} {out.get('bio') or ''}"):
+        _add_cand(nick, "links_explicit", False)
+
     # 1) Founder's own X profile bio
     if x_handle:
         try:
@@ -381,8 +469,18 @@ def bridge_lead_to_telegram(
         for nick in _extract_tme_handles(bio_blob):
             _add_cand(nick, "x_bio_explicit", False)
 
-    # 2) Web search `site:t.me "<domain>"` or `"<brand>"`
+    # 2) Direct product website HTML scan for explicit t.me handles
+    if domain and do_site_fetch is not None:
+        try:
+            site_html = do_site_fetch(domain)
+        except Exception:
+            site_html = ""
+        for nick in _extract_tme_handles(site_html):
+            _add_cand(nick, "website_direct", False)
+
+    # 3) Web search `site:t.me "<domain>"` or `"<brand>"`
     search_target = f'"{domain}"' if domain else (f'"{brand}"' if len(brand) >= 4 else "")
+    found_domain_explicit = False
     if search_target:
         query = f"site:t.me {search_target}"
         try:
@@ -395,6 +493,8 @@ def bridge_lead_to_telegram(
             hit_snip = str(hit.get("snippet") or hit.get("description") or "").strip()
             hit_blob = f"{hit_url} {hit_title} {hit_snip}"
             has_exact_domain = bool(domain and domain.lower() in hit_blob.lower())
+            if has_exact_domain:
+                found_domain_explicit = True
             for nick in _extract_tme_handles(hit_blob):
                 _add_cand(
                     nick,
@@ -402,9 +502,31 @@ def bridge_lead_to_telegram(
                     not has_exact_domain,
                 )
 
-    # 3) Same-handle candidate from X handle (strict anti-namesake confirmation required)
+    # 3b) Secondary person-name + brand search when multi-word founder name is known
+    founder_raw = " ".join(str(out.get("founder_name") or out.get("name") or "").split()).strip()
+    founder_words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", founder_raw)]
+    if (
+        not found_domain_explicit
+        and len(founder_words) >= 2
+        and founder_raw.casefold() != brand.casefold()
+        and len(brand) >= 3
+    ):
+        try:
+            s_payload_2 = do_search(f'site:t.me "{founder_raw}" "{brand}"')
+        except Exception:
+            s_payload_2 = None
+        for hit in _unwrap_search_hits(s_payload_2):
+            hit_blob = " ".join(
+                str(hit.get(k) or "").strip() for k in ("url", "title", "snippet", "description")
+            )
+            for nick in _extract_tme_handles(hit_blob):
+                _add_cand(nick, "founder_search_verified", True)
+
+    # 4) Same-handle / social / personal email candidates (strict anti-namesake confirmation required)
     if x_handle:
         _add_cand(x_handle, "x_handle_verified", True)
+    for social_nick, social_kind in _extract_social_or_email_candidates(out):
+        _add_cand(social_nick, social_kind, True)
 
     for nick, match_kind, require_confirm in candidates:
         try:
@@ -474,7 +596,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Bridge non-TG leads to verified Telegram handles")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--max-rows", type=int, default=20)
+    parser.add_argument("--max-rows", type=int, default=35)
     args = parser.parse_args(argv)
 
     in_path = Path(args.input)

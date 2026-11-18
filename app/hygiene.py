@@ -368,6 +368,27 @@ def _call_external_sniper_reject(
     return str(res or "").strip()
 
 
+def is_ofm_campaign_name(
+    camp_name: str | None,
+    leadgen_sources_json: str | None = None,
+) -> bool:
+    """Return True strictly for dedicated OFM campaigns (never mixed B2B campaigns)."""
+    cname = str(camp_name or "").strip()
+    if cname and re.search(r"\bofm\b", cname, re.IGNORECASE):
+        return True
+    raw_src = str(leadgen_sources_json or "").strip()
+    if raw_src.startswith("["):
+        try:
+            parsed = json.loads(raw_src)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list) and parsed:
+            norm = {str(x or "").strip().lower() for x in parsed if str(x or "").strip()}
+            if norm and norm <= {"ofm_groups", "ofm_tg"}:
+                return True
+    return False
+
+
 def sniper_lead_violation_reason(
     *,
     name: str = "",
@@ -378,6 +399,7 @@ def sniper_lead_violation_reason(
     url: str = "",
     lead_source: str = "",
     vacancies_enabled: bool = False,
+    ofm_enabled: bool = False,
 ) -> str:
     name_s = _fix_mojibake(name).strip()
     company_s = _fix_mojibake(company).strip()
@@ -387,6 +409,19 @@ def sniper_lead_violation_reason(
     url_s = str(url or "").strip()
     src_s = _fix_mojibake(lead_source).strip()
 
+    blob = "\n".join(p for p in (name_s, company_s, niche_s, note_s, desc_s, url_s, src_s) if p)
+    if not blob:
+        return ""
+
+    if ofm_enabled:
+        if re.search(
+            r"\b(?:matrixreach|matrixreach_bot|firsay|1win(?:\s+partners)?|1xbet|mostbet)\b",
+            blob,
+            re.IGNORECASE,
+        ):
+            return "запрещённый спам/казино паттерн в OFM-кампании"
+        return ""
+
     if niche_s:
         niche_norm = " ".join(niche_s.lower().split())
         if (
@@ -395,10 +430,6 @@ def sniper_lead_violation_reason(
             or any(sub in niche_norm for sub in _REJECTED_SNIPER_NICHE_SUBSTRINGS)
         ):
             return f"нецелевая категория ({niche_s})"
-
-    blob = "\n".join(p for p in (name_s, company_s, niche_s, note_s, desc_s, url_s, src_s) if p)
-    if not blob:
-        return ""
 
     ext_reason = _call_external_sniper_reject(
         blob=blob,
@@ -631,6 +662,26 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
     active_junk_leads: list[tuple[int, str, dict[str, Any]]] = []
     dirty_title_leads: list[tuple[int, str, str | None, dict[str, Any]]] = []
 
+    ofm_camp_ids = {
+        int(c["id"])
+        for c in conn.execute("SELECT id, name, leadgen_sources_json FROM campaigns").fetchall()
+        if is_ofm_campaign_name(c["name"], c["leadgen_sources_json"])
+    }
+    has_ofm_camp = bool(ofm_camp_ids)
+    ofm_lead_ids: set[int] = set()
+    ofm_usernames: set[str] = set()
+    if ofm_camp_ids:
+        ph = ",".join("?" for _ in ofm_camp_ids)
+        for orow in conn.execute(
+            f"SELECT lead_id, username FROM campaign_recipients WHERE campaign_id IN ({ph})",
+            tuple(sorted(ofm_camp_ids)),
+        ).fetchall():
+            if orow["lead_id"] is not None:
+                ofm_lead_ids.add(int(orow["lead_id"]))
+            ou = _clean_username_token(orow["username"]).lower()
+            if ou:
+                ofm_usernames.add(ou)
+
     outreach_lead_ids: set[int] = set()
     outreach_usernames: set[str] = set()
     for rr_link in conn.execute(
@@ -654,6 +705,12 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
 
         status_low = str(ld.get("status") or "").strip().lower()
         lead_source = str(ld.get("lead_source") or "").strip()
+        uname_ld = _clean_username_token(ld.get("username")).lower()
+        is_ofm_lead = (
+            (lid in ofm_lead_ids)
+            or (bool(uname_ld) and uname_ld in ofm_usernames)
+            or (has_ofm_camp and lead_source.lower().startswith("ofm"))
+        )
         is_cold_src = _is_cold_outreach_eligible_lead(
             ld,
             outreach_lead_ids=outreach_lead_ids,
@@ -681,11 +738,12 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
                 url=str(ld.get("url") or ""),
                 lead_source=lead_source,
                 vacancies_enabled=False,
+                ofm_enabled=is_ofm_lead,
             )
             if reason:
                 active_junk_leads.append((lid, reason, ld))
 
-        if status_low != "won" and is_cold_src:
+        if status_low != "won" and is_cold_src and not is_ofm_lead:
             cur_name = str(ld.get("name") or "")
             cur_comp_raw = ld.get("company")
             cur_comp = str(cur_comp_raw).strip() if cur_comp_raw is not None and str(cur_comp_raw).strip() != "" else None
@@ -707,6 +765,7 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
         rid = int(rd["id"])
         if _is_vacancy_or_qa_campaign(rd.get("camp_name"), rd.get("camp_sources_json")):
             continue
+        is_ofm_rec = is_ofm_campaign_name(rd.get("camp_name"), rd.get("camp_sources_json"))
         linked_lead = leads_by_id.get(int(rd["lead_id"])) if rd.get("lead_id") is not None else None
         if linked_lead is not None and is_protected_crm_deal(linked_lead):
             continue
@@ -731,6 +790,7 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
             url=str(rd.get("website") or (linked_lead or {}).get("url") or ""),
             lead_source=str((linked_lead or {}).get("lead_source") or ""),
             vacancies_enabled=False,
+            ofm_enabled=is_ofm_rec,
         )
         if rec_reason:
             active_junk_recipients.append((rid, rec_reason, rd))

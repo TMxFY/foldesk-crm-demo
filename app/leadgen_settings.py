@@ -50,6 +50,9 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "touch_mode": "direct",  # "direct" | "micro_ping"
         "target_campaign_tg": "Leadgen Auto (TG)",
         "target_campaign_wa": "Leadgen Auto (WA)",
+        "target_campaign_ofm": "SoftUGC — OFM (TG)",
+        "ofm_outreach_enabled": False,
+        "ofm_daily_limit": 25,
         "campaign_daily_limit": 30,
         "sources": {
             "tg_groups": True,
@@ -73,7 +76,18 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "tg_identity_bridge": True,
         },
         "tg_groups_old": ["producthunt_heroes", "id1613398776"],
-        "tg_groups_new": ["productcircle_chat", "solofounderschat", "saasfounders"],
+        "tg_groups_new": [
+            "productcircle_chat",
+            "solofounderschat",
+            "saasfounders",
+            "indiehackers",
+            "saas_chat",
+            "founders_chat",
+            "startupchat",
+            "buildinpublic",
+            "appfounders",
+            "marketing_chat",
+        ],
         "tg_comment_channels": [],
         "ofm_tg_groups": [
             "FranceOFM",
@@ -183,6 +197,15 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
     b2b["target_campaign_tg"] = str(b2b.get("target_campaign_tg") or "Leadgen Auto (TG)").strip() or "Leadgen Auto (TG)"
     b2b["target_campaign_wa"] = str(b2b.get("target_campaign_wa") or "Leadgen Auto (WA)").strip() or "Leadgen Auto (WA)"
+    b2b["target_campaign_ofm"] = str(b2b.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip() or "SoftUGC — OFM (TG)"
+    b2b["ofm_outreach_enabled"] = bool(b2b.get("ofm_outreach_enabled", False))
+    try:
+        ofm_limit = int(b2b.get("ofm_daily_limit", 25))
+    except (TypeError, ValueError):
+        raise ValueError("b2b.ofm_daily_limit должен быть от 1 до 500") from None
+    if not (1 <= ofm_limit <= 500):
+        raise ValueError("b2b.ofm_daily_limit должен быть от 1 до 500")
+    b2b["ofm_daily_limit"] = ofm_limit
 
     try:
         b2b_limit = int(b2b.get("campaign_daily_limit", 30))
@@ -738,6 +761,23 @@ def sync_leadgen_campaigns(
                     "is_b2b": True,
                 }
             )
+        ofm_name = str(b2b.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip()
+        if (
+            b2b.get("ofm_outreach_enabled", False)
+            and ofm_name
+            and ofm_name.lower() != tg_name.lower()
+        ):
+            ofm_lim = max(1, min(500, int(b2b.get("ofm_daily_limit") or 25)))
+            targets.append(
+                {
+                    "name": ofm_name,
+                    "daily_limit": ofm_lim,
+                    "leadgen_daily_quota": ofm_lim,
+                    "leadgen_sources": ["ofm_groups"],
+                    "default_steps": DEFAULT_B2B_STEPS,
+                    "is_b2b": True,
+                }
+            )
 
     raw_vac_lim = vac.get("daily_limit")
     resolved_vac_lim = 20 if raw_vac_lim is None else int(raw_vac_lim)
@@ -882,7 +922,7 @@ def _ingest_leads_without_campaign_limit_mutation(
 
 
 def _load_push_watermark(conn: sqlite3.Connection) -> dict[str, Any]:
-    out: dict[str, Any] = {"files": {}, "vacancies": {}}
+    out: dict[str, Any] = {"files": {}, "vacancies": {}, "ofm_files": {}}
     try:
         row = conn.execute(
             "SELECT value FROM kv_settings WHERE key = 'leadgen_push_watermark'"
@@ -894,6 +934,8 @@ def _load_push_watermark(conn: sqlite3.Connection) -> dict[str, Any]:
                     out["files"] = dict(parsed["files"])
                 if isinstance(parsed.get("vacancies"), dict):
                     out["vacancies"] = dict(parsed["vacancies"])
+                if isinstance(parsed.get("ofm_files"), dict):
+                    out["ofm_files"] = dict(parsed["ofm_files"])
     except Exception:
         pass
     return out
@@ -928,12 +970,15 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
         """
         SELECT COUNT(*) FROM campaign_recipients cr
         JOIN campaigns c ON c.id = cr.campaign_id
-        WHERE c.leadgen_enabled = 1 AND cr.created_at LIKE ?
+        WHERE c.leadgen_enabled = 1
+          AND lower(COALESCE(c.name, '')) NOT LIKE '%ofm%'
+          AND cr.created_at LIKE ?
         """,
         (f"{today}%",),
     ).fetchone()[0]
     remaining_quota = max(0, total_quota - int(already_today or 0))
-    if remaining_quota <= 0 and total_quota > 0:
+    ofm_outreach_active = bool((cfg.get("b2b") or {}).get("ofm_outreach_enabled", False))
+    if remaining_quota <= 0 and total_quota > 0 and not ofm_outreach_active:
         return {
             "ok": True,
             "ingested": 0,
@@ -1373,6 +1418,123 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 )
                 ingested_total += added_wa
                 campaigns_created += created_wa
+
+    # 3. OFM review leads -> separate isolated OFM campaign (only when explicitly enabled)
+    ofm_path = state_dir / "ofm_review_leads.jsonl"
+    if ofm_outreach_active and b2b_cfg.get("enabled", True) and state_dir.is_dir() and ofm_path.is_file() and ofm_path.stat().st_size > 0:
+        from app.hygiene import _normalize_ofm_review_record, _ofm_review_canonical_keys
+        from leadgen.outreach_copy import build_ofm_vlad_copy_batch
+
+        ofm_camp_name = str(b2b_cfg.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip() or "SoftUGC — OFM (TG)"
+        ofm_daily_lim = max(1, min(500, int(b2b_cfg.get("ofm_daily_limit") or 25)))
+        ofm_push_cap = max(100, ofm_daily_lim)
+        wm_ofm = wm.setdefault("ofm_files", {})
+        ofm_st = ofm_path.stat()
+        ofm_size = int(ofm_st.st_size)
+        ofm_mtime_ns = int(ofm_st.st_mtime_ns)
+        prev_ofm = wm_ofm.get(ofm_path.name) if isinstance(wm_ofm.get(ofm_path.name), dict) else None
+        ofm_already_done = bool(
+            prev_ofm is not None
+            and prev_ofm.get("done") is True
+            and int(prev_ofm.get("size") or -1) == ofm_size
+            and int(prev_ofm.get("mtime_ns") or -1) == ofm_mtime_ns
+        )
+        if not ofm_already_done:
+            ofm_lines = ofm_path.read_text(encoding="utf-8").splitlines()
+            if prev_ofm is not None and (
+                ofm_size > int(prev_ofm.get("size") or 0)
+                or (
+                    ofm_size == int(prev_ofm.get("size") or 0)
+                    and int(prev_ofm.get("mtime_ns") or -1) == ofm_mtime_ns
+                    and not prev_ofm.get("done")
+                )
+            ):
+                ofm_start = min(max(0, int(prev_ofm.get("offset") or 0)), len(ofm_lines))
+            else:
+                ofm_start = 0
+
+            ofm_raw_batch: list[dict[str, Any]] = []
+            ofm_seen_keys: set[str] = set()
+            ofm_next_offset = len(ofm_lines)
+            ofm_reached_end = True
+            for line_idx in range(ofm_start, len(ofm_lines)):
+                if len(ofm_raw_batch) >= ofm_push_cap:
+                    ofm_next_offset = line_idx
+                    ofm_reached_end = False
+                    break
+                raw_ln = ofm_lines[line_idx].strip()
+                if not raw_ln:
+                    continue
+                try:
+                    parsed_row = json.loads(raw_ln)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed_row, dict):
+                    continue
+                norm = _normalize_ofm_review_record(parsed_row)
+                uname_o = str(norm.get("username") or "").strip().lstrip("@")
+                if not uname_o:
+                    continue
+                ckeys = _ofm_review_canonical_keys(norm)
+                if ckeys and (ckeys & ofm_seen_keys):
+                    continue
+                ofm_seen_keys.update(ckeys)
+                ofm_raw_batch.append(norm)
+
+            if ofm_raw_batch:
+                drafted_batch = build_ofm_vlad_copy_batch(ofm_raw_batch)
+                ofm_payload: list[dict[str, Any]] = []
+                for norm, drafted in zip(ofm_raw_batch, drafted_batch):
+                    market_tag = str(norm.get("market") or "EN").strip() or "EN"
+                    grp_tag = str(norm.get("source_group") or "").strip()
+                    sig_tag = str(norm.get("signal_summary") or "").strip()
+                    sample_tag = str(norm.get("sample_message") or "").strip()
+                    note_txt = f"[{norm.get('ofm_tier') or 'traffic_buyer'}] {grp_tag} ({market_tag})\n{sample_tag}".strip()
+                    ofm_payload.append(
+                        {
+                            "name": norm.get("name") or norm.get("username") or "OFM Buyer",
+                            "username": norm.get("username"),
+                            "company": norm.get("company") or grp_tag or "OFM Agency",
+                            "url": norm.get("project_url") or norm.get("url") or norm.get("tg_url") or "",
+                            "website": norm.get("project_url") or norm.get("url") or "",
+                            "niche": f"OFM ({market_tag})",
+                            "category": "OFM / AI UGC",
+                            "lead_source": norm.get("source") or "ofm_tg",
+                            "source": norm.get("source") or "ofm_tg",
+                            "ofm_tier": norm.get("ofm_tier") or "traffic_buyer",
+                            "icp_score": int(norm.get("icp_score") or 90),
+                            "their_angle": sig_tag,
+                            "note": note_txt,
+                            "first_touch": drafted["first_touch"],
+                            "step1_text": drafted["step1_text"],
+                            "hook": drafted["hook"],
+                            "audience": drafted["audience"],
+                            "followup_1": drafted["followup_1"],
+                            "step2_text": drafted["step2_text"],
+                            "followup_2": drafted["followup_2"],
+                            "step3_text": drafted["step3_text"],
+                            "provider": "telegram",
+                        }
+                    )
+                added_ofm, created_ofm = _ingest_leads_without_campaign_limit_mutation(
+                    conn,
+                    call_mcp_tool_handler=call_mcp_tool_handler,
+                    leads_slice=ofm_payload,
+                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
+                    campaign_name=ofm_camp_name,
+                    default_quota=ofm_daily_lim,
+                    default_sources=["ofm_groups"],
+                )
+                ingested_total += added_ofm
+                campaigns_created += created_ofm
+
+            wm_ofm[ofm_path.name] = {
+                "mtime_ns": ofm_mtime_ns,
+                "size": ofm_size,
+                "offset": ofm_next_offset,
+                "done": ofm_reached_end,
+            }
+            wm_dirty = True
 
     if wm_dirty:
         _save_push_watermark(conn, wm)
