@@ -604,6 +604,14 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
     contacted_peer_ids: set[int] = set()
     contacted_usernames: set[str] = set()
     contacted_phones: set[str] = set()
+    reg_lead_ids: set[int] = set()
+    reg_peer_ids: set[int] = set()
+    reg_usernames: set[str] = set()
+    reg_phones: set[str] = set()
+    vac_lead_ids: set[int] = set()
+    vac_peer_ids: set[int] = set()
+    vac_usernames: set[str] = set()
+    vac_phones: set[str] = set()
     rec_rows = [
         as_dict(r)
         for r in conn.execute(
@@ -654,6 +662,25 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
                 rec_by_user[cu] = enriched_cr
             if cph and (cph not in rec_by_phone or (rec_by_phone[cph]["_is_vacancy"] and not is_vacancy)):
                 rec_by_phone[cph] = enriched_cr
+
+        if is_vacancy:
+            if cr.get("lead_id") is not None:
+                vac_lead_ids.add(int(cr["lead_id"]))
+            if cr.get("telegram_user_id") is not None:
+                vac_peer_ids.add(int(cr["telegram_user_id"]))
+            if cu:
+                vac_usernames.add(cu)
+            if cph:
+                vac_phones.add(cph)
+        else:
+            if cr.get("lead_id") is not None:
+                reg_lead_ids.add(int(cr["lead_id"]))
+            if cr.get("telegram_user_id") is not None:
+                reg_peer_ids.add(int(cr["telegram_user_id"]))
+            if cu:
+                reg_usernames.add(cu)
+            if cph:
+                reg_phones.add(cph)
 
         if is_contacted and not is_vacancy and not is_hygiene_v11:
             if cr.get("lead_id") is not None:
@@ -782,12 +809,28 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
         if matched_lead is None and not matched_contacted:
             continue
 
+        eff_lid = dlid if dlid is not None else (int(matched_lead["id"]) if matched_lead else None)
+        lead_st = matched_lead.get("_norm_status") if matched_lead else None
+        has_reg_rec = bool(
+            (eff_lid is not None and eff_lid in reg_lead_ids)
+            or (peer_id is not None and peer_id in reg_peer_ids)
+            or (uname and uname in reg_usernames)
+            or (ph15 and ph15 in reg_phones)
+        )
+        has_vac_rec = bool(
+            (eff_lid is not None and eff_lid in vac_lead_ids)
+            or (peer_id is not None and peer_id in vac_peer_ids)
+            or (uname and uname in vac_usernames)
+            or (ph15 and ph15 in vac_phones)
+        )
+        if has_vac_rec and not has_reg_rec and lead_st != "won":
+            continue
+
         eligible_crm_dialog_ids.add(did)
         is_sniper_quarantined = str((matched_lead or {}).get("next_step") or "").startswith(
             "Авто-карантин Sniper ICP"
         )
         unread_cnt = int(d.get("unread_count") or 0)
-        lead_st = matched_lead.get("_norm_status") if matched_lead else None
         lead_at_st = matched_lead.get("airtable_status") if matched_lead else None
         has_body = bool(str(d.get("last_message_preview") or "").strip()) or bool(
             msg_in_summary_by_dlg.get(did)
@@ -2453,7 +2496,7 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
     }
 
 
-def _compact_deep_item(item: dict) -> dict:
+def _compact_deep_item(item: dict, *, text_cap: int = 70) -> dict:
     return {
         "lead_id": item.get("lead_id"),
         "dialog_id": item.get("dialog_id"),
@@ -2466,7 +2509,7 @@ def _compact_deep_item(item: dict) -> dict:
         "company": item.get("company") or "",
         "reply_intent": item.get("reply_intent"),
         "reply_intent_label": item.get("reply_intent_label"),
-        "reply_text": str(item.get("reply_text") or "")[:90],
+        "reply_text": str(item.get("reply_text") or "")[:text_cap],
         "last_touch_at": item.get("last_touch_at") or "",
         "fine_status": item.get("fine_status") or "",
     }
@@ -2475,12 +2518,13 @@ def _compact_deep_item(item: dict) -> dict:
 def _compact_deep_outreach_for_summary(
     deep: dict,
     *,
-    waiting_limit: int = 15,
-    stalled_limit: int = 10,
-    positive_limit: int = 10,
-    hooks_limit: int = 12,
-    categories_limit: int = 10,
-    niches_limit: int = 10,
+    waiting_limit: int = 6,
+    stalled_limit: int = 4,
+    positive_limit: int = 4,
+    hooks_limit: int = 6,
+    categories_limit: int = 5,
+    niches_limit: int = 5,
+    text_cap: int = 70,
 ) -> dict:
     all_waiting = deep.get("waiting_items") or []
     all_stalled = deep.get("stalled_items") or []
@@ -2494,14 +2538,14 @@ def _compact_deep_outreach_for_summary(
     for h in all_hooks[:hooks_limit]:
         hc = dict(h)
         if hc.get("sample_text"):
-            hc["sample_text"] = str(hc["sample_text"])[:80]
+            hc["sample_text"] = str(hc["sample_text"])[:55]
         compact_hooks.append(hc)
 
     compact_steps = []
     for st in all_steps:
         sc = dict(st)
         if sc.get("template_text"):
-            sc["template_text"] = str(sc["template_text"])[:100]
+            sc["template_text"] = str(sc["template_text"])[:65]
         compact_steps.append(sc)
 
     return {
@@ -2510,9 +2554,9 @@ def _compact_deep_outreach_for_summary(
         "hooks_breakdown": compact_hooks,
         "categories_breakdown": all_cats[:categories_limit],
         "niches_breakdown": all_niches[:niches_limit],
-        "waiting_items": [_compact_deep_item(x) for x in all_waiting[:waiting_limit]],
-        "stalled_items": [_compact_deep_item(x) for x in all_stalled[:stalled_limit]],
-        "positive_items": [_compact_deep_item(x) for x in all_positive[:positive_limit]],
+        "waiting_items": [_compact_deep_item(x, text_cap=text_cap) for x in all_waiting[:waiting_limit]],
+        "stalled_items": [_compact_deep_item(x, text_cap=text_cap) for x in all_stalled[:stalled_limit]],
+        "positive_items": [_compact_deep_item(x, text_cap=text_cap) for x in all_positive[:positive_limit]],
         "waiting_items_total": len(all_waiting),
         "stalled_items_total": len(all_stalled),
         "positive_items_total": len(all_positive),
@@ -2521,6 +2565,41 @@ def _compact_deep_outreach_for_summary(
         "niches_total": len(all_niches),
         "drilldown_endpoint": "/api/analytics/deep-outreach",
     }
+
+
+def _enforce_summary_payload_budget(
+    payload: dict,
+    deep_full: dict,
+    *,
+    max_bytes: int = 58 * 1024,
+) -> dict:
+    if len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")) <= max_bytes:
+        return payload
+
+    payload["deep_outreach"] = _compact_deep_outreach_for_summary(
+        deep_full,
+        waiting_limit=3,
+        stalled_limit=2,
+        positive_limit=2,
+        hooks_limit=4,
+        categories_limit=3,
+        niches_limit=3,
+        text_cap=45,
+    )
+    if len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")) <= max_bytes:
+        return payload
+
+    # Second-stage trim preserving summary KPIs while shedding heavy redundant sub-arrays
+    charts = payload.get("charts")
+    if isinstance(charts, dict):
+        hm = charts.get("reply_heatmap")
+        if isinstance(hm, dict):
+            hm.pop("hourly_matrix", None)
+        if isinstance(charts.get("daily_flow"), list) and len(charts["daily_flow"]) > 30:
+            charts["daily_flow"] = charts["daily_flow"][-30:]
+        if isinstance(charts.get("revenue_timeline"), list) and len(charts["revenue_timeline"]) > 30:
+            charts["revenue_timeline"] = charts["revenue_timeline"][-30:]
+    return payload
 
 
 def get_deep_outreach_bucket(
@@ -2605,7 +2684,7 @@ def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict
     deep_outreach_full = _compute_outreach_deep_breakdown(conn, ctx=ctx)
     deep_outreach = _compact_deep_outreach_for_summary(deep_outreach_full)
 
-    return {
+    payload = {
         "period": clean_period,
         "funnel": funnel,
         "outreach": outreach,
@@ -2621,3 +2700,4 @@ def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict
         "win_rate_pct": funnel["win_rate_pct"],
         "reply_rate_pct": outreach["reply_rate_pct"],
     }
+    return _enforce_summary_payload_budget(payload, deep_outreach_full)

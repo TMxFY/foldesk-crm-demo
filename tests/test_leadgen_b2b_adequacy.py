@@ -723,3 +723,49 @@ def test_replenish_skips_when_single_instance_flock_is_held(tmp_path: Path):
         assert res_after.get("skipped") != "already_running"
     finally:
         conn.close()
+
+
+def test_buyer_public_rotates_queries_and_dedups_static_rows(tmp_path: Path, monkeypatch):
+    from leadgen import buyer_public
+
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        buyer_public,
+        "_curl",
+        lambda url: '<a href="https://t.me/static_creator_owner">owner</a>',
+    )
+    monkeypatch.setattr("leadgen.treg_client.check_treg_ready", lambda: True)
+
+    seen_queries: list[str] = []
+
+    def _fake_treg(ep: str, **kw):
+        q = str((kw.get("query") or {}).get("q") or "")
+        seen_queries.append(q)
+        if len(seen_queries) == 1:
+            return {"results": [{"snippet": "https://t.me/whop_founder_one"}]}
+        if len(seen_queries) == 2:
+            # Returns only already-seen founder_one on Q2, so rotation continues to next query
+            return {"results": [{"snippet": "https://t.me/whop_founder_one"}]}
+        return {"results": [{"snippet": "https://t.me/whop_founder_two"}]}
+
+    monkeypatch.setattr("leadgen.treg_client.call", _fake_treg)
+
+    run1 = buyer_public.whop_rows()
+    run1_tg = [
+        item["username"]
+        for r in run1
+        for item in (r.get("telegram_verified") or [])
+    ]
+    assert "static_creator_owner" in run1_tg
+    assert "whop_founder_one" in run1_tg
+
+    # Run 2 skips already-seen static_creator_owner & whop_founder_one, advances cursor & finds new founder_two
+    run2 = buyer_public.whop_rows()
+    run2_tg = [
+        item["username"]
+        for r in run2
+        for item in (r.get("telegram_verified") or [])
+    ]
+    assert run2_tg == ["whop_founder_two"]
+    assert len(seen_queries) == 3
+    assert len(set(seen_queries)) >= 2

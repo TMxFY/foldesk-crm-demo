@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 
@@ -35,7 +36,46 @@ _WHOP_SEARCH_QUERIES = (
     'site:whop.com ("x.com/" OR "t.me/") -blog -terms',
     'site:whop.com ("content rewards" OR "clipping" OR "ugc") ("x.com" OR "t.me")',
     'site:whop.com ("saas" OR "ai" OR "fitness" OR "app") ("x.com/" OR "t.me/")',
+    'site:whop.com ("bounty" OR "creator program" OR "affiliates") ("x.com/" OR "t.me/")',
+    'site:whop.com ("software" OR "ecom" OR "trading" OR "automation") "t.me/"',
+    'site:whop.com ("mobile app" OR "ai tool" OR "brand") "x.com/"',
 )
+
+
+def _resolve_buyer_public_seen_path() -> Path:
+    state_dir_raw = str(os.environ.get("LEADGEN_STATE_DIR") or "").strip()
+    if state_dir_raw:
+        return Path(state_dir_raw) / "buyer_public_seen.json"
+    return Path(__file__).resolve().parents[1] / "data" / "leadgen_state" / "buyer_public_seen.json"
+
+
+def _load_buyer_public_state(seen_path: Path) -> tuple[int, list[str]]:
+    if not seen_path.is_file():
+        return 0, []
+    try:
+        obj = json.loads(seen_path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            idx = int(obj.get("query_idx") or 0)
+            seen = [str(x) for x in (obj.get("seen_ids") or []) if str(x).strip()]
+            return idx, seen
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return 0, []
+    return 0, []
+
+
+def _save_buyer_public_state(seen_path: Path, query_idx: int, seen_ids: list[str]) -> None:
+    try:
+        seen_path.parent.mkdir(parents=True, exist_ok=True)
+        seen_path.write_text(
+            json.dumps(
+                {"query_idx": int(query_idx) % len(_WHOP_SEARCH_QUERIES), "seen_ids": seen_ids[-2000:]},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def _owner_row(*, handle: str, telegram: str, source_url: str) -> dict:
@@ -103,7 +143,11 @@ def _curl(url: str) -> str:
     return proc.stdout
 
 
-def _whop_treg_search_rows() -> list[dict]:
+def _whop_treg_search_rows(
+    *,
+    seen_path: Path | None = None,
+    seen_ids: set[str] | None = None,
+) -> list[dict]:
     try:
         from leadgen.treg_client import call as treg_call, check_treg_ready
     except ImportError:
@@ -113,12 +157,20 @@ def _whop_treg_search_rows() -> list[dict]:
             return []
     if not check_treg_ready():
         return []
-    from datetime import datetime, timezone
 
-    slot = int(datetime.now(timezone.utc).timestamp() // 14400) % len(_WHOP_SEARCH_QUERIES)
-    ordered_queries = [_WHOP_SEARCH_QUERIES[(slot + i) % len(_WHOP_SEARCH_QUERIES)] for i in range(len(_WHOP_SEARCH_QUERIES))]
+    st_path = seen_path if seen_path is not None else _resolve_buyer_public_seen_path()
+    saved_idx, saved_list = _load_buyer_public_state(st_path)
+    already_seen = set(saved_list)
+    if seen_ids is not None:
+        already_seen.update(seen_ids)
+
+    n_q = len(_WHOP_SEARCH_QUERIES)
+    start_idx = saved_idx % n_q
+    ordered_queries = [_WHOP_SEARCH_QUERIES[(start_idx + i) % n_q] for i in range(n_q)]
     snippets: list[str] = []
-    for query in ordered_queries[:2]:
+    queries_tried = 0
+    for query in ordered_queries[:3]:
+        queries_tried += 1
         payload = treg_call(
             "crawl4ai.web.search",
             query={"q": query},
@@ -129,17 +181,30 @@ def _whop_treg_search_rows() -> list[dict]:
         results = payload.get("results") or payload.get("result") or []
         if isinstance(results, dict):
             results = results.get("results") or []
+        batch_snips: list[str] = []
         if isinstance(results, list):
             for item in results:
                 if isinstance(item, dict):
-                    snippets.append(
+                    batch_snips.append(
                         " ".join(str(item.get(k) or "") for k in ("url", "title", "snippet", "description"))
                     )
-        if snippets:
-            break
+        if batch_snips:
+            cand_rows = [
+                r
+                for r in owner_contacts("\n".join(batch_snips), source_url=DISCOVER_URL)
+                if r.get("id") not in already_seen
+            ]
+            if cand_rows:
+                snippets.extend(batch_snips)
+                break
+    _save_buyer_public_state(st_path, (start_idx + max(1, queries_tried)) % n_q, saved_list)
     if not snippets:
         return []
-    rows = owner_contacts("\n".join(snippets), source_url=DISCOVER_URL)
+    rows = [
+        r
+        for r in owner_contacts("\n".join(snippets), source_url=DISCOVER_URL)
+        if r.get("id") not in already_seen
+    ]
     for row in rows:
         row["has_monetization_signal"] = True
         row["monetization"] = "paid_product"
@@ -154,11 +219,45 @@ def whop_rows(fetch_fn=None) -> list[dict]:
     except Exception:
         html = ""
     rows = owner_contacts(html or "", source_url=DISCOVER_URL)
-    if not rows and fetch_fn is None:
-        rows = _whop_treg_search_rows()
-    if not rows:
-        print("whop: skipped (no owner with x.com or t.me)", flush=True)
-    return rows
+    if fetch_fn is not None:
+        return rows
+
+    seen_path = _resolve_buyer_public_seen_path()
+    saved_idx, saved_list = _load_buyer_public_state(seen_path)
+    already_seen = set(saved_list)
+
+    fresh_rows: list[dict] = []
+    batch_ids: set[str] = set()
+    for r in rows:
+        rid = str(r.get("id") or "")
+        if rid and rid not in already_seen and rid not in batch_ids:
+            batch_ids.add(rid)
+            fresh_rows.append(r)
+
+    treg_rows = _whop_treg_search_rows(
+        seen_path=seen_path,
+        seen_ids=(already_seen | batch_ids),
+    )
+    # Reload query_idx updated by _whop_treg_search_rows and append emitted IDs
+    next_idx, latest_saved = _load_buyer_public_state(seen_path)
+    if not treg_rows:
+        next_idx = (saved_idx + 1) % len(_WHOP_SEARCH_QUERIES)
+    for r in treg_rows:
+        rid = str(r.get("id") or "")
+        if rid and rid not in already_seen and rid not in batch_ids:
+            batch_ids.add(rid)
+            fresh_rows.append(r)
+
+    updated_seen = list(latest_saved)
+    for r in fresh_rows:
+        rid = str(r.get("id") or "")
+        if rid and rid not in updated_seen:
+            updated_seen.append(rid)
+    _save_buyer_public_state(seen_path, next_idx, updated_seen)
+
+    if not fresh_rows:
+        print("whop: skipped (no fresh owner with x.com or t.me)", flush=True)
+    return fresh_rows
 
 
 def bloss_rows() -> list[dict]:

@@ -809,6 +809,97 @@ def _normalize_lead_compare_value(
     return str(val or "").strip()
 
 
+def _is_redundant_company_for_lead(
+    name_val: Any,
+    company_val: Any,
+    url_val: Any = None,
+) -> bool:
+    comp_raw = str(company_val or "").strip()
+    if not comp_raw:
+        return False
+    try:
+        from app.hygiene import clean_crm_lead_names
+
+        _, cleaned_comp = clean_crm_lead_names(
+            str(name_val or "").strip(),
+            comp_raw,
+            str(url_val or "").strip() or None,
+        )
+        return cleaned_comp is None
+    except Exception:
+        return comp_raw.casefold() == str(name_val or "").strip().casefold()
+
+
+def _normalize_airtable_remote_value(
+    field_name: str,
+    val: Any,
+    *,
+    lead_name: Any = None,
+    lead_url: Any = None,
+) -> Any:
+    if field_name in ("Value", "Monthly Value"):
+        try:
+            return int(float(val or 0))
+        except (TypeError, ValueError):
+            return 0
+    if field_name == "Offer Type":
+        return tuple(_parse_offer_type(val))
+    if field_name in ("Next Follow-up", "Last Contacted"):
+        return _clean_date(val) or ""
+    if field_name == "Contact":
+        u, p = parse_airtable_contact(val)
+        return ((u or "").casefold(), re.sub(r"\D", "", p or "")[-15:])
+    if field_name == "Company":
+        s = _as_str(val).strip()
+        if not s:
+            return ""
+        if lead_name and _is_redundant_company_for_lead(lead_name, s, lead_url):
+            return ""
+        return s
+    if field_name == "Lead Source":
+        return normalize_lead_source_for_airtable(val)
+    return _as_str(val).strip()
+
+
+def _airtable_fields_match_remote(
+    local_fields: dict[str, Any],
+    remote_fields: dict[str, Any],
+    *,
+    lead: dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(remote_fields, dict):
+        return False
+    lead_name = (lead or {}).get("name") or local_fields.get("Lead Name")
+    lead_url = (lead or {}).get("url") or local_fields.get("Website")
+    compare_keys = (
+        "Lead Name",
+        "Status",
+        "Lead Source",
+        "Company",
+        "Value",
+        "Monthly Value",
+        "Contact",
+        "Website",
+        "Niche",
+        "Offer Type",
+        "Offer Details",
+        "Next Step",
+        "Next Follow-up",
+        "Last Contacted",
+        "Notes",
+    )
+    for k in compare_keys:
+        loc_norm = _normalize_airtable_remote_value(
+            k, local_fields.get(k), lead_name=lead_name, lead_url=lead_url
+        )
+        rem_norm = _normalize_airtable_remote_value(
+            k, remote_fields.get(k), lead_name=lead_name, lead_url=lead_url
+        )
+        if loc_norm != rem_norm:
+            return False
+    return True
+
+
 def _compute_effective_lead_patch(
     existing: dict[str, Any],
     patch: dict[str, Any],
@@ -1019,6 +1110,7 @@ def pull_from_airtable(
     *,
     client: Any = None,
     preserve_dirty: bool = False,
+    preloaded_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     _ensure_dirty_tracking_trigger(conn)
     stages = ensure_airtable_pipeline_stages(conn)
@@ -1026,7 +1118,7 @@ def pull_from_airtable(
         client = AirtableRestClient()
 
     table_name = getattr(client, "table_name", None) or DEFAULT_TABLE_NAME
-    records = client.list_records(table_name)
+    records = preloaded_records if preloaded_records is not None else client.list_records(table_name)
     now = utc_now()
 
     pulled_leads = 0
@@ -1131,6 +1223,17 @@ def pull_from_airtable(
                 or not int(existing.get("monthly_value") or 0)
             ):
                 patch["monthly_value"] = mapped["monthly_value"]
+
+            if (
+                patch.get("company")
+                and not existing.get("company")
+                and _is_redundant_company_for_lead(
+                    existing.get("name") or mapped.get("name"),
+                    patch.get("company"),
+                    existing.get("url") or mapped.get("url"),
+                )
+            ):
+                patch.pop("company", None)
 
             effective_patch = _compute_effective_lead_patch(existing, patch, conn)
             if not effective_patch:
@@ -1362,6 +1465,7 @@ def push_lead_to_airtable(
     *,
     client: Any = None,
     remote_index: dict[str, Any] | None = None,
+    remote_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _ensure_dirty_tracking_trigger(conn)
     row = conn.execute("SELECT * FROM leads WHERE id = ?", (int(lead_id),)).fetchone()
@@ -1380,6 +1484,29 @@ def push_lead_to_airtable(
     rec_id = (lead.get("airtable_record_id") or "").strip() or None
 
     if rec_id:
+        if remote_record is not None and _airtable_fields_match_remote(
+            fields,
+            remote_record.get("fields") or {},
+            lead=lead,
+        ):
+            now = utc_now()
+            airtable_st = fields.get("Status") or status_to_airtable(lead.get("status"))
+            _mark_lead_synced(
+                conn,
+                int(lead_id),
+                airtable_record_id=rec_id,
+                airtable_status=airtable_st,
+                synced_at=now,
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "action": "unchanged",
+                "lead_id": int(lead_id),
+                "airtable_record_id": rec_id,
+                "fields": fields,
+                "record": remote_record,
+            }
         remote_rec = client.update_record(table_name, rec_id, fields, typecast=True)
         action = "updated"
     else:
@@ -1388,6 +1515,31 @@ def push_lead_to_airtable(
         )
         if matched_remote and matched_remote.get("id"):
             rec_id = str(matched_remote["id"])
+            if _airtable_fields_match_remote(
+                fields,
+                matched_remote.get("fields") or {},
+                lead=lead,
+            ):
+                if remote_index is not None:
+                    remote_index["claimed"].add(rec_id)
+                now = utc_now()
+                airtable_st = fields.get("Status") or status_to_airtable(lead.get("status"))
+                _mark_lead_synced(
+                    conn,
+                    int(lead_id),
+                    airtable_record_id=rec_id,
+                    airtable_status=airtable_st,
+                    synced_at=now,
+                )
+                conn.commit()
+                return {
+                    "ok": True,
+                    "action": "unchanged",
+                    "lead_id": int(lead_id),
+                    "airtable_record_id": rec_id,
+                    "fields": fields,
+                    "record": matched_remote,
+                }
             remote_rec = client.update_record(table_name, rec_id, fields, typecast=True)
             action = "updated"
         else:
@@ -1573,6 +1725,8 @@ def sync_airtable(
     synced_projects = 0
 
     # Push STRICTLY BEFORE pull so new local leads receive airtable_record_id and dirty edits win
+    table_name_for_sync = getattr(client, "table_name", None) or DEFAULT_TABLE_NAME
+    preloaded_records: list[dict[str, Any]] | None = None
     if norm_dir in ("both", "push"):
         dirty_rows = conn.execute(
             """
@@ -1590,24 +1744,40 @@ def sync_airtable(
             """
         ).fetchall()
         remote_index: dict[str, Any] | None = None
-        if any(not str(r["airtable_record_id"] or "").strip() for r in dirty_rows):
-            table_name_for_idx = getattr(client, "table_name", None) or DEFAULT_TABLE_NAME
+        remote_by_id: dict[str, dict[str, Any]] = {}
+        if dirty_rows or norm_dir == "both":
             try:
-                preloaded = client.list_records(table_name_for_idx)
+                listed = client.list_records(table_name_for_sync)
+                if isinstance(listed, list):
+                    preloaded_records = listed
             except Exception:
-                preloaded = []
-            remote_index = _build_remote_airtable_index(conn, preloaded)
+                preloaded_records = None
+        if preloaded_records is not None:
+            for r_obj in preloaded_records:
+                if isinstance(r_obj, dict) and str(r_obj.get("id") or "").strip():
+                    remote_by_id[str(r_obj["id"]).strip()] = r_obj
+            if any(not str(r["airtable_record_id"] or "").strip() for r in dirty_rows):
+                remote_index = _build_remote_airtable_index(conn, preloaded_records)
+        elif any(not str(r["airtable_record_id"] or "").strip() for r in dirty_rows):
+            remote_index = _build_remote_airtable_index(conn, [])
         for r in dirty_rows:
-            push_lead_to_airtable(
-                conn, int(r["id"]), client=client, remote_index=remote_index
+            r_id = str(r["airtable_record_id"] or "").strip()
+            push_res = push_lead_to_airtable(
+                conn,
+                int(r["id"]),
+                client=client,
+                remote_index=remote_index,
+                remote_record=remote_by_id.get(r_id) if r_id else None,
             )
-            pushed_to_airtable += 1
+            if push_res.get("action") != "unchanged":
+                pushed_to_airtable += 1
 
     if norm_dir in ("both", "pull"):
         pull_res = pull_from_airtable(
             conn,
             client=client,
             preserve_dirty=(norm_dir == "both"),
+            preloaded_records=preloaded_records if pushed_to_airtable == 0 else None,
         )
         pulled_leads = int(pull_res.get("pulled_leads") or 0)
         created_in_crm = int(pull_res.get("created_in_crm") or 0)

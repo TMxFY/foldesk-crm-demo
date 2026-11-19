@@ -125,16 +125,26 @@ def _audit_ssot_statistics(conn: sqlite3.Connection) -> dict:
         (get_inbox_counts(conn, account_id=0, crm_only=True) or {}).get("waiting") or 0
     )
     analytics_waiting = int(deep_sum.get("waiting_our_answer") or 0)
-    leads_waiting = sum(
+    inbox_rows = list_inbox(conn, account_id=0, crm_only=True, limit=0)
+    eligible_dlg_ids = {int(d["id"]) for d in inbox_rows if d.get("id") is not None}
+    inbox_linked_waiting = sum(
+        1
+        for d in inbox_rows
+        if d.get("is_waiting_our_answer") and d.get("lead_id") is not None
+    )
+    leads_crm_linked_waiting = sum(
         1
         for ld in search_leads(conn)
-        if is_waiting_our_answer(
+        if ld.get("dialog_id") is not None
+        and int(ld["dialog_id"]) in eligible_dlg_ids
+        and is_waiting_our_answer(
             ld.get("last_from_peer"), ld.get("status"), ld.get("airtable_status")
         )
     )
-    if not (inbox_waiting == leads_waiting == analytics_waiting):
+    if inbox_waiting != analytics_waiting or inbox_linked_waiting != leads_crm_linked_waiting:
         issues.append(
-            f"ssot_waiting_parity_mismatch(inbox={inbox_waiting},leads={leads_waiting},analytics={analytics_waiting})"
+            f"ssot_waiting_parity_mismatch(inbox={inbox_waiting},analytics={analytics_waiting},"
+            f"inbox_linked={inbox_linked_waiting},leads_linked={leads_crm_linked_waiting})"
         )
 
     accounts_obj = summary.get("accounts") or {}
@@ -176,8 +186,10 @@ def _audit_ssot_statistics(conn: sqlite3.Connection) -> dict:
         "analytics_payload_bytes": payload_bytes,
         "waiting_parity": {
             "inbox": inbox_waiting,
-            "leads": leads_waiting,
             "analytics": analytics_waiting,
+            "inbox_linked_leads": inbox_linked_waiting,
+            "leads_crm_linked": leads_crm_linked_waiting,
+            "unlinked_waiting_dialogs": max(0, inbox_waiting - inbox_linked_waiting),
         },
         "dropped_accounts_count": len(dropped_items),
         "db_dropped_accounts_count": len(db_dropped),
