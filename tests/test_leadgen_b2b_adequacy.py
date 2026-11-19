@@ -683,11 +683,15 @@ def test_discovery_rotation_and_deadline_guards(tmp_path: Path, monkeypatch: pyt
     assert spy_posts and "coolsaas.io" in spy_posts[0]
 
 
-def test_replenish_skips_when_single_instance_flock_is_held(tmp_path: Path):
+def test_replenish_skips_when_single_instance_flock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     import fcntl
     from app.db import connect, init_db
     from leadgen.vps_autonomous_replenish import run_autonomous_replenish
 
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(tmp_path / "leadgen_state"))
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(tmp_path / "leadgen_config.json"))
     db_path = tmp_path / "crm.db"
     conn = connect(db_path)
     init_db(conn)

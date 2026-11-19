@@ -21,10 +21,12 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _crmtg_ephemeral_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _crmtg_ephemeral_runtime_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CRMTG_SKIP_DOTENV", "1")
     monkeypatch.setenv("CRMTG_EPHEMERAL_RUNTIME", "1")
     monkeypatch.setenv("AIRTABLE_BG_SYNC", "0")
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(tmp_path / "_default_leadgen_state"))
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(tmp_path / "_default_leadgen_config.json"))
 
     orig_delenv = monkeypatch.delenv
 
