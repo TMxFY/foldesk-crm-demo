@@ -47,12 +47,14 @@ from app.db import (
     INBOX_MEDIA_DIR,
     ROOT,
     ThreadSafeConnection,
+    as_dict,
     connect,
     create_pipeline_stage,
     init_db,
     is_waiting_our_answer,
     list_pipeline_stages,
     locked_conn,
+    sql_norm_tg_username_expr,
     update_pipeline_stage,
     utc_now,
 )
@@ -79,6 +81,7 @@ from app.inbox import (
     get_workspace_total_dialogs,
     list_inbox,
     list_messages,
+    list_unified_inbox,
     mark_dialog_read,
     mark_dialog_unread,
     open_dialog_by_lead,
@@ -237,6 +240,14 @@ class StartDirectDialogIn(BaseModel):
     handle: str
     account_id: int | None = None
     name: str | None = None
+
+
+class SwitchAccountIn(BaseModel):
+    dialog_id: int | None = None
+    lead_id: int | None = None
+    peer_id: int | None = None
+    username: str | None = None
+    target_account_id: int
 
 
 class InboxSyncIn(BaseModel):
@@ -1842,12 +1853,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         return response
 
     from app.security import (
+        _PUBLIC_EXACT_PATHS,
         has_valid_bot_webhook_secret,
         has_valid_mcp_api_key,
         is_auth_enforced,
         register_security_middleware,
     )
 
+    _PUBLIC_EXACT_PATHS.add("/sw-inbox.js")
     register_security_middleware(app)
 
     def _resolve_db_file_path(conn_obj) -> str | None:
@@ -2040,6 +2053,20 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     @app.get("/design/tokens.css")
     def design_tokens():
         return FileResponse(ROOT / "replica" / "design" / "tokens.css", media_type="text/css")
+
+    @app.get("/sw-inbox.js")
+    def inbox_service_worker():
+        sw_path = BASE / "static" / "sw-inbox.js"
+        if not sw_path.is_file():
+            raise HTTPException(status_code=404, detail="sw-inbox.js не найден")
+        return FileResponse(
+            sw_path,
+            media_type="application/javascript",
+            headers={
+                "Service-Worker-Allowed": "/",
+                "Cache-Control": "no-cache",
+            },
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
@@ -3048,6 +3075,51 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         status: str | None = None,
         with_counts: bool = False,
         crm_only: bool = False,
+        group_by_lead: bool = False,
+    ):
+        if account_id is None or account_id == 0:
+            with locked_conn(request.app.state.conn):
+                rows = request.app.state.conn.execute(
+                    "SELECT id FROM accounts WHERE status = 'connected'"
+                ).fetchall()
+            for r in rows:
+                await ensure_private_inbox(request.app, int(r["id"]))
+        else:
+            await ensure_private_inbox(request.app, account_id)
+        if group_by_lead:
+            return _call(
+                list_unified_inbox,
+                request.app.state.conn,
+                account_id,
+                q,
+                chip,
+                provider,
+                status,
+                with_counts,
+                crm_only=bool(crm_only),
+            )
+        return _call(
+            list_inbox,
+            request.app.state.conn,
+            account_id,
+            q,
+            chip,
+            provider,
+            status,
+            with_counts,
+            crm_only=bool(crm_only),
+        )
+
+    @app.get("/api/inbox/unified")
+    async def inbox_unified_list(
+        request: Request,
+        account_id: int | None = None,
+        q: str = "",
+        chip: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        crm_only: bool = True,
+        limit: int | None = None,
     ):
         if account_id is None or account_id == 0:
             with locked_conn(request.app.state.conn):
@@ -3059,15 +3131,16 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         else:
             await ensure_private_inbox(request.app, account_id)
         return _call(
-            list_inbox,
+            list_unified_inbox,
             request.app.state.conn,
             account_id,
             q,
             chip,
             provider,
             status,
-            with_counts,
+            True,
             crm_only=bool(crm_only),
+            limit=limit,
         )
 
     @app.get("/api/inbox/counts")
@@ -3314,6 +3387,286 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             body.name,
             gateway=gateway,
         )
+
+    @app.post("/api/dialogs/switch-account")
+    async def dialogs_switch_account(body: SwitchAccountIn, request: Request):
+        conn = request.app.state.conn
+        target_account_id = int(body.target_account_id)
+
+        def _resolve_or_find_existing(db_conn) -> dict:
+            acc_row = db_conn.execute(
+                "SELECT * FROM accounts WHERE id = ?",
+                (target_account_id,),
+            ).fetchone()
+            if acc_row is None:
+                raise LookupError("account")
+            target_acc = as_dict(acc_row)
+
+            lead_id = int(body.lead_id) if body.lead_id is not None else None
+            peer_id = int(body.peer_id) if body.peer_id is not None else None
+            username = (body.username or "").strip().lstrip("@") or None
+            phone: str | None = None
+            name: str | None = None
+
+            if body.dialog_id is not None:
+                src_row = db_conn.execute(
+                    "SELECT * FROM dialogs WHERE id = ?",
+                    (int(body.dialog_id),),
+                ).fetchone()
+                if (
+                    src_row is None
+                    and lead_id is None
+                    and peer_id is None
+                    and not username
+                ):
+                    raise LookupError("dialog")
+                if src_row is not None:
+                    src = as_dict(src_row)
+                    if lead_id is None and src.get("lead_id") is not None:
+                        lead_id = int(src["lead_id"])
+                    if peer_id is None and src.get("peer_id") is not None:
+                        peer_id = int(src["peer_id"])
+                    if not username and src.get("username"):
+                        username = (
+                            str(src["username"]).strip().lstrip("@") or None
+                        )
+                    if not phone and src.get("phone"):
+                        phone = str(src["phone"]).strip() or None
+                    if not name and src.get("title"):
+                        name = str(src["title"]).strip() or None
+
+            if lead_id is not None:
+                lrow = db_conn.execute(
+                    "SELECT * FROM leads WHERE id = ?",
+                    (lead_id,),
+                ).fetchone()
+                if lrow is not None:
+                    ld = as_dict(lrow)
+                    if peer_id is None and ld.get("telegram_user_id") is not None:
+                        peer_id = int(ld["telegram_user_id"])
+                    if not username and ld.get("username"):
+                        username = (
+                            str(ld["username"]).strip().lstrip("@") or None
+                        )
+                    if not phone and ld.get("phone"):
+                        phone = str(ld["phone"]).strip() or None
+                    if not name and ld.get("name"):
+                        name = str(ld["name"]).strip() or None
+
+            lookup_uname = clean_tg_username_lookup(username) or None
+            if lead_id is None and (peer_id is not None or lookup_uname):
+                d_uname_l = sql_norm_tg_username_expr("username")
+                l_clauses = []
+                l_params: list = []
+                if peer_id is not None and not (
+                    900000 <= int(peer_id) < 1000000
+                ):
+                    l_clauses.append("telegram_user_id = ?")
+                    l_params.append(int(peer_id))
+                if lookup_uname:
+                    l_clauses.append(f"(username IS NOT NULL AND {d_uname_l} = ?)")
+                    l_params.append(lookup_uname)
+                if l_clauses:
+                    lrow2 = db_conn.execute(
+                        f"SELECT * FROM leads WHERE {' OR '.join(l_clauses)} ORDER BY id ASC LIMIT 1",
+                        l_params,
+                    ).fetchone()
+                    if lrow2 is not None:
+                        ld2 = as_dict(lrow2)
+                        lead_id = int(ld2["id"])
+                        if peer_id is None and ld2.get("telegram_user_id") is not None:
+                            peer_id = int(ld2["telegram_user_id"])
+                        if not phone and ld2.get("phone"):
+                            phone = str(ld2["phone"]).strip() or None
+                        if not name and ld2.get("name"):
+                            name = str(ld2["name"]).strip() or None
+
+            d_uname_expr = sql_norm_tg_username_expr("d.username")
+            existing = db_conn.execute(
+                f"""
+                SELECT d.id
+                FROM dialogs d
+                WHERE d.account_id = ?
+                  AND d.peer_type = 'user'
+                  AND COALESCE(d.is_group, 0) = 0
+                  AND (
+                      (? IS NOT NULL AND d.lead_id = ?)
+                      OR (? IS NOT NULL AND d.peer_id = ?)
+                      OR (? IS NOT NULL AND d.username IS NOT NULL AND {d_uname_expr} = ?)
+                      OR (? IS NOT NULL AND d.phone IS NOT NULL AND d.phone = ?)
+                  )
+                ORDER BY (CASE WHEN ? IS NOT NULL AND d.lead_id = ? THEN 0 ELSE 1 END),
+                         d.last_message_at DESC,
+                         d.id DESC
+                LIMIT 1
+                """,
+                (
+                    target_account_id,
+                    lead_id,
+                    lead_id,
+                    peer_id,
+                    peer_id,
+                    lookup_uname,
+                    lookup_uname,
+                    phone,
+                    phone,
+                    lead_id,
+                    lead_id,
+                ),
+            ).fetchone()
+
+            if existing is not None:
+                dlg_id = int(existing["id"])
+                if lead_id is not None:
+                    db_conn.execute(
+                        "UPDATE dialogs SET lead_id = COALESCE(lead_id, ?) WHERE id = ?",
+                        (lead_id, dlg_id),
+                    )
+                    db_conn.commit()
+                dlg_dict = _load_dialog_public(db_conn, dlg_id)
+                dlg_dict.setdefault(
+                    "account_health", target_acc.get("health") or "active"
+                )
+                return {
+                    "created": False,
+                    "dialog": dlg_dict,
+                    "target_acc": target_acc,
+                }
+
+            if lead_id is not None:
+                dlg_dict = open_dialog_by_lead(
+                    db_conn,
+                    lead_id=lead_id,
+                    account_id=target_account_id,
+                    telegram_user_id=peer_id,
+                    username=username,
+                    phone=phone,
+                    name=name,
+                )
+                dlg_dict.setdefault(
+                    "account_health", target_acc.get("health") or "active"
+                )
+                return {
+                    "created": True,
+                    "dialog": dlg_dict,
+                    "target_acc": target_acc,
+                }
+
+            if peer_id is not None and not (900000 <= int(peer_id) < 1000000):
+                dlg_dict = open_dialog_by_lead(
+                    db_conn,
+                    lead_id=None,
+                    account_id=target_account_id,
+                    telegram_user_id=peer_id,
+                    username=username,
+                    phone=phone,
+                    name=name,
+                )
+                dlg_dict.setdefault(
+                    "account_health", target_acc.get("health") or "active"
+                )
+                return {
+                    "created": True,
+                    "dialog": dlg_dict,
+                    "target_acc": target_acc,
+                }
+
+            handle = (
+                f"@{username.lstrip('@')}" if username else (phone or None)
+            )
+            if not handle:
+                raise ValueError(
+                    "Укажите dialog_id, lead_id, peer_id или username"
+                )
+
+            pre_existing_ids = [
+                int(r[0])
+                for r in db_conn.execute(
+                    "SELECT id FROM dialogs WHERE account_id = ?",
+                    (target_account_id,),
+                ).fetchall()
+            ]
+            return {
+                "created": None,
+                "handle": handle,
+                "name": name,
+                "target_acc": target_acc,
+                "pre_existing_ids": pre_existing_ids,
+            }
+
+        resolved = _call(_resolve_or_find_existing, conn)
+        target_acc = resolved["target_acc"]
+        prov = str(target_acc.get("provider") or "telegram").strip().lower()
+        sess_path = str(target_acc.get("session_path") or "")
+        is_demo = sess_path.startswith("data/sessions/demo")
+        gw = None
+        if not (
+            is_demo
+            and isinstance(
+                getattr(request.app.state, "gateway", None),
+                (type(None), TelethonGateway),
+            )
+        ):
+            try:
+                gw = _resolve_app_gateway(request.app, prov)
+            except Exception as exc:
+                _runtime_logger.warning(
+                    "switch-account gateway resolve failed: %s", exc
+                )
+                gw = None
+
+        if resolved["created"] is None:
+            direct_res = await _call_async(
+                start_direct_dialog,
+                conn,
+                resolved["handle"],
+                target_account_id,
+                resolved["name"],
+                gateway=gw,
+            )
+            dlg_dict = direct_res["dialog"]
+            dlg_dict.setdefault(
+                "account_health", target_acc.get("health") or "active"
+            )
+            created = int(dlg_dict["id"]) not in set(
+                resolved.get("pre_existing_ids") or []
+            )
+        else:
+            dlg_dict = resolved["dialog"]
+            created = bool(resolved["created"])
+
+        dlg_id = int(dlg_dict["id"])
+        health_norm = str(target_acc.get("health") or "active").strip().lower()
+        peer_val = dlg_dict.get("telegram_user_id")
+        is_synth = peer_val is not None and (
+            900000 <= int(peer_val) < 1000000
+        )
+
+        if (
+            gw is not None
+            and target_acc.get("status") == "connected"
+            and health_norm not in ("unauthorized", "banned")
+            and not (is_demo and isinstance(gw, TelethonGateway))
+            and not is_synth
+        ):
+            try:
+                messages = await get_thread(conn, dlg_id, gw, 50)
+            except Exception as exc:
+                _runtime_logger.warning(
+                    "switch-account get_thread fallback for dialog %s: %s",
+                    dlg_id,
+                    exc,
+                )
+                messages = _call(list_messages, conn, dlg_id, 50)
+        else:
+            messages = _call(list_messages, conn, dlg_id, 50)
+
+        return {
+            "ok": True,
+            "dialog": dlg_dict,
+            "messages": messages,
+            "created": bool(created),
+        }
 
     @app.post("/api/inbox/sync")
     async def inbox_sync_now(request: Request, body: InboxSyncIn | None = None):

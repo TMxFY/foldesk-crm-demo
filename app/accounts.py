@@ -162,10 +162,17 @@ def _public(row: dict, *, nodemaven_configured: bool | None = None) -> dict:
     )
     proxy_mode = classify_proxy_mode(row.get("proxy_url"), nodemaven_configured=eff_nm)
 
+    is_active = (
+        str(status or "").strip().lower() == "connected"
+        and str(health or "active").strip().lower() == "active"
+    )
+    remaining_today = max(0, daily_limit - sent_today) if is_active else 0
+
     out = {key: row.get(key) for key in PUBLIC_FIELDS}
     out["provider"] = provider
     out["daily_limit"] = daily_limit
     out["sent_today"] = sent_today
+    out["remaining_today"] = remaining_today
     out["sent_date"] = row.get("sent_date") or today
     out["proxy_url"] = row.get("proxy_url")
     out["proxy_mode"] = proxy_mode

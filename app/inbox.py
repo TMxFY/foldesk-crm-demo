@@ -3,6 +3,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from app.db import (
     normalize_status,
     safe_int,
     sql_norm_tg_username_expr,
+    status_to_airtable,
     utc_now,
 )
 from app.digest import (
@@ -40,6 +42,7 @@ from app.digest import (
 )
 from app.telegram_gateway import GatewayError, render_formatted_html
 
+logger = logging.getLogger(__name__)
 _PERSONAL_HYGIENE_ERRORS = PERSONAL_HYGIENE_ERRORS
 
 
@@ -2770,6 +2773,332 @@ def list_inbox(
             "total_dialogs": workspace_total,
         }
     return InboxResultList(capped, counts=counts, workspace_total_dialogs=workspace_total)
+
+
+def _unified_group_key(row: dict) -> tuple:
+    prov = str(row.get("provider") or "telegram").strip().lower() or "telegram"
+    lid = row.get("lead_id")
+    if lid is not None:
+        return (prov, "lead", int(lid))
+    peer_int = safe_int(row.get("telegram_user_id"))
+    if peer_int is not None and peer_int != 0:
+        return (prov, "peer", peer_int)
+    uname = clean_tg_username_lookup(row.get("username"))
+    if uname:
+        return (prov, "uname", uname)
+    return (prov, "dlg", int(row["id"]))
+
+
+def _unified_row_sort_key(row: dict, *, waiting: bool | None = None) -> tuple:
+    ts_norm = _norm_ts(row.get("last_message_at"))
+    wait_flag = (
+        bool(row.get("is_waiting_our_answer")) if waiting is None else bool(waiting)
+    )
+    return (
+        1 if ts_norm else 0,
+        ts_norm,
+        1 if wait_flag else 0,
+        int(row.get("id") or row.get("primary_dialog_id") or 0),
+    )
+
+
+def _compute_grouped_inbox_counts(groups: list[dict]) -> dict:
+    return {
+        "waiting": sum(1 for g in groups if bool(g.get("is_waiting_our_answer"))),
+        "our_turn": sum(
+            1
+            for g in groups
+            if int(g.get("last_from_peer") or 0) == 0
+            and not bool(g.get("is_waiting_our_answer"))
+        ),
+        "unread": sum(1 for g in groups if int(g.get("unread_count") or 0) > 0),
+        "groups": sum(1 for g in groups if int(g.get("is_group") or 0) == 1),
+        "muted": sum(1 for g in groups if int(g.get("muted") or 0) == 1),
+    }
+
+
+def _matches_grouped_chips(row: dict, chips: set[str]) -> bool:
+    if "waiting" in chips and not bool(row.get("is_waiting_our_answer")):
+        return False
+    if "our_turn" in chips and (
+        int(row.get("last_from_peer") or 0) != 0
+        or bool(row.get("is_waiting_our_answer"))
+    ):
+        return False
+    rem_chips = chips - {"waiting", "our_turn"}
+    if rem_chips:
+        return _matches_chips(row, rem_chips)
+    return True
+
+
+def list_unified_inbox(
+    conn,
+    account_id: int | None = None,
+    q: str = "",
+    chip: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    with_counts: bool = False,
+    crm_only: bool = True,
+    limit: int | None = None,
+) -> list | dict:
+    filter_acc_id = (
+        int(account_id)
+        if (account_id is not None and int(account_id) != 0)
+        else None
+    )
+    if filter_acc_id is not None:
+        acc_exists = conn.execute(
+            "SELECT id FROM accounts WHERE id = ?",
+            (filter_acc_id,),
+        ).fetchone()
+        if acc_exists is None:
+            raise LookupError("account")
+
+    has_q = bool((q or "").strip())
+    has_provider = bool((provider or "").strip())
+    has_status = bool((status or "").strip())
+    is_unfiltered_workspace = (
+        filter_acc_id is None
+        and not has_q
+        and not has_provider
+        and not has_status
+    )
+
+    all_scope_rows = _query_inbox_rows(
+        conn,
+        account_id=None,
+        q="",
+        provider=provider,
+        status=status,
+        crm_only=crm_only,
+    )
+    if has_q:
+        q_matched_rows = _query_inbox_rows(
+            conn,
+            account_id=None,
+            q=q,
+            provider=provider,
+            status=status,
+            crm_only=crm_only,
+        )
+        q_matched_ids = {int(r["id"]) for r in q_matched_rows}
+    else:
+        q_matched_rows = all_scope_rows
+        q_matched_ids = None
+
+    raw_rows_for_counts = (
+        [
+            r
+            for r in q_matched_rows
+            if int(r.get("account_id") or 0) == filter_acc_id
+        ]
+        if filter_acc_id is not None
+        else q_matched_rows
+    )
+    raw_counts = compute_inbox_counts(raw_rows_for_counts)
+
+    if is_unfiltered_workspace:
+        workspace_rows = all_scope_rows
+    else:
+        workspace_rows = _query_inbox_rows(
+            conn, account_id=None, crm_only=crm_only
+        )
+    workspace_total = len(workspace_rows)
+
+    account_health_by_id: dict[int, str] = {}
+    for arow in conn.execute("SELECT id, health FROM accounts").fetchall():
+        account_health_by_id[int(arow["id"])] = (
+            str(arow["health"]).strip() if arow["health"] else "active"
+        )
+
+    lead_ids = sorted(
+        {
+            int(r["lead_id"])
+            for r in all_scope_rows
+            if r.get("lead_id") is not None
+        }
+    )
+    leads_by_id: dict[int, dict] = {}
+    for start in range(0, len(lead_ids), 400):
+        chunk = lead_ids[start : start + 400]
+        ph = ",".join("?" for _ in chunk)
+        for lrow in conn.execute(
+            f"""
+            SELECT id, status, amount, company, niche, airtable_status, airtable_record_id
+            FROM leads
+            WHERE id IN ({ph})
+            """,
+            chunk,
+        ).fetchall():
+            leads_by_id[int(lrow["id"])] = as_dict(lrow)
+
+    at_base_id: str | None = None
+    try:
+        from app.airtable_sync import get_airtable_config
+
+        at_base_id = (
+            str(get_airtable_config(conn).get("base_id") or "").strip() or None
+        )
+    except Exception as exc:
+        logger.debug("get_airtable_config skipped in list_unified_inbox: %s", exc)
+        at_base_id = None
+
+    groups_by_key: dict[tuple, list[dict]] = {}
+    for r in all_scope_rows:
+        groups_by_key.setdefault(_unified_group_key(r), []).append(r)
+
+    if is_unfiltered_workspace:
+        grouped_total = len(groups_by_key)
+    else:
+        grouped_total = len({_unified_group_key(r) for r in workspace_rows})
+
+    grouped_rows: list[dict] = []
+    for grp_rows in groups_by_key.values():
+        if q_matched_ids is not None and not any(
+            int(r["id"]) in q_matched_ids for r in grp_rows
+        ):
+            continue
+        if filter_acc_id is not None and not any(
+            int(r.get("account_id") or 0) == filter_acc_id for r in grp_rows
+        ):
+            continue
+
+        group_lead_id = next(
+            (int(r["lead_id"]) for r in grp_rows if r.get("lead_id") is not None),
+            None,
+        )
+        lead_meta = (
+            leads_by_id.get(group_lead_id)
+            if group_lead_id is not None
+            else None
+        )
+        eff_lead_status_from_db = (
+            lead_meta.get("status") if lead_meta is not None else None
+        )
+        eff_at_status_from_db = (
+            lead_meta.get("airtable_status") if lead_meta is not None else None
+        )
+
+        peers_with_waiting: list[tuple[dict, bool]] = []
+        for r in grp_rows:
+            eff_lstatus = eff_lead_status_from_db or r.get("lead_status")
+            peer_waiting = is_waiting_our_answer(
+                r.get("last_from_peer"), eff_lstatus, eff_at_status_from_db
+            )
+            peers_with_waiting.append((r, bool(peer_waiting)))
+
+        peers_with_waiting.sort(
+            key=lambda pair: _unified_row_sort_key(
+                pair[0], waiting=pair[1]
+            ),
+            reverse=True,
+        )
+
+        primary_row, _ = peers_with_waiting[0]
+        primary_id = int(primary_row["id"])
+        peer_dialogs = [
+            {
+                "dialog_id": int(r["id"]),
+                "account_id": int(r["account_id"]),
+                "account_username": r.get("account_username"),
+                "account_name": r.get("account_name"),
+                "account_health": account_health_by_id.get(
+                    int(r["account_id"]), "active"
+                ),
+                "last_message_at": r.get("last_message_at"),
+                "last_from_peer": int(r.get("last_from_peer") or 0),
+                "unread_count": int(r.get("unread_count") or 0),
+                "is_waiting_our_answer": bool(w),
+            }
+            for r, w in peers_with_waiting
+        ]
+
+        grouped = dict(primary_row)
+        grouped["id"] = primary_id
+        grouped["dialog_id"] = primary_id
+        grouped["primary_dialog_id"] = primary_id
+        grouped["unread_count"] = sum(
+            int(p["unread_count"] or 0) for p in peer_dialogs
+        )
+        grouped["is_waiting_our_answer"] = any(
+            bool(p["is_waiting_our_answer"]) for p in peer_dialogs
+        )
+        grouped["peer_dialogs"] = peer_dialogs
+
+        if lead_meta is not None:
+            lstatus = lead_meta.get("status")
+            rec_id = str(lead_meta.get("airtable_record_id") or "").strip()
+            grouped["lead_id"] = int(lead_meta["id"])
+            grouped["lead_status"] = lstatus
+            grouped["lead_amount"] = int(lead_meta.get("amount") or 0)
+            grouped["lead_company"] = lead_meta.get("company") or None
+            grouped["lead_niche"] = lead_meta.get("niche") or None
+            grouped["lead_airtable_status"] = (
+                lead_meta.get("airtable_status")
+                or (status_to_airtable(lstatus) if lstatus else None)
+            )
+            grouped["lead_airtable_url"] = (
+                f"https://airtable.com/{at_base_id}/{rec_id}"
+                if (at_base_id and rec_id)
+                else None
+            )
+        else:
+            grouped["lead_status"] = primary_row.get("lead_status")
+            grouped["lead_amount"] = None
+            grouped["lead_company"] = None
+            grouped["lead_niche"] = None
+            grouped["lead_airtable_status"] = None
+            grouped["lead_airtable_url"] = None
+
+        grouped_rows.append(grouped)
+
+    grouped_rows.sort(key=_unified_row_sort_key, reverse=True)
+    grouped_counts = _compute_grouped_inbox_counts(grouped_rows)
+
+    chips = {c.strip().lower() for c in (chip or "").split(",") if c.strip()}
+    if chips:
+        filtered = [
+            g for g in grouped_rows if _matches_grouped_chips(g, chips)
+        ]
+    else:
+        filtered = grouped_rows
+
+    if limit is not None:
+        lim = int(limit)
+        capped = filtered if lim <= 0 else filtered[:lim]
+    else:
+        has_explicit_filter = bool(
+            chips
+            or has_q
+            or has_provider
+            or has_status
+            or crm_only
+        )
+        if has_explicit_filter:
+            cap = 2000
+        else:
+            cap = 60 if filter_acc_id is None else 30
+        capped = filtered[:cap]
+
+    if with_counts:
+        return {
+            "dialogs": capped,
+            "items": capped,
+            "counts": grouped_counts,
+            "raw_counts": raw_counts,
+            "workspace_total_dialogs": workspace_total,
+            "total_dialogs": workspace_total,
+            "grouped_total_leads": grouped_total,
+        }
+    res = InboxResultList(
+        capped,
+        counts=grouped_counts,
+        workspace_total_dialogs=workspace_total,
+    )
+    res.raw_counts = raw_counts
+    res.grouped_total_leads = grouped_total
+    return res
 
 
 def _load_dialog_public(conn, dialog_id: int) -> dict:
