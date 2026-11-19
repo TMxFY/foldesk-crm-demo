@@ -27,6 +27,24 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _resolve_playwright_node_path() -> str:
+    candidates = [ROOT / "e2e" / "node_modules"]
+    try:
+        common = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+        if common:
+            main_root = (ROOT / common).resolve().parent
+            candidates.append(main_root / "e2e" / "node_modules")
+    except Exception:
+        pass
+    parts = [str(p) for p in candidates if p.is_dir()]
+    if os.environ.get("NODE_PATH"):
+        parts.append(os.environ["NODE_PATH"])
+    return os.pathsep.join(parts)
+
+
 def test_v5_index_html_has_calendar_charts_mcp_and_airtable_controls(tmp_path: Path):
     client = _client(tmp_path)
     res = client.get("/")
@@ -59,26 +77,51 @@ def test_playwright_v5_calendar_charts_mcp_airtable_and_softugc_ui(tmp_path: Pat
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "e2e_v5.db"
+    admin_password = "V5PlaywrightPass!2026"
+
     env = dict(os.environ)
-    env["PORT"] = str(port)
-    env["E2E_DB_PATH"] = str(db_path)
-    env["PYTEST_CURRENT_TEST"] = "test_v5_ui_e2e"
+    env.pop("PYTEST_CURRENT_TEST", None)
+    env.pop("BOT_TOKEN", None)
+    env["PYTHONPATH"] = str(ROOT)
+    env["CRM_REQUIRE_AUTH"] = "1"
+    env["CRM_ADMIN_PASSWORD"] = admin_password
+    env["CRM_VIEW_MODE"] = "sheet"
+    env["CLOUD_BACKUP_ENABLED"] = "0"
+    env["DISABLE_TG_WATCHES"] = "1"
+    env["DEMO_AUTOSEED"] = "0"
+    env["BOOTSTRAP_PROD_SNAPSHOT"] = "0"
     env["AIRTABLE_API_KEY"] = ""
     env["AIRTABLE_BASE_ID"] = ""
     env["AIRTABLE_TOKEN"] = ""
 
+    server_code = f"""
+import uvicorn
+from pathlib import Path
+from app.db import connect, init_db
+from app.demo import seed_demo
+from app.main import create_app
+from app.telegram_gateway import FakeGateway
+
+conn = connect(Path({str(db_path)!r}))
+init_db(conn)
+seed_demo(conn)
+gw = FakeGateway(code="11111", password="secret", needs_password=False)
+app = create_app(conn=conn, gateway=gw)
+uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
+"""
+
     server = subprocess.Popen(
-        [sys.executable, str(ROOT / "e2e" / "serve.py")],
-        cwd=str(ROOT / "e2e"),
+        [sys.executable, "-c", server_code],
+        cwd=str(ROOT),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     try:
         ready = False
-        for _ in range(50):
+        for _ in range(60):
             try:
-                with urlopen(f"{base_url}/api/accounts", timeout=1) as resp:
+                with urlopen(f"{base_url}/api/health", timeout=1) as resp:
                     if resp.status == 200:
                         ready = True
                         break
@@ -87,13 +130,14 @@ def test_playwright_v5_calendar_charts_mcp_airtable_and_softugc_ui(tmp_path: Pat
         assert ready, "Test server did not start in time"
 
         pw_script = f"""
+const fs = require('fs');
 const {{ chromium }} = require('playwright');
 
 (async () => {{
-  const browser = await chromium.launch({{
-    executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    headless: true,
-  }});
+  const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  const launchOpts = {{ headless: true }};
+  if (fs.existsSync(chromePath)) launchOpts.executablePath = chromePath;
+  const browser = await chromium.launch(launchOpts);
   const context = await browser.newContext({{ viewport: {{ width: 1440, height: 900 }} }});
   const page = await context.newPage();
   const errors = [];
@@ -104,10 +148,20 @@ const {{ chromium }} = require('playwright');
     }}
   }});
 
-  await page.request.post('{base_url}/api/test/reset');
-  await page.request.post('{base_url}/api/demo/seed');
-  await page.goto('{base_url}/');
-  await page.locator("#board .lead-card").first().waitFor();
+  // Real CRM session cookie authentication (no e2e-not-a-secret bypass)
+  const unauthRes = await page.request.get('{base_url}/api/leads');
+  if (unauthRes.status() !== 401) {{
+    throw new Error(`Expected 401 without auth cookie, got ${{unauthRes.status()}}`);
+  }}
+  const loginRes = await page.request.post('{base_url}/api/auth/login', {{
+    data: {{ username: 'tim', password: '{admin_password}' }},
+  }});
+  if (!loginRes.ok()) {{
+    throw new Error(`CRM login failed: ${{loginRes.status()}} ${{await loginRes.text()}}`);
+  }}
+
+  await page.goto('{base_url}/', {{ waitUntil: 'domcontentloaded' }});
+  await page.locator('#board .lead-card').first().waitFor({{ state: 'visible', timeout: 15000 }});
 
   // Verify no stray <img> elements break F03-N2
   const imgCount = await page.getByRole('img').count();
@@ -130,8 +184,11 @@ const {{ chromium }} = require('playwright');
   await page.locator('#close-mcp-modal-btn').click();
 
   // 2. Test Airtable sync button & 7 SoftUGC stages
+  await page.locator('#leads-view-table-btn').click();
+  await page.locator('#airtable-sync-btn').waitFor({{ state: 'visible' }});
   await page.locator('#airtable-sync-btn').click();
-  await page.locator('#board .col[data-stage="call_scheduled"]').waitFor();
+  await page.locator('#leads-view-kanban-btn').click();
+  await page.locator('#board .col[data-stage="call_scheduled"]').waitFor({{ state: 'visible' }});
   const stageCols = await page.locator('#board .col').count();
   if (stageCols < 7) {{
     throw new Error(`Expected 7 SoftUGC stages on board after sync, got ${{stageCols}}`);
@@ -165,8 +222,12 @@ const {{ chromium }} = require('playwright');
   if (checkCard.company !== 'SoftUGC Cloud Corp' || checkCard.niche !== 'AI Video SaaS' || Number(checkCard.monthly_value) !== 4200) {{
     throw new Error(`SoftUGC fields did not persist: ${{JSON.stringify(checkCard)}}`);
   }}
+  const closeCardBtn = page.locator('#close-card-popup');
+  if (await closeCardBtn.isVisible()) {{
+    await closeCardBtn.click();
+  }}
 
-  // 4. Test Calendar (direct sheet hash, kept accessible even though hidden from 4-tab sidebar)
+  // 4. Test Calendar (direct sheet hash, lazy-loaded when activated)
   await page.evaluate(() => {{ window.location.hash = '#calendar'; }});
   await page.locator('#calendar').waitFor({{ state: 'visible' }});
   await page.locator('#cal-ev-title').fill('Демо созвон по AI UGC');
@@ -236,9 +297,12 @@ const {{ chromium }} = require('playwright');
   process.exit(1);
 }});
 """
+        node_env = dict(os.environ)
+        node_env["NODE_PATH"] = _resolve_playwright_node_path()
         proc = subprocess.run(
             ["node", "-e", pw_script],
             cwd=str(ROOT / "e2e"),
+            env=node_env,
             capture_output=True,
             text=True,
             timeout=60,
