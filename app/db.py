@@ -2579,3 +2579,117 @@ def bootstrap_prod_snapshot(conn: sqlite3.Connection) -> bool:
     return True
 
 
+PERSONAL_HYGIENE_ERRORS = frozenset(
+    {
+        "uncontacted_personal_chat_hygiene_v11",
+        "pre_softugc_personal_dm_hygiene_v11",
+    }
+)
+SNIPER_ICP_STOP_PREFIX = "Остановлено Sniper ICP-фильтром"
+
+
+def clean_tg_username(raw: str | None) -> str:
+    val = str(raw or "").strip()
+    if not val:
+        return ""
+    val = re.sub(r"^https?://", "", val, flags=re.IGNORECASE).strip()
+    val = re.sub(r"^(?:www\.)?(?:t\.me|telegram\.me)/", "", val, flags=re.IGNORECASE).strip()
+    val = val.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
+    return val.strip().lstrip("@")
+
+
+def clean_tg_username_lookup(raw: str | None) -> str:
+    return clean_tg_username(raw).lower()
+
+
+def sql_norm_tg_username_expr(col: str) -> str:
+    s = (
+        f"replace(replace(ltrim(replace(replace(replace(replace(replace(replace(trim(lower(coalesce({col}, ''))), "
+        f"'https://', ''), 'http://', ''), 'www.t.me/', ''), 'www.telegram.me/', ''), "
+        f"'telegram.me/', ''), 't.me/', ''), '@'), '?', '/'), '#', '/')"
+    )
+    return f"ltrim(trim(CASE WHEN instr({s}, '/') > 0 THEN substr({s}, 1, instr({s}, '/') - 1) ELSE {s} END), '@')"
+
+
+def is_vacancy_campaign_meta(
+    name: str | None, leadgen_sources_json: str | None = None
+) -> bool:
+    low = str(name or "").casefold()
+    if "ваканс" in low or "vacanc" in low:
+        return True
+    src_low = str(leadgen_sources_json or "").casefold()
+    return '"vacancies"' in src_low or "'vacancies'" in src_low
+
+
+def is_recipient_contacted_outreach(
+    status: Any,
+    current_step: Any,
+    last_sent_at: Any,
+    error_text: Any,
+) -> bool:
+    st = str(status or "").strip().lower()
+    step = int(current_step or 0)
+    sent = str(last_sent_at or "").strip()
+    err = str(error_text or "").strip()
+    if err in PERSONAL_HYGIENE_ERRORS or err.startswith(SNIPER_ICP_STOP_PREFIX):
+        return False
+    if st in ("replied", "in_progress"):
+        return True
+    if st == "completed":
+        return step >= 1 or bool(sent)
+    if st == "failed":
+        return step >= 1 and bool(sent)
+    return False
+
+
+def _parse_utc_naive_dt(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    cand = raw.replace(" ", "T")
+    if cand.endswith(("Z", "z")):
+        cand = cand[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(cand)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.replace(microsecond=0)
+    except ValueError:
+        pass
+    if len(cand) >= 19:
+        try:
+            return datetime.fromisoformat(cand[:19]).replace(microsecond=0)
+        except ValueError:
+            return None
+    return None
+
+
+def is_newer_dialog_snapshot_unbacked(
+    snap_preview: Any,
+    snap_at: Any,
+    snap_from_peer: Any,
+    last_msg_text: Any,
+    last_msg_at: Any,
+    last_msg_dir: Any,
+) -> bool:
+    prev = str(snap_preview or "").strip()
+    dt_snap = _parse_utc_naive_dt(snap_at)
+    if not prev or dt_snap is None:
+        return False
+    dt_msg = _parse_utc_naive_dt(last_msg_at)
+    if dt_msg is None:
+        return True
+    if dt_snap <= dt_msg:
+        return False
+    mtxt = str(last_msg_text or "").strip()
+    snap_dir = "in" if int(snap_from_peer or 0) else "out"
+    if (
+        snap_dir == str(last_msg_dir or "").strip().lower()
+        and (prev == mtxt or (len(prev) >= 120 and mtxt.startswith(prev)))
+        and 0 <= (dt_snap - dt_msg).total_seconds() <= 5
+    ):
+        return False
+    return True
+
+
+

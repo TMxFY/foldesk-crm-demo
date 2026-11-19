@@ -27,3 +27,10 @@ description: >-
 - После каждого деплоя на VPS Contabo проверяй живой эндпоинт `/api/health?deep=1` (`db_ok`, `tg_lease_ready`, `autopilot_running`, `healthy_accounts`, `running_campaigns`, `pending_step1_total`).
 - Любой обнаруженный в проде или на ревью новый класс бага зашивай обратно в статический или регрессионный гейт `scripts/verify.sh`, чтобы станок больше никогда не пропускал этот паттерн.
 
+## 5. Mandatory Bug-to-Harness Ratchet & Pre-Report Self-Verification
+- Для каждой новой задачи или найденного в проде бага:
+  1. **Сначала зафиксируй падение (`exit 1`):** добавь регрессионный тест в `tests/`, новый статический инвариант в `scripts/verify.sh`, и — для инвариантов данных/БД/статистики — проверку в `scripts/proactive_audit.py` (+ негативный кейс в `--self-test`, который реально падает до фикса).
+  2. **Проверь реальные Git-хуки (`scripts/install_hooks.sh`):** перед коммитом и пушем должны быть активны `githooks/pre-commit` (`verify.sh --fast-checks-only`) и `githooks/pre-push` (`verify.sh` + `proactive_audit.py --self-test`).
+  3. **Сам проверь до отчёта владельцу:** прогони `bash scripts/verify.sh`, `proactive_audit.py --self-test`, выкати на VPS, выполни живой прогон на боевой БД (`proactive_audit.py --db /opt/crmtg/data/crm.db`) и в живом Chrome через Playwright на `https://crm.softugc.com` со сквозным чтением скриншотов через `read_file`. Никогда не заявляй «готово», пока собственные проверки на локале и проде не зелёные.
+
+

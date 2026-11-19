@@ -637,6 +637,71 @@ if main_py_file.is_file() and (root / "app" / "inbox.py").is_file():
         if prof_route not in main_src_l:
             errors.append(f"Gate L violation in app/main.py: missing route '{prof_route}'")
 
+# Gate M: Old-Lead & Completed-Recipient Message Visibility, Chunked SQL & Git Hooks Gate
+if (root / "app" / "inbox.py").is_file():
+    db_src_m = (root / "app" / "db.py").read_text(encoding="utf-8") if (root / "app" / "db.py").is_file() else ""
+    for db_sym in (
+        "def clean_tg_username(",
+        "def sql_norm_tg_username_expr(",
+        "def is_recipient_contacted_outreach(",
+        "def is_newer_dialog_snapshot_unbacked(",
+    ):
+        if db_sym not in db_src_m:
+            errors.append(f"Gate M violation in app/db.py: missing canonical helper {db_sym}")
+
+    inbox_src_m = (root / "app" / "inbox.py").read_text(encoding="utf-8")
+    for fn_name, req_call in (
+        ("def stop_outreach_on_reply(", "is_recipient_contacted_outreach("),
+        ("def _person_is_crm_relevant(", "is_recipient_contacted_outreach("),
+        ("def _filter_crm_only_rows(", "is_recipient_contacted_outreach("),
+        ("def list_messages(", "is_newer_dialog_snapshot_unbacked("),
+    ):
+        m_fn = re.search(rf"{re.escape(fn_name)}[\s\S]*?(?=\ndef\s)", inbox_src_m)
+        if not m_fn or req_call not in m_fn.group(0):
+            errors.append(f"Gate M violation in app/inbox.py: {fn_name} must call {req_call}")
+
+    outreach_src_m = (root / "app" / "outreach.py").read_text(encoding="utf-8") if (root / "app" / "outreach.py").is_file() else ""
+    m_frd = re.search(r"def _find_recipient_dialogs\([\s\S]*?(?=\ndef\s)", outreach_src_m)
+    if not m_frd or "sent_account_id" not in m_frd.group(0) or "sql_norm_tg_username_expr(" not in m_frd.group(0):
+        errors.append("Gate M violation in app/outreach.py: _find_recipient_dialogs must use sent_account_id and sql_norm_tg_username_expr")
+
+    analytics_src_m = (root / "app" / "analytics.py").read_text(encoding="utf-8") if (root / "app" / "analytics.py").is_file() else ""
+    m_cca = re.search(r"def _compute_charts_analytics\([\s\S]*?(?=\ndef\s)", analytics_src_m)
+    if not m_cca or "range(0, len(eligible_ids), 400)" not in m_cca.group(0):
+        errors.append("Gate M violation in app/analytics.py: _compute_charts_analytics must chunk eligible_ids by 400")
+
+    if main_py_file.is_file():
+        main_src_m = main_py_file.read_text(encoding="utf-8")
+        m_fpec = re.search(r"def _filter_people_to_existing_or_crm\([\s\S]*?(?=\ndef\s|\nasync def\s)", main_src_m)
+        if not m_fpec or "is_recipient_contacted_outreach(" not in m_fpec.group(0):
+            errors.append("Gate M violation in app/main.py: _filter_people_to_existing_or_crm must call is_recipient_contacted_outreach")
+        m_auto = re.search(r"async def autopilot_loop\([\s\S]*?(?=\ndef\s|\nasync def\s)", main_src_m)
+        if not m_auto or "sync_crm_dialog_messages_backfill_once(" not in m_auto.group(0):
+            errors.append("Gate M violation in app/main.py: autopilot_loop must call sync_crm_dialog_messages_backfill_once")
+        m_sync_now = re.search(r"    async def inbox_sync_now\([\s\S]*?(?=\n    @app\.|\n    def |\n    async def |\ndef )", main_src_m)
+        if not m_sync_now or "sync_crm_dialog_messages_backfill_once(" not in m_sync_now.group(0):
+            errors.append("Gate M violation in app/main.py: inbox_sync_now must call sync_crm_dialog_messages_backfill_once")
+        m_prof = re.search(r"    async def _resolve_and_enrich_client_profile\([\s\S]*?(?=\n    @app\.|\n    def |\n    async def |\ndef )", main_src_m)
+        if not m_prof or "get_thread(" not in m_prof.group(0):
+            errors.append("Gate M violation in app/main.py: _resolve_and_enrich_client_profile must call get_thread for stale/missing messages")
+
+    if js_path.is_file():
+        js_src_m = js_path.read_text(encoding="utf-8")
+        if "function sortDialogsByRecency(" not in js_src_m or js_src_m.count("sortDialogsByRecency(") < 5:
+            errors.append("Gate M violation in app/static/app.js: sortDialogsByRecency must be defined and used across upsertDialog/renderDialogs/openInboxLive/loadInbox")
+
+    if (root / "scripts" / "proactive_audit.py").is_file():
+        audit_src_m = (root / "scripts" / "proactive_audit.py").read_text(encoding="utf-8")
+        if "_audit_old_lead_message_visibility" not in audit_src_m or "--self-test" not in audit_src_m or "limit=0" not in audit_src_m:
+            errors.append("Gate M violation in scripts/proactive_audit.py: missing _audit_old_lead_message_visibility, --self-test, or limit=0")
+
+    import os as _os
+
+    for hk in ("pre-commit", "pre-push"):
+        hk_path = root / "githooks" / hk
+        if not hk_path.is_file() or not _os.access(hk_path, _os.X_OK):
+            errors.append(f"Gate M violation: githooks/{hk} must exist and be executable")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
@@ -664,5 +729,6 @@ if [ "${1:-}" = "--fast-checks-only" ]; then
   exit 0
 fi
 
-echo "== [4/4] Full pytest harness (zero ignored suites) =="
+echo "== [4/4] Proactive audit self-test & full pytest harness (zero ignored suites) =="
+PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" scripts/proactive_audit.py --self-test
 PYTHONPATH=. "$PYTHON_BIN" -m pytest -q -k "not playwright"

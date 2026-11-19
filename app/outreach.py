@@ -25,7 +25,17 @@ from app.accounts import (
     increment_daily_sent,
     record_account_health_transition,
 )
-from app.db import DEFAULT_DB, as_dict, safe_int, utc_now, utc_today
+from app.db import (
+    DEFAULT_DB,
+    as_dict,
+    clean_tg_username,
+    clean_tg_username_lookup,
+    is_recipient_contacted_outreach,
+    safe_int,
+    sql_norm_tg_username_expr,
+    utc_now,
+    utc_today,
+)
 
 logger = logging.getLogger(__name__)
 PREWARM_STORIES_TIMEOUT_SEC: float = 8.0
@@ -187,15 +197,8 @@ def _parse_account_ids(account_id=None, account_ids=None) -> list[int]:
 
 
 def _clean_handle(raw: str | None) -> str | None:
-    if raw is None:
-        return None
-    val = str(raw).strip()
-    if not val:
-        return None
-    val = re.sub(r"^https?://(?:www\.)?t\.me/", "", val, flags=re.IGNORECASE)
-    val = re.sub(r"^t\.me/", "", val, flags=re.IGNORECASE)
-    val = val.strip().lstrip("@").strip("/")
-    return val or None
+    cleaned = clean_tg_username(raw)
+    return cleaned or None
 
 
 def _clean_company_title(raw: str | None) -> str | None:
@@ -1098,16 +1101,21 @@ def _add_hours_iso(iso_str: str | None, hours: int) -> str | None:
     return target.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> list[dict]:
+def _find_recipient_dialogs(
+    conn,
+    rec: dict,
+    account_id: int | None = None,
+    *,
+    ignore_assigned_account: bool = False,
+) -> list[dict]:
     if not isinstance(rec, dict):
         return []
     acc_ids = set()
-    aid_val = safe_int(account_id)
-    if aid_val:
-        acc_ids.add(aid_val)
-    assigned_aid = safe_int(rec.get("assigned_account_id"))
-    if assigned_aid:
-        acc_ids.add(assigned_aid)
+    if not ignore_assigned_account:
+        for raw_aid in (account_id, rec.get("sent_account_id"), rec.get("assigned_account_id")):
+            aid_val = safe_int(raw_aid)
+            if aid_val:
+                acc_ids.add(aid_val)
 
     match_clauses = []
     match_params = []
@@ -1120,9 +1128,11 @@ def _find_recipient_dialogs(conn, rec: dict, account_id: int | None = None) -> l
         match_clauses.append("lead_id = ?")
         match_params.append(rec_lid)
     if rec.get("username"):
-        clean_u = _clean_handle(rec["username"])
+        clean_u = clean_tg_username_lookup(rec["username"])
         if clean_u:
-            match_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+            match_clauses.append(
+                f"(username IS NOT NULL AND {sql_norm_tg_username_expr('username')} = ?)"
+            )
             match_params.append(clean_u)
     if rec.get("phone"):
         phone_str = str(rec["phone"]).strip()
@@ -1280,6 +1290,13 @@ def _latest_dialog_in_meta(conn, matched_dlg: dict | None) -> tuple[int | None, 
     return incoming_tg_msg_id, incoming_sent_at
 
 
+_CONTACTED_NON_HYGIENE_FAILED_SQL = (
+    "(status = 'failed' AND COALESCE(current_step, 0) >= 1 "
+    "AND COALESCE(last_sent_at, '') != '' "
+    "AND COALESCE(error_text, '') NOT IN ('uncontacted_personal_chat_hygiene_v11', 'pre_softugc_personal_dm_hygiene_v11'))"
+)
+
+
 def _stop_recipient_and_lead_quietly(
     conn,
     *,
@@ -1313,9 +1330,9 @@ def _stop_recipient_and_lead_quietly(
     if rec_id is not None:
         _collect_eligible(
             conn.execute(
-                """
+                f"""
                 SELECT id, last_sent_at FROM campaign_recipients
-                WHERE id = ? AND status IN ('pending', 'in_progress', 'completed')
+                WHERE id = ? AND (status IN ('pending', 'in_progress', 'completed') OR {_CONTACTED_NON_HYGIENE_FAILED_SQL})
                 """,
                 (int(rec_id),),
             ).fetchall()
@@ -1323,9 +1340,9 @@ def _stop_recipient_and_lead_quietly(
     if lead_id is not None:
         _collect_eligible(
             conn.execute(
-                """
+                f"""
                 SELECT id, last_sent_at FROM campaign_recipients
-                WHERE lead_id = ? AND status IN ('pending', 'in_progress')
+                WHERE lead_id = ? AND (status IN ('pending', 'in_progress', 'completed') OR {_CONTACTED_NON_HYGIENE_FAILED_SQL})
                 """,
                 (int(lead_id),),
             ).fetchall()
@@ -1339,9 +1356,9 @@ def _stop_recipient_and_lead_quietly(
     if peer_int > 0:
         _collect_eligible(
             conn.execute(
-                """
+                f"""
                 SELECT id, last_sent_at FROM campaign_recipients
-                WHERE telegram_user_id = ? AND status IN ('pending', 'in_progress')
+                WHERE telegram_user_id = ? AND (status IN ('pending', 'in_progress', 'completed') OR {_CONTACTED_NON_HYGIENE_FAILED_SQL})
                 """,
                 (peer_int,),
             ).fetchall()
@@ -1481,9 +1498,13 @@ def _stop_outreach_from_dialog_sync(
 
 def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None, opener=None) -> int:
     rows = conn.execute(
-        """
+        f"""
         SELECT * FROM campaign_recipients
-        WHERE campaign_id = ? AND status IN ('pending', 'in_progress', 'completed')
+        WHERE campaign_id = ?
+          AND (
+              status IN ('pending', 'in_progress', 'completed')
+              OR {_CONTACTED_NON_HYGIENE_FAILED_SQL}
+          )
         """,
         (campaign_id,),
     ).fetchall()
@@ -1494,13 +1515,24 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
         rec_id = safe_int(rec.get("id")) if rec else None
         if not rec or rec_id is None:
             continue
-        if (safe_int(rec.get("current_step"), 0) or 0) < 1 and not rec.get("last_sent_at"):
+        if str(rec.get("status") or "").strip().lower() == "pending":
+            if (safe_int(rec.get("current_step"), 0) or 0) < 1 and not rec.get("last_sent_at"):
+                continue
+        elif not is_recipient_contacted_outreach(
+            rec.get("status"),
+            rec.get("current_step"),
+            rec.get("last_sent_at"),
+            rec.get("error_text"),
+        ):
             continue
         dialogs = _find_recipient_dialogs(conn, rec, account_id=account_id)
-        if not dialogs and account_id is not None:
-            # Also check across any account if assigned_account_id or dialog exists elsewhere
-            dialogs = _find_recipient_dialogs(conn, rec, account_id=None)
         replied_dialogs = [d for d in dialogs if _dialog_has_client_reply(conn, d, rec)]
+        if not replied_dialogs:
+            # Also check across any account if reply landed on a sibling session
+            dialogs_any = _find_recipient_dialogs(
+                conn, rec, account_id=None, ignore_assigned_account=True
+            )
+            replied_dialogs = [d for d in dialogs_any if _dialog_has_client_reply(conn, d, rec)]
         if replied_dialogs:
             unread_dialogs = [d for d in replied_dialogs if _dialog_is_unread_awaiting_reply(conn, d, rec)]
             matched_dlg = unread_dialogs[0] if unread_dialogs else replied_dialogs[0]

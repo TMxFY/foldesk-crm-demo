@@ -993,6 +993,27 @@ function isSameDialog(a, b) {
   return false;
 }
 
+function normalizeDialogStamp(val) {
+  return String(val || "").trim().replace(" ", "T");
+}
+
+function sortDialogsByRecency(rows) {
+  const list = Array.isArray(rows) ? [...rows] : [];
+  return list.sort((a, b) => {
+    const aStamp = normalizeDialogStamp(a && a.last_message_at);
+    const bStamp = normalizeDialogStamp(b && b.last_message_at);
+    if (!aStamp && !bStamp) {
+      return (Number(b && b.id) || 0) - (Number(a && a.id) || 0);
+    }
+    if (!aStamp) return 1;
+    if (!bStamp) return -1;
+    if (aStamp !== bStamp) {
+      return bStamp > aStamp ? 1 : -1;
+    }
+    return (Number(b && b.id) || 0) - (Number(a && a.id) || 0);
+  });
+}
+
 function allRemindersForLead(leadId) {
   const merged = new Map();
   (state.allOpenReminders || []).forEach((item) => {
@@ -3357,15 +3378,20 @@ function passChips(dialog) {
   if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
     if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
   }
-  const searchRaw = String(state.inboxSearchQuery || "").trim().toLowerCase();
+  const searchRaw = String(state.inboxSearchQuery || state.dialogQuery || "").trim().toLowerCase();
   if (searchRaw) {
     const cleanQ = searchRaw.replace(/^@/, "");
+    const linkedLead = leadForDialog(dialog);
     const haystack = [
       dialog.name,
       dialog.title,
       dialog.username,
       dialog.phone,
+      dialog.company,
       dialog.last_message_preview,
+      linkedLead && linkedLead.name,
+      linkedLead && linkedLead.company,
+      linkedLead && linkedLead.username,
     ]
       .filter(Boolean)
       .join(" ")
@@ -3395,7 +3421,7 @@ function passChips(dialog) {
 function renderDialogs() {
   renderInboxChipCounts();
   const list = document.querySelector("#dialog-results");
-  const matched = state.dialogs.filter(passChips);
+  const matched = sortDialogsByRecency(state.dialogs.filter(passChips));
   if (state.inbox === "error") return;
   if (!state.dialogs.length) {
     setView("#inbox-view", state.dialogQuery ? "none" : "empty");
@@ -3983,6 +4009,12 @@ function renderThread() {
   const name = dialog.name || "Без имени";
   const ownerAcc = (state.accounts || []).find((acc) => Number(acc.id) === Number(dialog.account_id))
     || selectedAccount();
+  const ownerHealth = String((ownerAcc && ownerAcc.health) || dialog.account_health || "").trim().toLowerCase();
+  const ownerStatus = String((ownerAcc && ownerAcc.status) || "").trim().toLowerCase();
+  const isDeadSession = ownerHealth === "unauthorized"
+    || ownerHealth === "banned"
+    || Boolean(ownerAcc && ownerStatus && ownerStatus !== "connected");
+  const ownerAccLabel = (ownerAcc && (ownerAcc.telegram_name || ownerAcc.phone)) || accountLabel();
   const provider = normalizeProvider(dialog.provider || (ownerAcc && ownerAcc.provider) || "telegram");
   const contactHint = dialog.username
     ? `@${dialog.username}${dialog.phone ? ` · ${dialog.phone}` : ""}`
@@ -4033,7 +4065,7 @@ function renderThread() {
   document.querySelector("#thread-head").replaceChildren(
     titleGroup,
     el("div", { className: "thread-head-meta row" }, [
-      el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
+      el("p", { className: "hint" }, [`С аккаунта ${ownerAccLabel}`]),
       el("p", { className: "hint" }, [contactHint]),
       clientProfileBtn,
       dealPopupBtn,
@@ -4067,6 +4099,13 @@ function renderThread() {
     const mediaNode = buildMediaAttachmentNode(dialog, message);
     const hasText = Boolean(String(message.text || "").trim());
     const textNode = (hasText || !mediaNode) ? buildRichTextNode(message) : null;
+    const snapshotNoteNode = message && message.is_snapshot_preview === true
+      ? el("div", { className: "meta snapshot-preview-note" }, [
+        isDeadSession
+          ? "Снимок последнего сообщения · сессия отключена, полная история недоступна"
+          : "Снимок последнего сообщения · подгружаем полную историю",
+      ])
+      : null;
 
     const actionButtons = [
       el("button", {
@@ -4118,6 +4157,7 @@ function renderThread() {
       replyQuoteNode,
       mediaNode,
       textNode,
+      snapshotNoteNode,
       el("div", { className: "msg-meta" }, metaChildren),
     ].filter(Boolean));
   }));
@@ -4151,11 +4191,15 @@ function markDialogReadOnServer(dialogId) {
 
 async function selectDialog(dialog, options = {}) {
   const reqToken = ++dialogLoadToken;
+  const keepSessionAll = state.inboxSessionFilter === "all";
   if (dialog && dialog.account_id) {
     const select = document.querySelector("#tg-account");
     if (select && [...select.options].some((opt) => opt.value === String(dialog.account_id))) {
       select.value = String(dialog.account_id);
     }
+  }
+  if (keepSessionAll) {
+    state.inboxSessionFilter = "all";
   }
   state.selectedDialog = dialog;
   if (options && options.markRead && dialog && dialog.id != null) {
@@ -4165,25 +4209,10 @@ async function selectDialog(dialog, options = {}) {
   }
   state.messages = [];
   setView("#thread-view", "loading");
-  const liveRow = dialog && dialog.id != null
-    ? (
-      (Array.isArray(state.allDialogs) && state.allDialogs.find((r) => isSameDialog(r, dialog)))
-      || (Array.isArray(state.dialogs) && state.dialogs.find((r) => isSameDialog(r, dialog)))
-    )
-    : null;
-  const effectiveUnread = Math.max(
-    Number(dialog && dialog.unread_count) || 0,
-    Number(liveRow && liveRow.unread_count) || 0,
-  );
-  if (options && options.markRead && dialog && dialog.id && effectiveUnread > 0) {
-    dialog.unread_count = 0;
-    upsertDialog(dialog);
-    markDialogReadOnServer(dialog.id).catch(() => {});
-  } else {
-    renderDialogs();
-  }
+  renderDialogs();
   const reply = document.querySelector("#reply-text");
   if (reply) reply.value = "";
+  const preFetchStamp = normalizeDialogStamp(dialog && dialog.last_message_at);
   let loadError = "";
   let loadedMessages = [];
   if (dialog && dialog.id) {
@@ -4194,7 +4223,7 @@ async function selectDialog(dialog, options = {}) {
     }
   }
   if (reqToken !== dialogLoadToken) return;
-  state.messages = loadedMessages;
+  state.messages = Array.isArray(loadedMessages) ? loadedMessages : [];
   renderThread();
   if (loadError) {
     const error = document.querySelector("#thread-error");
@@ -4202,13 +4231,34 @@ async function selectDialog(dialog, options = {}) {
     error.textContent = loadError;
     const gap = document.querySelector("#thread-gap");
     if (gap) gap.hidden = true;
+  } else if (options && options.markRead && dialog && dialog.id) {
+    const liveRow = (Array.isArray(state.allDialogs) && state.allDialogs.find((r) => isSameDialog(r, dialog)))
+      || (Array.isArray(state.dialogs) && state.dialogs.find((r) => isSameDialog(r, dialog)))
+      || null;
+    const liveStamp = normalizeDialogStamp(liveRow && liveRow.last_message_at);
+    const newestLoadedStamp = state.messages.length
+      ? normalizeDialogStamp(state.messages[state.messages.length - 1].sent_at)
+      : "";
+    const arrivedNewerSseDuringFetch = Boolean(
+      liveRow && liveStamp && liveStamp > preFetchStamp && (!newestLoadedStamp || liveStamp > newestLoadedStamp)
+    );
+    const effectiveUnread = Math.max(
+      Number(dialog && dialog.unread_count) || 0,
+      Number(liveRow && liveRow.unread_count) || 0,
+    );
+    if (!arrivedNewerSseDuringFetch && effectiveUnread > 0) {
+      const mergedDialog = { ...dialog, ...(liveRow || {}), unread_count: 0 };
+      dialog.unread_count = 0;
+      upsertDialog(mergedDialog);
+      markDialogReadOnServer(dialog.id).catch(() => {});
+    }
   }
   renderSide();
 }
 
 function leadForDialog(dialog) {
   if (!dialog) return null;
-  const accountId = Number(document.querySelector("#tg-account")?.value || dialog.account_id || 0);
+  const accountId = Number(dialog.account_id || document.querySelector("#tg-account")?.value || 0);
   const cleanUser = String(dialog.username || "").replace(/^@/, "").toLowerCase();
   return state.leads.find((lead) => {
     if (dialog.lead_id && Number(lead.id) === Number(dialog.lead_id)) return true;
@@ -5854,12 +5904,14 @@ function upsertDialog(dialog) {
   const idx = state.dialogs.findIndex((row) => isSameDialog(row, mergedDialog));
   if (idx >= 0) state.dialogs[idx] = mergedDialog;
   else state.dialogs.unshift(mergedDialog);
+  state.dialogs = sortDialogsByRecency(state.dialogs);
   if (Array.isArray(state.allDialogs)) {
     const allIdx = state.allDialogs.findIndex((row) => isSameDialog(row, mergedDialog));
     if (allIdx >= 0) state.allDialogs[allIdx] = mergedDialog;
     else state.allDialogs.unshift(mergedDialog);
+    state.allDialogs = sortDialogsByRecency(state.allDialogs);
   }
-  if (state.allDialogsLoaded && Array.isArray(state.allDialogs) && state.allDialogs.length < 500) {
+  if (state.allDialogsLoaded && Array.isArray(state.allDialogs) && state.allDialogs.length < 2000) {
     state.inboxCounts = computeLocalInboxCounts(state.allDialogs);
   } else if (state.inboxCounts && typeof state.inboxCounts === "object") {
     const nextCounts = { ...state.inboxCounts };
@@ -5916,7 +5968,7 @@ function openInboxLive(accountId) {
     try {
       const rows = JSON.parse(event.data);
       if (!Array.isArray(rows)) return;
-      const sanitizedRows = rows.map((row) => {
+      const sanitizedRows = sortDialogsByRecency(rows.map((row) => {
         if (!row || row.id == null) return row;
         const rowId = Number(row.id);
         const pinnedRead = state.pinnedDialogId != null
@@ -5928,9 +5980,9 @@ function openInboxLive(accountId) {
           return { ...row, unread_count: 0 };
         }
         return row;
-      });
+      }));
       state.allDialogs = [...sanitizedRows];
-      state.allDialogsLoaded = sanitizedRows.length < 500;
+      state.allDialogsLoaded = sanitizedRows.length < 2000;
       if (state.allDialogsLoaded) {
         state.inboxCounts = computeLocalInboxCounts(sanitizedRows);
       } else {
@@ -5993,7 +6045,9 @@ async function loadInbox() {
   if (activeChips) qs.set("chip", activeChips);
   const res = await api(`/api/inbox?${qs.toString()}`);
   if (listToken !== inboxListLoadToken) return;
-  const dialogs = Array.isArray(res) ? res : (res && Array.isArray(res.dialogs) ? res.dialogs : []);
+  const dialogs = sortDialogsByRecency(
+    Array.isArray(res) ? res : (res && Array.isArray(res.dialogs) ? res.dialogs : []),
+  );
   if (syncToken === inboxCountSyncToken) {
     if (res && res.counts && typeof res.counts === "object") {
       state.inboxCounts = res.counts;
@@ -6003,7 +6057,7 @@ async function loadInbox() {
   }
   if (!activeChips) {
     state.allDialogs = [...dialogs];
-    state.allDialogsLoaded = dialogs.length < 500;
+    state.allDialogsLoaded = dialogs.length < 2000;
   }
   state.dialogs = dialogs;
   state.dialogQuery = "";

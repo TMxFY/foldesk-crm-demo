@@ -13,7 +13,15 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-from app.db import ROOT, as_dict, locked_conn, utc_now
+from app.db import (
+    ROOT,
+    as_dict,
+    clean_tg_username_lookup,
+    is_recipient_contacted_outreach,
+    locked_conn,
+    sql_norm_tg_username_expr,
+    utc_now,
+)
 from app.reminders import complete_reminder, list_reminders, normalize_due
 
 logger = logging.getLogger(__name__)
@@ -223,7 +231,7 @@ def _check_lead_or_recipient_backing(
     hdl_user, hdl_phone = _extract_handle_username_and_phone(
         lead_handle, allow_bare_username=False
     )
-    clean_user = raw_user or hdl_user
+    clean_user = clean_tg_username_lookup(raw_user or hdl_user) or None
     raw_phone_digits = re.sub(r"\D", "", str(phone or ""))
     norm_phone_digits = (
         raw_phone_digits[-15:]
@@ -233,6 +241,7 @@ def _check_lead_or_recipient_backing(
     sql_phone_expr = (
         "substr(replace(replace(replace(replace(replace(phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -15)"
     )
+    sql_uname_expr = sql_norm_tg_username_expr("username")
 
     matched_leads = []
     if _table_exists(conn, "leads"):
@@ -249,7 +258,7 @@ def _check_lead_or_recipient_backing(
             clauses.append("telegram_user_id = ?")
             params.append(clean_peer)
         if clean_user:
-            clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+            clauses.append(f"(username IS NOT NULL AND {sql_uname_expr} = ?)")
             params.append(clean_user)
         if norm_phone_digits:
             clauses.append(f"(phone IS NOT NULL AND {sql_phone_expr} = ?)")
@@ -281,22 +290,29 @@ def _check_lead_or_recipient_backing(
             rc_clauses.append("telegram_user_id = ?")
             rc_params.append(clean_peer)
         if clean_user:
-            rc_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
+            rc_clauses.append(f"(username IS NOT NULL AND {sql_uname_expr} = ?)")
             rc_params.append(clean_user)
         if norm_phone_digits:
             rc_clauses.append(f"(phone IS NOT NULL AND {sql_phone_expr} = ?)")
             rc_params.append(norm_phone_digits)
         if rc_clauses:
-            found_rec = conn.execute(
+            rec_rows = conn.execute(
                 f"""
-                SELECT 1 FROM campaign_recipients
+                SELECT status, current_step, last_sent_at, error_text
+                FROM campaign_recipients
                 WHERE ({' OR '.join(rc_clauses)})
-                  AND lower(coalesce(status, '')) IN ('in_progress', 'completed', 'replied')
-                LIMIT 1
                 """,
                 rc_params,
-            ).fetchone()
-            if found_rec is not None:
+            ).fetchall()
+            if any(
+                is_recipient_contacted_outreach(
+                    r["status"],
+                    r["current_step"],
+                    r["last_sent_at"],
+                    r["error_text"],
+                )
+                for r in rec_rows
+            ):
                 return True, "campaign_recipient"
 
     return False, "non_lead_dialog"

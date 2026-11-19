@@ -24,18 +24,45 @@ import argparse
 import importlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import sys
+import tempfile
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.analytics import get_analytics_summary  # noqa: E402
-from app.db import connect  # noqa: E402
-from app.digest import audit_reply_notifications, heal_reply_notifications  # noqa: E402
+from app.analytics import _sync_running_and_all_campaign_replies, get_analytics_summary  # noqa: E402
+from app.db import (  # noqa: E402
+    connect,
+    init_db,
+    is_newer_dialog_snapshot_unbacked,
+    is_recipient_contacted_outreach,
+    is_vacancy_campaign_meta,
+    utc_now,
+)
+from app.digest import (  # noqa: E402
+    audit_reply_notifications,
+    heal_reply_notifications,
+    is_ineligible_reply_notify_peer,
+)
+from app.funnel_analytics import ensure_funnel_columns  # noqa: E402
+from app.inbox import (  # noqa: E402
+    _PERSONAL_HYGIENE_ERRORS,
+    _norm_ts,
+    clean_tg_username_lookup,
+    list_inbox,
+    list_messages,
+)
+from app.leads import create_lead  # noqa: E402
 from app.main import load_env_file  # noqa: E402
+from app.outreach import (  # noqa: E402
+    _dialog_has_client_reply,
+    _find_recipient_dialogs,
+    _latest_dialog_in_meta,
+)
 from app.runtime_config import is_vps_runtime  # noqa: E402
 
 
@@ -99,6 +126,235 @@ def _audit_ssot_statistics(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _audit_old_lead_message_visibility(conn: sqlite3.Connection) -> dict:
+    """Verify every client/contacted reply is visible in Inbox, marked replied, and has readable latest msg."""
+    visible_rows = list_inbox(conn, 0, "", crm_only=True, limit=0)
+    visible_ids = {int(r["id"]) for r in visible_rows if r.get("id") is not None}
+
+    hidden_replied_dialogs: list[dict] = []
+    unmarked_replied_recipients: list[dict] = []
+    invisible_latest_messages: list[dict] = []
+
+    lead_ids_by_tg: dict[int, list[int]] = {}
+    lead_ids_by_uname: dict[str, list[int]] = {}
+    won_lead_ids: set[int] = set()
+    all_lead_ids: set[int] = set()
+    for lr in conn.execute(
+        "SELECT id, telegram_user_id, username, status FROM leads"
+    ).fetchall():
+        lid = int(lr["id"])
+        all_lead_ids.add(lid)
+        if str(lr["status"] or "").strip().lower() in ("won", "signed"):
+            won_lead_ids.add(lid)
+        if lr["telegram_user_id"] is not None:
+            lead_ids_by_tg.setdefault(int(lr["telegram_user_id"]), []).append(lid)
+        cu = clean_tg_username_lookup(lr["username"])
+        if cu:
+            lead_ids_by_uname.setdefault(cu, []).append(lid)
+
+    recs_all = conn.execute(
+        """
+        SELECT cr.id, cr.campaign_id, cr.lead_id, cr.telegram_user_id, cr.username, cr.phone,
+               cr.status, cr.current_step, cr.last_sent_at, cr.sent_account_id,
+               cr.assigned_account_id, cr.error_text, cr.created_at,
+               c.name AS camp_name, c.leadgen_sources_json AS camp_sources
+        FROM campaign_recipients cr
+        LEFT JOIN campaigns c ON c.id = cr.campaign_id
+        """
+    ).fetchall()
+    recs_by_lid: dict[int, list[dict]] = {}
+    recs_by_tg: dict[int, list[dict]] = {}
+    recs_by_u: dict[str, list[dict]] = {}
+    for rr in recs_all:
+        rd = dict(rr)
+        rd["_is_vac"] = is_vacancy_campaign_meta(rd.get("camp_name"), rd.get("camp_sources"))
+        if rd.get("lead_id") is not None:
+            recs_by_lid.setdefault(int(rd["lead_id"]), []).append(rd)
+        if rd.get("telegram_user_id") is not None:
+            recs_by_tg.setdefault(int(rd["telegram_user_id"]), []).append(rd)
+        ru = clean_tg_username_lookup(rd.get("username"))
+        if ru:
+            recs_by_u.setdefault(ru, []).append(rd)
+
+    dlg_rows = conn.execute(
+        """
+        SELECT d.id, d.account_id, d.peer_id, d.username, d.title, d.phone,
+               d.lead_id, d.is_bot, d.last_from_peer, d.last_message_at,
+               d.last_message_preview,
+               EXISTS(SELECT 1 FROM messages m WHERE m.dialog_id = d.id AND m.direction = 'in') AS has_in_msg,
+               EXISTS(SELECT 1 FROM messages m WHERE m.dialog_id = d.id) AS has_any_msg
+        FROM dialogs d
+        WHERE d.is_group = 0 AND COALESCE(d.peer_type, 'user') = 'user'
+        """
+    ).fetchall()
+    for drow in dlg_rows:
+        did = int(drow["id"])
+        acc_id = int(drow["account_id"]) if drow["account_id"] is not None else None
+        peer_id = int(drow["peer_id"]) if drow["peer_id"] is not None else None
+        uname = clean_tg_username_lookup(drow["username"])
+        has_reply_sig = int(drow["last_from_peer"] or 0) == 1 or bool(drow["has_in_msg"])
+        has_body = bool(str(drow["last_message_preview"] or "").strip()) or bool(drow["has_any_msg"])
+        if not (has_reply_sig and has_body):
+            continue
+        inelig, _ = is_ineligible_reply_notify_peer(
+            conn,
+            peer_id=peer_id,
+            username=uname or None,
+            phone=drow["phone"],
+            account_id=acc_id,
+            is_bot=bool(drow["is_bot"]),
+        )
+        if inelig:
+            continue
+
+        matched_lids: set[int] = set()
+        if drow["lead_id"] is not None and int(drow["lead_id"]) in all_lead_ids:
+            matched_lids.add(int(drow["lead_id"]))
+        if peer_id is not None and peer_id in lead_ids_by_tg:
+            matched_lids.update(lead_ids_by_tg[peer_id])
+        if uname and uname in lead_ids_by_uname:
+            matched_lids.update(lead_ids_by_uname[uname])
+
+        matched_recs: list[dict] = []
+        seen_rids: set[int] = set()
+        for bucket in (
+            *(recs_by_lid.get(lid, ()) for lid in matched_lids),
+            recs_by_tg.get(peer_id, ()) if peer_id is not None else (),
+            recs_by_u.get(uname, ()) if uname else (),
+        ):
+            for rec in bucket:
+                rid = int(rec["id"])
+                if rid not in seen_rids:
+                    seen_rids.add(rid)
+                    matched_recs.append(rec)
+
+        vac_recs = [r for r in matched_recs if r["_is_vac"]]
+        reg_recs = [r for r in matched_recs if not r["_is_vac"]]
+        has_won_lead = any(lid in won_lead_ids for lid in matched_lids)
+        if vac_recs and not reg_recs and not has_won_lead:
+            continue
+
+        has_valid_contacted_rec = any(
+            int(r.get("current_step") or 0) >= 1
+            and bool(str(r.get("last_sent_at") or "").strip())
+            and is_recipient_contacted_outreach(
+                r.get("status"),
+                r.get("current_step"),
+                r.get("last_sent_at"),
+                r.get("error_text"),
+            )
+            and (
+                (r.get("sent_account_id") if r.get("sent_account_id") is not None else r.get("assigned_account_id"))
+                in (None, acc_id)
+            )
+            for r in reg_recs
+        )
+        if (matched_lids or has_valid_contacted_rec) and did not in visible_ids:
+            hidden_replied_dialogs.append(
+                {
+                    "dialog_id": did,
+                    "account_id": acc_id,
+                    "username": drow["username"],
+                    "title": drow["title"],
+                }
+            )
+
+    # Check 2: contacted non-vacancy non-hygiene recipients with an incoming reply must be 'replied'
+    for rr in recs_all:
+        rec = dict(rr)
+        if is_vacancy_campaign_meta(rec.get("camp_name"), rec.get("camp_sources")):
+            continue
+        st = str(rec.get("status") or "").strip().lower()
+        if st not in ("in_progress", "completed", "failed"):
+            continue
+        if not is_recipient_contacted_outreach(
+            st,
+            rec.get("current_step"),
+            rec.get("last_sent_at"),
+            rec.get("error_text"),
+        ):
+            continue
+        if int(rec.get("current_step") or 0) < 1 or not str(rec.get("last_sent_at") or "").strip():
+            continue
+        dialogs = _find_recipient_dialogs(conn, rec, account_id=rec.get("sent_account_id") or rec.get("assigned_account_id"))
+        replied_cands = [d for d in dialogs if _dialog_has_client_reply(conn, d, rec)]
+        if not replied_cands:
+            dialogs_any = _find_recipient_dialogs(conn, rec, account_id=None, ignore_assigned_account=True)
+            replied_cands = [d for d in dialogs_any if _dialog_has_client_reply(conn, d, rec)]
+        rec_last_sent = _norm_ts(rec.get("last_sent_at"))
+        for d in replied_cands:
+            d_inelig, _ = is_ineligible_reply_notify_peer(
+                conn,
+                peer_id=d.get("peer_id"),
+                username=d.get("username"),
+                phone=d.get("phone"),
+                account_id=d.get("account_id"),
+                is_bot=bool(d.get("is_bot")),
+            )
+            if d_inelig:
+                continue
+            _, incoming_sent_at = _latest_dialog_in_meta(conn, d)
+            if incoming_sent_at and rec_last_sent and rec_last_sent > incoming_sent_at:
+                continue
+            unmarked_replied_recipients.append(
+                {
+                    "recipient_id": int(rec["id"]),
+                    "campaign_id": int(rec["campaign_id"]),
+                    "status": st,
+                    "username": rec.get("username"),
+                    "dialog_id": int(d["id"]),
+                }
+            )
+            break
+
+    # Check 3: every visible CRM dialog with preview + timestamp must show its latest msg in list_messages
+    for d in visible_rows:
+        snap_ts = _norm_ts(d.get("last_message_at"))
+        snap_prev = str(d.get("last_message_preview") or "").strip()
+        if not snap_ts or not snap_prev:
+            continue
+        did = int(d["id"])
+        msgs = list_messages(conn, did, 50)
+        if not msgs:
+            invisible_latest_messages.append(
+                {"dialog_id": did, "reason": "empty_list_messages", "last_message_at": snap_ts}
+            )
+            continue
+        newest_ts = max(_norm_ts(m.get("sent_at")) for m in msgs)
+        if is_newer_dialog_snapshot_unbacked(
+            snap_prev,
+            d.get("last_message_at"),
+            d.get("last_from_peer"),
+            msgs[-1].get("text"),
+            msgs[-1].get("sent_at"),
+            msgs[-1].get("direction"),
+        ):
+            invisible_latest_messages.append(
+                {
+                    "dialog_id": did,
+                    "reason": "latest_msg_older_than_snapshot",
+                    "last_message_at": snap_ts,
+                    "newest_msg_at": newest_ts,
+                }
+            )
+
+    ok = (
+        len(hidden_replied_dialogs) == 0
+        and len(unmarked_replied_recipients) == 0
+        and len(invisible_latest_messages) == 0
+    )
+    return {
+        "ok": ok,
+        "visible_crm_dialogs_count": len(visible_ids),
+        "hidden_replied_dialog_count": len(hidden_replied_dialogs),
+        "unmarked_replied_recipient_count": len(unmarked_replied_recipients),
+        "invisible_latest_message_count": len(invisible_latest_messages),
+        "hidden_replied_dialogs": hidden_replied_dialogs[:20],
+        "unmarked_replied_recipients": unmarked_replied_recipients[:20],
+        "invisible_latest_messages": invisible_latest_messages[:20],
+    }
+
+
 def _heal_crm_hygiene(conn) -> dict:
     return _raw_heal_crm_hygiene(conn, clear_stale_stage_errors=True)
 
@@ -122,6 +378,7 @@ def _audit_local_db(
         try:
             healed_replies = heal_reply_notifications(conn)
             healed_hygiene = _heal_crm_hygiene(conn)
+            _sync_running_and_all_campaign_replies(conn)
             print(
                 "proactive_audit: healed "
                 + json.dumps(
@@ -135,6 +392,7 @@ def _audit_local_db(
             reply_report = audit_reply_notifications(conn, since_hours=since_hours)
             hygiene_report = _audit_crm_hygiene(conn)
             stats_report = _audit_ssot_statistics(conn)
+            vis_report = _audit_old_lead_message_visibility(conn)
             if check_readiness:
                 readiness_report = _audit_server_leadgen_readiness(
                     conn, enforce_vps_checks=True
@@ -149,6 +407,7 @@ def _audit_local_db(
             reply_report = audit_reply_notifications(conn, since_hours=since_hours)
             hygiene_report = _audit_crm_hygiene(conn)
             stats_report = _audit_ssot_statistics(conn)
+            vis_report = _audit_old_lead_message_visibility(conn)
             if check_readiness:
                 readiness_report = _audit_server_leadgen_readiness(
                     conn, enforce_vps_checks=True
@@ -160,6 +419,7 @@ def _audit_local_db(
         bool(reply_report.get("ok"))
         and bool(hygiene_report.get("ok"))
         and bool(stats_report.get("ok"))
+        and bool(vis_report.get("ok"))
     )
     if readiness_report is not None and not bool(readiness_report.get("ok")):
         overall_ok = False
@@ -170,6 +430,8 @@ def _audit_local_db(
     combined["crm_hygiene"] = hygiene_report
     combined["ssot_stats_ok"] = bool(stats_report.get("ok"))
     combined["ssot_stats"] = stats_report
+    combined["message_visibility_ok"] = bool(vis_report.get("ok"))
+    combined["message_visibility"] = vis_report
     if readiness_report is not None:
         combined["leadgen_ready"] = bool(readiness_report.get("ok"))
         combined["leadgen_readiness"] = readiness_report
@@ -192,6 +454,13 @@ def _audit_local_db(
         )
     if not stats_report.get("ok"):
         reasons.append(f"ssot_stats({', '.join(stats_report.get('issues') or [])})")
+    if not vis_report.get("ok"):
+        reasons.append(
+            "message_visibility("
+            f"hidden_replied_dialogs={vis_report.get('hidden_replied_dialog_count', 0)}, "
+            f"unmarked_replied_recipients={vis_report.get('unmarked_replied_recipient_count', 0)}, "
+            f"invisible_latest_messages={vis_report.get('invisible_latest_message_count', 0)})"
+        )
     if readiness_report is not None and not readiness_report.get("ok"):
         missing = readiness_report.get("missing_components") or []
         reasons.append(
@@ -248,6 +517,126 @@ def _audit_health_url(url: str) -> int:
     return 0
 
 
+def _run_self_test() -> int:
+    """Verify proactive_audit actually fails (ok=False) on injected violations, then heals to ok=True."""
+    with tempfile.TemporaryDirectory(prefix="proactive_audit_selftest_") as td:
+        db_path = Path(td) / "selftest.db"
+        conn = connect(db_path)
+        try:
+            init_db(conn)
+            ensure_funnel_columns(conn)
+            now = utc_now()
+            acc_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO accounts (phone, session_path, status, health, telegram_user_id, telegram_username, created_at, updated_at)
+                    VALUES ('+79990001122', 's1.session', 'connected', 'active', 1001, 'sender_self', ?, ?)
+                    """,
+                    (now, now),
+                ).lastrowid
+            )
+            camp_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO campaigns (name, account_id, account_ids_json, daily_limit, status, created_at, updated_at)
+                    VALUES ('SoftUGC SelfTest', ?, ?, 20, 'running', ?, ?)
+                    """,
+                    (acc_id, f"[{acc_id}]", now, now),
+                ).lastrowid
+            )
+            # Bug 1: bot username lead
+            create_lead(
+                conn,
+                name="Bot Lead",
+                username="helperbot",
+                telegram_user_id=7001,
+                status="lost",
+                account_id=acc_id,
+            )
+            # Bug 2: unmarked completed recipient with incoming reply in dialog
+            conn.execute(
+                """
+                INSERT INTO campaign_recipients (
+                    campaign_id, telegram_user_id, username, name, step1_text,
+                    current_step, status, sent_account_id, assigned_account_id, last_sent_at, created_at, updated_at
+                ) VALUES (?, 7002, 'late_completed_lead', 'Late Lead', 'Hi', 1, 'completed', ?, ?, '2026-11-10T10:00:00', ?, ?)
+                """,
+                (camp_id, acc_id, acc_id, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO dialogs (
+                    account_id, peer_type, peer_id, username, title, is_group,
+                    unread_count, last_message_at, last_message_preview, last_from_peer,
+                    created_at, updated_at
+                ) VALUES (?, 'user', 7002, 'late_completed_lead', 'Late Lead', 0, 1, '2026-11-18T12:00:00', 'Да, давайте обсудим!', 1, ?, ?)
+                """,
+                (acc_id, now, now),
+            )
+            conn.commit()
+
+            rep_before = audit_reply_notifications(conn)
+            vis_before = _audit_old_lead_message_visibility(conn)
+            if rep_before.get("ok") is not False:
+                print("SELFTEST FAILED: audit_reply_notifications missed bot-username lead", file=sys.stderr)
+                return 1
+            if vis_before.get("ok") is not False or vis_before.get("unmarked_replied_recipient_count", 0) < 1:
+                print(
+                    f"SELFTEST FAILED: _audit_old_lead_message_visibility missed unmarked completed reply: {vis_before}",
+                    file=sys.stderr,
+                )
+                return 1
+
+            heal_reply_notifications(conn)
+            _heal_crm_hygiene(conn)
+            _sync_running_and_all_campaign_replies(conn)
+
+            rep_after = audit_reply_notifications(conn)
+            hyg_after = _audit_crm_hygiene(conn)
+            stat_after = _audit_ssot_statistics(conn)
+            vis_after = _audit_old_lead_message_visibility(conn)
+            if not (
+                rep_after.get("ok")
+                and hyg_after.get("ok")
+                and stat_after.get("ok")
+                and vis_after.get("ok")
+            ):
+                print(
+                    f"SELFTEST FAILED after heal: rep={rep_after} hyg={hyg_after} stat={stat_after} vis={vis_after}",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Prove Check 1 (hidden replied dialog) & Check 3 (invisible latest msg) also fail loudly
+            from unittest.mock import patch
+
+            with patch(__name__ + ".list_inbox", return_value=[]):
+                c1_fail = _audit_old_lead_message_visibility(conn)
+                if c1_fail.get("ok") is not False or c1_fail.get("hidden_replied_dialog_count", 0) < 1:
+                    print(
+                        f"SELFTEST FAILED: Check 1 missed hidden replied dialog: {c1_fail}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+            with patch(
+                __name__ + ".list_messages",
+                return_value=[{"text": "Old msg", "sent_at": "2026-10-01T00:00:00", "direction": "out"}],
+            ):
+                c3_fail = _audit_old_lead_message_visibility(conn)
+                if c3_fail.get("ok") is not False or c3_fail.get("invisible_latest_message_count", 0) < 1:
+                    print(
+                        f"SELFTEST FAILED: Check 3 missed invisible latest message: {c3_fail}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+            print("proactive_audit --self-test: OK (negative violations failed as expected, healed clean)")
+            return 0
+        finally:
+            conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Proactive reply-alert, ICP hygiene & server leadgen readiness auditor"
@@ -270,8 +659,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Restrict notification window in hours",
     )
     parser.add_argument("--health-url", type=str, help="Live /api/health?deep=1 URL")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Verify audit gates fail on injected DB violations and pass after healing",
+    )
     args = parser.parse_args(argv)
     load_env_file()
+
+    if args.self_test:
+        return _run_self_test()
 
     rc = 0
     if args.db is not None:

@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -65,8 +66,11 @@ from app.funnel_analytics import (
 from app.inbox import (
     _filter_crm_only_rows,
     _is_vacancy_campaign_meta,
+    _load_dialog_public,
     _person_is_crm_relevant,
+    _query_inbox_rows,
     apply_incoming,
+    clean_tg_username_lookup,
     edit_dialog_message,
     ensure_playable_voice_wav,
     get_dialog_avatar_with_cache,
@@ -121,6 +125,7 @@ from app.properties import (
 from app.tools import convert_phones_to_tg, parse_telegram_group
 from app.bot_login import apply_bot_update, handle_bot_reply_to_lead, operator_status, poll_bot_login
 from app.digest import (
+    _norm_ts,
     apply_digest_callback,
     callback_data_from_update,
     is_ineligible_reply_notify_peer,
@@ -713,31 +718,40 @@ def _filter_people_to_existing_or_crm(
             "SELECT telegram_user_id FROM leads WHERE telegram_user_id IS NOT NULL"
         ).fetchall()
     }
-    crm_usernames = {
-        str(r[0]).strip().lstrip("@").lower()
-        for r in conn.execute(
-            "SELECT username FROM leads WHERE username IS NOT NULL AND username != ''"
-        ).fetchall()
-    }
+    crm_usernames: set[str] = set()
+    for r in conn.execute(
+        "SELECT username FROM leads WHERE username IS NOT NULL AND username != ''"
+    ).fetchall():
+        u = clean_tg_username_lookup(r[0])
+        if u:
+            crm_usernames.add(u)
     crm_phones: set[str] = set()
     for pr in conn.execute("SELECT phone FROM leads WHERE phone IS NOT NULL AND phone != ''").fetchall():
         dig = _re.sub(r"\D", "", str(pr[0] or ""))
         if len(dig) >= 7:
             crm_phones.add(dig[-15:])
+    from app.db import is_recipient_contacted_outreach, is_vacancy_campaign_meta
+
     for rr in conn.execute(
         """
-        SELECT cr.telegram_user_id, cr.username, cr.phone, c.name AS camp_name, c.leadgen_sources_json AS camp_sources
+        SELECT cr.telegram_user_id, cr.username, cr.phone,
+               cr.status, cr.current_step, cr.last_sent_at, cr.error_text,
+               c.name AS camp_name, c.leadgen_sources_json AS camp_sources
         FROM campaign_recipients cr
         LEFT JOIN campaigns c ON c.id = cr.campaign_id
-        WHERE cr.status IN ('in_progress', 'replied')
+        WHERE cr.status IN ('in_progress', 'completed', 'replied', 'failed')
         """
     ).fetchall():
-        if _is_vacancy_campaign_meta(rr["camp_name"], rr["camp_sources"]):
+        if is_vacancy_campaign_meta(rr["camp_name"], rr["camp_sources"]):
+            continue
+        if not is_recipient_contacted_outreach(
+            rr["status"], rr["current_step"], rr["last_sent_at"], rr["error_text"]
+        ):
             continue
         if rr["telegram_user_id"] is not None:
             crm_tg_ids.add(int(rr["telegram_user_id"]))
         if rr["username"]:
-            u = str(rr["username"]).strip().lstrip("@").lower()
+            u = clean_tg_username_lookup(rr["username"])
             if u:
                 crm_usernames.add(u)
         if rr["phone"]:
@@ -753,7 +767,7 @@ def _filter_people_to_existing_or_crm(
             pid_int = int(pid) if pid is not None else None
         except (TypeError, ValueError):
             pid_int = None
-        uname = str(p.get("username") or "").strip().lstrip("@").lower()
+        uname = clean_tg_username_lookup(p.get("username"))
         p_dig = _re.sub(r"\D", "", str(p.get("phone") or ""))
         p_norm = p_dig[-15:] if len(p_dig) >= 7 else ""
         inelig, _ = is_ineligible_reply_notify_peer(
@@ -879,9 +893,10 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         gateway = _resolve_app_gateway(app, provider)
         if gateway is None:
             return
+        pull_limit = 250 if (existing_only_refresh or is_live_tg) else 30
         try:
             people = await gateway.load_inbox(
-                account["session_path"], limit=60 if (existing_only_refresh or is_live_tg) else 30
+                account["session_path"], limit=pull_limit
             )
         except Exception:
             if existing_only_refresh:
@@ -896,7 +911,7 @@ async def ensure_private_inbox(app, account_id: int) -> None:
                 app,
                 app.state.conn,
                 account_id,
-                people[: (60 if (existing_only_refresh or is_live_tg) else 30)],
+                people[:pull_limit],
                 crm_only=bool(existing_only_refresh or is_live_tg),
                 notify=not (existing_only_refresh or is_live_tg),
             )
@@ -1175,6 +1190,165 @@ async def sync_live_tg_read_receipts_once(
     }
 
 
+async def sync_crm_dialog_messages_backfill_once(
+    app: FastAPI, *, account_id: int | None = None, max_dialogs: int = 25
+) -> dict:
+    gateway = _resolve_app_gateway(app, "telegram")
+    if gateway is None or not hasattr(gateway, "fetch_messages"):
+        return {"ok": False, "checked": 0, "backfilled": 0}
+    conn = getattr(app.state, "conn", None)
+    if conn is None:
+        return {"ok": False, "checked": 0, "backfilled": 0}
+    cap_dialogs = max(0, int(max_dialogs or 0))
+    if cap_dialogs <= 0:
+        return {"ok": True, "checked": 0, "backfilled": 0}
+
+    attempted = getattr(app.state, "backfill_attempted_at", None)
+    if not isinstance(attempted, dict):
+        attempted = {}
+        app.state.backfill_attempted_at = attempted
+
+    now_mono = time.monotonic()
+    if len(attempted) > 4096:
+        expired = [k for k, ts in attempted.items() if (now_mono - ts) >= 600.0]
+        for k in expired:
+            attempted.pop(k, None)
+        if len(attempted) > 4096:
+            attempted.clear()
+
+    is_real_or_none_gw = isinstance(gateway, (type(None), TelethonGateway))
+    target_aid = int(account_id) if (account_id is not None and int(account_id) != 0) else None
+
+    def _select_backfill_candidates(c) -> list[dict]:
+        if target_aid is not None:
+            acc_rows = c.execute(
+                "SELECT id, session_path, provider, status, health FROM accounts WHERE id = ? AND status = 'connected'",
+                (target_aid,),
+            ).fetchall()
+        else:
+            acc_rows = c.execute(
+                "SELECT id, session_path, provider, status, health FROM accounts WHERE status = 'connected' ORDER BY id"
+            ).fetchall()
+        readable_acc_ids = {
+            int(r["id"])
+            for r in acc_rows
+            if str(r["provider"] or "telegram").strip().lower() == "telegram"
+            and not _is_dead_account_health(r["health"])
+            and not (
+                is_real_or_none_gw
+                and str(r["session_path"] or "").startswith("data/sessions/demo")
+            )
+        }
+        if not readable_acc_ids:
+            return []
+
+        all_rows = _query_inbox_rows(c, account_id=target_aid or 0, crm_only=False)
+        crm_rows = _filter_crm_only_rows(c, all_rows)
+        eligible_rows = [
+            r
+            for r in crm_rows
+            if r.get("id") is not None and int(r.get("account_id") or 0) in readable_acc_ids
+        ]
+        if not eligible_rows:
+            return []
+
+        msg_stats: dict[int, tuple[int, str]] = {}
+        cand_dids = [int(r["id"]) for r in eligible_rows]
+        for start in range(0, len(cand_dids), 400):
+            chunk = cand_dids[start : start + 400]
+            ph = ",".join("?" for _ in chunk)
+            for mr in c.execute(
+                f"""
+                SELECT dialog_id,
+                       COUNT(*) AS msg_cnt,
+                       MAX(REPLACE(COALESCE(sent_at, ''), ' ', 'T')) AS max_msg_at
+                FROM messages
+                WHERE dialog_id IN ({ph})
+                GROUP BY dialog_id
+                """,
+                chunk,
+            ).fetchall():
+                msg_stats[int(mr["dialog_id"])] = (
+                    int(mr["msg_cnt"] or 0),
+                    str(mr["max_msg_at"] or ""),
+                )
+
+        picked: list[dict] = []
+        for r in eligible_rows:
+            did = int(r["id"])
+            aid = int(r["account_id"])
+            msg_cnt, raw_max_msg_at = msg_stats.get(did, (0, ""))
+            norm_max_msg_at = _norm_ts(raw_max_msg_at)
+            raw_last_at = str(r.get("last_message_at") or "").strip()
+            norm_last_at = _norm_ts(raw_last_at)
+            has_snap = bool(
+                str(r.get("last_message_preview") or "").strip() or norm_last_at
+            )
+            needs_backfill = (msg_cnt == 0 and has_snap) or (
+                bool(norm_last_at) and norm_last_at > norm_max_msg_at
+            )
+            if not needs_backfill:
+                continue
+            prev_attempt = attempted.get((did, norm_last_at))
+            if prev_attempt is not None and (now_mono - prev_attempt) < 600.0:
+                continue
+            picked.append(
+                {
+                    "id": did,
+                    "account_id": aid,
+                    "msg_cnt": msg_cnt,
+                    "norm_max_msg_at": norm_max_msg_at,
+                    "norm_last_at": norm_last_at,
+                }
+            )
+        picked.sort(key=lambda item: (item["norm_last_at"], item["id"]), reverse=True)
+        return picked[:cap_dialogs]
+
+    try:
+        candidates = await _run_db_sync(conn, _select_backfill_candidates, conn)
+    except LookupError:
+        return {"ok": True, "checked": 0, "backfilled": 0}
+
+    checked = 0
+    backfilled = 0
+    hub = getattr(app.state, "inbox_hub", None)
+    for item in candidates:
+        did = int(item["id"])
+        aid = int(item["account_id"])
+        norm_last_at = item["norm_last_at"]
+        checked += 1
+        attempted[(did, norm_last_at)] = time.monotonic()
+        before_cnt = int(item["msg_cnt"])
+        before_max = item["norm_max_msg_at"]
+        try:
+            await get_thread(conn, did, gateway, 50)
+        except Exception:
+            continue
+
+        def _reload_dialog_state(c):
+            row_stats = c.execute(
+                "SELECT COUNT(*) AS cnt, MAX(REPLACE(COALESCE(sent_at, ''), ' ', 'T')) AS max_at FROM messages WHERE dialog_id = ?",
+                (did,),
+            ).fetchone()
+            after_cnt = int(row_stats["cnt"] or 0) if row_stats is not None else 0
+            after_max = _norm_ts(row_stats["max_at"]) if row_stats is not None else ""
+            dlg_pub = _load_dialog_public(c, did)
+            return after_cnt, after_max, dlg_pub
+
+        try:
+            after_cnt, after_max, dlg_pub = await _run_db_sync(
+                conn, _reload_dialog_state, conn
+            )
+        except Exception:
+            continue
+        if after_cnt > before_cnt or (after_max and after_max > before_max):
+            backfilled += 1
+            if hub is not None and isinstance(dlg_pub, dict):
+                hub.publish(aid, dlg_pub)
+
+    return {"ok": True, "checked": checked, "backfilled": backfilled}
+
+
 async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
     tick_counter = 0
     read_cursor = 0
@@ -1226,8 +1400,13 @@ async def autopilot_loop(app: FastAPI, interval_seconds: float = 30.0) -> None:
                 if tg_ids:
                     aid = tg_ids[read_cursor % len(tg_ids)]
                     read_cursor += 1
-                    rr = await sync_live_tg_read_receipts_once(app, account_id=aid, limit=60)
+                    rr = await sync_live_tg_read_receipts_once(app, account_id=aid, limit=200)
                     if int(rr.get("updated_recipients") or 0) > 0:
+                        dirty = True
+                    bf = await sync_crm_dialog_messages_backfill_once(
+                        app, account_id=aid, max_dialogs=15
+                    )
+                    if int(bf.get("backfilled") or 0) > 0:
                         dirty = True
             if dirty:
                 from app.cloud_persistence import schedule_cloud_backup
@@ -1602,6 +1781,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     app.state.inbox_tasks = {}
     app.state.inbox_synced = set()
     app.state.inbox_sync_lock = asyncio.Lock()
+    app.state.backfill_attempted_at = {}
     app.state.tg_lease_ready = True
     app.state.tg_lease_boot_task = None
     app.state.tg_lease_heartbeat_task = None
@@ -2296,10 +2476,69 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Не найдено") from exc
         tg_prof = profile.get("telegram_profile") or {}
         need_live = bool(refresh) or tg_prof.get("source") == "crm_only"
-        if not need_live:
-            return profile
 
         dialogs_pool = profile.get("dialogs") or []
+        gateway = _resolve_app_gateway(request.app, "telegram")
+        did_backfill = False
+        primary_did = profile.get("primary_dialog_id")
+        primary_dlg = (
+            next(
+                (
+                    d
+                    for d in dialogs_pool
+                    if d.get("id") is not None and int(d["id"]) == int(primary_did)
+                ),
+                None,
+            )
+            if primary_did is not None
+            else None
+        )
+        if (
+            primary_dlg is not None
+            and gateway is not None
+            and hasattr(gateway, "fetch_messages")
+            and str(primary_dlg.get("provider") or "telegram").strip().lower() == "telegram"
+            and str(primary_dlg.get("account_status") or "").strip().lower() == "connected"
+            and not _is_dead_account_health(primary_dlg.get("account_health"))
+            and not (
+                isinstance(gateway, (type(None), TelethonGateway))
+                and str(primary_dlg.get("account_session_path") or "").startswith("data/sessions/demo")
+            )
+        ):
+            msg_cnt = int(primary_dlg.get("msg_count") or 0)
+            last_at_norm = _norm_ts(primary_dlg.get("last_message_at"))
+            has_snap = bool(
+                str(primary_dlg.get("last_message_preview") or "").strip() or last_at_norm
+            )
+
+            def _load_primary_max_msg_at(c) -> str:
+                mr = c.execute(
+                    "SELECT MAX(REPLACE(COALESCE(sent_at, ''), ' ', 'T')) AS max_at FROM messages WHERE dialog_id = ?",
+                    (int(primary_did),),
+                ).fetchone()
+                return _norm_ts(mr["max_at"]) if mr is not None else ""
+
+            max_msg_norm = await _run_db_sync(conn, _load_primary_max_msg_at, conn)
+            if (msg_cnt == 0 and has_snap) or (
+                bool(last_at_norm) and last_at_norm > max_msg_norm
+            ):
+                try:
+                    await get_thread(conn, int(primary_did), gateway, 50)
+                    did_backfill = True
+                except Exception:
+                    did_backfill = False
+
+        if not need_live:
+            if did_backfill:
+                return await _run_db_sync(
+                    conn,
+                    get_client_full_profile,
+                    conn,
+                    lead_id=lead_id,
+                    dialog_id=dialog_id,
+                )
+            return profile
+
         candidate_acc_ids: list[int] = []
         if tg_prof.get("account_id") is not None:
             candidate_acc_ids.append(int(tg_prof["account_id"]))
@@ -2313,6 +2552,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
         peer_target = tg_prof.get("peer_id") or tg_prof.get("username")
         if not peer_target:
+            if did_backfill:
+                return await _run_db_sync(
+                    conn,
+                    get_client_full_profile,
+                    conn,
+                    lead_id=lead_id,
+                    dialog_id=dialog_id,
+                )
             return profile
 
         def _pick_tg_account(pref_ids: list[int]) -> dict | None:
@@ -2331,7 +2578,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 prov = str(acc.get("provider") or "telegram").strip().lower()
                 if prov != "telegram" or acc.get("status") != "connected":
                     continue
-                if str(acc.get("health") or "active").strip().lower() in ("unauthorized", "banned", "frozen"):
+                if str(acc.get("health") or "active").strip().lower() in ("unauthorized", "banned"):
                     continue
                 sess_path = str(acc.get("session_path") or "")
                 if sess_path.startswith("data/sessions/demo") and isinstance(
@@ -2342,12 +2589,16 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             return None
 
         chosen_acc = await _run_db_sync(conn, _pick_tg_account, candidate_acc_ids)
-        if chosen_acc is None:
-            return profile
-
-        gateway = _resolve_app_gateway(request.app, "telegram")
         fetch_fn = getattr(gateway, "fetch_peer_profile", None) if gateway is not None else None
-        if not callable(fetch_fn):
+        if chosen_acc is None or not callable(fetch_fn):
+            if did_backfill:
+                return await _run_db_sync(
+                    conn,
+                    get_client_full_profile,
+                    conn,
+                    lead_id=lead_id,
+                    dialog_id=dialog_id,
+                )
             return profile
 
         try:
@@ -2394,6 +2645,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                             r_tg[k] = fetched[k]
                 r_tg["source"] = "telegram_live"
             return refreshed
+        if did_backfill:
+            return await _run_db_sync(
+                conn,
+                get_client_full_profile,
+                conn,
+                lead_id=lead_id,
+                dialog_id=dialog_id,
+            )
         return profile
 
     @app.get("/api/leads/{lead_id}/profile")
@@ -2872,6 +3131,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 request.app.state.inbox_synced.discard(aid)
                 await ensure_private_inbox(request.app, aid)
                 await start_account_watch(request.app, aid)
+            await sync_crm_dialog_messages_backfill_once(
+                request.app, account_id=None, max_dialogs=80
+            )
             with locked_conn(conn):
                 dialogs = list_inbox(conn, 0, "", crm_only=crm_only)
             return {"synced": len(rows), "dialogs": dialogs}
@@ -2879,6 +3141,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         request.app.state.inbox_synced.discard(aid)
         await ensure_private_inbox(request.app, aid)
         await start_account_watch(request.app, aid)
+        await sync_crm_dialog_messages_backfill_once(
+            request.app, account_id=aid, max_dialogs=80
+        )
         with locked_conn(conn):
             dialogs = list_inbox(conn, aid, "", crm_only=crm_only)
         return {"synced": 1, "dialogs": dialogs}

@@ -1,9 +1,16 @@
 import json
 import re
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
-from app.db import as_dict, utc_now, utc_today
+from app.db import (
+    as_dict,
+    clean_tg_username,
+    is_recipient_contacted_outreach,
+    is_vacancy_campaign_meta,
+    utc_now,
+    utc_today,
+)
 
 STAGE_LABELS = {
     "queued": "В очереди / Не отправлено",
@@ -149,18 +156,48 @@ def ensure_funnel_columns(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def is_vacancy_campaign_name(name: str | None) -> bool:
-    low = str(name or "").lower()
-    return "ваканс" in low or "vacanc" in low
+_HYGIENE_V11_ERRORS = frozenset(
+    {
+        "uncontacted_personal_chat_hygiene_v11",
+        "pre_softugc_personal_dm_hygiene_v11",
+    }
+)
+
+
+def _norm_ts(value: object) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if len(s) >= 11 and s[10] == " ":
+        s = s[:10] + "T" + s[11:]
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return (
+            dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+            if dt.microsecond
+            else dt.strftime("%Y-%m-%dT%H:%M:%S")
+        )
+    except ValueError:
+        return s.replace(" ", "T")
+
+
+def _norm_phone_15(value: str | None) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits[-15:] if len(digits) >= 7 else ""
+
+
+def is_vacancy_campaign_name(
+    name: str | None, leadgen_sources_json: str | None = None
+) -> bool:
+    return is_vacancy_campaign_meta(name, leadgen_sources_json)
 
 
 def _clean_username(raw: str | None) -> str:
-    val = str(raw or "").strip()
-    if not val:
-        return ""
-    val = re.sub(r"^https?://(?:www\.)?t\.me/", "", val, flags=re.IGNORECASE)
-    val = val.lstrip("@").strip().strip("/")
-    return val
+    return clean_tg_username(raw)
 
 
 def _parse_extra(raw_json: str | None) -> dict:
@@ -569,14 +606,14 @@ def get_outreach_funnel(
     ensure_funnel_columns(conn)
 
     all_camp_rows = conn.execute(
-        "SELECT id, name, status, account_id FROM campaigns ORDER BY id DESC"
+        "SELECT id, name, status, account_id, leadgen_sources_json FROM campaigns ORDER BY id DESC"
     ).fetchall()
     campaigns_meta = []
     camp_by_id: dict[int, dict] = {}
     for row in all_camp_rows:
         cd = as_dict(row)
         cid = int(cd["id"])
-        is_b2b = not is_vacancy_campaign_name(cd.get("name"))
+        is_b2b = not is_vacancy_campaign_meta(cd.get("name"), cd.get("leadgen_sources_json"))
         item = {
             "id": cid,
             "name": cd.get("name") or f"Кампания #{cid}",
@@ -646,6 +683,9 @@ def get_outreach_funnel(
         ph_str = str(dd.get("phone") or "").strip()
         if ph_str:
             dialogs_by_phone.setdefault(ph_str, []).append(dd)
+        ph15 = _norm_phone_15(dd.get("phone"))
+        if ph15 and ph15 != ph_str:
+            dialogs_by_phone.setdefault(ph15, []).append(dd)
 
     msg_stats_by_dlg: dict[int, dict] = {}
     if dialogs_by_id:
@@ -653,7 +693,7 @@ def get_outreach_funnel(
             """
             SELECT dialog_id, direction, telegram_message_id, text, sent_at
             FROM messages
-            ORDER BY sent_at ASC, id ASC
+            ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') ASC, id ASC
             """
         ).fetchall():
             did = _safe_int(mrow["dialog_id"])
@@ -674,11 +714,11 @@ def get_outreach_funnel(
                 }
                 msg_stats_by_dlg[did] = st
             direction = mrow["direction"]
-            sent_at = str(mrow["sent_at"] or "")
+            sent_at = _norm_ts(mrow["sent_at"])
             txt = str(mrow["text"] or "").strip()
             tg_mid = _safe_int(mrow["telegram_message_id"])
             if direction == "out":
-                if st["first_out_at"] is None:
+                if st["first_out_at"] is None or (sent_at and sent_at < st["first_out_at"]):
                     st["first_out_at"] = sent_at
                 st["last_out_at"] = sent_at
                 if tg_mid > st["last_out_msg_id"]:
@@ -691,7 +731,7 @@ def get_outreach_funnel(
                     st["last_in_at"] = sent_at
                 if txt:
                     st["last_in_text"] = txt
-                if st["first_out_at"] is not None and sent_at >= st["first_out_at"]:
+                if st["first_out_at"] is not None and sent_at and sent_at >= st["first_out_at"]:
                     st["has_in_after_out"] = True
                     if txt:
                         st["last_in_after_out_text"] = txt
@@ -803,6 +843,9 @@ def get_outreach_funnel(
             _add_dlgs(dialogs_by_uname.get(username.lower()))
         if rd.get("phone"):
             _add_dlgs(dialogs_by_phone.get(str(rd["phone"]).strip()))
+            r_ph15 = _norm_phone_15(rd.get("phone"))
+            if r_ph15:
+                _add_dlgs(dialogs_by_phone.get(r_ph15))
 
         if pref_acc is not None and len(candidate_dlgs) > 1:
             pref_int = _safe_int(pref_acc)
@@ -818,44 +861,71 @@ def get_outreach_funnel(
         current_step = _safe_int(rd.get("current_step"))
         rec_status = str(rd.get("status") or "pending")
         last_sent_at = rd.get("last_sent_at")
-        has_sent_meta = (current_step >= 1) or bool(last_sent_at) or (rec_status == "completed")
+        ref_sent_norm = _norm_ts(last_sent_at)
+        err_txt = str(rd.get("error_text") or "").strip()
+        is_hygiene_v11 = err_txt in _HYGIENE_V11_ERRORS
+        has_sent_meta = is_recipient_contacted_outreach(
+            rec_status, current_step, last_sent_at, err_txt
+        )
+        is_contacted_completed_or_failed = has_sent_meta and rec_status in (
+            "completed",
+            "failed",
+        )
 
-        for dlg in candidate_dlgs:
-            did = _safe_int(dlg.get("id"))
-            if did <= 0:
-                continue
-            r_max = _safe_int(dlg.get("read_outbox_max_id"))
-            if r_max > max_read_outbox_id:
-                max_read_outbox_id = r_max
-            mst = msg_stats_by_dlg.get(did)
-            if mst:
-                if mst["last_out_text"] and not last_out_text_from_dlg:
-                    last_out_text_from_dlg = mst["last_out_text"]
-                last_out_mid = _safe_int(mst["last_out_msg_id"])
-                if r_max > 0 and last_out_mid > 0 and r_max >= last_out_mid:
-                    dialog_read_confirmed = True
-                if mst["has_in_after_out"]:
-                    has_msg_reply = True
-                    if mst["last_in_after_out_text"] and not last_inbound_text:
-                        last_inbound_text = mst["last_in_after_out_text"]
-                elif has_sent_meta and mst["has_in"] and mst["first_out_at"] is None:
-                    ref_sent = str(last_sent_at or "")
-                    last_in_at = str(mst.get("last_in_at") or "")
-                    if (not ref_sent) or (last_in_at and last_in_at >= ref_sent):
+        if not is_hygiene_v11:
+            for dlg in candidate_dlgs:
+                did = _safe_int(dlg.get("id"))
+                if did <= 0:
+                    continue
+                r_max = _safe_int(dlg.get("read_outbox_max_id"))
+                if r_max > max_read_outbox_id:
+                    max_read_outbox_id = r_max
+                mst = msg_stats_by_dlg.get(did)
+                dlg_last_at_norm = _norm_ts(dlg.get("last_message_at"))
+                if mst:
+                    if mst["last_out_text"] and not last_out_text_from_dlg:
+                        last_out_text_from_dlg = mst["last_out_text"]
+                    last_out_mid = _safe_int(mst["last_out_msg_id"])
+                    if r_max > 0 and last_out_mid > 0 and r_max >= last_out_mid:
+                        dialog_read_confirmed = True
+                    if mst["has_in_after_out"]:
                         has_msg_reply = True
-                        if mst["last_in_text"] and not last_inbound_text:
-                            last_inbound_text = mst["last_in_text"]
-            if (
-                not has_msg_reply
-                and has_sent_meta
-                and int(dlg.get("last_from_peer") or 0) == 1
-                and (not last_sent_at or str(dlg.get("last_message_at") or "") >= str(last_sent_at))
-            ):
-                has_msg_reply = True
-                if dlg.get("last_message_preview") and not last_inbound_text:
-                    last_inbound_text = str(dlg["last_message_preview"]).strip()
+                        if mst["last_in_after_out_text"] and not last_inbound_text:
+                            last_inbound_text = mst["last_in_after_out_text"]
+                    elif has_sent_meta and mst["has_in"]:
+                        last_in_at = str(mst.get("last_in_at") or "")
+                        if is_contacted_completed_or_failed or (
+                            mst["first_out_at"] is None
+                            and ((not ref_sent_norm) or (last_in_at and last_in_at >= ref_sent_norm))
+                        ):
+                            has_msg_reply = True
+                            if mst["last_in_text"] and not last_inbound_text:
+                                last_inbound_text = mst["last_in_text"]
+                if int(dlg.get("last_from_peer") or 0) == 1 and (
+                    is_contacted_completed_or_failed
+                    or (
+                        has_sent_meta
+                        and (
+                            not ref_sent_norm
+                            or not dlg_last_at_norm
+                            or dlg_last_at_norm >= ref_sent_norm
+                        )
+                    )
+                ):
+                    has_msg_reply = True
+                    prev_txt = str(dlg.get("last_message_preview") or "").strip()
+                    if prev_txt and (
+                        not last_inbound_text
+                        or (
+                            dlg_last_at_norm
+                            and mst
+                            and mst.get("last_in_at")
+                            and dlg_last_at_norm > str(mst["last_in_at"])
+                        )
+                    ):
+                        last_inbound_text = prev_txt
 
-        has_sent = has_sent_meta or bool(last_out_text_from_dlg)
+        has_sent = False if is_hygiene_v11 else (has_sent_meta or bool(last_out_text_from_dlg))
 
         if not last_inbound_text:
             last_inbound_text = _first_nonempty(
@@ -887,7 +957,7 @@ def get_outreach_funnel(
             extra=extra,
         )
 
-        has_reply = (rec_status == "replied") or has_msg_reply
+        has_reply = (not is_hygiene_v11) and ((rec_status == "replied") or has_msg_reply)
         read_at_val = rd.get("read_at")
         is_read = (
             bool(read_at_val)
@@ -1241,12 +1311,11 @@ def sync_untouched_recipient_drafts(
     ensure_funnel_columns(conn)
     now = utc_now()
 
-    camp_rows = conn.execute("SELECT id, name FROM campaigns").fetchall()
+    camp_rows = conn.execute("SELECT id, name, leadgen_sources_json FROM campaigns").fetchall()
     b2b_cids = {
         int(c["id"])
         for c in camp_rows
-        if "ваканс" not in str(c["name"] or "").casefold()
-        and "vacanc" not in str(c["name"] or "").casefold()
+        if not is_vacancy_campaign_meta(c["name"], c["leadgen_sources_json"])
     }
     if not b2b_cids or not items:
         return {"ok": True, "updated": 0, "skipped": len(items or [])}

@@ -9,6 +9,10 @@ from app.db import (
     KEY_TO_AIRTABLE_STATUS,
     STATUSES,
     as_dict,
+    clean_tg_username_lookup,
+    is_newer_dialog_snapshot_unbacked,
+    is_recipient_contacted_outreach,
+    is_vacancy_campaign_meta,
     normalize_status,
     utc_today,
 )
@@ -92,6 +96,20 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
         return dt
     except ValueError:
         return None
+
+
+def _norm_ts(value: str | None) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    dt = _parse_iso_dt(s)
+    if dt is not None:
+        return (
+            dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+            if dt.microsecond
+            else dt.strftime("%Y-%m-%dT%H:%M:%S")
+        )
+    return s.replace(" ", "T")
 
 
 def _load_stage_catalog(conn: sqlite3.Connection) -> list[tuple[str, str]]:
@@ -365,6 +383,113 @@ def _compute_funnel_analytics(conn: sqlite3.Connection) -> dict:
     }
 
 
+_HYGIENE_V11_ERRORS = frozenset(
+    {
+        "uncontacted_personal_chat_hygiene_v11",
+        "pre_softugc_personal_dm_hygiene_v11",
+    }
+)
+_REFUSAL_INTENT_MARKERS = (
+    "not interested",
+    "no thanks",
+    "no, thanks",
+    "don't need",
+    "dont need",
+    "unsubscribe",
+    "не интересно",
+    "неинтересно",
+    "не актуально",
+    "неактуально",
+    "не надо",
+    "нет бюджета",
+    "спасибо, нет",
+    "нет, спасибо",
+)
+_REFUSAL_INTENT_WORDS_RE = re.compile(r"\b(?:stop|pass)\b", re.IGNORECASE)
+
+
+def _norm_username(value: str | None) -> str:
+    return clean_tg_username_lookup(value)
+
+
+def _infer_reply_intent(reply_text: str | None) -> str:
+    txt = str(reply_text or "").strip()
+    if not txt:
+        return "neutral_or_question"
+    low = txt.lower()
+    if any(m in low for m in _REFUSAL_INTENT_MARKERS) or _REFUSAL_INTENT_WORDS_RE.search(low):
+        return "refusal_not_interested"
+    from app.funnel_analytics import _has_positive_reply_signal
+
+    if _has_positive_reply_signal(txt):
+        return "positive_interested"
+    return "neutral_or_question"
+
+
+def _lead_preference_key(lead: dict) -> tuple[int, int]:
+    norm_st = str(lead.get("_norm_status") or "").strip().lower()
+    is_closed = bool(lead.get("_is_closed"))
+    if not is_closed and norm_st not in ("won", "lost"):
+        rank = 3
+    elif norm_st == "won" or is_closed_lead_status(
+        norm_st, lead.get("airtable_status"), won_only=True
+    ):
+        rank = 2
+    else:
+        rank = 1
+    return (rank, int(lead.get("id") or 0))
+
+
+def _prefer_lead(existing: dict | None, cand: dict) -> dict:
+    if existing is None:
+        return cand
+    return cand if _lead_preference_key(cand) > _lead_preference_key(existing) else existing
+
+
+def _resolve_dialog_lead(
+    dlg: dict | None, ctx: dict, *, fallback_lead: dict | None = None
+) -> dict | None:
+    if dlg is None:
+        return fallback_lead
+    dlid = int(dlg["lead_id"]) if dlg.get("lead_id") is not None else None
+    peer_id = int(dlg["peer_id"]) if dlg.get("peer_id") is not None else None
+    uname = _norm_username(dlg.get("username"))
+    ph15 = _norm_phone_15(dlg.get("phone"))
+    best: dict | None = None
+    for cand in (
+        ctx["leads_by_id"].get(dlid) if dlid is not None else None,
+        ctx.get("leads_by_peer", {}).get(peer_id) if peer_id is not None else None,
+        ctx.get("leads_by_user", {}).get(uname) if uname else None,
+        ctx.get("leads_by_phone", {}).get(ph15) if ph15 else None,
+    ):
+        if cand is not None:
+            best = _prefer_lead(best, cand)
+    return best if best is not None else fallback_lead
+
+
+def _resolve_dialog_reply_text(
+    dlg: dict | None,
+    msum: dict | None,
+    extra: dict | None = None,
+    fallback: str = "",
+) -> str:
+    ex = extra if isinstance(extra, dict) else {}
+    in_txt = str((msum or {}).get("last_in_text") or "").strip()
+    if dlg is not None and int(dlg.get("last_from_peer") or 0) == 1:
+        prev_txt = str(dlg.get("last_message_preview") or "").strip()
+        dlg_ts = _norm_ts(dlg.get("last_message_at"))
+        max_in_ts = _norm_ts((msum or {}).get("max_in_ts"))
+        if prev_txt and (not in_txt or (dlg_ts and (not max_in_ts or dlg_ts > max_in_ts))):
+            return prev_txt
+        if in_txt:
+            return in_txt
+        if prev_txt:
+            return prev_txt
+    elif in_txt:
+        return in_txt
+    return str(ex.get("all_in_texts") or ex.get("first_in_text") or fallback or "").strip()
+
+
 def _norm_phone_15(value: str | None) -> str:
     digits = re.sub(r"\D", "", str(value or ""))
     return digits[-15:] if len(digits) >= 7 else ""
@@ -401,11 +526,15 @@ def _sync_running_and_all_campaign_replies(conn: sqlite3.Connection) -> None:
     try:
         camp_rows = [
             as_dict(r)
-            for r in conn.execute("SELECT id, account_id, account_ids_json FROM campaigns ORDER BY id DESC").fetchall()
+            for r in conn.execute(
+                "SELECT id, name, account_id, account_ids_json, leadgen_sources_json FROM campaigns ORDER BY id DESC"
+            ).fetchall()
         ]
     except Exception:
         return
     for camp in camp_rows:
+        if is_vacancy_campaign_meta(camp.get("name"), camp.get("leadgen_sources_json")):
+            continue
         cid = int(camp["id"])
         acc_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
         try:
@@ -442,13 +571,14 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
         enriched = {**lr, "_norm_status": norm_st, "_is_closed": closed}
         leads_by_id[lid] = enriched
         if lr.get("telegram_user_id") is not None:
-            leads_by_peer.setdefault(int(lr["telegram_user_id"]), enriched)
-        lu = str(lr.get("username") or "").strip().lstrip("@").lower()
+            pid_key = int(lr["telegram_user_id"])
+            leads_by_peer[pid_key] = _prefer_lead(leads_by_peer.get(pid_key), enriched)
+        lu = _norm_username(lr.get("username"))
         if lu:
-            leads_by_user.setdefault(lu, enriched)
+            leads_by_user[lu] = _prefer_lead(leads_by_user.get(lu), enriched)
         lph = _norm_phone_15(lr.get("phone"))
         if lph:
-            leads_by_phone.setdefault(lph, enriched)
+            leads_by_phone[lph] = _prefer_lead(leads_by_phone.get(lph), enriched)
 
     contacted_lead_ids: set[int] = set()
     contacted_peer_ids: set[int] = set()
@@ -458,7 +588,8 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
         as_dict(r)
         for r in conn.execute(
             """
-            SELECT cr.*, c.status AS campaign_status
+            SELECT cr.*, c.status AS campaign_status, c.name AS campaign_name,
+                   c.leadgen_sources_json AS campaign_sources_json
             FROM campaign_recipients cr
             LEFT JOIN campaigns c ON c.id = cr.campaign_id
             ORDER BY cr.id
@@ -471,23 +602,40 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
     rec_by_phone: dict[str, dict] = {}
 
     for cr in rec_rows:
+        is_vacancy = is_vacancy_campaign_meta(
+            cr.get("campaign_name"), cr.get("campaign_sources_json")
+        )
+        err_txt = str(cr.get("error_text") or "").strip()
+        is_hygiene_v11 = err_txt in _HYGIENE_V11_ERRORS
         st = str(cr.get("status") or "").lower()
         step = int(cr.get("current_step") or 0)
-        is_contacted = st in ("in_progress", "completed", "replied") or step >= 1
+        is_contacted = is_recipient_contacted_outreach(
+            st, step, cr.get("last_sent_at"), err_txt
+        )
         extra = _parse_extra_json(cr.get("extra_json"))
-        enriched_cr = {**cr, "_extra": extra}
-        if cr.get("lead_id") is not None:
-            rec_by_lead_id.setdefault(int(cr["lead_id"]), enriched_cr)
-        if cr.get("telegram_user_id") is not None:
-            rec_by_peer.setdefault(int(cr["telegram_user_id"]), enriched_cr)
-        cu = str(cr.get("username") or "").strip().lstrip("@").lower()
-        if cu:
-            rec_by_user.setdefault(cu, enriched_cr)
+        enriched_cr = {
+            **cr,
+            "_extra": extra,
+            "_is_vacancy": is_vacancy,
+            "_is_hygiene_v11": is_hygiene_v11,
+        }
+        cu = _norm_username(cr.get("username"))
         cph = _norm_phone_15(cr.get("phone"))
-        if cph:
-            rec_by_phone.setdefault(cph, enriched_cr)
+        if not is_hygiene_v11:
+            if cr.get("lead_id") is not None:
+                klid = int(cr["lead_id"])
+                if klid not in rec_by_lead_id or (rec_by_lead_id[klid]["_is_vacancy"] and not is_vacancy):
+                    rec_by_lead_id[klid] = enriched_cr
+            if cr.get("telegram_user_id") is not None:
+                kpeer = int(cr["telegram_user_id"])
+                if kpeer not in rec_by_peer or (rec_by_peer[kpeer]["_is_vacancy"] and not is_vacancy):
+                    rec_by_peer[kpeer] = enriched_cr
+            if cu and (cu not in rec_by_user or (rec_by_user[cu]["_is_vacancy"] and not is_vacancy)):
+                rec_by_user[cu] = enriched_cr
+            if cph and (cph not in rec_by_phone or (rec_by_phone[cph]["_is_vacancy"] and not is_vacancy)):
+                rec_by_phone[cph] = enriched_cr
 
-        if is_contacted:
+        if is_contacted and not is_vacancy and not is_hygiene_v11:
             if cr.get("lead_id") is not None:
                 contacted_lead_ids.add(int(cr["lead_id"]))
             if cr.get("telegram_user_id") is not None:
@@ -498,17 +646,53 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
                 contacted_phones.add(cph)
 
     last_out_mid_by_dlg: dict[int, int] = {}
+    msg_in_summary_by_dlg: dict[int, dict] = {}
     try:
         for mr in conn.execute(
             """
-            SELECT dialog_id, MAX(telegram_message_id) AS max_out_mid
+            SELECT id, dialog_id, direction, text, sent_at, telegram_message_id
             FROM messages
-            WHERE direction = 'out' AND telegram_message_id IS NOT NULL
-            GROUP BY dialog_id
+            ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') ASC, id ASC
             """
         ).fetchall():
-            if mr["max_out_mid"] is not None:
-                last_out_mid_by_dlg[int(mr["dialog_id"])] = int(mr["max_out_mid"])
+            did = int(mr["dialog_id"])
+            direction = str(mr["direction"] or "")
+            txt = str(mr["text"] or "").strip()
+            ts = _norm_ts(mr["sent_at"])
+            mid_pk = int(mr["id"])
+            if direction == "out" and mr["telegram_message_id"] is not None:
+                tg_mid = int(mr["telegram_message_id"])
+                if did not in last_out_mid_by_dlg or tg_mid > last_out_mid_by_dlg[did]:
+                    last_out_mid_by_dlg[did] = tg_mid
+            msum = msg_in_summary_by_dlg.get(did)
+            if msum is None:
+                msum = {
+                    "in_count": 0,
+                    "max_in_ts": "",
+                    "max_any_ts": "",
+                    "last_in_text": "",
+                    "last_any_text": "",
+                    "last_any_dir": "",
+                    "_in_key": ("", -1),
+                    "_any_key": ("", -1),
+                }
+                msg_in_summary_by_dlg[did] = msum
+            any_key = (ts, mid_pk)
+            if any_key >= msum["_any_key"]:
+                msum["_any_key"] = any_key
+                msum["max_any_ts"] = ts
+                msum["last_any_text"] = txt
+                msum["last_any_dir"] = direction
+            if direction == "in":
+                msum["in_count"] += 1
+                if any_key >= msum["_in_key"]:
+                    msum["_in_key"] = any_key
+                    msum["max_in_ts"] = ts
+                    if txt or not msum["last_in_text"]:
+                        msum["last_in_text"] = txt
+        for msum in msg_in_summary_by_dlg.values():
+            msum.pop("_in_key", None)
+            msum.pop("_any_key", None)
     except Exception:
         pass
 
@@ -526,7 +710,7 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
         did = int(d["id"])
         aid = int(d["account_id"]) if d.get("account_id") is not None else None
         peer_id = int(d["peer_id"]) if d.get("peer_id") is not None else None
-        uname = str(d.get("username") or "").strip().lstrip("@").lower()
+        uname = _norm_username(d.get("username"))
         ph15 = _norm_phone_15(d.get("phone"))
         dlid = int(d["lead_id"]) if d.get("lead_id") is not None else None
         dialogs_by_id[did] = d
@@ -558,12 +742,15 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
         if inelig:
             continue
 
-        matched_lead = (
-            (leads_by_id.get(dlid) if dlid is not None else None)
-            or (leads_by_peer.get(peer_id) if peer_id is not None else None)
-            or (leads_by_user.get(uname) if uname else None)
-            or (leads_by_phone.get(ph15) if ph15 else None)
-        )
+        matched_lead = None
+        for cand_lead in (
+            leads_by_id.get(dlid) if dlid is not None else None,
+            leads_by_peer.get(peer_id) if peer_id is not None else None,
+            leads_by_user.get(uname) if uname else None,
+            leads_by_phone.get(ph15) if ph15 else None,
+        ):
+            if cand_lead is not None:
+                matched_lead = _prefer_lead(matched_lead, cand_lead)
         matched_contacted = bool(
             (dlid is not None and dlid in contacted_lead_ids)
             or (peer_id is not None and peer_id in contacted_peer_ids)
@@ -575,7 +762,15 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
 
         eligible_crm_dialog_ids.add(did)
         is_closed = bool(matched_lead and matched_lead.get("_is_closed"))
-        if int(d.get("last_from_peer") or 0) == 1 and not is_closed:
+        is_sniper_quarantined = str((matched_lead or {}).get("next_step") or "").startswith(
+            "Авто-карантин Sniper ICP"
+        )
+        unread_cnt = int(d.get("unread_count") or 0)
+        if (
+            int(d.get("last_from_peer") or 0) == 1
+            and not is_sniper_quarantined
+            and (not is_closed or unread_cnt > 0)
+        ):
             matched_rec = (
                 (rec_by_lead_id.get(int(matched_lead["id"])) if matched_lead else None)
                 or (rec_by_peer.get(peer_id) if peer_id is not None else None)
@@ -583,7 +778,9 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
                 or (rec_by_phone.get(ph15) if ph15 else None)
             )
             extra = matched_rec.get("_extra", {}) if matched_rec else {}
-            intent = str(extra.get("reply_intent") or "neutral_or_question")
+            msum = msg_in_summary_by_dlg.get(did)
+            reply_txt = _resolve_dialog_reply_text(d, msum, extra)
+            intent = str(extra.get("reply_intent") or "").strip() or _infer_reply_intent(reply_txt)
             live_waiting_dialogs.append(
                 {
                     "dialog_id": did,
@@ -604,22 +801,24 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
                     "company": (matched_lead.get("company") if matched_lead else None)
                     or (matched_rec.get("company") if matched_rec else "")
                     or "",
-                    "unread_count": int(d.get("unread_count") or 0),
+                    "unread_count": unread_cnt,
                     "reply_intent": intent,
                     "last_touch_at": str(d.get("last_message_at") or ""),
-                    "reply_text": str(
-                        d.get("last_message_preview")
-                        or extra.get("first_in_text")
-                        or extra.get("all_in_texts")
-                        or ""
-                    )[:360],
+                    "reply_text": reply_txt[:360],
                 }
             )
 
     return {
         "accounts_by_id": accounts_by_id,
         "leads_by_id": leads_by_id,
+        "leads_by_peer": leads_by_peer,
+        "leads_by_user": leads_by_user,
+        "leads_by_phone": leads_by_phone,
         "rec_rows": rec_rows,
+        "rec_by_lead_id": rec_by_lead_id,
+        "rec_by_peer": rec_by_peer,
+        "rec_by_user": rec_by_user,
+        "rec_by_phone": rec_by_phone,
         "dialogs_by_id": dialogs_by_id,
         "dialogs_by_lead_id": dialogs_by_lead_id,
         "dialogs_by_acc_peer": dialogs_by_acc_peer,
@@ -627,6 +826,7 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
         "dialogs_by_user": dialogs_by_user,
         "dialogs_by_phone": dialogs_by_phone,
         "last_out_mid_by_dlg": last_out_mid_by_dlg,
+        "msg_in_summary_by_dlg": msg_in_summary_by_dlg,
         "eligible_crm_dialog_ids": eligible_crm_dialog_ids,
         "live_waiting_dialogs": live_waiting_dialogs,
     }
@@ -645,7 +845,7 @@ def _match_recipient_dialog(cr: dict, ctx: dict) -> dict | None:
             return dlg
     if pid is not None and pid in ctx["dialogs_by_peer"]:
         return ctx["dialogs_by_peer"][pid]
-    uname = str(cr.get("username") or "").strip().lstrip("@").lower()
+    uname = _norm_username(cr.get("username"))
     if uname and uname in ctx["dialogs_by_user"]:
         return ctx["dialogs_by_user"][uname]
     ph15 = _norm_phone_15(cr.get("phone"))
@@ -662,6 +862,11 @@ def _is_recipient_read_live(rec: dict, extra: dict, dlg: dict | None, ctx: dict)
     if int(extra.get("in_count") or 0) > 0 or bool(extra.get("last_out_read")):
         return True
     if dlg is not None:
+        if int(dlg.get("last_from_peer") or 0) == 1:
+            return True
+        msum = ctx.get("msg_in_summary_by_dlg", {}).get(int(dlg["id"]))
+        if msum and int(msum.get("in_count") or 0) > 0:
+            return True
         ro = int(dlg.get("read_outbox_max_id") or 0)
         if ro > 0:
             last_out_mid = ctx["last_out_mid_by_dlg"].get(int(dlg["id"]))
@@ -763,17 +968,25 @@ def _compute_outreach_analytics(conn: sqlite3.Connection, ctx: dict | None = Non
 
         for r in recs:
             st = str(r.get("status") or "")
+            err_txt = str(r.get("error_text") or "").strip()
+            is_hygiene_v11 = bool(r.get("_is_hygiene_v11")) or (err_txt in _HYGIENE_V11_ERRORS)
             lid = int(r["lead_id"]) if r.get("lead_id") is not None else None
             lead_row = ctx["leads_by_id"].get(lid) if lid is not None else None
             l_status = lead_row.get("_norm_status") if lead_row else None
-            if l_status in ("talking", "call_scheduled", "waiting", "on_hold", "won") or st == "replied":
+            if l_status in ("talking", "call_scheduled", "waiting", "on_hold", "won") or (
+                st == "replied" and not is_hygiene_v11
+            ):
                 c_talking += 1
             if l_status == "won":
                 c_won += 1
 
             extra = r.get("_extra") if isinstance(r.get("_extra"), dict) else _parse_extra_json(r.get("extra_json"))
             dlg = _match_recipient_dialog(r, ctx)
-            is_sent = st in ("in_progress", "completed", "replied") or int(r.get("current_step") or 0) >= 1
+            msum = ctx["msg_in_summary_by_dlg"].get(int(dlg["id"])) if dlg is not None else None
+            is_contacted_rec = is_recipient_contacted_outreach(
+                st, r.get("current_step"), r.get("last_sent_at"), err_txt
+            )
+            is_sent = (st in ("in_progress", "completed", "replied")) and is_contacted_rec
             is_read = is_sent and _is_recipient_read_live(r, extra, dlg, ctx)
             if is_read:
                 c_read += 1
@@ -795,8 +1008,20 @@ def _compute_outreach_analytics(conn: sqlite3.Connection, ctx: dict | None = Non
                     sb_rep = step_buckets.setdefault(rep_s, {"sent": 0, "read": 0, "replied": 0})
                     sb_rep["replied"] += 1
 
-            if st == "replied" or int(extra.get("in_count") or 0) > 0:
-                intent = str(extra.get("reply_intent") or "neutral_or_question")
+            has_reply_sig = (not is_hygiene_v11) and (
+                st == "replied"
+                or int(extra.get("in_count") or 0) > 0
+                or (
+                    is_contacted_rec
+                    and (
+                        int((msum or {}).get("in_count") or 0) > 0
+                        or (dlg is not None and int(dlg.get("last_from_peer") or 0) == 1)
+                    )
+                )
+            )
+            if has_reply_sig:
+                reply_txt = _resolve_dialog_reply_text(dlg, msum, extra)
+                intent = str(extra.get("reply_intent") or "").strip() or _infer_reply_intent(reply_txt)
                 if intent == "positive_interested":
                     c_pos += 1
                 elif intent == "refusal_not_interested":
@@ -804,9 +1029,16 @@ def _compute_outreach_analytics(conn: sqlite3.Connection, ctx: dict | None = Non
                 else:
                     c_q += 1
 
-            if dlg is not None and int(dlg.get("last_from_peer") or 0) == 1:
-                if not (lead_row and lead_row.get("_is_closed")):
-                    c_waiting_ids.add(int(dlg["id"]))
+            if not is_hygiene_v11 and dlg is not None and int(dlg.get("last_from_peer") or 0) == 1:
+                did = int(dlg["id"])
+                if did in ctx["eligible_crm_dialog_ids"]:
+                    eff_lead = _resolve_dialog_lead(dlg, ctx, fallback_lead=lead_row)
+                    is_closed = bool(eff_lead and eff_lead.get("_is_closed"))
+                    is_sniper_q = str((eff_lead or {}).get("next_step") or "").startswith(
+                        "Авто-карантин Sniper ICP"
+                    )
+                    if not is_sniper_q and (not is_closed or int(dlg.get("unread_count") or 0) > 0):
+                        c_waiting_ids.add(did)
 
         acc_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
         assigned_accounts = []
@@ -1052,9 +1284,9 @@ def _compute_accounts_analytics(conn: sqlite3.Connection, ctx: dict | None = Non
             int(d["lead_id"]) for d in replied_dialogs if d.get("lead_id") is not None
         }
         replied_dialog_usernames = {
-            str(d["username"]).strip().lstrip("@").lower()
+            _norm_username(d["username"])
             for d in replied_dialogs
-            if d.get("username")
+            if _norm_username(d.get("username"))
         }
         extra_camp_replies = 0
         for cr in camp_replied_recs:
@@ -1069,11 +1301,7 @@ def _compute_accounts_analytics(conn: sqlite3.Connection, ctx: dict | None = Non
                 and int(cr["lead_id"]) in replied_dialog_lead_ids
             ):
                 matched = True
-            elif (
-                cr.get("username")
-                and str(cr["username"]).strip().lstrip("@").lower()
-                in replied_dialog_usernames
-            ):
+            elif _norm_username(cr.get("username")) in replied_dialog_usernames:
                 matched = True
             if not matched:
                 extra_camp_replies += 1
@@ -1241,17 +1469,18 @@ def _compute_charts_analytics(
 
     lead_rows = [as_dict(r) for r in conn.execute("SELECT * FROM leads ORDER BY id").fetchall()]
     eligible_ids = sorted(ctx["eligible_crm_dialog_ids"])
-    if eligible_ids:
-        ph_elig = ",".join("?" for _ in eligible_ids)
-        msg_rows = [
+    msg_rows = []
+    for start in range(0, len(eligible_ids), 400):
+        chunk_ids = eligible_ids[start : start + 400]
+        ph_elig = ",".join("?" for _ in chunk_ids)
+        msg_rows.extend(
             as_dict(r)
             for r in conn.execute(
                 f"SELECT id, dialog_id, direction, sent_at, created_at FROM messages WHERE dialog_id IN ({ph_elig}) ORDER BY id",
-                eligible_ids,
+                chunk_ids,
             ).fetchall()
-        ]
-    else:
-        msg_rows = []
+        )
+    msg_rows.sort(key=lambda r: int(r.get("id") or 0))
     camp_rec_rows = ctx["rec_rows"]
 
     # 1. daily_flow (strictly scoped to CRM leads & outreach recipients; zero personal-chat pollution)
@@ -1276,6 +1505,33 @@ def _compute_charts_analytics(
             in_msgs_by_day[s_day] += 1
             if m.get("dialog_id") is not None:
                 unique_reply_dlgs_by_day[s_day].add(int(m["dialog_id"]))
+
+    snapshot_reply_dts: list[datetime] = []
+    msg_summary_map = ctx.get("msg_in_summary_by_dlg", {})
+    for did in eligible_ids:
+        dlg = ctx["dialogs_by_id"].get(did)
+        if not dlg or int(dlg.get("last_from_peer") or 0) != 1:
+            continue
+        raw_last_at = dlg.get("last_message_at")
+        if not raw_last_at:
+            continue
+        msum = msg_summary_map.get(did)
+        dlg_prev = str(dlg.get("last_message_preview") or "").strip()
+        if is_newer_dialog_snapshot_unbacked(
+            dlg_prev,
+            raw_last_at,
+            dlg.get("last_from_peer"),
+            (msum or {}).get("last_any_text"),
+            (msum or {}).get("max_any_ts"),
+            (msum or {}).get("last_any_dir"),
+        ):
+            dt = _parse_iso_dt(raw_last_at)
+            if dt is not None:
+                snap_day = dt.strftime("%Y-%m-%d")
+                if snap_day in in_msgs_by_day:
+                    in_msgs_by_day[snap_day] += 1
+                    unique_reply_dlgs_by_day[snap_day].add(did)
+                snapshot_reply_dts.append(dt)
 
     for cr in camp_rec_rows:
         ls_day = str(cr.get("last_sent_at") or "")[:10]
@@ -1612,6 +1868,18 @@ def _compute_charts_analytics(
         by_hour[hr] += 1
         total_inbound += 1
 
+    for dt in snapshot_reply_dts:
+        day_str = dt.strftime("%Y-%m-%d")
+        if cutoff_date and day_str < cutoff_date:
+            continue
+        wday = dt.weekday()
+        hr = dt.hour
+        slot_idx = min(5, hr // 4)
+        matrix[wday][slot_idx] += 1
+        hourly_matrix[wday][hr] += 1
+        by_hour[hr] += 1
+        total_inbound += 1
+
     max_value = 0
     peak_day_idx = 0
     peak_slot_idx = 0
@@ -1650,7 +1918,7 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
     if ctx is None:
         ctx = _load_ssot_crm_context(conn)
 
-    rec_rows = ctx["rec_rows"]
+    rec_rows = [r for r in ctx["rec_rows"] if not r.get("_is_vacancy")]
     pending_queue_real = sum(
         1
         for r in rec_rows
@@ -1663,10 +1931,10 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
     )
     failed_real = sum(1 for r in rec_rows if r.get("status") == "failed")
 
-    # Deduplicate by username (or phone digits / id when username missing), preferring rows with extra_json or non-pending status
+    # Deduplicate by username (or phone digits / id when username missing), preferring non-hygiene rows with extra_json or non-pending status
     by_key: dict[str, dict] = {}
     for r in rec_rows:
-        u = str(r.get("username") or "").strip().lower().lstrip("@")
+        u = _norm_username(r.get("username"))
         raw_phone = str(r.get("phone") or "").strip()
         p_digits = "".join(ch for ch in raw_phone if ch.isdigit())[-15:]
         key = f"u:{u}" if u else (f"p:{p_digits}" if p_digits else f"id:{r.get('id')}")
@@ -1674,8 +1942,10 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
             by_key[key] = r
         else:
             prev = by_key[key]
-            r_score = (2 if r.get("extra_json") else 0) + (1 if r.get("status") in ("in_progress", "completed", "replied") else 0)
-            p_score = (2 if prev.get("extra_json") else 0) + (1 if prev.get("status") in ("in_progress", "completed", "replied") else 0)
+            r_hyg = str(r.get("error_text") or "").strip() in _HYGIENE_V11_ERRORS
+            p_hyg = str(prev.get("error_text") or "").strip() in _HYGIENE_V11_ERRORS
+            r_score = (0 if r_hyg else 4) + (2 if r.get("extra_json") else 0) + (1 if r.get("status") in ("in_progress", "completed", "replied") else 0)
+            p_score = (0 if p_hyg else 4) + (2 if prev.get("extra_json") else 0) + (1 if prev.get("status") in ("in_progress", "completed", "replied") else 0)
             if r_score > p_score:
                 by_key[key] = r
 
@@ -1721,15 +1991,42 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
 
     live_waiting_by_dlg = {int(w["dialog_id"]): w for w in ctx["live_waiting_dialogs"]}
     matched_waiting_dlgs: set[int] = set()
+    matched_rec_dlg_ids: set[int] = set()
+    msg_summary_map = ctx.get("msg_in_summary_by_dlg", {})
 
     for r in unique_recs:
         extra = r.get("_extra") if isinstance(r.get("_extra"), dict) else _parse_extra_json(r.get("extra_json"))
         r["_extra"] = extra
+        err_txt = str(r.get("error_text") or "").strip()
+        is_hygiene_v11 = bool(r.get("_is_hygiene_v11")) or (err_txt in _HYGIENE_V11_ERRORS)
         dlg = _match_recipient_dialog(r, ctx)
-        fine = str(extra.get("fine_status") or "")
+        if dlg is not None and not is_hygiene_v11:
+            matched_rec_dlg_ids.add(int(dlg["id"]))
+        msum = msg_summary_map.get(int(dlg["id"])) if dlg is not None else None
+        is_contacted = is_recipient_contacted_outreach(
+            r.get("status"), r.get("current_step"), r.get("last_sent_at"), err_txt
+        )
+        in_cnt = (
+            max(
+                int(extra.get("in_count") or 0),
+                int((msum or {}).get("in_count") or 0),
+                1
+                if (
+                    r.get("status") == "replied"
+                    or (dlg is not None and int(dlg.get("last_from_peer") or 0) == 1)
+                )
+                else 0,
+            )
+            if is_contacted
+            else 0
+        )
+
+        fine = "" if is_hygiene_v11 else str(extra.get("fine_status") or "")
         if not fine:
             st = r.get("status")
-            if st == "replied":
+            if is_hygiene_v11:
+                fine = "invalid_or_deleted_username" if st == "failed" else "not_contacted_skipped"
+            elif st == "replied" or (is_contacted and in_cnt > 0):
                 if dlg is not None and int(dlg.get("last_from_peer") or 0) == 0:
                     fine = "replied_we_answered_seen_stalled"
                 else:
@@ -1743,13 +2040,11 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
         r["_fine"] = fine
         fine_counts[fine] += 1
 
-        is_contacted = r.get("status") in ("in_progress", "completed", "replied") or int(r.get("current_step") or 0) >= 1
         if not is_contacted:
             continue
 
         contacted_recs.append(r)
-        in_cnt = int(extra.get("in_count") or (1 if r.get("status") == "replied" else 0))
-        is_read = _is_recipient_read_live(r, extra, dlg, ctx)
+        is_read = (in_cnt > 0) or _is_recipient_read_live(r, extra, dlg, ctx)
         r["_is_read"] = is_read
         r["_in_cnt"] = in_cnt
 
@@ -1770,7 +2065,8 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
 
         if in_cnt > 0:
             replied_recs.append(r)
-            intent = str(extra.get("reply_intent") or "neutral_or_question")
+            reply_txt = _resolve_dialog_reply_text(dlg, msum, extra)
+            intent = str(extra.get("reply_intent") or "").strip() or _infer_reply_intent(reply_txt)
             rep_step = str(extra.get("replied_to_step") or f"step{max(1, int(r.get('current_step') or 1))}")
             r["_intent"] = intent
             r["_rep_step"] = rep_step
@@ -1824,13 +2120,7 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
                 "replied_to_step_label": STEP_LABELS_RU.get(rep_step, f"Шаг {r.get('current_step') or 1}"),
                 "reply_intent": intent,
                 "reply_intent_label": INTENT_LABELS_RU.get(intent, intent),
-                "reply_text": str(
-                    (dlg.get("last_message_preview") if dlg else None)
-                    or extra.get("all_in_texts")
-                    or extra.get("first_in_text")
-                    or r.get("note")
-                    or ""
-                )[:360],
+                "reply_text": (reply_txt or str(r.get("note") or ""))[:360],
                 "step1_text": str(r.get("step1_text") or "")[:360],
                 "last_touch_at": str((dlg.get("last_message_at") if dlg else None) or r.get("last_sent_at") or ""),
                 "fine_status": fine,
@@ -2051,6 +2341,48 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
     waiting_on_dropped = sum(1 for x in waiting_items if x.get("account_is_dropped"))
     unseen_total = max(0, total_contacted - total_read)
 
+    rec_by_lead_id = ctx.get("rec_by_lead_id", {})
+    rec_by_peer = ctx.get("rec_by_peer", {})
+    rec_by_user = ctx.get("rec_by_user", {})
+    rec_by_phone = ctx.get("rec_by_phone", {})
+    direct_client_replies = 0
+    for did in sorted(ctx["eligible_crm_dialog_ids"]):
+        if did in matched_rec_dlg_ids:
+            continue
+        dlg = ctx["dialogs_by_id"].get(did)
+        if dlg is None:
+            continue
+        matched_lead = _resolve_dialog_lead(dlg, ctx)
+        if matched_lead is None:
+            continue
+        if str(matched_lead.get("next_step") or "").startswith("Авто-карантин Sniper ICP"):
+            continue
+        dlid = int(dlg["lead_id"]) if dlg.get("lead_id") is not None else None
+        peer_id = int(dlg["peer_id"]) if dlg.get("peer_id") is not None else None
+        uname = _norm_username(dlg.get("username"))
+        ph15 = _norm_phone_15(dlg.get("phone"))
+        l_peer = (
+            int(matched_lead["telegram_user_id"])
+            if matched_lead.get("telegram_user_id") is not None
+            else None
+        )
+        l_uname = _norm_username(matched_lead.get("username"))
+        l_ph15 = _norm_phone_15(matched_lead.get("phone"))
+        if (
+            int(matched_lead["id"]) in rec_by_lead_id
+            or (dlid is not None and dlid in rec_by_lead_id)
+            or (peer_id is not None and peer_id in rec_by_peer)
+            or (l_peer is not None and l_peer in rec_by_peer)
+            or (uname and uname in rec_by_user)
+            or (l_uname and l_uname in rec_by_user)
+            or (ph15 and ph15 in rec_by_phone)
+            or (l_ph15 and l_ph15 in rec_by_phone)
+        ):
+            continue
+        msum = msg_summary_map.get(did)
+        if int((msum or {}).get("in_count") or 0) > 0 or int(dlg.get("last_from_peer") or 0) == 1:
+            direct_client_replies += 1
+
     return {
         "summary": {
             "total_base": total_base,
@@ -2058,6 +2390,7 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
             "read": total_read,
             "open_rate_pct": round(total_read / max(1, total_contacted) * 100, 1),
             "replied": total_replied,
+            "direct_client_replies": direct_client_replies,
             "reply_rate_pct": round(total_replied / max(1, total_contacted) * 100, 1),
             "reply_of_read_pct": round(total_replied / max(1, total_read) * 100, 1),
             "positive_count": pos_total,

@@ -871,7 +871,7 @@ def _inbox_limit(limit) -> int:
         cap = 30
     if cap < 1:
         cap = 1
-    return min(cap, 100)
+    return min(cap, 500)
 
 
 _SERVICE_PEER_IDS = frozenset((777000, 178220800, 1271266957, 93372553))
@@ -2114,7 +2114,7 @@ class TelethonGateway(TelegramGateway):
                         continue
                     raise GatewayError(str(exc) or "Таймаут чтения входящих") from exc
                 except Exception as exc:
-                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned"):
                         await self._evict_client_unlocked(session_path)
                     raise GatewayError(str(exc) or "Не удалось прочитать входящие") from exc
                 finally:
@@ -2151,6 +2151,22 @@ class TelethonGateway(TelegramGateway):
             if message is not None:
                 text = getattr(message, "message", None)
                 preview = "" if text is None else str(text)[:120]
+                media_info = _extract_message_media(message)
+                if not preview.strip() and media_info.get("media_type"):
+                    mt = str(media_info.get("media_type") or "").strip().lower()
+                    if mt == "voice":
+                        preview = "[Голосовое сообщение]"
+                    elif mt == "video_note":
+                        preview = "[Видеосообщение]"
+                    elif mt == "photo":
+                        preview = "[Фото]"
+                    elif mt == "video":
+                        preview = "[Видео]"
+                    elif mt == "audio":
+                        preview = "[Аудио]"
+                    else:
+                        fname = str(media_info.get("media_filename") or "").strip()
+                        preview = f"[Файл: {fname}]"[:120] if fname else "[Документ]"
                 sent_at = _stamp(getattr(message, "date", None))
                 last_from = 0 if getattr(message, "out", False) else 1
             raw_dlg = getattr(dialog, "dialog", None)
@@ -2171,6 +2187,7 @@ class TelethonGateway(TelegramGateway):
                     "name": dialog.name or _person_name(entity),
                     "peer_type": "user",
                     "unread_count": unread_count,
+                    "telegram_message_id": (int(getattr(message, "id", 0)) or None) if message is not None else None,
                     "last_message_preview": preview,
                     "last_message_at": sent_at,
                     "last_from_peer": last_from,
@@ -2631,7 +2648,6 @@ class TelethonGateway(TelegramGateway):
                 if _classify_session_error(exc).get("health") in (
                     "unauthorized",
                     "banned",
-                    "frozen",
                 ):
                     await self._evict_client_unlocked(session_path)
                 flood_sec = getattr(exc, "seconds", None)
@@ -2800,7 +2816,6 @@ class TelethonGateway(TelegramGateway):
                 if _classify_session_error(exc).get("health") in (
                     "unauthorized",
                     "banned",
-                    "frozen",
                 ):
                     await self._evict_client_unlocked(session_path)
                 return None
@@ -2838,7 +2853,7 @@ class TelethonGateway(TelegramGateway):
                         continue
                     raise GatewayError(str(exc) or "Таймаут чтения истории") from exc
                 except Exception as exc:
-                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    if _classify_session_error(exc).get("health") in ("unauthorized", "banned"):
                         await self._evict_client_unlocked(session_path)
                     raise GatewayError(str(exc) or "Не удалось прочитать историю") from exc
                 finally:
@@ -3099,7 +3114,7 @@ class TelethonGateway(TelegramGateway):
                 await self._drop_zombie_client_unlocked(session_path)
                 return False
             except Exception as exc:
-                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned"):
                     await self._evict_client_unlocked(session_path)
                 return False
             finally:

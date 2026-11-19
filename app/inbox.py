@@ -15,7 +15,21 @@ import time
 import wave
 import weakref
 
-from app.db import INBOX_MEDIA_DIR, as_dict, normalize_status, safe_int, utc_now
+from app.db import (
+    INBOX_MEDIA_DIR,
+    PERSONAL_HYGIENE_ERRORS,
+    as_dict,
+    clean_tg_username,
+    clean_tg_username_lookup,
+    is_newer_dialog_snapshot_unbacked,
+    is_recipient_contacted_outreach,
+    is_vacancy_campaign_meta,
+    locked_conn,
+    normalize_status,
+    safe_int,
+    sql_norm_tg_username_expr,
+    utc_now,
+)
 from app.digest import (
     _norm_ts,
     ensure_dialog_notify_columns,
@@ -23,6 +37,27 @@ from app.digest import (
     is_ineligible_reply_notify_peer,
 )
 from app.telegram_gateway import GatewayError, render_formatted_html
+
+_PERSONAL_HYGIENE_ERRORS = PERSONAL_HYGIENE_ERRORS
+
+
+def _clean_tg_username_display(raw: str | None) -> str | None:
+    cleaned = clean_tg_username(raw)
+    return cleaned or None
+
+
+def _sql_norm_uname_expr(col: str) -> str:
+    return sql_norm_tg_username_expr(col)
+
+
+def _is_contacted_non_hygiene_failed_row(rr) -> bool:
+    st = str(rr["status"] or "").strip().lower()
+    if st != "failed":
+        return False
+    step_val = int(rr["current_step"] or 0)
+    sent_val = str(rr["last_sent_at"] or "").strip()
+    err_val = str(rr["error_text"] or "").strip()
+    return step_val >= 1 and bool(sent_val) and err_val not in _PERSONAL_HYGIENE_ERRORS
 
 
 def ensure_playable_voice_wav(
@@ -395,7 +430,8 @@ def stop_outreach_on_reply(
         return 0
     now = utc_now()
     clean_min_sent = str(min_sent_at).strip() if min_sent_at else None
-    clean_user = str(username).strip().lstrip("@") if username else None
+    clean_user = _clean_tg_username_display(username)
+    lookup_user = clean_tg_username_lookup(username)
     clean_phone = str(phone).strip() if phone else None
     phone_digits = re.sub(r"\D", "", clean_phone or "")
     norm_e164_digits = phone_digits[-15:] if (phone_digits and len(phone_digits) >= 7) else ""
@@ -440,9 +476,9 @@ def stop_outreach_on_reply(
     if clean_peer_id is not None:
         lead_clauses.append("telegram_user_id = ?")
         lead_params.append(clean_peer_id)
-    if clean_user:
-        lead_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
-        lead_params.append(clean_user)
+    if lookup_user:
+        lead_clauses.append(f"(username IS NOT NULL AND {_sql_norm_uname_expr('username')} = ?)")
+        lead_params.append(lookup_user)
     if phone_variants:
         ph_v = ",".join("?" for _ in phone_variants)
         lead_clauses.append(f"(phone IS NOT NULL AND phone IN ({ph_v}))")
@@ -478,9 +514,9 @@ def stop_outreach_on_reply(
     if clean_peer_id is not None:
         rec_clauses.append("telegram_user_id = ?")
         rec_params.append(clean_peer_id)
-    if clean_user:
-        rec_clauses.append("(username IS NOT NULL AND lower(username) = lower(?))")
-        rec_params.append(clean_user)
+    if lookup_user:
+        rec_clauses.append(f"(username IS NOT NULL AND {_sql_norm_uname_expr('username')} = ?)")
+        rec_params.append(lookup_user)
     if phone_variants:
         ph_v = ",".join("?" for _ in phone_variants)
         rec_clauses.append(f"(phone IS NOT NULL AND phone IN ({ph_v}))")
@@ -504,7 +540,7 @@ def stop_outreach_on_reply(
     if rec_clauses:
         all_rec_rows = conn.execute(
             f"""
-            SELECT id, campaign_id, lead_id, status, last_sent_at,
+            SELECT id, campaign_id, lead_id, status, current_step, last_sent_at, error_text,
                    sent_account_id, assigned_account_id, telegram_user_id,
                    username, name, phone, company, note, website, category, their_angle
             FROM campaign_recipients
@@ -516,7 +552,9 @@ def stop_outreach_on_reply(
         contacted_rec_rows = [
             rr
             for rr in all_rec_rows
-            if str(rr["status"] or "").lower() in ("in_progress", "completed", "replied")
+            if is_recipient_contacted_outreach(
+                rr["status"], rr["current_step"], rr["last_sent_at"], rr["error_text"]
+            )
         ]
         has_contacted_recipient = len(contacted_rec_rows) > 0
         for rr in all_rec_rows:
@@ -551,13 +589,18 @@ def stop_outreach_on_reply(
                     if aid not in candidate_account_ids:
                         candidate_account_ids.append(aid)
 
-        # Stop in_progress/completed always; stop pending ONLY when already backed by an open/known DB lead or contacted recipient.
+        # Stop in_progress/completed/contacted non-hygiene failed always; stop pending ONLY when already backed by an open/known DB lead or contacted recipient.
         active_rec_rows = [
             rr
             for rr in all_rec_rows
-            if rr["status"] in ("in_progress", "completed")
+            if (
+                str(rr["status"] or "").lower() != "replied"
+                and is_recipient_contacted_outreach(
+                    rr["status"], rr["current_step"], rr["last_sent_at"], rr["error_text"]
+                )
+            )
             or (
-                rr["status"] == "pending"
+                str(rr["status"] or "").lower() == "pending"
                 and (bool(matched_lead_ids) or has_contacted_recipient)
             )
         ]
@@ -604,10 +647,10 @@ def stop_outreach_on_reply(
             "SELECT * FROM dialogs WHERE peer_type = 'user' AND peer_id = ? ORDER BY last_message_at DESC LIMIT 1",
             (int(clean_peer_id),),
         ).fetchone()
-    elif clean_user:
+    elif lookup_user:
         dlg_row = conn.execute(
-            "SELECT * FROM dialogs WHERE peer_type = 'user' AND lower(username) = lower(?) ORDER BY last_message_at DESC LIMIT 1",
-            (clean_user,),
+            f"SELECT * FROM dialogs WHERE peer_type = 'user' AND {_sql_norm_uname_expr('username')} = ? ORDER BY last_message_at DESC LIMIT 1",
+            (lookup_user,),
         ).fetchone()
     elif matched_lead_ids:
         ph_lids = ",".join("?" for _ in matched_lead_ids)
@@ -1348,6 +1391,20 @@ def _upsert_snapshot_dialog(
                 else None
             )
         )
+        is_new_incoming_snap = bool(
+            has_explicit_unread
+            and (
+                prev_dlg is None
+                or int(prev_dlg["last_from_peer"] or 0) == 0
+                or (
+                    sent_at
+                    and (
+                        not prev_dlg["last_message_at"]
+                        or _norm_ts(sent_at) > _norm_ts(prev_dlg["last_message_at"])
+                    )
+                )
+            )
+        )
         stop_outreach_on_reply(
             conn,
             account_id=account_id,
@@ -1356,6 +1413,7 @@ def _upsert_snapshot_dialog(
             phone=row["phone"],
             lead_id=row["lead_id"],
             preview=row["last_message_preview"],
+            force_event=is_new_incoming_snap,
             min_sent_at=snap_sent_at,
             opener=opener,
             notify=bool(notify and has_explicit_unread),
@@ -1955,11 +2013,7 @@ def apply_inbox_read_update(
 def _is_vacancy_campaign_meta(
     name: str | None, leadgen_sources_json: str | None = None
 ) -> bool:
-    low = str(name or "").casefold()
-    if "ваканс" in low or "vacanc" in low:
-        return True
-    src_low = str(leadgen_sources_json or "").casefold()
-    return '"vacancies' in src_low
+    return is_vacancy_campaign_meta(name, leadgen_sources_json)
 
 
 def _person_is_crm_relevant(
@@ -1971,7 +2025,7 @@ def _person_is_crm_relevant(
     *,
     is_bot: bool = False,
 ) -> bool:
-    clean_u = (username or "").strip().lstrip("@").lower()
+    clean_u = clean_tg_username_lookup(username)
     clean_p = (phone or "").strip()
     p_digits = re.sub(r"\D", "", clean_p)
 
@@ -1997,7 +2051,7 @@ def _person_is_crm_relevant(
     lead_clauses = ["telegram_user_id = ?"]
     lead_params: list = [int(peer_id)]
     if clean_u:
-        lead_clauses.append("(username IS NOT NULL AND ltrim(lower(username), '@') = ?)")
+        lead_clauses.append(f"(username IS NOT NULL AND {_sql_norm_uname_expr('username')} = ?)")
         lead_params.append(clean_u)
     if clean_p:
         lead_clauses.append("phone = ?")
@@ -2026,7 +2080,7 @@ def _person_is_crm_relevant(
     rec_clauses = ["cr.telegram_user_id = ?"]
     rec_params: list = [int(peer_id)]
     if clean_u:
-        rec_clauses.append("(cr.username IS NOT NULL AND ltrim(lower(cr.username), '@') = ?)")
+        rec_clauses.append(f"(cr.username IS NOT NULL AND {_sql_norm_uname_expr('cr.username')} = ?)")
         rec_params.append(clean_u)
     if clean_p:
         rec_clauses.append("cr.phone = ?")
@@ -2042,7 +2096,8 @@ def _person_is_crm_relevant(
     has_reg_any_rec = False
     for rrow in conn.execute(
         f"""
-        SELECT cr.status, c.name AS camp_name, c.leadgen_sources_json AS camp_sources
+        SELECT cr.status, cr.current_step, cr.last_sent_at, cr.error_text,
+               c.name AS camp_name, c.leadgen_sources_json AS camp_sources
         FROM campaign_recipients cr
         LEFT JOIN campaigns c ON c.id = cr.campaign_id
         WHERE {' OR '.join(rec_clauses)}
@@ -2054,7 +2109,9 @@ def _person_is_crm_relevant(
             has_vac_rec = True
         else:
             has_reg_any_rec = True
-            if str(rrow["status"] or "").strip().lower() in ("in_progress", "replied"):
+            if is_recipient_contacted_outreach(
+                rrow["status"], rrow["current_step"], rrow["last_sent_at"], rrow["error_text"]
+            ):
                 has_reg_active_rec = True
 
     if has_vac_rec and not has_reg_any_rec and not has_won_lead:
@@ -2092,9 +2149,7 @@ def sync_inbox(
             if peer_id is None:
                 continue
             if crm_only:
-                username = person.get("username")
-                if username is not None:
-                    username = str(username).strip().lstrip("@") or None
+                username = clean_tg_username_lookup(person.get("username")) or None
                 provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
                 phone = _extract_dialog_phone(person, int(peer_id), provider)
                 if not _person_is_crm_relevant(
@@ -2137,7 +2192,10 @@ class InboxResultList(list):
         }
 
 
-_INBOX_SELECT_SQL = """
+_SQL_NORM_L_UNAME = _sql_norm_uname_expr("l.username")
+_SQL_NORM_D_UNAME = _sql_norm_uname_expr("d.username")
+
+_INBOX_SELECT_SQL = f"""
     SELECT
         d.*,
         COALESCE(d.provider, a.provider, 'telegram') AS provider,
@@ -2149,15 +2207,15 @@ _INBOX_SELECT_SQL = """
             d.lead_id,
             (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
             (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1),
-            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND ltrim(lower(l.username), '@') = ltrim(lower(d.username), '@') AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
-            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND ltrim(lower(l.username), '@') = ltrim(lower(d.username), '@') ORDER BY l.id LIMIT 1)
+            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
+            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} ORDER BY l.id LIMIT 1)
         ) AS resolved_lead_id,
         COALESCE(
             (SELECT l.status FROM leads l WHERE l.id = d.lead_id LIMIT 1),
             (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
             (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1),
-            (SELECT l.status FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND ltrim(lower(l.username), '@') = ltrim(lower(d.username), '@') AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
-            (SELECT l.status FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND ltrim(lower(l.username), '@') = ltrim(lower(d.username), '@') ORDER BY l.id LIMIT 1)
+            (SELECT l.status FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
+            (SELECT l.status FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} ORDER BY l.id LIMIT 1)
         ) AS lead_status
     FROM dialogs d
     JOIN accounts a ON a.id = d.account_id
@@ -2212,6 +2270,7 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
         """
         SELECT cr.lead_id, cr.telegram_user_id, cr.username, cr.phone,
                cr.status, cr.current_step, cr.last_sent_at, cr.sent_account_id,
+               cr.assigned_account_id, cr.error_text,
                c.name AS camp_name, c.leadgen_sources_json AS camp_sources
         FROM campaign_recipients cr
         LEFT JOIN campaigns c ON c.id = cr.campaign_id
@@ -2227,6 +2286,8 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
             "current_step": int(rr["current_step"] or 0),
             "last_sent_at": str(rr["last_sent_at"] or "").strip(),
             "sent_account_id": int(rr["sent_account_id"]) if rr["sent_account_id"] is not None else None,
+            "assigned_account_id": int(rr["assigned_account_id"]) if rr["assigned_account_id"] is not None else None,
+            "error_text": str(rr["error_text"] or "").strip(),
             "is_vacancy": _is_vacancy_campaign_meta(rr["camp_name"], rr["camp_sources"]),
         }
         if rr["lead_id"] is not None:
@@ -2234,7 +2295,7 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
         if rr["telegram_user_id"] is not None:
             recs_by_tgid.setdefault(int(rr["telegram_user_id"]), []).append(rec_meta)
         if rr["username"]:
-            u = str(rr["username"]).strip().lstrip("@").lower()
+            u = clean_tg_username_lookup(rr["username"])
             if u:
                 recs_by_uname.setdefault(u, []).append(rec_meta)
         if rr["phone"]:
@@ -2276,7 +2337,7 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
 
         row_acc_id = int(row["account_id"]) if row.get("account_id") is not None else None
         tg_id = row.get("telegram_user_id")
-        uname = str(row.get("username") or "").strip().lstrip("@").lower()
+        uname = clean_tg_username_lookup(row.get("username"))
         p_dig = re.sub(r"\D", "", str(row.get("phone") or ""))
 
         inelig, _ = is_ineligible_reply_notify_peer(
@@ -2320,17 +2381,28 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
             continue
 
         has_any_rec = len(reg_recs) > 0
-        has_valid_replied_rec = any(
-            rc["status"] == "replied"
-            and rc["current_step"] >= 1
-            and bool(rc["last_sent_at"])
-            and (
-                rc["sent_account_id"] is None
-                or row_acc_id is None
-                or rc["sent_account_id"] == row_acc_id
-            )
-            for rc in reg_recs
+        peer_has_replied_signal = (
+            int(row.get("last_from_peer") or 0) == 1
+            or (dlg_id is not None and dlg_id in in_msg_dialog_ids)
         )
+        has_valid_replied_rec = False
+        for rc in reg_recs:
+            if rc["current_step"] < 1 or not rc["last_sent_at"]:
+                continue
+            if not is_recipient_contacted_outreach(
+                rc["status"], rc["current_step"], rc["last_sent_at"], rc["error_text"]
+            ):
+                continue
+            eff_sent_acc = (
+                rc["sent_account_id"]
+                if rc["sent_account_id"] is not None
+                else rc["assigned_account_id"]
+            )
+            if not (eff_sent_acc is None or row_acc_id is None or eff_sent_acc == row_acc_id):
+                continue
+            if rc["status"] == "replied" or peer_has_replied_signal:
+                has_valid_replied_rec = True
+                break
         has_lead = bool(row.get("lead_id") is not None or row.get("lead_status"))
 
         if not has_lead and not has_valid_replied_rec:
@@ -2488,6 +2560,7 @@ def list_inbox(
     status: str | None = None,
     with_counts: bool = False,
     crm_only: bool = False,
+    limit: int | None = None,
 ) -> list | dict:
     base_rows = _query_inbox_rows(
         conn,
@@ -2505,18 +2578,22 @@ def list_inbox(
     else:
         filtered = base_rows
 
-    has_explicit_filter = bool(
-        chips
-        or (q or "").strip()
-        or (provider or "").strip()
-        or (status or "").strip()
-        or crm_only
-    )
-    if has_explicit_filter:
-        cap = 500
+    if limit is not None:
+        lim = int(limit)
+        capped = filtered if lim <= 0 else filtered[:lim]
     else:
-        cap = 60 if (account_id is None or int(account_id) == 0) else 30
-    capped = filtered[:cap]
+        has_explicit_filter = bool(
+            chips
+            or (q or "").strip()
+            or (provider or "").strip()
+            or (status or "").strip()
+            or crm_only
+        )
+        if has_explicit_filter:
+            cap = 2000
+        else:
+            cap = 60 if (account_id is None or int(account_id) == 0) else 30
+        capped = filtered[:cap]
 
     if with_counts:
         return {"dialogs": capped, "counts": counts}
@@ -2590,7 +2667,8 @@ def open_dialog_by_lead(
             raise LookupError("account")
         explicit_acc = as_dict(acc_check)
 
-    clean_user = str(username).strip().lstrip("@") if username and str(username).strip() else None
+    clean_user = _clean_tg_username_display(username)
+    lookup_user = clean_tg_username_lookup(username)
     clean_phone = str(phone).strip() if phone and str(phone).strip() else None
     clean_tg_id = (
         int(telegram_user_id)
@@ -2607,10 +2685,10 @@ def open_dialog_by_lead(
             "SELECT * FROM leads WHERE telegram_user_id = ? ORDER BY id LIMIT 1",
             (clean_tg_id,),
         ).fetchone()
-    if lead_row is None and clean_user:
+    if lead_row is None and lookup_user:
         lead_row = conn.execute(
-            "SELECT * FROM leads WHERE username IS NOT NULL AND ltrim(lower(username), '@') = lower(?) ORDER BY id LIMIT 1",
-            (clean_user,),
+            f"SELECT * FROM leads WHERE username IS NOT NULL AND {_sql_norm_uname_expr('username')} = ? ORDER BY id LIMIT 1",
+            (lookup_user,),
         ).fetchone()
     if lead_row is None and clean_phone:
         lead_row = conn.execute(
@@ -2667,9 +2745,11 @@ def open_dialog_by_lead(
     # 1. Try existing dialog on requested account (or any account if not specified)
     existing_dlg = None
     match_lid = lid if lid is not None else -1
+    lead_uname_lookup = clean_tg_username_lookup(lead.get("username")) or None
+    d_uname_expr = _sql_norm_uname_expr("d.username")
     if explicit_acc_id is not None:
         existing_dlg = conn.execute(
-            """
+            f"""
             SELECT d.*,
                    COALESCE(d.provider, a.provider, 'telegram') AS provider,
                    d.phone AS phone,
@@ -2685,7 +2765,7 @@ def open_dialog_by_lead(
                   OR (? IS NOT NULL AND d.peer_id = ?)
                   OR (? IS NOT NULL AND d.peer_id = ?)
                   OR (? IS NOT NULL AND d.phone IS NOT NULL AND d.phone = ?)
-                  OR (? IS NOT NULL AND d.username IS NOT NULL AND lower(d.username) = lower(?))
+                  OR (? IS NOT NULL AND d.username IS NOT NULL AND {d_uname_expr} = ?)
               )
             ORDER BY d.id LIMIT 1
             """,
@@ -2698,13 +2778,13 @@ def open_dialog_by_lead(
                 wa_peer_id,
                 lead_phone,
                 lead_phone,
-                lead.get("username"),
-                lead.get("username"),
+                lead_uname_lookup,
+                lead_uname_lookup,
             ),
         ).fetchone()
     else:
         existing_dlg = conn.execute(
-            """
+            f"""
             SELECT d.*,
                    COALESCE(d.provider, a.provider, 'telegram') AS provider,
                    d.phone AS phone,
@@ -2721,7 +2801,7 @@ def open_dialog_by_lead(
                   OR (? IS NOT NULL AND d.peer_id = ?)
                   OR (? IS NOT NULL AND d.peer_id = ?)
                   OR (? IS NOT NULL AND d.phone IS NOT NULL AND d.phone = ?)
-                  OR (? IS NOT NULL AND d.username IS NOT NULL AND lower(d.username) = lower(?))
+                  OR (? IS NOT NULL AND d.username IS NOT NULL AND {d_uname_expr} = ?)
               )
             ORDER BY (d.lead_id = ?) DESC, d.id LIMIT 1
             """,
@@ -2735,8 +2815,8 @@ def open_dialog_by_lead(
                 wa_peer_id,
                 lead_phone,
                 lead_phone,
-                lead.get("username"),
-                lead.get("username"),
+                lead_uname_lookup,
+                lead_uname_lookup,
                 match_lid,
             ),
         ).fetchone()
@@ -2823,7 +2903,7 @@ def open_dialog_by_lead(
     else:
         peer_id = int(lead.get("telegram_user_id") or wa_peer_id or fallback_synth)
 
-    username = (lead.get("username") or "").strip().lstrip("@") or None
+    username = _clean_tg_username_display(lead.get("username"))
     title = (lead.get("name") or "").strip() or username or lead_phone or (f"Лид #{lid}" if lid is not None else "Контакт")
     preview = (lead.get("note") or lead.get("description") or "Контакт из CRM · готов к диалогу")[:120]
 
@@ -2883,7 +2963,10 @@ def open_dialog_by_lead(
 
 
 def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
-    dialog = conn.execute("SELECT id FROM dialogs WHERE id = ?", (dialog_id,)).fetchone()
+    dialog = conn.execute(
+        "SELECT id, last_message_at, last_message_preview, last_from_peer FROM dialogs WHERE id = ?",
+        (dialog_id,),
+    ).fetchone()
     if dialog is None:
         raise LookupError("dialog")
     if limit is None:
@@ -2891,7 +2974,7 @@ def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
             """
             SELECT * FROM messages
             WHERE dialog_id = ?
-            ORDER BY sent_at, id
+            ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T'), id
             """,
             (dialog_id,),
         ).fetchall()
@@ -2901,9 +2984,9 @@ def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
             SELECT * FROM (
                 SELECT * FROM messages
                 WHERE dialog_id = ?
-                ORDER BY sent_at DESC, id DESC
+                ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC, id DESC
                 LIMIT ?
-            ) ORDER BY sent_at, id
+            ) ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T'), id
             """,
             (dialog_id, int(limit)),
         ).fetchall()
@@ -2915,6 +2998,34 @@ def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
         elif d.get("formatted_html") is None:
             d["formatted_html"] = ""
         out.append(d)
+
+    snap_preview = str(dialog["last_message_preview"] or "")
+    snap_at = str(dialog["last_message_at"] or "")
+    if is_newer_dialog_snapshot_unbacked(
+        snap_preview,
+        snap_at,
+        dialog["last_from_peer"],
+        out[-1].get("text") if out else "",
+        out[-1].get("sent_at") if out else "",
+        out[-1].get("direction") if out else "",
+    ):
+        out.append(
+            {
+                "id": -int(dialog_id),
+                "dialog_id": int(dialog_id),
+                "telegram_message_id": None,
+                "direction": "in" if int(dialog["last_from_peer"] or 0) else "out",
+                "text": snap_preview,
+                "formatted_html": render_formatted_html(snap_preview, None),
+                "sent_at": snap_at,
+                "is_snapshot_preview": True,
+                "media_url": None,
+                "media_type": None,
+            }
+        )
+    if limit is not None:
+        cap = max(0, int(limit))
+        out = out[-cap:] if cap > 0 else []
     return out
 
 
@@ -3138,25 +3249,26 @@ def _normalize_message(item, now: str):
 
 
 async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
-    dialog = conn.execute("SELECT * FROM dialogs WHERE id = ?", (dialog_id,)).fetchone()
-    if dialog is None:
-        raise LookupError("dialog")
-    dialog = as_dict(dialog)
-    if dialog["peer_type"] != "user" or int(dialog["is_group"] or 0):
-        raise ValueError("Это не личный диалог")
-    account = conn.execute(
-        "SELECT * FROM accounts WHERE id = ?", (dialog["account_id"],)
-    ).fetchone()
-    if account is None:
-        raise LookupError("account")
-    account = as_dict(account)
-    if account["status"] != "connected":
-        raise ValueError("Аккаунт не подключён")
-    cap = 50 if limit is None else max(1, min(int(limit), 50))
-    account_health = str(account.get("health") or "active").strip().lower()
-    if account_health in ("unauthorized", "banned"):
-        return list_messages(conn, dialog_id, cap)
-    peer_id = int(dialog["peer_id"])
+    with locked_conn(conn):
+        dialog = conn.execute("SELECT * FROM dialogs WHERE id = ?", (dialog_id,)).fetchone()
+        if dialog is None:
+            raise LookupError("dialog")
+        dialog = as_dict(dialog)
+        if dialog["peer_type"] != "user" or int(dialog["is_group"] or 0):
+            raise ValueError("Это не личный диалог")
+        account = conn.execute(
+            "SELECT * FROM accounts WHERE id = ?", (dialog["account_id"],)
+        ).fetchone()
+        if account is None:
+            raise LookupError("account")
+        account = as_dict(account)
+        if account["status"] != "connected":
+            raise ValueError("Аккаунт не подключён")
+        cap = 50 if limit is None else max(1, min(int(limit), 50))
+        account_health = str(account.get("health") or "active").strip().lower()
+        if account_health in ("unauthorized", "banned"):
+            return list_messages(conn, dialog_id, cap)
+        peer_id = int(dialog["peer_id"])
     if _is_synthetic_peer_id(peer_id) and dialog.get("username") and hasattr(gateway, "search_dialogs"):
         try:
             found = await gateway.search_dialogs(
@@ -3165,29 +3277,31 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
             if isinstance(found, list) and found and found[0].get("telegram_user_id"):
                 real_id = int(found[0]["telegram_user_id"])
                 if real_id != peer_id:
-                    try:
-                        conn.execute(
-                            "UPDATE dialogs SET peer_id = ?, updated_at = ? WHERE id = ?",
-                            (real_id, utc_now(), dialog_id),
-                        )
-                        if dialog.get("lead_id"):
+                    with locked_conn(conn):
+                        try:
                             conn.execute(
-                                "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
-                                (real_id, utc_now(), int(dialog["lead_id"])),
+                                "UPDATE dialogs SET peer_id = ?, updated_at = ? WHERE id = ?",
+                                (real_id, utc_now(), dialog_id),
                             )
-                        conn.commit()
-                        peer_id = real_id
-                    except sqlite3.IntegrityError:
-                        conn.rollback()
+                            if dialog.get("lead_id"):
+                                conn.execute(
+                                    "UPDATE leads SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+                                    (real_id, utc_now(), int(dialog["lead_id"])),
+                                )
+                            conn.commit()
+                            peer_id = real_id
+                        except sqlite3.IntegrityError:
+                            conn.rollback()
         except Exception:
             pass
     if _is_synthetic_peer_id(peer_id) or gateway is None:
-        return list_messages(conn, dialog_id, cap)
+        with locked_conn(conn):
+            return list_messages(conn, dialog_id, cap)
     try:
         try:
             fetched = await gateway.fetch_messages(account["session_path"], peer_id, cap)
         except Exception as exc:
-            uname = str(dialog.get("username") or "").strip().lstrip("@")
+            uname = clean_tg_username_lookup(dialog.get("username"))
             if uname and "could not find the input entity" in str(exc).casefold():
                 fetched = await gateway.fetch_messages(
                     account["session_path"], f"@{uname}", cap
@@ -3195,17 +3309,20 @@ async def get_thread(conn, dialog_id: int, gateway, limit: int = 50) -> list:
             else:
                 raise
     except Exception:
-        cached = list_messages(conn, dialog_id, cap)
+        with locked_conn(conn):
+            cached = list_messages(conn, dialog_id, cap)
         if cached:
             return cached
         raise
     if not isinstance(fetched, list):
-        cached = list_messages(conn, dialog_id, cap)
+        with locked_conn(conn):
+            cached = list_messages(conn, dialog_id, cap)
         if cached:
             return cached
         raise GatewayError("История без списка")
-    _cache_messages(conn, dialog_id, fetched[-cap:])
-    return list_messages(conn, dialog_id, cap)
+    with locked_conn(conn):
+        _cache_messages(conn, dialog_id, fetched[-cap:])
+        return list_messages(conn, dialog_id, cap)
 
 
 async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) -> dict:

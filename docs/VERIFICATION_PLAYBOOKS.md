@@ -59,3 +59,19 @@
    - `get_analytics_summary` и `proactive_audit.py` проверяют тождество `read + unseen_total == contacted`, раздельные счётчики running vs draft pending queues, видимость **всех** отвалившихся аккаунтов в `accounts.dropped_accounts` (включая `0`-send/`0`-dialog аккаунты) с причиной и датой отвала, исключение личных не-CRM диалогов из `daily_flow` / `reply_heatmap`, и живой `waiting_our_answer` в разбивке на живые/отвалившиеся аккаунты.
 3. **4-Tab Simplified UI & Zero Hardcoded Stats (`Gate J` & `Gate K`)**:
    - Навигация `.nav` и `#miniapp-bottom-nav` содержит ровно 4 вкладки: `Входящие` (`inbox`), `Лиды` (`leads`), `Рассылки` (`outreach`), `Статистика` (`analytics`); в коде UI отсутствуют захардкоженные цифры (`2 174`, `129 ждущих`, `3.6% отказов`, `30.5% всей выручки`) и несуществующие вызовы `setActiveSheet(`.
+
+## Playbook 5: Old-Lead & Completed-Recipient Message Visibility, Thread Backfill & Git Hooks Gate (`Gate M`)
+Гарантирует, что ни одно новое сообщение от старого лида, `completed`-получателя или проконтактированного `failed(step>=1)` получателя не теряется на входе, в списке «Входящие», внутри треда «Переписка», в профиле клиента и в «Статистике».
+
+### Обязательные независимые перепроверки (4-of-4):
+1. **Static & Hooks Gate (`./scripts/verify.sh` — Gate M + `githooks/pre-commit`)**:
+   - Проверяет включение `'completed'` в `_person_is_crm_relevant`, `_filter_crm_only_rows` и `_filter_people_to_existing_or_crm`.
+   - Проверяет подключение `sync_crm_dialog_messages_backfill_once` в `app/main.py` и `sortDialogsByRecency` в `app/static/app.js`.
+   - Проверяет наличие исполняемых хуков `githooks/pre-commit` и `githooks/pre-push` (устанавливаются `bash scripts/install_hooks.sh`).
+2. **Message Visibility & `--self-test` Audit (`python scripts/proactive_audit.py --self-test` и `--db <crm.db>`)**:
+   - Ловит (`exit 1`): 1) скрытые из `list_inbox(..., crm_only=True)` клиентские диалоги с ответом; 2) не переведённых в `replied` проконтактированных получателей с входящим ответом; 3) клиентские диалоги, у которых `last_message_at` / `last_message_preview` не видны в `list_messages(conn, dialog_id, 50)`.
+   - `--self-test` программно вбрасывает эти баги во временную БД, доказывает падение аудита (`ok=False`) и проверяет автоисправление (`ok=True`).
+3. **Runtime Regression Suite (`tests/test_old_leads_messages_and_harness.py`)**:
+   - Покрывает ответы от `completed`, `failed(step>=1)`, прямых `won`-лидов (`unread > 0` в статистике без спама алертами), голосовые/медиа-превью, `t.me/` хендлы, бэкфилл тредов на активных и `frozen` сессиях и падение `githooks/pre-commit` при нарушении Gate M.
+4. **Post-Deploy Live Sync & Playbook Check**:
+   - На VPS после деплоя вызывается `POST /api/inbox/sync` (`crm_only=true`), прогоняется `proactive_audit.py --db /opt/crmtg/data/crm.db --heal` + повторный read-only прогон (`exit 0`), затем живая проверка в Chrome/Playwright на `https://crm.softugc.com`.

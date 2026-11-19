@@ -6,14 +6,19 @@ import sqlite3
 from app.db import (
     STATUSES,
     as_dict,
+    clean_tg_username,
+    clean_tg_username_lookup,
     create_pipeline_stage,
+    is_newer_dialog_snapshot_unbacked,
     list_pipeline_stages,
     normalize_status,
+    sql_norm_tg_username_expr,
     status_to_airtable,
     update_pipeline_stage,
     utc_now,
     valid_statuses,
 )
+from app.digest import _norm_ts
 from app.events import add_lead_event, list_lead_events, record_lead_event
 from app.notes import notes_for_card
 from app.properties import list_lead_properties
@@ -67,7 +72,7 @@ def _build_enrich_cache(conn) -> dict:
             rec_by_lid.setdefault(int(rd["lead_id"]), rd)
         if rd.get("telegram_user_id") is not None:
             rec_by_tg.setdefault(int(rd["telegram_user_id"]), rd)
-        uname = (rd.get("username") or "").strip().lower()
+        uname = _clean_username_lookup(rd.get("username"))
         if uname:
             rec_by_uname.setdefault(uname, rd)
         ph = (rd.get("phone") or "").strip()
@@ -96,7 +101,7 @@ def _build_enrich_cache(conn) -> dict:
             dlg_by_lid.setdefault(int(dd["lead_id"]), dd)
         if dd.get("peer_id") is not None:
             dlg_by_tg.setdefault(int(dd["peer_id"]), dd)
-        uname = (dd.get("username") or "").strip().lower()
+        uname = _clean_username_lookup(dd.get("username"))
         if uname:
             dlg_by_uname.setdefault(uname, dd)
         ph = (dd.get("phone") or "").strip()
@@ -140,7 +145,7 @@ def _enrich_lead(conn, data: dict | None, cache: dict | None = None) -> dict | N
         if rec is None and tg_id is not None:
             rec = cache["rec_by_tg"].get(int(tg_id))
         if rec is None and username:
-            rec = cache["rec_by_uname"].get(str(username).strip().lower())
+            rec = cache["rec_by_uname"].get(_clean_username_lookup(username))
         if rec is None and phone:
             rec = cache["rec_by_phone"].get(str(phone).strip())
     else:
@@ -153,9 +158,10 @@ def _enrich_lead(conn, data: dict | None, cache: dict | None = None) -> dict | N
         if tg_id is not None:
             rec_clauses.append("cr.telegram_user_id = ?")
             rec_params.append(int(tg_id))
-        if username:
-            rec_clauses.append("(cr.username IS NOT NULL AND lower(cr.username) = lower(?))")
-            rec_params.append(str(username))
+        clean_uname_lookup = _clean_username_lookup(username)
+        if clean_uname_lookup:
+            rec_clauses.append(f"(cr.username IS NOT NULL AND {_sql_norm_uname_expr('cr.username')} = ?)")
+            rec_params.append(clean_uname_lookup)
         if phone:
             rec_clauses.append("(cr.phone IS NOT NULL AND cr.phone = ?)")
             rec_params.append(str(phone))
@@ -214,7 +220,7 @@ def _enrich_lead(conn, data: dict | None, cache: dict | None = None) -> dict | N
         if dlg is None and tg_id is not None:
             dlg = cache["dlg_by_tg"].get(int(tg_id))
         if dlg is None and username:
-            dlg = cache["dlg_by_uname"].get(str(username).strip().lower())
+            dlg = cache["dlg_by_uname"].get(_clean_username_lookup(username))
         if dlg is None and phone:
             dlg = cache["dlg_by_phone"].get(str(phone).strip())
     else:
@@ -230,9 +236,10 @@ def _enrich_lead(conn, data: dict | None, cache: dict | None = None) -> dict | N
         if tg_id is not None:
             dlg_clauses.append("d.peer_id = ?")
             dlg_params.append(int(tg_id))
-        if username:
-            dlg_clauses.append("(d.username IS NOT NULL AND lower(d.username) = lower(?))")
-            dlg_params.append(str(username))
+        clean_dlg_uname = _clean_username_lookup(username)
+        if clean_dlg_uname:
+            dlg_clauses.append(f"(d.username IS NOT NULL AND {_sql_norm_uname_expr('d.username')} = ?)")
+            dlg_params.append(clean_dlg_uname)
         if phone:
             dlg_clauses.append("(d.phone IS NOT NULL AND d.phone = ?)")
             dlg_params.append(str(phone))
@@ -362,12 +369,16 @@ def _clean_currency(value) -> str:
 
 
 def _clean_username(username):
-    if username is None:
-        return None
-    value = str(username).strip()
-    if value.startswith("@"):
-        value = value[1:]
-    return value or None
+    cleaned = clean_tg_username(username)
+    return cleaned or None
+
+
+def _clean_username_lookup(username) -> str:
+    return clean_tg_username_lookup(username)
+
+
+def _sql_norm_uname_expr(col: str) -> str:
+    return sql_norm_tg_username_expr(col)
 
 
 def _blank(value):
@@ -1980,10 +1991,10 @@ def get_cached_peer_profile(
         ).fetchone()
         if row is not None:
             return as_dict(row)
-    clean_u = str(username or "").strip().lstrip("@").lower()
+    clean_u = _clean_username_lookup(username)
     if clean_u:
         row = conn.execute(
-            "SELECT * FROM peer_profiles WHERE username IS NOT NULL AND ltrim(lower(username), '@') = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            f"SELECT * FROM peer_profiles WHERE username IS NOT NULL AND {_sql_norm_uname_expr('username')} = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
             (clean_u,),
         ).fetchone()
         if row is not None:
@@ -2032,7 +2043,7 @@ def get_client_full_profile(
 
     if resolved_lead is None and primary_dialog is not None:
         tg_id = primary_dialog.get("peer_id")
-        uname = str(primary_dialog.get("username") or "").strip().lstrip("@").lower()
+        uname = _clean_username_lookup(primary_dialog.get("username"))
         ph = str(primary_dialog.get("phone") or "").strip()
         p_dig = _norm_phone_15(ph)
         clauses = ["dialog_id = ?"]
@@ -2041,7 +2052,7 @@ def get_client_full_profile(
             clauses.append("telegram_user_id = ?")
             params.append(int(tg_id))
         if uname:
-            clauses.append("(username IS NOT NULL AND ltrim(lower(username), '@') = ?)")
+            clauses.append(f"(username IS NOT NULL AND {_sql_norm_uname_expr('username')} = ?)")
             params.append(uname)
         if ph:
             clauses.append("phone = ?")
@@ -2065,11 +2076,10 @@ def get_client_full_profile(
         if primary_dialog is not None and primary_dialog.get("peer_id") is not None
         else (resolved_lead.get("telegram_user_id") if resolved_lead is not None else None)
     )
-    eff_uname = str(
+    eff_uname = _clean_username(
         (primary_dialog.get("username") if primary_dialog else None)
         or (resolved_lead.get("username") if resolved_lead else None)
-        or ""
-    ).strip().lstrip("@")
+    ) or ""
     eff_phone = str(
         (primary_dialog.get("phone") if primary_dialog else None)
         or (resolved_lead.get("phone") if resolved_lead else None)
@@ -2094,7 +2104,7 @@ def get_client_full_profile(
         dlg_clauses.append("(d.peer_type = 'user' AND d.peer_id = ?)")
         dlg_params.append(int(eff_peer_id))
     if eff_uname:
-        dlg_clauses.append("(d.peer_type = 'user' AND d.username IS NOT NULL AND ltrim(lower(d.username), '@') = ?)")
+        dlg_clauses.append(f"(d.peer_type = 'user' AND d.username IS NOT NULL AND {_sql_norm_uname_expr('d.username')} = ?)")
         dlg_params.append(eff_uname.lower())
     if eff_pdig:
         dlg_clauses.append(
@@ -2119,7 +2129,7 @@ def get_client_full_profile(
             FROM dialogs d
             JOIN accounts a ON a.id = d.account_id
             WHERE {' OR '.join(dlg_clauses)}
-            ORDER BY (d.last_message_at IS NULL), d.last_message_at DESC, d.id DESC
+            ORDER BY (d.last_message_at IS NULL), REPLACE(COALESCE(d.last_message_at, ''), ' ', 'T') DESC, d.id DESC
             """,
             dlg_params,
         ).fetchall()
@@ -2133,7 +2143,7 @@ def get_client_full_profile(
             if eff_peer_id is None and d.get("peer_id") is not None:
                 eff_peer_id = int(d["peer_id"])
             if not eff_uname and d.get("username"):
-                eff_uname = str(d["username"]).strip().lstrip("@")
+                eff_uname = _clean_username(d["username"]) or ""
             client_dialogs.append(d)
 
     if primary_dialog is None and client_dialogs:
@@ -2157,7 +2167,7 @@ def get_client_full_profile(
         rec_clauses.append("cr.telegram_user_id = ?")
         rec_params.append(int(eff_peer_id))
     if eff_uname:
-        rec_clauses.append("(cr.username IS NOT NULL AND ltrim(lower(cr.username), '@') = ?)")
+        rec_clauses.append(f"(cr.username IS NOT NULL AND {_sql_norm_uname_expr('cr.username')} = ?)")
         rec_params.append(eff_uname.lower())
     if eff_pdig:
         rec_clauses.append(
@@ -2187,6 +2197,7 @@ def get_client_full_profile(
             outreach_rows.append(rd)
 
     recent_messages: list[dict] = []
+    latest_msg_by_dlg: dict[int, tuple[str, str]] = {}
     dlg_ids = [int(d["id"]) for d in client_dialogs]
     if dlg_ids:
         ph_ids = ",".join("?" for _ in dlg_ids)
@@ -2197,12 +2208,70 @@ def get_client_full_profile(
             JOIN dialogs d ON d.id = m.dialog_id
             JOIN accounts a ON a.id = d.account_id
             WHERE m.dialog_id IN ({ph_ids})
-            ORDER BY m.sent_at DESC, m.id DESC
+            ORDER BY REPLACE(COALESCE(m.sent_at, ''), ' ', 'T') DESC, m.id DESC
             LIMIT 15
             """,
             dlg_ids,
         ).fetchall():
             recent_messages.append(as_dict(mr))
+        for lr in conn.execute(
+            f"""
+            SELECT dialog_id, direction, sent_at, text
+            FROM messages
+            WHERE dialog_id IN ({ph_ids})
+            ORDER BY REPLACE(COALESCE(sent_at, ''), ' ', 'T') DESC, id DESC
+            """,
+            dlg_ids,
+        ).fetchall():
+            did_val = int(lr["dialog_id"])
+            ts_val = _norm_ts(lr["sent_at"])
+            txt_val = str(lr["text"] or "").strip()
+            dir_val = str(lr["direction"] or "")
+            prev_pair = latest_msg_by_dlg.get(did_val)
+            if prev_pair is None or ts_val > prev_pair[0]:
+                latest_msg_by_dlg[did_val] = (ts_val, txt_val, dir_val)
+
+    extra_in = 0
+    extra_out = 0
+    for d in client_dialogs:
+        did_val = int(d["id"])
+        snap_preview = str(d.get("last_message_preview") or "").strip()
+        snap_at = str(d.get("last_message_at") or "").strip()
+        max_ts, max_txt, max_dir = latest_msg_by_dlg.get(did_val, ("", "", ""))
+        if is_newer_dialog_snapshot_unbacked(
+            snap_preview,
+            snap_at,
+            d.get("last_from_peer"),
+            max_txt,
+            max_ts,
+            max_dir,
+        ):
+            snap_dir = "in" if int(d.get("last_from_peer") or 0) else "out"
+            recent_messages.append(
+                {
+                    "id": -did_val,
+                    "dialog_id": did_val,
+                    "telegram_message_id": None,
+                    "direction": snap_dir,
+                    "text": str(d.get("last_message_preview") or ""),
+                    "sent_at": snap_at,
+                    "is_snapshot_preview": True,
+                    "media_url": None,
+                    "media_type": None,
+                    "account_id": d.get("account_id"),
+                    "account_username": d.get("account_username"),
+                }
+            )
+            if snap_dir == "in":
+                extra_in += 1
+            else:
+                extra_out += 1
+    if recent_messages:
+        recent_messages.sort(
+            key=lambda m: (_norm_ts(m.get("sent_at")), int(m.get("id") or 0)),
+            reverse=True,
+        )
+        recent_messages = recent_messages[:15]
 
     reminders: list[dict] = []
     if eff_lid is not None:
@@ -2232,7 +2301,7 @@ def get_client_full_profile(
         or eff_uname
         or (outreach_rows[0].get("username") if outreach_rows else None)
     )
-    clean_final_uname = str(final_uname or "").strip().lstrip("@") or None
+    clean_final_uname = _clean_username(final_uname)
     final_phone = (
         (cached_tg.get("phone") if cached_tg else None)
         or eff_phone
@@ -2268,14 +2337,14 @@ def get_client_full_profile(
         "source": "telegram_cached" if cached_tg else "crm_only",
     }
 
-    total_messages = sum(int(d.get("msg_count") or 0) for d in client_dialogs)
-    in_messages = sum(int(d.get("in_count") or 0) for d in client_dialogs)
-    out_messages = sum(int(d.get("out_count") or 0) for d in client_dialogs)
+    total_messages = sum(int(d.get("msg_count") or 0) for d in client_dialogs) + extra_in + extra_out
+    in_messages = sum(int(d.get("in_count") or 0) for d in client_dialogs) + extra_in
+    out_messages = sum(int(d.get("out_count") or 0) for d in client_dialogs) + extra_out
     msg_dates = [str(m.get("sent_at") or "") for m in recent_messages if m.get("sent_at")]
     if dlg_ids:
         ph_ids = ",".join("?" for _ in dlg_ids)
         agg_row = conn.execute(
-            f"SELECT MIN(sent_at) AS min_at, MAX(sent_at) AS max_at FROM messages WHERE dialog_id IN ({ph_ids})",
+            f"SELECT MIN(REPLACE(COALESCE(sent_at, ''), ' ', 'T')) AS min_at, MAX(REPLACE(COALESCE(sent_at, ''), ' ', 'T')) AS max_at FROM messages WHERE dialog_id IN ({ph_ids})",
             dlg_ids,
         ).fetchone()
         if agg_row is not None:
@@ -2301,8 +2370,8 @@ def get_client_full_profile(
             "in_messages": in_messages,
             "out_messages": out_messages,
             "campaigns_count": len(outreach_rows),
-            "first_contact_at": min(msg_dates) if msg_dates else None,
-            "last_contact_at": max(msg_dates) if msg_dates else None,
+            "first_contact_at": min(msg_dates, key=_norm_ts) if msg_dates else None,
+            "last_contact_at": max(msg_dates, key=_norm_ts) if msg_dates else None,
         },
     }
 
