@@ -286,7 +286,7 @@ const {{ chromium }} = require('playwright');
     }});
   }});
 
-  // 1. Real CRM cookie authentication (no e2e-not-a-secret bypass)
+  // 1. Real CRM cookie authentication (no synthetic BOT_TOKEN bypass)
   const unauth = await page.request.get('{base_url}/api/accounts');
   if (unauth.status() !== 401) {{
     throw new Error(`Expected 401 before login, got ${{unauth.status()}}`);

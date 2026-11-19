@@ -702,6 +702,211 @@ if (root / "app" / "inbox.py").is_file():
         if not hk_path.is_file() or not _os.access(hk_path, _os.X_OK):
             errors.append(f"Gate M violation: githooks/{hk} must exist and be executable")
 
+# Gate N: Inbox, Filters & Stable Workspace Counters
+if idx_path.is_file() and js_path.is_file():
+    if 'data-chip="groups"' in idx_html:
+        errors.append("Gate N violation in app/templates/index.html: dead filter data-chip=\"groups\" must stay removed")
+    if 'id="chip-note"' not in idx_html or 'id="stat-dialogs"' not in idx_html:
+        errors.append("Gate N violation in app/templates/index.html: missing #chip-note or #stat-dialogs")
+    js_src_n = js_path.read_text(encoding="utf-8")
+    m_chip = re.search(r"function syncChipNote\([\s\S]*?(?=\nfunction |\ndocument\.querySelector)", js_src_n)
+    if not m_chip or "#chip-note" not in m_chip.group(0):
+        errors.append("Gate N violation in app/static/app.js: syncChipNote() must gate #chip-note")
+    m_uws = re.search(r"function updateWorkspaceStats\([\s\S]*?(?=\nfunction )", js_src_n)
+    if (
+        not m_uws
+        or "#stat-dialogs" not in m_uws.group(0)
+        or "state.workspaceTotalDialogs" not in m_uws.group(0)
+        or re.search(r"dialogsNode\.textContent\s*=\s*String\(\s*\(?\s*state\.dialogs", m_uws.group(0))
+    ):
+        errors.append("Gate N violation in app/static/app.js: #stat-dialogs must bind to state.workspaceTotalDialogs")
+    m_qform = re.search(
+        r'document\.querySelector\("#search-form"\)\.addEventListener\("submit"[\s\S]*?(?=\ndocument\.querySelector\("\.chips"\))',
+        js_src_n,
+    )
+    if not m_qform or "loadLeads(" in m_qform.group(0) or "loadInbox(" not in m_qform.group(0):
+        errors.append("Gate N violation in app/static/app.js: #search-form submit must query loadInbox(), never loadLeads()")
+
+# Gate O: Leads & Airtable Zero-Clobber / Zero-Diff-Loop Invariant
+at_file = root / "app" / "airtable_sync.py"
+if at_file.is_file():
+    at_src = at_file.read_text(encoding="utf-8")
+    at_tree = ast.parse(at_src, filename=str(at_file))
+    pull_fn = next((n for n in at_tree.body if isinstance(n, ast.FunctionDef) and n.name == "pull_from_airtable"), None)
+    if pull_fn is None:
+        errors.append("Gate O violation in app/airtable_sync.py: missing pull_from_airtable")
+    else:
+        diff_lines = []
+        update_lines = []
+        event_lines = []
+        preserve_lines = []
+        for node in ast.walk(pull_fn):
+            if isinstance(node, ast.Call):
+                fn_id = node.func.id if isinstance(node.func, ast.Name) else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
+                if fn_id == "_compute_effective_lead_patch":
+                    diff_lines.append(node.lineno)
+                elif fn_id == "update_lead":
+                    update_lines.append(node.lineno)
+                elif fn_id == "_should_preserve_local_lead_source":
+                    preserve_lines.append(node.lineno)
+                elif fn_id == "record_lead_event" and any(isinstance(a, ast.Constant) and a.value == "airtable_synced" for a in node.args):
+                    event_lines.append(node.lineno)
+        if not diff_lines or not preserve_lines or (update_lines and min(diff_lines) >= min(update_lines)) or (event_lines and min(diff_lines) >= min(event_lines)):
+            errors.append(
+                "Gate O violation in app/airtable_sync.py: pull_from_airtable must compute _compute_effective_lead_patch & _should_preserve_local_lead_source before update_lead / airtable_synced"
+            )
+
+# Gate P: Leadgen Per-Campaign Starvation & UI Health Strip
+hyg_file = root / "app" / "hygiene.py"
+if idx_path.is_file() and js_path.is_file() and hyg_file.is_file() and main_py_file.is_file():
+    hyg_src = hyg_file.read_text(encoding="utf-8")
+    if "def _audit_per_campaign_leadgen_status(" not in hyg_src or "def inspect_leadgen_run_anomalies(" not in hyg_src:
+        errors.append("Gate P violation in app/hygiene.py: missing per-campaign starvation or run anomaly helpers")
+    m_rd = re.search(r"def audit_server_leadgen_readiness\([\s\S]*?(?=\ndef\s)", hyg_src)
+    if not m_rd or not all(k in m_rd.group(0) for k in ("campaigns", "campaigns_starved", "starvation_alert", "tg_bridged_zero_streak")):
+        errors.append("Gate P violation in app/hygiene.py: audit_server_leadgen_readiness must expose per-campaign starvation telemetry")
+    main_src_p = main_py_file.read_text(encoding="utf-8")
+    for req_p in (
+        "leadgen_campaigns",
+        "campaigns_starved",
+        "leadgen_starvation_alert",
+        "tg_bridged_zero_streak",
+        '"/api/leadgen/health-summary"',
+        '"/api/leadgen/direct-x-leads"',
+    ):
+        if req_p not in main_src_p:
+            errors.append(f"Gate P violation in app/main.py: missing {req_p}")
+    if 'id="leadgen-health-strip"' not in idx_html:
+        errors.append('Gate P violation in app/templates/index.html: missing id="leadgen-health-strip"')
+    if "#leadgen-health-strip" not in js_path.read_text(encoding="utf-8"):
+        errors.append("Gate P violation in app/static/app.js: missing #leadgen-health-strip wiring")
+
+# Gate Q: Session Safety, Lease Guard Order & Systemd Graceful Shutdown
+tg_gw_file_q = root / "app" / "telegram_gateway.py"
+if main_py_file.is_file() and tg_gw_file_q.is_file():
+    main_src_q = main_py_file.read_text(encoding="utf-8")
+    main_tree_q = ast.parse(main_src_q, filename=str(main_py_file))
+    top_fns_q = {
+        n.name: n
+        for n in main_tree_q.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for gw_fn_name in ("_gateway", "_resolve_app_gateway"):
+        fn_node = top_fns_q.get(gw_fn_name)
+        if fn_node is None:
+            errors.append(f"Gate Q violation in app/main.py: missing {gw_fn_name}")
+            continue
+        lease_lines = [n.lineno for n in ast.walk(fn_node) if isinstance(n, ast.Constant) and n.value == "tg_lease_ready"]
+        gw_attr_lines = [
+            n.lineno
+            for n in ast.walk(fn_node)
+            if isinstance(n, ast.Attribute)
+            and n.attr == "gateway"
+            and isinstance(n.ctx, ast.Load)
+        ]
+        if not lease_lines or not gw_attr_lines or min(lease_lines) >= min(gw_attr_lines):
+            errors.append(f"Gate Q violation in app/main.py:{gw_fn_name}: must check tg_lease_ready before returning app.state.gateway")
+
+    hb_fn = top_fns_q.get("_tg_lease_heartbeat_loop")
+    if hb_fn is None:
+        errors.append("Gate Q violation in app/main.py: missing _tg_lease_heartbeat_loop")
+    else:
+        stop_watch_lines = [
+            n.lineno
+            for n in ast.walk(hb_fn)
+            if isinstance(n, ast.Call)
+            and ((isinstance(n.func, ast.Name) and n.func.id == "stop_inbox_watches") or (isinstance(n.func, ast.Attribute) and n.func.attr == "stop_inbox_watches"))
+        ]
+        clear_gw_lines = [
+            n.lineno
+            for n in ast.walk(hb_fn)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Attribute) and t.attr == "gateway" for t in n.targets)
+            and isinstance(n.value, ast.Constant)
+            and n.value.value is None
+        ]
+        reacq_lines = [
+            n.lineno
+            for n in ast.walk(hb_fn)
+            if isinstance(n, ast.Name) and n.id == "wait_and_acquire_tg_runtime_lease"
+        ]
+        if not stop_watch_lines or not clear_gw_lines or not reacq_lines or not (min(stop_watch_lines) < min(reacq_lines) and min(clear_gw_lines) < min(reacq_lines)):
+            errors.append("Gate Q violation in app/main.py:_tg_lease_heartbeat_loop: must stop_inbox_watches & clear gateway=None before wait_and_acquire_tg_runtime_lease")
+
+    rt_fn = top_fns_q.get("should_enable_live_tg_runtime")
+    if rt_fn is None:
+        errors.append("Gate Q violation in app/main.py: missing should_enable_live_tg_runtime")
+    else:
+        for stmt in ast.walk(rt_fn):
+            if isinstance(stmt, ast.If) and any(isinstance(c, ast.Constant) and c.value == "RENDER" for c in ast.walk(stmt.test)):
+                if any(isinstance(r, ast.Return) and isinstance(r.value, ast.Constant) and r.value.value is True for r in stmt.body):
+                    errors.append("Gate Q violation in app/main.py: RENDER env must never enable live TG runtime")
+
+    tg_src_q = tg_gw_file_q.read_text(encoding="utf-8")
+    if "_schedule_bg_disconnect" in tg_src_q:
+        errors.append("Gate Q violation in app/telegram_gateway.py: _schedule_bg_disconnect must be removed")
+    m_rp = re.search(r"def _resolve_proxy\([\s\S]*?(?=\n    def |\ndef )", tg_src_q)
+    if m_rp and re.search(r"\bacc_id\s+or\s+session_path\b", m_rp.group(0)):
+        errors.append("Gate Q violation in app/telegram_gateway.py:_resolve_proxy: forbidden 'acc_id or session_path' global fallback")
+
+svc_crmtg_q = systemd_dir / "crmtg.service"
+if svc_crmtg_q.is_file():
+    svc_text_q = svc_crmtg_q.read_text(encoding="utf-8")
+    if "uvicorn app.main:app" in svc_text_q:
+        m_gs = re.search(r"--timeout-graceful-shutdown\s+(\d+)", svc_text_q)
+        m_ts = re.search(r"^TimeoutStopSec\s*=\s*(\d+)", svc_text_q, flags=re.MULTILINE)
+        if not m_gs or not m_ts or int(m_ts.group(1)) < int(m_gs.group(1)) + 10:
+            errors.append("Gate Q violation in deploy/systemd/crmtg.service: TimeoutStopSec must be >= timeout-graceful-shutdown + 10")
+
+# Gate R: Analytics & Inbox SSOT Parity and Payload Budget
+if (root / "app" / "inbox.py").is_file() and (root / "app" / "analytics.py").is_file():
+    for mod_name in ("inbox.py", "analytics.py"):
+        msrc = (root / "app" / mod_name).read_text(encoding="utf-8")
+        if "is_waiting_our_answer" not in msrc and "sql_is_waiting_our_answer_expr" not in msrc:
+            errors.append(f"Gate R violation in app/{mod_name}: must import and use canonical is_waiting_our_answer / sql_is_waiting_our_answer_expr")
+    air_test = root / "tests" / "test_airtable_inbox_analytics_adequacy.py"
+    if not air_test.is_file() or ("60 * 1024" not in air_test.read_text(encoding="utf-8") and "61440" not in air_test.read_text(encoding="utf-8")):
+        errors.append("Gate R violation: tests/test_airtable_inbox_analytics_adequacy.py must test analytics <= 60 KB payload budget")
+
+# Gate S: Security, Deep Health Auth, Zero Hardcoded E2E Secret & Bare Except Ceiling
+forbidden_secret_marker = "e2e-" + "not-a-secret"
+for scan_dir in ("app", "leadgen", "tests", "e2e"):
+    dpath = root / scan_dir
+    if not dpath.is_dir():
+        continue
+    for fpath in sorted(dpath.rglob("*")):
+        if not fpath.is_file() or fpath.suffix not in (".py", ".ts", ".js") or "node_modules" in fpath.parts:
+            continue
+        if forbidden_secret_marker in fpath.read_text(encoding="utf-8", errors="ignore"):
+            errors.append(f"Gate S violation: forbidden hardcoded secret literal in {fpath.relative_to(root)}")
+
+sec_file_s = root / "app" / "security.py"
+if main_py_file.is_file():
+    ms_s = main_py_file.read_text(encoding="utf-8")
+    if re.search(r'\.mount\(\s*["\']/a["\']|["\']/a/["\']', ms_s):
+        errors.append("Gate S violation in app/main.py: /a/ Astryx proxy mount must remain unmounted")
+    if sec_file_s.is_file() and "is_strict_loopback_direct" not in ms_s:
+        errors.append("Gate S violation in app/main.py: api_health deep gate must enforce is_strict_loopback_direct")
+
+if sec_file_s.is_file():
+    sec_src_s = sec_file_s.read_text(encoding="utf-8")
+    if "_is_deep_health_request" not in sec_src_s or "is_strict_loopback_direct" not in sec_src_s:
+        errors.append("Gate S violation in app/security.py: /api/health?deep=1 must not bypass external auth")
+
+bare_except_ceiling = 196
+bare_except_actual = 0
+for scan_sub in ("app", "leadgen"):
+    for py_f in sorted((root / scan_sub).rglob("*.py")):
+        t_ast = ast.parse(py_f.read_text(encoding="utf-8"), filename=str(py_f))
+        for nd in ast.walk(t_ast):
+            if isinstance(nd, ast.ExceptHandler) and len(nd.body) == 1 and isinstance(nd.body[0], ast.Pass):
+                if nd.type is None or (isinstance(nd.type, ast.Name) and nd.type.id in ("Exception", "BaseException")):
+                    bare_except_actual += 1
+if bare_except_actual > bare_except_ceiling:
+    errors.append(
+        f"Gate S violation: bare except/pass count grew from {bare_except_ceiling} to {bare_except_actual}"
+    )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
@@ -731,4 +936,4 @@ fi
 
 echo "== [4/4] Proactive audit self-test & full pytest harness (zero ignored suites) =="
 PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" scripts/proactive_audit.py --self-test
-PYTHONPATH=. "$PYTHON_BIN" -m pytest -q -k "not playwright"
+PYTHONPATH=. "$PYTHON_BIN" -m pytest -q

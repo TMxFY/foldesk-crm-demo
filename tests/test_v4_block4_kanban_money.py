@@ -23,6 +23,24 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _resolve_playwright_node_path() -> str:
+    candidates = [ROOT / "e2e" / "node_modules"]
+    try:
+        common = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+        if common:
+            main_root = (ROOT / common).resolve().parent
+            candidates.append(main_root / "e2e" / "node_modules")
+    except Exception:
+        pass
+    parts = [str(p) for p in candidates if p.is_dir()]
+    if os.environ.get("NODE_PATH"):
+        parts.append(os.environ["NODE_PATH"])
+    return os.pathsep.join(parts)
+
+
 def test_lead_amount_create_and_patch(tmp_path):
     client, _ = _make_client(tmp_path)
 
@@ -237,14 +255,15 @@ def test_kanban_drag_drop_sums_and_stages_playwright_e2e(tmp_path):
         assert ready, "E2E server did not start in time"
 
         js_script = f"""
+const fs = require("fs");
 const {{ chromium }} = require("playwright");
 
 (async () => {{
   const baseURL = "http://127.0.0.1:{port}";
-  const browser = await chromium.launch({{
-    executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    headless: true,
-  }});
+  const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  const launchOpts = {{ headless: true }};
+  if (fs.existsSync(chromePath)) launchOpts.executablePath = chromePath;
+  const browser = await chromium.launch(launchOpts);
   const context = await browser.newContext({{ viewport: {{ width: 1440, height: 900 }} }});
   const page = await context.newPage();
 
@@ -349,9 +368,14 @@ const {{ chromium }} = require("playwright");
   await browser.close();
 }})();
 """
+        node_env = dict(os.environ)
+        node_path = _resolve_playwright_node_path()
+        if node_path:
+            node_env["NODE_PATH"] = node_path
         proc = subprocess.run(
             ["node", "-e", js_script],
             cwd=str(ROOT / "e2e"),
+            env=node_env,
             capture_output=True,
             text=True,
             timeout=45,

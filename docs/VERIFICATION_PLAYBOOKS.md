@@ -75,3 +75,39 @@
    - Покрывает ответы от `completed`, `failed(step>=1)`, прямых `won`-лидов (`unread > 0` в статистике без спама алертами), голосовые/медиа-превью, `t.me/` хендлы, бэкфилл тредов на активных и `frozen` сессиях и падение `githooks/pre-commit` при нарушении Gate M.
 4. **Post-Deploy Live Sync & Playbook Check**:
    - На VPS после деплоя вызывается `POST /api/inbox/sync` (`crm_only=true`), прогоняется `proactive_audit.py --db /opt/crmtg/data/crm.db --heal` + повторный read-only прогон (`exit 0`), затем живая проверка в Chrome/Playwright на `https://crm.softugc.com`.
+
+## Playbook 6: Full-System Adequacy Harness (`Gates N–S` & Expanded `proactive_audit.py`)
+Гарантирует сквозную адекватность после объединения 4 треков (`w1-sessions`, `w1-inbox-airtable`, `w1-leadgen`, `w1-astryx-ui`): стабильные счётчики, отсутствие Airtable diff-loop, видимость голодающего B2B-лидгена, 0s split-brain сессий, SSOT-паритет `<= 60 KB` и закрытый периметр безопасности.
+
+### Статические гейты (`./scripts/verify.sh` — Gates N–S + full Playwright):
+1. **Gate N (Inbox & Filters)**:
+   - `#chip-note` синхронизируется через `syncChipNote()`, мёртвый чип `data-chip="groups"` удалён из `app/templates/index.html`, `#stat-dialogs` привязан к `state.workspaceTotalDialogs`, а `#search-form` submit вызывает `loadInbox()`, никогда не `loadLeads()`.
+2. **Gate O (Leads & Airtable Zero-Clobber)**:
+   - `pull_from_airtable()` вычисляет `_compute_effective_lead_patch()` и `_should_preserve_local_lead_source()` ДО `update_lead()` / `record_lead_event("airtable_synced")` — fallback Single Select `"Cold outreach"` из Airtable никогда не затирает богатые локальные источники (`yc`, `meta_ads`, `high_yield_veins`, `tg_groups`) и не вызывает diff-loop.
+3. **Gate P (Per-Campaign Leadgen & UI Health Strip)**:
+   - `audit_server_leadgen_readiness` и `GET /api/health?deep=1` экспонируют `leadgen_campaigns`, `campaigns_starved`, `leadgen_starvation_alert`, `tg_bridged_zero_streak`, `static_dump_alert`, плюс эндпоинты `/api/leadgen/health-summary`, `/api/leadgen/direct-x-leads` и UI-блок `#leadgen-health-strip`.
+4. **Gate Q (Sessions, Lease Safety & Graceful Shutdown)**:
+   - AST проверяет, что `_gateway()` и `_resolve_app_gateway()` проверяют `tg_lease_ready` ДО возврата кэшированного `app.state.gateway`; `_tg_lease_heartbeat_loop()` сперва вызывает `stop_inbox_watches()` и сбрасывает `app.state.gateway = None` ДО `wait_and_acquire_tg_runtime_lease()`; `RENDER` никогда не включает live MTProto runtime; `_schedule_bg_disconnect` и небезопасный `acc_id or session_path` fallback удалены; `deploy/systemd/crmtg.service` задаёт `TimeoutStopSec >= timeout-graceful-shutdown + 10`.
+5. **Gate R (Analytics & SSOT Parity `<= 60 KB`)**:
+   - `app/inbox.py` и `app/analytics.py` используют канонические `is_waiting_our_answer` / `sql_is_waiting_our_answer_expr`; `tests/test_airtable_inbox_analytics_adequacy.py` проверяет бюджет ответа `/api/analytics/summary <= 60 KB`.
+6. **Gate S (Security, Deep Health Auth & Zero Bare Except Creep)**:
+   - Запрещён захардкоженный секрет-сентинел в `app/`, `leadgen/`, `tests/`, `e2e/` (используйте `CRMTG_E2E_SANDBOX=1` / `is_e2e_sandbox()` / `is_ephemeral_runtime()`).
+   - `/a/` остаётся размонтированным, внешний неавторизованный `/api/health?deep=1` блокируется (`_is_deep_health_request` + `is_strict_loopback_direct`), а число голых `except: pass` / `except Exception: pass` в `app/` + `leadgen/` не превышает зафиксированный потолок (`<= 196`).
+7. **Full Playwright Gate (`pytest -q`)**:
+   - В `./scripts/verify.sh` и `.github/workflows/deploy-vps.yml` удалён фильтр `-k "not playwright"`; прогоняются все unit и Playwright UI/E2E тесты без пропущенных сьютов.
+
+### Расширенные проверки `scripts/proactive_audit.py` (`(a)`–`(i)`):
+- `(a)` `0` дубликатов `auth_key` SHA-256 между `accounts` и `scraper_sessions/` (`SCRAPER_TG_SESSION`).
+- `(b)` Паритет `accounts.session_string` vs `.session` на диске (`--heal` запускает `reconcile_disk_sessions_with_db`).
+- `(c)` `< 500` событий `airtable_synced` за 24ч и размер таблицы `lead_events < 10 MB` (`--heal` вызывает `prune_redundant_airtable_synced_events`).
+- `(d)` Пер-кампанейный голод лидгена (`pending < 15` или `ingested_72h == 0` у активной `leadgen_enabled=1` кампании, не маскируемый OFM); отдельный прогон `--check-leadgen-starvation`.
+- `(e)` 3-кратная серия `tg_bridged_count == 0`, повтор static-дампа и краши `rc != 0` / активные `leadgen_stage_errors`.
+- `(f)` Дрейф `dialogs.last_from_peer` vs последнее направление в `messages` == `0` (`--heal` вызывает `repair_dialog_last_from_peer_drift`).
+- `(g)` SSOT-паритет `waiting` (`inbox == leads == analytics`).
+- `(h)` Размер ответа `/api/analytics/summary <= 60 KB` (локально и в `--health-url`).
+- `(i)` Живой `/api/health?deep=1`: `tg_lease_ready` не `False`, `disconnects_1h_by_account <= 10`, поддержка `--api-key` / `MCP_API_KEY`; rotating NodeMaven-прокси выдаёт `WARNING:` по умолчанию и роняет с кодом `1` только при `--strict-static-proxy`.
+
+### Ремедиация при падении:
+- Ошибки `(b)/(c)/(f)` на VPS лечатся через `python scripts/proactive_audit.py --db /opt/crmtg/data/crm.db --heal` с последующим повторным read-only аудитом (`exit 0`).
+- Голод лидгена `(d)/(e)` лечится запуском пополнения (`CRMTG_VPS_RUNTIME=1 python -m leadgen.vps_autonomous_replenish --force-direct-x`) и проверкой `/api/leadgen/health-summary`.
+- При `tg_lease_ready=False` или `disconnects_1h > 10` проверить `systemctl status crmtg` и сменить прокси на static ISP SOCKS5 (затем подтвердить `--strict-static-proxy`).

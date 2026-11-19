@@ -793,13 +793,14 @@ def test_playwright_v6_rich_inbox_voice_edit_and_miniapp(tmp_path):
         assert ready, "V6 E2E server did not start in time"
 
         pw_script = f"""
+const fs = require('fs');
 const {{ chromium }} = require('playwright');
 
 (async () => {{
-  const browser = await chromium.launch({{
-    executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    headless: true,
-  }});
+  const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  const launchOpts = {{ headless: true }};
+  if (fs.existsSync(chromePath)) launchOpts.executablePath = chromePath;
+  const browser = await chromium.launch(launchOpts);
   const context = await browser.newContext({{ viewport: {{ width: 1440, height: 900 }} }});
   const page = await context.newPage();
   const errors = [];
@@ -860,12 +861,25 @@ const {{ chromium }} = require('playwright');
 }});
 """
         node_env = dict(os.environ)
+        candidates = [root / "e2e" / "node_modules"]
+        try:
+            common = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+                text=True,
+            ).strip()
+            if common:
+                candidates.append((root / common).resolve().parent / "e2e" / "node_modules")
+        except Exception:
+            pass
         if not (root / "e2e" / "node_modules").exists():
             venv_link = root / ".venv"
             if venv_link.is_symlink():
-                main_nm = venv_link.resolve().parent / "e2e" / "node_modules"
-                if main_nm.exists():
-                    node_env["NODE_PATH"] = str(main_nm)
+                candidates.append(venv_link.resolve().parent / "e2e" / "node_modules")
+        nm_parts = [str(p) for p in candidates if p.is_dir()]
+        if node_env.get("NODE_PATH"):
+            nm_parts.append(node_env["NODE_PATH"])
+        if nm_parts:
+            node_env["NODE_PATH"] = os.pathsep.join(nm_parts)
         node_bin = shutil.which("node") or "/opt/homebrew/bin/node" or "/usr/local/bin/node"
         proc = subprocess.run(
             [node_bin, "-e", pw_script],

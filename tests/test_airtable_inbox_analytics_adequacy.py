@@ -615,7 +615,8 @@ def test_security_removes_e2e_backdoor_guards_deep_health_and_unmounts_tg_web_pr
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("CRMTG_VPS_RUNTIME", "1")
-    monkeypatch.setenv("BOT_TOKEN", "e2e-not-a-secret")
+    monkeypatch.setenv("CRMTG_E2E_SANDBOX", "1")
+    monkeypatch.setenv("BOT_TOKEN", "legacy-" + "not-a-secret")
     monkeypatch.setenv("MCP_API_KEY", "mcp-super-secret-2026")
     monkeypatch.setenv("CRM_ADMIN_PASSWORD", "StrongTimPass#2026")
     monkeypatch.setenv("CRM_VLAD_PASSWORD", "StrongVladPass#2026")
@@ -625,7 +626,7 @@ def test_security_removes_e2e_backdoor_guards_deep_health_and_unmounts_tg_web_pr
     init_db(conn)
     app = create_app(conn=conn, gateway=None)
 
-    # 1. Default TestClient (non-loopback host 'testclient'): BOT_TOKEN=e2e-not-a-secret MUST NOT bypass auth!
+    # 1. Default TestClient (non-loopback host 'testclient'): sandbox/token flags MUST NOT bypass auth!
     with TestClient(app, follow_redirects=False) as client:
         assert client.get("/api/leads").status_code == 401
         r_root = client.get("/")
@@ -711,4 +712,69 @@ def test_security_removes_e2e_backdoor_guards_deep_health_and_unmounts_tg_web_pr
             ).status_code
             == 401
         )
+    conn.close()
+
+
+def test_airtable_roundtrip_preserves_rich_local_lead_source_without_diff_loop(tmp_path: Path):
+    conn = connect(tmp_path / "at_source_preserve.db")
+    init_db(conn)
+
+    veins = [
+        ("YC App", "yc_founder", "yc"),
+        ("Meta Brand", "meta_founder", "meta_ads"),
+        ("High Yield Brand", "hyv_founder", "high_yield_veins"),
+        ("TG Group Lead", "tg_group_founder", "tg_groups"),
+    ]
+    for name, uname, src in veins:
+        create_lead(conn, name=name, username=uname, status="new", lead_source=src)
+
+    client = _FakeAirtable(leads=[])
+
+    # 1. Push + Pull roundtrip ("both"): pushes normalized "Cold outreach" to Airtable,
+    #    then pulls back "Cold outreach" -> MUST NOT clobber local rich lead_source!
+    first = sync_airtable(conn, direction="both", client=client)
+    assert first["pushed_to_airtable"] == 4
+    assert first["updated_in_crm"] == 0
+    for rec in client.tables["Leads"]:
+        assert rec["fields"]["Lead Source"] == "Cold outreach"
+
+    for _name, uname, expected_src in veins:
+        row = conn.execute(
+            "SELECT lead_source FROM leads WHERE username = ?", (uname,)
+        ).fetchone()
+        assert row["lead_source"] == expected_src
+
+    # 2. Pure pull_from_airtable(preserve_dirty=False) + another both-sync:
+    #    zero updates, zero pushes, zero extra airtable_synced events!
+    events_before = conn.execute(
+        "SELECT COUNT(*) FROM lead_events WHERE event_type = 'airtable_synced'"
+    ).fetchone()[0]
+    assert events_before == 4
+
+    pull_res = pull_from_airtable(conn, client=client, preserve_dirty=False)
+    assert pull_res["updated_in_crm"] == 0
+    second = sync_airtable(conn, direction="both", client=client)
+    assert second["pushed_to_airtable"] == 0
+    assert second["updated_in_crm"] == 0
+
+    events_after = conn.execute(
+        "SELECT COUNT(*) FROM lead_events WHERE event_type = 'airtable_synced'"
+    ).fetchone()[0]
+    assert events_after == 4
+
+    for _name, uname, expected_src in veins:
+        row = conn.execute(
+            "SELECT lead_source FROM leads WHERE username = ?", (uname,)
+        ).fetchone()
+        assert row["lead_source"] == expected_src
+
+    # 3. Explicit human recategorization in Airtable to an allowlisted non-'Cold outreach' option
+    #    (e.g. 'Referral') still propagates to CRM cleanly.
+    client.tables["Leads"][0]["fields"]["Lead Source"] = "Referral"
+    third = pull_from_airtable(conn, client=client, preserve_dirty=False)
+    assert third["updated_in_crm"] == 1
+    yc_row = conn.execute(
+        "SELECT lead_source FROM leads WHERE username = 'yc_founder'"
+    ).fetchone()
+    assert yc_row["lead_source"] == "Referral"
     conn.close()

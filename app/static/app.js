@@ -13894,7 +13894,7 @@ function renderLeadgenHealthStrip() {
     if (lastRun) {
       const rc = lastRun.rc ?? lastRun.returncode ?? lastRun.exit_code ?? 0;
       const stageErrs = Number(lastRun.stage_error_count ?? 0);
-      const runTime = lastRun.finished_at || lastRun.started_at || lastRun.updated_at || "";
+      const runTime = lastRun.finished_at || lastRun.started_at || lastRun.updated_at || lastRun.timestamp || "";
       const timeSuffix = runTime ? ` · ${formatShortTime(runTime)}` : "";
       if (Number(rc) !== 0 || stageErrs > 0) {
         runBadge.className = "badge b-bad";
@@ -13981,19 +13981,20 @@ function downloadBlobFile(filename, content, mimeType) {
 }
 
 function exportDirectXLeadsCsv(items) {
-  const cols = ["company", "name", "x_handle", "x_url", "website", "niche", "source", "reason"];
+  const cols = ["company", "name", "email", "x_handle", "x_url", "website", "niche", "source", "reason"];
   const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const lines = [cols.join(",")];
   (items || []).forEach((it) => {
     lines.push([
       it.company || it.product || "",
       it.name || it.founder || "",
+      it.email || it.work_email || "",
       it.x_handle || it.twitter || it.handle || "",
       it.x_url || it.twitter_url || "",
       it.website || it.url || "",
       it.niche || it.category || "",
       it.source || it.lead_source || "direct_x",
-      it.reason || it.hook || "",
+      it.reason || it.hook || it.their_angle || "",
     ].map(esc).join(","));
   });
   downloadBlobFile("direct_x_leads.csv", lines.join("\n"), "text/csv;charset=utf-8");
@@ -14015,6 +14016,7 @@ function renderDirectXLeadsDrawerBody(items) {
       const handleRaw = String(it.x_handle || it.twitter || it.handle || "").trim().replace(/^@+/, "");
       const xHref = it.x_url || it.twitter_url || (handleRaw ? `https://x.com/${encodeURIComponent(handleRaw)}` : "");
       const siteHref = it.website || it.url || "";
+      const emailAddr = String(it.email || it.work_email || "").trim();
       const links = [];
       if (xHref) {
         links.push(el("a", { href: safeHref(xHref) || xHref, target: "_blank", rel: "noreferrer noopener" }, [handleRaw ? `X: @${handleRaw} ↗` : "Профиль X ↗"]));
@@ -14022,13 +14024,17 @@ function renderDirectXLeadsDrawerBody(items) {
       if (siteHref) {
         links.push(el("a", { href: safeHref(siteHref) || siteHref, target: "_blank", rel: "noreferrer noopener" }, ["Сайт ↗"]));
       }
+      if (emailAddr) {
+        links.push(el("a", { href: `mailto:${emailAddr}` }, [emailAddr]));
+      }
+      const noteText = it.hook || it.reason || it.their_angle || "";
       return el("article", { className: "direct-x-lead-card" }, [
         el("div", { className: "direct-x-lead-head" }, [
           el("strong", {}, [title]),
-          el("span", { className: "badge b-new" }, [it.niche || it.category || it.source || "Direct X"]),
+          el("span", { className: "badge b-new" }, [it.niche || it.category || it.source || it.lead_source || "Direct X"]),
         ]),
         it.name && it.name !== title ? el("div", { className: "hint" }, [`Контакт: ${it.name}`]) : null,
-        it.hook || it.reason ? el("p", { className: "hint" }, [it.hook || it.reason]) : null,
+        noteText ? el("p", { className: "hint" }, [noteText]) : null,
         links.length ? el("div", { className: "direct-x-lead-links" }, links) : null,
       ].filter(Boolean));
     }),

@@ -1307,7 +1307,7 @@ def enrich_lead_contacts(
 
 
 def _stdlib_load_dotenv(env_path: Path) -> None:
-    if os.getenv("BOT_TOKEN") == "e2e-not-a-secret":
+    if (os.getenv("CRMTG_E2E_SANDBOX") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return
     if (os.getenv("CRMTG_SKIP_DOTENV") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return

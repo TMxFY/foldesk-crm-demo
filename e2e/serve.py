@@ -7,8 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Fake operator bot & disabled cloud/tg watchers must be set before importing app.main.
-os.environ["BOT_TOKEN"] = "e2e-not-a-secret"
+# Explicit E2E sandbox flags & disabled cloud/tg watchers must be set before importing app.main.
+os.environ["CRMTG_E2E_SANDBOX"] = "1"
+os.environ["CRMTG_EPHEMERAL_RUNTIME"] = "1"
+os.environ["CRMTG_SKIP_DOTENV"] = "1"
+os.environ.setdefault("CRM_VIEW_MODE", "all")
+os.environ["BOT_TOKEN"] = ""
 os.environ["BOT_CHAT_ID"] = "900001"
 os.environ["CLOUD_BACKUP_ENABLED"] = "0"
 os.environ["DISABLE_TG_WATCHES"] = "1"
@@ -215,8 +219,9 @@ def build():
     init_db(conn)
     gateway = E2EGateway()
     wa_gateway = E2EWhatsAppGateway(db_path=DB_PATH)
-    # Fake operator bot. Real BOT_TOKEN from the parent shell must not be used.
-    os.environ["BOT_TOKEN"] = "e2e-not-a-secret"
+    # Isolated sandbox operator bot. Real BOT_TOKEN from the parent shell must not be used.
+    os.environ["CRMTG_E2E_SANDBOX"] = "1"
+    os.environ["BOT_TOKEN"] = ""
     os.environ["BOT_CHAT_ID"] = "900001"
     app = create_app(conn=conn, gateway=gateway, wa_gateway=wa_gateway)
     app.state.digest_opener = digest_box
@@ -224,6 +229,8 @@ def build():
     @app.post("/api/test/reset")
     async def reset():
         await stop_inbox_watches(app)
+        app.state.gateway = gateway
+        app.state.wa_gateway = wa_gateway
         with gateway._lock:
             gateway._listeners.clear()
             gateway._backlog.clear()

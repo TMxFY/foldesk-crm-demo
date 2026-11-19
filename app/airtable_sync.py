@@ -522,6 +522,18 @@ def normalize_lead_source_for_airtable(raw_source: str | None) -> str:
     return _LEAD_SOURCE_BY_LOWER.get(cleaned.lower(), "Cold outreach")
 
 
+def _should_preserve_local_lead_source(
+    existing_source: str | None,
+    pulled_source: str | None,
+) -> bool:
+    """Keep rich non-allowlisted local lead_source when Airtable returns its normalized 'Cold outreach' fallback."""
+    existing_clean = str(existing_source or "").strip()
+    if not existing_clean or existing_clean.lower() in _LEAD_SOURCE_BY_LOWER:
+        return False
+    pulled_clean = str(pulled_source or "").strip()
+    return not pulled_clean or pulled_clean.lower() == "cold outreach"
+
+
 def map_airtable_record_to_lead_fields(
     record: dict[str, Any],
     conn: sqlite3.Connection | None = None,
@@ -1091,6 +1103,10 @@ def pull_from_airtable(
                 "lead_source",
                 "note",
             ):
+                if key == "lead_source" and _should_preserve_local_lead_source(
+                    existing.get("lead_source"), mapped.get("lead_source")
+                ):
+                    continue
                 if mapped.get(key) is not None:
                     patch[key] = mapped[key]
             from app.digest import is_bot_or_service_telegram_username

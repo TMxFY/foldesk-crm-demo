@@ -520,10 +520,12 @@ def build_digest(rows: list) -> tuple[str, dict | None]:
 
 
 def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = False) -> tuple[str, str]:
+    from app.runtime_config import is_e2e_sandbox
+
+    if is_e2e_sandbox():
+        return "", ""
     token = (os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.environ.get("BOT_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
-    if token == "e2e-not-a-secret":
-        return "", ""
     if (not token or not chat_id) and conn is not None:
         try:
             with locked_conn(conn):
@@ -538,8 +540,6 @@ def resolve_colleague_bot_credentials(conn=None, *, default_chat_id: bool = Fals
                 chat_id = str(rows.get("bot_chat_id") or "").strip()
         except Exception:
             pass
-    if token == "e2e-not-a-secret":
-        return "", ""
     return token, chat_id
 
 

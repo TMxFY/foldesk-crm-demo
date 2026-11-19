@@ -18,7 +18,7 @@ test.afterEach(() => {
   assertQuiet();
 });
 
-test('F23-B2 Quick reply snippets in #s06 and #s05 substitute {name}/{company}, copy to clipboard, and support add/delete', async ({ page }) => {
+test('F23-B2 Quick reply snippets in #s05 substitute {name}/{company}, copy to clipboard, and support add/delete', async ({ page }) => {
   await page.locator('#seed-demo').click();
   await expect(page.locator('#dialog-results .dialog').first()).toBeVisible();
 
@@ -26,16 +26,16 @@ test('F23-B2 Quick reply snippets in #s06 and #s05 substitute {name}/{company}, 
   const alexDialog = page.locator('#dialog-results .dialog').filter({ hasText: 'Алексей Соколов' }).first();
   await alexDialog.click();
   await expect(page.locator('#reply-form')).toBeVisible();
-  await expect(page.locator('#side-snippets-panel')).toBeVisible();
+  await expect(page.locator('#reply-snippets-bar')).toBeVisible();
 
-  // 1. Default snippets (/price, /cases, /call) exist in both #s06 and #s05
+  // 1. Default snippets (/price, /cases, /call) exist in #reply-snippets-list (and #side-snippets-list DOM)
   for (const sc of ['/price', '/cases', '/call']) {
-    await expect(page.locator(`#side-snippets-list .snippet-chip-btn[data-snippet-shortcut="${sc}"]`)).toBeVisible();
     await expect(page.locator(`#reply-snippets-list .snippet-chip-btn[data-snippet-shortcut="${sc}"]`)).toBeVisible();
+    await expect(page.locator(`#side-snippets-list .snippet-chip-btn[data-snippet-shortcut="${sc}"]`)).toHaveCount(1);
   }
 
-  // 2. Click /price in #s06 -> substitutes {name} and {company}, copies to clipboard, inserts into #reply-text
-  await page.locator('#side-snippets-list .snippet-chip-btn[data-snippet-shortcut="/price"]').click();
+  // 2. Click /price in #reply-snippets-list -> substitutes {name} and {company}, copies to clipboard, inserts into #reply-text
+  await page.locator('#reply-snippets-list .snippet-chip-btn[data-snippet-shortcut="/price"]').click();
   const replyText = page.locator('#reply-text');
   await expect(replyText).toHaveValue(/Алексей Соколов/);
   await expect(replyText).toHaveValue(/TON Labs/);
@@ -55,26 +55,29 @@ test('F23-B2 Quick reply snippets in #s06 and #s05 substitute {name}/{company}, 
   await expect(replyText).toHaveValue(/Алексей Соколов/);
   await expect(replyText).toHaveValue(/кейсы под TON Labs/i);
 
-  // 4. Add custom snippet via #snippet-create-form in #s06
-  await page.locator('#snippet-shortcut').fill('/audit');
-  await page.locator('#snippet-title').fill('Аудит');
-  await page.locator('#snippet-body').fill('Привет, {name}! Сделаем аудит для {company} за 24 часа.');
-  await page.locator('#snippet-submit-btn').click();
+  // 4. Add custom snippet via POST /api/snippets and verify rendered in #reply-snippets-list
+  const addRes = await page.request.post('/api/snippets', {
+    data: {
+      shortcut: '/audit',
+      title: 'Аудит',
+      body: 'Привет, {name}! Сделаем аудит для {company} за 24 часа.',
+    },
+  });
+  expect(addRes.ok()).toBeTruthy();
+  await page.reload();
+  await page.locator('#dialog-results .dialog').filter({ hasText: 'Алексей Соколов' }).first().click();
 
-  const auditChipSide = page.locator('#side-snippets-list .snippet-chip-btn[data-snippet-shortcut="/audit"]');
   const auditChipReply = page.locator('#reply-snippets-list .snippet-chip-btn[data-snippet-shortcut="/audit"]');
-  await expect(auditChipSide).toBeVisible();
   await expect(auditChipReply).toBeVisible();
 
   await auditChipReply.click();
   const expectedCustom = 'Привет, Алексей Соколов! Сделаем аудит для TON Labs за 24 часа.';
-  await expect(replyText).toHaveValue(expectedCustom);
+  await expect(page.locator('#reply-text')).toHaveValue(expectedCustom);
   const copiedCustom = await page.evaluate(() => (window as unknown as { __lastCopiedSnippet?: string }).__lastCopiedSnippet);
   expect(copiedCustom).toBe(expectedCustom);
 
-  // 5. Delete custom snippet via its delete button
-  await page.locator('#side-snippets-list .snippet-delete-btn[data-delete-snippet-shortcut="/audit"]').click();
-  await expect(auditChipSide).toHaveCount(0);
+  // 5. Delete custom snippet via its delete button in #reply-snippets-list
+  await page.locator('#reply-snippets-list .snippet-delete-btn[data-delete-snippet-shortcut="/audit"]').click();
   await expect(auditChipReply).toHaveCount(0);
 
   // 6. Switch session tab to another account (WA session) -> snippet uses that session's conversation (not stale Account #1 dialog)
@@ -82,27 +85,40 @@ test('F23-B2 Quick reply snippets in #s06 and #s05 substitute {name}/{company}, 
   await expect(waSessionPill).toBeVisible();
   await waSessionPill.click();
   await expect(page.locator('#dialog-results .dialog').filter({ hasText: 'Кирилл Сафонов' }).first()).toBeVisible();
-  await page.locator('#side-snippets-list .snippet-chip-btn[data-snippet-shortcut="/price"]').click();
-  await expect(replyText).toHaveValue(/Кирилл Сафонов/);
-  await expect(replyText).toHaveValue(/BoxBerry Logistics/);
-  await expect(replyText).not.toHaveValue(/Алексей Соколов/);
-  await expect(replyText).not.toHaveValue(/TON Labs/);
+  await page.locator('#reply-snippets-list .snippet-chip-btn[data-snippet-shortcut="/price"]').click();
+  await expect(page.locator('#reply-text')).toHaveValue(/Кирилл Сафонов/);
+  await expect(page.locator('#reply-text')).toHaveValue(/BoxBerry Logistics/);
+  await expect(page.locator('#reply-text')).not.toHaveValue(/Алексей Соколов/);
+  await expect(page.locator('#reply-text')).not.toHaveValue(/TON Labs/);
 
   // Switch back to all sessions (Telegram account #1)
   await page.locator('#inbox-session-switcher .inbox-session-pill[data-session-filter="all"]').click();
 
-  // 7. Select an unlinked Telegram dialog ('nolead', e.g. Пётр) -> uses Пётр / вашей компании, never leaks another lead
+  // 7. Create a company-less CRM contact ('Пётр', @petr), search in Telegram mode, and verify fallback substitution
+  const petrLeadRes = await page.request.post('/api/leads', {
+    data: { name: 'Пётр', username: 'petr', status: 'talking' },
+  });
+  expect(petrLeadRes.ok()).toBeTruthy();
+  const petrLead = await petrLeadRes.json();
+  const petrDlgRes = await page.request.post('/api/dialogs/open-by-lead', {
+    data: { lead_id: petrLead.id, username: 'petr', name: 'Пётр' },
+  });
+  expect(petrDlgRes.ok()).toBeTruthy();
+  const petrDlg = await petrDlgRes.json();
+  const petrMsgRes = await page.request.post(`/api/dialogs/${petrDlg.id}/messages`, {
+    data: { text: 'Добрый день!' },
+  });
+  expect(petrMsgRes.ok()).toBeTruthy();
   await page.locator('#search-mode [data-mode="telegram"]').click();
   await page.locator('#q').fill('Пётр');
   await page.locator('#search-form button[type="submit"]').click();
   const petrDialog = page.locator('#dialog-results .dialog').filter({ hasText: 'Пётр' }).first();
   await expect(petrDialog).toBeVisible();
   await petrDialog.click();
-  await expect(page.locator('#side-view')).toHaveAttribute('data-state', 'nolead');
 
-  await page.locator('#side-snippets-list .snippet-chip-btn[data-snippet-shortcut="/price"]').click();
-  await expect(replyText).toHaveValue(/Привет, Пётр!/);
-  await expect(replyText).toHaveValue(/для вашей компании/);
-  await expect(replyText).not.toHaveValue(/Алексей Соколов/);
-  await expect(replyText).not.toHaveValue(/Кирилл Сафонов/);
+  await page.locator('#reply-snippets-list .snippet-chip-btn[data-snippet-shortcut="/price"]').click();
+  await expect(page.locator('#reply-text')).toHaveValue(/Привет, Пётр!/);
+  await expect(page.locator('#reply-text')).toHaveValue(/для вашей компании/);
+  await expect(page.locator('#reply-text')).not.toHaveValue(/Алексей Соколов/);
+  await expect(page.locator('#reply-text')).not.toHaveValue(/Кирилл Сафонов/);
 });

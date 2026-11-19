@@ -28,16 +28,26 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'e2e/package-lock.json'
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          npm ci --prefix e2e
+          ./e2e/node_modules/.bin/playwright install --with-deps chromium
 
-      - name: Run test suite & design/launch gates
+      - name: Run full test suite, proactive self-test & design/launch gates
         run: |
-          python -m pytest -q -k "not playwright"
           bash ./scripts/verify.sh --fast-checks-only
+          python scripts/proactive_audit.py --self-test
+          PYTHONPATH=. python -m pytest -q
           python .claude/skills/replica-design/contrast.py replica/design/tokens.json
           python .claude/skills/replica-launch/listing.py replica/launch/listing.json
 
@@ -96,10 +106,18 @@ jobs:
 
             systemctl restart crmtg.service
 
+            hc_auth_args=()
+            if [ -f "$APP_DIR/.env" ]; then
+              mcp_key="$(grep -E '^MCP_API_KEY=' "$APP_DIR/.env" | tail -n1 | cut -d= -f2- | tr -d '\r' | sed -e 's/^["\x27]//' -e 's/["\x27]$//' || true)"
+              if [ -n "$mcp_key" ]; then
+                hc_auth_args=(-H "Authorization: Bearer $mcp_key")
+              fi
+            fi
+
             healthy=0
             hc_json=""
             for i in $(seq 1 60); do
-              if hc_json="$(curl -fsS --max-time 3 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True and d.get("icp_hygiene_ok") is True and d.get("leadgen_ready") is True else 1)'; then
+              if hc_json="$(curl -fsS --max-time 3 "${hc_auth_args[@]}" 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True and d.get("icp_hygiene_ok") is True and d.get("leadgen_ready") is True and d.get("tg_lease_ready") is not False else 1)'; then
                 healthy=1
                 break
               fi

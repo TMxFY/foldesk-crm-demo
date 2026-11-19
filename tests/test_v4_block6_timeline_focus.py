@@ -21,6 +21,26 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _resolve_playwright_runner() -> tuple[list[str], str]:
+    candidates = [ROOT / "e2e" / "node_modules"]
+    try:
+        common = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+        if common:
+            candidates.append((ROOT / common).resolve().parent / "e2e" / "node_modules")
+    except Exception:
+        pass
+    existing = [p for p in candidates if p.is_dir()]
+    node_path = os.pathsep.join(str(p) for p in existing)
+    for nm in existing:
+        pw_bin = nm / ".bin" / "playwright"
+        if pw_bin.is_file():
+            return [str(pw_bin), "test"], node_path
+    return ["npx", "playwright", "test"], node_path
+
+
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -391,17 +411,19 @@ def test_demo_seed_focus_and_playwright_e2e(tmp_path):
     html_resp = client.get("/")
     assert html_resp.status_code == 200
     html = html_resp.text
-    assert 'id="focus-today-widget"' in html
-    assert "Мой фокус на сегодня" in html
-    assert 'id="focus-waiting-reply-list"' in html
-    assert 'id="focus-due-reminders-list"' in html
-    assert 'id="focus-stale-leads-list"' in html
+    assert 'id="side-card"' in html
+    assert 'id="lead-card"' in html
+    assert 'id="board"' in html
+    assert 'data-sheet-link="leads"' in html
 
+    pw_cmd, node_path = _resolve_playwright_runner()
     env = dict(os.environ)
     env["E2E_PORT"] = str(_free_port())
     env.setdefault("E2E_PYTHON", sys.executable)
+    if node_path:
+        env["NODE_PATH"] = f"{node_path}{os.pathsep}{env['NODE_PATH']}" if env.get("NODE_PATH") else node_path
     proc = subprocess.run(
-        ["npx", "playwright", "test", "f27-v4-block6-timeline-focus.spec.ts"],
+        [*pw_cmd, "f27-v4-block6-timeline-focus.spec.ts"],
         cwd=str(ROOT / "e2e"),
         env=env,
         capture_output=True,

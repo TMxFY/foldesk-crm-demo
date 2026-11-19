@@ -3825,8 +3825,10 @@ def _mark_cloud_persistence_dirty(conn, now_iso: str | None = None) -> None:
         (ts, ts),
     )
     conn.commit()
+    from app.runtime_config import is_ephemeral_runtime
+
     if (
-        os.environ.get("BOT_TOKEN") == "e2e-not-a-secret"
+        is_ephemeral_runtime()
         or os.environ.get("CRMTG_SKIP_GLOBAL_DB_FALLBACK") == "1"
         or os.environ.get("CLOUD_BACKUP_ENABLED", "1").strip().lower() in ("0", "false", "no", "off")
     ):

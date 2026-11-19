@@ -24,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 def _should_use_global_db_fallback(session_path: str | None = None) -> bool:
+    from app.runtime_config import is_ephemeral_runtime
+
     if os.environ.get("CRMTG_SKIP_GLOBAL_DB_FALLBACK") == "1":
         return False
-    if os.environ.get("BOT_TOKEN") == "e2e-not-a-secret":
+    if is_ephemeral_runtime():
         return False
     if not DEFAULT_DB.exists():
         return False

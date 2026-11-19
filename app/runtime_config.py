@@ -21,8 +21,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def is_e2e_sandbox() -> bool:
-    """Return True when running against the synthetic E2E sandbox token."""
-    return os.getenv("BOT_TOKEN") == "e2e-not-a-secret"
+    """Return True when running against an explicit E2E sandbox environment."""
+    return _env_flag("CRMTG_E2E_SANDBOX", False)
 
 
 def is_vps_runtime() -> bool:

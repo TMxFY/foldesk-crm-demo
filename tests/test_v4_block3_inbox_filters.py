@@ -378,10 +378,23 @@ def test_playwright_inbox_chips_and_mark_unread(tmp_path):
     import time
     from pathlib import Path
 
-    pw_module = Path("/Users/timofei/.claude/skills/gstack/node_modules/playwright")
+    root_dir = Path(__file__).resolve().parents[1]
+    pw_candidates = [
+        root_dir / "e2e" / "node_modules" / "playwright",
+        Path("/Users/timofei/.claude/skills/gstack/node_modules/playwright"),
+    ]
+    try:
+        common = subprocess.check_output(
+            ["git", "-C", str(root_dir), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+        if common:
+            pw_candidates.insert(1, (root_dir / common).resolve().parent / "e2e" / "node_modules" / "playwright")
+    except Exception:
+        pass
+    pw_module = next((p for p in pw_candidates if p.exists()), None)
     chrome_bin = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    if not shutil.which("node") or not pw_module.exists() or not chrome_bin.exists():
-        return
+    assert shutil.which("node") and pw_module is not None, "Playwright node module missing"
 
     db_path = tmp_path / "pw_block3.db"
     with socket.socket() as s:
@@ -412,12 +425,13 @@ uvicorn.run(app, host="127.0.0.1", port={port}, log_level="error")
                 time.sleep(0.1)
 
         js = f"""
+const fs = require("fs");
 const {{ chromium }} = require({str(pw_module)!r});
 (async () => {{
-  const browser = await chromium.launch({{
-    headless: true,
-    executablePath: {str(chrome_bin)!r}
-  }});
+  const chromePath = {str(chrome_bin)!r};
+  const launchOpts = {{ headless: true }};
+  if (fs.existsSync(chromePath)) launchOpts.executablePath = chromePath;
+  const browser = await chromium.launch(launchOpts);
   const page = await browser.newPage({{ viewport: {{ width: 1440, height: 900 }} }});
   page.setDefaultTimeout(5000);
   await page.goto("http://127.0.0.1:{port}/#inbox", {{ waitUntil: "domcontentloaded" }});

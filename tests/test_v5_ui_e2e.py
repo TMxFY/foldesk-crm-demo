@@ -148,7 +148,7 @@ const {{ chromium }} = require('playwright');
     }}
   }});
 
-  // Real CRM session cookie authentication (no e2e-not-a-secret bypass)
+  // Real CRM session cookie authentication (no synthetic BOT_TOKEN bypass)
   const unauthRes = await page.request.get('{base_url}/api/leads');
   if (unauthRes.status() !== 401) {{
     throw new Error(`Expected 401 without auth cookie, got ${{unauthRes.status()}}`);

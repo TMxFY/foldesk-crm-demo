@@ -315,9 +315,11 @@ def _clear_deleted_session(conn, session_path: str | None = None, phone: str | N
 
 
 def _can_mutate_session_file_on_disk(conn, abs_p: Path) -> bool:
+    from app.runtime_config import is_e2e_sandbox
+
     if os.environ.get("CRMTG_SKIP_GLOBAL_DB_FALLBACK") == "1":
         return False
-    if os.getenv("BOT_TOKEN") == "e2e-not-a-secret":
+    if is_e2e_sandbox():
         return False
     try:
         db_file = None
@@ -630,12 +632,13 @@ def compute_account_pool_summary(
 
     rows = conn.execute(
         """
-        SELECT id, health, daily_limit, sent_today, sent_date
+        SELECT id, phone, telegram_username, health, daily_limit, sent_today, sent_date, proxy_url, provider
         FROM accounts
         WHERE status = 'connected'
         ORDER BY id ASC
         """
     ).fetchall()
+    nm_configured = _is_nodemaven_configured(conn)
 
     connected_accounts = 0
     active_accounts = 0
@@ -646,11 +649,13 @@ def compute_account_pool_summary(
     cooldown_accounts = 0
     offline_accounts = 0
     dead_accounts = 0
+    rotating_proxy_accounts: list[dict] = []
 
     for raw in rows:
         row = as_dict(raw)
         acc_id = int(row["id"])
         health_norm = str(row.get("health") or "active").strip().lower()
+        provider_norm = str(row.get("provider") or "telegram").strip().lower()
         limit_val = max(0, int(row.get("daily_limit") or 20))
         sent_val = int(row.get("sent_today") or 0) if row.get("sent_date") == today else 0
         in_cd = acc_id in cooldown_ids
@@ -664,6 +669,18 @@ def compute_account_pool_summary(
             offline_accounts += 1
         if in_cd:
             cooldown_accounts += 1
+
+        if provider_norm != "whatsapp":
+            pmode = classify_proxy_mode(row.get("proxy_url"), nodemaven_configured=nm_configured)
+            if pmode == "rotating_nodemaven":
+                rotating_proxy_accounts.append(
+                    {
+                        "id": acc_id,
+                        "phone": row.get("phone"),
+                        "telegram_username": row.get("telegram_username"),
+                        "proxy_mode": pmode,
+                    }
+                )
 
         if health_norm == "active" and not in_cd:
             active_accounts += 1
@@ -681,6 +698,8 @@ def compute_account_pool_summary(
         "cooldown_accounts": cooldown_accounts,
         "offline_accounts": offline_accounts,
         "dead_accounts": dead_accounts,
+        "rotating_proxy_count": len(rotating_proxy_accounts),
+        "rotating_proxy_accounts": rotating_proxy_accounts,
     }
 
 

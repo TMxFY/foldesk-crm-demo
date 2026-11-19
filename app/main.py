@@ -1908,6 +1908,8 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             "cooldown_accounts": 0,
             "offline_accounts": 0,
             "dead_accounts": 0,
+            "rotating_proxy_count": 0,
+            "rotating_proxy_accounts": [],
         }
         running_campaigns = 0
         pending_step1_total = 0
