@@ -4,6 +4,7 @@ import argparse
 import base64
 import copy
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import logging
@@ -1104,7 +1105,99 @@ def _enforce_rule5_quarantine_on_new_recipients(
     return preview, []
 
 
+DEFAULT_REPLENISH_LOCK_PATH = Path("/run/crmtg-leadgen.lock")
+FALLBACK_REPLENISH_LOCK_PATH = Path("/tmp/crmtg-leadgen.lock")
+
+
+def _acquire_replenish_lock(lock_path: Path | None = None):
+    """Acquire non-blocking single-instance flock for leadgen replenishment.
+
+    Raises BlockingIOError if another process already holds the lock.
+    """
+    candidates = (
+        [Path(lock_path)]
+        if lock_path is not None
+        else [DEFAULT_REPLENISH_LOCK_PATH, FALLBACK_REPLENISH_LOCK_PATH]
+    )
+    for idx, cand in enumerate(candidates):
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            fh = cand.open("a+", encoding="utf-8")
+        except OSError:
+            if idx + 1 < len(candidates):
+                continue
+            return None
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh.seek(0)
+            fh.truncate(0)
+            fh.write(f"pid={os.getpid()} started_at={utc_now()}\n")
+            fh.flush()
+            return fh
+        except BlockingIOError:
+            fh.close()
+            raise
+        except OSError:
+            fh.close()
+            if idx + 1 < len(candidates):
+                continue
+            return None
+    return None
+
+
+def _release_replenish_lock(lock_fh: Any | None) -> None:
+    if lock_fh is None:
+        return
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        lock_fh.close()
+    except OSError:
+        pass
+
+
 def run_autonomous_replenish(
+    conn: sqlite3.Connection,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+    low_water_mark: int = 50,
+    vac_low_water_mark: int = 10,
+    critical_low_mark: int = 15,
+    stage_timeout: int = 300,
+    scraper_session: str | Path | None = None,
+    digest_opener: Any = None,
+    lock_path: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        lock_fh = _acquire_replenish_lock(lock_path)
+    except BlockingIOError:
+        logger.warning(
+            "Skipping run_autonomous_replenish: another instance holds single-instance flock"
+        )
+        return {
+            "ok": True,
+            "skipped": "already_running",
+            "stage_errors": [],
+            "stage_error_count": 0,
+        }
+    try:
+        return _run_autonomous_replenish_locked(
+            conn,
+            runner=runner,
+            low_water_mark=low_water_mark,
+            vac_low_water_mark=vac_low_water_mark,
+            critical_low_mark=critical_low_mark,
+            stage_timeout=stage_timeout,
+            scraper_session=scraper_session,
+            digest_opener=digest_opener,
+        )
+    finally:
+        _release_replenish_lock(lock_fh)
+
+
+def _run_autonomous_replenish_locked(
     conn: sqlite3.Connection,
     *,
     runner: Callable[..., Any] = subprocess.run,

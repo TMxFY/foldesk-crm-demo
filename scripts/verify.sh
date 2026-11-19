@@ -780,6 +780,8 @@ if idx_path.is_file() and js_path.is_file() and hyg_file.is_file() and main_py_f
         errors.append('Gate P violation in app/templates/index.html: missing id="leadgen-health-strip"')
     if "#leadgen-health-strip" not in js_path.read_text(encoding="utf-8"):
         errors.append("Gate P violation in app/static/app.js: missing #leadgen-health-strip wiring")
+    if "fcntl.flock" not in repl_src:
+        errors.append("Gate P violation in leadgen/vps_autonomous_replenish.py: missing fcntl.flock single-instance lock")
 
 # Gate Q: Session Safety, Lease Guard Order & Systemd Graceful Shutdown
 tg_gw_file_q = root / "app" / "telegram_gateway.py"

@@ -681,3 +681,45 @@ def test_discovery_rotation_and_deadline_guards(tmp_path: Path, monkeypatch: pyt
     )
     spy_posts = tg_ad_spy.fetch_public_channel_posts_http("coolchan", limit=5)
     assert spy_posts and "coolsaas.io" in spy_posts[0]
+
+
+def test_replenish_skips_when_single_instance_flock_is_held(tmp_path: Path):
+    import fcntl
+    from app.db import connect, init_db
+    from leadgen.vps_autonomous_replenish import run_autonomous_replenish
+
+    db_path = tmp_path / "crm.db"
+    conn = connect(db_path)
+    init_db(conn)
+    lock_file = tmp_path / "crmtg-leadgen.lock"
+    called: list[object] = []
+
+    def _fail_if_called(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("subprocess runner must not run when flock is already held")
+
+    try:
+        with lock_file.open("a+", encoding="utf-8") as holder:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            res = run_autonomous_replenish(
+                conn,
+                runner=_fail_if_called,
+                lock_path=lock_file,
+            )
+            assert res == {
+                "ok": True,
+                "skipped": "already_running",
+                "stage_errors": [],
+                "stage_error_count": 0,
+            }
+            assert called == []
+
+        # After releasing the lock, a subsequent invocation acquires cleanly and runs normally
+        res_after = run_autonomous_replenish(
+            conn,
+            runner=lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            lock_path=lock_file,
+        )
+        assert res_after.get("skipped") != "already_running"
+    finally:
+        conn.close()
