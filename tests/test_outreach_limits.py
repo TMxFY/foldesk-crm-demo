@@ -738,10 +738,10 @@ def test_tg_web_a_session_init_js_and_persistence(tmp_path):
         assert accs[1]["tg_web_ready"] is False
 
         js_res = client.get(f"/a/foldesk-session-init.js?account_id={acc_id_2}")
-        assert js_res.status_code == 200
+        assert js_res.status_code == 404
+        assert client.get("/a/").status_code == 404
         assert fake_key.hex() not in js_res.text
         assert fake_key_2.hex() not in js_res.text
-        assert 'localStorage.removeItem("dc" + i + "_auth_key")' in js_res.text
 
         # Calling /api/accounts/start for an already connected phone returns 400 error and prevents duplicates
         again = client.post("/api/accounts/start", json={"phone": "+905346380943"})

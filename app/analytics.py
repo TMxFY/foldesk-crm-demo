@@ -13,6 +13,7 @@ from app.db import (
     is_newer_dialog_snapshot_unbacked,
     is_recipient_contacted_outreach,
     is_vacancy_campaign_meta,
+    is_waiting_our_answer,
     normalize_status,
     utc_today,
 )
@@ -782,15 +783,19 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
             continue
 
         eligible_crm_dialog_ids.add(did)
-        is_closed = bool(matched_lead and matched_lead.get("_is_closed"))
         is_sniper_quarantined = str((matched_lead or {}).get("next_step") or "").startswith(
             "Авто-карантин Sniper ICP"
         )
         unread_cnt = int(d.get("unread_count") or 0)
+        lead_st = matched_lead.get("_norm_status") if matched_lead else None
+        lead_at_st = matched_lead.get("airtable_status") if matched_lead else None
+        has_body = bool(str(d.get("last_message_preview") or "").strip()) or bool(
+            msg_in_summary_by_dlg.get(did)
+        )
         if (
-            int(d.get("last_from_peer") or 0) == 1
+            has_body
             and not is_sniper_quarantined
-            and (not is_closed or unread_cnt > 0)
+            and is_waiting_our_answer(d.get("last_from_peer"), lead_st, lead_at_st)
         ):
             matched_rec = (
                 (rec_by_lead_id.get(int(matched_lead["id"])) if matched_lead else None)
@@ -2448,6 +2453,139 @@ def _compute_outreach_deep_breakdown(conn: sqlite3.Connection, ctx: dict | None 
     }
 
 
+def _compact_deep_item(item: dict) -> dict:
+    return {
+        "lead_id": item.get("lead_id"),
+        "dialog_id": item.get("dialog_id"),
+        "account_id": item.get("account_id"),
+        "sender_account": item.get("sender_account"),
+        "account_is_dropped": bool(item.get("account_is_dropped")),
+        "account_health": item.get("account_health") or "unknown",
+        "username": item.get("username"),
+        "name": item.get("name"),
+        "company": item.get("company") or "",
+        "reply_intent": item.get("reply_intent"),
+        "reply_intent_label": item.get("reply_intent_label"),
+        "reply_text": str(item.get("reply_text") or "")[:90],
+        "last_touch_at": item.get("last_touch_at") or "",
+        "fine_status": item.get("fine_status") or "",
+    }
+
+
+def _compact_deep_outreach_for_summary(
+    deep: dict,
+    *,
+    waiting_limit: int = 15,
+    stalled_limit: int = 10,
+    positive_limit: int = 10,
+    hooks_limit: int = 12,
+    categories_limit: int = 10,
+    niches_limit: int = 10,
+) -> dict:
+    all_waiting = deep.get("waiting_items") or []
+    all_stalled = deep.get("stalled_items") or []
+    all_positive = deep.get("positive_items") or []
+    all_hooks = deep.get("hooks_breakdown") or []
+    all_cats = deep.get("categories_breakdown") or []
+    all_niches = deep.get("niches_breakdown") or []
+    all_steps = deep.get("steps_breakdown") or []
+
+    compact_hooks = []
+    for h in all_hooks[:hooks_limit]:
+        hc = dict(h)
+        if hc.get("sample_text"):
+            hc["sample_text"] = str(hc["sample_text"])[:80]
+        compact_hooks.append(hc)
+
+    compact_steps = []
+    for st in all_steps:
+        sc = dict(st)
+        if sc.get("template_text"):
+            sc["template_text"] = str(sc["template_text"])[:100]
+        compact_steps.append(sc)
+
+    return {
+        "summary": deep.get("summary") or {},
+        "steps_breakdown": compact_steps,
+        "hooks_breakdown": compact_hooks,
+        "categories_breakdown": all_cats[:categories_limit],
+        "niches_breakdown": all_niches[:niches_limit],
+        "waiting_items": [_compact_deep_item(x) for x in all_waiting[:waiting_limit]],
+        "stalled_items": [_compact_deep_item(x) for x in all_stalled[:stalled_limit]],
+        "positive_items": [_compact_deep_item(x) for x in all_positive[:positive_limit]],
+        "waiting_items_total": len(all_waiting),
+        "stalled_items_total": len(all_stalled),
+        "positive_items_total": len(all_positive),
+        "hooks_total": len(all_hooks),
+        "categories_total": len(all_cats),
+        "niches_total": len(all_niches),
+        "drilldown_endpoint": "/api/analytics/deep-outreach",
+    }
+
+
+def get_deep_outreach_bucket(
+    conn: sqlite3.Connection,
+    *,
+    bucket: str = "waiting",
+    limit: int = 50,
+    offset: int = 0,
+    account: str | None = None,
+) -> dict:
+    _sync_running_and_all_campaign_replies(conn)
+    ctx = _load_ssot_crm_context(conn)
+    deep = _compute_outreach_deep_breakdown(conn, ctx=ctx)
+
+    clean_bucket = str(bucket or "waiting").strip().lower()
+    if clean_bucket == "all":
+        return deep
+
+    bucket_map = {
+        "waiting": "waiting_items",
+        "waiting_items": "waiting_items",
+        "stalled": "stalled_items",
+        "stalled_items": "stalled_items",
+        "positive": "positive_items",
+        "positive_items": "positive_items",
+        "hooks": "hooks_breakdown",
+        "hooks_breakdown": "hooks_breakdown",
+        "categories": "categories_breakdown",
+        "categories_breakdown": "categories_breakdown",
+        "niches": "niches_breakdown",
+        "niches_breakdown": "niches_breakdown",
+        "steps": "steps_breakdown",
+        "steps_breakdown": "steps_breakdown",
+    }
+    key = bucket_map.get(clean_bucket)
+    if key is None:
+        raise ValueError(
+            "bucket должен быть одним из: waiting, stalled, positive, hooks, categories, niches, steps, all"
+        )
+
+    rows = list(deep.get(key) or [])
+    clean_acc = str(account or "").strip().lower()
+    if clean_acc and key in ("waiting_items", "stalled_items", "positive_items"):
+        clean_acc_no_at = clean_acc.lstrip("@")
+        rows = [
+            r
+            for r in rows
+            if str(r.get("sender_account") or "").strip().lower().lstrip("@") == clean_acc_no_at
+        ]
+
+    safe_limit = max(1, min(500, int(limit or 50)))
+    safe_offset = max(0, int(offset or 0))
+    total = len(rows)
+    page = rows[safe_offset : safe_offset + safe_limit]
+    return {
+        "bucket": clean_bucket,
+        "total": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "has_more": (safe_offset + len(page)) < total,
+        "items": page,
+        "summary": deep.get("summary") or {},
+    }
+
+
 def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict:
     clean_period = str(period or "30d").strip().lower()
     if clean_period not in VALID_PERIODS:
@@ -2464,7 +2602,8 @@ def get_analytics_summary(conn: sqlite3.Connection, period: str = "30d") -> dict
         accounts_analytics=accounts,
         ctx=ctx,
     )
-    deep_outreach = _compute_outreach_deep_breakdown(conn, ctx=ctx)
+    deep_outreach_full = _compute_outreach_deep_breakdown(conn, ctx=ctx)
+    deep_outreach = _compact_deep_outreach_for_summary(deep_outreach_full)
 
     return {
         "period": clean_period,

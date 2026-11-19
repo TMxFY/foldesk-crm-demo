@@ -476,7 +476,6 @@ def test_importing_app_main_has_no_eager_create_app_side_effects(tmp_path):
         if k != "PYTEST_CURRENT_TEST"
     }
     env["PYTHONPATH"] = worktree_root
-    env["BOT_TOKEN"] = "e2e-not-a-secret"
     env["DISABLE_TG_WATCHES"] = "1"
     tmp_db = tmp_path / "eager_check.db"
     code = (

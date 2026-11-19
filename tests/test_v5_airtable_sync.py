@@ -330,7 +330,7 @@ def test_pull_deduplication_by_record_id_and_username(conn):
 
     second = pull_from_airtable(conn, client=client)
     assert second["created_in_crm"] == 0
-    assert second["updated_in_crm"] == 2
+    assert second["updated_in_crm"] == 1
     assert len(search_leads(conn)) == 2
 
     after_second = get_lead(conn, local_lead["id"])

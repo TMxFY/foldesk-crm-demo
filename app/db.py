@@ -796,6 +796,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate(conn)
+    has_msgs = conn.execute("SELECT 1 FROM messages LIMIT 1").fetchone()
+    if has_msgs is not None:
+        from app.inbox import repair_dialog_last_from_peer_drift
+
+        repair_dialog_last_from_peer_drift(conn, commit=True)
 
 
 def _migrate_legacy_leads_status_check(conn: sqlite3.Connection) -> None:
@@ -2692,4 +2697,59 @@ def is_newer_dialog_snapshot_unbacked(
     return True
 
 
+CLOSED_WAITING_STATUSES = frozenset(
+    {
+        "lost",
+        "won",
+        "on_hold",
+        "archived",
+        "cancelled",
+        "canceled",
+        "signed",
+        "closed",
+        "done",
+        "rejected",
+    }
+)
+
+
+def is_waiting_our_answer(
+    last_from_peer: Any,
+    lead_status: Any = None,
+    airtable_status: Any = None,
+) -> bool:
+    """Canonical SSOT predicate: dialog/lead needs our reply.
+
+    Returns True iff last_from_peer == 1 AND lead_status is not in
+    ('lost', 'won', 'on_hold', 'archived') (including Airtable aliases).
+    """
+    try:
+        lfp = int(last_from_peer or 0)
+    except (TypeError, ValueError):
+        lfp = 1 if bool(last_from_peer) else 0
+    if lfp != 1:
+        return False
+    for raw in (lead_status, airtable_status):
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low in CLOSED_WAITING_STATUSES:
+            return False
+        norm = normalize_status(s).strip().lower()
+        if norm in CLOSED_WAITING_STATUSES:
+            return False
+    return True
+
+
+def sql_is_waiting_our_answer_expr(
+    last_from_peer_col: str = "d.last_from_peer",
+    lead_status_col: str = "l.status",
+) -> str:
+    """Canonical SQL boolean expression matching is_waiting_our_answer()."""
+    closed_sql = ", ".join(f"'{st}'" for st in sorted(CLOSED_WAITING_STATUSES))
+    return (
+        f"(COALESCE({last_from_peer_col}, 0) = 1 "
+        f"AND lower(trim(COALESCE({lead_status_col}, ''))) NOT IN ({closed_sql}))"
+    )
 

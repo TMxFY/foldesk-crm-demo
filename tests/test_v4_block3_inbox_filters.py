@@ -347,14 +347,14 @@ def test_status_filter_matches_phone_and_at_username_and_large_inbox_over_60(tmp
         new_rows = client.get("/api/inbox", params={"account_id": 0, "status": "new"}).json()
         assert [d["id"] for d in new_rows] == [at_user_dialog]
 
-        # Unfiltered inbox caps at 60, but counts reflect all 71 dialogs
+        # Unfiltered inbox caps at 60, but counts reflect all 71 dialogs (lost phone_only excluded from SSOT waiting)
         unfiltered = client.get("/api/inbox", params={"account_id": 0, "with_counts": 1}).json()
         assert len(unfiltered["dialogs"]) == 60
-        assert unfiltered["counts"]["waiting"] == 2 + 1 + 65  # d1, d3 + phone_only + 65 bulk
+        assert unfiltered["counts"]["waiting"] == 2 + 65  # d1, d3 + 65 bulk (phone_only is status='lost')
 
-        # Explicit chip filter returns all 68 waiting dialogs (not truncated to 60 or 30)
+        # Explicit chip filter returns all 67 active waiting dialogs (not truncated to 60 or 30)
         all_waiting = client.get("/api/inbox", params={"account_id": 0, "chip": "waiting"}).json()
-        assert len(all_waiting) == 68
+        assert len(all_waiting) == 67
         assert tail_dialog_id in {d["id"] for d in all_waiting}
 
         # Combined status + provider + q finds tail dialog beyond 60

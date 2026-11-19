@@ -231,7 +231,16 @@ def test_deep_health_and_startup_and_autopilot_heal_real_crm_hygiene(
     )
     conn.commit()
 
-    with TestClient(app) as client:
+    class _LoopbackApp:
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                scope = dict(scope, client=("127.0.0.1", 50000))
+            await self._inner(scope, receive, send)
+
+    with TestClient(_LoopbackApp(app)) as client:
         broken_resp = client.get("/api/health?deep=1")
         assert broken_resp.status_code == 200
         broken = broken_resp.json()
@@ -360,7 +369,16 @@ def test_direct_x_contract_roundtrip_between_replenish_hygiene_and_mcp(
         fh.write("{corrupted-json-line\n")
 
     app = create_app(conn=conn)
-    with TestClient(app) as client:
+    class _LoopbackProxyApp:
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                scope = dict(scope, client=("127.0.0.1", 50000))
+            await self._inner(scope, receive, send)
+
+    with TestClient(_LoopbackProxyApp(app)) as client:
         unauth = client.get("/api/leadgen/direct-leads")
         assert unauth.status_code == 401
 
@@ -482,7 +500,16 @@ def test_proactive_audit_health_url_cli_exits_1_on_hollow_pipe_and_0_when_health
     init_db(conn)
     app = create_app(conn=conn)
 
-    with TestClient(app) as client:
+    class _LoopbackProxyApp:
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                scope = dict(scope, client=("127.0.0.1", 50000))
+            await self._inner(scope, receive, send)
+
+    with TestClient(_LoopbackProxyApp(app)) as client:
 
         class _ProxyToAppHandler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
