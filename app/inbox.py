@@ -848,6 +848,7 @@ def stop_outreach_on_reply(
                 (primary_lid, int(account_id), int(clean_peer_id)),
             )
 
+        backfill_dlg_id = int(dlg_row["id"]) if dlg_row is not None else None
         ph = ",".join("?" for _ in matched_lead_ids)
         open_at_guard = "lower(coalesce(airtable_status, '')) NOT IN ('signed', 'cancelled', 'closed won', 'closed lost')"
         conn.execute(
@@ -862,10 +863,11 @@ def stop_outreach_on_reply(
                     THEN COALESCE(next_step, 'Клиент ответил — цепочка остановлена, ответьте вручную')
                     ELSE next_step
                 END,
+                dialog_id = COALESCE(dialog_id, ?),
                 updated_at = ?
             WHERE id IN ({ph})
             """,
-            [now, *sorted(matched_lead_ids)],
+            [backfill_dlg_id, now, *sorted(matched_lead_ids)],
         )
 
         latest_out_row_id = 0

@@ -910,3 +910,68 @@ def test_analytics_excludes_legacy_vacancy_dialog_for_waiting_parity(tmp_path: P
     assert summary["deep_outreach"]["summary"]["waiting_our_answer"] == 1
     assert len(json.dumps(summary, ensure_ascii=False).encode("utf-8")) <= 60 * 1024
     conn.close()
+
+
+def test_lead_dialog_link_desync_parity_and_heal_repair(tmp_path: Path):
+    from app.leads import search_leads
+    from scripts.proactive_audit import _audit_ssot_statistics, _heal_lead_dialog_links
+
+    conn = connect(tmp_path / "link_desync.db")
+    init_db(conn)
+    now = utc_now()
+    acc_id = int(
+        conn.execute(
+            "INSERT INTO accounts (phone, session_path, status, health, telegram_user_id, telegram_username, created_at, updated_at) "
+            "VALUES ('+79005550099', 's99.session', 'connected', 'active', 1099, 'sender_acc99', ?, ?)",
+            (now, now),
+        ).lastrowid
+    )
+    b2b_camp = int(
+        conn.execute(
+            "INSERT INTO campaigns (name, account_id, account_ids_json, status, created_at, updated_at) "
+            "VALUES ('SoftUGC B2B', ?, ?, 'running', ?, ?)",
+            (acc_id, f"[{acc_id}]", now, now),
+        ).lastrowid
+    )
+
+    lead_id = int(
+        create_lead(
+            conn,
+            name="Dmitry Bondarev",
+            username="dmitrybondarev",
+            telegram_user_id=173774,
+            status="talking",
+            account_id=acc_id,
+        )["id"]
+    )
+    dlg_id = int(
+        conn.execute(
+            "INSERT INTO dialogs (account_id, peer_type, peer_id, username, title, is_group, last_message_at, last_message_preview, last_from_peer, lead_id, created_at, updated_at) "
+            "VALUES (?, 'user', 173774, 'DmitryBondarev', 'Dmitry Bondarev', 0, '2026-11-19T12:53:18', 'Привет, жду детали', 1, ?, ?, ?)",
+            (acc_id, lead_id, now, now),
+        ).lastrowid
+    )
+    conn.execute(
+        "INSERT INTO campaign_recipients (campaign_id, lead_id, telegram_user_id, username, status, current_step, sent_account_id, last_sent_at, created_at, updated_at) "
+        "VALUES (?, ?, 173774, 'DmitryBondarev', 'replied', 1, ?, '2026-11-18T10:00:00', ?, ?)",
+        (b2b_camp, lead_id, acc_id, now, now),
+    )
+    # Intentionally leave leads.dialog_id NULL to simulate historical one-way dialog linking
+    conn.execute("UPDATE leads SET dialog_id = NULL WHERE id = ?", (lead_id,))
+    conn.commit()
+
+    leads = search_leads(conn)
+    assert len(leads) == 1
+    assert leads[0]["dialog_id"] == dlg_id
+
+    stats_audit = _audit_ssot_statistics(conn)
+    assert stats_audit["ok"] is True, stats_audit
+    assert stats_audit["waiting_parity"]["inbox_linked_leads"] == 1
+    assert stats_audit["waiting_parity"]["leads_crm_linked"] == 1
+
+    repaired = _heal_lead_dialog_links(conn)
+    assert repaired == {"repaired": 1, "lead_ids": [lead_id]}
+    row = conn.execute("SELECT dialog_id FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    assert row is not None and int(row["dialog_id"]) == dlg_id
+    conn.close()
+

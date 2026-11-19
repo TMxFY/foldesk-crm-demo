@@ -887,6 +887,40 @@ def _heal_crm_hygiene(conn) -> dict:
     return _raw_heal_crm_hygiene(conn, clear_stale_stage_errors=True)
 
 
+def _heal_lead_dialog_links(conn: sqlite3.Connection) -> dict:
+    """Backfill NULL leads.dialog_id from latest linked user dialog (d.lead_id = l.id)."""
+    rows = conn.execute(
+        """
+        SELECT l.id AS lead_id,
+               (
+                   SELECT d.id
+                   FROM dialogs d
+                   WHERE d.lead_id = l.id AND d.peer_type = 'user'
+                   ORDER BY COALESCE(d.last_message_at, d.updated_at) DESC, d.id DESC
+                   LIMIT 1
+               ) AS dlg_id
+        FROM leads l
+        WHERE l.dialog_id IS NULL
+          AND EXISTS (
+              SELECT 1 FROM dialogs d2
+              WHERE d2.lead_id = l.id AND d2.peer_type = 'user'
+          )
+        """
+    ).fetchall()
+    repaired_ids: list[int] = []
+    for row in rows:
+        if row["dlg_id"] is None:
+            continue
+        conn.execute(
+            "UPDATE leads SET dialog_id = ? WHERE id = ? AND dialog_id IS NULL",
+            (int(row["dlg_id"]), int(row["lead_id"])),
+        )
+        repaired_ids.append(int(row["lead_id"]))
+    if repaired_ids:
+        conn.commit()
+    return {"repaired": len(repaired_ids), "lead_ids": repaired_ids[:50]}
+
+
 def _audit_local_db(
     db_path: Path,
     *,
@@ -914,6 +948,7 @@ def _audit_local_db(
             healed_drift = repair_dialog_last_from_peer_drift(conn)
             healed_events = prune_redundant_airtable_synced_events(conn)
             healed_sessions = reconcile_disk_sessions_with_db(conn)
+            healed_links = _heal_lead_dialog_links(conn)
             print(
                 "proactive_audit: healed "
                 + json.dumps(
@@ -923,6 +958,7 @@ def _audit_local_db(
                         "dialog_drift": healed_drift,
                         "airtable_events_pruned": healed_events,
                         "session_parity": healed_sessions,
+                        "lead_dialog_links": healed_links,
                     },
                     ensure_ascii=False,
                 )

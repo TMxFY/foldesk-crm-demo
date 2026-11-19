@@ -263,6 +263,8 @@ def _enrich_lead(conn, data: dict | None, cache: dict | None = None) -> dict | N
         dlg = as_dict(dlg_row) if dlg_row is not None else None
 
     if dlg is not None:
+        if data.get("dialog_id") is None and dlg.get("id") is not None:
+            data["dialog_id"] = int(dlg["id"])
         data["last_message_at"] = dlg.get("last_message_at")
         data["last_message_preview"] = dlg.get("last_message_preview")
         data["last_from_peer"] = dlg.get("last_from_peer")

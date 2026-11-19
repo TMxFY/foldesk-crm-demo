@@ -1465,6 +1465,10 @@ def _stop_recipient_and_lead_quietly(
                 "UPDATE dialogs SET lead_id = ? WHERE id = ? AND lead_id IS NULL",
                 (int(lead_id), int(raw_dlg_id)),
             )
+            conn.execute(
+                "UPDATE leads SET dialog_id = COALESCE(dialog_id, ?) WHERE id = ?",
+                (int(raw_dlg_id), int(lead_id)),
+            )
         except (TypeError, ValueError):
             pass
     return len(eligible_ids)
