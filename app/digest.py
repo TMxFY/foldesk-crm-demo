@@ -37,6 +37,7 @@ INTERNAL_TEAM_USERNAMES = frozenset(
         "spambot",
         "botfather",
         "replies",
+        "telegram",
     }
 )
 CLOSED_LEAD_STATUSES = frozenset({"won", "lost"})
@@ -1403,7 +1404,8 @@ def audit_reply_notifications(conn, *, since_hours: int | None = None) -> dict:
             for lr in conn.execute(
                 "SELECT id, name, username, status FROM leads WHERE username IS NOT NULL AND trim(username) != ''"
             ).fetchall():
-                if is_likely_telegram_bot_username(lr["username"]):
+                clean_lu = str(lr["username"] or "").strip().lstrip("@").lower()
+                if is_likely_telegram_bot_username(lr["username"]) or clean_lu == "telegram":
                     bot_username_leads.append(
                         {
                             "id": int(lr["id"]),
@@ -1426,7 +1428,11 @@ def audit_reply_notifications(conn, *, since_hours: int | None = None) -> dict:
 def heal_reply_notifications(conn) -> dict:
     """Self-heal persisted false reply notifications and bot-username leads."""
     if conn is None:
-        return {"purged_notifications": 0, "scrubbed_bot_leads": 0}
+        return {
+            "purged_notifications": 0,
+            "scrubbed_bot_leads": 0,
+            "detached_ineligible_dialogs": 0,
+        }
 
     with locked_conn(conn):
         report = audit_reply_notifications(conn)
@@ -1449,7 +1455,8 @@ def heal_reply_notifications(conn) -> dict:
                 continue
             old_u = str(row["username"] or "").strip().lstrip("@")
             old_note = str(row["note"] or "").strip()
-            marker = f"[bot-handle: @{old_u}]"
+            prefix = "service-handle" if old_u.lower() == "telegram" else "bot-handle"
+            marker = f"[{prefix}: @{old_u}]"
             new_note = old_note
             if old_u and marker.lower() not in old_note.lower():
                 new_note = f"{old_note}\n{marker}".strip() if old_note else marker
@@ -1459,6 +1466,40 @@ def heal_reply_notifications(conn) -> dict:
             )
             scrubbed += 1
 
-        if purged or scrubbed:
+        detached = 0
+        if _table_exists(conn, "dialogs"):
+            dlg_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(dialogs)").fetchall()
+            }
+            has_is_bot = "is_bot" in dlg_cols
+            has_phone = "phone" in dlg_cols
+            sel_cols = "id, account_id, peer_id, username"
+            if has_phone:
+                sel_cols += ", phone"
+            if has_is_bot:
+                sel_cols += ", is_bot"
+            for drow in conn.execute(
+                f"SELECT {sel_cols} FROM dialogs WHERE lead_id IS NOT NULL"
+            ).fetchall():
+                inelig, _ = is_ineligible_reply_notify_peer(
+                    conn,
+                    peer_id=drow["peer_id"],
+                    username=drow["username"],
+                    phone=drow["phone"] if has_phone else None,
+                    account_id=drow["account_id"],
+                    is_bot=bool(drow["is_bot"]) if has_is_bot else False,
+                )
+                if inelig:
+                    conn.execute(
+                        "UPDATE dialogs SET lead_id = NULL, updated_at = ? WHERE id = ?",
+                        (now_ts, int(drow["id"])),
+                    )
+                    detached += 1
+
+        if purged or scrubbed or detached:
             conn.commit()
-    return {"purged_notifications": purged, "scrubbed_bot_leads": scrubbed}
+    return {
+        "purged_notifications": purged,
+        "scrubbed_bot_leads": scrubbed,
+        "detached_ineligible_dialogs": detached,
+    }

@@ -7,7 +7,7 @@
   <title>Foldesk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261119v1">
+  <link rel="stylesheet" href="/static/app.css?v=20261119v2">
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
 </head>
 <body>
@@ -503,7 +503,10 @@
               <p data-when="empty" class="hint empty-state">Выберите разговор</p>
               <div data-when="nolead" class="stack">
                 <p>К этому чату лид ещё не заведён</p>
-                <button type="button" id="to-leads" class="btn primary sm">В лиды</button>
+                <div class="row">
+                  <button type="button" id="to-leads" class="btn primary sm">В лиды</button>
+                  <button type="button" id="nolead-client-profile-btn" class="btn secondary sm">👤 Полный профиль</button>
+                </div>
               </div>
               <div data-when="filled" id="side-card"></div>
               <p data-when="error" id="side-error" class="msg" role="alert"></p>
@@ -2221,6 +2224,20 @@
 
   <div id="sheet-popup-backdrop" class="sheet-popup-backdrop" hidden></div>
   <div id="toast" class="toast" hidden></div>
+  <div id="client-profile-modal" class="client-profile-root" hidden>
+    <button type="button" class="overlay" id="client-profile-dismiss" aria-label="Закрыть профиль клиента"></button>
+    <aside class="client-profile-drawer" role="dialog" aria-modal="true" aria-labelledby="client-profile-title">
+      <div class="client-profile-topbar">
+        <h2 id="client-profile-title">Профиль клиента</h2>
+        <div class="row">
+          <button type="button" id="client-profile-refresh-btn" class="btn secondary sm">↻ Обновить из TG</button>
+          <button type="button" id="client-profile-close-btn" class="btn ghost sm" aria-label="Закрыть">✕</button>
+        </div>
+      </div>
+      <div id="client-profile-body" class="client-profile-body"></div>
+    </aside>
+  </div>
+
   <div id="modal" class="modal-root" hidden>
     <button type="button" class="overlay" id="modal-dismiss" aria-label="Закрыть"></button>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -2228,6 +2245,6 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261119v1"></script>
+  <script src="/static/app.js?v=20261119v2"></script>
 </body>
 </html>

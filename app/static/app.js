@@ -3016,11 +3016,17 @@ function renderInboxSessionSwitcher() {
     const prefix = isWa ? "WA" : "TG";
     const uname = account.telegram_username || account.username;
     const label = uname ? `@${uname}` : (account.telegram_name || account.phone || `#${account.id}`);
+    const accHealth = String(account.health || "active").toLowerCase();
+    const unhealthy = accHealth && accHealth !== "active";
+    const healthMeta = ACCOUNT_HEALTH[accHealth];
     const pill = el("button", {
       type: "button",
-      className: "inbox-session-pill",
+      className: `inbox-session-pill${unhealthy ? " is-unhealthy" : ""}`,
       "data-session-filter": key,
       "aria-pressed": activeKey === key ? "true" : "false",
+      title: unhealthy
+        ? `Статус сессии: ${(healthMeta && healthMeta[0]) || accHealth}`
+        : `Сессия ${label}`,
       onclick: () => switchInboxSession(key),
     }, [`${prefix} · ${label}`]);
     host.append(pill);
@@ -4002,16 +4008,34 @@ function renderThread() {
     className: "btn secondary sm",
     onclick: () => openDealInspectorPopup(),
   }, ["🗂 Карточка и заметки"]);
+  const clientProfileBtn = el("button", {
+    type: "button",
+    id: "open-client-profile-btn",
+    className: "btn primary sm",
+    onclick: () => openClientProfile({
+      dialogId: dialog.id || null,
+      leadId: lead ? lead.id : null,
+    }),
+  }, ["👤 Профиль"]);
+  const titleGroup = el("div", {
+    className: "thread-title-group thread-title-trigger",
+    title: "Открыть полный профиль клиента",
+    onclick: () => openClientProfile({
+      dialogId: dialog.id || null,
+      leadId: lead ? lead.id : null,
+    }),
+  }, [
+    threadAvatarImg,
+    channelBadgeEl(provider),
+    el("h3", { className: "name" }, [name]),
+    stageBadge,
+  ].filter(Boolean));
   document.querySelector("#thread-head").replaceChildren(
-    el("div", { className: "thread-title-group" }, [
-      threadAvatarImg,
-      channelBadgeEl(provider),
-      el("h3", { className: "name" }, [name]),
-      stageBadge,
-    ].filter(Boolean)),
+    titleGroup,
     el("div", { className: "thread-head-meta row" }, [
       el("p", { className: "hint" }, [`С аккаунта ${accountLabel()}`]),
       el("p", { className: "hint" }, [contactHint]),
+      clientProfileBtn,
       dealPopupBtn,
     ]),
     buildInboxStageBar(dialog, lead, "inbox-stage-bar"),
@@ -4299,19 +4323,26 @@ function renderSide({ syncSelectedLead = true } = {}) {
         el("p", { className: "note", hidden: Boolean(formatStructuredNoteNode(sideNoteText(lead), { compact: true })) }, [sideNoteText(lead)]),
       ].filter(Boolean)),
       renderLeadEventsSection(state.cards[lead.id] || lead, { compact: true }),
-      el("a", {
-        className: "btn secondary sm",
-        href: "#s09",
-        onclick: (event) => {
-          state.selectedLeadId = lead.id;
-          renderCard();
-          renderBoard();
-          if (state.viewMode === "sheet") {
-            event.preventDefault();
-            openSheetPopup("card");
-          }
-        },
-      }, ["Открыть карточку"]),
+      el("div", { className: "row" }, [
+        el("button", {
+          type: "button",
+          className: "btn primary sm",
+          onclick: () => openClientProfile({ leadId: lead.id, dialogId: dialog.id || null }),
+        }, ["👤 Полный профиль"]),
+        el("a", {
+          className: "btn secondary sm",
+          href: "#s09",
+          onclick: (event) => {
+            state.selectedLeadId = lead.id;
+            renderCard();
+            renderBoard();
+            if (state.viewMode === "sheet") {
+              event.preventDefault();
+              openSheetPopup("card");
+            }
+          },
+        }, ["Открыть карточку"]),
+      ]),
     ]),
   );
   setView("#side-view", "filled");
@@ -4705,7 +4736,8 @@ function paintCard(lead) {
         el("h3", { id: "card-name", className: "name" }, [lead.name || "Без имени"]),
       ]),
       el("div", { className: "row card-quick-actions" }, [
-        el("button", { type: "button", className: "btn primary sm", onclick: () => openChat(lead) }, ["Открыть чат"]),
+        el("button", { type: "button", className: "btn primary sm", onclick: () => openClientProfile({ leadId: lead.id }) }, ["👤 Профиль"]),
+        el("button", { type: "button", className: "btn secondary sm", onclick: () => openChat(lead) }, ["Открыть чат"]),
         el("button", { type: "button", className: "btn secondary sm", onclick: () => openNoteModal(lead) }, ["Заметка"]),
         el("button", { type: "button", className: "btn secondary sm", onclick: () => openReminderModal(lead) }, ["Напоминание"]),
       ]),
@@ -5066,6 +5098,24 @@ function renderBoard() {
             `${tr.accountName || tr.accountPhone}`,
           ]));
         }
+        tagNodes.push(el("span", {
+          role: "button",
+          tabindex: "0",
+          className: "lead-profile-trigger",
+          title: "Открыть полный профиль клиента",
+          onclick: (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            openClientProfile({ leadId: lead.id });
+          },
+          onkeydown: (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              ev.stopPropagation();
+              openClientProfile({ leadId: lead.id });
+            }
+          },
+        }, ["👤 Профиль"]));
         bodyNodes.push(el("span", { className: "card-tags" }, tagNodes));
         const link = el("a", {
           className: "card lead-card",
@@ -5261,6 +5311,14 @@ function buildLeadCrmPills(lead) {
       ]));
     }
   });
+  const profileBtn = el("button", {
+    type: "button",
+    className: "lead-profile-trigger",
+    onclick: (ev) => {
+      ev.stopPropagation();
+      openClientProfile({ leadId: lead.id });
+    },
+  }, ["👤 Профиль"]);
   const openBtn = el("button", {
     type: "button",
     className: "lead-open-card-btn",
@@ -5272,7 +5330,7 @@ function buildLeadCrmPills(lead) {
       if (state.viewMode === "sheet") openSheetPopup("card");
     },
   }, ["Карточка →"]);
-  pills.push(openBtn);
+  pills.push(profileBtn, openBtn);
   return el("div", { className: "lead-crm-pills-row" }, pills);
 }
 
@@ -5966,7 +6024,7 @@ async function searchTelegram(query) {
   }
   setView("#inbox-view", "loading");
   state.inbox = "loading";
-  const dialogs = await api(`/api/accounts/${select.value}/dialogs?q=${encodeURIComponent(query || "")}`);
+  const dialogs = await api(`/api/accounts/${select.value}/dialogs?q=${encodeURIComponent(query || "")}&crm_only=1`);
   state.dialogs = dialogs;
   state.inbox = "filled";
   renderDialogs();
@@ -7745,6 +7803,7 @@ document.querySelector("#modal").addEventListener("keydown", (event) => {
   if (document.querySelector("#modal").hidden) return;
   if (event.key === "Escape") {
     event.preventDefault();
+    event.stopPropagation();
     closeModal();
     return;
   }
@@ -13657,6 +13716,446 @@ function bindOutreachFilterEvents() {
     });
   }
 }
+
+let clientProfileToken = 0;
+let clientProfileTarget = { leadId: null, dialogId: null };
+
+function closeClientProfile() {
+  ++clientProfileToken;
+  const modal = document.querySelector("#client-profile-modal");
+  if (!modal) return;
+  modal.hidden = true;
+}
+
+function profileField(label, valueNodeOrText) {
+  if (valueNodeOrText == null || valueNodeOrText === "") return null;
+  return el("div", { className: "client-profile-field" }, [
+    el("span", { className: "client-profile-field-label" }, [label]),
+    typeof valueNodeOrText === "string" || typeof valueNodeOrText === "number"
+      ? el("div", { className: "client-profile-field-val" }, [String(valueNodeOrText)])
+      : el("div", { className: "client-profile-field-val" }, [valueNodeOrText]),
+  ]);
+}
+
+function renderClientProfileBody(data) {
+  const body = document.querySelector("#client-profile-body");
+  if (!body) return;
+  const tg = (data && data.telegram_profile) || {};
+  const lead = (data && data.lead) || null;
+  const outreach = Array.isArray(data && data.outreach) ? data.outreach : [];
+  const dialogs = Array.isArray(data && data.dialogs) ? data.dialogs : [];
+  const recentMessages = Array.isArray(data && data.recent_messages) ? data.recent_messages : [];
+  const reminders = Array.isArray(data && data.reminders) ? data.reminders : [];
+  const stats = (data && data.stats) || {};
+  const primaryDialogId = data ? data.primary_dialog_id : null;
+  const primaryDialogObj = dialogs.find((d) => Number(d.id) === Number(primaryDialogId)) || dialogs[0] || null;
+  const displayName = tg.full_name || (lead && lead.name) || "Клиент";
+
+  // Hero badges
+  const heroBadges = [channelBadgeEl(tg.provider || (lead && lead.provider) || "telegram")];
+  if (lead && lead.status) {
+    const stPair = STATUSES.find(([k]) => k === lead.status);
+    heroBadges.push(el("span", { className: `badge ${BADGE[lead.status] || "b-new"}` }, [
+      stPair ? stPair[1] : lead.status,
+    ]));
+  }
+  if (tg.is_premium) heroBadges.push(el("span", { className: "badge b-talk" }, ["⭐ Premium"]));
+  if (tg.is_verified) heroBadges.push(el("span", { className: "badge b-ok" }, ["✓ Verified"]));
+  if (tg.is_scam || tg.is_fake) heroBadges.push(el("span", { className: "badge b-bad" }, [tg.is_scam ? "Scam" : "Fake"]));
+  if (tg.status_text) heroBadges.push(el("span", { className: "badge b-new" }, [tg.status_text]));
+
+  const initialsFallback = el("span", {}, [initials(displayName)]);
+  const avatarKids = [];
+  if (tg.avatar_url) {
+    const img = el("img", {
+      src: tg.avatar_url,
+      alt: displayName,
+      onload: () => { initialsFallback.hidden = true; },
+      onerror: () => { img.hidden = true; initialsFallback.hidden = false; },
+    });
+    avatarKids.push(img, initialsFallback);
+  } else {
+    avatarKids.push(initialsFallback);
+  }
+
+  const metaLinks = [];
+  if (tg.username) {
+    if (tg.tg_url) {
+      metaLinks.push(el("a", { href: tg.tg_url, target: "_blank", rel: "noreferrer noopener" }, [`@${tg.username} ↗`]));
+    } else {
+      metaLinks.push(el("span", {}, [`@${tg.username}`]));
+    }
+  }
+  if (tg.phone) metaLinks.push(el("span", {}, [tg.phone]));
+  if (tg.peer_id != null) metaLinks.push(el("span", {}, [`ID: ${tg.peer_id}`]));
+  if (lead && lead.email) metaLinks.push(el("span", {}, [lead.email]));
+  const webHref = safeHref((lead && lead.url) || (outreach[0] && outreach[0].website) || "");
+  if (webHref) {
+    metaLinks.push(el("a", { href: webHref, target: "_blank", rel: "noreferrer noopener" }, ["Сайт ↗"]));
+  }
+
+  const hero = el("section", { className: "client-profile-hero" }, [
+    el("div", { className: "client-profile-avatar-wrap" }, avatarKids),
+    el("div", { className: "client-profile-hero-main" }, [
+      el("div", { className: "client-profile-name-row" }, [
+        el("h3", {}, [displayName]),
+        ...heroBadges,
+      ]),
+      metaLinks.length ? el("div", { className: "client-profile-meta-links" }, metaLinks) : null,
+    ].filter(Boolean)),
+  ]);
+
+  // Action bar
+  const actionButtons = [
+    el("button", {
+      type: "button",
+      className: "btn primary sm",
+      onclick: async () => {
+        closeClientProfile();
+        if (primaryDialogObj) {
+          upsertDialog(primaryDialogObj);
+          activateSheet("inbox");
+          await selectDialog(primaryDialogObj, { markRead: false });
+        } else if (lead) {
+          await openChat(lead);
+        } else {
+          toast("Диалог не найден", "error");
+        }
+      },
+    }, ["💬 Открыть чат"]),
+  ];
+  if (lead) {
+    actionButtons.push(
+      el("button", {
+        type: "button",
+        className: "btn secondary sm",
+        onclick: async () => {
+          closeClientProfile();
+          await focusLead(lead.id);
+        },
+      }, ["✏️ Редактировать сделку"]),
+      el("button", {
+        type: "button",
+        className: "btn secondary sm",
+        onclick: () => openNoteModal(lead),
+      }, ["📝 Заметка"]),
+      el("button", {
+        type: "button",
+        className: "btn secondary sm",
+        onclick: () => openReminderModal(lead),
+      }, ["⏰ Напоминание"]),
+    );
+  } else if (primaryDialogObj) {
+    actionButtons.push(
+      el("button", {
+        type: "button",
+        className: "btn secondary sm",
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          try {
+            const created = await api("/api/leads", {
+              method: "POST",
+              body: {
+                account_id: primaryDialogObj.account_id,
+                telegram_user_id: primaryDialogObj.telegram_user_id || tg.peer_id || null,
+                username: tg.username || primaryDialogObj.username || null,
+                name: displayName,
+                phone: tg.phone || primaryDialogObj.phone || null,
+                dialog_id: primaryDialogObj.id,
+                status: "talking",
+              },
+            });
+            toast("Лид создан в CRM", "ok");
+            await loadLeads(state.leadQuery, created ? created.id : null, true);
+            await openClientProfile({ leadId: created.id, dialogId: primaryDialogObj.id });
+          } catch (err) {
+            toast(err.message || "Не удалось создать лида", "error");
+            btn.disabled = false;
+          }
+        },
+      }, ["+ Создать лида в CRM"]),
+    );
+  }
+
+  const actionsSection = el("section", { className: "client-profile-section" }, [
+    el("div", { className: "row" }, actionButtons),
+    primaryDialogObj ? buildInboxStageBar(primaryDialogObj, lead, "profile-stage-bar") : null,
+  ].filter(Boolean));
+
+  // Telegram Bio section
+  const sourceBadge = tg.source === "telegram_live"
+    ? el("span", { className: "badge b-ok" }, ["Telegram Live"])
+    : (tg.source === "telegram_cached"
+      ? el("span", { className: "badge b-talk" }, [`Кэш TG${tg.fetched_at ? ` · ${formatShortTime(tg.fetched_at)}` : ""}`])
+      : el("span", { className: "badge b-new" }, ["Только CRM-данные"]));
+
+  const bioKids = [
+    el("div", { className: "client-profile-bio-head" }, [
+      el("strong", {}, ["Telegram Bio / О себе"]),
+      sourceBadge,
+    ]),
+    el("p", { className: tg.bio ? "client-profile-bio-text" : "hint" }, [
+      tg.bio || "Био в Telegram не заполнено или ещё не загружено (нажмите «Обновить из TG»).",
+    ]),
+  ];
+  if (tg.personal_channel || Number(tg.common_chats_count || 0) > 0) {
+    bioKids.push(el("div", { className: "row" }, [
+      tg.personal_channel ? el("span", { className: "card-pill" }, [`📢 Канал: ${tg.personal_channel}`]) : null,
+      Number(tg.common_chats_count || 0) > 0
+        ? el("span", { className: "card-pill" }, [`👥 Общих чатов: ${tg.common_chats_count}`])
+        : null,
+    ].filter(Boolean)));
+  }
+  const bioSection = el("section", { className: "client-profile-bio" }, bioKids);
+
+  // KPI strip
+  const budgetText = lead
+    ? `${formatMoney(leadAmount(lead), lead.currency)}${lead.monthly_value ? ` (+${formatMoney(lead.monthly_value, lead.currency)}/мес)` : ""}`
+    : "—";
+  const kpiStrip = el("div", { className: "client-profile-kpis" }, [
+    el("div", { className: "client-profile-kpi" }, [
+      el("small", {}, ["Сообщений"]),
+      el("strong", {}, [String(stats.total_messages || 0)]),
+      el("span", { className: "hint" }, [`вх ${stats.in_messages || 0} / исх ${stats.out_messages || 0}`]),
+    ]),
+    el("div", { className: "client-profile-kpi" }, [
+      el("small", {}, ["Диалогов"]),
+      el("strong", {}, [String(stats.total_dialogs || 0)]),
+      el("span", { className: "hint" }, ["по всем сессиям"]),
+    ]),
+    el("div", { className: "client-profile-kpi" }, [
+      el("small", {}, ["Рассылок"]),
+      el("strong", {}, [String(stats.campaigns_count || 0)]),
+      el("span", { className: "hint" }, ["кампаний"]),
+    ]),
+    el("div", { className: "client-profile-kpi" }, [
+      el("small", {}, ["Сделка / MRR"]),
+      el("strong", {}, [budgetText]),
+      el("span", { className: "hint" }, [stats.last_contact_at ? `касание ${formatShortTime(stats.last_contact_at)}` : "нет дат"]),
+    ]),
+  ]);
+
+  const blocks = [hero, actionsSection, bioSection, kpiStrip];
+
+  // CRM Dossier section
+  if (lead) {
+    const dealFields = [
+      profileField("Компания", lead.company),
+      profileField("Ниша", lead.niche),
+      profileField("Источник", lead.lead_source),
+      profileField("Оффер", lead.offer_type),
+      profileField("Детали оффера", lead.offer_details),
+      profileField("Следующий шаг", lead.next_step),
+      profileField("Follow-up", lead.next_follow_up ? formatDue(lead.next_follow_up) : null),
+      profileField("Последний контакт", lead.last_contacted ? formatShortTime(lead.last_contacted) : null),
+      profileField("Папка", lead.folder_name),
+      profileField("Airtable", lead.airtable_status),
+    ].filter(Boolean);
+    const dossierKids = [el("h4", {}, ["Досье CRM и сделка"])];
+    if (dealFields.length) dossierKids.push(el("div", { className: "client-profile-grid" }, dealFields));
+    if (lead.description) dossierKids.push(profileField("Описание", lead.description));
+    if (lead.note) dossierKids.push(profileField("Заметка сделки", lead.note));
+    if (Array.isArray(lead.properties) && lead.properties.length) {
+      const filledProps = lead.properties
+        .map((p) => [p.name, propertyShown(p)])
+        .filter(([, v]) => v && v !== "-");
+      if (filledProps.length) {
+        dossierKids.push(
+          el("div", { className: "client-profile-grid" }, filledProps.map(([k, v]) => profileField(k, v))),
+        );
+      }
+    }
+    blocks.push(el("section", { className: "client-profile-section" }, dossierKids));
+  }
+
+  // Outreach / Campaign context
+  if (outreach.length) {
+    const outreachCards = outreach.map((rec) => {
+      const stMeta = RECIPIENT_STATUS_LABEL[rec.status] || [rec.status || "—", "b-new"];
+      const ex = rec.extra || {};
+      const metaFields = [
+        profileField("Аккаунт отправки", rec.sent_account_username ? `@${rec.sent_account_username}` : rec.sent_account_name),
+        profileField("Шаг / Дата", `Шаг ${rec.current_step || 0}${rec.last_sent_at ? ` · ${formatShortTime(rec.last_sent_at)}` : ""}`),
+        profileField("Категория", rec.category),
+        profileField("Их угол", rec.their_angle),
+        profileField("Наш угол", rec.our_angle),
+        profileField("Хук", rec.hook),
+        profileField("Интент ответа", ex.reply_intent || ex.stop_reason),
+        profileField("Прочитано", rec.read_at ? formatShortTime(rec.read_at) : null),
+      ].filter(Boolean);
+
+      const stepsDetails = [];
+      [
+        ["Step 1", rec.step1_text],
+        ["Step 2", rec.step2_text],
+        ["Step 3", rec.step3_text],
+      ].forEach(([lbl, txt]) => {
+        if (txt) {
+          stepsDetails.push(el("div", { className: "client-profile-field" }, [
+            el("span", { className: "client-profile-field-label" }, [lbl]),
+            el("p", { className: "client-profile-bio-text" }, [txt]),
+          ]));
+        }
+      });
+
+      return el("div", { className: "client-profile-outreach-card" }, [
+        el("div", { className: "row" }, [
+          el("strong", {}, [rec.campaign_name || `Кампания #${rec.campaign_id}`]),
+          el("span", { className: `badge ${stMeta[1]}` }, [stMeta[0]]),
+        ]),
+        metaFields.length ? el("div", { className: "client-profile-grid" }, metaFields) : null,
+        stepsDetails.length
+          ? el("details", {}, [
+            el("summary", { className: "hint" }, ["Показать тексты касаний (Step 1–3)"]),
+            el("div", { className: "stack" }, stepsDetails),
+          ])
+          : null,
+      ].filter(Boolean));
+    });
+    blocks.push(el("section", { className: "client-profile-section" }, [
+      el("h4", {}, ["Аутрич и рассылки"]),
+      ...outreachCards,
+    ]));
+  }
+
+  // All dialogs across sessions
+  if (dialogs.length) {
+    blocks.push(el("section", { className: "client-profile-section" }, [
+      el("h4", {}, [`Диалоги по сессиям (${dialogs.length})`]),
+      el("div", { className: "stack" }, dialogs.map((d) => {
+        const accLabel = d.account_username ? `@${d.account_username}` : (d.account_name || `#${d.account_id}`);
+        return el("button", {
+          type: "button",
+          className: "client-profile-dialog-row",
+          onclick: async () => {
+            closeClientProfile();
+            await switchInboxSession(String(d.account_id));
+            activateSheet("inbox");
+            await selectDialog(d, { markRead: false });
+          },
+        }, [
+          el("div", { className: "stack" }, [
+            el("strong", {}, [`Сессия ${accLabel} · сообщений: ${d.msg_count || 0}`]),
+            el("span", { className: "hint" }, [d.last_message_preview || "Открыть переписку"]),
+          ]),
+          el("span", { className: "badge b-new" }, [
+            d.unread_count ? `Непрочит: ${d.unread_count}` : (d.last_message_at ? formatShortTime(d.last_message_at) : "Открыть"),
+          ]),
+        ]);
+      })),
+    ]));
+  }
+
+  // Recent messages
+  if (recentMessages.length) {
+    blocks.push(el("section", { className: "client-profile-section" }, [
+      el("h4", {}, [`Последние сообщения (${recentMessages.length})`]),
+      el("div", { className: "client-profile-msg-list" }, recentMessages.map((m) => {
+        const isOut = m.direction === "out";
+        const bodyTxt = m.text || (m.media_type ? `[Медиа: ${m.media_type}]` : "—");
+        return el("div", { className: `client-profile-msg-item${isOut ? " is-out" : ""}` }, [
+          el("div", { className: "row" }, [
+            el("span", { className: `badge ${isOut ? "b-talk" : "b-ok"}` }, [isOut ? "→ Вы" : "← Клиент"]),
+            el("span", { className: "hint" }, [
+              `${m.account_username ? `@${m.account_username} · ` : ""}${m.sent_at ? formatDue(m.sent_at) || formatShortTime(m.sent_at) : ""}`,
+            ]),
+          ]),
+          el("p", { className: "client-profile-bio-text" }, [bodyTxt]),
+        ]);
+      })),
+    ]));
+  }
+
+  // Notes, tasks, reminders, events
+  if (lead) {
+    const notes = Array.isArray(lead.notes) ? lead.notes : [];
+    const tasks = Array.isArray(lead.tasks) ? lead.tasks : [];
+    const noteItems = notes.map((n) => el("li", { className: "client-profile-msg-item" }, [
+      el("p", {}, [n.body]),
+      el("span", { className: "hint" }, [formatDue(n.created_at) || n.created_at || ""]),
+    ]));
+    const taskItems = tasks.map((t) => el("li", { className: "row" }, [
+      el("span", { className: `badge ${t.done_at ? "b-ok" : "b-wait"}` }, [t.done_at ? "✓" : "○"]),
+      el("span", {}, [t.title]),
+    ]));
+    const remItems = reminders.map((r) => el("li", { className: "row" }, [
+      el("span", { className: `badge ${r.done_at ? "b-ok" : "b-wait"}` }, [r.done_at ? "Выполнено" : formatDue(r.due_at)]),
+      el("span", {}, [r.text]),
+    ]));
+    if (noteItems.length || taskItems.length || remItems.length) {
+      blocks.push(el("section", { className: "client-profile-section" }, [
+        el("h4", {}, ["Заметки, задачи и напоминания"]),
+        noteItems.length ? el("ul", { className: "stack" }, noteItems) : null,
+        taskItems.length ? el("ul", { className: "stack" }, taskItems) : null,
+        remItems.length ? el("ul", { className: "stack" }, remItems) : null,
+      ].filter(Boolean)));
+    }
+    blocks.push(el("section", { className: "client-profile-section" }, [
+      renderLeadEventsSection(lead),
+    ]));
+  }
+
+  body.replaceChildren(...blocks);
+}
+
+async function openClientProfile({ leadId = null, dialogId = null, refresh = false } = {}) {
+  const modal = document.querySelector("#client-profile-modal");
+  const body = document.querySelector("#client-profile-body");
+  if (!modal || !body) return;
+  if (leadId == null && dialogId == null) return;
+  if (typeof closeDealInspectorPopup === "function") closeDealInspectorPopup();
+
+  clientProfileTarget = { leadId, dialogId };
+  const reqToken = ++clientProfileToken;
+  modal.hidden = false;
+  body.replaceChildren(
+    el("div", { className: "skeleton", "aria-hidden": "true" }, [
+      el("span", { className: "sk" }),
+      el("span", { className: "sk tall" }),
+    ]),
+  );
+
+  const endpoint = dialogId != null
+    ? `/api/dialogs/${encodeURIComponent(String(dialogId))}/profile${refresh ? "?refresh=1" : ""}`
+    : `/api/leads/${encodeURIComponent(String(leadId))}/profile${refresh ? "?refresh=1" : ""}`;
+  try {
+    const data = await api(endpoint);
+    if (reqToken !== clientProfileToken) return;
+    if (data && data.lead && data.lead.id) {
+      clientProfileTarget.leadId = data.lead.id;
+    }
+    if (data && data.primary_dialog_id) {
+      clientProfileTarget.dialogId = data.primary_dialog_id;
+    }
+    renderClientProfileBody(data);
+  } catch (error) {
+    if (reqToken !== clientProfileToken) return;
+    body.replaceChildren(
+      el("p", { className: "msg" }, [error.message || "Не удалось загрузить профиль клиента"]),
+    );
+  }
+}
+
+document.querySelector("#client-profile-dismiss")?.addEventListener("click", closeClientProfile);
+document.querySelector("#client-profile-close-btn")?.addEventListener("click", closeClientProfile);
+document.querySelector("#client-profile-refresh-btn")?.addEventListener("click", () => {
+  openClientProfile({ ...clientProfileTarget, refresh: true });
+});
+document.querySelector("#nolead-client-profile-btn")?.addEventListener("click", () => {
+  if (state.selectedDialog && state.selectedDialog.id) {
+    openClientProfile({ dialogId: state.selectedDialog.id });
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const formModal = document.querySelector("#modal");
+  if (formModal && !formModal.hidden) return;
+  const cpModal = document.querySelector("#client-profile-modal");
+  if (cpModal && !cpModal.hidden) {
+    closeClientProfile();
+  }
+});
 
 bindV5Events();
 bindLeadgenEvents();

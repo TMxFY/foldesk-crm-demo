@@ -1864,3 +1864,445 @@ def export_leads_csv(
 
     return buf.getvalue()
 
+
+def _parse_extra_profile_json(raw: object) -> dict:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+_SQL_NORM_PHONE_EXPR = (
+    "substr(replace(replace(replace(replace(replace(replace(COALESCE({col}, ''), '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', ''), -15)"
+)
+
+
+def _norm_phone_15(raw: object) -> str:
+    digits = re.sub(r"\D", "", str(raw or ""))
+    return digits[-15:] if len(digits) >= 7 else ""
+
+
+def upsert_peer_profile(
+    conn: sqlite3.Connection,
+    account_id: int,
+    peer_id: int,
+    profile: dict,
+) -> dict:
+    now = utc_now()
+    clean_uname = str(profile.get("username") or "").strip().lstrip("@") or None
+    first_name = str(profile.get("first_name") or "").strip() or None
+    last_name = str(profile.get("last_name") or "").strip() or None
+    phone = str(profile.get("phone") or "").strip() or None
+    bio = str(profile.get("bio") or "").strip() or None
+    status_text = str(profile.get("status_text") or "").strip() or None
+    is_premium = 1 if profile.get("is_premium") else 0
+    is_verified = 1 if profile.get("is_verified") else 0
+    is_scam = 1 if profile.get("is_scam") else 0
+    is_fake = 1 if profile.get("is_fake") else 0
+    is_bot = 1 if profile.get("is_bot") else 0
+    common_chats_count = int(profile.get("common_chats_count") or 0)
+    personal_channel = str(profile.get("personal_channel") or "").strip() or None
+    conn.execute(
+        """
+        INSERT INTO peer_profiles (
+            account_id, peer_id, username, first_name, last_name, phone, bio,
+            status_text, is_premium, is_verified, is_scam, is_fake, is_bot,
+            common_chats_count, personal_channel, fetched_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account_id, peer_id) DO UPDATE SET
+            username = COALESCE(excluded.username, peer_profiles.username),
+            first_name = COALESCE(excluded.first_name, peer_profiles.first_name),
+            last_name = COALESCE(excluded.last_name, peer_profiles.last_name),
+            phone = COALESCE(excluded.phone, peer_profiles.phone),
+            bio = excluded.bio,
+            status_text = excluded.status_text,
+            is_premium = excluded.is_premium,
+            is_verified = excluded.is_verified,
+            is_scam = excluded.is_scam,
+            is_fake = excluded.is_fake,
+            is_bot = excluded.is_bot,
+            common_chats_count = excluded.common_chats_count,
+            personal_channel = excluded.personal_channel,
+            fetched_at = excluded.fetched_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            int(account_id),
+            int(peer_id),
+            clean_uname,
+            first_name,
+            last_name,
+            phone,
+            bio,
+            status_text,
+            is_premium,
+            is_verified,
+            is_scam,
+            is_fake,
+            is_bot,
+            common_chats_count,
+            personal_channel,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM peer_profiles WHERE account_id = ? AND peer_id = ?",
+        (int(account_id), int(peer_id)),
+    ).fetchone()
+    return as_dict(row) or {}
+
+
+def get_cached_peer_profile(
+    conn: sqlite3.Connection,
+    *,
+    account_id: int | None = None,
+    peer_id: int | None = None,
+    username: str | None = None,
+) -> dict | None:
+    if peer_id is not None and account_id is not None:
+        row = conn.execute(
+            "SELECT * FROM peer_profiles WHERE account_id = ? AND peer_id = ? LIMIT 1",
+            (int(account_id), int(peer_id)),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+    if peer_id is not None:
+        row = conn.execute(
+            "SELECT * FROM peer_profiles WHERE peer_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (int(peer_id),),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+    clean_u = str(username or "").strip().lstrip("@").lower()
+    if clean_u:
+        row = conn.execute(
+            "SELECT * FROM peer_profiles WHERE username IS NOT NULL AND ltrim(lower(username), '@') = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (clean_u,),
+        ).fetchone()
+        if row is not None:
+            return as_dict(row)
+    return None
+
+
+def get_client_full_profile(
+    conn: sqlite3.Connection,
+    *,
+    lead_id: int | None = None,
+    dialog_id: int | None = None,
+) -> dict:
+    """Assemble full CRM + Telegram dossier for either a lead or an inbox dialog."""
+    primary_dialog: dict | None = None
+    if dialog_id is not None:
+        drow = conn.execute(
+            """
+            SELECT d.*,
+                   COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                   a.telegram_username AS account_username,
+                   COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                   COALESCE(a.health, 'active') AS account_health,
+                   a.status AS account_status,
+                   a.session_path AS account_session_path
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE d.id = ?
+            """,
+            (int(dialog_id),),
+        ).fetchone()
+        if drow is None:
+            raise LookupError("dialog")
+        primary_dialog = as_dict(drow)
+        if lead_id is None and primary_dialog.get("lead_id") is not None:
+            lead_id = int(primary_dialog["lead_id"])
+
+    resolved_lead: dict | None = None
+    if lead_id is not None:
+        try:
+            resolved_lead = lead_card(conn, int(lead_id))
+        except LookupError:
+            if primary_dialog is None:
+                raise
+            resolved_lead = None
+
+    if resolved_lead is None and primary_dialog is not None:
+        tg_id = primary_dialog.get("peer_id")
+        uname = str(primary_dialog.get("username") or "").strip().lstrip("@").lower()
+        ph = str(primary_dialog.get("phone") or "").strip()
+        p_dig = _norm_phone_15(ph)
+        clauses = ["dialog_id = ?"]
+        params: list = [int(primary_dialog["id"])]
+        if tg_id is not None:
+            clauses.append("telegram_user_id = ?")
+            params.append(int(tg_id))
+        if uname:
+            clauses.append("(username IS NOT NULL AND ltrim(lower(username), '@') = ?)")
+            params.append(uname)
+        if ph:
+            clauses.append("phone = ?")
+            params.append(ph)
+        if p_dig:
+            clauses.append(f"(phone IS NOT NULL AND {_SQL_NORM_PHONE_EXPR.format(col='phone')} = ?)")
+            params.append(p_dig)
+        lrow = conn.execute(
+            f"SELECT id FROM leads WHERE {' OR '.join(clauses)} ORDER BY id DESC LIMIT 1",
+            params,
+        ).fetchone()
+        if lrow is not None:
+            resolved_lead = lead_card(conn, int(lrow["id"]))
+
+    if resolved_lead is None and primary_dialog is None:
+        raise LookupError("profile")
+
+    eff_lid = int(resolved_lead["id"]) if resolved_lead is not None else None
+    eff_peer_id = (
+        primary_dialog.get("peer_id")
+        if primary_dialog is not None and primary_dialog.get("peer_id") is not None
+        else (resolved_lead.get("telegram_user_id") if resolved_lead is not None else None)
+    )
+    eff_uname = str(
+        (primary_dialog.get("username") if primary_dialog else None)
+        or (resolved_lead.get("username") if resolved_lead else None)
+        or ""
+    ).strip().lstrip("@")
+    eff_phone = str(
+        (primary_dialog.get("phone") if primary_dialog else None)
+        or (resolved_lead.get("phone") if resolved_lead else None)
+        or ""
+    ).strip()
+    eff_pdig = _norm_phone_15(eff_phone)
+    eff_acc_id = (
+        primary_dialog.get("account_id")
+        if primary_dialog is not None
+        else (resolved_lead.get("account_id") if resolved_lead is not None else None)
+    )
+
+    dlg_clauses = []
+    dlg_params: list = []
+    if primary_dialog is not None:
+        dlg_clauses.append("d.id = ?")
+        dlg_params.append(int(primary_dialog["id"]))
+    if eff_lid is not None:
+        dlg_clauses.append("d.lead_id = ?")
+        dlg_params.append(eff_lid)
+    if eff_peer_id is not None:
+        dlg_clauses.append("(d.peer_type = 'user' AND d.peer_id = ?)")
+        dlg_params.append(int(eff_peer_id))
+    if eff_uname:
+        dlg_clauses.append("(d.peer_type = 'user' AND d.username IS NOT NULL AND ltrim(lower(d.username), '@') = ?)")
+        dlg_params.append(eff_uname.lower())
+    if eff_pdig:
+        dlg_clauses.append(
+            f"(d.peer_type = 'user' AND d.phone IS NOT NULL AND {_SQL_NORM_PHONE_EXPR.format(col='d.phone')} = ?)"
+        )
+        dlg_params.append(eff_pdig)
+
+    client_dialogs: list[dict] = []
+    if dlg_clauses:
+        rows = conn.execute(
+            f"""
+            SELECT d.*,
+                   COALESCE(d.provider, a.provider, 'telegram') AS provider,
+                   a.telegram_username AS account_username,
+                   COALESCE(a.telegram_name, a.telegram_username, a.phone) AS account_name,
+                   COALESCE(a.health, 'active') AS account_health,
+                   a.status AS account_status,
+                   a.session_path AS account_session_path,
+                   (SELECT COUNT(*) FROM messages m WHERE m.dialog_id = d.id) AS msg_count,
+                   (SELECT COUNT(*) FROM messages m WHERE m.dialog_id = d.id AND m.direction = 'in') AS in_count,
+                   (SELECT COUNT(*) FROM messages m WHERE m.dialog_id = d.id AND m.direction = 'out') AS out_count
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            WHERE {' OR '.join(dlg_clauses)}
+            ORDER BY (d.last_message_at IS NULL), d.last_message_at DESC, d.id DESC
+            """,
+            dlg_params,
+        ).fetchall()
+        seen_dids: set[int] = set()
+        for r in rows:
+            d = as_dict(r)
+            did = int(d["id"])
+            if did in seen_dids:
+                continue
+            seen_dids.add(did)
+            if eff_peer_id is None and d.get("peer_id") is not None:
+                eff_peer_id = int(d["peer_id"])
+            if not eff_uname and d.get("username"):
+                eff_uname = str(d["username"]).strip().lstrip("@")
+            client_dialogs.append(d)
+
+    if primary_dialog is None and client_dialogs:
+        primary_dialog = client_dialogs[0]
+        if eff_acc_id is None:
+            eff_acc_id = primary_dialog.get("account_id")
+
+    cached_tg = get_cached_peer_profile(
+        conn,
+        account_id=int(eff_acc_id) if eff_acc_id is not None else None,
+        peer_id=int(eff_peer_id) if eff_peer_id is not None else None,
+        username=eff_uname or None,
+    )
+
+    rec_clauses = []
+    rec_params: list = []
+    if eff_lid is not None:
+        rec_clauses.append("cr.lead_id = ?")
+        rec_params.append(eff_lid)
+    if eff_peer_id is not None:
+        rec_clauses.append("cr.telegram_user_id = ?")
+        rec_params.append(int(eff_peer_id))
+    if eff_uname:
+        rec_clauses.append("(cr.username IS NOT NULL AND ltrim(lower(cr.username), '@') = ?)")
+        rec_params.append(eff_uname.lower())
+    if eff_pdig:
+        rec_clauses.append(
+            f"(cr.phone IS NOT NULL AND {_SQL_NORM_PHONE_EXPR.format(col='cr.phone')} = ?)"
+        )
+        rec_params.append(eff_pdig)
+
+    outreach_rows: list[dict] = []
+    if rec_clauses:
+        for rr in conn.execute(
+            f"""
+            SELECT cr.*,
+                   c.name AS campaign_name,
+                   c.status AS campaign_status,
+                   sa.telegram_username AS sent_account_username,
+                   COALESCE(sa.telegram_name, sa.telegram_username, sa.phone) AS sent_account_name
+            FROM campaign_recipients cr
+            LEFT JOIN campaigns c ON c.id = cr.campaign_id
+            LEFT JOIN accounts sa ON sa.id = COALESCE(cr.sent_account_id, cr.assigned_account_id)
+            WHERE {' OR '.join(rec_clauses)}
+            ORDER BY (cr.last_sent_at IS NULL), cr.last_sent_at DESC, cr.id DESC
+            """,
+            rec_params,
+        ).fetchall():
+            rd = as_dict(rr)
+            rd["extra"] = _parse_extra_profile_json(rd.get("extra_json"))
+            outreach_rows.append(rd)
+
+    recent_messages: list[dict] = []
+    dlg_ids = [int(d["id"]) for d in client_dialogs]
+    if dlg_ids:
+        ph_ids = ",".join("?" for _ in dlg_ids)
+        for mr in conn.execute(
+            f"""
+            SELECT m.*, d.account_id, a.telegram_username AS account_username
+            FROM messages m
+            JOIN dialogs d ON d.id = m.dialog_id
+            JOIN accounts a ON a.id = d.account_id
+            WHERE m.dialog_id IN ({ph_ids})
+            ORDER BY m.sent_at DESC, m.id DESC
+            LIMIT 15
+            """,
+            dlg_ids,
+        ).fetchall():
+            recent_messages.append(as_dict(mr))
+
+    reminders: list[dict] = []
+    if eff_lid is not None:
+        reminders = [
+            as_dict(r)
+            for r in conn.execute(
+                "SELECT * FROM reminders WHERE lead_id = ? ORDER BY done_at IS NOT NULL, due_at ASC, id DESC",
+                (eff_lid,),
+            ).fetchall()
+        ]
+
+    display_name = (
+        (
+            f"{cached_tg.get('first_name') or ''} {cached_tg.get('last_name') or ''}".strip()
+            if cached_tg
+            else ""
+        )
+        or (resolved_lead.get("name") if resolved_lead else None)
+        or (primary_dialog.get("title") if primary_dialog else None)
+        or (outreach_rows[0].get("name") if outreach_rows else None)
+        or (f"@{eff_uname}" if eff_uname else None)
+        or eff_phone
+        or "Клиент"
+    )
+    final_uname = (
+        (cached_tg.get("username") if cached_tg else None)
+        or eff_uname
+        or (outreach_rows[0].get("username") if outreach_rows else None)
+    )
+    clean_final_uname = str(final_uname or "").strip().lstrip("@") or None
+    final_phone = (
+        (cached_tg.get("phone") if cached_tg else None)
+        or eff_phone
+        or (outreach_rows[0].get("phone") if outreach_rows else None)
+        or None
+    )
+    provider = str(
+        (primary_dialog.get("provider") if primary_dialog else None)
+        or (resolved_lead.get("provider") if resolved_lead else None)
+        or "telegram"
+    ).strip().lower()
+
+    telegram_profile = {
+        "peer_id": int(eff_peer_id) if eff_peer_id is not None else None,
+        "account_id": int(eff_acc_id) if eff_acc_id is not None else None,
+        "username": clean_final_uname,
+        "tg_url": f"https://t.me/{clean_final_uname}" if (clean_final_uname and provider != "whatsapp") else None,
+        "first_name": cached_tg.get("first_name") if cached_tg else None,
+        "last_name": cached_tg.get("last_name") if cached_tg else None,
+        "full_name": display_name,
+        "phone": final_phone,
+        "provider": provider,
+        "avatar_url": f"/api/dialogs/{primary_dialog['id']}/avatar" if primary_dialog else None,
+        "bio": cached_tg.get("bio") if cached_tg else None,
+        "status_text": cached_tg.get("status_text") if cached_tg else None,
+        "is_premium": bool(cached_tg.get("is_premium")) if cached_tg else False,
+        "is_verified": bool(cached_tg.get("is_verified")) if cached_tg else False,
+        "is_scam": bool(cached_tg.get("is_scam")) if cached_tg else False,
+        "is_fake": bool(cached_tg.get("is_fake")) if cached_tg else False,
+        "common_chats_count": int(cached_tg.get("common_chats_count") or 0) if cached_tg else 0,
+        "personal_channel": cached_tg.get("personal_channel") if cached_tg else None,
+        "fetched_at": cached_tg.get("fetched_at") if cached_tg else None,
+        "source": "telegram_cached" if cached_tg else "crm_only",
+    }
+
+    total_messages = sum(int(d.get("msg_count") or 0) for d in client_dialogs)
+    in_messages = sum(int(d.get("in_count") or 0) for d in client_dialogs)
+    out_messages = sum(int(d.get("out_count") or 0) for d in client_dialogs)
+    msg_dates = [str(m.get("sent_at") or "") for m in recent_messages if m.get("sent_at")]
+    if dlg_ids:
+        ph_ids = ",".join("?" for _ in dlg_ids)
+        agg_row = conn.execute(
+            f"SELECT MIN(sent_at) AS min_at, MAX(sent_at) AS max_at FROM messages WHERE dialog_id IN ({ph_ids})",
+            dlg_ids,
+        ).fetchone()
+        if agg_row is not None:
+            if agg_row["min_at"]:
+                msg_dates.append(str(agg_row["min_at"]))
+            if agg_row["max_at"]:
+                msg_dates.append(str(agg_row["max_at"]))
+    for d in client_dialogs:
+        if d.get("last_message_at"):
+            msg_dates.append(str(d["last_message_at"]))
+
+    return {
+        "lead": resolved_lead,
+        "primary_dialog_id": int(primary_dialog["id"]) if primary_dialog else None,
+        "telegram_profile": telegram_profile,
+        "outreach": outreach_rows,
+        "dialogs": client_dialogs,
+        "recent_messages": recent_messages,
+        "reminders": reminders,
+        "stats": {
+            "total_dialogs": len(client_dialogs),
+            "total_messages": total_messages,
+            "in_messages": in_messages,
+            "out_messages": out_messages,
+            "campaigns_count": len(outreach_rows),
+            "first_contact_at": min(msg_dates) if msg_dates else None,
+            "last_contact_at": max(msg_dates) if msg_dates else None,
+        },
+    }
+

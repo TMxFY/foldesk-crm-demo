@@ -769,6 +769,30 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS peer_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            peer_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            phone TEXT,
+            bio TEXT,
+            status_text TEXT,
+            is_premium INTEGER NOT NULL DEFAULT 0 CHECK (is_premium IN (0, 1)),
+            is_verified INTEGER NOT NULL DEFAULT 0 CHECK (is_verified IN (0, 1)),
+            is_scam INTEGER NOT NULL DEFAULT 0 CHECK (is_scam IN (0, 1)),
+            is_fake INTEGER NOT NULL DEFAULT 0 CHECK (is_fake IN (0, 1)),
+            is_bot INTEGER NOT NULL DEFAULT 0 CHECK (is_bot IN (0, 1)),
+            common_chats_count INTEGER DEFAULT 0,
+            personal_channel TEXT,
+            fetched_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (account_id, peer_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_peer_profiles_peer ON peer_profiles(peer_id);
         """
     )
     _migrate(conn)
@@ -1093,6 +1117,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if vac_disabled_v6 is None:
             apply_disable_vacancy_outreach_v6(conn)
+        inbox_strict_v11 = conn.execute(
+            "SELECT 1 FROM kv_settings WHERE key = 'inbox_strict_clients_hygiene_v11'"
+        ).fetchone()
+        if inbox_strict_v11 is None:
+            apply_inbox_strict_clients_hygiene_v11(conn)
     sniper_cleanup_v7 = conn.execute(
         "SELECT 1 FROM kv_settings WHERE key = 'sniper_icp_cleanup_v7'"
     ).fetchone()
@@ -2234,6 +2263,67 @@ def apply_zero_fake_wa_antiban_v10(
         "wa_campaigns_updated": int(wa_camp_updated or 0),
         "emails_fixed": emails_fixed,
         "names_fixed": names_fixed,
+    }
+
+
+def apply_inbox_strict_clients_hygiene_v11(
+    conn: sqlite3.Connection, *, force: bool = False
+) -> dict:
+    """Detach ineligible bot/service dialogs and quarantine uncontacted or pre-SoftUGC personal DMs."""
+    with locked_conn(conn):
+        if not force:
+            done = conn.execute(
+                "SELECT 1 FROM kv_settings WHERE key = 'inbox_strict_clients_hygiene_v11'"
+            ).fetchone()
+            if done is not None:
+                return {"already_applied": True}
+
+        from app.digest import heal_reply_notifications
+
+        healed_alerts = heal_reply_notifications(conn)
+        now_ts = utc_now()
+
+        uncontacted_quarantined = conn.execute(
+            """
+            UPDATE campaign_recipients
+            SET status = 'failed',
+                error_text = 'uncontacted_personal_chat_hygiene_v11',
+                updated_at = ?
+            WHERE lead_id IS NULL
+              AND status = 'replied'
+              AND (
+                  COALESCE(current_step, 0) = 0
+                  OR last_sent_at IS NULL
+                  OR trim(last_sent_at) = ''
+              )
+            """,
+            (now_ts,),
+        ).rowcount
+
+        pre_softugc_quarantined = conn.execute(
+            """
+            UPDATE campaign_recipients
+            SET status = 'failed',
+                error_text = 'pre_softugc_personal_dm_hygiene_v11',
+                updated_at = ?
+            WHERE lead_id IS NULL
+              AND status = 'replied'
+              AND last_sent_at IS NOT NULL
+              AND last_sent_at < '2026-09-01'
+            """,
+            (now_ts,),
+        ).rowcount
+
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('inbox_strict_clients_hygiene_v11', '1', ?)",
+            (now_ts,),
+        )
+        conn.commit()
+    return {
+        "already_applied": False,
+        "healed_alerts": healed_alerts,
+        "uncontacted_quarantined": int(uncontacted_quarantined or 0),
+        "pre_softugc_quarantined": int(pre_softugc_quarantined or 0),
     }
 
 

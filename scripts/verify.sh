@@ -614,9 +614,28 @@ if idx_path.is_file():
 
 if idx_path.is_file() and js_path.is_file():
     js_src = js_path.read_text(encoding="utf-8")
-    for req_fn in ("function moveDialogToStage(", "function renderStatsExecutiveBlocks(", "function buildInboxStageBar("):
+    for req_fn in (
+        "function moveDialogToStage(",
+        "function renderStatsExecutiveBlocks(",
+        "function buildInboxStageBar(",
+        "function openClientProfile(",
+    ):
         if req_fn not in js_src:
             errors.append(f"Gate K violation in app/static/app.js: missing {req_fn}")
+
+# Gate L: Strict CRM-Only Inbox Eligibility & Full Client Profile Drawer
+if idx_path.is_file() and 'id="client-profile-modal"' not in idx_html:
+    errors.append("Gate L violation in app/templates/index.html: missing id=\"client-profile-modal\"")
+if (root / "app" / "inbox.py").is_file():
+    inbox_src_l = (root / "app" / "inbox.py").read_text(encoding="utf-8")
+    m_fcm = re.search(r"def _filter_crm_only_rows\([\s\S]*?(?=\ndef\s)", inbox_src_l)
+    if not m_fcm or "is_ineligible_reply_notify_peer" not in m_fcm.group(0):
+        errors.append("Gate L violation in app/inbox.py: _filter_crm_only_rows must enforce is_ineligible_reply_notify_peer")
+if main_py_file.is_file() and (root / "app" / "inbox.py").is_file():
+    main_src_l = main_py_file.read_text(encoding="utf-8")
+    for prof_route in ("/api/dialogs/{dialog_id}/profile", "/api/leads/{lead_id}/profile"):
+        if prof_route not in main_src_l:
+            errors.append(f"Gate L violation in app/main.py: missing route '{prof_route}'")
 
 if errors:
     for err in errors:

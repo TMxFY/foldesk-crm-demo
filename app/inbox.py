@@ -313,6 +313,7 @@ def _public(row) -> dict:
         "unread_count": data["unread_count"],
         "muted": data["muted"],
         "is_group": data["is_group"],
+        "is_bot": int(data.get("is_bot") or 0),
         "last_message_at": data["last_message_at"],
         "last_message_preview": data["last_message_preview"],
         "last_from_peer": data["last_from_peer"],
@@ -1369,7 +1370,7 @@ def _upsert_snapshot_dialog(
             "SELECT * FROM dialogs WHERE id = ?",
             (row["id"],),
         ).fetchone()
-    return _public(row)
+    return _load_dialog_public(conn, int(row["id"])) if row is not None else None
 
 
 def remember_dialogs(conn, account_id: int, people: list, opener=None) -> list:
@@ -1661,7 +1662,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
             )
         row = conn.execute("SELECT * FROM dialogs WHERE id = ?", (int(prev_dlg["id"]),)).fetchone()
         conn.commit()
-        return _public(row)
+        return _load_dialog_public(conn, int(row["id"]))
 
     prev_read_max_id = int(prev_dlg["read_inbox_max_id"] or 0) if prev_dlg is not None else 0
     is_already_read_mid = bool(mid is not None and prev_read_max_id > 0 and int(mid) <= prev_read_max_id)
@@ -1770,7 +1771,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
             (row["id"],),
         ).fetchone()
     conn.commit()
-    return _public(row)
+    return _load_dialog_public(conn, int(row["id"]))
 
 
 def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
@@ -1921,7 +1922,7 @@ def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
     except sqlite3.IntegrityError:
         pass
     conn.commit()
-    return _public(row)
+    return _load_dialog_public(conn, int(row["id"]))
 
 
 def apply_inbox_read_update(
@@ -1948,7 +1949,17 @@ def apply_inbox_read_update(
         force_bump_turn=False,
     )
     conn.commit()
-    return _public(updated)
+    return _load_dialog_public(conn, int(updated["id"]))
+
+
+def _is_vacancy_campaign_meta(
+    name: str | None, leadgen_sources_json: str | None = None
+) -> bool:
+    low = str(name or "").casefold()
+    if "ваканс" in low or "vacanc" in low:
+        return True
+    src_low = str(leadgen_sources_json or "").casefold()
+    return '"vacancies' in src_low
 
 
 def _person_is_crm_relevant(
@@ -1957,10 +1968,23 @@ def _person_is_crm_relevant(
     peer_id: int,
     username: str | None,
     phone: str | None,
+    *,
+    is_bot: bool = False,
 ) -> bool:
     clean_u = (username or "").strip().lstrip("@").lower()
     clean_p = (phone or "").strip()
     p_digits = re.sub(r"\D", "", clean_p)
+
+    inelig, _ = is_ineligible_reply_notify_peer(
+        conn,
+        peer_id=int(peer_id) if peer_id is not None else None,
+        username=clean_u or None,
+        phone=clean_p or None,
+        account_id=int(account_id) if account_id is not None else None,
+        is_bot=bool(is_bot),
+    )
+    if inelig:
+        return False
 
     dlg_existing = conn.execute(
         """
@@ -1970,9 +1994,6 @@ def _person_is_crm_relevant(
         """,
         (int(account_id), int(peer_id)),
     ).fetchone()
-    if dlg_existing is not None and dlg_existing["lead_id"] is not None:
-        return True
-
     lead_clauses = ["telegram_user_id = ?"]
     lead_params: list = [int(peer_id)]
     if clean_u:
@@ -1987,30 +2008,63 @@ def _person_is_crm_relevant(
         lead_clauses.append("phone = ?")
         lead_params.append(f"+{p_digits}")
 
-    if conn.execute(
-        f"SELECT 1 FROM leads WHERE {' OR '.join(lead_clauses)} LIMIT 1",
+    matched_leads = conn.execute(
+        f"SELECT id, status FROM leads WHERE {' OR '.join(lead_clauses)}",
         lead_params,
-    ).fetchone() is not None:
-        return True
+    ).fetchall()
+    has_won_lead = False
+    for lr in matched_leads:
+        raw_st = str(lr["status"] or "").strip().lower()
+        try:
+            norm_st = normalize_status(raw_st, conn).strip().lower() if raw_st else ""
+        except ValueError:
+            norm_st = raw_st
+        if raw_st in ("won", "signed") or norm_st == "won":
+            has_won_lead = True
+            break
 
-    rec_clauses = ["telegram_user_id = ?"]
+    rec_clauses = ["cr.telegram_user_id = ?"]
     rec_params: list = [int(peer_id)]
     if clean_u:
-        rec_clauses.append("(username IS NOT NULL AND ltrim(lower(username), '@') = ?)")
+        rec_clauses.append("(cr.username IS NOT NULL AND ltrim(lower(cr.username), '@') = ?)")
         rec_params.append(clean_u)
     if clean_p:
-        rec_clauses.append("phone = ?")
+        rec_clauses.append("cr.phone = ?")
         rec_params.append(clean_p)
     if len(p_digits) >= 7:
-        rec_clauses.append("phone = ?")
+        rec_clauses.append("cr.phone = ?")
         rec_params.append(p_digits)
-        rec_clauses.append("phone = ?")
+        rec_clauses.append("cr.phone = ?")
         rec_params.append(f"+{p_digits}")
 
-    if conn.execute(
-        f"SELECT 1 FROM campaign_recipients WHERE {' OR '.join(rec_clauses)} LIMIT 1",
+    has_vac_rec = False
+    has_reg_active_rec = False
+    has_reg_any_rec = False
+    for rrow in conn.execute(
+        f"""
+        SELECT cr.status, c.name AS camp_name, c.leadgen_sources_json AS camp_sources
+        FROM campaign_recipients cr
+        LEFT JOIN campaigns c ON c.id = cr.campaign_id
+        WHERE {' OR '.join(rec_clauses)}
+        """,
         rec_params,
-    ).fetchone() is not None:
+    ).fetchall():
+        is_vac = _is_vacancy_campaign_meta(rrow["camp_name"], rrow["camp_sources"])
+        if is_vac:
+            has_vac_rec = True
+        else:
+            has_reg_any_rec = True
+            if str(rrow["status"] or "").strip().lower() in ("in_progress", "replied"):
+                has_reg_active_rec = True
+
+    if has_vac_rec and not has_reg_any_rec and not has_won_lead:
+        return False
+
+    if dlg_existing is not None and dlg_existing["lead_id"] is not None:
+        return True
+    if matched_leads:
+        return True
+    if has_reg_active_rec:
         return True
 
     return False
@@ -2044,7 +2098,12 @@ def sync_inbox(
                 provider = str(person.get("provider") or acc_provider or "telegram").strip().lower()
                 phone = _extract_dialog_phone(person, int(peer_id), provider)
                 if not _person_is_crm_relevant(
-                    conn, account_id, int(peer_id), username, phone
+                    conn,
+                    account_id,
+                    int(peer_id),
+                    username,
+                    phone,
+                    is_bot=bool(person.get("is_bot")),
                 ):
                     continue
             item = _upsert_snapshot_dialog(
@@ -2151,36 +2210,52 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
         return []
     rec_rows = conn.execute(
         """
-        SELECT lead_id, telegram_user_id, username, phone, status
-        FROM campaign_recipients
+        SELECT cr.lead_id, cr.telegram_user_id, cr.username, cr.phone,
+               cr.status, cr.current_step, cr.last_sent_at, cr.sent_account_id,
+               c.name AS camp_name, c.leadgen_sources_json AS camp_sources
+        FROM campaign_recipients cr
+        LEFT JOIN campaigns c ON c.id = cr.campaign_id
         """
     ).fetchall()
-    recs_by_lid: dict[int, list[str]] = {}
-    recs_by_tgid: dict[int, list[str]] = {}
-    recs_by_uname: dict[str, list[str]] = {}
-    recs_by_phone: dict[str, list[str]] = {}
+    recs_by_lid: dict[int, list[dict]] = {}
+    recs_by_tgid: dict[int, list[dict]] = {}
+    recs_by_uname: dict[str, list[dict]] = {}
+    recs_by_phone: dict[str, list[dict]] = {}
     for rr in rec_rows:
-        st = str(rr["status"] or "").strip().lower()
+        rec_meta = {
+            "status": str(rr["status"] or "").strip().lower(),
+            "current_step": int(rr["current_step"] or 0),
+            "last_sent_at": str(rr["last_sent_at"] or "").strip(),
+            "sent_account_id": int(rr["sent_account_id"]) if rr["sent_account_id"] is not None else None,
+            "is_vacancy": _is_vacancy_campaign_meta(rr["camp_name"], rr["camp_sources"]),
+        }
         if rr["lead_id"] is not None:
-            recs_by_lid.setdefault(int(rr["lead_id"]), []).append(st)
+            recs_by_lid.setdefault(int(rr["lead_id"]), []).append(rec_meta)
         if rr["telegram_user_id"] is not None:
-            recs_by_tgid.setdefault(int(rr["telegram_user_id"]), []).append(st)
+            recs_by_tgid.setdefault(int(rr["telegram_user_id"]), []).append(rec_meta)
         if rr["username"]:
             u = str(rr["username"]).strip().lstrip("@").lower()
             if u:
-                recs_by_uname.setdefault(u, []).append(st)
+                recs_by_uname.setdefault(u, []).append(rec_meta)
         if rr["phone"]:
             p_dig = re.sub(r"\D", "", str(rr["phone"]))
             if len(p_dig) >= 7:
-                recs_by_phone.setdefault(p_dig, []).append(st)
+                recs_by_phone.setdefault(p_dig, []).append(rec_meta)
 
     in_msg_dialog_ids: set[int] = set()
+    any_msg_dialog_ids: set[int] = set()
     dialog_ids = [int(r["id"]) for r in rows if r.get("id") is not None]
-    if dialog_ids:
-        ph_dids = ",".join("?" for _ in dialog_ids)
+    for start in range(0, len(dialog_ids), 400):
+        chunk_dids = dialog_ids[start : start + 400]
+        ph_dids = ",".join("?" for _ in chunk_dids)
+        for mrow in conn.execute(
+            f"SELECT DISTINCT dialog_id FROM messages WHERE dialog_id IN ({ph_dids})",
+            chunk_dids,
+        ).fetchall():
+            any_msg_dialog_ids.add(int(mrow["dialog_id"]))
         for mrow in conn.execute(
             f"SELECT DISTINCT dialog_id FROM messages WHERE dialog_id IN ({ph_dids}) AND direction = 'in'",
-            dialog_ids,
+            chunk_dids,
         ).fetchall():
             in_msg_dialog_ids.add(int(mrow["dialog_id"]))
 
@@ -2199,35 +2274,71 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
         if (row.get("peer_type") or "user") != "user":
             continue
 
-        matched_rec_statuses: list[str] = []
-        lid = row.get("lead_id")
-        if lid is not None and int(lid) in recs_by_lid:
-            matched_rec_statuses.extend(recs_by_lid[int(lid)])
+        row_acc_id = int(row["account_id"]) if row.get("account_id") is not None else None
         tg_id = row.get("telegram_user_id")
-        if tg_id is not None and int(tg_id) in recs_by_tgid:
-            matched_rec_statuses.extend(recs_by_tgid[int(tg_id)])
         uname = str(row.get("username") or "").strip().lstrip("@").lower()
-        if uname and uname in recs_by_uname:
-            matched_rec_statuses.extend(recs_by_uname[uname])
         p_dig = re.sub(r"\D", "", str(row.get("phone") or ""))
-        if len(p_dig) >= 7 and p_dig in recs_by_phone:
-            matched_rec_statuses.extend(recs_by_phone[p_dig])
 
-        has_any_rec = len(matched_rec_statuses) > 0
-        has_replied_rec = "replied" in matched_rec_statuses
-        has_lead = bool(row.get("lead_id") is not None or row.get("lead_status"))
-
-        if not has_lead and not has_replied_rec:
+        inelig, _ = is_ineligible_reply_notify_peer(
+            conn,
+            peer_id=int(tg_id) if tg_id is not None else None,
+            username=uname or None,
+            phone=row.get("phone"),
+            account_id=row_acc_id,
+            is_bot=bool(row.get("is_bot")),
+        )
+        if inelig:
             continue
 
-        if has_any_rec and not has_replied_rec:
+        dlg_id = int(row["id"]) if row.get("id") is not None else None
+        if not str(row.get("last_message_preview") or "").strip() and (
+            dlg_id is None or dlg_id not in any_msg_dialog_ids
+        ):
+            continue
+
+        matched_recs: list[dict] = []
+        lid = row.get("lead_id")
+        if lid is not None and int(lid) in recs_by_lid:
+            matched_recs.extend(recs_by_lid[int(lid)])
+        if tg_id is not None and int(tg_id) in recs_by_tgid:
+            matched_recs.extend(recs_by_tgid[int(tg_id)])
+        if uname and uname in recs_by_uname:
+            matched_recs.extend(recs_by_uname[uname])
+        if len(p_dig) >= 7 and p_dig in recs_by_phone:
+            matched_recs.extend(recs_by_phone[p_dig])
+
+        reg_recs = [rc for rc in matched_recs if not rc["is_vacancy"]]
+        vac_recs = [rc for rc in matched_recs if rc["is_vacancy"]]
+
+        raw_lstatus = str(row.get("lead_status") or "").strip().lower()
+        try:
+            norm_lstatus = normalize_status(raw_lstatus, conn).strip().lower() if raw_lstatus else ""
+        except ValueError:
+            norm_lstatus = raw_lstatus
+
+        if vac_recs and not reg_recs and norm_lstatus != "won":
+            continue
+
+        has_any_rec = len(reg_recs) > 0
+        has_valid_replied_rec = any(
+            rc["status"] == "replied"
+            and rc["current_step"] >= 1
+            and bool(rc["last_sent_at"])
+            and (
+                rc["sent_account_id"] is None
+                or row_acc_id is None
+                or rc["sent_account_id"] == row_acc_id
+            )
+            for rc in reg_recs
+        )
+        has_lead = bool(row.get("lead_id") is not None or row.get("lead_status"))
+
+        if not has_lead and not has_valid_replied_rec:
+            continue
+
+        if has_any_rec and not has_valid_replied_rec:
             last_from_peer = int(row.get("last_from_peer") or 0)
-            has_in_msg = int(row["id"]) in in_msg_dialog_ids
-            raw_lstatus = str(row.get("lead_status") or "").strip().lower()
-            try:
-                norm_lstatus = normalize_status(raw_lstatus, conn).strip().lower() if raw_lstatus else ""
-            except ValueError:
-                norm_lstatus = raw_lstatus
+            has_in_msg = dlg_id is not None and dlg_id in in_msg_dialog_ids
             is_active_deal = (
                 raw_lstatus in active_deal_statuses
                 or norm_lstatus in ("talking", "call_scheduled", "won")
@@ -2419,7 +2530,9 @@ def _load_dialog_public(conn, dialog_id: int) -> dict:
     ).fetchone()
     if row is None:
         raise LookupError("dialog")
-    return _public(row)
+    out = _public(row)
+    _resolve_missing_lead_status_by_phone(conn, [out])
+    return out
 
 
 def mark_dialog_unread(conn, dialog_id: int) -> dict:

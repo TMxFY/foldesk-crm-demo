@@ -428,6 +428,15 @@ class TelegramGateway(ABC):
     ) -> str | None:
         return None
 
+    async def fetch_peer_profile(
+        self,
+        session_path: str,
+        peer_id: int | str,
+        *,
+        username: str | None = None,
+    ) -> dict | None:
+        return None
+
     async def fetch_messages(self, session_path: str, peer_id: int, limit: int = 50) -> list:
         """Last personal-dialog messages, oldest first. Not groups or channels."""
         raise GatewayError("История не подключена")
@@ -2657,6 +2666,157 @@ class TelethonGateway(TelegramGateway):
             else:
                 pending_map[session_path] = cur_pending - 1
 
+    async def fetch_peer_profile(
+        self,
+        session_path: str,
+        peer_id: int | str,
+        *,
+        username: str | None = None,
+    ) -> dict | None:
+        from telethon.tl.functions.users import GetFullUserRequest
+        from telethon.tl.types import User
+
+        target = (
+            int(peer_id)
+            if isinstance(peer_id, int) or str(peer_id).lstrip("-").isdigit()
+            else str(peer_id or "").strip()
+        )
+        if not target and username:
+            target = str(username).strip().lstrip("@")
+        if not target:
+            return None
+
+        lock = self._session_lock(session_path)
+        lock_acquired = False
+        client = None
+        owned = False
+        try:
+            try:
+                async with asyncio.timeout(2.5):
+                    await lock.acquire()
+                lock_acquired = True
+            except TimeoutError:
+                return None
+
+            try:
+                client, owned = await asyncio.wait_for(
+                    self._open(session_path), timeout=self._avatar_timeout
+                )
+                entity = await self._resolve_avatar_entity(
+                    client, session_path, target, username=username
+                )
+                if not isinstance(entity, User):
+                    return None
+                full = await asyncio.wait_for(
+                    client(GetFullUserRequest(entity)),
+                    timeout=6.0,
+                )
+                full_user = getattr(full, "full_user", None)
+                user_obj = entity
+                for candidate in getattr(full, "users", None) or ():
+                    if getattr(candidate, "id", None) == getattr(entity, "id", None):
+                        user_obj = candidate
+                        break
+
+                uname = getattr(user_obj, "username", None)
+                if not uname:
+                    for un in getattr(user_obj, "usernames", None) or ():
+                        if getattr(un, "active", False) and getattr(un, "username", None):
+                            uname = un.username
+                            break
+                clean_uname = str(uname or "").strip().lstrip("@") or None
+
+                raw_phone = str(getattr(user_obj, "phone", None) or "").strip()
+                clean_phone = (
+                    (raw_phone if raw_phone.startswith("+") else f"+{raw_phone}")
+                    if raw_phone
+                    else None
+                )
+
+                st_obj = getattr(user_obj, "status", None)
+                st_name = type(st_obj).__name__ if st_obj is not None else ""
+                status_text = None
+                if st_name == "UserStatusOnline":
+                    status_text = "В сети"
+                elif st_name == "UserStatusRecently":
+                    status_text = "Был(а) недавно"
+                elif st_name == "UserStatusLastWeek":
+                    status_text = "Был(а) на этой неделе"
+                elif st_name == "UserStatusLastMonth":
+                    status_text = "Был(а) в этом месяце"
+                elif st_name == "UserStatusOffline":
+                    was = getattr(st_obj, "was_online", None)
+                    if was is not None:
+                        try:
+                            if getattr(was, "tzinfo", None) is not None:
+                                was = was.astimezone(timezone.utc)
+                            status_text = f"Был(а) {was.strftime('%d.%m %H:%M UTC')}"
+                        except Exception:
+                            status_text = "Не в сети"
+                    else:
+                        status_text = "Не в сети"
+
+                personal_channel = None
+                p_ch_id = getattr(full_user, "personal_channel_id", None)
+                if p_ch_id:
+                    for ch in getattr(full, "chats", None) or ():
+                        if getattr(ch, "id", None) == p_ch_id:
+                            ch_u = str(getattr(ch, "username", None) or "").strip().lstrip("@")
+                            ch_t = str(getattr(ch, "title", None) or "").strip()
+                            personal_channel = (
+                                f"@{ch_u} · {ch_t}".strip(" ·")
+                                if ch_u
+                                else (ch_t or f"channel:{p_ch_id}")
+                            )
+                            break
+
+                bio = str(getattr(full_user, "about", None) or "").strip() or None
+                return {
+                    "peer_id": int(getattr(user_obj, "id", target)),
+                    "username": clean_uname,
+                    "first_name": str(getattr(user_obj, "first_name", None) or "").strip() or None,
+                    "last_name": str(getattr(user_obj, "last_name", None) or "").strip() or None,
+                    "phone": clean_phone,
+                    "bio": bio,
+                    "status_text": status_text,
+                    "is_premium": bool(getattr(user_obj, "premium", False)),
+                    "is_verified": bool(getattr(user_obj, "verified", False)),
+                    "is_scam": bool(getattr(user_obj, "scam", False)),
+                    "is_fake": bool(getattr(user_obj, "fake", False)),
+                    "is_bot": bool(getattr(user_obj, "bot", False)),
+                    "common_chats_count": int(getattr(full_user, "common_chats_count", 0) or 0),
+                    "personal_channel": personal_channel,
+                }
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                is_conn_err = isinstance(exc, ConnectionError) or (
+                    isinstance(exc, OSError) and not isinstance(exc, TimeoutError)
+                )
+                if client is not None and (is_conn_err or not client.is_connected()):
+                    await self._drop_zombie_client_unlocked(session_path)
+                return None
+            except Exception as exc:
+                if _classify_session_error(exc).get("health") in (
+                    "unauthorized",
+                    "banned",
+                    "frozen",
+                ):
+                    await self._evict_client_unlocked(session_path)
+                return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        finally:
+            if lock_acquired:
+                lock.release()
+            if owned:
+                try:
+                    await self._close(session_path)
+                except Exception:
+                    pass
+
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:
         async with self._session_lock(session_path):
             for attempt in range(2):
@@ -3292,11 +3452,17 @@ class FakeGateway(TelegramGateway):
         history=None,
         health=None,
         folders=None,
+        profiles=None,
     ):
         self.code = code
         self.password = password
         self.needs_password = needs_password
         self.health = health
+        self.profiles = {}
+        for k, v in (profiles or {}).items():
+            raw_k = str(k).strip()
+            norm_k = raw_k.lstrip("@").lower() if not raw_k.lstrip("-").isdigit() else raw_k
+            self.profiles[norm_k] = dict(v)
         self.dialogs = [dict(item) for item in (dialogs or [])]
         self.folders = []
         for item in folders or []:
@@ -3795,6 +3961,21 @@ class FakeGateway(TelegramGateway):
     async def download_profile_photo(
         self, session_path: str, peer_id: int | str, dest_path: str
     ) -> str | None:
+        return None
+
+    async def fetch_peer_profile(
+        self,
+        session_path: str,
+        peer_id: int | str,
+        *,
+        username: str | None = None,
+    ) -> dict | None:
+        keys = [str(peer_id)]
+        if username:
+            keys.append(str(username).strip().lstrip("@").lower())
+        for k in keys:
+            if k in self.profiles:
+                return dict(self.profiles[k])
         return None
 
     async def fetch_messages(self, session_path: str, peer_id, limit: int = 50) -> list:

@@ -64,6 +64,8 @@ from app.funnel_analytics import (
 )
 from app.inbox import (
     _filter_crm_only_rows,
+    _is_vacancy_campaign_meta,
+    _person_is_crm_relevant,
     apply_incoming,
     edit_dialog_message,
     ensure_playable_voice_wav,
@@ -82,7 +84,16 @@ from app.inbox import (
     sync_inbox,
 )
 from app.folders import list_folders, pull_folders, sync_all_folders, sync_folder, update_folder
-from app.leads import add_lead_from_dialog, create_lead, get_lead, lead_card, search_leads, update_lead
+from app.leads import (
+    add_lead_from_dialog,
+    create_lead,
+    get_client_full_profile,
+    get_lead,
+    lead_card,
+    search_leads,
+    update_lead,
+    upsert_peer_profile,
+)
 from app.notes import add_note
 from app.outreach import (
     create_campaign,
@@ -109,7 +120,12 @@ from app.properties import (
 )
 from app.tools import convert_phones_to_tg, parse_telegram_group
 from app.bot_login import apply_bot_update, handle_bot_reply_to_lead, operator_status, poll_bot_login
-from app.digest import apply_digest_callback, callback_data_from_update, send_morning_digest
+from app.digest import (
+    apply_digest_callback,
+    callback_data_from_update,
+    is_ineligible_reply_notify_peer,
+    send_morning_digest,
+)
 from app.reminders import complete_reminder, create_reminder, list_reminders, postpone_reminder
 from app.tasks import create_task, set_task_done
 from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
@@ -680,6 +696,8 @@ async def _run_db_sync(conn, func, *args, **kwargs):
 def _filter_people_to_existing_or_crm(
     conn, account_id: int, people: list[dict]
 ) -> list[dict]:
+    import re as _re
+
     if not people:
         return []
     existing_peer_ids = {
@@ -692,23 +710,40 @@ def _filter_people_to_existing_or_crm(
     crm_tg_ids = {
         int(r[0])
         for r in conn.execute(
-            """
-            SELECT telegram_user_id FROM leads WHERE telegram_user_id IS NOT NULL
-            UNION
-            SELECT telegram_user_id FROM campaign_recipients WHERE telegram_user_id IS NOT NULL
-            """
+            "SELECT telegram_user_id FROM leads WHERE telegram_user_id IS NOT NULL"
         ).fetchall()
     }
     crm_usernames = {
         str(r[0]).strip().lstrip("@").lower()
         for r in conn.execute(
-            """
-            SELECT username FROM leads WHERE username IS NOT NULL AND username != ''
-            UNION
-            SELECT username FROM campaign_recipients WHERE username IS NOT NULL AND username != ''
-            """
+            "SELECT username FROM leads WHERE username IS NOT NULL AND username != ''"
         ).fetchall()
     }
+    crm_phones: set[str] = set()
+    for pr in conn.execute("SELECT phone FROM leads WHERE phone IS NOT NULL AND phone != ''").fetchall():
+        dig = _re.sub(r"\D", "", str(pr[0] or ""))
+        if len(dig) >= 7:
+            crm_phones.add(dig[-15:])
+    for rr in conn.execute(
+        """
+        SELECT cr.telegram_user_id, cr.username, cr.phone, c.name AS camp_name, c.leadgen_sources_json AS camp_sources
+        FROM campaign_recipients cr
+        LEFT JOIN campaigns c ON c.id = cr.campaign_id
+        WHERE cr.status IN ('in_progress', 'replied')
+        """
+    ).fetchall():
+        if _is_vacancy_campaign_meta(rr["camp_name"], rr["camp_sources"]):
+            continue
+        if rr["telegram_user_id"] is not None:
+            crm_tg_ids.add(int(rr["telegram_user_id"]))
+        if rr["username"]:
+            u = str(rr["username"]).strip().lstrip("@").lower()
+            if u:
+                crm_usernames.add(u)
+        if rr["phone"]:
+            dig = _re.sub(r"\D", "", str(rr["phone"] or ""))
+            if len(dig) >= 7:
+                crm_phones.add(dig[-15:])
     filtered = []
     for p in people:
         if not isinstance(p, dict):
@@ -719,9 +754,22 @@ def _filter_people_to_existing_or_crm(
         except (TypeError, ValueError):
             pid_int = None
         uname = str(p.get("username") or "").strip().lstrip("@").lower()
+        p_dig = _re.sub(r"\D", "", str(p.get("phone") or ""))
+        p_norm = p_dig[-15:] if len(p_dig) >= 7 else ""
+        inelig, _ = is_ineligible_reply_notify_peer(
+            conn,
+            peer_id=pid_int,
+            username=uname or None,
+            phone=p.get("phone"),
+            account_id=account_id,
+            is_bot=bool(p.get("is_bot")),
+        )
+        if inelig:
+            continue
         if (
             (pid_int is not None and (pid_int in existing_peer_ids or pid_int in crm_tg_ids))
             or (uname and uname in crm_usernames)
+            or (p_norm and p_norm in crm_phones)
         ):
             filtered.append(p)
     return filtered
@@ -813,10 +861,12 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if str(account.get("session_path") or "").startswith("data/sessions/demo"):
             synced.add(account_id)
             return
+        is_live_tg = (
+            not is_ephemeral_runtime()
+            and isinstance(getattr(app.state, "gateway", None), (type(None), TelethonGateway))
+        )
         existing_only_refresh = False
-        if not is_ephemeral_runtime() and isinstance(
-            getattr(app.state, "gateway", None), (type(None), TelethonGateway)
-        ):
+        if is_live_tg:
             with locked_conn(app.state.conn):
                 total_dlg_cnt = app.state.conn.execute(
                     "SELECT COUNT(*) FROM dialogs WHERE account_id = ?",
@@ -831,7 +881,7 @@ async def ensure_private_inbox(app, account_id: int) -> None:
             return
         try:
             people = await gateway.load_inbox(
-                account["session_path"], limit=60 if existing_only_refresh else 30
+                account["session_path"], limit=60 if (existing_only_refresh or is_live_tg) else 30
             )
         except Exception:
             if existing_only_refresh:
@@ -846,9 +896,9 @@ async def ensure_private_inbox(app, account_id: int) -> None:
                 app,
                 app.state.conn,
                 account_id,
-                people[: (60 if existing_only_refresh else 30)],
-                crm_only=existing_only_refresh,
-                notify=not existing_only_refresh,
+                people[: (60 if (existing_only_refresh or is_live_tg) else 30)],
+                crm_only=bool(existing_only_refresh or is_live_tg),
+                notify=not (existing_only_refresh or is_live_tg),
             )
         except (LookupError, ValueError):
             return
@@ -1972,7 +2022,12 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         )
 
     @app.get("/api/accounts/{account_id}/dialogs")
-    async def account_dialogs(account_id: int, request: Request, q: str = ""):
+    async def account_dialogs(
+        account_id: int,
+        request: Request,
+        q: str = "",
+        crm_only: bool = False,
+    ):
         try:
             with locked_conn(request.app.state.conn):
                 account = load_account(request.app.state.conn, account_id)
@@ -1986,8 +2041,39 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         except GatewayError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         with locked_conn(request.app.state.conn):
-            saved = remember_dialogs(request.app.state.conn, account_id, found[:30])
-            sync_dialog_read_receipts(request.app.state.conn, account_id, found[:30])
+            eligible_found = []
+            for item in (found or [])[:30]:
+                if not isinstance(item, dict):
+                    continue
+                pid = item.get("telegram_user_id") if item.get("telegram_user_id") is not None else item.get("peer_id")
+                try:
+                    pid_int = int(pid) if pid is not None else None
+                except (TypeError, ValueError):
+                    pid_int = None
+                inelig, _ = is_ineligible_reply_notify_peer(
+                    request.app.state.conn,
+                    peer_id=pid_int,
+                    username=item.get("username"),
+                    phone=item.get("phone"),
+                    account_id=account_id,
+                    is_bot=bool(item.get("is_bot")),
+                )
+                if inelig:
+                    continue
+                if crm_only and pid_int is not None and not _person_is_crm_relevant(
+                    request.app.state.conn,
+                    account_id,
+                    pid_int,
+                    item.get("username"),
+                    item.get("phone"),
+                    is_bot=bool(item.get("is_bot")),
+                ):
+                    continue
+                eligible_found.append(item)
+            saved = remember_dialogs(request.app.state.conn, account_id, eligible_found)
+            sync_dialog_read_receipts(request.app.state.conn, account_id, eligible_found)
+            if crm_only:
+                saved = _filter_crm_only_rows(request.app.state.conn, saved)
         return saved
 
     @app.post("/api/leads")
@@ -2189,6 +2275,138 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     @app.get("/api/leads/{lead_id}/card")
     async def leads_card(lead_id: int, request: Request):
         return _call(lead_card, request.app.state.conn, lead_id)
+
+    async def _resolve_and_enrich_client_profile(
+        request: Request,
+        *,
+        lead_id: int | None = None,
+        dialog_id: int | None = None,
+        refresh: bool = False,
+    ) -> dict:
+        conn = request.app.state.conn
+        try:
+            profile = await _run_db_sync(
+                conn,
+                get_client_full_profile,
+                conn,
+                lead_id=lead_id,
+                dialog_id=dialog_id,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Не найдено") from exc
+        tg_prof = profile.get("telegram_profile") or {}
+        need_live = bool(refresh) or tg_prof.get("source") == "crm_only"
+        if not need_live:
+            return profile
+
+        dialogs_pool = profile.get("dialogs") or []
+        candidate_acc_ids: list[int] = []
+        if tg_prof.get("account_id") is not None:
+            candidate_acc_ids.append(int(tg_prof["account_id"]))
+        for d in dialogs_pool:
+            if d.get("account_id") is not None and int(d["account_id"]) not in candidate_acc_ids:
+                candidate_acc_ids.append(int(d["account_id"]))
+        if profile.get("lead") and profile["lead"].get("account_id") is not None:
+            laid = int(profile["lead"]["account_id"])
+            if laid not in candidate_acc_ids:
+                candidate_acc_ids.append(laid)
+
+        peer_target = tg_prof.get("peer_id") or tg_prof.get("username")
+        if not peer_target:
+            return profile
+
+        def _pick_tg_account(pref_ids: list[int]) -> dict | None:
+            checked = list(pref_ids)
+            for ar in conn.execute(
+                "SELECT id FROM accounts WHERE status = 'connected' ORDER BY id ASC"
+            ).fetchall():
+                aid_val = int(ar[0])
+                if aid_val not in checked:
+                    checked.append(aid_val)
+            for aid in checked:
+                try:
+                    acc = load_account(conn, aid)
+                except LookupError:
+                    continue
+                prov = str(acc.get("provider") or "telegram").strip().lower()
+                if prov != "telegram" or acc.get("status") != "connected":
+                    continue
+                if str(acc.get("health") or "active").strip().lower() in ("unauthorized", "banned", "frozen"):
+                    continue
+                sess_path = str(acc.get("session_path") or "")
+                if sess_path.startswith("data/sessions/demo") and isinstance(
+                    getattr(request.app.state, "gateway", None), (type(None), TelethonGateway)
+                ):
+                    continue
+                return acc
+            return None
+
+        chosen_acc = await _run_db_sync(conn, _pick_tg_account, candidate_acc_ids)
+        if chosen_acc is None:
+            return profile
+
+        gateway = _resolve_app_gateway(request.app, "telegram")
+        fetch_fn = getattr(gateway, "fetch_peer_profile", None) if gateway is not None else None
+        if not callable(fetch_fn):
+            return profile
+
+        try:
+            fetched = await fetch_fn(
+                chosen_acc["session_path"],
+                tg_prof.get("peer_id") or tg_prof.get("username"),
+                username=tg_prof.get("username"),
+            )
+        except Exception:
+            fetched = None
+
+        if isinstance(fetched, dict):
+            stored_peer = fetched.get("peer_id") or tg_prof.get("peer_id")
+            if stored_peer is not None:
+                await _run_db_sync(
+                    conn,
+                    upsert_peer_profile,
+                    conn,
+                    int(chosen_acc["id"]),
+                    int(stored_peer),
+                    fetched,
+                )
+            refreshed = await _run_db_sync(
+                conn,
+                get_client_full_profile,
+                conn,
+                lead_id=lead_id,
+                dialog_id=dialog_id,
+            )
+            r_tg = refreshed.get("telegram_profile")
+            if isinstance(r_tg, dict):
+                if r_tg.get("source") == "crm_only":
+                    for k in (
+                        "bio",
+                        "status_text",
+                        "is_premium",
+                        "is_verified",
+                        "is_scam",
+                        "is_fake",
+                        "common_chats_count",
+                        "personal_channel",
+                    ):
+                        if fetched.get(k) is not None and not r_tg.get(k):
+                            r_tg[k] = fetched[k]
+                r_tg["source"] = "telegram_live"
+            return refreshed
+        return profile
+
+    @app.get("/api/leads/{lead_id}/profile")
+    async def leads_profile(lead_id: int, request: Request, refresh: bool = False):
+        return await _resolve_and_enrich_client_profile(
+            request, lead_id=lead_id, refresh=bool(refresh)
+        )
+
+    @app.get("/api/dialogs/{dialog_id}/profile")
+    async def dialogs_profile(dialog_id: int, request: Request, refresh: bool = False):
+        return await _resolve_and_enrich_client_profile(
+            request, dialog_id=dialog_id, refresh=bool(refresh)
+        )
 
     @app.get("/api/leads/{lead_id}/events")
     async def leads_events_list(lead_id: int, request: Request, limit: int = 200):
