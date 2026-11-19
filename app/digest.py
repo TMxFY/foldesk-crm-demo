@@ -279,7 +279,12 @@ def _check_lead_or_recipient_backing(
             rc_params.append(norm_phone_digits)
         if rc_clauses:
             found_rec = conn.execute(
-                f"SELECT 1 FROM campaign_recipients WHERE {' OR '.join(rc_clauses)} LIMIT 1",
+                f"""
+                SELECT 1 FROM campaign_recipients
+                WHERE ({' OR '.join(rc_clauses)})
+                  AND lower(coalesce(status, '')) IN ('in_progress', 'completed', 'replied')
+                LIMIT 1
+                """,
                 rc_params,
             ).fetchone()
             if found_rec is not None:
@@ -744,7 +749,16 @@ def _should_skip_reply_notification(
     turn_seq = int(dlg_row["reply_turn_seq"] or 0) if dlg_row is not None else 0
 
     if dlg_row is not None:
-        # 1) Guard: manager already replied
+        # 1) Guard: triggering message & latest dialog state must be incoming (never outgoing)
+        if telegram_message_id is not None and resolved_dialog_id is not None and _table_exists(conn, "messages"):
+            trig_row = conn.execute(
+                "SELECT direction FROM messages WHERE dialog_id = ? AND telegram_message_id = ? LIMIT 1",
+                (int(resolved_dialog_id), int(telegram_message_id)),
+            ).fetchone()
+            if trig_row is not None and str(trig_row["direction"] or "").strip().lower() != "in":
+                return True
+
+        # 2) Guard: manager already replied
         if int(dlg_row["last_from_peer"] or 0) == 0:
             return True
         if latest_msg is not None and str(latest_msg["direction"]) == "out":
@@ -757,7 +771,7 @@ def _should_skip_reply_notification(
                 if not (in_ts and out_ts and in_ts > out_ts and int(dlg_row["last_from_peer"] or 0) == 1):
                     return True
 
-        # 2) Guard: dialog is already read
+        # 3) Guard: dialog is already read
         if not allow_read and int(dlg_row["unread_count"] or 0) == 0:
             return True
         read_inbox_max_id = int(dlg_row["read_inbox_max_id"] or 0)
@@ -768,7 +782,7 @@ def _should_skip_reply_notification(
             if telegram_message_id is not None and read_inbox_max_id > 0:
                 pass
             elif telegram_message_id is not None:
-                if in_ts and in_ts < last_read_at:
+                if in_ts and in_ts <= last_read_at:
                     return True
             else:
                 eff_in_ts = in_ts or _norm_ts(dlg_row["last_message_at"])
@@ -917,6 +931,8 @@ def send_lead_reply_notification(
     lead_id: int | None = None,
     account_id: int | None = None,
     peer_id: int | None = None,
+    phone: str | None = None,
+    direction: str = "in",
     crm_url: str | None = None,
     opener=None,
     incoming_sent_at: str | None = None,
@@ -924,6 +940,10 @@ def send_lead_reply_notification(
     allow_read: bool = False,
 ) -> bool:
     try:
+        if os.getenv("DISABLE_BOT_ALERTS", "").strip() == "1":
+            return False
+        if str(direction or "").strip().lower() != "in":
+            return False
         resolved_dialog_id = int(dialog_id) if dialog_id is not None else None
         resolved_lead_id = int(lead_id) if lead_id is not None else None
         resolved_account_id = int(account_id) if account_id is not None else None
@@ -937,7 +957,7 @@ def send_lead_reply_notification(
             peek_dlg = None
             dlg_is_bot = False
             dlg_username = None
-            dlg_phone = None
+            dlg_phone = str(phone).strip() if phone else None
             if conn is not None:
                 peek_dlg = _resolve_notify_dialog(
                     conn,
@@ -955,9 +975,27 @@ def send_lead_reply_notification(
                     if resolved_lead_id is None and peek_dlg["lead_id"] is not None:
                         resolved_lead_id = int(peek_dlg["lead_id"])
                     dlg_username = peek_dlg["username"]
-                    dlg_phone = peek_dlg["phone"]
+                    dlg_phone = peek_dlg["phone"] or dlg_phone
                     if "is_bot" in peek_dlg.keys():
                         dlg_is_bot = bool(peek_dlg["is_bot"])
+                if not dlg_phone and resolved_lead_id is not None and _table_exists(conn, "leads"):
+                    l_ph = conn.execute(
+                        "SELECT phone FROM leads WHERE id = ?",
+                        (resolved_lead_id,),
+                    ).fetchone()
+                    if l_ph is not None and l_ph["phone"]:
+                        dlg_phone = str(l_ph["phone"]).strip() or None
+                if (
+                    resolved_dialog_id is not None
+                    and clean_mid is not None
+                    and _table_exists(conn, "messages")
+                ):
+                    msg_row = conn.execute(
+                        "SELECT direction FROM messages WHERE dialog_id = ? AND telegram_message_id = ? LIMIT 1",
+                        (resolved_dialog_id, clean_mid),
+                    ).fetchone()
+                    if msg_row is not None and str(msg_row["direction"] or "").strip().lower() != "in":
+                        return False
 
             inelig, _ = is_ineligible_reply_notify_peer(
                 conn,
@@ -979,12 +1017,7 @@ def send_lead_reply_notification(
                 username=dlg_username,
                 lead_handle=lead_handle,
                 phone=dlg_phone,
-                require_backing=bool(
-                    peek_dlg is not None
-                    or resolved_dialog_id is not None
-                    or resolved_peer_id is not None
-                    or resolved_lead_id is not None
-                ),
+                require_backing=(conn is not None),
             )
             if not backed_ok:
                 return False
@@ -1314,6 +1347,20 @@ def audit_reply_notifications(conn, *, since_hours: int | None = None) -> dict:
                         inelig = True
                         reason = back_reason
 
+                if (
+                    not inelig
+                    and r["dialog_id"] is not None
+                    and r["incoming_message_id"] is not None
+                    and _table_exists(conn, "messages")
+                ):
+                    mdir = conn.execute(
+                        "SELECT direction FROM messages WHERE dialog_id = ? AND telegram_message_id = ? LIMIT 1",
+                        (int(r["dialog_id"]), int(r["incoming_message_id"])),
+                    ).fetchone()
+                    if mdir is not None and str(mdir["direction"] or "").strip().lower() != "in":
+                        inelig = True
+                        reason = "outgoing_message_alert"
+
                 if inelig:
                     false_notifications.append(
                         {
@@ -1327,6 +1374,30 @@ def audit_reply_notifications(conn, *, since_hours: int | None = None) -> dict:
                             "reason": reason,
                         }
                     )
+
+            seen_msg_keys: set[tuple[str, int, int]] = set()
+            for r in rows:
+                created_norm = _norm_ts(r["created_at"])
+                if cutoff and created_norm and created_norm < cutoff:
+                    continue
+                if r["dialog_id"] is None or r["incoming_message_id"] is None:
+                    continue
+                d_key = (str(r["chat_id"]), int(r["dialog_id"]), int(r["incoming_message_id"]))
+                if d_key in seen_msg_keys:
+                    false_notifications.append(
+                        {
+                            "chat_id": str(r["chat_id"]),
+                            "bot_message_id": int(r["bot_message_id"]),
+                            "lead_handle": r["lead_handle"],
+                            "account_handle": r["account_handle"],
+                            "peer_id": r["peer_id"],
+                            "lead_id": r["lead_id"],
+                            "created_at": r["created_at"],
+                            "reason": "duplicate_incoming_message_alert",
+                        }
+                    )
+                else:
+                    seen_msg_keys.add(d_key)
 
         if _table_exists(conn, "leads"):
             for lr in conn.execute(

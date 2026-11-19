@@ -4704,11 +4704,9 @@ tr.bulk-selected,
    6. Minimalist Clean Dashboard V2 (Sidebar, Web TG, Pipeline, Accounts, Outreach, Leadgen)
    ========================================================================== */
 
-/* 6.1 Clean Sidebar Footer (Hide Foldesk Pro, Demo & Theme visually while keeping #seed-demo E2E-clickable) */
-.sidebar-plan-card,
-#sidebar-user-btn,
-#theme,
-.sidebar .nav-sublink {
+/* 6.1 Hide demo button visually in sheet mode while leaving E2E all-mode clickable */
+.workspace[data-view-mode="sheet"] ~ * .sidebar-footer,
+body:has(.workspace[data-view-mode="sheet"]) .sidebar-footer {
   display: none !important;
 }
 
@@ -4882,7 +4880,7 @@ tr.bulk-selected,
 
 #accounts .account-row-line {
   display: grid;
-  grid-template-columns: minmax(190px, 1.5fr) auto minmax(260px, 1.4fr) auto;
+  grid-template-columns: minmax(150px, 1.2fr) minmax(0, auto) max-content max-content;
   align-items: center;
   gap: 10px;
 }
@@ -4914,7 +4912,8 @@ tr.bulk-selected,
   display: flex;
   align-items: center;
   gap: 4px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 #accounts .account-col-limit.account-limit-bar {
@@ -4995,7 +4994,7 @@ tr.bulk-selected,
   border-color: rgba(239, 68, 68, 0.55) !important;
 }
 
-@media (max-width: 980px) {
+@media (max-width: 1180px) {
   #accounts .account-row-line {
     grid-template-columns: 1fr auto;
     row-gap: 6px;
@@ -6642,10 +6641,110 @@ tr.bulk-selected,
   gap: 8px;
 }
 
-.leadgen-sources-spoiler[open] > summary {
-  margin-bottom: 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border);
+/* ==========================================================================
+   Simplified 4-Tab CRM (Inbox 1-Click Stages, Unified Leads Toggle, SSOT Stats)
+   ========================================================================== */
+
+.leads-view-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  margin-bottom: 12px;
+}
+
+.inbox-stage-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.inbox-stage-pill {
+  border: 1px solid var(--border);
+  background: var(--sunken);
+  color: var(--text-muted);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.inbox-stage-pill:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.inbox-stage-pill.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.stats-exec-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.stats-campaigns-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.stats-campaign-card {
+  border: 1px solid var(--border);
+  background: var(--sunken);
+  border-radius: 12px;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.stats-campaign-card.is-running {
+  border-color: var(--accent);
+}
+
+.stats-campaign-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  font-size: 12px;
+}
+
+.stats-campaign-metric {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  display: grid;
+  gap: 2px;
+}
+
+.stats-dropped-alert {
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.08);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.stats-dropped-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
 }
 
 

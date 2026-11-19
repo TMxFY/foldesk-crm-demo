@@ -193,11 +193,44 @@ def has_valid_mcp_api_key(request: Request) -> bool:
         provided = (
             request.headers.get("x-mcp-api-key")
             or request.headers.get("x-mcp-key")
+            or request.headers.get("x-bot-webhook-secret")
             or ""
         ).strip()
     if not provided:
         return False
     return hmac.compare_digest(provided.encode("utf-8"), mcp_key.encode("utf-8"))
+
+
+def has_valid_bot_webhook_secret(request: Request) -> bool:
+    """Validate Telegram/Colleague bot webhook requests when a secret is configured."""
+    expected = [
+        val
+        for val in (
+            os.getenv("BOT_WEBHOOK_SECRET", "").strip(),
+            os.getenv("MCP_API_KEY", "").strip(),
+        )
+        if val
+    ]
+    if not expected:
+        return True
+    auth_hdr = (request.headers.get("authorization") or "").strip()
+    bearer = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+    candidates = [
+        val
+        for val in (
+            bearer,
+            (request.headers.get("x-bot-webhook-secret") or "").strip(),
+            (request.headers.get("x-telegram-bot-api-secret-token") or "").strip(),
+            (request.headers.get("x-mcp-api-key") or "").strip(),
+            (request.headers.get("x-mcp-key") or "").strip(),
+        )
+        if val
+    ]
+    return any(
+        hmac.compare_digest(prov.encode("utf-8"), exp.encode("utf-8"))
+        for prov in candidates
+        for exp in expected
+    )
 
 
 def is_blocked_user_agent(request: Request, path: str) -> bool:
@@ -208,6 +241,8 @@ def is_blocked_user_agent(request: Request, path: str) -> bool:
         or (request.headers.get("x-foldesk-token") or "").strip()
         or (request.headers.get("x-mcp-api-key") or "").strip()
         or (request.headers.get("x-mcp-key") or "").strip()
+        or (request.headers.get("x-bot-webhook-secret") or "").strip()
+        or (request.headers.get("x-telegram-bot-api-secret-token") or "").strip()
     ):
         return False
     ua = (request.headers.get("user-agent") or "").strip()
@@ -302,6 +337,8 @@ def _has_auth_credentials(request: Request) -> bool:
     if (request.headers.get("x-mcp-api-key") or "").strip():
         return True
     if (request.headers.get("x-mcp-key") or "").strip():
+        return True
+    if (request.headers.get("x-bot-webhook-secret") or "").strip():
         return True
     if (request.cookies.get(AUTH_COOKIE_NAME) or "").strip():
         return True

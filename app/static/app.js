@@ -74,22 +74,22 @@ const RECIPIENT_STATUS_LABEL = {
 };
 
 const SHEET_LABELS = {
-  s07: "Воронка",
+  s07: "Лиды",
   inbox: "Входящие",
   outreach: "Рассылки",
   leads: "Лиды",
   s09: "Карточка",
   digest: "Напоминания",
-  accounts: "Аккаунт",
+  accounts: "Рассылки · Аккаунты",
   s11: "Папки",
   "crm-properties": "Поля CRM",
   "ai-bot": "AI Агент",
-  leadgen: "Лидген и Вакансии",
+  leadgen: "Лидген",
   "tool-phones": "Телефоны в TG",
   "tool-parser": "Парсер групп",
   calendar: "Календарь",
-  analytics: "Аналитика",
-  funnel: "Воронка и Лидген",
+  analytics: "Статистика",
+  funnel: "Статистика",
 };
 
 const SCHEDULE_DAYS = [
@@ -127,7 +127,9 @@ const state = {
   mode: "crm",
   scope: "open",
   viewMode: initialViewMode,
-  activeSheet: (workspaceMain && workspaceMain.dataset.activeSheet) || "s07",
+  activeSheet: (workspaceMain && workspaceMain.dataset.activeSheet) || "leads",
+  leadsSubView: "kanban",
+  outreachSubView: "campaigns",
   loginId: null,
   accounts: [],
   leads: [],
@@ -230,22 +232,21 @@ function el(tag, attrs, children) {
 function sheetFromHash(hash) {
   const clean = String(hash || "").replace(/^#/, "").trim();
   if (!clean) return "";
-  if (clean === "s07" || clean === "pipeline") return "s07";
+  if (clean === "s07" || clean === "pipeline") {
+    state.leadsSubView = "kanban";
+    return "leads";
+  }
   if (clean === "s04" || clean === "s05" || clean === "s06" || clean === "inbox") return "inbox";
   if (clean === "outreach") return "outreach";
+  if (clean === "accounts") {
+    state.outreachSubView = "accounts";
+    return "outreach";
+  }
   if (clean === "leads") return "leads";
   if (clean === "s09") return "s09";
-  if (clean === "digest") return "digest";
-  if (clean === "accounts") return "accounts";
-  if (clean === "s11" || clean === "folders") return "s11";
-  if (clean === "crm-properties" || clean === "properties") return "crm-properties";
-  if (clean === "ai-bot") return "ai-bot";
-  if (clean === "leadgen") return "leadgen";
-  if (clean === "tool-phones") return "tool-phones";
-  if (clean === "tool-parser") return "tool-parser";
-  if (clean === "calendar") return "calendar";
   if (clean === "analytics") return "analytics";
-  if (clean === "funnel") return "funnel";
+  if (clean === "calendar") return "calendar";
+  if (clean === "crm-properties") return "crm-properties";
   return "";
 }
 
@@ -329,14 +330,23 @@ function syncSheetVisibility() {
   closeToolbarMoreMenus();
   const main = document.querySelector("#workspace-main");
   if (!main) return;
-  const active = state.activeSheet || "s07";
+  let active = state.activeSheet || "leads";
+  if (active === "s07" || active === "pipeline") {
+    state.leadsSubView = "kanban";
+    active = "leads";
+    state.activeSheet = "leads";
+  } else if (active === "accounts") {
+    state.outreachSubView = "accounts";
+    active = "outreach";
+    state.activeSheet = "outreach";
+  }
   main.dataset.viewMode = state.viewMode;
   main.dataset.activeSheet = active;
   syncPopupState();
 
   const labelNode = document.querySelector("#active-sheet-label");
   if (labelNode) {
-    labelNode.textContent = SHEET_LABELS[active] || "Воронка";
+    labelNode.textContent = SHEET_LABELS[active] || "Лиды";
   }
 
   const toggleBtn = document.querySelector("#toggle-view-mode");
@@ -346,25 +356,25 @@ function syncSheetVisibility() {
       : "Все блоки";
   }
 
-  document.querySelectorAll("[data-sheet-tab]").forEach((btn) => {
-    const isCurrent = state.viewMode === "sheet" && btn.dataset.sheetTab === active;
-    btn.setAttribute("aria-pressed", isCurrent ? "true" : "false");
-  });
-
-  document.querySelectorAll(".flow-step[data-sheet-link]").forEach((step) => {
-    if (step.dataset.sheetLink === active) step.setAttribute("aria-current", "step");
-    else step.removeAttribute("aria-current");
-  });
-
   const navLinks = [...document.querySelectorAll(".nav a[data-sheet-link]")];
   navLinks.forEach((item) => {
     if (item.dataset.sheetLink === active) item.setAttribute("aria-current", "page");
     else item.removeAttribute("aria-current");
   });
 
+  const bottomNav = document.querySelector("#miniapp-bottom-nav");
+  if (bottomNav) {
+    bottomNav.querySelectorAll("a[data-sheet-link]").forEach((node) => {
+      node.classList.toggle("is-active", node.dataset.sheetLink === active);
+    });
+  }
+
+  const leadsViewBar = document.querySelector("#leads-view-bar");
   const s07 = document.querySelector("#s07");
   const messengerGrid = document.querySelector(".messenger-grid");
   const outreach = document.querySelector("#outreach");
+  const outreachCampaignsPane = document.querySelector("#outreach-campaigns-pane");
+  const outreachAccountsPane = document.querySelector("#outreach-accounts-pane");
   const leads = document.querySelector("#leads");
   const opsGrid = document.querySelector(".ops-grid");
   const digest = document.querySelector("#digest");
@@ -379,7 +389,22 @@ function syncSheetVisibility() {
   const analyticsSec = document.querySelector("#analytics");
   const funnelSec = document.querySelector("#funnel");
 
+  // Sync sub-view toggle buttons
+  const leadsSub = state.leadsSubView === "table" ? "table" : "kanban";
+  document.querySelectorAll("[data-leads-subview]").forEach((btn) => {
+    const isAct = btn.dataset.leadsSubview === leadsSub;
+    btn.className = `btn ${isAct ? "primary" : "ghost"} sm`;
+    btn.setAttribute("aria-pressed", isAct ? "true" : "false");
+  });
+  const outreachSub = state.outreachSubView === "accounts" ? "accounts" : "campaigns";
+  document.querySelectorAll("[data-outreach-subview]").forEach((btn) => {
+    const isAct = btn.dataset.outreachSubview === outreachSub;
+    btn.className = `btn ${isAct ? "primary" : "ghost"} sm`;
+    btn.setAttribute("aria-pressed", isAct ? "true" : "false");
+  });
+
   if (state.viewMode !== "sheet") {
+    if (leadsViewBar) leadsViewBar.hidden = false;
     if (s07) s07.hidden = false;
     if (messengerGrid) {
       messengerGrid.hidden = false;
@@ -387,32 +412,33 @@ function syncSheetVisibility() {
       messengerGrid.removeAttribute("data-card-overlay");
     }
     if (outreach) outreach.hidden = false;
+    if (outreachCampaignsPane) outreachCampaignsPane.hidden = false;
+    if (outreachAccountsPane) outreachAccountsPane.hidden = false;
     if (leads) {
       leads.hidden = false;
       leads.removeAttribute("data-popup-only");
     }
-    if (opsGrid) opsGrid.hidden = false;
-    if (digest) digest.hidden = false;
+    if (opsGrid) opsGrid.hidden = true;
+    if (digest) digest.hidden = true;
     if (accounts) accounts.hidden = false;
-    if (s11) s11.hidden = false;
-    if (calendarSec) calendarSec.hidden = false;
+    if (s11) s11.hidden = true;
+    if (calendarSec) calendarSec.hidden = active !== "calendar";
     if (analyticsSec) analyticsSec.hidden = false;
-    if (leadgenSec) leadgenSec.hidden = active !== "leadgen";
-    if (toolPhones) toolPhones.hidden = active !== "tool-phones";
-    if (toolParser) toolParser.hidden = active !== "tool-parser";
+    if (leadgenSec) leadgenSec.hidden = true;
+    if (toolPhones) toolPhones.hidden = true;
+    if (toolParser) toolParser.hidden = true;
     if (crmProps) crmProps.hidden = active !== "crm-properties";
-    if (aiBot) aiBot.hidden = active !== "ai-bot";
-    if (funnelSec) funnelSec.hidden = active !== "funnel";
-    if (active === "funnel" && typeof loadOutreachFunnel === "function" && !state.funnelData) {
-      loadOutreachFunnel().catch(() => {});
-    }
+    if (aiBot) aiBot.hidden = true;
+    if (funnelSec) funnelSec.hidden = true;
     return;
   }
 
   const cardPopupOpen = state.activePopup === "card" || active === "s09";
   const leadPopupOpen = state.activePopup === "lead";
+  const showLeads = active === "leads";
 
-  if (s07) s07.hidden = active !== "s07";
+  if (leadsViewBar) leadsViewBar.hidden = !showLeads;
+  if (s07) s07.hidden = !(showLeads && leadsSub === "kanban");
   if (messengerGrid) {
     const showInbox = active === "inbox";
     messengerGrid.hidden = !(showInbox || cardPopupOpen);
@@ -425,35 +451,33 @@ function syncSheetVisibility() {
     else messengerGrid.removeAttribute("data-sheet-focus");
   }
   if (outreach) outreach.hidden = active !== "outreach";
+  if (outreachCampaignsPane) outreachCampaignsPane.hidden = outreachSub !== "campaigns";
+  if (outreachAccountsPane) outreachAccountsPane.hidden = outreachSub !== "accounts";
+  if (accounts) accounts.hidden = active !== "outreach" || outreachSub !== "accounts";
   if (leads) {
-    const showLeads = active === "leads";
-    leads.hidden = !(showLeads || leadPopupOpen);
-    if (!showLeads && leadPopupOpen) {
+    const showLeadsTable = showLeads && leadsSub === "table";
+    leads.hidden = !(showLeadsTable || leadPopupOpen);
+    if (!showLeadsTable && leadPopupOpen) {
       leads.dataset.popupOnly = "true";
     } else {
       leads.removeAttribute("data-popup-only");
     }
   }
 
-  const showOps = active === "digest" || active === "accounts" || active === "s11";
-  if (opsGrid) opsGrid.hidden = !showOps;
-  if (digest) digest.hidden = active !== "digest";
-  if (accounts) accounts.hidden = active !== "accounts";
-  if (s11) s11.hidden = active !== "s11";
-  if (leadgenSec) leadgenSec.hidden = active !== "leadgen";
-  if (toolPhones) toolPhones.hidden = active !== "tool-phones";
-  if (toolParser) toolParser.hidden = active !== "tool-parser";
+  if (opsGrid) opsGrid.hidden = true;
+  if (digest) digest.hidden = true;
+  if (s11) s11.hidden = true;
+  if (leadgenSec) leadgenSec.hidden = true;
+  if (toolPhones) toolPhones.hidden = true;
+  if (toolParser) toolParser.hidden = true;
   if (crmProps) crmProps.hidden = active !== "crm-properties";
-  if (aiBot) aiBot.hidden = active !== "ai-bot";
+  if (aiBot) aiBot.hidden = true;
   if (calendarSec) calendarSec.hidden = active !== "calendar";
   if (analyticsSec) analyticsSec.hidden = active !== "analytics";
-  if (funnelSec) funnelSec.hidden = active !== "funnel";
-  if (active === "funnel" && typeof loadOutreachFunnel === "function" && !state.funnelData) {
-    loadOutreachFunnel().catch(() => {});
-  }
+  if (funnelSec) funnelSec.hidden = true;
 
-  if (active === "s07" || active === "leads") {
-    state.bulkHostTarget = active;
+  if (showLeads) {
+    state.bulkHostTarget = leadsSub === "kanban" ? "s07" : "leads";
   }
   if (typeof syncBulkHostContainer === "function") syncBulkHostContainer();
 
@@ -462,7 +486,7 @@ function syncSheetVisibility() {
     syncTelegramWebAPanel(connected);
   }
 
-  const activeNode = active === "inbox" ? messengerGrid : document.querySelector(`#${active}`);
+  const activeNode = active === "inbox" ? messengerGrid : (showLeads && leadsSub === "kanban" ? s07 : document.querySelector(`#${active}`));
   triggerSheetEntrance(activeNode);
   window.requestAnimationFrame(() => window.scrollTo(0, 0));
 }
@@ -472,6 +496,13 @@ function activateSheet(sheetId, forceSheetMode) {
   if (sheetId === "s09" && state.viewMode === "sheet") {
     openSheetPopup("card");
     return;
+  }
+  if (sheetId === "s07" || sheetId === "pipeline") {
+    state.leadsSubView = "kanban";
+    sheetId = "leads";
+  } else if (sheetId === "accounts") {
+    state.outreachSubView = "accounts";
+    sheetId = "outreach";
   }
   state.activePopup = null;
   state.activeSheet = sheetId;
@@ -1288,6 +1319,10 @@ function renderAccounts() {
   const deadAccounts = state.accounts.filter(
     (account) => account.status !== "connected" || ["unauthorized", "banned", "frozen"].includes(String(account.health || "")),
   );
+  const accTabCount = document.querySelector("#outreach-accounts-count");
+  if (accTabCount) {
+    accTabCount.textContent = String(state.accounts.length);
+  }
   const disconnectedCount = deadAccounts.length;
   const totalDailyPool = connected.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
   if (summaryBar) {
@@ -3035,7 +3070,7 @@ function syncTelegramWebAPanel(connected) {
     return;
   }
 
-  panel.hidden = false;
+  panel.hidden = true;
   state.inboxChatMode = "crm";
   const mode = "crm";
   panel.dataset.chatMode = mode;
@@ -3859,6 +3894,73 @@ function closeDealInspectorPopup() {
   document.body.classList.remove("has-deal-popup");
 }
 
+async function moveDialogToStage(dialog, targetStatus, triggerBtn = null) {
+  if (!dialog || !targetStatus) return;
+  const existingLead = leadForDialog(dialog);
+  const accountId = Number(
+    dialog.account_id
+    || document.querySelector("#tg-account")?.value
+    || ((state.accounts || []).find((a) => a.status === "connected")?.id || 0),
+  );
+  if (triggerBtn) triggerBtn.disabled = true;
+  try {
+    if (existingLead && existingLead.id != null) {
+      await patchLead(existingLead.id, { status: targetStatus });
+    } else {
+      const created = await api("/api/leads", {
+        method: "POST",
+        body: {
+          account_id: accountId || null,
+          telegram_user_id: dialog.telegram_user_id,
+          username: dialog.username,
+          name: dialog.name,
+          phone: dialog.phone || null,
+          status: targetStatus,
+          dialog_id: dialog.id || null,
+        },
+      });
+      if (created && created.id != null && created.status !== targetStatus) {
+        await api(`/api/leads/${created.id}`, { method: "PATCH", body: { status: targetStatus } });
+      }
+      if (created && created.id != null) {
+        dialog.lead_id = created.id;
+        state.leadCache[created.id] = created;
+      }
+      await loadLeads(state.leadQuery, created ? created.id : null, true);
+    }
+    const stagePair = STATUSES.find(([v]) => v === targetStatus) || [targetStatus, targetStatus];
+    toast(`Этап: «${stagePair[1]}»`, "ok");
+    renderDialogs();
+    renderThread();
+    renderSide();
+  } catch (error) {
+    toast(error.message || "Не удалось сменить этап", "error");
+  } finally {
+    if (triggerBtn) triggerBtn.disabled = false;
+  }
+}
+
+function buildInboxStageBar(dialog, lead, barId) {
+  const currentStatus = lead ? String(lead.status || "") : "";
+  return el(
+    "div",
+    { id: barId, className: "inbox-stage-bar", role: "group", "aria-label": "Перенос по этапам воронки" },
+    STATUSES.map(([stKey, stLabel]) => {
+      const isCurrent = Boolean(currentStatus && stKey === currentStatus);
+      return el("button", {
+        type: "button",
+        className: `inbox-stage-pill${isCurrent ? " is-active" : ""}`,
+        "data-stage-move": stKey,
+        "aria-pressed": isCurrent ? "true" : "false",
+        onclick: (ev) => {
+          ev.stopPropagation();
+          moveDialogToStage(dialog, stKey, ev.currentTarget);
+        },
+      }, [stLabel]);
+    }),
+  );
+}
+
 function renderThread() {
   const dialog = state.selectedDialog;
   const error = document.querySelector("#thread-error");
@@ -3912,6 +4014,7 @@ function renderThread() {
       el("p", { className: "hint" }, [contactHint]),
       dealPopupBtn,
     ]),
+    buildInboxStageBar(dialog, lead, "inbox-stage-bar"),
   );
   const items = state.messages || [];
   const msgById = new Map();
@@ -4186,6 +4289,7 @@ function renderSide({ syncSelectedLead = true } = {}) {
           formatMoney(leadAmount(lead), lead.currency),
         ]),
       ]),
+      buildInboxStageBar(dialog, lead, "side-stage-bar"),
       el("p", { className: "hint" }, [handleParts.join(" · ")]),
       el("label", { className: "side-amount-label" }, ["Бюджет ($)", amountField(lead, "Бюджет ($)")]),
       leadTrackingBox(lead),
@@ -6198,8 +6302,6 @@ if (sessionArchiveFile) {
     if (!file) return;
     uploadedSessionFilename = file.name;
     uploadedSessionBase64 = "";
-    const dropText = document.querySelector("#session-dropzone-text");
-    if (dropText) dropText.textContent = `Выбран файл: ${file.name}`;
     const reader = new FileReader();
     if (file.name.toLowerCase().endsWith(".json")) {
       reader.onload = () => {
@@ -7680,28 +7782,32 @@ document.querySelector(".nav").addEventListener("click", (event) => {
   }
 });
 
-const sheetTabsBar = document.querySelector("#sheet-tabs");
-if (sheetTabsBar) {
-  sheetTabsBar.addEventListener("click", (event) => {
-    const btn = event.target.closest("[data-sheet-tab]");
-    if (!btn) return;
-    activateSheet(btn.dataset.sheetTab, true);
-  });
-}
+document.querySelector("#leads-view-toggle")?.addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-leads-subview]");
+  if (!btn) return;
+  state.leadsSubView = btn.dataset.leadsSubview === "table" ? "table" : "kanban";
+  syncSheetVisibility();
+});
 
-const flowStepsBar = document.querySelector(".flow-steps");
-if (flowStepsBar) {
-  flowStepsBar.addEventListener("click", (event) => {
-    const link = event.target.closest("[data-sheet-link]");
-    if (!link) return;
-    if (state.viewMode === "sheet") {
-      event.preventDefault();
-      activateSheet(link.dataset.sheetLink, true);
-      return;
-    }
-    activateSheet(link.dataset.sheetLink);
-  });
-}
+document.querySelector("#outreach-subtabs")?.addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-outreach-subview]");
+  if (!btn) return;
+  state.outreachSubView = btn.dataset.outreachSubview === "accounts" ? "accounts" : "campaigns";
+  syncSheetVisibility();
+});
+
+document.addEventListener("click", (event) => {
+  const link = event.target.closest("[data-sheet-link]");
+  if (!link || link.closest(".nav") || link.closest("#miniapp-bottom-nav")) return;
+  const targetSheet = link.dataset.sheetLink || sheetFromHash(link.getAttribute("href"));
+  if (!targetSheet) return;
+  if (state.viewMode === "sheet") {
+    event.preventDefault();
+    activateSheet(targetSheet, true);
+  } else {
+    activateSheet(targetSheet);
+  }
+});
 
 const toggleViewModeBtn = document.querySelector("#toggle-view-mode");
 if (toggleViewModeBtn) {
@@ -7778,22 +7884,26 @@ window.addEventListener("hashchange", () => {
   }
 });
 
-document.querySelector("#theme").addEventListener("click", () => {
-  const next = document.documentElement.dataset.theme === "dark" ? "" : "dark";
-  if (next) document.documentElement.dataset.theme = next;
-  else delete document.documentElement.dataset.theme;
-  document.querySelector("#theme").setAttribute("aria-pressed", next ? "true" : "false");
-  try { localStorage.setItem("theme", next || "light"); } catch (_err) { /* хранилище может быть закрыто */ }
-});
+const themeBtn = document.querySelector("#theme");
+if (themeBtn) {
+  themeBtn.addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "dark" ? "" : "dark";
+    if (next) document.documentElement.dataset.theme = next;
+    else delete document.documentElement.dataset.theme;
+    themeBtn.setAttribute("aria-pressed", next ? "true" : "false");
+    try { localStorage.setItem("theme", next || "light"); } catch (_err) { /* хранилище может быть закрыто */ }
+  });
+}
 
 try {
   const savedTheme = localStorage.getItem("theme");
+  const themeBtn = document.querySelector("#theme");
   if (savedTheme === "light") {
     delete document.documentElement.dataset.theme;
-    document.querySelector("#theme").setAttribute("aria-pressed", "false");
+    if (themeBtn) themeBtn.setAttribute("aria-pressed", "false");
   } else {
     document.documentElement.dataset.theme = "dark";
-    document.querySelector("#theme").setAttribute("aria-pressed", "true");
+    if (themeBtn) themeBtn.setAttribute("aria-pressed", "true");
   }
 } catch (_err) {
   document.documentElement.dataset.theme = "dark";
@@ -8709,8 +8819,224 @@ function renderAnalytics(data) {
   if (typeof renderAnalyticsCharts === "function") {
     renderAnalyticsCharts(summary);
   }
+  if (typeof renderStatsExecutiveBlocks === "function") {
+    renderStatsExecutiveBlocks(summary);
+  }
   if (typeof renderDeepOutreachAnalytics === "function") {
     renderDeepOutreachAnalytics(summary);
+  }
+}
+
+function renderStatsExecutiveBlocks(summary) {
+  const s = summary || {};
+  const outreach = s.outreach || {};
+  const accounts = s.accounts || {};
+  const funnel = s.funnel || {};
+  const deep = (s.deep_outreach && s.deep_outreach.summary) || {};
+
+  const kpiStrip = document.querySelector("#stats-kpi-strip");
+  if (kpiStrip) {
+    const healthyAccs = Number(accounts.healthy_accounts ?? accounts.connected_accounts ?? 0);
+    const totalAccs = Number(accounts.total_accounts ?? 0);
+    const droppedCnt = Number(accounts.dropped_accounts_count ?? (accounts.dropped_accounts || []).length);
+    const sentToday = Number(accounts.healthy_sent_today ?? accounts.sent_today ?? 0);
+    const dailyLim = Number(accounts.daily_limit ?? 0);
+    const waitTotal = Number(deep.waiting_our_answer ?? 0);
+    const waitDropped = Number(deep.waiting_on_dropped_accounts ?? 0);
+
+    const kpiCard = (label, val, sub, extraCls = "") => el("div", { className: "pipeline-kpi-card" }, [
+      el("span", { className: "pipeline-kpi-label" }, [label]),
+      el("strong", { className: `pipeline-kpi-value ${extraCls}`.trim() }, [val]),
+      el("span", { className: "hint" }, [sub]),
+    ]);
+
+    kpiStrip.replaceChildren(
+      kpiCard(
+        "Активные рассылки",
+        String(outreach.running_campaigns || 0),
+        `Сегодня отправлено: ${outreach.sent_today_total || 0} · В очереди: ${outreach.pending_running_total ?? deep.pending_queue ?? 0}`,
+      ),
+      kpiCard(
+        "Отправлено / Прочитано",
+        `${outreach.sent || 0} / ${outreach.read ?? deep.read ?? 0}`,
+        `Open Rate: ${outreach.open_rate_pct ?? deep.open_rate_pct ?? 0}%`,
+      ),
+      kpiCard(
+        "Ответили (Reply %)",
+        `${outreach.replied || 0} (${outreach.reply_rate_pct || 0}%)`,
+        `${deep.reply_of_read_pct || 0}% от прочитавших`,
+        "is-won",
+      ),
+      kpiCard(
+        "Живые ждут ответа",
+        String(waitTotal),
+        waitDropped > 0 ? `⚠️ Из них ${waitDropped} на отвалившихся аккаунтах` : "Все на активных аккаунтах",
+      ),
+      kpiCard(
+        "Аккаунты и отвалы",
+        `${healthyAccs} / ${totalAccs} живых`,
+        droppedCnt > 0
+          ? `⚠️ Отвалились: ${droppedCnt} · Лимит: ${sentToday}/${dailyLim}`
+          : `Все в строю · Сегодня: ${sentToday}/${dailyLim}`,
+      ),
+      kpiCard(
+        "Воронка CRM",
+        formatMoneyUsd(funnel.pipeline_value || 0),
+        `Выиграно: ${formatMoneyUsd(funnel.won_value || 0)}`,
+        "is-won",
+      ),
+    );
+  }
+
+  const campsHost = document.querySelector("#stats-campaigns-grid");
+  if (campsHost) {
+    const camps = Array.isArray(outreach.campaigns) ? outreach.campaigns : [];
+    const activeCount = camps.filter((c) => c.status === "running").length;
+    const head = el("div", { className: "subcard-head" }, [
+      el("div", { className: "pipeline-title-row" }, [
+        el("h3", {}, ["Запущенные и активные рассылки"]),
+        el("span", { className: "badge b-talk" }, [`Запущено сейчас: ${activeCount} из ${camps.length}`]),
+      ]),
+    ]);
+
+    if (!camps.length) {
+      campsHost.replaceChildren(head, el("p", { className: "hint empty-state" }, ["Рассылок пока нет"]));
+    } else {
+      const grid = el("div", { className: "stats-campaigns-grid" }, camps.map((camp) => {
+        const [stLabel, stBadge] = CAMPAIGN_STATUS_LABEL[camp.status] || [camp.status, "b-new"];
+        const total = Number(camp.total_recipients || 0);
+        const sent = Number(camp.sent || 0);
+        const pct = total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : 0;
+        const stepSummary = Array.isArray(camp.steps_breakdown) && camp.steps_breakdown.length
+          ? camp.steps_breakdown.map((sb) => `Шаг ${sb.step}: ${sb.sent} отпр / ${sb.read} проч / ${sb.replied} отв`).join(" · ")
+          : "";
+        const accPills = Array.isArray(camp.assigned_accounts) && camp.assigned_accounts.length
+          ? camp.assigned_accounts.map((a) => el("span", {
+            className: `badge ${a.is_dropped ? "b-bad" : "b-ok"}`,
+          }, [a.is_dropped ? `⚠️ ${a.handle} (${a.health})` : a.handle]))
+          : [];
+        return el("div", {
+          className: `stats-campaign-card${camp.status === "running" ? " is-running" : ""}`,
+          "data-stats-campaign-id": String(camp.id),
+        }, [
+          el("div", { className: "subcard-head" }, [
+            el("div", { className: "row" }, [
+              channelBadgeEl(camp.provider || "telegram"),
+              el("strong", {}, [camp.name]),
+            ]),
+            el("span", { className: `badge ${stBadge}` }, [stLabel]),
+          ]),
+          el("div", { className: "campaign-cell-progress-wrap" }, [
+            el("div", { className: "campaign-cell-progress-meta" }, [
+              el("span", {}, [`Отправлено ${sent} из ${total} · сегодня +${camp.sent_today || 0}`]),
+              el("strong", {}, [`${pct}%`]),
+            ]),
+            el("div", { className: "campaign-cell-progress" }, [
+              el("span", { className: "campaign-cell-progress-fill", style: `width: ${pct}%` }),
+            ]),
+          ]),
+          el("div", { className: "stats-campaign-metrics" }, [
+            el("div", { className: "stats-campaign-metric" }, [
+              el("span", { className: "hint" }, ["Прочитано"]),
+              el("strong", {}, [`${camp.read || 0} (${camp.open_rate_pct || 0}%)`]),
+            ]),
+            el("div", { className: "stats-campaign-metric" }, [
+              el("span", { className: "hint" }, ["Ответили"]),
+              el("strong", { className: "is-won" }, [`${camp.replied || 0} (${camp.reply_rate_pct || 0}%)`]),
+            ]),
+            el("div", { className: "stats-campaign-metric" }, [
+              el("span", { className: "hint" }, ["В очереди / Ошибки"]),
+              el("strong", {}, [`${camp.pending || 0} / ${camp.failed || 0}`]),
+            ]),
+          ]),
+          accPills.length ? el("div", { className: "row" }, accPills) : null,
+          stepSummary ? el("p", { className: "hint" }, [stepSummary]) : null,
+        ].filter(Boolean));
+      }));
+      campsHost.replaceChildren(head, grid);
+    }
+  }
+
+  const accHealthHost = document.querySelector("#stats-accounts-health");
+  if (accHealthHost) {
+    const dropped = Array.isArray(accounts.dropped_accounts) ? accounts.dropped_accounts : [];
+    const items = Array.isArray(accounts.items) ? accounts.items : [];
+    const healthyItems = items.filter((a) => !a.is_dropped);
+
+    const droppedBox = dropped.length
+      ? el("div", { className: "stats-dropped-alert" }, [
+        el("div", { className: "subcard-head" }, [
+          el("strong", {}, [`⚠️ Отвалились аккаунты (${dropped.length})`]),
+          el("button", {
+            type: "button",
+            className: "btn secondary sm",
+            onclick: () => {
+              state.outreachSubView = "accounts";
+              activateSheet("outreach", true);
+            },
+          }, ["Переподключить →"]),
+        ]),
+        ...dropped.map((acc) => el("div", {
+          className: "stats-dropped-row",
+          "data-dropped-account-id": String(acc.id),
+        }, [
+          el("div", { className: "stack" }, [
+            el("div", { className: "row" }, [
+              channelBadgeEl(acc.provider),
+              el("strong", {}, [acc.handle || acc.name || acc.phone]),
+              acc.phone ? el("span", { className: "hint" }, [acc.phone]) : null,
+              el("span", { className: "badge b-bad" }, [acc.health || acc.status]),
+              acc.waiting_our_answer > 0
+                ? el("span", { className: "badge b-wait" }, [`🔥 Ждут ответа: ${acc.waiting_our_answer}`])
+                : null,
+            ].filter(Boolean)),
+            el("span", { className: "hint" }, [
+              `${acc.last_error || "Требуется повторная авторизация"}${acc.dropped_at ? ` · с ${formatDue(acc.dropped_at)}` : ""}`,
+            ]),
+          ]),
+          el("span", { className: "hint" }, [`Отправлено: ${acc.campaign_sent_count || 0} · Ответов: ${acc.campaign_replied_count || 0}`]),
+        ])),
+      ])
+      : el("div", { className: "row" }, [
+        el("span", { className: "badge b-ok" }, ["✅ Все подключённые аккаунты в строю"]),
+      ]);
+
+    const activeHead = el("div", { className: "subcard-head" }, [
+      el("h3", {}, ["Здоровый пул отправителей"]),
+      el("span", { className: "badge b-ok" }, [
+        `Активных: ${healthyItems.length} · Сегодня: ${accounts.healthy_sent_today ?? accounts.sent_today ?? 0} / ${accounts.daily_limit || 0} (${accounts.utilization_pct || 0}%)`,
+      ]),
+    ]);
+
+    const activeRows = healthyItems.length
+      ? el("div", { className: "table-wrap" }, [
+        el("table", {}, [
+          el("thead", {}, [
+            el("tr", {}, [
+              el("th", {}, ["Аккаунт"]),
+              el("th", { className: "num" }, ["Сегодня / Лимит"]),
+              el("th", { className: "num" }, ["Рассылка отпр."]),
+              el("th", { className: "num" }, ["Ответы (Reply %)"]),
+              el("th", { className: "num" }, ["Ждут ответа"]),
+            ]),
+          ]),
+          el("tbody", {}, healthyItems.map((acc) => el("tr", {}, [
+            el("td", {}, [
+              el("div", { className: "row" }, [
+                channelBadgeEl(acc.provider),
+                el("strong", {}, [acc.handle || acc.name]),
+              ]),
+            ]),
+            el("td", { className: "num" }, [`${acc.sent_today} / ${acc.daily_limit}`]),
+            el("td", { className: "num" }, [String(acc.campaign_sent_count || 0)]),
+            el("td", { className: "num" }, [`${acc.campaign_replied_count || 0} (${acc.reply_rate_pct || 0}%)`]),
+            el("td", { className: "num" }, [String(acc.waiting_our_answer || 0)]),
+          ]))),
+        ]),
+      ])
+      : el("p", { className: "hint empty-state" }, ["Нет активных аккаунтов в пуле"]);
+
+    accHealthHost.replaceChildren(activeHead, droppedBox, activeRows);
   }
 }
 
@@ -8729,13 +9055,13 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
     quickCountEl.textContent = String(s.waiting_our_answer);
   }
 
-  // 1. Summary KPI Card
+  // 1. Summary KPI Card (strictly SSOT from API, zero hardcoded figures)
   const kpiCard = el("div", { className: "surface-subcard stack" }, [
     el("div", { className: "subcard-head" }, [
       el("div", { className: "pipeline-title-row" }, [
-        el("h3", {}, ["Аудит базы 2 174 лидов (Все2) по 9 аккаунтам: Статусы · Шаги · Форматы · Кто отвечает +"]),
-        el("span", { className: "badge b-wait" }, [`🔥 Ждут нашего ответа: ${s.waiting_our_answer || 0} (из них + Позитив: ${s.waiting_positive || 0})`]),
-        el("span", { className: "badge b-won" }, [`Целевой + Позитив: ${s.positive_count || 0} (${s.positive_pct || 0}%)`]),
+        el("h3", {}, [`Сводка аутрич-воронки (${s.total_base || 0} получателей в базе)`]),
+        el("span", { className: "badge b-wait" }, [`🔥 Ждут нашего ответа: ${s.waiting_our_answer || 0} (Позитив: ${s.waiting_positive || 0})`]),
+        el("span", { className: "badge b-won" }, [`Позитив: ${s.positive_count || 0} (${s.positive_pct || 0}%)`]),
       ]),
       el("div", { className: "row" }, [
         el("button", {
@@ -8746,53 +9072,49 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
             const stgSel = document.querySelector("#stage-filter");
             if (fupSel) fupSel.value = "waiting_our_answer";
             if (stgSel) stgSel.value = "";
-            setActiveSheet("s07");
+            state.leadsSubView = "kanban";
+            activateSheet("leads");
             renderBoard();
             renderLeadTable();
           },
-        }, [`Открыть 129 ждущих ответа на доске Воронки →`]),
+        }, [`Открыть ${s.waiting_our_answer || 0} ждущих ответа на доске Лидов →`]),
       ]),
     ]),
     el("div", { className: "analytics-mini-kpis" }, [
       el("div", { className: "analytics-mini-kpi" }, [
-        el("span", { className: "hint" }, ["Написали (из 2 174)"]),
+        el("span", { className: "hint" }, [`Отправлено (из ${s.total_base || 0})`]),
         el("strong", {}, [`${s.contacted || 0}`]),
-        el("span", { className: "hint" }, [`В очереди (новые): ${s.pending_queue || 0}`]),
+        el("span", { className: "hint" }, [`В очереди активных: ${s.pending_queue || 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
         el("span", { className: "hint" }, ["Прочитали (2 галочки)"]),
         el("strong", {}, [`${s.read || 0} (${s.open_rate_pct || 0}%)`]),
-        el("span", { className: "hint" }, [`1 галочка: ${s.unseen_total || 0}`]),
+        el("span", { className: "hint" }, [`Не прочитано: ${s.unseen_total || 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
         el("span", { className: "hint" }, ["Ответили всего"]),
         el("strong", { className: "is-won" }, [`${s.replied || 0} (${s.reply_rate_pct || 0}%)`]),
-        el("span", { className: "hint" }, [`${s.reply_of_read_pct || 0}% от прочитавших!`]),
+        el("span", { className: "hint" }, [`${s.reply_of_read_pct || 0}% от прочитавших`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
         el("span", { className: "hint" }, ["Конструктив (+ и ?)"]),
         el("strong", { className: "is-won" }, [`${s.constructive_count || 0} (${s.constructive_pct || 0}%)`]),
-        el("span", { className: "hint" }, [`+ Позитив: ${s.positive_count || 0} · ? Вопрос: ${s.question_count || 0}`]),
+        el("span", { className: "hint" }, [`Позитив: ${s.positive_count || 0} · Вопрос: ${s.question_count || 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
-        el("span", { className: "hint" }, ["🔥 Ждут НАШЕГО ответа"]),
+        el("span", { className: "hint" }, ["🔥 Ждут нашего ответа"]),
         el("strong", { style: "color: #fbbf24;" }, [`${s.waiting_our_answer || 0}`]),
-        el("span", { className: "hint" }, [`Мяч на нашей стороне`]),
+        el("span", { className: "hint" }, [`На живых акк.: ${s.waiting_on_healthy_accounts ?? (s.waiting_our_answer || 0)} · На отвал.: ${s.waiting_on_dropped_accounts ?? 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
-        el("span", { className: "hint" }, ["💬 Прочитали наш ответ и молчат"]),
-        el("strong", {}, [`${s.stalled_after_answer || 0}`]),
-        el("span", { className: "hint" }, [`Нужен пинг · Не прочит.: ${s.unseen_our_answer || 0}`]),
+        el("span", { className: "hint" }, ["В цепочке (ждут фоллоу-ап)"]),
+        el("strong", {}, [`${s.in_progress_followup || 0}`]),
+        el("span", { className: "hint" }, [`Ошибки отправки: ${s.failed_total || 0}`]),
       ]),
       el("div", { className: "analytics-mini-kpi" }, [
-        el("span", { className: "hint" }, ["👀 Ждут фоллоу-ап (в цепочке)"]),
-        el("strong", {}, [`${s.in_progress_followup ?? ((s.need_step2 || 0) + (s.need_step3 || 0))}`]),
-        el("span", { className: "hint" }, [`Прочитали Шаг 1/2: ${(s.need_step2 || 0) + (s.need_step3 || 0)} (Ш2: ${s.need_step2 || 0} · Ш3: ${s.need_step3 || 0})`]),
-      ]),
-      el("div", { className: "analytics-mini-kpi" }, [
-        el("span", { className: "hint" }, ["Отказы (-) / Позже"]),
+        el("span", { className: "hint" }, ["Отказы / Написать позже"]),
         el("strong", {}, [`${s.refusal_count || 0} / ${s.defer_count || 0}`]),
-        el("span", { className: "hint" }, [`Всего 3.6% отказов от базы`]),
+        el("span", { className: "hint" }, [`Доля отказов: ${s.contacted > 0 ? Math.round(((s.refusal_count || 0) / s.contacted) * 1000) / 10 : 0}%`]),
       ]),
     ]),
   ]);
@@ -8819,8 +9141,8 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
 
   const stepsCard = el("div", { className: "surface-subcard stack" }, [
     el("div", { className: "subcard-head" }, [
-      el("h3", {}, ["1. На какое сообщение лучше всего отвечают (Конверсия по 3 шагам и тексты сообщений)"]),
-      el("span", { className: "badge b-talk" }, ["Фоллоу-апы Шага 2 и 3 принесли 96 ответов (30.5% всей выручки)!"]),
+      el("h3", {}, ["1. Конверсия по шагам рассылки"]),
+      el("span", { className: "badge b-talk" }, [`Ответов: ${s.replied || 0}`]),
     ]),
     el("div", { className: "table-wrap" }, [
       el("table", {}, [
@@ -8858,8 +9180,8 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
 
   const hooksCard = el("div", { className: "surface-subcard stack" }, [
     el("div", { className: "subcard-head" }, [
-      el("h3", {}, ["2. Конверсия по форматам и углам захода (Hooks) в 1-м сообщении + тексты"]),
-      el("span", { className: "badge b-won" }, ["Лидеры: RU-питч СНГ (28.6% в +) и Партнёрский питч для агентств (27.8% в +)"]),
+      el("h3", {}, ["2. Конверсия по форматам (Hooks)"]),
+      el("span", { className: "badge b-won" }, [`Форматов: ${hooks.length}`]),
     ]),
     el("div", { className: "table-wrap" }, [
       el("table", {}, [
@@ -8880,7 +9202,7 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
     ]),
   ]);
 
-  // 4. Who replies + (By Category & By Niche)
+  // 4. Who replies (By Category & By Niche)
   const buildBreakdownTable = (items, keyField, labelHeader) => el("div", { className: "table-wrap" }, [
     el("table", {}, [
       el("thead", {}, [
@@ -8918,8 +9240,8 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
 
   const whoRepliesCard = el("div", { className: "surface-subcard stack" }, [
     el("div", { className: "subcard-head" }, [
-      el("h3", {}, ["3. Кто отвечает + (Разбивка по категориям Все2 и продуктовым нишам)"]),
-      el("span", { className: "badge b-ok" }, ["AI (30.6% в +) · Gaming/iGaming (25.2% в +) · Агентства (49 целевых +)"]),
+      el("h3", {}, ["3. Разбивка ответов по категориям и нишам"]),
+      el("span", { className: "badge b-ok" }, [`Категорий: ${cats.length} · Ниш: ${niches.length}`]),
     ]),
     el("span", { className: "steps-caption" }, ["А. ПО КАТЕГОРИЯМ ТАБЛИЦЫ ВСЕ2:"]),
     buildBreakdownTable(cats, "category", "Категория клиента"),
@@ -9052,7 +9374,8 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
                     if (state.viewMode === "sheet") {
                       openSheetPopup("card");
                     } else {
-                      setActiveSheet("s07");
+                      state.leadsSubView = "kanban";
+                      activateSheet("leads");
                     }
                   },
                 }, ["Карточка"]) : null,
@@ -9079,29 +9402,16 @@ function renderDeepOutreachAnalytics(summary) {
   const analyticsBox = document.querySelector("#analytics-deep-outreach-box");
   if (analyticsBox) {
     analyticsBox.replaceChildren(
-      el("details", { className: "surface-subcard outreach-audit-details" }, [
+      el("details", { className: "surface-subcard outreach-audit-details", open: true }, [
         el("summary", { className: "subcard-head outreach-audit-summary" }, [
-          el("strong", {}, ["Детальный аудит рассылок"]),
-          el("span", { className: "badge b-new" }, ["Развернуть"]),
+          el("strong", {}, ["Детальный разбор рассылок и очередь ответов"]),
+          el("span", { className: "badge b-new" }, ["Развернуть / свернуть"]),
         ]),
         el("div", { className: "outreach-audit-body stack" }, [
           buildDeepOutreachNode(data.deep_outreach, "an_deep"),
         ]),
       ]),
     );
-  }
-  const outreachBox = document.querySelector("#outreach-deep-stats-box");
-  if (outreachBox) {
-    const deepDetails = el("details", { className: "surface-subcard outreach-audit-details" }, [
-      el("summary", { className: "subcard-head outreach-audit-summary" }, [
-        el("strong", {}, ["📊 Подробная аналитика касаний, ответов и конверсии по рассылкам"]),
-        el("span", { className: "badge b-new" }, ["Развернуть отчёт"]),
-      ]),
-      el("div", { className: "outreach-audit-body stack" }, [
-        buildDeepOutreachNode(data.deep_outreach, "out_deep"),
-      ]),
-    ]);
-    outreachBox.replaceChildren(deepDetails);
   }
 }
 
@@ -9638,7 +9948,7 @@ function syncBulkHostContainer(preferredTarget) {
   if (!bulkBar || !leadsSec || !boardSec) return;
 
   const isBoardActive = (state.bulkHostTarget === "s07" && !boardSec.hidden)
-    || (state.viewMode === "sheet" && state.activeSheet === "s07" && leadsSec.hidden);
+    || (state.viewMode === "sheet" && state.activeSheet === "leads" && state.leadsSubView === "kanban" && leadsSec.hidden);
   if (isBoardActive) {
     const header = boardSec.querySelector(".pipeline-header");
     if (bulkBar.parentElement !== boardSec) {

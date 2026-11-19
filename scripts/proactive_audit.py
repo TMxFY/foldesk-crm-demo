@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.analytics import get_analytics_summary  # noqa: E402
 from app.db import connect  # noqa: E402
 from app.digest import audit_reply_notifications, heal_reply_notifications  # noqa: E402
 from app.main import load_env_file  # noqa: E402
@@ -43,6 +44,59 @@ from app.hygiene import (  # noqa: E402
     audit_server_leadgen_readiness as _audit_server_leadgen_readiness,
     heal_crm_hygiene as _raw_heal_crm_hygiene,
 )
+
+
+def _audit_ssot_statistics(conn: sqlite3.Connection) -> dict:
+    """Verify SSOT analytics math consistency and visibility of all dropped accounts."""
+    summary = get_analytics_summary(conn, period="7d")
+    issues: list[str] = []
+    deep_sum = (summary.get("deep_outreach") or {}).get("summary") or {}
+    contacted = int(deep_sum.get("contacted") or 0)
+    read_cnt = int(deep_sum.get("read") or 0)
+    unseen_cnt = int(deep_sum.get("unseen_total") or 0)
+    if contacted > 0 and read_cnt + unseen_cnt != contacted:
+        issues.append(f"read({read_cnt})+unseen({unseen_cnt})!=contacted({contacted})")
+
+    accounts_obj = summary.get("accounts") or {}
+    dropped_items = accounts_obj.get("dropped_accounts") or []
+    dropped_ids = {int(a["id"]) for a in dropped_items if a.get("id") is not None}
+    db_dropped = conn.execute(
+        "SELECT id, COALESCE(telegram_username, telegram_name, phone, '') AS label, status FROM accounts "
+        "WHERE lower(COALESCE(status, '')) NOT IN ('connected', 'active', 'online')"
+    ).fetchall()
+    missing_dropped = [
+        f"#{r['id']}({r['label'] or r['status']})"
+        for r in db_dropped
+        if int(r["id"]) not in dropped_ids
+    ]
+    if missing_dropped:
+        issues.append(f"dropped_accounts_hidden={missing_dropped}")
+
+    # Verify daily_flow excludes non-CRM personal dialogs (peer with no lead & no campaign_recipient)
+    personal_msgs_7d = conn.execute(
+        """
+        SELECT COUNT(*) FROM messages m
+        JOIN dialogs d ON d.id = m.dialog_id
+        WHERE d.peer_type = 'user'
+          AND d.lead_id IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM campaign_recipients cr
+              WHERE (d.peer_id IS NOT NULL AND cr.telegram_user_id = d.peer_id)
+                 OR (d.username IS NOT NULL AND cr.username IS NOT NULL AND lower(cr.username) = lower(d.username))
+          )
+        """
+    ).fetchone()[0]
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "contacted": contacted,
+        "read": read_cnt,
+        "unseen_total": unseen_cnt,
+        "dropped_accounts_count": len(dropped_items),
+        "db_dropped_accounts_count": len(db_dropped),
+        "ignored_personal_messages_total": int(personal_msgs_7d or 0),
+    }
 
 
 def _heal_crm_hygiene(conn) -> dict:
@@ -80,6 +134,7 @@ def _audit_local_db(
             )
             reply_report = audit_reply_notifications(conn, since_hours=since_hours)
             hygiene_report = _audit_crm_hygiene(conn)
+            stats_report = _audit_ssot_statistics(conn)
             if check_readiness:
                 readiness_report = _audit_server_leadgen_readiness(
                     conn, enforce_vps_checks=True
@@ -93,6 +148,7 @@ def _audit_local_db(
         try:
             reply_report = audit_reply_notifications(conn, since_hours=since_hours)
             hygiene_report = _audit_crm_hygiene(conn)
+            stats_report = _audit_ssot_statistics(conn)
             if check_readiness:
                 readiness_report = _audit_server_leadgen_readiness(
                     conn, enforce_vps_checks=True
@@ -100,7 +156,11 @@ def _audit_local_db(
         finally:
             conn.close()
 
-    overall_ok = bool(reply_report.get("ok")) and bool(hygiene_report.get("ok"))
+    overall_ok = (
+        bool(reply_report.get("ok"))
+        and bool(hygiene_report.get("ok"))
+        and bool(stats_report.get("ok"))
+    )
     if readiness_report is not None and not bool(readiness_report.get("ok")):
         overall_ok = False
 
@@ -108,6 +168,8 @@ def _audit_local_db(
     combined["ok"] = overall_ok
     combined["icp_hygiene_ok"] = bool(hygiene_report.get("ok"))
     combined["crm_hygiene"] = hygiene_report
+    combined["ssot_stats_ok"] = bool(stats_report.get("ok"))
+    combined["ssot_stats"] = stats_report
     if readiness_report is not None:
         combined["leadgen_ready"] = bool(readiness_report.get("ok"))
         combined["leadgen_readiness"] = readiness_report
@@ -128,6 +190,8 @@ def _audit_local_db(
             f"contactless_leads={hygiene_report.get('contactless_lead_count', 0)}, "
             f"dirty_title_leads={hygiene_report.get('dirty_title_lead_count', 0)})"
         )
+    if not stats_report.get("ok"):
+        reasons.append(f"ssot_stats({', '.join(stats_report.get('issues') or [])})")
     if readiness_report is not None and not readiness_report.get("ok"):
         missing = readiness_report.get("missing_components") or []
         reasons.append(

@@ -5189,7 +5189,12 @@ async def run_campaign_batch(
                                     if isinstance(m, dict)
                                 )
                                 if fetched_msgs:
-                                    _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                                    _cache_messages(
+                                        conn,
+                                        int(dialog["id"]),
+                                        fetched_msgs,
+                                        skip_reply_stop=True,
+                                    )
                         except Exception as fetch_exc:
                             f_kind, _ = _classify_outreach_send_error(fetch_exc)
                             if f_kind in ("account_dead", "account_transient"):
@@ -5210,7 +5215,12 @@ async def run_campaign_batch(
                                             if isinstance(m, dict)
                                         )
                                         if fetched_msgs:
-                                            _cache_messages(conn, int(dialog["id"]), fetched_msgs)
+                                            _cache_messages(
+                                                conn,
+                                                int(dialog["id"]),
+                                                fetched_msgs,
+                                                skip_reply_stop=True,
+                                            )
                                 except Exception as inner_exc:
                                     if _classify_outreach_send_error(inner_exc)[0] in ("account_dead", "account_transient"):
                                         raise
@@ -5222,13 +5232,14 @@ async def run_campaign_batch(
                             refreshed_dlg = as_dict(refreshed_dlg_row)
                             if refreshed_dlg and safe_int(refreshed_dlg.get("id")) is not None:
                                 dialog = refreshed_dlg
-                    if _dialog_has_client_reply(conn, dialog, rec) and _stop_outreach_from_dialog_sync(
-                        conn,
-                        rec,
-                        dialog,
-                        account_id=chosen_account_id,
-                        notify=_dialog_is_unread_awaiting_reply(conn, dialog, rec),
-                    ):
+                    if _dialog_has_client_reply(conn, dialog, rec):
+                        _stop_outreach_from_dialog_sync(
+                            conn,
+                            rec,
+                            dialog,
+                            account_id=chosen_account_id,
+                            notify=_dialog_is_unread_awaiting_reply(conn, dialog, rec),
+                        )
                         conn.execute(
                             "UPDATE campaign_recipients SET status = 'replied', updated_at = ? WHERE id = ?",
                             (now, rec["id"]),

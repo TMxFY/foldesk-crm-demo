@@ -51,3 +51,11 @@
    - `last_run_summary.json` отображает по-источниковую статистику прогона (`per_source_counts`, `tg_bridged_count`), а карточка «Свежий улов парсеров» в UI показывает целевые лиды в TG-кампании и пуле Direct/X.
 4. **AST Local Use-Before-Def Gate (`./scripts/verify.sh` — Gate I)**:
    - Проверяет все функции в `app/` и `leadgen/` на чтение/вызов локального `def <name>` раньше его определения в том же scope (предотвращает `UnboundLocalError` в `crmtg-leadgen.service`), а `vps_autonomous_replenish.main()` фиксирует необработанные падения в `kv_settings['leadgen_stage_errors']`.
+
+## Playbook 4: Strict DB-Lead Incoming-Only Alerts, SSOT Statistics & 4-Tab UI Gate (`Gate C`, `Gate J`, `Gate K`)
+1. **Strict Alert Eligibility (`tests/test_alert_strict_db_lead_and_incoming_only.py`)**:
+   - Уведомление через `@softugccollegabot` отправляется **строго** при наличии открытого лида (или реально проконтактированного получателя) в БД И входящем сообщении (`direction='in'`) этого лида. Любые исходящие, не-лид ЛС, нетронутые `pending`/`failed` получатели, закрытые (`won`/`lost`) клиенты, боты, подключённые аккаунты, дубликаты `(chat_id, dialog_id, incoming_message_id)`, эдиты и уже прочитанные (`sent_at <= last_read_at`) сообщения подавляются с `0` отправок.
+2. **SSOT Statistics (`tests/test_ssot_statistics_and_simplified_ui.py` & `scripts/proactive_audit.py`)**:
+   - `get_analytics_summary` и `proactive_audit.py` проверяют тождество `read + unseen_total == contacted`, раздельные счётчики running vs draft pending queues, видимость **всех** отвалившихся аккаунтов в `accounts.dropped_accounts` (включая `0`-send/`0`-dialog аккаунты) с причиной и датой отвала, исключение личных не-CRM диалогов из `daily_flow` / `reply_heatmap`, и живой `waiting_our_answer` в разбивке на живые/отвалившиеся аккаунты.
+3. **4-Tab Simplified UI & Zero Hardcoded Stats (`Gate J` & `Gate K`)**:
+   - Навигация `.nav` и `#miniapp-bottom-nav` содержит ровно 4 вкладки: `Входящие` (`inbox`), `Лиды` (`leads`), `Рассылки` (`outreach`), `Статистика` (`analytics`); в коде UI отсутствуют захардкоженные цифры (`2 174`, `129 ждущих`, `3.6% отказов`, `30.5% всей выручки`) и несуществующие вызовы `setActiveSheet(`.

@@ -144,6 +144,7 @@ def test_send_lead_reply_notification_exact_call(conn, monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "colleague-token-123")
     monkeypatch.setenv("BOT_CHAT_ID", "colleague-chat-456")
     calls = _install_mock_opener(monkeypatch)
+    create_lead(conn, name="Phoenix Lead", username="phoenixIam", status="waiting")
 
     ok = send_lead_reply_notification(
         conn,
@@ -558,6 +559,7 @@ def test_credentials_from_kv_settings_when_env_not_set(conn, monkeypatch):
     assert chat_id == "chat_from_kv_888"
 
     calls = _install_mock_opener(monkeypatch)
+    create_lead(conn, name="Phoenix Lead", username="phoenixIam", status="waiting")
     ok = send_lead_reply_notification(
         conn,
         lead_handle="@phoenixIam",

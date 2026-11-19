@@ -388,7 +388,10 @@ def stop_outreach_on_reply(
     incoming_sent_at: str | None = None,
     source: str | None = None,
     is_bot: bool = False,
+    direction: str = "in",
 ) -> int:
+    if str(direction or "").strip().lower() != "in":
+        return 0
     now = utc_now()
     clean_min_sent = str(min_sent_at).strip() if min_sent_at else None
     clean_user = str(username).strip().lstrip("@") if username else None
@@ -492,7 +495,9 @@ def stop_outreach_on_reply(
     candidate_names: list[str] = []
     candidate_phones: list[str] = []
     all_rec_rows = []
+    contacted_rec_rows = []
     had_active_recs = False
+    has_contacted_recipient = False
     has_any_recipient = False
 
     if rec_clauses:
@@ -507,6 +512,12 @@ def stop_outreach_on_reply(
             rec_params,
         ).fetchall()
         has_any_recipient = len(all_rec_rows) > 0
+        contacted_rec_rows = [
+            rr
+            for rr in all_rec_rows
+            if str(rr["status"] or "").lower() in ("in_progress", "completed", "replied")
+        ]
+        has_contacted_recipient = len(contacted_rec_rows) > 0
         for rr in all_rec_rows:
             if rr["lead_id"]:
                 lid_existing = int(rr["lead_id"])
@@ -539,8 +550,15 @@ def stop_outreach_on_reply(
                     if aid not in candidate_account_ids:
                         candidate_account_ids.append(aid)
 
+        # Stop in_progress/completed always; stop pending ONLY when already backed by an open/known DB lead or contacted recipient.
         active_rec_rows = [
-            rr for rr in all_rec_rows if rr["status"] in ("pending", "in_progress", "completed")
+            rr
+            for rr in all_rec_rows
+            if rr["status"] in ("in_progress", "completed")
+            or (
+                rr["status"] == "pending"
+                and (bool(matched_lead_ids) or has_contacted_recipient)
+            )
         ]
         had_active_recs = len(active_rec_rows) > 0
         if clean_min_sent:
@@ -600,8 +618,8 @@ def stop_outreach_on_reply(
     if clean_min_sent and had_active_recs and stopped_count == 0 and not force_event:
         return 0
 
-    if has_any_recipient and not matched_lead_ids and all_rec_rows:
-        first_rec = all_rec_rows[0]
+    if has_contacted_recipient and not matched_lead_ids and contacted_rec_rows:
+        first_rec = contacted_rec_rows[0]
         auto_acc_id = (
             int(account_id)
             if account_id is not None
@@ -656,6 +674,17 @@ def stop_outreach_on_reply(
             auto_status = "talking"
             auto_airtable_status = "In conversation"
             auto_next_step = "Клиент ответил — цепочка остановлена, ответьте вручную"
+        auto_provider = (
+            str(dlg_row["provider"]).strip().lower()
+            if (dlg_row is not None and "provider" in dlg_row.keys() and dlg_row["provider"])
+            else (
+                _account_provider(conn, auto_acc_id)
+                if auto_acc_id is not None
+                else "telegram"
+            )
+        )
+        if auto_provider not in ("telegram", "whatsapp"):
+            auto_provider = "telegram"
         try:
             cur_lead = conn.execute(
                 """
@@ -663,7 +692,7 @@ def stop_outreach_on_reply(
                     account_id, telegram_user_id, username, name, phone,
                     status, airtable_status, company, description, niche, url,
                     note, next_step, dialog_id, provider, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'telegram', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     auto_acc_id,
@@ -680,6 +709,7 @@ def stop_outreach_on_reply(
                     auto_note,
                     auto_next_step,
                     auto_dlg_id,
+                    auto_provider,
                     now,
                     now,
                 ),
@@ -868,7 +898,7 @@ def stop_outreach_on_reply(
         or any_lead_status_moved
         or (
             force_event
-            and (has_open_lead or (has_any_recipient and not matched_lead_ids))
+            and (has_open_lead or (has_contacted_recipient and not matched_lead_ids))
         )
     )
     should_notify_colleague = bool(notify) and base_notify_trigger
@@ -1006,6 +1036,8 @@ def stop_outreach_on_reply(
                 lead_id=sorted(matched_lead_ids)[0] if matched_lead_ids else lead_id,
                 account_id=resolved_acc_id,
                 peer_id=clean_peer_id,
+                phone=clean_phone or (dlg_row["phone"] if dlg_row is not None else None),
+                direction=direction,
                 opener=opener,
                 incoming_sent_at=effective_incoming_sent_at,
                 telegram_message_id=int(telegram_message_id) if telegram_message_id is not None else None,
@@ -1158,6 +1190,7 @@ def _upsert_snapshot_dialog(
     *,
     opener=None,
     source: str,
+    notify: bool = True,
 ) -> dict | None:
     peer_id = _resolve_private_peer_id(person)
     if peer_id is None:
@@ -1304,6 +1337,16 @@ def _upsert_snapshot_dialog(
     if row and int(row["last_from_peer"] or 0) == 1:
         has_explicit_unread = unread is not None and int(row["unread_count"] or 0) > 0
         row_is_bot = bool(snap_is_bot or ("is_bot" in row.keys() and row["is_bot"]))
+        snap_sent_at = sent_at or (str(row["last_message_at"]) if row["last_message_at"] else None)
+        snap_mid = (
+            int(person["telegram_message_id"])
+            if person.get("telegram_message_id") is not None
+            else (
+                int(person["last_message_id"])
+                if person.get("last_message_id") is not None
+                else None
+            )
+        )
         stop_outreach_on_reply(
             conn,
             account_id=account_id,
@@ -1312,12 +1355,15 @@ def _upsert_snapshot_dialog(
             phone=row["phone"],
             lead_id=row["lead_id"],
             preview=row["last_message_preview"],
+            min_sent_at=snap_sent_at,
             opener=opener,
-            notify=has_explicit_unread,
+            notify=bool(notify and has_explicit_unread),
             incoming_unread=has_explicit_unread,
-            incoming_sent_at=sent_at or (str(row["last_message_at"]) if row["last_message_at"] else None),
+            telegram_message_id=snap_mid,
+            incoming_sent_at=snap_sent_at,
             source=source,
             is_bot=row_is_bot,
+            direction="in",
         )
         row = conn.execute(
             "SELECT * FROM dialogs WHERE id = ?",
@@ -1417,6 +1463,7 @@ def _prepare_message_fields(conn, account_id: int, message: dict, now: str) -> d
         "has_explicit_sent_at": explicit_sent_at is not None and str(explicit_sent_at).strip() != "",
         "sent_at": sent_at,
         "mid": mid,
+        "external_message_id": str(message.get("external_message_id") or "").strip() or None,
         "is_bot": bool(message.get("is_bot")),
     }
 
@@ -1457,12 +1504,13 @@ def _upsert_dialog_message_row(conn, dialog_id: int, direction: str, fields: dic
     conn.execute(
         """
         INSERT INTO messages (
-            dialog_id, telegram_message_id, direction, text, media_url,
+            dialog_id, telegram_message_id, external_message_id, direction, text, media_url,
             media_type, media_mime, media_filename, media_duration,
             entities_json, formatted_html, edited_at,
             sent_at, reply_to_telegram_message_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+            external_message_id = COALESCE(excluded.external_message_id, messages.external_message_id),
             direction = excluded.direction,
             text = excluded.text,
             formatted_html = excluded.formatted_html,
@@ -1479,6 +1527,7 @@ def _upsert_dialog_message_row(conn, dialog_id: int, direction: str, fields: dic
         (
             int(dialog_id),
             int(mid),
+            fields.get("external_message_id"),
             direction,
             body,
             fields["media_url"],
@@ -1522,6 +1571,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
     ).fetchone()
 
     existing_msg = None
+    ext_mid = fields.get("external_message_id")
     if prev_dlg is not None and mid is not None:
         existing_msg = conn.execute(
             """
@@ -1530,6 +1580,17 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
             """,
             (int(prev_dlg["id"]), int(mid)),
         ).fetchone()
+    if existing_msg is None and prev_dlg is not None and ext_mid:
+        existing_msg = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE dialog_id = ? AND external_message_id = ?
+            """,
+            (int(prev_dlg["id"]), ext_mid),
+        ).fetchone()
+        if existing_msg is not None and existing_msg["telegram_message_id"] is not None:
+            mid = int(existing_msg["telegram_message_id"])
+            fields = {**fields, "mid": mid}
 
     # Idempotent redelivery guard for non-edit events
     if not is_edit and existing_msg is not None:
@@ -1702,6 +1763,7 @@ def apply_incoming(conn, account_id: int, message: dict, opener=None) -> dict:
             incoming_sent_at=sent_at,
             source="apply_incoming",
             is_bot=row_is_bot,
+            direction="in",
         )
         row = conn.execute(
             "SELECT * FROM dialogs WHERE id = ?",
@@ -1738,6 +1800,7 @@ def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
     ).fetchone()
 
     existing_msg = None
+    ext_mid = fields.get("external_message_id")
     if prev_dlg is not None and mid is not None:
         existing_msg = conn.execute(
             """
@@ -1746,6 +1809,17 @@ def apply_live_outgoing(conn, account_id: int, message: dict) -> dict | None:
             """,
             (int(prev_dlg["id"]), int(mid)),
         ).fetchone()
+    if existing_msg is None and prev_dlg is not None and ext_mid:
+        existing_msg = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE dialog_id = ? AND external_message_id = ?
+            """,
+            (int(prev_dlg["id"]), ext_mid),
+        ).fetchone()
+        if existing_msg is not None and existing_msg["telegram_message_id"] is not None:
+            mid = int(existing_msg["telegram_message_id"])
+            fields = {**fields, "mid": mid}
 
     if is_edit and existing_msg is not None and not fields["has_explicit_sent_at"]:
         if existing_msg["sent_at"]:
@@ -1948,6 +2022,7 @@ def sync_inbox(
     people: list,
     opener=None,
     crm_only: bool = False,
+    notify: bool = True,
 ) -> list:
     ensure_dialog_notify_columns(conn)
     acc_provider = _account_provider(conn, account_id, require_exists=True)
@@ -1980,6 +2055,7 @@ def sync_inbox(
                 now,
                 opener=opener,
                 source="sync_inbox",
+                notify=bool(notify),
             )
             if item is not None:
                 saved.append(item)
@@ -2729,7 +2805,7 @@ def list_messages(conn, dialog_id: int, limit: int | None = None) -> list:
     return out
 
 
-def _cache_messages(conn, dialog_id: int, items: list) -> None:
+def _cache_messages(conn, dialog_id: int, items: list, *, skip_reply_stop: bool = False) -> None:
     now = utc_now()
     normalized = [_normalize_message(item, now) for item in items]
     try:
@@ -2854,7 +2930,8 @@ def _cache_messages(conn, dialog_id: int, items: list) -> None:
                     dlg_row = conn.execute(
                         "SELECT * FROM dialogs WHERE id = ?", (dialog_id,)
                     ).fetchone()
-                    if dlg_row is not None:
+                    if dlg_row is not None and not skip_reply_stop:
+                        row_is_bot = bool("is_bot" in dlg_row.keys() and dlg_row["is_bot"])
                         stop_outreach_on_reply(
                             conn,
                             account_id=int(dlg_row["account_id"]),
@@ -2869,6 +2946,8 @@ def _cache_messages(conn, dialog_id: int, items: list) -> None:
                             telegram_message_id=int(latest_mid) if latest_mid is not None else None,
                             incoming_sent_at=last_at,
                             source="cache_messages",
+                            is_bot=row_is_bot,
+                            direction="in",
                         )
             else:
                 if not prev_ts or not batch_ts or prev_ts <= batch_ts:
@@ -3098,35 +3177,47 @@ async def send_reply(conn, dialog_id: int, text: str, gateway, reply_to=None) ->
     message_text = (sent.get("text") or body).strip() or body
     formatted_html = sent.get("formatted_html") or render_formatted_html(message_text, None)
     tg_mid = int(sent["telegram_message_id"])
-    conn.execute(
-        """
-        INSERT INTO messages (
-            dialog_id, telegram_message_id, direction, text, formatted_html,
-            sent_at, reply_to_telegram_message_id, created_at, updated_at
-        ) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
-            direction = 'out',
-            text = excluded.text,
-            formatted_html = excluded.formatted_html,
-            sent_at = excluded.sent_at,
-            reply_to_telegram_message_id = COALESCE(excluded.reply_to_telegram_message_id, messages.reply_to_telegram_message_id),
-            updated_at = excluded.updated_at
-        """,
-        (
-            int(dialog_id),
-            tg_mid,
-            message_text,
-            formatted_html,
-            sent_at,
-            int(reply_to) if reply_to else None,
-            now,
-            now,
-        ),
+    ext_mid = str(sent.get("external_message_id") or "").strip() or None
+    existing_ext = (
+        conn.execute(
+            "SELECT * FROM messages WHERE dialog_id = ? AND external_message_id = ?",
+            (int(dialog_id), ext_mid),
+        ).fetchone()
+        if ext_mid
+        else None
     )
+    if existing_ext is None:
+        conn.execute(
+            """
+            INSERT INTO messages (
+                dialog_id, telegram_message_id, external_message_id, direction, text, formatted_html,
+                sent_at, reply_to_telegram_message_id, created_at, updated_at
+            ) VALUES (?, ?, ?, 'out', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dialog_id, telegram_message_id) DO UPDATE SET
+                external_message_id = COALESCE(excluded.external_message_id, messages.external_message_id),
+                direction = 'out',
+                text = excluded.text,
+                formatted_html = excluded.formatted_html,
+                sent_at = excluded.sent_at,
+                reply_to_telegram_message_id = COALESCE(excluded.reply_to_telegram_message_id, messages.reply_to_telegram_message_id),
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(dialog_id),
+                tg_mid,
+                ext_mid,
+                message_text,
+                formatted_html,
+                sent_at,
+                int(reply_to) if reply_to else None,
+                now,
+                now,
+            ),
+        )
     preview = message_text[:120]
     _mark_dialog_replied_out(conn, int(dialog_id), sent_at, preview, now)
     conn.commit()
-    row = conn.execute(
+    row = existing_ext or conn.execute(
         "SELECT * FROM messages WHERE dialog_id = ? AND telegram_message_id = ?",
         (int(dialog_id), tg_mid),
     ).fetchone()

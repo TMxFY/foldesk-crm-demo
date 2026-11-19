@@ -862,7 +862,30 @@ def _inbox_limit(limit) -> int:
         cap = 30
     if cap < 1:
         cap = 1
-    return min(cap, 30)
+    return min(cap, 100)
+
+
+_SERVICE_PEER_IDS = frozenset((777000, 178220800, 1271266957, 93372553))
+
+
+def _is_blocked_private_peer(
+    peer_id_val: int | None,
+    username: str | None = None,
+    *,
+    is_self: bool = False,
+    is_bot: bool = False,
+) -> bool:
+    if is_self or is_bot:
+        return True
+    if peer_id_val is not None:
+        if int(peer_id_val) <= 0 or int(peer_id_val) in _SERVICE_PEER_IDS:
+            return True
+    clean_uname = str(username or "").strip().lstrip("@").lower()
+    if clean_uname == "replies":
+        return True
+    if len(clean_uname) >= 4 and clean_uname.endswith("bot"):
+        return True
+    return False
 
 
 def _history_limit(limit) -> int:
@@ -2105,12 +2128,11 @@ class TelethonGateway(TelegramGateway):
                 continue
             ent_id = int(getattr(entity, "id", 0) or 0)
             ent_user = str(getattr(entity, "username", "") or "").strip()
-            if (
-                getattr(entity, "is_self", False)
-                or getattr(entity, "bot", False)
-                or ent_id in (777000, 178220800, 1271266957, 93372553)
-                or ent_user.lower() == "replies"
-                or (len(ent_user) >= 4 and ent_user.lower().endswith("bot"))
+            if _is_blocked_private_peer(
+                ent_id,
+                ent_user,
+                is_self=bool(getattr(entity, "is_self", False)),
+                is_bot=bool(getattr(entity, "bot", False)),
             ):
                 continue
             message = getattr(dialog, "message", None)
@@ -2152,6 +2174,8 @@ class TelethonGateway(TelegramGateway):
         return found
 
     async def _search(self, client, query: str, limit: int) -> list:
+        from telethon.tl.types import User
+
         q = (query or "").strip()
         if q.startswith("@"):
             return await self._resolve_username(client, q)
@@ -2161,7 +2185,16 @@ class TelethonGateway(TelegramGateway):
             if not dialog.is_user:
                 continue
             entity = dialog.entity
+            if not isinstance(entity, User):
+                continue
             username = getattr(entity, "username", None)
+            if _is_blocked_private_peer(
+                getattr(entity, "id", None),
+                username,
+                is_self=bool(getattr(entity, "is_self", False)),
+                is_bot=bool(getattr(entity, "bot", False)),
+            ):
+                continue
             name = dialog.name or ""
             if needle:
                 blob = " ".join((name, username or "", str(entity.id))).casefold()
@@ -2785,6 +2818,10 @@ class TelethonGateway(TelegramGateway):
             username = getattr(peer, "username", None)
             name = _person_name(peer)
         elif is_out:
+            if peer is not None and (
+                getattr(peer, "is_self", False) or getattr(peer, "bot", False)
+            ):
+                return None
             raw_peer = getattr(message, "peer_id", None)
             uid = getattr(raw_peer, "user_id", None) or getattr(event, "chat_id", None)
             if uid is None:
@@ -2792,17 +2829,18 @@ class TelethonGateway(TelegramGateway):
             peer_id_val = int(uid)
             if self_id and peer_id_val == self_id:
                 return None
-            name = f"TG {peer_id_val}"
+            username = getattr(peer, "username", None) if peer is not None else None
+            name = (
+                _person_name(peer) if peer is not None else ""
+            ) or f"TG {peer_id_val}"
         else:
             return None
 
-        if peer_id_val <= 0:
-            return None
-        clean_uname = str(username or "").strip().lower()
-        if (
-            peer_id_val in (777000, 178220800, 1271266957, 93372553)
-            or clean_uname == "replies"
-            or (len(clean_uname) >= 4 and clean_uname.endswith("bot"))
+        if _is_blocked_private_peer(
+            peer_id_val,
+            username,
+            is_self=bool(peer is not None and getattr(peer, "is_self", False)),
+            is_bot=bool(peer is not None and getattr(peer, "bot", False)),
         ):
             return None
         raw_text = getattr(message, "message", None)
@@ -2817,6 +2855,7 @@ class TelethonGateway(TelegramGateway):
             "telegram_user_id": int(peer_id_val),
             "username": username,
             "name": name,
+            "phone": getattr(peer, "phone", None) if peer is not None else None,
             "telegram_message_id": int(message.id),
             "text": text,
             "sent_at": _stamp(getattr(message, "date", None)),
@@ -3036,6 +3075,13 @@ class TelethonGateway(TelegramGateway):
             return []
         if not isinstance(entity, User):
             return []
+        if _is_blocked_private_peer(
+            getattr(entity, "id", None),
+            getattr(entity, "username", None),
+            is_self=bool(getattr(entity, "is_self", False)),
+            is_bot=bool(getattr(entity, "bot", False)),
+        ):
+            return []
         return [
             {
                 "telegram_user_id": entity.id,
@@ -3146,7 +3192,12 @@ class TelethonGateway(TelegramGateway):
                 entity = await client.get_entity(peer)
             except Exception:
                 continue
-            if not isinstance(entity, User) or getattr(entity, "bot", False):
+            if not isinstance(entity, User) or _is_blocked_private_peer(
+                getattr(entity, "id", None),
+                getattr(entity, "username", None),
+                is_self=bool(getattr(entity, "is_self", False)),
+                is_bot=bool(getattr(entity, "bot", False)),
+            ):
                 continue
             people.append(
                 {

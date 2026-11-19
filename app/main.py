@@ -27,6 +27,7 @@ from app.accounts import (
     list_accounts,
     purge_dead_accounts,
     reconnect_account,
+    record_account_health_transition,
     restore_disk_sessions,
     set_daily_limit,
     start_login,
@@ -727,7 +728,12 @@ def _filter_people_to_existing_or_crm(
 
 
 def _sync_and_publish_dialogs_sync(
-    conn, account_id: int, people: list[dict], *, crm_only: bool = False
+    conn,
+    account_id: int,
+    people: list[dict],
+    *,
+    crm_only: bool = False,
+    notify: bool = True,
 ):
     load_all = getattr(_inbox_mod, "_query_inbox_rows", None)
     if load_all is not None:
@@ -744,7 +750,7 @@ def _sync_and_publish_dialogs_sync(
         if crm_only
         else people
     )
-    sync_inbox(conn, account_id, effective_people)
+    sync_inbox(conn, account_id, effective_people, notify=notify)
     res = sync_dialog_read_receipts(conn, account_id, people)
     if load_all is not None:
         after_rows = load_all(conn, account_id=account_id)
@@ -761,12 +767,18 @@ def _sync_and_publish_dialogs_sync(
 
 
 async def _sync_and_publish_dialogs(
-    app, conn, account_id: int, people: list[dict], *, crm_only: bool = False
+    app,
+    conn,
+    account_id: int,
+    people: list[dict],
+    *,
+    crm_only: bool = False,
+    notify: bool = True,
 ):
     res, changed = await _run_db_sync(
         conn,
         lambda c: _sync_and_publish_dialogs_sync(
-            c, account_id, people, crm_only=crm_only
+            c, account_id, people, crm_only=crm_only, notify=notify
         ),
         conn,
     )
@@ -801,6 +813,7 @@ async def ensure_private_inbox(app, account_id: int) -> None:
         if str(account.get("session_path") or "").startswith("data/sessions/demo"):
             synced.add(account_id)
             return
+        existing_only_refresh = False
         if not is_ephemeral_runtime() and isinstance(
             getattr(app.state, "gateway", None), (type(None), TelethonGateway)
         ):
@@ -810,20 +823,33 @@ async def ensure_private_inbox(app, account_id: int) -> None:
                     (int(account_id),),
                 ).fetchone()[0]
             if int(total_dlg_cnt or 0) > 0:
-                synced.add(account_id)
-                return
+                # Refresh read watermarks quietly before watch catch_up() without ingesting non-CRM DMs or notifying.
+                existing_only_refresh = True
         provider = str(account.get("provider") or "telegram").strip().lower()
         gateway = _resolve_app_gateway(app, provider)
         if gateway is None:
             return
         try:
-            people = await gateway.load_inbox(account["session_path"], limit=30)
+            people = await gateway.load_inbox(
+                account["session_path"], limit=60 if existing_only_refresh else 30
+            )
         except Exception:
+            if existing_only_refresh:
+                synced.add(account_id)
             return
         if not isinstance(people, list):
+            if existing_only_refresh:
+                synced.add(account_id)
             return
         try:
-            await _sync_and_publish_dialogs(app, app.state.conn, account_id, people[:30])
+            await _sync_and_publish_dialogs(
+                app,
+                app.state.conn,
+                account_id,
+                people[: (60 if existing_only_refresh else 30)],
+                crm_only=existing_only_refresh,
+                notify=not existing_only_refresh,
+            )
         except (LookupError, ValueError):
             return
         synced.add(account_id)
@@ -945,9 +971,15 @@ async def start_account_watch(app, account_id: int) -> None:
             try:
                 try:
                     await gateway.watch_private(session_path, on_message, **watch_kwargs)
-                except TypeError:
-                    await gateway.watch_private(session_path, on_message)
-                return
+                except TypeError as exc:
+                    if "unexpected keyword argument" in str(exc):
+                        await gateway.watch_private(session_path, on_message)
+                    else:
+                        raise
+                _runtime_logger.warning(
+                    "Watch disconnected normally for account_id=%s, scheduling reconnect...",
+                    account_id,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -958,30 +990,45 @@ async def start_account_watch(app, account_id: int) -> None:
                         "unauthorized",
                         "auth_key_duplicated",
                         "two different ip",
+                        "sessionrevoked",
                         "deactivated",
+                        "userdeactivated",
                     )
                 ):
                     _runtime_logger.error(
                         "Permanent watch failure for account_id=%s: %s", account_id, exc
                     )
+                    try:
+                        await _run_db_sync(
+                            app.state.conn,
+                            record_account_health_transition,
+                            app.state.conn,
+                            account_id,
+                            "unauthorized",
+                            str(exc),
+                        )
+                    except Exception:
+                        _runtime_logger.exception(
+                            "Failed to persist unauthorized health for account_id=%s",
+                            account_id,
+                        )
                     return
                 _runtime_logger.warning(
                     "Transient watch disconnect for account_id=%s (%s), retrying...",
                     account_id,
                     exc,
                 )
-                retry_delay = float(getattr(app.state, "watch_retry_delay", 5.0) or 5.0)
-                await asyncio.sleep(retry_delay)
-                try:
-                    with locked_conn(app.state.conn):
-                        refreshed = load_account(app.state.conn, account_id)
-                    if refreshed.get("status") != "connected" or refreshed.get("health") in (
-                        "unauthorized",
-                        "banned",
-                    ):
-                        return
-                except Exception:
+            retry_delay = float(getattr(app.state, "watch_retry_delay", 5.0) or 5.0)
+            await asyncio.sleep(retry_delay)
+            try:
+                with locked_conn(app.state.conn):
+                    refreshed = load_account(app.state.conn, account_id)
+                if refreshed.get("status") != "connected" or _is_dead_account_health(
+                    refreshed.get("health")
+                ):
                     return
+            except Exception:
+                return
 
     task = asyncio.create_task(runner())
     app.state.inbox_tasks[account_id] = task
@@ -1532,6 +1579,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         return response
 
     from app.security import (
+        has_valid_bot_webhook_secret,
         has_valid_mcp_api_key,
         is_auth_enforced,
         register_security_middleware,
@@ -2280,6 +2328,8 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     @app.post("/api/digest/webhook")
     @app.post("/api/bot/webhook")
     async def digest_webhook(request: Request):
+        if not has_valid_bot_webhook_secret(request):
+            raise HTTPException(status_code=401, detail="Неверный секрет webhook")
         try:
             update = await request.json()
         except Exception as exc:

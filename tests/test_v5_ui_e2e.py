@@ -166,8 +166,8 @@ const {{ chromium }} = require('playwright');
     throw new Error(`SoftUGC fields did not persist: ${{JSON.stringify(checkCard)}}`);
   }}
 
-  // 4. Test Calendar: create event, verify chip in grid, drag-and-drop reschedule, switch views
-  await page.locator('a[data-sheet-link="calendar"]').click();
+  // 4. Test Calendar (direct sheet hash, kept accessible even though hidden from 4-tab sidebar)
+  await page.evaluate(() => {{ window.location.hash = '#calendar'; }});
   await page.locator('#calendar').waitFor({{ state: 'visible' }});
   await page.locator('#cal-ev-title').fill('Демо созвон по AI UGC');
   await page.locator('#cal-ev-type').selectOption('call');

@@ -251,9 +251,9 @@ const {{ chromium }} = require("playwright");
   await page.request.post(`${{baseURL}}/api/test/reset`);
   await page.goto(`${{baseURL}}/`);
 
-  // 1. Seed demo data and open Kanban board (#s07)
+  // 1. Seed demo data and open Лиды (Kanban board #s07 is the default view)
   await page.locator("#seed-demo").click();
-  await page.locator('a[data-sheet-link="s07"]').first().click();
+  await page.locator('a[data-sheet-link="leads"]').first().click();
   await page.locator("#board .col[data-stage='new'] .lead-card").first().waitFor();
 
   const newCol = page.locator("#board .col[data-stage='new']");

@@ -13,8 +13,6 @@ test.afterEach(() => {
 });
 
 test('F20-H1 sheet mode switches active sheet and hides inactive sections', async ({ page }) => {
-  await expect(page.locator('#workspace-main')).toHaveAttribute('data-view-mode', 'all');
-  await page.locator('#toggle-view-mode').click();
   await expect(page.locator('#workspace-main')).toHaveAttribute('data-view-mode', 'sheet');
 
   await page.locator('.nav a[href="#outreach"]').click();
@@ -22,11 +20,11 @@ test('F20-H1 sheet mode switches active sheet and hides inactive sections', asyn
   await expect(page.locator('#s07')).toBeHidden();
   await expect(page.locator('#leads')).toBeHidden();
 
-  await page.locator('.nav a[href="#accounts"]').click();
+  await page.locator('#outreach-subtabs button[data-outreach-subview="accounts"]').click();
   await expect(page.locator('#accounts')).toBeVisible();
-  await expect(page.locator('#outreach')).toBeHidden();
+  await expect(page.locator('#outreach-campaigns-pane')).toBeHidden();
 
-  await page.locator('.nav a[href="#s07"]').click();
+  await page.locator('.nav a[href="#leads"]').click();
   await expect(page.locator('#s07')).toBeVisible();
   await expect(page.locator('#accounts')).toBeHidden();
 });

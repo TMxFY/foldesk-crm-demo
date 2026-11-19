@@ -519,10 +519,15 @@ def test_funnel_ssot_variants_diagnoses_and_vacancy_exclusion(tmp_path):
         assert f_vac["summary"]["total_leads"] == 1
         assert f_vac["leads"][0]["username"] == "hr_lead"
 
-        # UI navigation & assets check
+        # UI navigation & assets check (4 simplified sidebar tabs)
         html = client.get("/").text
-        assert 'href="#funnel"' in html
-        assert "Воронка и Лидген" in html
+        for nav_href in (
+            'data-sheet-link="inbox"',
+            'data-sheet-link="leads"',
+            'data-sheet-link="outreach"',
+            'data-sheet-link="analytics"',
+        ):
+            assert nav_href in html
         assert 'id="funnel"' in html
         js = client.get("/static/app.js").text
         assert "/api/analytics/outreach-funnel" in js

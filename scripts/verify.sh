@@ -147,10 +147,26 @@ if (root / "app" / "inbox.py").is_file():
         errors.append("Reply-Alert Gate violation in app/inbox.py: bare 'dlg_row is not None' in base_notify_trigger spams non-leads")
     if "is_ineligible_reply_notify_peer" not in inbox_src:
         errors.append("Reply-Alert Gate violation: missing canonical is_ineligible_reply_notify_peer guard in app/inbox.py")
+    if re.search(r"require_backing\s*=\s*(?:False\b|bool\()", inbox_src):
+        errors.append("Reply-Alert Gate violation in app/inbox.py: forbidden require_backing=False/bool() bypass")
+    if 'direction or "").strip().lower() != "in"' not in inbox_src:
+        errors.append("Reply-Alert Gate violation in app/inbox.py: stop_outreach_on_reply must reject direction != 'in'")
 if (root / "app" / "digest.py").is_file():
     digest_src = (root / "app" / "digest.py").read_text(encoding="utf-8")
     if "is_ineligible_reply_notify_peer" not in digest_src or "extract_bot_user_id_from_token" not in digest_src:
         errors.append("Reply-Alert Gate violation: missing is_ineligible_reply_notify_peer / extract_bot_user_id_from_token guard in app/digest.py")
+    if re.search(r"require_backing\s*=\s*(?:False\b|bool\()", digest_src):
+        errors.append("Reply-Alert Gate violation in app/digest.py: forbidden require_backing=False/bool() bypass")
+    if 'direction or "").strip().lower() != "in"' not in digest_src:
+        errors.append("Reply-Alert Gate violation in app/digest.py: send_lead_reply_notification must reject direction != 'in'")
+if (root / "app" / "main.py").is_file() and (root / "app" / "inbox.py").is_file():
+    main_guard_src = (root / "app" / "main.py").read_text(encoding="utf-8")
+    if "record_account_health_transition" not in main_guard_src:
+        errors.append("Reply-Alert/Health Gate violation in app/main.py: missing immediate record_account_health_transition on auth failure")
+if (root / "app" / "outreach.py").is_file():
+    outreach_guard_src = (root / "app" / "outreach.py").read_text(encoding="utf-8")
+    if "skip_reply_stop=True" not in outreach_guard_src:
+        errors.append("Outreach Gate violation in app/outreach.py: pre-followup cache_messages must pass skip_reply_stop=True")
 if (root / "app" / "telegram_gateway.py").is_file():
     tg_gw_src = (root / "app" / "telegram_gateway.py").read_text(encoding="utf-8")
     if 'getattr(peer, "bot", False)' not in tg_gw_src or 'getattr(entity, "bot", False)' not in tg_gw_src:
@@ -536,6 +552,71 @@ for folder in ("app", "leadgen"):
         continue
     for py_file in sorted(folder_path.rglob("*.py")):
         errors.extend(_check_local_def_use_before_def(py_file))
+
+# Gate J: Zero Hardcoded Stats & Undefined UI Symbols Gate
+forbidden_stats_literals = (
+    "2 174",
+    "2174",
+    "129 ждущих",
+    "3.6% отказов",
+    "30.5% всей выручки",
+    "AI (30.6%",
+)
+for ui_sub in (root / "app").rglob("*"):
+    if not ui_sub.is_file() or ui_sub.suffix not in (".py", ".js", ".html"):
+        continue
+    usrc = ui_sub.read_text(encoding="utf-8")
+    for lit in forbidden_stats_literals:
+        if lit in usrc:
+            errors.append(f"Gate J violation in {ui_sub}: hardcoded stats literal '{lit}'")
+    if ui_sub.suffix in (".js", ".html") and "setActiveSheet(" in usrc:
+        errors.append(f"Gate J violation in {ui_sub}: undefined call 'setActiveSheet(' (use activateSheet)")
+
+# Gate K: Simplified 4-Tab CRM UI Contract
+idx_path = root / "app" / "templates" / "index.html"
+js_path = root / "app" / "static" / "app.js"
+if idx_path.is_file():
+    idx_html = idx_path.read_text(encoding="utf-8")
+    nav_match = re.search(r'<nav class="nav"[^>]*>([\s\S]*?)</nav>', idx_html)
+    if not nav_match:
+        errors.append("Gate K violation: missing <nav class=\"nav\"> in app/templates/index.html")
+    else:
+        nav_links = re.findall(
+            r'<a\b[^>]*href="([^"]+)"[^>]*data-sheet-link="([^"]+)"[^>]*>([\s\S]*?)</a>',
+            nav_match.group(1),
+        )
+        cleaned_links = [
+            (href, sheet, re.sub(r"<[^>]+>", "", lbl).strip())
+            for href, sheet, lbl in nav_links
+        ]
+        expected_links = [
+            ("#s04", "inbox", "Входящие"),
+            ("#leads", "leads", "Лиды"),
+            ("#outreach", "outreach", "Рассылки"),
+            ("#analytics", "analytics", "Статистика"),
+        ]
+        if cleaned_links != expected_links:
+            errors.append(
+                f"Gate K violation in app/templates/index.html: expected 4 nav tabs {expected_links}, got {cleaned_links}"
+            )
+    for req_id in (
+        'id="leads-view-toggle"',
+        'id="outreach-subtabs"',
+        'id="stats-campaigns-grid"',
+        'id="stats-accounts-health"',
+        'id="miniapp-bottom-nav"',
+    ):
+        if req_id not in idx_html:
+            errors.append(f"Gate K violation in app/templates/index.html: missing {req_id}")
+    m_user_btn = re.search(r'<button[^>]*id="crm-user-btn"[^>]*>', idx_html)
+    if not m_user_btn or "topbar-duplicate-btn" in m_user_btn.group(0):
+        errors.append("Gate K violation in app/templates/index.html: #crm-user-btn must remain visible (no topbar-duplicate-btn)")
+
+if idx_path.is_file() and js_path.is_file():
+    js_src = js_path.read_text(encoding="utf-8")
+    for req_fn in ("function moveDialogToStage(", "function renderStatsExecutiveBlocks(", "function buildInboxStageBar("):
+        if req_fn not in js_src:
+            errors.append(f"Gate K violation in app/static/app.js: missing {req_fn}")
 
 if errors:
     for err in errors:

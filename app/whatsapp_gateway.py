@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -71,6 +72,14 @@ except Exception:
 DEFAULT_WA_DAILY_LIMIT = 6
 WA_MIN_COLD_INTERVAL_SECONDS = 480
 _ALLOWED_PROXY_SCHEMES = ("socks5://", "socks5h://", "http://", "https://")
+
+
+def _wa_monotonic_mid(raw_wa_id: str, ts_sec: float | None = None) -> int:
+    """Build a deterministic 52-bit integer ID that stays monotonic with Unix timestamps."""
+    sec = int(ts_sec) if (ts_sec is not None and ts_sec > 1_500_000_000) else int(time.time())
+    h20 = int(hashlib.sha256(str(raw_wa_id).encode("utf-8")).hexdigest()[:5], 16)
+    mid = ((sec & 0xFFFFFFFF) << 20) | (h20 & 0xFFFFF)
+    return mid if mid > 0 else 1
 
 
 def _render_real_qr_svg(qr_payload: str | bytes) -> str:
@@ -201,6 +210,7 @@ class WhatsAppGateway(TelegramGateway):
         self._proxies = {}
         self._active_proxies = {}
         self._verified_wa_numbers = {}
+        self._wa_id_to_mid: dict[str, int] = {}
 
     def _get_session_lock(self, session_path: str) -> asyncio.Lock:
         with self._lock:
@@ -514,12 +524,31 @@ class WhatsAppGateway(TelegramGateway):
                         peer_jid = getattr(src, "Chat", None) or getattr(src, "Sender", None)
                     else:
                         peer_jid = getattr(src, "Sender", None) or getattr(src, "Chat", None)
-                    if str(getattr(peer_jid, "Server", "") or "").lower() == "g.us":
+                    if str(getattr(peer_jid, "Server", "") or "").lower() in (
+                        "g.us",
+                        "newsletter",
+                        "lid",
+                    ):
+                        return
+                    raw_jid_str = str(peer_jid or "").lower()
+                    if any(tag in raw_jid_str for tag in ("@g.us", "@newsletter", "@lid")):
                         return
                     sender_user = str(getattr(peer_jid, "User", "") or "").split(":", 1)[0]
                     digits = re.sub(r"\D", "", sender_user)[-15:]
                     if len(digits) < 7:
                         return
+                    if not is_from_me:
+                        own_user = str(
+                            getattr(
+                                getattr(getattr(_client, "me", None), "JID", None),
+                                "User",
+                                "",
+                            )
+                            or ""
+                        ).split(":", 1)[0]
+                        own_digits = re.sub(r"\D", "", own_user)[-15:]
+                        if own_digits and digits == own_digits:
+                            return
                     msg_proto = getattr(ev, "Message", None)
                     text = (
                         getattr(msg_proto, "conversation", "")
@@ -535,19 +564,41 @@ class WhatsAppGateway(TelegramGateway):
                         push_name = str(
                             getattr(info_proto, "Pushname", "") or f"WA +{digits}"
                         ).strip()
-                    seq_id = self._next_message_seq()
+                    raw_wa_id = str(getattr(info_proto, "ID", "") or "").strip()
+                    raw_ts = getattr(info_proto, "Timestamp", None)
+                    parsed_ts: float | None = None
+                    sent_at_val = utc_now()
+                    if raw_ts is not None:
+                        try:
+                            ts_num = float(raw_ts)
+                            if ts_num > 1e12:
+                                ts_num /= 1000.0
+                            if ts_num > 0:
+                                parsed_ts = ts_num
+                                sent_at_val = datetime.fromtimestamp(
+                                    ts_num, tz=timezone.utc
+                                ).strftime("%Y-%m-%dT%H:%M:%S")
+                        except (TypeError, ValueError, OSError, OverflowError):
+                            pass
+                    if raw_wa_id:
+                        cached_mid = self._wa_id_to_mid.get(raw_wa_id)
+                        if cached_mid is not None:
+                            msg_mid = cached_mid
+                        else:
+                            msg_mid = _wa_monotonic_mid(raw_wa_id, ts_sec=parsed_ts)
+                            self._wa_id_to_mid[raw_wa_id] = msg_mid
+                    else:
+                        msg_mid = self._next_message_seq()
                     payload = {
                         "telegram_user_id": peer_id,
                         "username": None,
                         "name": push_name,
                         "phone": f"+{digits}",
                         "wa_jid": f"{digits}@s.whatsapp.net",
-                        "telegram_message_id": seq_id,
-                        "external_message_id": str(
-                            getattr(info_proto, "ID", "") or f"WA{seq_id}"
-                        ),
+                        "telegram_message_id": msg_mid,
+                        "external_message_id": raw_wa_id or f"WA{msg_mid}",
                         "text": text,
-                        "sent_at": utc_now(),
+                        "sent_at": sent_at_val,
                         "direction": "out" if is_from_me else "in",
                         "peer_type": "user",
                     }
@@ -1056,7 +1107,10 @@ class WhatsAppGateway(TelegramGateway):
             int(row.get("telegram_message_id") or 0)
             for row in self.history.get(peer_key, [])
         }
-        seq_id = self._next_message_seq(used)
+        seq_id = _wa_monotonic_mid(external_message_id, ts_sec=time.time())
+        while used and seq_id in used:
+            seq_id += 1
+        self._wa_id_to_mid[external_message_id] = seq_id
 
         sent_item = {
             "peer_id": peer_key,
@@ -1141,11 +1195,7 @@ class WhatsAppGateway(TelegramGateway):
     ) -> None:
         del on_read
         self._loop = asyncio.get_running_loop()
-        if _inspect_whatsmeow_db(session_path) is not None:
-            try:
-                await self._ensure_neonize_client(session_path, fresh_qr=False)
-            except Exception:
-                pass
+        # Register listeners BEFORE connecting neonize so early sync events are never dropped
         with self._lock:
             self._listeners[session_path] = on_message
             if on_outgoing is not None:
@@ -1156,6 +1206,11 @@ class WhatsAppGateway(TelegramGateway):
                 if on_outgoing is not None
                 else []
             )
+        if _inspect_whatsmeow_db(session_path) is not None:
+            try:
+                await self._ensure_neonize_client(session_path, fresh_qr=False)
+            except Exception:
+                pass
         try:
             for item in batch:
                 await self._invoke_cb(on_message, dict(item))
@@ -1163,7 +1218,11 @@ class WhatsAppGateway(TelegramGateway):
                 for o_item in out_batch:
                     await self._invoke_cb(on_outgoing, dict(o_item))
             listening_event(self, session_path).set()
-            await asyncio.Future()
+            while True:
+                client = self._neonize_clients.get(session_path)
+                if client is not None and getattr(client, "stopped", False) is True:
+                    return
+                await asyncio.sleep(5.0)
         finally:
             with self._lock:
                 if self._listeners.get(session_path) is on_message:

@@ -9,6 +9,7 @@ from app.digest import (
     SEND_URL,
     _post as _digest_post,
     ensure_bot_reply_notifications_table,
+    is_ineligible_reply_notify_peer,
     resolve_colleague_bot_credentials,
 )
 from app.inbox import open_dialog_by_lead, send_reply
@@ -252,6 +253,15 @@ def apply_forward_update(conn, update: dict) -> dict:
         return _no_lead()
     person = _forward_person(message)
     if person is None:
+        return _no_lead()
+    inelig, _ = is_ineligible_reply_notify_peer(
+        conn,
+        peer_id=person.get("telegram_user_id"),
+        username=person.get("username"),
+        lead_handle=person.get("name"),
+        is_bot=bool((message.get("forward_from") or {}).get("is_bot")),
+    )
+    if inelig:
         return _no_lead()
     update_id = _update_id(update)
     if update_id is not None:
@@ -508,11 +518,20 @@ async def handle_bot_reply_to_lead(
     message = update.get("message")
     if not isinstance(message, dict):
         return {"ok": True, "replied": False, "dialog_id": None}
+    msg_from = message.get("from")
+    if isinstance(msg_from, dict) and msg_from.get("is_bot"):
+        return {"ok": True, "replied": False, "dialog_id": None}
     reply_text = str(message.get("text") or "").strip()
     if not reply_text or _is_start(reply_text) or _forward_person(message) is not None:
         return {"ok": True, "replied": False, "dialog_id": None}
 
     chat_id = _chat_id(message) or ""
+    if not chat_id:
+        return {"ok": True, "replied": False, "dialog_id": None}
+    _, expected_chat = resolve_colleague_bot_credentials(conn, default_chat_id=False)
+    clean_expected = str(expected_chat or "").strip()
+    if clean_expected and str(chat_id) != clean_expected:
+        return {"ok": True, "replied": False, "dialog_id": None}
     dialog_id: int | None = None
     used_active_key = False
 
@@ -557,7 +576,8 @@ async def handle_bot_reply_to_lead(
         candidate_keys = []
         if chat_id:
             candidate_keys.append(f"bot_active_reply_dialog_{chat_id}")
-        candidate_keys.append("bot_active_reply_dialog_default")
+        if clean_expected:
+            candidate_keys.append("bot_active_reply_dialog_default")
         for key in candidate_keys:
             row = conn.execute(
                 "SELECT value FROM kv_settings WHERE key = ?",

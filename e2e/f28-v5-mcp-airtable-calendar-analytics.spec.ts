@@ -53,8 +53,8 @@ test('F28-V5 Full E2E across MCP Modal, 7-Stage Airtable Pipeline, SoftUGC Card 
     await drawerClose.click();
   }
 
-  // 4. Switch to Calendar sheet, verify views and add a call event
-  await page.locator('.nav a[href="#calendar"]').click();
+  // 4. Switch to Calendar sheet via hash (hidden from 4-tab sidebar), verify views and add a call event
+  await page.evaluate(() => { window.location.hash = '#calendar'; });
   await expect(page.locator('#calendar')).toBeVisible();
   await expect(page.locator('#calendar-grid-container')).toBeVisible();
 
