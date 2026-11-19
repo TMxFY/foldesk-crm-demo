@@ -130,6 +130,40 @@ def _table_exists(conn, table: str) -> bool:
     return row is not None
 
 
+def build_ineligible_peer_context(conn) -> dict:
+    token, chat_id = resolve_colleague_bot_credentials(conn)
+    bot_uid = extract_bot_user_id_from_token(token)
+    operator_chat_id: int | None = None
+    if chat_id and str(chat_id).strip().lstrip("-").isdigit():
+        try:
+            operator_chat_id = int(str(chat_id).strip())
+        except ValueError:
+            operator_chat_id = None
+    acc_uids: set[int] = set()
+    acc_unames: set[str] = set()
+    acc_phones: set[str] = set()
+    if conn is not None and _table_exists(conn, "accounts"):
+        for arow in conn.execute(
+            "SELECT id, telegram_user_id, telegram_username, phone FROM accounts"
+        ).fetchall():
+            a_uid = arow["telegram_user_id"]
+            if a_uid is not None:
+                acc_uids.add(int(a_uid))
+            a_uname = clean_tg_username_lookup(arow["telegram_username"])
+            if a_uname:
+                acc_unames.add(a_uname)
+            a_pdigits = re.sub(r"\D", "", str(arow["phone"] or ""))
+            if len(a_pdigits) >= 7:
+                acc_phones.add(a_pdigits[-15:])
+    return {
+        "bot_uid": bot_uid,
+        "operator_chat_id": operator_chat_id,
+        "acc_uids": acc_uids,
+        "acc_unames": acc_unames,
+        "acc_phones": acc_phones,
+    }
+
+
 def is_ineligible_reply_notify_peer(
     conn,
     *,
@@ -140,6 +174,7 @@ def is_ineligible_reply_notify_peer(
     account_id: int | None = None,
     account_handle: str | None = None,
     is_bot: bool = False,
+    preloaded_ctx: dict | None = None,
 ) -> tuple[bool, str]:
     """Single source of truth for peers that must NEVER trigger lead-reply alerts."""
     if is_bot:
@@ -178,6 +213,24 @@ def is_ineligible_reply_notify_peer(
 
     if any(cu.lower() in INTERNAL_TEAM_USERNAMES for cu in candidate_users):
         return True, "internal_team_member"
+
+    if preloaded_ctx is not None:
+        bot_uid = preloaded_ctx.get("bot_uid")
+        if bot_uid is not None and clean_peer is not None and clean_peer == bot_uid:
+            return True, "colleague_bot_self_echo"
+        op_chat_id = preloaded_ctx.get("operator_chat_id")
+        if op_chat_id is not None and clean_peer is not None and clean_peer == op_chat_id:
+            return True, "operator_chat_self_echo"
+        acc_uids = preloaded_ctx.get("acc_uids") or ()
+        if clean_peer is not None and clean_peer in acc_uids:
+            return True, "crm_connected_account"
+        acc_unames = preloaded_ctx.get("acc_unames") or ()
+        if any(clean_tg_username_lookup(cu) in acc_unames for cu in candidate_users):
+            return True, "crm_connected_account"
+        acc_phones = preloaded_ctx.get("acc_phones") or ()
+        if norm_phone_digits and norm_phone_digits in acc_phones:
+            return True, "crm_connected_account"
+        return False, ""
 
     token, chat_id = resolve_colleague_bot_credentials(conn)
     bot_uid = extract_bot_user_id_from_token(token)

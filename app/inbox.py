@@ -32,6 +32,7 @@ from app.db import (
 )
 from app.digest import (
     _norm_ts,
+    build_ineligible_peer_context,
     ensure_dialog_notify_columns,
     is_closed_lead_status,
     is_ineligible_reply_notify_peer,
@@ -2192,10 +2193,7 @@ class InboxResultList(list):
         }
 
 
-_SQL_NORM_L_UNAME = _sql_norm_uname_expr("l.username")
-_SQL_NORM_D_UNAME = _sql_norm_uname_expr("d.username")
-
-_INBOX_SELECT_SQL = f"""
+_INBOX_SELECT_SQL = """
     SELECT
         d.*,
         COALESCE(d.provider, a.provider, 'telegram') AS provider,
@@ -2206,16 +2204,12 @@ _INBOX_SELECT_SQL = f"""
         COALESCE(
             d.lead_id,
             (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
-            (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1),
-            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
-            (SELECT l.id FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} ORDER BY l.id LIMIT 1)
+            (SELECT l.id FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1)
         ) AS resolved_lead_id,
         COALESCE(
             (SELECT l.status FROM leads l WHERE l.id = d.lead_id LIMIT 1),
             (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
-            (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1),
-            (SELECT l.status FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} AND (l.account_id = d.account_id OR l.account_id IS NULL) ORDER BY l.account_id DESC, l.id LIMIT 1),
-            (SELECT l.status FROM leads l WHERE d.username IS NOT NULL AND l.username IS NOT NULL AND {_SQL_NORM_L_UNAME} != '' AND {_SQL_NORM_L_UNAME} = {_SQL_NORM_D_UNAME} ORDER BY l.id LIMIT 1)
+            (SELECT l.status FROM leads l WHERE l.telegram_user_id = d.peer_id ORDER BY l.id LIMIT 1)
         ) AS lead_status
     FROM dialogs d
     JOIN accounts a ON a.id = d.account_id
@@ -2223,33 +2217,42 @@ _INBOX_SELECT_SQL = f"""
 
 
 def _resolve_missing_lead_status_by_phone(conn, dialogs: list[dict]) -> None:
-    need_phone = [
+    need_resolve = [
         d for d in dialogs
-        if not d.get("lead_status") and d.get("phone")
+        if (not d.get("lead_status") or not d.get("lead_id"))
+        and (d.get("username") or d.get("phone"))
     ]
-    if not need_phone:
+    if not need_resolve:
         return
     lead_rows = conn.execute(
-        "SELECT id, account_id, phone, status FROM leads WHERE phone IS NOT NULL AND phone != '' ORDER BY id ASC"
+        "SELECT id, account_id, username, phone, status FROM leads ORDER BY id ASC"
     ).fetchall()
     if not lead_rows:
         return
+    by_uname: dict[str, list[dict]] = {}
     by_digits: dict[str, list[dict]] = {}
     for lr in lead_rows:
         ld = as_dict(lr)
+        uname = clean_tg_username_lookup(ld.get("username"))
+        if uname:
+            by_uname.setdefault(uname, []).append(ld)
         digits = re.sub(r"\D", "", str(ld.get("phone") or ""))
         if len(digits) >= 7:
             by_digits.setdefault(digits, []).append(ld)
             if len(digits) > 10:
                 by_digits.setdefault(digits[-10:], []).append(ld)
-    for d in need_phone:
-        digits = re.sub(r"\D", "", str(d.get("phone") or ""))
-        if len(digits) < 7:
-            continue
-        candidates = by_digits.get(digits) or (by_digits.get(digits[-10:]) if len(digits) > 10 else None)
+    for d in need_resolve:
+        acc_id = d.get("account_id")
+        candidates = None
+        uname = clean_tg_username_lookup(d.get("username"))
+        if uname and uname in by_uname:
+            candidates = by_uname[uname]
+        if not candidates and d.get("phone"):
+            digits = re.sub(r"\D", "", str(d.get("phone") or ""))
+            if len(digits) >= 7:
+                candidates = by_digits.get(digits) or (by_digits.get(digits[-10:]) if len(digits) > 10 else None)
         if not candidates:
             continue
-        acc_id = d.get("account_id")
         best = sorted(
             candidates,
             key=lambda c: (
@@ -2257,7 +2260,7 @@ def _resolve_missing_lead_status_by_phone(conn, dialogs: list[dict]) -> None:
                 int(c.get("id") or 0),
             ),
         )[0]
-        if best.get("status"):
+        if not d.get("lead_status") and best.get("status"):
             d["lead_status"] = best["status"]
         if not d.get("lead_id") and best.get("id"):
             d["lead_id"] = best["id"]
@@ -2328,6 +2331,7 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
         "call scheduled",
         "signed",
     }
+    inelig_ctx = build_ineligible_peer_context(conn)
     filtered = []
     for row in rows:
         if int(row.get("is_group") or 0) != 0:
@@ -2347,6 +2351,7 @@ def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
             phone=row.get("phone"),
             account_id=row_acc_id,
             is_bot=bool(row.get("is_bot")),
+            preloaded_ctx=inelig_ctx,
         )
         if inelig:
             continue

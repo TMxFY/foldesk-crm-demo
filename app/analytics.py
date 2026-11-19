@@ -16,8 +16,16 @@ from app.db import (
     normalize_status,
     utc_today,
 )
-from app.digest import is_closed_lead_status, is_ineligible_reply_notify_peer
-from app.outreach import _parse_account_ids, _sync_campaign_replies
+from app.digest import (
+    build_ineligible_peer_context,
+    is_closed_lead_status,
+    is_ineligible_reply_notify_peer,
+)
+from app.outreach import (
+    _build_recipient_dialogs_index,
+    _parse_account_ids,
+    _sync_campaign_replies,
+)
 
 STAGE_LABELS = {
     "new": "Лид",
@@ -532,13 +540,24 @@ def _sync_running_and_all_campaign_replies(conn: sqlite3.Connection) -> None:
         ]
     except Exception:
         return
+    try:
+        dialogs_idx = _build_recipient_dialogs_index(conn)
+    except Exception:
+        dialogs_idx = None
     for camp in camp_rows:
         if is_vacancy_campaign_meta(camp.get("name"), camp.get("leadgen_sources_json")):
             continue
         cid = int(camp["id"])
         acc_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
         try:
-            _sync_campaign_replies(conn, cid, acc_ids[0] if len(acc_ids) == 1 else None)
+            replied_n = _sync_campaign_replies(
+                conn,
+                cid,
+                acc_ids[0] if len(acc_ids) == 1 else None,
+                dialogs_index=dialogs_idx,
+            )
+            if replied_n and dialogs_idx is not None:
+                dialogs_idx = _build_recipient_dialogs_index(conn)
         except Exception:
             pass
 
@@ -705,6 +724,7 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
     dialogs_by_phone: dict[str, dict] = {}
     eligible_crm_dialog_ids: set[int] = set()
     live_waiting_dialogs: list[dict] = []
+    inelig_ctx = build_ineligible_peer_context(conn)
 
     for d in dlg_rows:
         did = int(d["id"])
@@ -738,6 +758,7 @@ def _load_ssot_crm_context(conn: sqlite3.Connection) -> dict:
             account_id=aid,
             account_handle=acc_meta["handle"] if acc_meta else None,
             is_bot=is_bot,
+            preloaded_ctx=inelig_ctx,
         )
         if inelig:
             continue

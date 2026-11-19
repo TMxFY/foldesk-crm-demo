@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from email.message import Message
 from datetime import datetime, timezone
@@ -629,9 +630,51 @@ def test_analytics_summary_chunks_over_1050_eligible_crm_dialogs(tmp_path):
                 "INSERT INTO messages (dialog_id, telegram_message_id, direction, text, sent_at, created_at, updated_at) VALUES (?, ?, 'in', 'Ping', ?, ?, ?)",
                 (did, idx + 1, f"{today}T09:00:00", now, now),
             )
+    camp = create_campaign(conn, name="SoftUGC Scale Bench", account_id=acc, steps=[{"template_text": "Hey"}])
+    for ridx in range(1000):
+        st = "completed" if (ridx % 2 == 0) else "pending"
+        conn.execute(
+            """
+            INSERT INTO campaign_recipients (
+                campaign_id, telegram_user_id, username, name, company,
+                current_step, status, sent_account_id, assigned_account_id, last_sent_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'ScaleCo', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                camp["id"],
+                900000 + ridx,
+                f"scale_rec_{ridx}",
+                f"Scale Rec {ridx}",
+                1 if st == "completed" else 0,
+                st,
+                acc if st == "completed" else None,
+                acc,
+                "2026-10-01T10:00:00" if st == "completed" else None,
+                now,
+                now,
+            ),
+        )
     conn.commit()
 
+    from scripts.proactive_audit import _audit_old_lead_message_visibility
+
+    t0 = time.perf_counter()
+    inbox_rows = list_inbox(conn, 0, "", crm_only=True, limit=0)
+    t_inbox = time.perf_counter() - t0
+    assert len(inbox_rows) == 1055
+    assert t_inbox < 2.0, f"list_inbox O(N+M) regression: {t_inbox:.3f}s"
+
+    t1 = time.perf_counter()
     analytics = get_analytics_summary(conn, period="7d")
+    t_ana = time.perf_counter() - t1
     today_flow = [d for d in analytics["charts"]["daily_flow"] if d["date"] == today]
     assert len(today_flow) == 1
     assert today_flow[0]["replies_received"] >= 100
+    assert t_ana < 2.0, f"get_analytics_summary O(N+M) regression: {t_ana:.3f}s"
+
+    t2 = time.perf_counter()
+    vis = _audit_old_lead_message_visibility(conn)
+    t_vis = time.perf_counter() - t2
+    assert vis["ok"] is True
+    assert vis["visible_crm_dialogs_count"] == 1055
+    assert t_vis < 2.0, f"_audit_old_lead_message_visibility O(N+M) regression: {t_vis:.3f}s"

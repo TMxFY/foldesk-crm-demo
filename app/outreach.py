@@ -1101,12 +1101,42 @@ def _add_hours_iso(iso_str: str | None, hours: int) -> str | None:
     return target.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _build_recipient_dialogs_index(conn) -> dict:
+    by_peer_id: dict[int, list[dict]] = {}
+    by_lead_id: dict[int, list[dict]] = {}
+    by_uname: dict[str, list[dict]] = {}
+    by_phone: dict[str, list[dict]] = {}
+    for row in conn.execute("SELECT * FROM dialogs WHERE peer_type = 'user'").fetchall():
+        d = as_dict(row)
+        if not d or safe_int(d.get("id")) is None:
+            continue
+        pid = safe_int(d.get("peer_id"))
+        if pid is not None:
+            by_peer_id.setdefault(pid, []).append(d)
+        lid = safe_int(d.get("lead_id"))
+        if lid is not None:
+            by_lead_id.setdefault(lid, []).append(d)
+        u = clean_tg_username_lookup(d.get("username"))
+        if u:
+            by_uname.setdefault(u, []).append(d)
+        ph = str(d.get("phone") or "").strip()
+        if ph:
+            by_phone.setdefault(ph, []).append(d)
+    return {
+        "by_peer_id": by_peer_id,
+        "by_lead_id": by_lead_id,
+        "by_uname": by_uname,
+        "by_phone": by_phone,
+    }
+
+
 def _find_recipient_dialogs(
     conn,
     rec: dict,
     account_id: int | None = None,
     *,
     ignore_assigned_account: bool = False,
+    dialogs_index: dict | None = None,
 ) -> list[dict]:
     if not isinstance(rec, dict):
         return []
@@ -1117,27 +1147,56 @@ def _find_recipient_dialogs(
             if aid_val:
                 acc_ids.add(aid_val)
 
+    tg_uid = safe_int(rec.get("telegram_user_id"))
+    rec_lid = safe_int(rec.get("lead_id"))
+    clean_u = clean_tg_username_lookup(rec.get("username")) if rec.get("username") else ""
+    phone_str = str(rec.get("phone") or "").strip() if rec.get("phone") else ""
+    peer_cand = None
+    if phone_str:
+        phone_digits = re.sub(r"\D", "", phone_str)
+        peer_cand = int(phone_digits[-15:]) if phone_digits and len(phone_digits) >= 7 else -1
+
+    if dialogs_index is not None:
+        if not (tg_uid or rec_lid or clean_u or phone_str):
+            return []
+        seen_ids: set[int] = set()
+        found: list[dict] = []
+        cand_lists: list[list[dict]] = []
+        if tg_uid:
+            cand_lists.append(dialogs_index["by_peer_id"].get(tg_uid, []))
+        if rec_lid:
+            cand_lists.append(dialogs_index["by_lead_id"].get(rec_lid, []))
+        if clean_u:
+            cand_lists.append(dialogs_index["by_uname"].get(clean_u, []))
+        if phone_str:
+            cand_lists.append(dialogs_index["by_phone"].get(phone_str, []))
+            if peer_cand is not None and peer_cand != -1:
+                cand_lists.append(dialogs_index["by_peer_id"].get(peer_cand, []))
+        for bucket in cand_lists:
+            for d in bucket:
+                did = int(d["id"])
+                if did in seen_ids:
+                    continue
+                if acc_ids and safe_int(d.get("account_id")) not in acc_ids:
+                    continue
+                seen_ids.add(did)
+                found.append(d)
+        return found
+
     match_clauses = []
     match_params = []
-    tg_uid = safe_int(rec.get("telegram_user_id"))
     if tg_uid:
         match_clauses.append("peer_id = ?")
         match_params.append(tg_uid)
-    rec_lid = safe_int(rec.get("lead_id"))
     if rec_lid:
         match_clauses.append("lead_id = ?")
         match_params.append(rec_lid)
-    if rec.get("username"):
-        clean_u = clean_tg_username_lookup(rec["username"])
-        if clean_u:
-            match_clauses.append(
-                f"(username IS NOT NULL AND {sql_norm_tg_username_expr('username')} = ?)"
-            )
-            match_params.append(clean_u)
-    if rec.get("phone"):
-        phone_str = str(rec["phone"]).strip()
-        phone_digits = re.sub(r"\D", "", phone_str)
-        peer_cand = int(phone_digits[-15:]) if phone_digits and len(phone_digits) >= 7 else -1
+    if clean_u:
+        match_clauses.append(
+            f"(username IS NOT NULL AND {sql_norm_tg_username_expr('username')} = ?)"
+        )
+        match_params.append(clean_u)
+    if phone_str:
         match_clauses.append("(phone = ? OR peer_id = ?)")
         match_params.extend([phone_str, peer_cand])
 
@@ -1496,7 +1555,14 @@ def _stop_outreach_from_dialog_sync(
     return True
 
 
-def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None, opener=None) -> int:
+def _sync_campaign_replies(
+    conn,
+    campaign_id: int,
+    account_id: int | None = None,
+    opener=None,
+    *,
+    dialogs_index: dict | None = None,
+) -> int:
     rows = conn.execute(
         f"""
         SELECT * FROM campaign_recipients
@@ -1508,6 +1574,9 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
         """,
         (campaign_id,),
     ).fetchall()
+    if not rows:
+        return 0
+    idx = dialogs_index if dialogs_index is not None else _build_recipient_dialogs_index(conn)
     replied_now = 0
     now = utc_now()
     for row in rows:
@@ -1525,12 +1594,16 @@ def _sync_campaign_replies(conn, campaign_id: int, account_id: int | None = None
             rec.get("error_text"),
         ):
             continue
-        dialogs = _find_recipient_dialogs(conn, rec, account_id=account_id)
+        dialogs = _find_recipient_dialogs(conn, rec, account_id=account_id, dialogs_index=idx)
         replied_dialogs = [d for d in dialogs if _dialog_has_client_reply(conn, d, rec)]
         if not replied_dialogs:
             # Also check across any account if reply landed on a sibling session
             dialogs_any = _find_recipient_dialogs(
-                conn, rec, account_id=None, ignore_assigned_account=True
+                conn,
+                rec,
+                account_id=None,
+                ignore_assigned_account=True,
+                dialogs_index=idx,
             )
             replied_dialogs = [d for d in dialogs_any if _dialog_has_client_reply(conn, d, rec)]
         if replied_dialogs:

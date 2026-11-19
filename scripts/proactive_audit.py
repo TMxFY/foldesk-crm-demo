@@ -45,6 +45,7 @@ from app.db import (  # noqa: E402
 )
 from app.digest import (  # noqa: E402
     audit_reply_notifications,
+    build_ineligible_peer_context,
     heal_reply_notifications,
     is_ineligible_reply_notify_peer,
 )
@@ -59,6 +60,7 @@ from app.inbox import (  # noqa: E402
 from app.leads import create_lead  # noqa: E402
 from app.main import load_env_file  # noqa: E402
 from app.outreach import (  # noqa: E402
+    _build_recipient_dialogs_index,
     _dialog_has_client_reply,
     _find_recipient_dialogs,
     _latest_dialog_in_meta,
@@ -128,6 +130,8 @@ def _audit_ssot_statistics(conn: sqlite3.Connection) -> dict:
 
 def _audit_old_lead_message_visibility(conn: sqlite3.Connection) -> dict:
     """Verify every client/contacted reply is visible in Inbox, marked replied, and has readable latest msg."""
+    inelig_ctx = build_ineligible_peer_context(conn)
+    dialogs_idx = _build_recipient_dialogs_index(conn)
     visible_rows = list_inbox(conn, 0, "", crm_only=True, limit=0)
     visible_ids = {int(r["id"]) for r in visible_rows if r.get("id") is not None}
 
@@ -203,6 +207,7 @@ def _audit_old_lead_message_visibility(conn: sqlite3.Connection) -> dict:
             phone=drow["phone"],
             account_id=acc_id,
             is_bot=bool(drow["is_bot"]),
+            preloaded_ctx=inelig_ctx,
         )
         if inelig:
             continue
@@ -276,10 +281,21 @@ def _audit_old_lead_message_visibility(conn: sqlite3.Connection) -> dict:
             continue
         if int(rec.get("current_step") or 0) < 1 or not str(rec.get("last_sent_at") or "").strip():
             continue
-        dialogs = _find_recipient_dialogs(conn, rec, account_id=rec.get("sent_account_id") or rec.get("assigned_account_id"))
+        dialogs = _find_recipient_dialogs(
+            conn,
+            rec,
+            account_id=rec.get("sent_account_id") or rec.get("assigned_account_id"),
+            dialogs_index=dialogs_idx,
+        )
         replied_cands = [d for d in dialogs if _dialog_has_client_reply(conn, d, rec)]
         if not replied_cands:
-            dialogs_any = _find_recipient_dialogs(conn, rec, account_id=None, ignore_assigned_account=True)
+            dialogs_any = _find_recipient_dialogs(
+                conn,
+                rec,
+                account_id=None,
+                ignore_assigned_account=True,
+                dialogs_index=dialogs_idx,
+            )
             replied_cands = [d for d in dialogs_any if _dialog_has_client_reply(conn, d, rec)]
         rec_last_sent = _norm_ts(rec.get("last_sent_at"))
         for d in replied_cands:
@@ -290,6 +306,7 @@ def _audit_old_lead_message_visibility(conn: sqlite3.Connection) -> dict:
                 phone=d.get("phone"),
                 account_id=d.get("account_id"),
                 is_bot=bool(d.get("is_bot")),
+                preloaded_ctx=inelig_ctx,
             )
             if d_inelig:
                 continue
@@ -377,8 +394,8 @@ def _audit_local_db(
         conn = connect(db_path)
         try:
             healed_replies = heal_reply_notifications(conn)
-            healed_hygiene = _heal_crm_hygiene(conn)
             _sync_running_and_all_campaign_replies(conn)
+            healed_hygiene = _heal_crm_hygiene(conn)
             print(
                 "proactive_audit: healed "
                 + json.dumps(
@@ -588,8 +605,8 @@ def _run_self_test() -> int:
                 return 1
 
             heal_reply_notifications(conn)
-            _heal_crm_hygiene(conn)
             _sync_running_and_all_campaign_replies(conn)
+            _heal_crm_hygiene(conn)
 
             rep_after = audit_reply_notifications(conn)
             hyg_after = _audit_crm_hygiene(conn)
