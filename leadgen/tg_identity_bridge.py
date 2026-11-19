@@ -260,18 +260,24 @@ def _default_site_fetch(domain: str) -> str:
     clean = str(domain or "").strip().lower().removeprefix("www.").strip("/")
     if not clean or "." not in clean:
         return ""
-    try:
-        resp = requests.get(
-            f"https://{clean}",
-            headers={"User-Agent": "Mozilla/5.0 (compatible; SoftUGC/1.0)"},
-            timeout=4,
-            allow_redirects=True,
-        )
-        if int(getattr(resp, "status_code", 0) or 0) == 200:
-            return str(getattr(resp, "text", "") or "")[:200_000]
-    except requests.RequestException:
-        pass
-    return ""
+    chunks: list[str] = []
+    for suffix in ("", "/contact", "/about"):
+        try:
+            resp = requests.get(
+                f"https://{clean}{suffix}",
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SoftUGC/1.0)"},
+                timeout=3 if suffix else 4,
+                allow_redirects=True,
+            )
+            if int(getattr(resp, "status_code", 0) or 0) == 200:
+                txt = str(getattr(resp, "text", "") or "")[:200_000]
+                if txt:
+                    chunks.append(txt)
+                    if suffix == "" and _extract_tme_handles(txt):
+                        break
+        except requests.RequestException:
+            continue
+    return "\n".join(chunks)
 
 
 def _extract_social_or_email_candidates(row: dict[str, Any]) -> list[tuple[str, str]]:
@@ -378,7 +384,7 @@ def _extract_x_bio_blob(profile: dict[str, Any] | None) -> str:
 
     parts: list[str] = []
     for src in roots:
-        for k in ("bio", "description", "url", "website", "location"):
+        for k in ("bio", "description", "url", "website", "location", "name"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 parts.append(v.strip())
@@ -386,6 +392,28 @@ def _extract_x_bio_blob(profile: dict[str, Any] | None) -> str:
         if isinstance(entities, dict):
             parts.append(json.dumps(entities, ensure_ascii=False))
     return " ".join(parts)
+
+
+def _extract_x_founder_name(profile: dict[str, Any] | None, brand: str) -> str:
+    if not isinstance(profile, dict):
+        return ""
+    candidates: list[str] = []
+    for top in (profile, profile.get("data"), profile.get("user"), profile.get("output"), profile.get("result"), profile.get("legacy")):
+        if isinstance(top, dict):
+            val = top.get("name")
+            if isinstance(val, str) and val.strip():
+                candidates.append(" ".join(val.split()).strip())
+            leg = top.get("legacy")
+            if isinstance(leg, dict) and isinstance(leg.get("name"), str) and leg["name"].strip():
+                candidates.append(" ".join(leg["name"].split()).strip())
+    brand_cf = str(brand or "").strip().casefold()
+    for cand in candidates:
+        if cand.casefold() == brand_cf:
+            continue
+        words = re.findall(r"[A-Za-z]{2,18}", cand)
+        if 2 <= len(words) <= 3 and not any(w.lower() in _GENERIC_BRAND_WORDS for w in words):
+            return " ".join(words)
+    return ""
 
 
 def _distinctive_tokens(row: dict[str, Any], domain: str) -> list[str]:
@@ -515,22 +543,34 @@ def bridge_lead_to_telegram(
             return out
         return None
 
-    # 0) Explicit t.me handles already present in lead links/bio (no remote calls if valid personal DM)
+    # 0) Explicit t.me handles already present in lead links/bio/notes (no remote calls if valid personal DM)
     links_blob = " ".join(str(u) for u in (out.get("links") or []) if u)
+    stage0_blob = " ".join(
+        p for p in (links_blob, out.get("bio") or "", out.get("sample") or "", out.get("what_they_do") or "") if p
+    )
     stage0 = [
         (nick, "links_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)))
-        for nick in _extract_tme_handles(f"{links_blob} {out.get('bio') or ''}")
+        for nick in _extract_tme_handles(stage0_blob)
     ]
     if hit := _try_candidates(stage0):
         return hit
 
     # 1) Founder's own X profile bio
+    x_founder_cands: list[tuple[str, str]] = []
     if x_handle:
         try:
             x_prof = get_x(x_handle)
         except Exception:
             x_prof = None
         bio_blob = _extract_x_bio_blob(x_prof)
+        x_founder_name = _extract_x_founder_name(x_prof, brand)
+        if x_founder_name:
+            if not str(out.get("founder_name") or "").strip():
+                out["founder_name"] = x_founder_name
+            fw = [w.lower() for w in x_founder_name.split()]
+            if len(fw) >= 2:
+                x_founder_cands.append((f"{fw[0]}_{fw[-1]}", "x_founder_handle"))
+                x_founder_cands.append((f"{fw[0]}{fw[-1]}", "x_founder_handle"))
         stage1 = [
             (nick, "x_bio_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)))
             for nick in _extract_tme_handles(bio_blob)
@@ -605,10 +645,12 @@ def bridge_lead_to_telegram(
         if hit := _try_candidates(stage3b):
             return hit
 
-    # 4) Same-handle / social / personal email candidates (strict anti-namesake confirmation required)
+    # 4) Same-handle / social / personal email / founder-name candidates (strict anti-namesake confirmation required)
     stage4: list[tuple[str, str, bool]] = []
     if x_handle:
         stage4.append((x_handle, "x_handle_verified", True))
+    for fn_nick, fn_kind in x_founder_cands:
+        stage4.append((fn_nick, fn_kind, True))
     for social_nick, social_kind in _extract_social_or_email_candidates(out):
         stage4.append((social_nick, social_kind, True))
     if hit := _try_candidates(stage4):

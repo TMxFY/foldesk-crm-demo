@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
@@ -60,6 +61,10 @@ DEFAULT_AD_SPY_CHANNELS: tuple[str, ...] = (
     "gamedev_ru",
     "neurochannel",
     "ecom_digest",
+    "saasgrowth",
+    "indiehackers",
+    "marketingmemes",
+    "devtools_daily",
 )
 
 AD_MARKER_RE = re.compile(
@@ -216,11 +221,25 @@ def _load_seen(path: str) -> set[str]:
     return set()
 
 
-def _save_seen(path: str, seen: set[str]) -> None:
+def _load_spy_cursor(path: str) -> int:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return max(0, int(data.get("cursor") or 0))
+    except (OSError, ValueError, TypeError):
+        pass
+    return 0
+
+
+def _save_seen(path: str, seen: set[str], *, cursor: int | None = None) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
+    payload: dict = {"seen": sorted(seen)}
+    if cursor is not None:
+        payload["cursor"] = max(0, int(cursor))
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"seen": sorted(seen)}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
 
@@ -372,6 +391,17 @@ def fetch_public_channel_posts_http(
         return []
     custom_mode = any(fn is not None for fn in (monid_fn, treg_fn, http_get_fn))
 
+    # In production, check fast free https://t.me/s/<channel> FIRST (~0.3s) so 12+ channels
+    # complete in a few seconds instead of spending 20-45s per channel polling Monid/Treg.
+    if not custom_mode:
+        try:
+            html_txt = default_fetch_html(f"https://t.me/s/{ch}")
+            posts = _parse_tme_s_html(str(html_txt or ""), limit)
+            if posts:
+                return posts
+        except Exception:
+            pass
+
     # 1) Monid litescrape /telegram/posts
     try:
         if monid_fn is not None:
@@ -382,7 +412,7 @@ def fetch_public_channel_posts_http(
             except ImportError:
                 from monid_client import check_monid_ready, run_monid
             m_payload = (
-                run_monid("litescrape", "/telegram/posts", query={"channel": ch}, wait_sec=20, timeout=25)
+                run_monid("litescrape", "/telegram/posts", query={"channel": ch}, wait_sec=8, timeout=12)
                 if check_monid_ready()
                 else None
             )
@@ -404,7 +434,7 @@ def fetch_public_channel_posts_http(
             except ImportError:
                 from treg_client import call as treg_call, check_treg_ready
             t_payload = (
-                treg_call("crawl4ai.telegram.channel.posts", method="POST", data={"channel": ch, "limit": limit}, timeout=25)
+                treg_call("crawl4ai.telegram.channel.posts", method="POST", data={"channel": ch, "limit": limit}, timeout=12)
                 if check_treg_ready()
                 else None
             )
@@ -416,18 +446,19 @@ def fetch_public_channel_posts_http(
     except Exception:
         pass
 
-    # 3) Public https://t.me/s/<channel> HTML fallback
-    try:
-        tme_url = f"https://t.me/s/{ch}"
-        if http_get_fn is not None:
-            html_txt = http_get_fn(tme_url) or ""
-        else:
-            html_txt = default_fetch_html(tme_url)
-        posts = _parse_tme_s_html(str(html_txt or ""), limit)
-        if posts:
-            return posts
-    except Exception:
-        pass
+    # 3) Public https://t.me/s/<channel> HTML fallback (custom test hooks)
+    if custom_mode:
+        try:
+            tme_url = f"https://t.me/s/{ch}"
+            if http_get_fn is not None:
+                html_txt = http_get_fn(tme_url) or ""
+            else:
+                html_txt = default_fetch_html(tme_url)
+            posts = _parse_tme_s_html(str(html_txt or ""), limit)
+            if posts:
+                return posts
+        except Exception:
+            pass
     return []
 
 
@@ -440,145 +471,158 @@ async def scan_ad_channels(
     delay: float = 1.0,
     fetch_html=default_fetch_html,
     public_posts_fn=None,
+    max_runtime_sec: float = 150.0,
 ) -> list[dict]:
     from types import SimpleNamespace
 
     seen = _load_seen(seen_path)
+    cursor = _load_spy_cursor(seen_path)
+    ordered_channels = [c for c in channels if c and c.strip()]
+    if len(ordered_channels) > 1 and cursor > 0:
+        shift = cursor % len(ordered_channels)
+        ordered_channels = ordered_channels[shift:] + ordered_channels[:shift]
+    deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered: list[dict] = []
 
-    with open(output_path, "w", encoding="utf-8") as out_fh:
-        for raw_ch in channels:
-            ch = raw_ch.strip().lstrip("@")
-            if not ch:
-                continue
-            messages = None
-            if public_posts_fn is not None:
-                try:
-                    raw_posts = public_posts_fn(ch, msg_limit) or []
-                except Exception:
-                    raw_posts = []
-                if raw_posts:
-                    messages = [
-                        SimpleNamespace(id=idx + 1, message=str(txt))
-                        for idx, txt in enumerate(raw_posts[:msg_limit])
-                        if str(txt or "").strip()
-                    ]
-            if messages is None:
-                try:
-                    entity = await client.get_entity(ch)
-                    messages = await client.get_messages(entity, limit=msg_limit)
-                except FloodWaitError as fw:
-                    await asyncio.sleep(min(fw.seconds, 60))
+    try:
+        with open(output_path, "w", encoding="utf-8") as out_fh:
+            for raw_ch in ordered_channels:
+                if deadline is not None and time.monotonic() >= deadline:
+                    print("# tg_ad_spy: runtime budget reached; saving partial state", file=sys.stderr)
+                    break
+                ch = raw_ch.strip().lstrip("@")
+                if not ch:
                     continue
-                except Exception as exc:
-                    print(f"# ad_spy error reading {ch}: {exc}", file=sys.stderr)
-                    continue
+                messages = None
+                if public_posts_fn is not None:
+                    try:
+                        raw_posts = public_posts_fn(ch, msg_limit) or []
+                    except Exception:
+                        raw_posts = []
+                    if raw_posts:
+                        messages = [
+                            SimpleNamespace(id=idx + 1, message=str(txt))
+                            for idx, txt in enumerate(raw_posts[:msg_limit])
+                            if str(txt or "").strip()
+                        ]
+                if messages is None:
+                    try:
+                        entity = await client.get_entity(ch)
+                        messages = await client.get_messages(entity, limit=msg_limit)
+                    except FloodWaitError as fw:
+                        await asyncio.sleep(min(fw.seconds, 60))
+                        continue
+                    except Exception as exc:
+                        print(f"# ad_spy error reading {ch}: {exc}", file=sys.stderr)
+                        continue
 
-            for msg in messages or []:
-                text = (getattr(msg, "message", None) or "").strip()
-                if not text:
-                    continue
-                sig = detect_ad_post(text, host_channel=ch)
-                if not sig["is_ad"]:
-                    continue
+                for msg in messages or []:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    text = (getattr(msg, "message", None) or "").strip()
+                    if not text:
+                        continue
+                    sig = detect_ad_post(text, host_channel=ch)
+                    if not sig["is_ad"]:
+                        continue
 
-                site = sig["product_site"]
-                tg_targets = sig["tg_targets"]
+                    site = sig["product_site"]
+                    tg_targets = sig["tg_targets"]
 
-                resolved_username = ""
-                resolved_name = ""
-                resolved_company = ""
-                resolved_bio = ""
-                resolved_id = 0
-                x_handle = ""
+                    resolved_username = ""
+                    resolved_name = ""
+                    resolved_company = ""
+                    resolved_bio = ""
+                    resolved_id = 0
+                    x_handle = ""
 
-                if tg_targets:
-                    target_info = await _resolve_tg_target(client, tg_targets[0])
-                    resolved_username = target_info.get("username") or ""
-                    resolved_name = target_info.get("name") or ""
-                    resolved_company = target_info.get("company") or ""
-                    resolved_bio = target_info.get("bio") or ""
-                    resolved_id = target_info.get("id") or 0
-                    if not site and target_info.get("site"):
-                        site = target_info["site"]
+                    if tg_targets:
+                        target_info = await _resolve_tg_target(client, tg_targets[0])
+                        resolved_username = target_info.get("username") or ""
+                        resolved_name = target_info.get("name") or ""
+                        resolved_company = target_info.get("company") or ""
+                        resolved_bio = target_info.get("bio") or ""
+                        resolved_id = target_info.get("id") or 0
+                        if not site and target_info.get("site"):
+                            site = target_info["site"]
 
-                if site and (not resolved_username or not resolved_company):
-                    html_text = ""
-                    if fetch_html is not None:
-                        try:
-                            html_text = fetch_html(site) or ""
-                        except Exception:
-                            html_text = ""
-                    meta = parse_site_html_contacts(html_text, fallback_domain=site)
-                    if not resolved_company and meta["title"]:
-                        resolved_company = meta["title"]
-                    if not resolved_username and meta["tg_username"]:
-                        resolved_username = meta["tg_username"]
-                    if meta["x_handle"]:
-                        x_handle = meta["x_handle"]
+                    if site and (not resolved_username or not resolved_company):
+                        html_text = ""
+                        if fetch_html is not None:
+                            try:
+                                html_text = fetch_html(site) or ""
+                            except Exception:
+                                html_text = ""
+                        meta = parse_site_html_contacts(html_text, fallback_domain=site)
+                        if not resolved_company and meta["title"]:
+                            resolved_company = meta["title"]
+                        if not resolved_username and meta["tg_username"]:
+                            resolved_username = meta["tg_username"]
+                        if meta["x_handle"]:
+                            x_handle = meta["x_handle"]
 
-                if not x_handle:
-                    for m_x in X_URL_RE.finditer(text):
-                        cand = m_x.group(1)
-                        if cand.lower() not in X_SKIP_HANDLES:
-                            x_handle = cand
-                            break
+                    if not x_handle:
+                        for m_x in X_URL_RE.finditer(text):
+                            cand = m_x.group(1)
+                            if cand.lower() not in X_SKIP_HANDLES:
+                                x_handle = cand
+                                break
 
-                dedup_key = (resolved_username or x_handle or site).lower()
-                if not dedup_key or dedup_key in seen:
-                    continue
-                if not (resolved_username or x_handle or site):
-                    continue
-                seen.add(dedup_key)
-                if site:
-                    seen.add(site.lower())
+                    dedup_key = (resolved_username or x_handle or site).lower()
+                    if not dedup_key or dedup_key in seen:
+                        continue
+                    if not (resolved_username or x_handle or site):
+                        continue
+                    seen.add(dedup_key)
+                    if site:
+                        seen.add(site.lower())
 
-                contact_channels: list[str] = []
-                links: list[str] = []
-                if site:
-                    links.append(site)
-                if resolved_username:
-                    contact_channels.append("telegram")
-                    links.append(f"https://t.me/{resolved_username}")
-                if x_handle:
-                    contact_channels.append("x")
-                    links.append(f"https://x.com/{x_handle}")
-                if not contact_channels and site:
-                    contact_channels.append("site")
+                    contact_channels: list[str] = []
+                    links: list[str] = []
+                    if site:
+                        links.append(site)
+                    if resolved_username:
+                        contact_channels.append("telegram")
+                        links.append(f"https://t.me/{resolved_username}")
+                    if x_handle:
+                        contact_channels.append("x")
+                        links.append(f"https://x.com/{x_handle}")
+                    if not contact_channels and site:
+                        contact_channels.append("site")
 
-                if not resolved_company and site:
-                    host = urlparse(site).netloc.removeprefix("www.")
-                    resolved_company = host.split(".")[0].capitalize()
+                    if not resolved_company and site:
+                        host = urlparse(site).netloc.removeprefix("www.")
+                        resolved_company = host.split(".")[0].capitalize()
 
-                row: dict = {
-                    "id": resolved_id or hash(dedup_key) & 0x7FFFFFFF,
-                    "username": resolved_username,
-                    "telegram_username": resolved_username,
-                    "name": resolved_name or resolved_company or resolved_username,
-                    "company": resolved_company or resolved_name,
-                    "site": site,
-                    "project_url": site,
-                    "bio": resolved_bio or text[:240],
-                    "source": "tg_ad_spy",
-                    "ad_host_channel": ch,
-                    "sample_messages": [text],
-                    "contact_channels": contact_channels,
-                    "links": list(dict.fromkeys(links)),
-                }
-                if x_handle:
-                    x_url = f"https://x.com/{x_handle}"
-                    row["founder_x"] = x_url
-                    row["social_verified"] = [{"platform": "x", "handle": x_handle, "url": x_url}]
+                    row: dict = {
+                        "id": resolved_id or hash(dedup_key) & 0x7FFFFFFF,
+                        "username": resolved_username,
+                        "telegram_username": resolved_username,
+                        "name": resolved_name or resolved_company or resolved_username,
+                        "company": resolved_company or resolved_name,
+                        "site": site,
+                        "project_url": site,
+                        "bio": resolved_bio or text[:240],
+                        "source": "tg_ad_spy",
+                        "ad_host_channel": ch,
+                        "sample_messages": [text],
+                        "contact_channels": contact_channels,
+                        "links": list(dict.fromkeys(links)),
+                    }
+                    if x_handle:
+                        x_url = f"https://x.com/{x_handle}"
+                        row["founder_x"] = x_url
+                        row["social_verified"] = [{"platform": "x", "handle": x_handle, "url": x_url}]
 
-                discovered.append(row)
-                out_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                out_fh.flush()
+                    discovered.append(row)
+                    out_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    out_fh.flush()
 
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-    _save_seen(seen_path, seen)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+    finally:
+        _save_seen(seen_path, seen, cursor=cursor + 1)
     return discovered
 
 
@@ -614,6 +658,7 @@ async def _async_main(args: argparse.Namespace) -> None:
             output_path=args.output,
             delay=args.delay,
             public_posts_fn=fetch_public_channel_posts_http,
+            max_runtime_sec=float(getattr(args, "max_runtime_sec", 150.0) or 150.0),
         )
         print(f"# tg_ad_spy: discovered {len(rows)} advertiser leads -> {args.output}", file=sys.stderr)
     finally:
@@ -629,6 +674,7 @@ def main() -> None:
     ap.add_argument("--seen", default=DEFAULT_SEEN_PATH)
     ap.add_argument("--output", required=True)
     ap.add_argument("--delay", type=float, default=1.0)
+    ap.add_argument("--max-runtime-sec", type=float, default=150.0)
     args = ap.parse_args()
     asyncio.run(_async_main(args))
 

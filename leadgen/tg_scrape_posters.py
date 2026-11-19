@@ -421,6 +421,8 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
         if mode == "posters":
             sample = sample_by_sender.get(sid, (0, ""))[1]
         row = {
+            "source": "tg_groups",
+            "lead_source": "tg_groups",
             "group": group,
             "id": sid,
             "username": username,

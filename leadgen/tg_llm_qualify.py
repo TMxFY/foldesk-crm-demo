@@ -19,13 +19,41 @@ Env (.env in project root):
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import faulthandler
 import json
 import os
 import re
+import subprocess
 import sys
 from typing import Any
 
 import requests
+
+try:
+    faulthandler.enable()
+except Exception:
+    pass
+
+
+def _ensure_safe_ssl_cert_env() -> None:
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return
+    try:
+        import certifi  # type: ignore
+
+        ca_path = certifi.where()
+        if ca_path and os.path.isfile(ca_path):
+            os.environ["SSL_CERT_FILE"] = ca_path
+            return
+    except Exception:
+        pass
+    for cand in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.isfile(cand):
+            os.environ["SSL_CERT_FILE"] = cand
+            return
+
+
+_ensure_safe_ssl_cert_env()
 
 try:
     from typesafe_leads import qualify_creator_rows, creator_filter
@@ -34,6 +62,8 @@ except Exception:
         from leadgen.typesafe_leads import qualify_creator_rows, creator_filter
     except Exception:
         qualify_creator_rows = creator_filter = None
+
+_ORIG_QUALIFY_CREATOR_ROWS = qualify_creator_rows
 
 try:
     from relay_route import chain, note_failure
@@ -121,7 +151,7 @@ REJECT (is_lead=false, icp_score < 80, or monetization="none"):
 - Forum job seekers, freelancers, 3D modeler / Roblox builder recruitment threads, pure traders/investors, community mods.
 
 For EACH lead in the input array decide:
-- is_lead: true ONLY if Founder/Marketing/Growth of an own monetized product needing short-form traffic
+- is_lead: true ONLY if Founder/Marketing/Growth of an own monetized product OR a monetized consumer/prosumer SaaS/AI/D2C/Gaming brand discovered via paid ads/stores/launches (e.g. source=meta_ads, app_store, tiktok_ads, tiktok_shop, whop, d2c_whatsapp, yc, ph_detailed) whose decision-maker contact is enriched downstream — NOT an agency, consultancy, pure B2D CLI/SDK, robotics/hardware maker, university, or hobby
 - icp_score: integer 0..100 (80+ ONLY for verified monetized products in target clusters)
 - monetization: one of ["subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none"]
 - short_form_fit: bool (true if product can convert from TikTok/Reels/Shorts)
@@ -141,6 +171,8 @@ def lead_view(i, r):
         "n": i,
         "name": r.get("name") or "",
         "username": r.get("username") or "",
+        "source": r.get("source") or r.get("lead_source") or "",
+        "role": r.get("role") or "",
         "bio": (r.get("bio") or "")[:400],
         "project": r.get("project") or r.get("company") or "",
         "project_url": r.get("project_url") or "",
@@ -354,6 +386,56 @@ def _quarantine_row(row: dict, reason: str, quarantine_list: list[dict]) -> None
     quarantine_list.append(q)
 
 
+def _run_typesafe_safely(rows: list[dict]) -> list[dict | None]:
+    """Run TypeSafe pre-classification isolated from SIGSEGV/TLS crashes.
+
+    When using the real TypeSafe SDK, execute in a bounded child process so any
+    native C-extension segfault (e.g., rc=-11) degrades gracefully to ``None``
+    per row (letting Relay Fast evaluate every row) instead of killing the stage.
+    """
+    if not rows or not qualify_creator_rows or os.getenv("TYPESAFE_ENABLED", "1").lower() in {"0", "false", "no"}:
+        return []
+    use_subprocess = (
+        qualify_creator_rows is _ORIG_QUALIFY_CREATOR_ROWS
+        and os.getenv("TYPESAFE_IN_SUBPROCESS", "1").lower() not in {"0", "false", "no"}
+    )
+    if use_subprocess:
+        _ensure_safe_ssl_cert_env()
+        worker_env = dict(os.environ)
+        worker_env.setdefault("TYPESAFE_CONCURRENCY", "4")
+        worker_timeout = max(15, int(os.getenv("TYPESAFE_WORKER_TIMEOUT", "90") or "90"))
+        try:
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--typesafe-worker"],
+                input=json.dumps(rows, ensure_ascii=False),
+                capture_output=True,
+                text=True,
+                timeout=worker_timeout,
+                env=worker_env,
+            )
+            if proc.returncode == 0 and (proc.stdout or "").strip():
+                parsed = json.loads(proc.stdout)
+                if isinstance(parsed, list) and len(parsed) == len(rows):
+                    return [x if isinstance(x, dict) else None for x in parsed]
+            print(
+                f"TypeSafe worker unavailable (rc={proc.returncode}); using Relay Fast for all rows",
+                file=sys.stderr,
+            )
+            return [None] * len(rows)
+        except Exception as exc:
+            print(f"TypeSafe worker error; using Relay Fast for all rows ({exc})", file=sys.stderr)
+            return [None] * len(rows)
+    try:
+        import asyncio
+        res = asyncio.run(qualify_creator_rows(rows))
+        if isinstance(res, list) and len(res) == len(rows):
+            return res
+        return [None] * len(rows)
+    except Exception as exc:
+        print(f"TypeSafe unavailable; using Relay Fast for all rows ({exc})", file=sys.stderr)
+        return [None] * len(rows)
+
+
 def qualify_loaded(
     rows,
     *,
@@ -378,15 +460,9 @@ def qualify_loaded(
 
     out = []
     fast_path = os.getenv("TYPESAFE_FAST_PATH", "0").lower() in {"1", "true", "yes"}
-    ts_results = []
-    if rows and qualify_creator_rows and os.getenv("TYPESAFE_ENABLED", "1").lower() not in {"0", "false", "no"}:
-        try:
-            import asyncio
-            ts_results = asyncio.run(qualify_creator_rows(rows))
-            print(f"TypeSafe judgments: {sum(x is not None for x in ts_results)}/{len(rows)}", file=sys.stderr)
-        except Exception as exc:
-            print(f"TypeSafe unavailable; using Relay Fast for all rows ({exc})", file=sys.stderr)
-            ts_results = [None] * len(rows)
+    ts_results = _run_typesafe_safely(rows)
+    if ts_results:
+        print(f"TypeSafe judgments: {sum(x is not None for x in ts_results)}/{len(rows)}", file=sys.stderr)
 
     routed = []
     for row, ts in zip(rows, ts_results or [None] * len(rows)):
@@ -590,11 +666,26 @@ def qualify_loaded(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
+    p.add_argument("--input")
+    p.add_argument("--output")
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     p.add_argument("--limit", type=int, default=0, help="debug limit")
+    p.add_argument("--typesafe-worker", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
+
+    if args.typesafe_worker:
+        import asyncio
+        raw_text = sys.stdin.read()
+        rows_in = json.loads(raw_text) if raw_text.strip() else []
+        if not isinstance(rows_in, list) or not qualify_creator_rows:
+            print(json.dumps([None] * (len(rows_in) if isinstance(rows_in, list) else 0)))
+            return
+        res = asyncio.run(qualify_creator_rows(rows_in))
+        print(json.dumps(res, ensure_ascii=False))
+        return
+
+    if not args.input or not args.output:
+        p.error("--input and --output are required unless --typesafe-worker is set")
 
     rows = [json.loads(l) for l in open(args.input) if l.strip()]
     if args.limit:

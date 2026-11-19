@@ -1,7 +1,10 @@
 """CRM database hygiene, Sniper ICP gate, self-healing, and server leadgen readiness SSOT."""
 from __future__ import annotations
 
+import csv
+from datetime import datetime, timedelta, timezone
 import inspect
+import io
 import json
 import os
 from pathlib import Path
@@ -1120,6 +1123,226 @@ def _parse_iso_ts_utc(raw: Any):
 
 
 STAGE_ERROR_TTL_SECONDS = 6 * 3600
+DEFAULT_STARVATION_CRITICAL_LOW = 15
+
+
+def _resolve_leadgen_state_dir() -> Path:
+    from app.leadgen_settings import _resolve_state_dir
+
+    return _resolve_state_dir()
+
+
+def _read_last_run_summary_safe(state_dir: Path) -> dict[str, Any]:
+    summary_path = state_dir / "last_run_summary.json"
+    if not summary_path.is_file():
+        return {}
+    try:
+        parsed = json.loads(summary_path.read_text(encoding="utf-8", errors="replace"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def inspect_leadgen_run_anomalies(state_dir: Path | None = None) -> dict[str, Any]:
+    """Inspect leadgen_run_history.jsonl + last_run_summary.json for 3-run 0-bridge & static dump repeats."""
+    st_dir = state_dir if state_dir is not None else _resolve_leadgen_state_dir()
+    hist_path = st_dir / "leadgen_run_history.jsonl"
+    history: list[dict[str, Any]] = []
+    if hist_path.is_file():
+        try:
+            for ln in hist_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        history.append(obj)
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            pass
+
+    summary = _read_last_run_summary_safe(st_dir)
+    if not history and summary:
+        history = [summary]
+
+    trend = [
+        {
+            "timestamp": str(item.get("timestamp") or ""),
+            "tg_bridged_count": int(item.get("tg_bridged_count") or 0),
+        }
+        for item in history[-10:]
+    ]
+
+    zero_streak = 0
+    for item in reversed(history):
+        try:
+            cnt = int(item.get("tg_bridged_count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        if cnt == 0:
+            zero_streak += 1
+        else:
+            break
+
+    static_repeats: list[dict[str, Any]] = []
+    if len(history) >= 2:
+        latest_hashes = history[-1].get("source_hashes") or {}
+        if isinstance(latest_hashes, dict):
+            for src, sha in latest_hashes.items():
+                if not sha:
+                    continue
+                streak = 1
+                for prev in reversed(history[:-1]):
+                    ph = prev.get("source_hashes") or {}
+                    if isinstance(ph, dict) and ph.get(src) == sha:
+                        streak += 1
+                    else:
+                        break
+                if streak >= 2:
+                    static_repeats.append({"source": src, "sha256": sha, "repeat_runs": streak})
+    elif isinstance(summary.get("static_dump_repeats"), list):
+        static_repeats = [x for x in summary["static_dump_repeats"] if isinstance(x, dict)]
+
+    return {
+        "tg_bridged_trend": trend,
+        "tg_bridged_zero_streak": zero_streak,
+        "tg_bridged_zero_alert": zero_streak >= 3,
+        "static_dump_repeats": static_repeats,
+        "static_dump_alert": bool(static_repeats),
+        "last_run": summary,
+    }
+
+
+def _audit_per_campaign_leadgen_status(
+    conn: sqlite3.Connection,
+    *,
+    state_dir: Path | None = None,
+    critical_low_mark: int = DEFAULT_STARVATION_CRITICAL_LOW,
+) -> list[dict[str, Any]]:
+    """Report queue & 24h/72h inflow separately for every running campaign with leadgen_enabled=1."""
+    try:
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+    except sqlite3.Error:
+        return []
+    if "leadgen_enabled" not in cols:
+        return []
+
+    sel_channel = ", channel" if "channel" in cols else ""
+    try:
+        camp_rows = conn.execute(
+            f"""
+            SELECT id, name, status, leadgen_enabled{sel_channel}
+            FROM campaigns
+            WHERE lower(COALESCE(status, '')) = 'running'
+              AND COALESCE(leadgen_enabled, 0) = 1
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    st_dir = state_dir if state_dir is not None else _resolve_leadgen_state_dir()
+    summary = _read_last_run_summary_safe(st_dir)
+    summary_reasons = [str(x) for x in (summary.get("reasons") or [])]
+    low_water_obj = summary.get("low_water_alert") if isinstance(summary.get("low_water_alert"), dict) else {}
+
+    now_dt = datetime.now(timezone.utc)
+    cutoff_24h = (now_dt - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_72h = (now_dt - timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_24h_t = (now_dt - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+    cutoff_72h_t = (now_dt - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    results: list[dict[str, Any]] = []
+    for crow in camp_rows:
+        cdict = as_dict(crow)
+        cid = int(cdict["id"])
+        cname = str(cdict.get("name") or "")
+        raw_ch = str(cdict.get("channel") or "").strip().lower()
+        if not raw_ch:
+            low_name = cname.lower()
+            if "(wa)" in low_name or "whatsapp" in low_name:
+                raw_ch = "whatsapp"
+            else:
+                wa_row = conn.execute(
+                    """
+                    SELECT 1 FROM campaign_recipients cr
+                    LEFT JOIN leads l ON l.id = cr.lead_id
+                    WHERE cr.campaign_id = ? AND lower(COALESCE(l.provider, '')) = 'whatsapp'
+                    LIMIT 1
+                    """,
+                    (cid,),
+                ).fetchone()
+                raw_ch = "whatsapp" if wa_row is not None else "telegram"
+
+        pending = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ? AND status = 'pending'",
+                (cid,),
+            ).fetchone()[0]
+            or 0
+        )
+        ingested_24h = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM campaign_recipients
+                WHERE campaign_id = ?
+                  AND replace(substr(created_at, 1, 19), 'T', ' ') >= ?
+                """,
+                (cid, min(cutoff_24h, cutoff_24h_t)),
+            ).fetchone()[0]
+            or 0
+        )
+        ingested_72h = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM campaign_recipients
+                WHERE campaign_id = ?
+                  AND replace(substr(created_at, 1, 19), 'T', ' ') >= ?
+                """,
+                (cid, min(cutoff_72h, cutoff_72h_t)),
+            ).fetchone()[0]
+            or 0
+        )
+
+        low_water = pending < int(critical_low_mark)
+        explicit_exhausted = (
+            "sources_exhausted" in summary_reasons
+            or (
+                int(low_water_obj.get("campaign_id") or -1) == cid
+                and str(low_water_obj.get("reason") or "") == "sources_exhausted"
+            )
+        )
+        sources_exhausted = bool(low_water and (explicit_exhausted or (ingested_24h == 0 and bool(summary))))
+        results.append(
+            {
+                "campaign_id": cid,
+                "name": cname,
+                "channel": raw_ch,
+                "pending": pending,
+                "ingested_24h": ingested_24h,
+                "ingested_72h": ingested_72h,
+                "critical_low_mark": int(critical_low_mark),
+                "sources_exhausted": sources_exhausted,
+                "low_water_alert": low_water,
+            }
+        )
+    return results
+
+
+def read_stage_errors_list(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    try:
+        row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'leadgen_stage_errors'"
+        ).fetchone()
+        if row and row["value"]:
+            parsed = json.loads(str(row["value"]))
+            if isinstance(parsed, list):
+                return [x for x in parsed if isinstance(x, dict)]
+    except (sqlite3.Error, json.JSONDecodeError):
+        pass
+    return []
 
 
 def _count_stage_timeouts_or_errors(conn: sqlite3.Connection) -> int:
@@ -1174,6 +1397,7 @@ def audit_server_leadgen_readiness(
     conn: sqlite3.Connection,
     *,
     enforce_vps_checks: bool | None = None,
+    fail_on_starvation: bool = False,
 ) -> dict[str, Any]:
     enforced = (
         (os.environ.get("CRMTG_VPS_RUNTIME") == "1")
@@ -1236,6 +1460,11 @@ def audit_server_leadgen_readiness(
     except (ValueError, OSError):
         scraper_session_ready = False
 
+    campaigns = _audit_per_campaign_leadgen_status(conn)
+    campaigns_starved = [c for c in campaigns if c.get("low_water_alert")]
+    starvation_alert = bool(campaigns_starved)
+    anomalies = inspect_leadgen_run_anomalies()
+
     if not leadgen_enabled:
         return {
             "ok": True,
@@ -1246,9 +1475,17 @@ def audit_server_leadgen_readiness(
             "scraper_session_ready": scraper_session_ready,
             "treg_required": False,
             "treg_ready": treg_ready,
+            "monid_ready": monid_ready,
             "typesafe_ready": typesafe_ready,
             "stage_timeout_count": stage_timeout_count,
             "missing_components": [],
+            "campaigns": campaigns,
+            "campaigns_starved": campaigns_starved,
+            "starvation_alert": starvation_alert,
+            "tg_bridged_zero_streak": anomalies["tg_bridged_zero_streak"],
+            "tg_bridged_zero_alert": anomalies["tg_bridged_zero_alert"],
+            "static_dump_repeats": anomalies["static_dump_repeats"],
+            "static_dump_alert": anomalies["static_dump_alert"],
         }
 
     missing_components: list[str] = []
@@ -1260,6 +1497,8 @@ def audit_server_leadgen_readiness(
         missing_components.append("treg_cli")
     if stage_timeout_count > 0:
         missing_components.append("stage_errors")
+    if fail_on_starvation and starvation_alert:
+        missing_components.append("campaign_starvation")
 
     if enforced:
         ok = bool(
@@ -1267,6 +1506,7 @@ def audit_server_leadgen_readiness(
             and (not scraper_session_required or scraper_session_ready)
             and (not treg_required or treg_ready)
             and stage_timeout_count == 0
+            and (not fail_on_starvation or not starvation_alert)
         )
     else:
         ok = True
@@ -1284,7 +1524,80 @@ def audit_server_leadgen_readiness(
         "typesafe_ready": typesafe_ready,
         "stage_timeout_count": stage_timeout_count,
         "missing_components": missing_components,
+        "campaigns": campaigns,
+        "campaigns_starved": campaigns_starved,
+        "starvation_alert": starvation_alert,
+        "tg_bridged_zero_streak": anomalies["tg_bridged_zero_streak"],
+        "tg_bridged_zero_alert": anomalies["tg_bridged_zero_alert"],
+        "static_dump_repeats": anomalies["static_dump_repeats"],
+        "static_dump_alert": anomalies["static_dump_alert"],
     }
+
+
+def read_leadgen_health_summary(
+    conn: sqlite3.Connection,
+    *,
+    state_dir: Path | None = None,
+    direct_x_limit: int = 50,
+    query: str = "",
+) -> dict[str, Any]:
+    st_dir = state_dir if state_dir is not None else _resolve_leadgen_state_dir()
+    readiness = audit_server_leadgen_readiness(conn)
+    anomalies = inspect_leadgen_run_anomalies(st_dir)
+    last_run = dict(anomalies.get("last_run") or {})
+    stage_errors = read_stage_errors_list(conn)
+    if not last_run.get("stage_errors") and stage_errors:
+        last_run["stage_errors"] = stage_errors
+    dx_payload = read_direct_x_leads(st_dir, limit=direct_x_limit, query=query)
+    return {
+        "ok": True,
+        "readiness_ok": bool(readiness.get("ok", True)),
+        "starvation_ok": not bool(readiness.get("starvation_alert", False)),
+        "campaigns": readiness.get("campaigns") or [],
+        "campaigns_starved": readiness.get("campaigns_starved") or [],
+        "starvation_alert": bool(readiness.get("starvation_alert", False)),
+        "last_run": {
+            "timestamp": last_run.get("timestamp"),
+            "rc_ok": int(last_run.get("stage_error_count") or len(stage_errors)) == 0,
+            "stage_error_count": int(last_run.get("stage_error_count") or len(stage_errors)),
+            "stage_errors": last_run.get("stage_errors") or stage_errors,
+            "stages_run": last_run.get("stages_run") or [],
+            "ingested_total": int(last_run.get("ingested_total") or 0),
+            "direct_x_routed": int(last_run.get("direct_x_routed") or 0),
+            "ofm_review_added": int(last_run.get("ofm_review_added") or 0),
+            "tg_bridged_count": int(last_run.get("tg_bridged_count") or 0),
+            "per_source_counts": last_run.get("per_source_counts") or {},
+        },
+        "tg_bridged_trend": anomalies["tg_bridged_trend"],
+        "tg_bridged_zero_streak": anomalies["tg_bridged_zero_streak"],
+        "tg_bridged_zero_alert": anomalies["tg_bridged_zero_alert"],
+        "static_dump_repeats": anomalies["static_dump_repeats"],
+        "static_dump_alert": anomalies["static_dump_alert"],
+        "direct_x_count": int(dx_payload.get("total") or 0),
+        "direct_x_leads": dx_payload.get("items") or [],
+        "readiness": readiness,
+    }
+
+
+def export_direct_x_leads_csv(items: list[dict[str, Any]]) -> str:
+    fields = [
+        "name",
+        "company",
+        "email",
+        "x_url",
+        "linkedin_url",
+        "url",
+        "category",
+        "their_angle",
+        "lead_source",
+        "saved_at",
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for item in items:
+        writer.writerow({k: item.get(k) or "" for k in fields})
+    return buf.getvalue()
 
 
 def _direct_x_canonical_keys(row: dict[str, Any]) -> set[str]:

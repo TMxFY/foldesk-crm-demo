@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Callable
 import urllib.parse
 
@@ -817,13 +818,191 @@ def _merge_discovered_jsonl_into_raw(
                         row["project_url"] = row.get("site")
                     if not row.get("project") and row.get("company"):
                         row["project"] = row.get("company")
+                    orig_src = str(row.get("lead_source") or row.get("source") or "").strip()
+                    if not orig_src and row.get("group"):
+                        orig_src = "tg_groups"
+                else:
+                    orig_src = ""
                 admitted = admit_discovered_row(row)
                 if not admitted:
                     continue
+                if orig_src:
+                    if not str(admitted.get("source") or "").strip():
+                        admitted["source"] = orig_src
+                    if not str(admitted.get("lead_source") or "").strip():
+                        admitted["lead_source"] = str(admitted.get("source") or orig_src)
                 admitted.setdefault("icp_match", True)
                 out_fh.write(json.dumps(admitted, ensure_ascii=False) + "\n")
                 added += 1
     return added
+
+
+_PROTECTED_JSONL_NAMES = frozenset(
+    {
+        "master_ids.jsonl",
+        "direct_x_leads.jsonl",
+        "ofm_review_leads.jsonl",
+        "quarantined_unqualified.jsonl",
+        "pending_qualify_queue.jsonl",
+        "leadgen_run_history.jsonl",
+    }
+)
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def prune_leadgen_state_jsonl(
+    state_dir: Path,
+    *,
+    max_age_days: int = 14,
+    max_total_bytes: int = 20 * 1024 * 1024,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Enforce retention (<=14d ephemeral runs, <=20MB total *.jsonl) without wiping active SSOT files."""
+    if not state_dir.is_dir():
+        return {"deleted_files": [], "trimmed_files": [], "total_bytes_after": 0}
+    now_sec = float(time.time() if now_ts is None else now_ts)
+    cutoff_sec = now_sec - max(1, int(max_age_days)) * 86400.0
+    deleted: list[str] = []
+    trimmed: list[str] = []
+
+    def _all_jsonl_stats() -> list[tuple[float, int, Path]]:
+        items: list[tuple[float, int, Path]] = []
+        for p in state_dir.glob("*.jsonl*"):
+            if not p.is_file() or ".jsonl" not in p.name:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            items.append((float(st.st_mtime), int(st.st_size), p))
+        return items
+
+    # 1) Remove ephemeral staging/run .jsonl files older than max_age_days
+    for mtime, _size, p in _all_jsonl_stats():
+        if p.name in _PROTECTED_JSONL_NAMES:
+            continue
+        if mtime < cutoff_sec:
+            try:
+                p.unlink(missing_ok=True)
+                deleted.append(p.name)
+            except OSError:
+                pass
+
+    # 2) Enforce total <= max_total_bytes by evicting oldest ephemeral artifacts first
+    stats = _all_jsonl_stats()
+    total_bytes = sum(sz for _, sz, _ in stats)
+    if total_bytes > max_total_bytes:
+        ephemeral = sorted(
+            [(mt, sz, p) for mt, sz, p in stats if p.name not in _PROTECTED_JSONL_NAMES],
+            key=lambda x: x[0],
+        )
+        for _mt, sz, p in ephemeral:
+            if total_bytes <= max_total_bytes:
+                break
+            try:
+                p.unlink(missing_ok=True)
+                deleted.append(p.name)
+                total_bytes = max(0, total_bytes - sz)
+            except OSError:
+                pass
+
+    # 3) If protected quarantine/pending logs still push over budget, trim oldest lines only
+    if total_bytes > max_total_bytes:
+        for trim_name in ("quarantined_unqualified.jsonl", "pending_qualify_queue.jsonl", "leadgen_run_history.jsonl"):
+            if total_bytes <= max_total_bytes:
+                break
+            tp = state_dir / trim_name
+            if not tp.is_file():
+                continue
+            try:
+                old_sz = tp.stat().st_size
+                lines = tp.read_text(encoding="utf-8", errors="replace").splitlines()
+                # Keep newest half (or newest lines within leftover budget)
+                keep_from = max(len(lines) // 2, len(lines) - 200)
+                kept = lines[keep_from:]
+                new_text = "\n".join(kept) + ("\n" if kept else "")
+                tmp = tp.with_suffix(".jsonl.trim_tmp")
+                tmp.write_text(new_text, encoding="utf-8")
+                tmp.replace(tp)
+                new_sz = tp.stat().st_size
+                total_bytes = max(0, total_bytes - max(0, old_sz - new_sz))
+                trimmed.append(trim_name)
+            except OSError:
+                pass
+
+    final_total = sum(sz for _, sz, _ in _all_jsonl_stats())
+    return {"deleted_files": deleted, "trimmed_files": trimmed, "total_bytes_after": final_total}
+
+
+def _update_run_history_and_detect(
+    state_dir: Path,
+    run_entry: dict[str, Any],
+    *,
+    max_history: int = 30,
+) -> tuple[int, list[dict[str, Any]]]:
+    hist_path = state_dir / "leadgen_run_history.jsonl"
+    prev_entries: list[dict[str, Any]] = []
+    if hist_path.is_file():
+        for ln in hist_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    prev_entries.append(obj)
+            except json.JSONDecodeError:
+                continue
+
+    entries = (prev_entries + [run_entry])[-max_history:]
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = hist_path.with_suffix(".jsonl.tmp")
+        tmp.write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(hist_path)
+    except OSError:
+        pass
+
+    # Count trailing streak of runs with tg_bridged_count == 0
+    zero_streak = 0
+    for item in reversed(entries):
+        try:
+            cnt = int(item.get("tg_bridged_count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        if cnt == 0:
+            zero_streak += 1
+        else:
+            break
+
+    # Detect non-empty per-source JSONLs whose SHA-256 hash matches the previous run
+    repeats: list[dict[str, Any]] = []
+    cur_hashes = run_entry.get("source_hashes") or {}
+    if isinstance(cur_hashes, dict) and len(entries) >= 2:
+        for src, sha in cur_hashes.items():
+            if not sha:
+                continue
+            streak = 1
+            for prev in reversed(entries[:-1]):
+                prev_hashes = prev.get("source_hashes") or {}
+                if isinstance(prev_hashes, dict) and prev_hashes.get(src) == sha:
+                    streak += 1
+                else:
+                    break
+            if streak >= 2:
+                repeats.append({"source": src, "sha256": sha, "repeat_runs": streak})
+
+    return zero_streak, repeats
 
 
 def _enforce_rule5_quarantine_on_new_recipients(
@@ -988,6 +1167,7 @@ def run_autonomous_replenish(
     rule5_previews: dict[str, Any] = {}
     rule5_quarantined: dict[str, list[int]] = {}
     per_source_counts: dict[str, int] = {}
+    source_hashes: dict[str, str] = {}
     tg_bridged_count = 0
     treg_ready = check_treg_ready()
     monid_ready = check_monid_ready()
@@ -1121,6 +1301,8 @@ def run_autonomous_replenish(
                             str(ROOT / "leadgen" / "buyer_catalogs.py"),
                             "--output",
                             str(catalogs_out),
+                            "--seen",
+                            str(state_dir / "buyer_catalogs_seen.json"),
                         ],
                     )
 
@@ -1155,6 +1337,8 @@ def run_autonomous_replenish(
                                 str(state_dir / "high_yield_seen.json"),
                                 "--veins",
                                 ",".join(enabled_veins),
+                                "--max-runtime-sec",
+                                str(min(200, max(60, int(stage_timeout) - 60))),
                             ],
                         )
                     elif "missing_treg_cli" not in replenish_reasons:
@@ -1234,6 +1418,7 @@ def run_autonomous_replenish(
                         "5",
                         "--no-llm",
                         "--no-sheet",
+                        "--persist-seen",
                     ]
                     if isolated_session is None:
                         yc_cmd.append("--no-tg")
@@ -1255,6 +1440,8 @@ def run_autonomous_replenish(
                             str(external_out),
                             "--limit",
                             str(ext_limit),
+                            "--seen",
+                            str(state_dir / "creator_external_seen.json"),
                             "--verify-telegram",
                             "--no-qualify",
                         ],
@@ -1357,6 +1544,8 @@ def run_autonomous_replenish(
                             str(channel_graph_out),
                             "--state",
                             str(state_dir / "tg_channel_graph_seen.json"),
+                            "--max-runtime-sec",
+                            str(min(180, max(60, int(stage_timeout) - 60))),
                         ],
                     )
 
@@ -1376,6 +1565,8 @@ def run_autonomous_replenish(
                             str(ad_spy_out),
                             "--seen",
                             str(state_dir / "tg_ad_spy_seen.json"),
+                            "--max-runtime-sec",
+                            str(min(180, max(60, int(stage_timeout) - 60))),
                         ],
                     )
 
@@ -1396,6 +1587,11 @@ def run_autonomous_replenish(
                     ("tg_ad_spy", ad_spy_out),
                 ):
                     per_source_counts[src_label] = _count_jsonl_lines(src_path)
+                    if src_path.is_file() and src_path.stat().st_size > 0:
+                        try:
+                            source_hashes[src_label] = _file_sha256(src_path)
+                        except OSError:
+                            pass
 
                 pending_qualify_queue = state_dir / "pending_qualify_queue.jsonl"
                 llm_failed_file = state_dir / "llm_failed_batches.jsonl"
@@ -1487,6 +1683,11 @@ def run_autonomous_replenish(
                                     ],
                                 )
                                 if curate_ok:
+                                    pre_wf_tg_cnt = (
+                                        _count_personal_tg_rows(curated_jsonl)
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0
+                                        else 0
+                                    )
                                     if treg_ready and curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
                                         treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
                                         treg_ok = _exec_stage(
@@ -1540,7 +1741,6 @@ def run_autonomous_replenish(
                                         and curated_jsonl.is_file()
                                         and curated_jsonl.stat().st_size > 0
                                     ):
-                                        pre_tg_cnt = _count_personal_tg_rows(curated_jsonl)
                                         bridge_tmp_jsonl = state_dir / f"raw_{ts}.bridge_tmp.jsonl"
                                         bridge_ok = _exec_stage(
                                             "tg_identity_bridge",
@@ -1559,11 +1759,18 @@ def run_autonomous_replenish(
                                             and bridge_tmp_jsonl.stat().st_size > 0
                                         ):
                                             bridge_tmp_jsonl.replace(curated_jsonl)
-                                            post_tg_cnt = _count_personal_tg_rows(curated_jsonl)
-                                            tg_bridged_count = max(0, post_tg_cnt - pre_tg_cnt)
                                         elif bridge_tmp_jsonl.is_file():
                                             bridge_tmp_jsonl.unlink(missing_ok=True)
                                     if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                        post_tg_cnt = _count_personal_tg_rows(curated_jsonl)
+                                        bridged_tag_cnt = sum(
+                                            1
+                                            for r in _read_jsonl_dicts(curated_jsonl)
+                                            if str(r.get("tg_bridge_match") or "").strip()
+                                        )
+                                        tg_bridged_count = max(
+                                            0, post_tg_cnt - pre_wf_tg_cnt, bridged_tag_cnt
+                                        )
                                         split_res = split_tg_and_direct_x_leads(
                                             curated_jsonl, state_dir / "direct_x_leads.jsonl"
                                         )
@@ -1730,14 +1937,35 @@ def run_autonomous_replenish(
         conn.commit()
 
     ofm_review_added = int(per_source_counts.get("ofm_groups") or 0)
+    st_dir = _resolve_state_dir()
+    prune_stats = prune_leadgen_state_jsonl(st_dir)
+    run_timestamp = utc_now()
+    zero_streak = 0
+    static_repeats: list[dict[str, Any]] = []
+    if stages_run or ingested_total > 0 or direct_x_routed > 0 or ofm_review_added > 0:
+        zero_streak, static_repeats = _update_run_history_and_detect(
+            st_dir,
+            {
+                "timestamp": run_timestamp,
+                "tg_bridged_count": tg_bridged_count,
+                "ingested_total": ingested_total,
+                "direct_x_routed": direct_x_routed,
+                "source_hashes": source_hashes,
+                "stage_error_count": len(stage_errors),
+            },
+        )
     result_payload = {
         "ok": True,
-        "timestamp": utc_now(),
+        "timestamp": run_timestamp,
         "ingested_total": ingested_total,
         "direct_x_routed": direct_x_routed,
         "ofm_review_added": ofm_review_added,
         "tg_bridged_count": tg_bridged_count,
+        "tg_bridged_zero_streak": zero_streak,
         "per_source_counts": per_source_counts,
+        "source_hashes": source_hashes,
+        "static_dump_repeats": static_repeats,
+        "prune_stats": prune_stats,
         "pending_b2b": pending_b2b,
         "pending_vacancies": pending_vac,
         "quarantined_sources": sorted(quarantined),
@@ -1750,7 +1978,6 @@ def run_autonomous_replenish(
     }
     if stages_run or ingested_total > 0 or direct_x_routed > 0 or ofm_review_added > 0:
         try:
-            st_dir = _resolve_state_dir()
             st_dir.mkdir(parents=True, exist_ok=True)
             summary_tmp = st_dir / "last_run_summary.json.tmp"
             summary_tmp.write_text(
@@ -1761,11 +1988,17 @@ def run_autonomous_replenish(
                         "direct_x_routed": direct_x_routed,
                         "ofm_review_added": ofm_review_added,
                         "tg_bridged_count": tg_bridged_count,
+                        "tg_bridged_zero_streak": zero_streak,
                         "per_source_counts": per_source_counts,
+                        "source_hashes": source_hashes,
+                        "static_dump_repeats": static_repeats,
+                        "prune_stats": prune_stats,
                         "pending_b2b": pending_b2b,
                         "pending_vacancies": pending_vac,
                         "stages_run": stages_run,
                         "stage_error_count": len(stage_errors),
+                        "stage_errors": stage_errors,
+                        "reasons": replenish_reasons,
                     },
                     ensure_ascii=False,
                     indent=2,

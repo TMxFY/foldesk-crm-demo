@@ -160,14 +160,14 @@ def yc_algolia_key():
         raise RuntimeError(f"AlgoliaOpts unparseable: {e}")
 
 
-def yc_fetch_batch(app, key, batch, limit):
+def yc_fetch_batch(app, key, batch, limit, *, page: int = 0):
     url = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/YCCompany_By_Launch_Date_production/query"
     headers = {
         "X-Algolia-Application-Id": app,
         "X-Algolia-API-Key": key,
         "Content-Type": "application/json",
     }
-    body = {"query": "", "hitsPerPage": limit, "filters": f'batch:"{batch}"'}
+    body = {"query": "", "hitsPerPage": limit, "page": max(0, int(page)), "filters": f'batch:"{batch}"'}
     r = requests.post(url, headers=headers, json=body, timeout=30)
     r.raise_for_status()
     return r.json().get("hits", [])
@@ -210,15 +210,22 @@ def _social_user(url, host_pat):
     return m.group(1) if m else ""
 
 
-def scrape_yc(limit, seen_keys=None):
+def scrape_yc(limit, seen_keys=None, *, cursor: int = 0):
     app, key = yc_algolia_key()
     leads = []
     fetch_limit = max(limit * 3, 100) if seen_keys is not None else max(1, limit // 2)
-    for batch in YC_BATCHES:
+    batches = list(YC_BATCHES)
+    if batches and cursor > 0:
+        shift = cursor % len(batches)
+        batches = batches[shift:] + batches[:shift]
+    page = (max(0, int(cursor)) // max(1, len(batches))) % 3
+    for batch in batches:
         if len(leads) >= limit:
             break
         try:
-            hits = yc_fetch_batch(app, key, batch, fetch_limit)
+            hits = yc_fetch_batch(app, key, batch, fetch_limit, page=page)
+            if not hits and page > 0:
+                hits = yc_fetch_batch(app, key, batch, fetch_limit, page=0)
         except Exception as e:
             log(f"YC batch {batch}: {e}")
             continue
@@ -1547,6 +1554,7 @@ def main():
     p.add_argument("--no-tg", action="store_true", help="skip Telegram lookup")
     p.add_argument("--no-llm", action="store_true", help="skip site research + LLM enrichment")
     p.add_argument("--no-sheet", action="store_true", help="skip sheet append (dry run)")
+    p.add_argument("--persist-seen", action="store_true", help="advance seen/cursor state even when --no-sheet is set")
     args = p.parse_args()
 
     load_env()
@@ -1556,12 +1564,13 @@ def main():
     try:
         seen = json.load(open(SEEN_PATH))
     except (FileNotFoundError, json.JSONDecodeError):
-        seen = {"keys": []}
+        seen = {"keys": [], "cursor": 0}
     seen_keys = set(seen.get("keys", []))
+    run_cursor = int(seen.get("cursor") or 0)
 
     log("=== scraping YC ===")
     try:
-        yc_leads = scrape_yc(args.yc_limit, seen_keys=seen_keys) if args.yc_limit > 0 else []
+        yc_leads = scrape_yc(args.yc_limit, seen_keys=seen_keys, cursor=run_cursor) if args.yc_limit > 0 else []
     except Exception as e:
         # Keep Product Hunt/YC as a best-effort stage: a transient directory
         # outage must not discard already collected Telegram leads or prevent
@@ -1721,14 +1730,17 @@ def main():
             upd = (resp.get("updates") or {})
             log(f"sheet append: updatedRows={upd.get('updatedRows')} updatedCells={upd.get('updatedCells')}")
 
-    # persist seen (skip on dry-run so --no-sheet does not burn unseen leads)
-    if not args.no_sheet:
+    # persist seen (skip on dry-run unless --persist-seen is passed)
+    if args.persist_seen or not args.no_sheet:
         for l in fresh:
             seen_keys.add(norm_site(l.get("site")) or (l.get("name") or "").strip().lower())
             seen_keys.add((l.get("name") or "").strip().lower())
         seen["keys"] = sorted(k for k in seen_keys if k)
-        with open(SEEN_PATH, "w") as f:
+        seen["cursor"] = run_cursor + 1
+        tmp_seen = SEEN_PATH + ".tmp"
+        with open(tmp_seen, "w") as f:
             json.dump(seen, f, ensure_ascii=False, indent=1)
+        os.replace(tmp_seen, SEEN_PATH)
 
     # summary for stdout
     summary = {

@@ -7,10 +7,13 @@ Rows keep a real http(s) site that is not a social host. Casino wording and
 from __future__ import annotations
 
 import argparse
+from datetime import date, timedelta
 import html
 import json
+import os
 import re
 import sys
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -36,6 +39,22 @@ TIMEOUT = 8
 SOURCES = (
     ("groover", "https://groover.co/en/influencer/list/tags/label/"),
     ("gumroad", "https://gumroad.com/discover?query=fitness"),
+)
+ROTATING_SOURCES = (
+    ("gumroad", "https://gumroad.com/discover?query=ai"),
+    ("gumroad", "https://gumroad.com/discover?query=saas"),
+    ("gumroad", "https://gumroad.com/discover?query=video"),
+    ("gumroad", "https://gumroad.com/discover?query=marketing"),
+    ("gumroad", "https://gumroad.com/discover?query=notion"),
+    ("gumroad", "https://gumroad.com/discover?query=productivity"),
+    ("gumroad", "https://gumroad.com/discover?query=automation"),
+    ("groover", "https://groover.co/en/influencer/list/tags/indie/"),
+    ("groover", "https://groover.co/en/influencer/list/tags/pop/"),
+    ("groover", "https://groover.co/en/influencer/list/tags/electronic/"),
+)
+DEFAULT_CATALOG_SEEN_PATH = os.path.join(
+    os.environ.get("LEADGEN_STATE_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "leadgen_state"),
+    "buyer_catalogs_seen.json",
 )
 
 _UA = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/json"}
@@ -493,11 +512,64 @@ def _enrich_detail_row(row: dict, getter) -> dict:
     return row
 
 
-def collect(fetch=None) -> list[dict]:
-    """One short request per catalog. A failed or empty source is skipped."""
+def _load_catalog_seen(path: Path) -> tuple[dict[str, str], int]:
+    cutoff = date.today() - timedelta(days=14)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}, 0
+        cursor = int(raw.get("cursor") or 0)
+        items_raw = raw.get("items") if isinstance(raw.get("items"), dict) else {}
+        kept: dict[str, str] = {}
+        for k, v in items_raw.items():
+            try:
+                if date.fromisoformat(str(v)[:10]) >= cutoff:
+                    kept[str(k)] = str(v)[:10]
+            except ValueError:
+                continue
+        return kept, cursor
+    except (OSError, ValueError, TypeError):
+        return {}, 0
+
+
+def _save_catalog_seen(path: Path, items: dict[str, str], cursor: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"cursor": int(cursor), "items": items}, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _catalog_row_key(row: dict) -> str:
+    return str(row.get("project_url") or row.get("id") or row.get("name") or "").strip().casefold()
+
+
+def collect(fetch=None, *, seen_path: Path | None = None) -> list[dict]:
+    """Bounded request per catalog with optional rotating queries & seen dedup."""
     getter = fetch or _http_get
+    seen_items: dict[str, str] = {}
+    cursor = 0
+    if seen_path is not None:
+        seen_items, cursor = _load_catalog_seen(seen_path)
+
+    active_sources = list(SOURCES)
+    if seen_path is not None and ROTATING_SOURCES:
+        rot_len = len(ROTATING_SOURCES)
+        idx = cursor % rot_len
+        for off in range(min(3, rot_len)):
+            cand = ROTATING_SOURCES[(idx + off) % rot_len]
+            if cand not in active_sources:
+                active_sources.append(cand)
+
     found = []
-    for name, url in SOURCES:
+    local_keys: set[str] = set()
+    today_iso = date.today().isoformat()
+    for name, url in active_sources:
         try:
             body = getter(url)
         except Exception:
@@ -508,16 +580,29 @@ def collect(fetch=None) -> list[dict]:
             continue
         if fetch is None:
             rows = [_enrich_detail_row(row, getter) for row in rows]
-        found.extend(rows)
+        for row in rows:
+            rk = _catalog_row_key(row)
+            if not rk or rk in local_keys:
+                continue
+            if seen_path is not None and rk in seen_items:
+                continue
+            local_keys.add(rk)
+            if seen_path is not None:
+                seen_items[rk] = today_iso
+            found.append(row)
+
+    if seen_path is not None:
+        _save_catalog_seen(seen_path, seen_items, cursor + 1)
     return found
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
+    parser.add_argument("--seen", default=DEFAULT_CATALOG_SEEN_PATH)
     args = parser.parse_args()
     try:
-        rows = collect()
+        rows = collect(seen_path=Path(args.seen) if args.seen else None)
     except Exception:
         rows = []
     with open(args.output, "w", encoding="utf-8") as handle:

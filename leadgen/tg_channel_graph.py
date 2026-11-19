@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import deque
 from urllib.parse import urlparse
 
@@ -51,6 +52,22 @@ DEFAULT_GRAPH_SEED_CHANNELS: tuple[str, ...] = (
     "ai_founders",
     "microconf",
     "startups",
+    "saasgrowth",
+    "indiehackers",
+    "nocodefounders",
+    "producthunt_news",
+)
+FALLBACK_EN_GRAPH_SEEDS: tuple[str, ...] = (
+    "saasgrowth",
+    "indiehackers",
+    "nocodefounders",
+    "ai_founders",
+    "microconf",
+    "startups",
+    "producthunt_news",
+    "growthhacking",
+    "b2bsaas",
+    "bootstrapped",
 )
 MAX_SUBSCRIBERS = 100_000
 
@@ -315,6 +332,7 @@ async def crawl_channel_graph(
     output_path: str = "channel_graph_leads.jsonl",
     linked_chats_path: str | None = None,
     delay: float = 1.0,
+    max_runtime_sec: float = 150.0,
 ) -> list[dict]:
     if not linked_chats_path:
         state_dir = os.path.dirname(os.path.abspath(state_path))
@@ -325,6 +343,7 @@ async def crawl_channel_graph(
     queue: deque[tuple[object, int]] = deque()
     queued_keys: set[str] = set()
     deferred_frontier: list[tuple[object, int]] = []
+    deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
 
     def _target_key(obj: object) -> str:
         if isinstance(obj, int):
@@ -357,6 +376,21 @@ async def crawl_channel_graph(
         queue.append((clean, 0))
         queued_keys.add(s_key)
 
+    # When saved frontier is empty and initial seeds are all exhausted, rotate through
+    # unseen EN seeds or least-recently-checked seen channels so graph never stalls at 0.
+    if not queue and seeds:
+        for fb in FALLBACK_EN_GRAPH_SEEDS:
+            fb_key = fb.strip().lstrip("@").lower()
+            if fb_key and fb_key not in queued_keys and fb_key not in seen_channels:
+                queue.append((fb, 0))
+                queued_keys.add(fb_key)
+        if not queue:
+            unexpanded_seen = [c for c in sorted(seen_channels) if c not in expanded_channels]
+            for cand in unexpanded_seen[:12]:
+                if cand not in queued_keys:
+                    queue.append((cand, 0))
+                    queued_keys.add(cand)
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered_rows: list[dict] = []
     seen_expansions = 0
@@ -364,6 +398,9 @@ async def crawl_channel_graph(
 
     with open(output_path, "w", encoding="utf-8") as out_fh:
         while queue and len(discovered_rows) < limit:
+            if deadline is not None and time.monotonic() >= deadline:
+                print("# tg_channel_graph: runtime budget reached; saving partial state", file=sys.stderr)
+                break
             target, cur_depth = queue.popleft()
             target_key = _target_key(target)
 
@@ -559,6 +596,7 @@ async def _async_main(args: argparse.Namespace) -> None:
             state_path=args.state,
             output_path=args.output,
             delay=args.delay,
+            max_runtime_sec=float(getattr(args, "max_runtime_sec", 150.0) or 150.0),
         )
         print(f"# tg_channel_graph: discovered {len(rows)} founder leads -> {args.output}", file=sys.stderr)
     finally:
@@ -575,6 +613,7 @@ def main() -> None:
     ap.add_argument("--state", "--seen", dest="state", default=DEFAULT_STATE_PATH)
     ap.add_argument("--output", required=True)
     ap.add_argument("--delay", type=float, default=1.5)
+    ap.add_argument("--max-runtime-sec", type=float, default=150.0)
     args = ap.parse_args()
     asyncio.run(_async_main(args))
 

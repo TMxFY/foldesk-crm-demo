@@ -2020,6 +2020,11 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                     ),
                     "leadgen_ready": bool(leadgen_readiness.get("ok", True)),
                     "leadgen_readiness": leadgen_readiness,
+                    "leadgen_campaigns": leadgen_readiness.get("campaigns") or [],
+                    "campaigns_starved": leadgen_readiness.get("campaigns_starved") or [],
+                    "leadgen_starvation_alert": bool(leadgen_readiness.get("starvation_alert", False)),
+                    "tg_bridged_zero_streak": int(leadgen_readiness.get("tg_bridged_zero_streak") or 0),
+                    "static_dump_alert": bool(leadgen_readiness.get("static_dump_alert", False)),
                 }
             )
         return payload
@@ -4541,6 +4546,36 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 if isinstance(parsed, dict):
                     items.append(parsed)
         return {"ok": True, "count": len(items), "items": items[-200:]}
+
+    @app.get("/api/leadgen/direct-x-leads")
+    def leadgen_direct_x_leads_get(
+        request: Request,
+        limit: int = 100,
+        query: str = "",
+        format: str = "json",
+    ):
+        from app.hygiene import export_direct_x_leads_csv, read_direct_x_leads
+
+        payload = read_direct_x_leads(_resolve_state_dir(), limit=limit, query=query)
+        if str(format or "").strip().lower() == "csv":
+            csv_body = export_direct_x_leads_csv(payload.get("items") or [])
+            return Response(
+                content=csv_body,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": 'attachment; filename="direct_x_leads.csv"'},
+            )
+        return payload
+
+    @app.get("/api/leadgen/health-summary")
+    def leadgen_health_summary_get(request: Request, limit: int = 50, query: str = ""):
+        from app.hygiene import read_leadgen_health_summary
+
+        return _call(
+            lambda conn: read_leadgen_health_summary(
+                conn, state_dir=_resolve_state_dir(), direct_x_limit=limit, query=query
+            ),
+            request.app.state.conn,
+        )
 
     @app.get("/api/leadgen/ofm-review")
     def leadgen_ofm_review_get(request: Request, limit: int = 100, query: str = ""):

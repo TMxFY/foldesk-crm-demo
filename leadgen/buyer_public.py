@@ -28,9 +28,14 @@ _DENY = {
     "pamba_ai", "karolzdeb", "usefastlane", "gauravsbuilding", "arcads_ai",
     "rom1trs", "creatify_ai", "makeugc", "fyncas",
 }
-_TG_DENY = {"joinchat", "share", "addstickers", "proxy", "iv"}
+_TG_DENY = {"joinchat", "share", "addstickers", "proxy", "iv", "s"}
 DISCOVER_URL = "https://contentrewards.com/c/discover"
 _TOKEN_KEYS = ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "BLOSS_DISCORD_TOKEN")
+_WHOP_SEARCH_QUERIES = (
+    'site:whop.com ("x.com/" OR "t.me/") -blog -terms',
+    'site:whop.com ("content rewards" OR "clipping" OR "ugc") ("x.com" OR "t.me")',
+    'site:whop.com ("saas" OR "ai" OR "fitness" OR "app") ("x.com/" OR "t.me/")',
+)
 
 
 def _owner_row(*, handle: str, telegram: str, source_url: str) -> dict:
@@ -100,34 +105,45 @@ def _curl(url: str) -> str:
 
 def _whop_treg_search_rows() -> list[dict]:
     try:
-        from treg_client import call as treg_call, check_treg_ready
+        from leadgen.treg_client import call as treg_call, check_treg_ready
     except ImportError:
         try:
-            from leadgen.treg_client import call as treg_call, check_treg_ready
+            from treg_client import call as treg_call, check_treg_ready
         except ImportError:
             return []
     if not check_treg_ready():
         return []
-    payload = treg_call(
-        "crawl4ai.web.search",
-        query={"q": 'site:whop.com ("content rewards" OR "per 1,000 views") ("x.com" OR "t.me")'},
-        timeout=30,
-    )
-    if not isinstance(payload, dict):
-        return []
+    from datetime import datetime, timezone
+
+    slot = int(datetime.now(timezone.utc).timestamp() // 14400) % len(_WHOP_SEARCH_QUERIES)
+    ordered_queries = [_WHOP_SEARCH_QUERIES[(slot + i) % len(_WHOP_SEARCH_QUERIES)] for i in range(len(_WHOP_SEARCH_QUERIES))]
     snippets: list[str] = []
-    results = payload.get("results") or payload.get("result") or []
-    if isinstance(results, dict):
-        results = results.get("results") or []
-    if isinstance(results, list):
-        for item in results:
-            if isinstance(item, dict):
-                snippets.append(
-                    " ".join(str(item.get(k) or "") for k in ("url", "title", "snippet", "description"))
-                )
+    for query in ordered_queries[:2]:
+        payload = treg_call(
+            "crawl4ai.web.search",
+            query={"q": query},
+            timeout=25,
+        )
+        if not isinstance(payload, dict):
+            continue
+        results = payload.get("results") or payload.get("result") or []
+        if isinstance(results, dict):
+            results = results.get("results") or []
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict):
+                    snippets.append(
+                        " ".join(str(item.get(k) or "") for k in ("url", "title", "snippet", "description"))
+                    )
+        if snippets:
+            break
     if not snippets:
         return []
-    return owner_contacts("\n".join(snippets), source_url=DISCOVER_URL)
+    rows = owner_contacts("\n".join(snippets), source_url=DISCOVER_URL)
+    for row in rows:
+        row["has_monetization_signal"] = True
+        row["monetization"] = "paid_product"
+    return rows
 
 
 def whop_rows(fetch_fn=None) -> list[dict]:
