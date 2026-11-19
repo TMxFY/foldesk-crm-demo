@@ -531,12 +531,13 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar .nav-sublink {
 }
 
 /* 3-Column Single-Screen Inbox + Right Slide-over Drawer (#s09) */
-.workspace[data-view-mode="sheet"] .messenger-grid {
+.workspace[data-view-mode="sheet"] .messenger-grid:not([data-inbox-v2="mounted"]) {
   grid-template-columns: 340px minmax(0, 1fr) 300px;
   align-items: start;
 }
 
-.workspace[data-view-mode="sheet"] .messenger-grid .inspector-col > #s09 {
+.workspace[data-view-mode="sheet"] .messenger-grid .inspector-col > #s09,
+.workspace[data-view-mode="sheet"] > #s09 {
   display: none;
 }
 
@@ -548,7 +549,9 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar .nav-sublink {
 }
 
 .workspace[data-view-mode="sheet"][data-active-popup="card"] .messenger-grid .inspector-col > #s09,
-.workspace[data-view-mode="sheet"] .messenger-grid[data-sheet-focus="s09"] .inspector-col > #s09 {
+.workspace[data-view-mode="sheet"] .messenger-grid[data-sheet-focus="s09"] .inspector-col > #s09,
+.workspace[data-view-mode="sheet"][data-active-popup="card"] > #s09,
+.workspace[data-view-mode="sheet"] > #s09[data-sheet-focus="s09"] {
   display: grid !important;
   position: fixed;
   top: 16px;
@@ -4874,21 +4877,24 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar-footer {
 }
 
 #accounts .account.account-compact-row {
+  display: block;
   padding: 6px 10px;
   border-radius: var(--radius-sm);
 }
 
 #accounts .account-row-line {
   display: grid;
-  grid-template-columns: minmax(150px, 1.2fr) minmax(0, auto) max-content max-content;
+  width: 100%;
+  grid-template-columns: minmax(180px, 1.4fr) minmax(0, auto) max-content max-content;
   align-items: center;
   gap: 10px;
 }
 
 #accounts .account-col-identity {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 3px 6px;
   min-width: 0;
   overflow: hidden;
 }
@@ -4899,6 +4905,18 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar-footer {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+@media (min-width: 1200px) {
+  #accounts .account-row-line {
+    grid-template-columns: minmax(240px, 1.6fr) minmax(120px, 1fr) max-content max-content;
+  }
+
+  #accounts .account-col-identity {
+    min-width: 240px;
+    flex: 1 1 240px;
+  }
 }
 
 #accounts .account-col-identity .account-submeta {
@@ -6232,12 +6250,12 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar-footer {
     display: inline-flex !important;
   }
 
-  .messenger-grid[data-mobile-pane="thread"] #s04 {
+  .messenger-grid:not([data-inbox-v2="mounted"])[data-mobile-pane="thread"] #s04 {
     display: none !important;
   }
 
-  .messenger-grid[data-mobile-pane="list"] #s05,
-  .messenger-grid[data-mobile-pane="list"] .inspector-col {
+  .messenger-grid:not([data-inbox-v2="mounted"])[data-mobile-pane="list"] #s05,
+  .messenger-grid:not([data-inbox-v2="mounted"])[data-mobile-pane="list"] .inspector-col {
     display: none !important;
   }
 }
@@ -6254,8 +6272,8 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar-footer {
 }
 
 @media (min-width: 901px) {
-  .messenger-grid,
-  .workspace[data-view-mode="sheet"] .messenger-grid {
+  .messenger-grid:not([data-inbox-v2="mounted"]),
+  .workspace[data-view-mode="sheet"] .messenger-grid:not([data-inbox-v2="mounted"]) {
     grid-template-columns: 360px minmax(0, 1fr) !important;
   }
 }
@@ -7319,7 +7337,32 @@ textarea:focus {
   text-decoration: underline;
 }
 
+/* =========================================================================
+ * Wave 2: React Inbox v2 Host Geometry Isolation
+ * ========================================================================= */
+#inbox-v2-host[data-inbox-v2="mounted"] {
+  display: block !important;
+  grid-template-columns: none !important;
+  width: 100%;
+  min-width: 0;
+}
 
+#inbox-v2-host[data-inbox-v2="mounted"][hidden] {
+  display: none !important;
+}
 
+.workspace[data-view-mode="sheet"][data-active-sheet="inbox"] #inbox-v2-host[data-inbox-v2="mounted"]:not([hidden]),
+.sheet-view[data-active-sheet="inbox"] #inbox-v2-host[data-inbox-v2="mounted"]:not([hidden]),
+.workspace:not([data-view-mode="sheet"]) #inbox-v2-host[data-inbox-v2="mounted"]:not([hidden]) {
+  height: calc(100vh - 96px);
+  min-height: 620px;
+  overflow: hidden;
+}
 
-
+@media (max-width: 768px) {
+  .workspace[data-view-mode="sheet"][data-active-sheet="inbox"] #inbox-v2-host[data-inbox-v2="mounted"]:not([hidden]),
+  .sheet-view[data-active-sheet="inbox"] #inbox-v2-host[data-inbox-v2="mounted"]:not([hidden]) {
+    height: calc(100dvh - 136px);
+    min-height: 480px;
+  }
+}
