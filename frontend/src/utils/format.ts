@@ -269,7 +269,7 @@ export function renderSnippetTemplate(
   lead: LeadItem | null,
   fallbackLead?: LeadItem | null,
 ): string {
-  const effectiveLead = lead || fallbackLead || null;
+  const effectiveLead = lead || (!dialog ? fallbackLead : null) || null;
   const rawName = String(
     effectiveLead?.name ||
       dialog?.name ||
