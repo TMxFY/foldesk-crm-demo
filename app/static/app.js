@@ -406,6 +406,9 @@ function syncSheetVisibility() {
     btn.setAttribute("aria-pressed", isAct ? "true" : "false");
   });
 
+  const s09El = document.querySelector("#s09");
+  const s09InsideGrid = Boolean(s09El && messengerGrid && messengerGrid.contains(s09El));
+
   if (state.viewMode !== "sheet") {
     if (leadsViewBar) leadsViewBar.hidden = false;
     if (s07) s07.hidden = false;
@@ -413,6 +416,10 @@ function syncSheetVisibility() {
       messengerGrid.hidden = false;
       messengerGrid.removeAttribute("data-sheet-focus");
       messengerGrid.removeAttribute("data-card-overlay");
+    }
+    if (s09El) {
+      s09El.hidden = false;
+      s09El.removeAttribute("data-sheet-focus");
     }
     if (outreach) outreach.hidden = false;
     if (outreachCampaignsPane) outreachCampaignsPane.hidden = false;
@@ -446,14 +453,19 @@ function syncSheetVisibility() {
   if (s07) s07.hidden = !(showLeads && leadsSub === "kanban");
   if (messengerGrid) {
     const showInbox = active === "inbox";
-    messengerGrid.hidden = !(showInbox || cardPopupOpen);
-    if (!showInbox && cardPopupOpen) {
+    messengerGrid.hidden = !(showInbox || (cardPopupOpen && s09InsideGrid));
+    if (!showInbox && cardPopupOpen && s09InsideGrid) {
       messengerGrid.dataset.cardOverlay = "true";
     } else {
       messengerGrid.removeAttribute("data-card-overlay");
     }
-    if (active === "s09") messengerGrid.setAttribute("data-sheet-focus", "s09");
+    if (active === "s09" && s09InsideGrid) messengerGrid.setAttribute("data-sheet-focus", "s09");
     else messengerGrid.removeAttribute("data-sheet-focus");
+  }
+  if (s09El && !s09InsideGrid) {
+    s09El.hidden = !cardPopupOpen;
+    if (active === "s09") s09El.setAttribute("data-sheet-focus", "s09");
+    else s09El.removeAttribute("data-sheet-focus");
   }
   if (outreach) outreach.hidden = active !== "outreach";
   if (outreachCampaignsPane) outreachCampaignsPane.hidden = outreachSub !== "campaigns";
@@ -802,6 +814,7 @@ async function loadPipelineStages() {
         if (!BADGE[s.key]) BADGE[s.key] = "b-new";
       });
       syncStageSelectOptions();
+      syncInboxV2BootSlice("stages");
       renderBoard();
       renderLeadTable();
       if (state.selectedLeadId != null && state.cards[state.selectedLeadId]) {
@@ -1402,6 +1415,8 @@ function renderAccounts() {
     fillFolderAccounts();
     fillCampaignAccounts();
     renderInboxSessionSwitcher();
+    syncInboxV2BootSlice("accounts");
+    hydrateLeadsTopKpis(state.analytics, state.accounts);
     updateWorkspaceStats();
     setView("#accounts-view", "empty");
     return;
@@ -1512,6 +1527,13 @@ function renderAccounts() {
           className: "btn secondary sm",
           title: "Открыть диалоги в CRM",
           onclick: async () => {
+            if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__) {
+              activateSheet("inbox");
+              if (typeof window.__INBOX_V2_BRIDGE__.refresh === "function") {
+                window.__INBOX_V2_BRIDGE__.refresh({ accountId: account.id });
+              }
+              return;
+            }
             await switchInboxSession(String(account.id));
             activateSheet("inbox");
             const s04 = document.querySelector("#s04");
@@ -1554,21 +1576,25 @@ function renderAccounts() {
   });
   if (pending && state.loginId == null && connected.length === 0) resumeLogin(pending);
   const select = document.querySelector("#tg-account");
-  const previous = select.value;
   if (accountsSection) {
     accountsSection.dataset.hasConnected = (connected.length > 0 && state.loginId == null) ? "true" : "false";
   }
-  select.replaceChildren();
-  connected.forEach((account) => {
-    const label = account.telegram_name || account.phone;
-    select.append(el("option", { value: String(account.id) }, [label]));
-  });
-  if (previous && [...select.options].some((opt) => opt.value === previous)) {
-    select.value = previous;
+  if (select) {
+    const previous = select.value;
+    select.replaceChildren();
+    connected.forEach((account) => {
+      const label = account.telegram_name || account.phone;
+      select.append(el("option", { value: String(account.id) }, [label]));
+    });
+    if (previous && [...select.options].some((opt) => opt.value === previous)) {
+      select.value = previous;
+    }
   }
   fillFolderAccounts();
   fillCampaignAccounts();
   renderInboxSessionSwitcher();
+  syncInboxV2BootSlice("accounts");
+  hydrateLeadsTopKpis(state.analytics, state.accounts);
   updateWorkspaceStats();
   setView("#accounts-view", "filled");
 }
@@ -3065,6 +3091,7 @@ async function loadAccounts() {
 }
 
 function renderInboxSessionSwitcher() {
+  if (isInboxV2Active()) return;
   const host = document.querySelector("#inbox-session-switcher");
   const badge = document.querySelector("#inbox-active-session-badge");
   const connected = (state.accounts || []).filter((account) => account.status === "connected");
@@ -3185,6 +3212,7 @@ function activeInboxChips() {
 }
 
 function syncChipNote() {
+  if (isInboxV2Active()) return;
   const note = document.querySelector("#chip-note");
   if (!note) return;
   const inTelegramSearch = state.searchMode === "telegram" && Boolean(String(state.dialogQuery || "").trim());
@@ -3335,6 +3363,7 @@ function passChips(dialog) {
 }
 
 function renderDialogs() {
+  if (isInboxV2Active()) return;
   renderInboxChipCounts();
   const list = document.querySelector("#dialog-results");
   const matched = sortDialogsByRecency(state.dialogs.filter(passChips));
@@ -3910,6 +3939,7 @@ function buildInboxStageBar(dialog, lead, barId) {
 }
 
 function renderThread() {
+  if (isInboxV2Active()) return;
   const dialog = state.selectedDialog;
   const error = document.querySelector("#thread-error");
   const grid = document.querySelector(".messenger-grid");
@@ -4136,6 +4166,12 @@ function markDialogReadOnServer(dialogId) {
 }
 
 async function selectDialog(dialog, options = {}) {
+  if (isInboxV2Active()) {
+    if (dialog && dialog.id != null && window.__INBOX_V2_BRIDGE__ && typeof window.__INBOX_V2_BRIDGE__.selectDialogById === "function") {
+      await window.__INBOX_V2_BRIDGE__.selectDialogById(dialog.id);
+    }
+    return;
+  }
   const reqToken = ++dialogLoadToken;
   const keepSessionAll = state.inboxSessionFilter === "all";
   if (dialog && dialog.account_id) {
@@ -4279,6 +4315,9 @@ function refreshSideEvents(leadId) {
 }
 
 function renderSide({ syncSelectedLead = true } = {}) {
+  if (isInboxV2Active()) return;
+  const sideCard = document.querySelector("#side-card");
+  if (!sideCard) return;
   const dialog = state.selectedDialog;
   if (!dialog) {
     setView("#side-view", "empty");
@@ -4464,6 +4503,14 @@ function openReminderModal(lead) {
 
 async function openChat(lead) {
   if (!lead) return;
+  if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__ && typeof window.__INBOX_V2_BRIDGE__.openLeadDialog === "function") {
+    closeSheetPopup();
+    activateSheet("inbox");
+    await window.__INBOX_V2_BRIDGE__.openLeadDialog(lead);
+    const hostEl = document.querySelector("#inbox-v2-host");
+    if (hostEl && state.viewMode !== "sheet") hostEl.scrollIntoView({ block: "nearest" });
+    return;
+  }
   const cleanUser = String(lead.username || "").replace(/^@/, "").toLowerCase();
   const matchesLead = (item, strictAccount) => {
     if (strictAccount && lead.account_id && item.account_id && Number(item.account_id) !== Number(lead.account_id)) {
@@ -4896,7 +4943,7 @@ async function resetPipelineView() {
   if (pipelineSearchNode) pipelineSearchNode.value = "";
   document.querySelector("#saved-view").value = "";
   document.querySelector("#view-name").value = "";
-  if (state.mode === "crm") {
+  if (!isInboxV2Active() && state.mode === "crm") {
     const query = document.querySelector("#q");
     if (query) query.value = "";
     state.inboxSearchQuery = "";
@@ -5007,6 +5054,7 @@ function renderBoard() {
   setBoardKpi("#analytics-kpi-won-sub", `${wonLeadsCount} выиграно · всего ${totalLeadsCount}`);
   setBoardKpi("#analytics-kpi-win-rate", boardWinRate);
   setBoardKpi("#analytics-kpi-win-rate-sub", `Общий объём: ${boardTotalVal}`);
+  hydrateLeadsTopKpis(state.analytics, state.accounts);
   syncQuickWaitingCount(waitingCount);
 
   const counterStrip = document.querySelector("#pipeline-counter-strip");
@@ -5491,6 +5539,7 @@ async function loadLeads(query = "", keepId = null, silent = false) {
   const leads = await api(`/api/leads?${params.toString()}`);
   state.leads = leads;
   leads.forEach((lead) => { state.leadCache[lead.id] = lead; });
+  syncInboxV2BootSlice("leads");
   if (keepId != null && state.leadCache[keepId]) {
     state.selectedLeadId = keepId;
   } else if (state.selectedLeadId && !leads.some((lead) => lead.id === state.selectedLeadId)) {
@@ -5848,6 +5897,7 @@ function closeInboxLive() {
 }
 
 function upsertDialog(dialog) {
+  if (isInboxV2Active()) return;
   if (!dialog) return;
   const prevAll = Array.isArray(state.allDialogs)
     ? state.allDialogs.find((row) => isSameDialog(row, dialog))
@@ -5901,6 +5951,10 @@ function upsertDialog(dialog) {
 }
 
 function openInboxLive(accountId) {
+  if (isInboxV2Active()) {
+    closeLegacyInboxSseOnly();
+    return;
+  }
   const id = String(accountId || "");
   if (!id) {
     closeInboxLive();
@@ -6001,6 +6055,17 @@ function openInboxLive(accountId) {
 }
 
 async function loadInbox(opts = {}) {
+  if (isInboxV2Active()) {
+    closeLegacyInboxSseOnly();
+    if (
+      (!opts || !opts.fromBoot || bootSeq > 1)
+      && window.__INBOX_V2_BRIDGE__
+      && typeof window.__INBOX_V2_BRIDGE__.refresh === "function"
+    ) {
+      window.__INBOX_V2_BRIDGE__.refresh();
+    }
+    return;
+  }
   const select = document.querySelector("#tg-account");
   const connected = (state.accounts || []).filter((acc) => acc.status === "connected");
   if (!select || (!select.value && !connected.length)) {
@@ -6569,6 +6634,7 @@ bindBusy(document.querySelector("#password-form"), async (event) => {
 });
 
 document.querySelector("#tg-account").addEventListener("change", (event) => {
+  if (isInboxV2Active()) return;
   state.dialogQuery = "";
   const val = event.target.value;
   state.inboxSessionFilter = val ? String(val) : "all";
@@ -6585,6 +6651,7 @@ document.querySelector("#tg-account").addEventListener("change", (event) => {
 let crmSearchDebounceTimer = 0;
 
 document.querySelector("#search-mode").addEventListener("click", (event) => {
+  if (isInboxV2Active()) return;
   const button = event.target.closest("button");
   if (!button) return;
   state.mode = button.dataset.mode;
@@ -6604,6 +6671,7 @@ document.querySelector("#search-mode").addEventListener("click", (event) => {
 });
 
 document.querySelector("#q").addEventListener("input", (event) => {
+  if (isInboxV2Active()) return;
   const val = String(event.target.value || "");
   document.querySelector("#search-form").dataset.typing = val ? "true" : "false";
   if (state.mode !== "telegram") {
@@ -6626,6 +6694,7 @@ document.querySelector("#q").addEventListener("input", (event) => {
 
 document.querySelector("#search-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (isInboxV2Active()) return;
   window.clearTimeout(crmSearchDebounceTimer);
   showError(null);
   const query = String(new FormData(event.target).get("q") || "");
@@ -6659,6 +6728,7 @@ document.querySelector("#search-form").addEventListener("submit", async (event) 
 });
 
 document.querySelector(".chips").addEventListener("click", async (event) => {
+  if (isInboxV2Active()) return;
   const button = event.target.closest("[data-chip]");
   if (!button) return;
   state.pinnedDialogId = null;
@@ -7581,11 +7651,13 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
     });
   }
   document.addEventListener("click", (ev) => {
+    if (isInboxV2Active()) return;
     if (!inspectorCol || !inspectorCol.classList.contains("is-deal-popup-open")) return;
     if (ev.target.closest && (ev.target.closest("#s06") || ev.target.closest("#open-deal-popup-btn"))) return;
     closeDealInspectorPopup();
   });
   document.addEventListener("keydown", (ev) => {
+    if (isInboxV2Active()) return;
     if (ev.key === "Escape" && inspectorCol && inspectorCol.classList.contains("is-deal-popup-open")) {
       closeDealInspectorPopup();
     }
@@ -7747,6 +7819,7 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
   const replyTextField = document.querySelector("#reply-text");
   if (replyTextField) {
     replyTextField.addEventListener("keydown", (event) => {
+      if (isInboxV2Active()) return;
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
         const form = document.querySelector("#reply-form");
@@ -7761,6 +7834,7 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
   let sending = false;
   document.querySelector("#reply-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (isInboxV2Active()) return;
     const error = document.querySelector("#thread-error");
     const dialog = state.selectedDialog;
     const field = document.querySelector("#reply-text");
@@ -7861,6 +7935,7 @@ document.querySelector("#to-leads").addEventListener("click", async () => {
 }
 
 document.querySelector("#mark-unread").addEventListener("click", async () => {
+  if (isInboxV2Active()) return;
   const error = document.querySelector("#thread-error");
   const dialog = state.selectedDialog;
   error.hidden = true;
@@ -8838,9 +8913,7 @@ function renderAnalytics(data) {
   setText("#analytics-kpi-win-rate-sub", `Общий объём: ${totalVal}`);
   setText("#analytics-kpi-reply-rate", replyRate);
   setText("#analytics-kpi-reply-rate-sub", `Ответили: ${outreach.replied || 0} из ${outreach.sent || 0}`);
-  setText("#analytics-kpi-pool", `${accounts.sent_today || 0} / ${accounts.daily_limit || 0}`);
-  const activeHealth = (accounts.by_health && accounts.by_health.active) || 0;
-  setText("#analytics-kpi-pool-sub", `Активных сессий: ${activeHealth} · Загрузка ${accounts.utilization_pct || 0}%`);
+  hydrateLeadsTopKpis(summary, state.accounts);
 
   const convStrip = document.querySelector("#pipeline-conversion-strip");
   if (convStrip) {
@@ -9837,6 +9910,7 @@ function buildSnippetChipEl(snippet, includeDelete = true) {
 }
 
 function renderSnippets() {
+  if (isInboxV2Active()) return;
   const items = Array.isArray(state.snippets) ? state.snippets : [];
   const sideHost = document.querySelector("#side-snippets-list");
   const replyHost = document.querySelector("#reply-snippets-list");
@@ -9951,12 +10025,185 @@ async function loadSnippets() {
 
 let bootSeq = 0;
 let bootingSeq = 0;
+let inboxV2FlagWatched = false;
+
+function isInboxV2Active() {
+  return Boolean(window.__INBOX_V2_ACTIVE__);
+}
+
+function closeLegacyInboxSseOnly() {
+  if (inboxSource) {
+    inboxSource.close();
+    inboxSource = null;
+  }
+  inboxLiveAccount = "";
+}
+
+function watchInboxV2Flag() {
+  if (inboxV2FlagWatched) return;
+  inboxV2FlagWatched = true;
+  let activeVal = Boolean(window.__INBOX_V2_ACTIVE__);
+  try {
+    const desc = Object.getOwnPropertyDescriptor(window, "__INBOX_V2_ACTIVE__");
+    if (!desc || desc.configurable) {
+      Object.defineProperty(window, "__INBOX_V2_ACTIVE__", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return activeVal;
+        },
+        set(next) {
+          activeVal = Boolean(next);
+          if (activeVal) {
+            closeLegacyInboxSseOnly();
+          }
+        },
+      });
+    }
+  } catch (_err) { /* ignore non-configurable global */ }
+}
+
+function getStagesForBridge() {
+  if (Array.isArray(state.pipelineStages) && state.pipelineStages.length) {
+    return state.pipelineStages;
+  }
+  return STATUSES.map(([key, label], idx) => ({ key, label, sort_order: idx }));
+}
+
+function syncInboxV2BootSlice(slice) {
+  const bridge = window.__INBOX_V2_BRIDGE__;
+  if (!bridge) return;
+  if ((!slice || slice === "accounts") && typeof bridge.setAccounts === "function") {
+    bridge.setAccounts(Array.isArray(state.accounts) ? state.accounts : []);
+  }
+  if ((!slice || slice === "leads") && typeof bridge.setLeads === "function") {
+    bridge.setLeads(Array.isArray(state.leads) ? state.leads : []);
+  }
+  if ((!slice || slice === "stages") && typeof bridge.setStages === "function") {
+    bridge.setStages(getStagesForBridge());
+  }
+}
+
+function hydrateLeadsTopKpis(summary = state.analytics, accountsList = state.accounts) {
+  const setText = (sel, text) => {
+    const node = document.querySelector(sel);
+    if (node) node.textContent = text;
+  };
+  const list = Array.isArray(accountsList) ? accountsList : [];
+  const summaryOutreach = summary && summary.outreach ? summary.outreach : null;
+  const summaryAcc = summary && summary.accounts ? summary.accounts : null;
+
+  if (summary && (summaryOutreach || summary.reply_rate_pct != null)) {
+    const rawReplyRate = Number(
+      (summaryOutreach && summaryOutreach.reply_rate_pct) ?? summary.reply_rate_pct ?? 0,
+    );
+    const replyRate = `${rawReplyRate.toFixed(1).replace(/\.0$/, "")}%`;
+    const replied = Number(summaryOutreach && summaryOutreach.replied) || 0;
+    const sent = Number(summaryOutreach && summaryOutreach.sent) || 0;
+    setText("#stat-reply-rate", replyRate);
+    setText("#analytics-kpi-reply-rate", replyRate);
+    setText("#analytics-kpi-reply-rate-sub", `Ответили: ${replied} из ${sent}`);
+  }
+
+  const activePoolAccs = list.filter(isAccountPoolActive);
+  const connectedAccs = list.filter((acc) => acc && acc.status === "connected");
+  const poolBasis = activePoolAccs.length ? activePoolAccs : connectedAccs;
+  const fallbackDailyLimit = poolBasis.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
+  const fallbackSentToday = poolBasis.reduce((sum, acc) => sum + (Number(acc.sent_today) || 0), 0);
+
+  if (summaryAcc || list.length) {
+    const hasSummaryAcc = Boolean(
+      summaryAcc && (summaryAcc.daily_limit != null || summaryAcc.total_accounts != null),
+    );
+    const sentToday = hasSummaryAcc
+      ? Number(summaryAcc.healthy_sent_today ?? summaryAcc.sent_today ?? fallbackSentToday)
+      : fallbackSentToday;
+    const dailyLimit = hasSummaryAcc
+      ? Number(summaryAcc.daily_limit ?? fallbackDailyLimit)
+      : fallbackDailyLimit;
+    const activeHealth = hasSummaryAcc
+      ? Number(
+        summaryAcc.healthy_accounts
+          ?? ((summaryAcc.by_health && summaryAcc.by_health.active) || activePoolAccs.length),
+      )
+      : activePoolAccs.length;
+    const utilPct = hasSummaryAcc && summaryAcc.utilization_pct != null
+      ? Number(summaryAcc.utilization_pct)
+      : (dailyLimit > 0 ? Math.round((sentToday / dailyLimit) * 1000) / 10 : 0);
+    setText("#analytics-kpi-pool", `${sentToday} / ${dailyLimit}`);
+    setText("#analytics-kpi-pool-sub", `Активных сессий: ${activeHealth} · Загрузка ${utilPct}%`);
+  }
+}
+
+function showSheet(sheetName) {
+  return activateSheet(sheetName);
+}
+
+function registerCrmBridge() {
+  if (window.__CRM_BRIDGE__) return window.__CRM_BRIDGE__;
+  window.__CRM_BRIDGE__ = {
+    openClientProfile(leadId, dialogId) {
+      if (leadId && typeof leadId === "object") {
+        return openClientProfile(leadId);
+      }
+      return openClientProfile({
+        leadId: leadId || null,
+        dialogId: dialogId || null,
+      });
+    },
+    showToast(msg, kind) {
+      toast(msg, kind);
+    },
+    setWorkspaceDialogsTotal(n) {
+      if (n != null && Number.isFinite(Number(n))) {
+        state.workspaceTotalDialogs = Number(n);
+        updateWorkspaceStats({ refreshAnalytics: false });
+      }
+    },
+    setLiveStatus(ok) {
+      setInboxLive(Boolean(ok));
+    },
+    onLeadUpdated(updatedLead) {
+      if (!updatedLead || updatedLead.id == null) return;
+      const lid = Number(updatedLead.id);
+      delete state.cards[lid];
+      const prevCached = state.leadCache[lid] || {};
+      const mergedLead = { ...prevCached, ...updatedLead };
+      state.leadCache[lid] = mergedLead;
+      const idx = (state.leads || []).findIndex((item) => Number(item.id) === lid);
+      if (idx >= 0) {
+        state.leads[idx] = { ...state.leads[idx], ...mergedLead };
+      } else if (!state.leadQuery) {
+        state.leads.unshift(mergedLead);
+      }
+      renderBoard();
+      renderLeadTable();
+      if (state.selectedLeadId != null && Number(state.selectedLeadId) === lid) {
+        renderCard();
+      }
+      updateWorkspaceStats();
+    },
+    switchSheet(sheetName) {
+      showSheet(sheetName);
+    },
+    getBootData() {
+      return {
+        accounts: Array.isArray(state.accounts) ? state.accounts : [],
+        leads: Array.isArray(state.leads) ? state.leads : [],
+        stages: getStagesForBridge(),
+      };
+    },
+  };
+  return window.__CRM_BRIDGE__;
+}
 
 function isBootInFlight() {
   return bootingSeq !== 0 && bootingSeq === bootSeq;
 }
 
 async function boot() {
+  watchInboxV2Flag();
+  registerCrmBridge();
   const mySeq = ++bootSeq;
   bootingSeq = mySeq;
   try {
@@ -9974,12 +10221,19 @@ async function boot() {
     await loadPipelineStages();
     if (mySeq !== bootSeq) return;
 
+    const analyticsPromise = loadAnalyticsSummary().then((summary) => {
+      if (mySeq === bootSeq) hydrateLeadsTopKpis(summary, state.accounts);
+      return summary;
+    });
+
     setView("#board-view", "loading");
     setView("#leads-view", "loading");
     setView("#accounts-view", "loading");
-    setView("#inbox-view", "empty");
-    setView("#thread-view", "empty");
-    setView("#side-view", "empty");
+    if (!isInboxV2Active()) {
+      setView("#inbox-view", "empty");
+      setView("#thread-view", "empty");
+      setView("#side-view", "empty");
+    }
     setView("#card-view", "empty");
     let initialLeadsFailed = false;
     try {
@@ -10002,20 +10256,21 @@ async function boot() {
     try {
       await loadAccounts();
       if (mySeq !== bootSeq) return;
+      hydrateLeadsTopKpis(state.analytics, state.accounts);
     } catch (error) {
       if (mySeq !== bootSeq) return;
       failRegion("#accounts-view", "#accounts-error", error);
     }
     if (mySeq !== bootSeq) return;
     try {
-      await loadInbox();
+      await loadInbox({ fromBoot: true });
     } catch (error) {
       if (mySeq !== bootSeq) return;
       closeInboxLive();
       state.inbox = "error";
       const node = document.querySelector("#inbox-error");
       if (node) node.textContent = error.message;
-      setView("#inbox-view", "error");
+      if (!isInboxV2Active()) setView("#inbox-view", "error");
     }
     if (mySeq !== bootSeq) return;
     try {
@@ -10053,7 +10308,7 @@ async function boot() {
     }
     await loadSnippets();
     if (mySeq !== bootSeq) return;
-    await loadAnalyticsSummary();
+    await analyticsPromise;
     if (mySeq !== bootSeq) return;
     if (initialLeadsFailed) {
       try {
@@ -12992,6 +13247,22 @@ function normalizeExternalUrl(rawSite) {
 async function openFunnelLeadDialog(row) {
   if (!row) return;
   const dialogId = Number(row.dialog_id || 0);
+  if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__) {
+    activateSheet("inbox");
+    if (dialogId > 0 && typeof window.__INBOX_V2_BRIDGE__.selectDialogById === "function") {
+      await window.__INBOX_V2_BRIDGE__.selectDialogById(dialogId);
+      return;
+    }
+    if (typeof window.__INBOX_V2_BRIDGE__.openLeadDialog === "function") {
+      await window.__INBOX_V2_BRIDGE__.openLeadDialog({
+        id: row.lead_id || null,
+        dialog_id: dialogId > 0 ? dialogId : null,
+        username: row.username || "",
+        name: row.company || row.name || row.username || "Контакт",
+      });
+      return;
+    }
+  }
   if (dialogId > 0) {
     const existing = (state.dialogs || []).find((d) => Number(d.id) === dialogId);
     if (existing) {
@@ -14204,6 +14475,17 @@ function renderClientProfileBody(data) {
       className: "btn primary sm",
       onclick: async () => {
         closeClientProfile();
+        if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__) {
+          activateSheet("inbox");
+          if (primaryDialogObj && primaryDialogObj.id && typeof window.__INBOX_V2_BRIDGE__.selectDialogById === "function") {
+            await window.__INBOX_V2_BRIDGE__.selectDialogById(primaryDialogObj.id);
+          } else if (lead && typeof window.__INBOX_V2_BRIDGE__.openLeadDialog === "function") {
+            await window.__INBOX_V2_BRIDGE__.openLeadDialog(lead);
+          } else if (primaryDialogObj && typeof window.__INBOX_V2_BRIDGE__.openLeadDialog === "function") {
+            await window.__INBOX_V2_BRIDGE__.openLeadDialog({ ...primaryDialogObj, dialog_id: primaryDialogObj.id });
+          }
+          return;
+        }
         if (primaryDialogObj) {
           upsertDialog(primaryDialogObj);
           activateSheet("inbox");
@@ -14422,6 +14704,11 @@ function renderClientProfileBody(data) {
           className: "client-profile-dialog-row",
           onclick: async () => {
             closeClientProfile();
+            if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__ && typeof window.__INBOX_V2_BRIDGE__.selectDialogById === "function") {
+              activateSheet("inbox");
+              await window.__INBOX_V2_BRIDGE__.selectDialogById(d.id);
+              return;
+            }
             await switchInboxSession(String(d.account_id));
             activateSheet("inbox");
             await selectDialog(d, { markRead: false });

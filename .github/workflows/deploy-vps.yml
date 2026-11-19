@@ -29,12 +29,14 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
-          cache-dependency-path: 'e2e/package-lock.json'
+          cache-dependency-path: |
+            e2e/package-lock.json
+            frontend/package-lock.json
 
       - name: Install dependencies
         env:
@@ -51,6 +53,10 @@ jobs:
           pip install -r requirements.txt
           npm ci --prefix e2e
           ./e2e/node_modules/.bin/playwright install chromium
+
+      - name: Build Inbox v2 React bundle
+        run: |
+          npm ci --prefix frontend && npm run build --prefix frontend
 
       - name: Run full test suite, proactive self-test & design/launch gates
         run: |
@@ -96,6 +102,7 @@ jobs:
             git fetch origin main
             git reset --hard "$TARGET_SHA"
             "$APP_DIR/.venv/bin/pip" install -q -r requirements.txt
+            if [ -f "$APP_DIR/frontend/package.json" ]; then npm ci --prefix "$APP_DIR/frontend" && npm run build --prefix "$APP_DIR/frontend"; fi
 
             if [ -f "$APP_DIR/deploy/systemd/crmtg.service" ]; then
               install -m 0644 "$APP_DIR/deploy/systemd/crmtg.service" /etc/systemd/system/crmtg.service
@@ -138,6 +145,7 @@ jobs:
               echo "::error::Healthcheck failed on 127.0.0.1:18084, rolling back to $PREV_SHA"
               git reset --hard "$PREV_SHA"
               "$APP_DIR/.venv/bin/pip" install -q -r requirements.txt
+              if [ -f "$APP_DIR/frontend/package.json" ]; then npm ci --prefix "$APP_DIR/frontend" && npm run build --prefix "$APP_DIR/frontend"; fi
               systemctl restart crmtg.service
               exit 1
             fi

@@ -10,7 +10,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap&subset=cyrillic,latin">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261119astryx1">
+  <link rel="stylesheet" href="/static/app.css?v=20261119w2">
+  <link rel="stylesheet" href="/static/inbox-v2/inbox-v2.css?v=20261119w2">
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
 </head>
 <body>
@@ -335,7 +336,7 @@
         </div>
       </section>
 
-      <div class="messenger-grid" data-sheet="inbox">
+      <div id="inbox-v2-host" class="messenger-grid" data-sheet="inbox">
         <section id="s04" class="surface-box pane-col" aria-labelledby="s04-title">
           <div class="pane-head">
             <div class="row">
@@ -509,20 +510,21 @@
             </div>
           </section>
 
-          <section id="s09" class="surface-box" data-popup-box="card" aria-labelledby="s09-title">
-            <div class="pane-head">
-              <h2 id="s09-title">Карточка</h2>
-              <button type="button" class="btn ghost sm popup-close-btn sheet-only-btn" id="close-card-popup" data-close-popup aria-label="Закрыть карточку">Закрыть ×</button>
-            </div>
-            <div id="card-view" data-state="empty">
-              <p data-when="empty" class="hint empty-state">Выберите лида в списке или на воронке</p>
-              <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
-              <div data-when="filled" id="lead-card"></div>
-              <p data-when="error" id="card-error" class="msg" role="alert"></p>
-            </div>
-          </section>
         </div>
       </div>
+
+      <section id="s09" class="surface-box" data-popup-box="card" aria-labelledby="s09-title">
+        <div class="pane-head">
+          <h2 id="s09-title">Карточка</h2>
+          <button type="button" class="btn ghost sm popup-close-btn sheet-only-btn" id="close-card-popup" data-close-popup aria-label="Закрыть карточку">Закрыть ×</button>
+        </div>
+        <div id="card-view" data-state="empty">
+          <p data-when="empty" class="hint empty-state">Выберите лида в списке или на воронке</p>
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span></div>
+          <div data-when="filled" id="lead-card"></div>
+          <p data-when="error" id="card-error" class="msg" role="alert"></p>
+        </div>
+      </section>
 
       <section id="digest" hidden aria-label="Напоминания">
         <button type="button" id="digest-send">Прислать сводку</button>
@@ -1419,6 +1421,14 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261119astryx1"></script>
+  <script src="/static/app.js?v=20261119w2"></script>
+  <script type="module" src="/static/inbox-v2/inbox-v2.js?v=20261119w2"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw-inbox.js', { scope: '/' }).catch(() => {});
+      });
+    }
+  </script>
 </body>
 </html>
