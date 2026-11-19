@@ -40,11 +40,17 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            (curl -fsSL --retry 3 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+              | sudo tar -xJ --wildcards --strip-components=2 -C /usr/local/bin '*/bin/ffmpeg' \
+              && sudo chmod +x /usr/local/bin/ffmpeg) \
+              || (sudo apt-get update -qq && sudo apt-get install -y -qq --fix-missing ffmpeg)
+          fi
+          ffmpeg -version | head -n 1
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           npm ci --prefix e2e
-          ./e2e/node_modules/.bin/playwright install --with-deps chromium
+          ./e2e/node_modules/.bin/playwright install chromium
 
       - name: Run full test suite, proactive self-test & design/launch gates
         run: |
