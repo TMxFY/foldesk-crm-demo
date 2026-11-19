@@ -1252,6 +1252,16 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 if "ofm_tier" in item or str(item.get("source") or item.get("lead_source") or "").strip().lower().startswith("ofm"):
                     continue
                 cand = dict(item)
+                if not str(cand.get("lead_source") or "").strip():
+                    explicit_src = str(cand.get("source") or "").strip()
+                    if not explicit_src and cand.get("group"):
+                        explicit_src = "tg_groups"
+                    if explicit_src and explicit_src.lower() not in {"cold outreach", "leadgen"}:
+                        cand["lead_source"] = explicit_src
+                    elif explicit_src:
+                        cand["lead_source"] = explicit_src
+                if not str(cand.get("source") or "").strip() and cand.get("lead_source"):
+                    cand["source"] = cand["lead_source"]
                 uname = str(cand.get("username") or cand.get("tg_username") or cand.get("telegram_username") or "").strip().lstrip("@")
                 if uname and not cand.get("username"):
                     cand["username"] = uname

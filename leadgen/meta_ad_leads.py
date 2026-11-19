@@ -529,6 +529,8 @@ def collect(
                 "founder_linkedin": founder_linkedin,
                 "founder_x": founder_x,
                 "work_email": work_email,
+                "has_monetization_signal": True,
+                "monetization": "subscription",
                 "icp_match": True,
                 "lead_tier": "A",
             }

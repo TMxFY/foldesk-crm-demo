@@ -528,6 +528,29 @@ _MEGACORP_STORE_RE = re.compile(
     re.I,
 )
 APP_STORE_TERMS = ("AI astrology", "AI fitness coach", "calorie tracker AI", "language tutor AI")
+APP_STORE_ROTATING_TERMS = (
+    "AI astrology",
+    "AI fitness coach",
+    "calorie tracker AI",
+    "language tutor AI",
+    "AI video editor",
+    "AI note taker",
+    "habit tracker AI",
+    "AI sleep tracker",
+    "AI skincare scanner",
+    "study flashcards AI",
+)
+CHROME_STORE_TERMS = ("AI productivity", "AI writing", "AI meeting notes", "video downloader")
+LAUNCH_SIGNAL_ROTATING_QUERIES = (
+    'site:x.com ("just launched" OR "now live" OR "looking for beta users") (AI OR SaaS)',
+    'site:linkedin.com/in ("founder" OR "co-founder") ("launched" OR "now live") AI startup',
+    'site:x.com ("launched today" OR "built with AI" OR "our new app") ("try it" OR "waitlist")',
+    'site:x.com ("D2C" OR "Shopify" OR "consumer app") ("UGC" OR "TikTok" OR "creators")',
+)
+DEFAULT_EXTERNAL_SEEN_PATH = os.path.join(
+    os.environ.get("LEADGEN_STATE_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "leadgen_state"),
+    "creator_external_seen.json",
+)
 
 
 def _is_megacorp_store_item(item: dict[str, Any]) -> bool:
@@ -542,29 +565,39 @@ def _is_megacorp_store_item(item: dict[str, Any]) -> bool:
     return bool(_MEGACORP_STORE_RE.search(blob))
 
 
-def app_stores(limit: int) -> list[dict[str, Any]]:
+_ACTIVE_EXTERNAL_CURSOR = 0
+
+
+def app_stores(limit: int, *, cursor: int | None = None) -> list[dict[str, Any]]:
+    eff_cursor = _ACTIVE_EXTERNAL_CURSOR if cursor is None else int(cursor)
     rows: list[dict[str, Any]] = []
-    for term in APP_STORE_TERMS:
+    if eff_cursor > 0:
+        shift = (eff_cursor * 4) % len(APP_STORE_ROTATING_TERMS)
+        terms = tuple(APP_STORE_ROTATING_TERMS[(shift + i) % len(APP_STORE_ROTATING_TERMS)] for i in range(4))
+    else:
+        terms = APP_STORE_TERMS
+    for term in terms:
         try:
             payload = _get_json("https://itunes.apple.com/search", params={"term": term, "entity": "software", "country": "us", "limit": min(limit, 50)})
             for item in payload.get("results", []):
                 if _is_megacorp_store_item(item):
                     continue
                 url = item.get("trackViewUrl") or ""
-                rows.append(_base_row(name=item.get("trackName") or "App Store app", bio=item.get("description") or item.get("primaryGenreName") or "", source="app_store", source_url=url, project=item.get("trackName") or "", project_url=item.get("sellerUrl") or url, links=[url, item.get("sellerUrl") or ""]) | {"app_store": "apple", "developer": item.get("artistName") or "", "rating_count": int(item.get("userRatingCount") or 0)})
-                if len(rows) >= limit * len(APP_STORE_TERMS):
+                rows.append(_base_row(name=item.get("trackName") or "App Store app", bio=item.get("description") or item.get("primaryGenreName") or "", source="app_store", source_url=url, project=item.get("trackName") or "", project_url=item.get("sellerUrl") or url, links=[url, item.get("sellerUrl") or ""]) | {"app_store": "apple", "developer": item.get("artistName") or "", "rating_count": int(item.get("userRatingCount") or 0), "has_monetization_signal": True, "monetization": "subscription"})
+                if len(rows) >= limit * len(terms):
                     break
         except Exception as exc:
             log("App Store discovery failed:", exc)
         # Focused consumer subscription queries avoid mega-utilities like ChatGPT/Gemini.
 
     try:
-        query = quote_plus("AI productivity")
+        chrome_term = CHROME_STORE_TERMS[eff_cursor % len(CHROME_STORE_TERMS)] if eff_cursor > 0 else "AI productivity"
+        query = quote_plus(chrome_term)
         text = _get_text(f"https://chromewebstore.google.com/search/{query}")
         links = _parse_store_links(text, r"https://chromewebstore\.google\.com/detail/[A-Za-z0-9._%-]+/[A-Za-z0-9_-]+")
         for url in links[:limit]:
             slug = url.rstrip("/").split("/")[-2].replace("-", " ")
-            rows.append(_base_row(name=slug.title(), bio="Chrome Web Store extension; AI/productivity", source="chrome_web_store", source_url=url, project=slug.title(), project_url=url, links=[url]) | {"app_store": "chrome"})
+            rows.append(_base_row(name=slug.title(), bio=f"Chrome Web Store extension; {chrome_term}", source="chrome_web_store", source_url=url, project=slug.title(), project_url=url, links=[url]) | {"app_store": "chrome", "has_monetization_signal": True, "monetization": "subscription"})
     except Exception as exc:
         log("Chrome Web Store discovery failed:", exc)
     return rows
@@ -592,12 +625,17 @@ def _treg_launch_hits(query: str) -> list[dict[str, Any]]:
     return []
 
 
-def launch_signals(limit: int) -> list[dict[str, Any]]:
+def launch_signals(limit: int, *, cursor: int | None = None) -> list[dict[str, Any]]:
+    eff_cursor = _ACTIVE_EXTERNAL_CURSOR if cursor is None else int(cursor)
     rows: list[dict[str, Any]] = []
-    queries = (
-        'site:x.com ("just launched" OR "now live" OR "looking for beta users") (AI OR SaaS)',
-        'site:linkedin.com/in ("founder" OR "co-founder") ("launched" OR "now live") AI startup',
-    )
+    if eff_cursor > 0:
+        shift = eff_cursor % len(LAUNCH_SIGNAL_ROTATING_QUERIES)
+        queries = tuple(
+            LAUNCH_SIGNAL_ROTATING_QUERIES[(shift + i) % len(LAUNCH_SIGNAL_ROTATING_QUERIES)]
+            for i in range(2)
+        )
+    else:
+        queries = LAUNCH_SIGNAL_ROTATING_QUERIES[:2]
     for query in queries:
         treg_hits = _treg_launch_hits(query)
         if treg_hits:
@@ -679,11 +717,47 @@ async def qualify(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _load_external_seen(path: str | None) -> tuple[dict[str, str], int]:
+    if not path:
+        return {}, 0
+    cutoff = date.today() - timedelta(days=14)
+    try:
+        raw = json.loads(open(path, encoding="utf-8").read())
+        if not isinstance(raw, dict):
+            return {}, 0
+        cursor = int(raw.get("cursor") or 0)
+        items_raw = raw.get("items") if isinstance(raw.get("items"), dict) else {}
+        kept: dict[str, str] = {}
+        for k, v in items_raw.items():
+            try:
+                if date.fromisoformat(str(v)[:10]) >= cutoff:
+                    kept[str(k)] = str(v)[:10]
+            except ValueError:
+                continue
+        return kept, cursor
+    except (OSError, ValueError, TypeError):
+        return {}, 0
+
+
+def _save_external_seen(path: str | None, items: dict[str, str], cursor: int) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"cursor": int(cursor), "items": items}, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def discover_all(
     *,
     limit: int = DEFAULT_LIMIT,
     sources: Iterable[str] | str | None = None,
     include_dev_sources: bool = False,
+    seen_path: str | None = None,
 ) -> list[dict[str, Any]]:
     bounded_limit = max(1, min(int(limit or DEFAULT_LIMIT), 100))
     if sources is None:
@@ -700,20 +774,29 @@ def discover_all(
     elif not include_dev_sources:
         selected -= set(DEV_SOURCES)
 
+    global _ACTIVE_EXTERNAL_CURSOR
+    seen_items, cursor = _load_external_seen(seen_path)
+
     rows: list[dict[str, Any]] = []
-    if "github" in selected:
-        rows.extend(github_candidates(bounded_limit))
-    if "show_hn" in selected:
-        rows.extend(hn_candidates(bounded_limit))
-    if "huggingface" in selected:
-        rows.extend(hf_candidates(bounded_limit))
-    if "app_stores" in selected:
-        rows.extend(app_stores(bounded_limit))
-    if "launch_signals" in selected:
-        rows.extend(launch_signals(bounded_limit))
+    prev_cursor = _ACTIVE_EXTERNAL_CURSOR
+    _ACTIVE_EXTERNAL_CURSOR = cursor
+    try:
+        if "github" in selected:
+            rows.extend(github_candidates(bounded_limit))
+        if "show_hn" in selected:
+            rows.extend(hn_candidates(bounded_limit))
+        if "huggingface" in selected:
+            rows.extend(hf_candidates(bounded_limit))
+        if "app_stores" in selected:
+            rows.extend(app_stores(bounded_limit))
+        if "launch_signals" in selected:
+            rows.extend(launch_signals(bounded_limit))
+    finally:
+        _ACTIVE_EXTERNAL_CURSOR = prev_cursor
 
     deduped = dedupe(rows)
     filtered: list[dict[str, Any]] = []
+    today_iso = date.today().isoformat()
     for row in deduped:
         item = dict(row)
         if sanitize_person_and_company is not None:
@@ -729,7 +812,14 @@ def discover_all(
                 item["project"] = clean_p
         if not include_dev_sources and sniper_reject_reason is not None and sniper_reject_reason(item):
             continue
+        item_key = str(item.get("source_url") or item.get("project_url") or item.get("id") or "").strip().casefold()
+        if seen_path and item_key:
+            if item_key in seen_items:
+                continue
+            seen_items[item_key] = today_iso
         filtered.append(item)
+    if seen_path:
+        _save_external_seen(seen_path, seen_items, cursor + 1)
     return filtered
 
 
@@ -747,6 +837,7 @@ def main() -> None:
     parser.add_argument("--verify-telegram", action="store_true")
     parser.add_argument("--verify-telegram-telethon", action="store_true",
                         help="also resolve candidates with the authenticated Telethon session")
+    parser.add_argument("--seen", default=DEFAULT_EXTERNAL_SEEN_PATH)
     args = parser.parse_args()
     limit = max(1, min(args.limit, 100))
     selected_sources = args.sources
@@ -756,6 +847,7 @@ def main() -> None:
         limit=limit,
         sources=selected_sources,
         include_dev_sources=bool(args.include_dev_sources),
+        seen_path=(args.seen or "").strip() or None,
     )
     if args.verify_telegram:
         # Bounded parallel t.me verification so external stage completes well under stage_timeout

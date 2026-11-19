@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import time
 from typing import Any
 from urllib.parse import urlparse
 import urllib.request
@@ -208,11 +209,15 @@ def _slugify(value: str) -> str:
     return slug[:64] or "lead"
 
 
-def _rotate_for_day(items: tuple[str, ...], day: date, count: int) -> list[str]:
+_ACTIVE_RUN_CURSOR = 0
+
+
+def _rotate_for_day(items: tuple[str, ...], day: date, count: int, cursor: int | None = None) -> list[str]:
     total = len(items)
     if not total or count <= 0:
         return []
-    start = (day.toordinal() * count) % total
+    eff_cursor = _ACTIVE_RUN_CURSOR if cursor is None else int(cursor)
+    start = ((day.toordinal() + max(0, eff_cursor)) * count) % total
     return [items[(start + i) % total] for i in range(min(count, total))]
 
 
@@ -241,7 +246,7 @@ def _unwrap_search_results(payload: Any) -> list[dict[str, Any]]:
 def _default_web_search(query: str) -> dict[str, Any] | None:
     if not check_treg_ready():
         return None
-    return treg_call("crawl4ai.web.search", query={"q": query}, timeout=35)
+    return treg_call("crawl4ai.web.search", query={"q": query}, timeout=20)
 
 
 def _is_noise_brand(brand: str) -> bool:
@@ -2027,10 +2032,25 @@ def collect_producthunt_detailed(
     return rows, current
 
 
-def _save_seen(path: Path, seen: dict[str, str]) -> None:
+def _load_cursor(path: Path) -> int:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return max(0, int(raw.get("cursor") or 0))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return 0
+
+
+def _save_seen(path: Path, seen: dict[str, str], *, cursor: int | None = None) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"items": seen}, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload: dict[str, Any] = {"items": seen}
+        if cursor is not None:
+            payload["cursor"] = max(0, int(cursor))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
     except OSError:
         pass
 
@@ -2041,70 +2061,65 @@ def collect_all_veins(
     seen: dict[str, str] | None = None,
     limit: int = 24,
     veins: tuple[str, ...] = ("whop", "tiktok_ads", "tiktok_shop"),
+    cursor: int = 0,
+    max_runtime_sec: float = 180.0,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    global _ACTIVE_RUN_CURSOR
     today = day or date.today()
     merged_seen = fresh_seen(seen or {}, today)
     all_rows: list[dict[str, Any]] = []
 
-    vein_set = {v.strip().lower() for v in veins if v.strip()}
-    per_vein_cap = max(2, min(6, limit // max(1, len(vein_set)) + 1))
+    ordered_veins = [v.strip().lower() for v in veins if v.strip()]
+    if len(ordered_veins) > 1 and cursor > 0:
+        shift = int(cursor) % len(ordered_veins)
+        ordered_veins = ordered_veins[shift:] + ordered_veins[:shift]
 
-    if "d2c_whatsapp" in vein_set and len(all_rows) < limit:
-        d_rows, merged_seen = collect_d2c_whatsapp_brands(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[10],
-        )
-        all_rows.extend(d_rows)
-    if "whop" in vein_set and len(all_rows) < limit:
-        w_rows, merged_seen = collect_whop_content_rewards(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[10],
-        )
-        all_rows.extend(w_rows)
-    if "tiktok_ads" in vein_set and len(all_rows) < limit:
-        t_rows, merged_seen = collect_tiktok_creative_ads(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[10],
-        )
-        all_rows.extend(t_rows)
-    if "tiktok_shop" in vein_set and len(all_rows) < limit:
-        s_rows, merged_seen = collect_tiktok_shop_brands(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[10],
-        )
-        all_rows.extend(s_rows)
-    if "app_stores" in vein_set and len(all_rows) < limit:
-        a_rows, merged_seen = collect_scaling_store_apps(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[10],
-        )
-        all_rows.extend(a_rows)
-    if "ats_hiring" in vein_set and len(all_rows) < limit:
-        h_rows, merged_seen = collect_ats_ugc_hiring(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[10],
-        )
-        all_rows.extend(h_rows)
-    if "ph_detailed" in vein_set and len(all_rows) < limit:
-        p_rows, merged_seen = collect_producthunt_detailed(
-            limit=min(per_vein_cap, limit - len(all_rows)),
-            day=today,
-            seen=merged_seen,
-            call_budget=[8],
-        )
-        all_rows.extend(p_rows)
+    per_vein_cap = max(2, min(6, limit // max(1, len(ordered_veins)) + 1))
+    deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
+
+    vein_runners: dict[str, Any] = {
+        "d2c_whatsapp": lambda rem, cur_seen: collect_d2c_whatsapp_brands(
+            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+        ),
+        "whop": lambda rem, cur_seen: collect_whop_content_rewards(
+            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+        ),
+        "tiktok_ads": lambda rem, cur_seen: collect_tiktok_creative_ads(
+            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+        ),
+        "tiktok_shop": lambda rem, cur_seen: collect_tiktok_shop_brands(
+            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+        ),
+        "app_stores": lambda rem, cur_seen: collect_scaling_store_apps(
+            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+        ),
+        "ats_hiring": lambda rem, cur_seen: collect_ats_ugc_hiring(
+            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+        ),
+        "ph_detailed": lambda rem, cur_seen: collect_producthunt_detailed(
+            limit=rem, day=today, seen=cur_seen, call_budget=[6]
+        ),
+    }
+
+    prev_cursor = _ACTIVE_RUN_CURSOR
+    _ACTIVE_RUN_CURSOR = max(0, int(cursor))
+    try:
+        for v_name in ordered_veins:
+            if len(all_rows) >= limit:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            fn = vein_runners.get(v_name)
+            if fn is None:
+                continue
+            rem = min(per_vein_cap, limit - len(all_rows))
+            try:
+                v_rows, merged_seen = fn(rem, merged_seen)
+            except Exception:
+                v_rows = []
+            all_rows.extend(v_rows)
+    finally:
+        _ACTIVE_RUN_CURSOR = prev_cursor
 
     return all_rows[:limit], merged_seen
 
@@ -2116,17 +2131,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--limit", type=int, default=24)
     parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop,app_stores,ats_hiring,ph_detailed,d2c_whatsapp")
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
+    parser.add_argument("--max-runtime-sec", type=float, default=180.0)
     args = parser.parse_args(argv)
 
     day = date.fromisoformat(args.day) if args.day else date.today()
     seen_path = Path(args.seen)
     before = _load_seen(seen_path)
+    cursor = _load_cursor(seen_path)
     veins = tuple(v.strip() for v in args.veins.split(",") if v.strip())
     try:
-        rows, updated = collect_all_veins(day=day, seen=before, limit=max(0, args.limit), veins=veins)
+        rows, updated = collect_all_veins(
+            day=day,
+            seen=before,
+            limit=max(0, args.limit),
+            veins=veins,
+            cursor=cursor,
+            max_runtime_sec=float(args.max_runtime_sec),
+        )
     except Exception:
         rows, updated = [], before
-    _save_seen(seen_path, updated)
+    _save_seen(seen_path, updated, cursor=cursor + 1)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

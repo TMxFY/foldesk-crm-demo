@@ -558,7 +558,10 @@ def build_lead_payload_from_dict(
     raw_our_angle = str(record.get("our_angle") or "").strip()
     raw_hook = str(record.get("hook") or "").strip()
     raw_first_touch = str(record.get("first_touch") or record.get("step1_text") or "").strip()
-    source = str(record.get("lead_source") or record.get("source") or "leadgen").strip()
+    raw_source = str(record.get("lead_source") or record.get("source") or "").strip()
+    if not raw_source and record.get("group"):
+        raw_source = "tg_groups"
+    source = raw_source or "leadgen"
 
     username_raw = str(
         record.get("username")

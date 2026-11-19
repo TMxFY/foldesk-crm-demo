@@ -17,9 +17,30 @@ import sys
 from pathlib import Path
 from typing import Any
 
+def _ensure_safe_ssl_cert_env() -> None:
+    """Populate SSL_CERT_FILE when unset so httpx2 avoids Linux truststore C-layer races."""
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return
+    try:
+        import certifi  # type: ignore
+
+        ca_path = certifi.where()
+        if ca_path and os.path.isfile(ca_path):
+            os.environ["SSL_CERT_FILE"] = ca_path
+            return
+    except Exception:
+        pass
+    for cand in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.isfile(cand):
+            os.environ["SSL_CERT_FILE"] = cand
+            return
+
+
+_ensure_safe_ssl_cert_env()
+
 for _vendor_cand in ("/opt/crmtg/vendor/typesafe-sdk", "/Users/timofei/.codex/vendor/typesafe-sdk"):
     if os.path.isdir(_vendor_cand) and _vendor_cand not in sys.path:
-        sys.path.insert(0, _vendor_cand)
+        sys.path.append(_vendor_cand)
 
 try:
     from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul
@@ -28,7 +49,7 @@ except Exception:  # SDK is optional at runtime.
 
 MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
 ENABLED = os.getenv("TYPESAFE_ENABLED", "1").lower() not in {"0", "false", "no"}
-CONCURRENCY = max(1, int(os.getenv("TYPESAFE_CONCURRENCY", "16")))
+CONCURRENCY = max(1, min(6, int(os.getenv("TYPESAFE_CONCURRENCY", "4"))))
 _DEFAULT_STATE_DIR = os.getenv("LEADGEN_STATE_DIR") or "data/leadgen_state"
 CREATOR_CACHE = Path(os.getenv("TYPESAFE_CREATOR_CACHE", os.path.join(_DEFAULT_STATE_DIR, "typesafe_qualify_cache.json")))
 FOREX_CACHE = Path(os.getenv("TYPESAFE_FOREX_CACHE", "data/typesafe_channel_cache.json"))
@@ -148,9 +169,9 @@ async def qualify_creator_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
         if not state.get("source"):
             state["source"] = row.get("group") or ""
         states.append((_key(state), state, {"questions": {
-            "fit": Noul(instructions="Is this a buyer for short-form user acquisition: a founder, owner, marketing/growth lead, or creator with a real product? High for an AI SaaS, consumer app, Shopify/D2C e-commerce brand (skincare, cosmetics, supplements), fintech, prop firm, or any product that is naturally advertised with TikTok/Reels/Shorts. A public owner of a shipped product or verified D2C store with an explicit X, LinkedIn, or WhatsApp business contact counts even when the bio is short or technical. The source chat and sample message are context, not proof. Return low for a pure retail trader, signal caller, investor, job seeker, UGC freelancer with no product, visa/relocation chatter, local classifieds, clinic/salon, OTC, spammer, or empty profile."),
+            "fit": Noul(instructions="Is this a buyer for short-form user acquisition: a founder, owner, marketing/growth lead, or a real monetized B2C/prosumer product discovered via ads/stores/launches whose decision-maker will be contacted? High for an AI SaaS, consumer subscription app (language learning, note taker, astrology, fitness, productivity, flashcards), Shopify/D2C e-commerce brand (skincare, cosmetics, supplements), fintech, prop firm, or mobile/gaming product naturally advertised with TikTok/Reels/Shorts — including active Meta Ads / App Store / YC / Whop product rows that do not yet carry a personal Telegram username. The source chat and sample message are context, not proof. Return low for agencies, consultancies, pure B2D developer CLIs/SDKs, robotics/industrial hardware, universities, non-profits, pure retail traders, signal callers, investors, job seekers, UGC freelancers with no product, visa/relocation chatter, local classifieds, clinic/salon, OTC, spammer, or empty profile."),
             "category": Choice(instructions="Which category best describes the person's actual product/project?", criteria={x: None for x in categories}),
-            "role": Choice(instructions="Which role best describes this person in relation to the product/project? Treat the public owner/maintainer of a shipped product with a direct social profile, or an official brand/Shopify store contact without a separate personal bio, as Founder when no stronger evidence says otherwise; do not label them Dev or Other only because the project is technical or store-facing.", criteria={x: None for x in roles}),
+            "role": Choice(instructions="Which role best describes this person in relation to the product/project? Treat the public owner/maintainer of a shipped product with a direct social profile, or an official brand/Meta Ads/App Store/Shopify/YC product entry without a separate personal bio, as Founder or Marketing when no stronger evidence says otherwise; do not label them Dev or Other only because the project is technical or brand-facing.", criteria={x: None for x in roles}),
         }, "parse": lambda r: {
             "typesafe_fit": _prob(_answer(r, "fit")),
             "typesafe_category": _choice(_answer(r, "category")),
