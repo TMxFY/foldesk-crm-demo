@@ -1668,9 +1668,16 @@ export function useInboxStore() {
   }, [loadInboxList, selectDialog, upsertDialogsBatch]);
 
   const selectedMessages = selectedDialogId != null ? messagesByDialog[selectedDialogId] || [] : [];
-  const selectedLeadCard = selectedLead?.id != null ? cardsByLeadId[selectedLead.id] || selectedLead : null;
-  const selectedProfileKey = selectedDialog ? `${selectedDialog.id}:${selectedDialog.lead_id ?? selectedLead?.id ?? "none"}` : "";
+  const selectedProfileKey = selectedDialog
+    ? `${selectedDialog.id}:${selectedDialog.lead_id ?? selectedLead?.id ?? "none"}`
+    : "";
   const selectedProfile = selectedProfileKey ? profilesByKey[selectedProfileKey] || null : null;
+  const resolvedLeadId =
+    selectedLead?.id ?? selectedDialog?.lead_id ?? selectedProfile?.lead?.id ?? null;
+  const selectedLeadCard =
+    resolvedLeadId != null
+      ? cardsByLeadId[Number(resolvedLeadId)] || selectedProfile?.lead || selectedLead || null
+      : selectedProfile?.lead || null;
 
   const hasDraftForDialog = useCallback(
     (d: DialogItem): boolean => {

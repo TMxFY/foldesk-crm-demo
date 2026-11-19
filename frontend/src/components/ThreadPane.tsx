@@ -445,7 +445,7 @@ export function ThreadPane({
         snippet.body,
         selectedDialog,
         selectedLead,
-        leads[0] || null,
+        selectedDialog ? null : leads[0] || null,
       );
       setComposerText(rendered);
       if (selectedDialog && !editingMessage) {
