@@ -909,6 +909,56 @@ if bare_except_actual > bare_except_ceiling:
         f"Gate S violation: bare except/pass count grew from {bare_except_ceiling} to {bare_except_actual}"
     )
 
+# Gate T: Unified Inbox v2 React Bundle, Template Host, Modern Web CSS & SW Cache Contract
+if (root / "app" / "inbox.py").is_file() or idx_path.is_file() or (root / "frontend").is_dir():
+    req_t_files = (
+        root / "frontend" / "package.json",
+        root / "frontend" / "tsconfig.json",
+        root / "app" / "static" / "inbox-v2" / "inbox-v2.js",
+        root / "app" / "static" / "inbox-v2" / "inbox-v2.css",
+        root / "app" / "static" / "sw-inbox.js",
+    )
+    for req_tf in req_t_files:
+        if not req_tf.is_file():
+            errors.append(f"Gate T violation: missing required file {req_tf.relative_to(root)}")
+
+    if main_py_file.is_file():
+        ms_t = main_py_file.read_text(encoding="utf-8")
+        for route_tok in ("/sw-inbox.js", "/api/dialogs/switch-account", "/api/inbox/unified", "group_by_lead"):
+            if route_tok not in ms_t:
+                errors.append(f"Gate T violation in app/main.py: missing unified inbox route/param '{route_tok}'")
+
+    if idx_path.is_file():
+        for html_tok in ('id="inbox-v2-host"', "inbox-v2.css", "inbox-v2.js", "/sw-inbox.js"):
+            if html_tok not in idx_html:
+                errors.append(f"Gate T violation in app/templates/index.html: missing '{html_tok}'")
+
+    v2_css_file = root / "app" / "static" / "inbox-v2" / "inbox-v2.css"
+    v2_js_file = root / "app" / "static" / "inbox-v2" / "inbox-v2.js"
+    if v2_css_file.is_file():
+        v2_css_src = v2_css_file.read_text(encoding="utf-8")
+        if re.search(r"figtree", v2_css_src, flags=re.IGNORECASE):
+            errors.append("Gate T violation in app/static/inbox-v2/inbox-v2.css: forbidden font 'Figtree'")
+        if not re.search(r"@supports\s*\(\s*position-area\s*:", v2_css_src):
+            errors.append("Gate T violation in app/static/inbox-v2/inbox-v2.css: missing '@supports (position-area:' anchor positioning")
+        if not re.search(r"\.dialog-row-deferred[^}]*content-visibility\s*:\s*auto", v2_css_src):
+            errors.append("Gate T violation in app/static/inbox-v2/inbox-v2.css: missing '.dialog-row-deferred { ... content-visibility: auto }'")
+        if not re.search(r"scrollbar-color\s*:", v2_css_src):
+            errors.append("Gate T violation in app/static/inbox-v2/inbox-v2.css: missing 'scrollbar-color'")
+
+    if v2_js_file.is_file():
+        v2_js_src = v2_js_file.read_text(encoding="utf-8")
+        if re.search(r"figtree", v2_js_src, flags=re.IGNORECASE):
+            errors.append("Gate T violation in app/static/inbox-v2/inbox-v2.js: forbidden font 'Figtree'")
+
+    fe_src_dir = root / "frontend" / "src"
+    if fe_src_dir.is_dir():
+        for fe_file in sorted(fe_src_dir.rglob("*")):
+            if not fe_file.is_file() or fe_file.suffix not in (".ts", ".tsx", ".css"):
+                continue
+            if re.search(r"figtree", fe_file.read_text(encoding="utf-8"), flags=re.IGNORECASE):
+                errors.append(f"Gate T violation in {fe_file.relative_to(root)}: forbidden font 'Figtree'")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
@@ -916,10 +966,20 @@ if errors:
 print("Static AST & Sacred Rules invariants OK.")
 PY
 
-echo "== [2/4] Frontend JS syntax check =="
+echo "== [2/4] Frontend JS syntax & TypeScript check =="
 if command -v node >/dev/null 2>&1; then
   node --check app/static/app.js
-  echo "app/static/app.js syntax OK."
+  if [ -f "app/static/sw-inbox.js" ]; then
+    node --check app/static/sw-inbox.js
+  fi
+  if [ -f "app/static/inbox-v2/inbox-v2.js" ]; then
+    node --check app/static/inbox-v2/inbox-v2.js
+  fi
+  echo "Frontend JS syntax OK."
+  if [ -d "$ROOT_DIR/frontend/node_modules" ] && command -v npx >/dev/null 2>&1; then
+    npx --prefix "$ROOT_DIR/frontend" tsc -p "$ROOT_DIR/frontend/tsconfig.json" --noEmit
+    echo "frontend TypeScript check OK."
+  fi
 fi
 
 echo "== [3/4] Design, launch & CLI smoke gates =="
