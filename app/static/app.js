@@ -125,6 +125,7 @@ const initialViewMode = (workspaceMain && workspaceMain.dataset.viewMode) || "al
 
 const state = {
   mode: "crm",
+  searchMode: "crm",
   scope: "open",
   viewMode: initialViewMode,
   activeSheet: (workspaceMain && workspaceMain.dataset.activeSheet) || "leads",
@@ -140,6 +141,9 @@ const state = {
   dialogs: [],
   allDialogs: [],
   allDialogsLoaded: false,
+  workspaceTotalDialogs: null,
+  canonicalWaitingCount: null,
+  crmSearchServerApplied: false,
   inboxCounts: null,
   messages: [],
   dialogQuery: "",
@@ -149,6 +153,11 @@ const state = {
   inboxChatMode: "crm",
   inboxChatModeExplicit: false,
   inboxSessionFilter: "all",
+  leadgenHealth: null,
+  directXLeads: [],
+  outreachScheduleLoaded: false,
+  calendarLoaded: false,
+  crmPropsLoaded: false,
   selectedDialog: null,
   replyToMessage: null,
   editingMessage: null,
@@ -376,15 +385,9 @@ function syncSheetVisibility() {
   const outreachCampaignsPane = document.querySelector("#outreach-campaigns-pane");
   const outreachAccountsPane = document.querySelector("#outreach-accounts-pane");
   const leads = document.querySelector("#leads");
-  const opsGrid = document.querySelector(".ops-grid");
   const digest = document.querySelector("#digest");
   const accounts = document.querySelector("#accounts");
-  const s11 = document.querySelector("#s11");
-  const leadgenSec = document.querySelector("#leadgen");
-  const toolPhones = document.querySelector("#tool-phones");
-  const toolParser = document.querySelector("#tool-parser");
   const crmProps = document.querySelector("#crm-properties");
-  const aiBot = document.querySelector("#ai-bot");
   const calendarSec = document.querySelector("#calendar");
   const analyticsSec = document.querySelector("#analytics");
   const funnelSec = document.querySelector("#funnel");
@@ -418,18 +421,20 @@ function syncSheetVisibility() {
       leads.hidden = false;
       leads.removeAttribute("data-popup-only");
     }
-    if (opsGrid) opsGrid.hidden = true;
     if (digest) digest.hidden = true;
     if (accounts) accounts.hidden = false;
-    if (s11) s11.hidden = true;
     if (calendarSec) calendarSec.hidden = active !== "calendar";
     if (analyticsSec) analyticsSec.hidden = false;
-    if (leadgenSec) leadgenSec.hidden = true;
-    if (toolPhones) toolPhones.hidden = true;
-    if (toolParser) toolParser.hidden = true;
     if (crmProps) crmProps.hidden = active !== "crm-properties";
-    if (aiBot) aiBot.hidden = true;
     if (funnelSec) funnelSec.hidden = true;
+    if (active === "calendar" && !state.calendarLoaded) {
+      state.calendarLoaded = true;
+      loadCalendar().catch(() => {});
+    }
+    if (active === "crm-properties" && !state.crmPropsLoaded) {
+      state.crmPropsLoaded = true;
+      loadCrmProperties().catch(() => {});
+    }
     return;
   }
 
@@ -464,14 +469,8 @@ function syncSheetVisibility() {
     }
   }
 
-  if (opsGrid) opsGrid.hidden = true;
   if (digest) digest.hidden = true;
-  if (s11) s11.hidden = true;
-  if (leadgenSec) leadgenSec.hidden = true;
-  if (toolPhones) toolPhones.hidden = true;
-  if (toolParser) toolParser.hidden = true;
   if (crmProps) crmProps.hidden = active !== "crm-properties";
-  if (aiBot) aiBot.hidden = true;
   if (calendarSec) calendarSec.hidden = active !== "calendar";
   if (analyticsSec) analyticsSec.hidden = active !== "analytics";
   if (funnelSec) funnelSec.hidden = true;
@@ -481,9 +480,20 @@ function syncSheetVisibility() {
   }
   if (typeof syncBulkHostContainer === "function") syncBulkHostContainer();
 
-  if (active === "inbox") {
-    const connected = (state.accounts || []).filter((account) => account.status === "connected");
-    syncTelegramWebAPanel(connected);
+  if (active === "calendar" && !state.calendarLoaded) {
+    state.calendarLoaded = true;
+    loadCalendar().catch(() => {});
+  }
+  if (active === "crm-properties" && !state.crmPropsLoaded) {
+    state.crmPropsLoaded = true;
+    loadCrmProperties().catch(() => {});
+  }
+  if (active === "outreach") {
+    if (!state.outreachScheduleLoaded) {
+      state.outreachScheduleLoaded = true;
+      loadOutreachSchedule().catch(() => {});
+    }
+    loadLeadgenHealthSummary().catch(() => {});
   }
 
   const activeNode = active === "inbox" ? messengerGrid : (showLeads && leadsSub === "kanban" ? s07 : document.querySelector(`#${active}`));
@@ -1081,7 +1091,15 @@ function resolveLeadTracking(lead) {
   const nextStepStr = String(lead.next_step || "");
   const offerTypeStr = String(lead.offer_type || "");
   const noteStr = String(lead.note || "");
-  const isWaitingOurAnswer = lastFromPeer === 1 || nextStepStr.startsWith("🔥");
+  const isClosedDeal = isLeadStatusClosed(lead && lead.status);
+  const explicitWaiting = lead && (lead.is_waiting_our_answer != null
+    ? lead.is_waiting_our_answer
+    : lead.waiting_our_answer);
+  const isWaitingOurAnswer = !isClosedDeal && (
+    explicitWaiting != null
+      ? Boolean(explicitWaiting)
+      : (lastFromPeer === 1 || nextStepStr.startsWith("🔥"))
+  );
   const isPositiveReply = offerTypeStr.includes("+ Позитив") || nextStepStr.includes("+ Позитив") || noteStr.includes("+ Позитив");
   return {
     accountName,
@@ -1330,6 +1348,27 @@ function shortProxyLabel(account) {
   }
 }
 
+const CLOSED_DEAL_STATUSES = new Set(["lost", "won", "on_hold", "archived"]);
+
+function isLeadStatusClosed(status) {
+  return CLOSED_DEAL_STATUSES.has(String(status || "").trim().toLowerCase());
+}
+
+function isAccountPoolActive(account) {
+  if (!account || account.status !== "connected") return false;
+  const h = String(account.health || "active").trim().toLowerCase();
+  return h === "" || h === "active" || h === "ok";
+}
+
+function syncQuickWaitingCount(fallbackCount = 0) {
+  const quickCountEl = document.querySelector("#quick-waiting-count");
+  if (!quickCountEl) return;
+  const resolved = state.canonicalWaitingCount != null
+    ? Number(state.canonicalWaitingCount)
+    : Number(fallbackCount || 0);
+  quickCountEl.textContent = String(resolved);
+}
+
 function renderAccounts() {
   const list = document.querySelector("#account-list");
   const accountsSection = document.querySelector("#accounts");
@@ -1337,17 +1376,18 @@ function renderAccounts() {
   const purgeBtn = document.querySelector("#purge-dead-accounts-btn");
   list.replaceChildren();
   const connected = state.accounts.filter((account) => account.status === "connected");
-  const deadAccounts = state.accounts.filter(
-    (account) => account.status !== "connected" || ["unauthorized", "banned", "frozen"].includes(String(account.health || "")),
-  );
+  const activePoolAccounts = state.accounts.filter(isAccountPoolActive);
+  const deadAccounts = state.accounts.filter((account) => !isAccountPoolActive(account));
   const accTabCount = document.querySelector("#outreach-accounts-count");
   if (accTabCount) {
     accTabCount.textContent = String(state.accounts.length);
   }
   const disconnectedCount = deadAccounts.length;
-  const totalDailyPool = connected.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
+  const totalDailyPool = activePoolAccounts.reduce((sum, acc) => sum + (Number(acc.daily_limit) || 20), 0);
   if (summaryBar) {
-    summaryBar.textContent = `Подключено: ${connected.length} · Не подключено: ${disconnectedCount} · Суточный пул: ${totalDailyPool} сообщ./сут`;
+    summaryBar.textContent = `Активных: ${activePoolAccounts.length} · Неактивных: ${disconnectedCount} · Суточный пул: ${totalDailyPool} сообщ./сут`;
+    summaryBar.dataset.activeCount = String(activePoolAccounts.length);
+    summaryBar.dataset.dailyPool = String(totalDailyPool);
   }
   if (purgeBtn) {
     purgeBtn.hidden = deadAccounts.length === 0;
@@ -1393,6 +1433,18 @@ function renderAccounts() {
       account.status !== "connected" ? el("span", { className: `badge ${pair[1]}` }, [pair[0]]) : null,
       proxyShort !== "Auto" ? el("span", { className: "badge b-new", title: proxyFull }, [proxyShort]) : null,
     ].filter(Boolean);
+    const rawProxyMode = String(account.proxy_mode || "").trim().toLowerCase();
+    const isRotatingNodeMaven = rawProxyMode === "rotating_nodemaven"
+      || (!rawProxyMode && proxyFull.toLowerCase().includes("nodemaven"));
+    if (isRotatingNodeMaven) {
+      badgeChildren.push(
+        el("span", {
+          className: "badge b-wait proxy-mode-badge",
+          "data-proxy-mode": "rotating_nodemaven",
+          title: "Ротируемый NodeMaven прокси может вызывать обрывы сессии — рекомендуется статический ISP",
+        }, ["NodeMaven rotating · рек. static ISP"]),
+      );
+    }
     if (account.health && account.health !== "ok") {
       const healthPair = ACCOUNT_HEALTH[account.health] || [account.health, "b-off"];
       badgeChildren.push(el("span", { className: `badge ${healthPair[1]}` }, [healthPair[0]]));
@@ -1454,31 +1506,12 @@ function renderAccounts() {
       actionsWrap.append(el("button", { type: "button", className: "btn primary sm", onclick: () => resumeLogin(account) }, [caption]));
     }
     if (account.status === "connected") {
-      if (account.tg_web_ready) {
-        actionsWrap.append(
-          el("button", {
-            type: "button",
-            className: "btn primary sm",
-            title: "Открыть Telegram Web (/a/)",
-            onclick: async () => {
-              state.inboxChatMode = "tgweb";
-              state.inboxChatModeExplicit = true;
-              await switchInboxSession(String(account.id));
-              activateSheet("inbox");
-              const panel = document.querySelector("#tg-web-a-panel");
-              if (panel && state.viewMode !== "sheet") panel.scrollIntoView({ block: "nearest" });
-            },
-          }, ["Web TG ↗"]),
-        );
-      }
       actionsWrap.append(
         el("button", {
           type: "button",
           className: "btn secondary sm",
           title: "Открыть диалоги в CRM",
           onclick: async () => {
-            state.inboxChatMode = "crm";
-            state.inboxChatModeExplicit = true;
             await switchInboxSession(String(account.id));
             activateSheet("inbox");
             const s04 = document.querySelector("#s04");
@@ -2451,7 +2484,9 @@ function renderFullCampaignCards(onlyCampaignId = null) {
     const attachedNames = attachedAccounts.map(
       (item) => formatCompactAccountName(item),
     );
-    const poolCapacity = attachedAccounts.reduce((sum, item) => sum + (Number(item.daily_limit) || 20), 0);
+    const poolCapacity = attachedAccounts
+      .filter(isAccountPoolActive)
+      .reduce((sum, item) => sum + (Number(item.daily_limit) || 20), 0);
     const poolSummaryLabel = attachedAccounts.length > 1
       ? `Пул: ${attachedAccounts.length} ${accountWord(attachedAccounts.length)} (${attachedNames.join(", ")})`
       : (attachedNames[0] || "Профиль не выбран");
@@ -2554,6 +2589,19 @@ function renderFullCampaignCards(onlyCampaignId = null) {
     const leadgenEnabled = Boolean(camp.leadgen_enabled);
     const leadgenQuota = Number(camp.leadgen_daily_quota ?? 20);
     const leadgenSourcesList = Array.isArray(camp.leadgen_sources) ? camp.leadgen_sources : ["tg_groups", "yc_ph", "meta_ads", "tg_ad_spy", "channel_graph"];
+    const campPendingCount = Number(camp.pending_count ?? camp.stats?.queued ?? 0);
+    const campHealthRow = (state.leadgenHealth && Array.isArray(state.leadgenHealth.campaigns))
+      ? state.leadgenHealth.campaigns.find((c) => Number(c.campaign_id ?? c.id) === Number(camp.id))
+      : null;
+    const isStarved = leadgenEnabled && camp.status === "running" && (
+      campPendingCount === 0 || Boolean(campHealthRow && campHealthRow.sources_exhausted)
+    );
+    const leadgenBadgeClass = !leadgenEnabled ? "b-off" : (isStarved ? "b-bad" : "b-won");
+    const leadgenBadgeText = !leadgenEnabled
+      ? "Лидген: ВЫКЛ"
+      : (isStarved
+        ? "0 pending · источники исчерпаны"
+        : `Лидген: ВКЛ · ${campPendingCount} в очереди · до ${leadgenQuota}/сут`);
 
     const badgeNodes = [
       ...channelBadges,
@@ -2565,11 +2613,10 @@ function renderFullCampaignCards(onlyCampaignId = null) {
           : `${sentToday} / ${dailyLimit} в сут`,
       ]),
       el("span", {
-        className: `badge ${leadgenEnabled ? "b-won" : "b-off"} campaign-leadgen-badge`,
+        className: `badge ${leadgenBadgeClass} campaign-leadgen-badge`,
         "data-leadgen-enabled": leadgenEnabled ? "true" : "false",
-      }, [
-        leadgenEnabled ? `Лидген: ВКЛ · до ${leadgenQuota} лидов/сут` : "Лидген: ВЫКЛ",
-      ]),
+        "data-leadgen-starved": isStarved ? "true" : "false",
+      }, [leadgenBadgeText]),
     ];
 
     const quickLimitStep = async (delta) => {
@@ -3012,7 +3059,9 @@ async function loadOperator() {
 async function loadAccounts() {
   state.accounts = await api("/api/accounts");
   renderAccounts();
-  await loadFolderList();
+  if (document.querySelector("#folder-account")) {
+    await loadFolderList();
+  }
 }
 
 function renderInboxSessionSwitcher() {
@@ -3063,168 +3112,6 @@ function renderInboxSessionSwitcher() {
       badge.textContent = found
         ? `Сессия: ${foundPrefix} · ${foundUname ? `@${foundUname}` : (found.telegram_name || found.phone)}`
         : "Активная сессия";
-    }
-  }
-  syncTelegramWebAPanel(connected);
-}
-
-function setInboxChatMode(mode) {
-  state.inboxChatMode = mode === "crm" ? "crm" : "tgweb";
-  state.inboxChatModeExplicit = true;
-  const connected = (state.accounts || []).filter((account) => account.status === "connected");
-  syncTelegramWebAPanel(connected);
-}
-
-function syncTelegramWebAPanel(connected) {
-  const panel = document.querySelector("#tg-web-a-panel");
-  const frameWrap = document.querySelector("#tg-web-a-frame-wrap");
-  const badge = document.querySelector("#tg-web-a-session-badge");
-  const pillsHost = document.querySelector("#tg-web-a-account-pills");
-  const extLink = document.querySelector("#tg-web-a-external-link");
-  const btnTgWeb = document.querySelector("#inbox-mode-tgweb");
-  const btnCrm = document.querySelector("#inbox-mode-crm");
-  if (!panel || !frameWrap) return;
-
-  const grid = document.querySelector(".messenger-grid");
-  const webReady = (connected || []).filter((acc) => Boolean(acc.tg_web_ready));
-  if (!webReady.length) {
-    [...frameWrap.querySelectorAll("iframe")].forEach((node) => {
-      try { node.src = "about:blank"; } catch (_e) {}
-      node.remove();
-    });
-    panel.hidden = true;
-    if (grid) grid.dataset.tgwebActive = "false";
-    return;
-  }
-
-  panel.hidden = true;
-  state.inboxChatMode = "crm";
-  const mode = "crm";
-  panel.dataset.chatMode = mode;
-  if (grid) grid.dataset.tgwebActive = mode === "tgweb" ? "true" : "false";
-  const snippetsBar = document.querySelector("#tg-web-snippets-bar");
-  if (snippetsBar) snippetsBar.hidden = mode === "crm";
-  if (pillsHost) pillsHost.hidden = mode === "crm";
-  const activeKey = String(state.inboxSessionFilter || "all");
-  const targetIdx = Math.max(0, webReady.findIndex((acc) => String(acc.id) === activeKey));
-  const target = webReady[targetIdx] || webReady[0];
-  const targetSlot = targetIdx + 1;
-  const targetUrl = targetSlot === 1
-    ? `/a/?account_id=${encodeURIComponent(String(target.id))}`
-    : `/a/?account=${targetSlot}&account_id=${encodeURIComponent(String(target.id))}`;
-
-  if (badge) {
-    const uname = target.telegram_username ? `@${target.telegram_username}` : target.phone;
-    const tname = target.telegram_name ? ` (${target.telegram_name})` : "";
-    badge.textContent = `Аккаунт #${targetSlot}: ${uname}${tname} · Онлайн`;
-  }
-  if (extLink) {
-    extLink.href = targetUrl;
-  }
-  if (pillsHost) {
-    pillsHost.replaceChildren();
-    webReady.forEach((acc, idx) => {
-      const slot = idx + 1;
-      const key = String(acc.id);
-      const isSelected = String(target.id) === key;
-      const uname = acc.telegram_username ? `@${acc.telegram_username}` : (acc.telegram_name || acc.phone);
-      const tabBtn = el("button", {
-        type: "button",
-        className: `tg-web-account-tab${isSelected ? " is-active" : ""}`,
-        "data-tgweb-account-id": key,
-        "data-tgweb-slot": String(slot),
-        "aria-pressed": isSelected ? "true" : "false",
-        title: `${acc.telegram_name || ""} ${uname}`.trim(),
-        onclick: () => {
-          switchInboxSession(key);
-        },
-      }, [
-        el("span", { className: "conn-dot", "data-conn": "ok", "aria-hidden": "true" }, []),
-        el("span", { className: "tg-web-tab-slot" }, [`#${slot}`]),
-        el("span", { className: "tg-web-tab-name" }, [uname]),
-      ]);
-      pillsHost.append(tabBtn);
-    });
-    const addAccBtn = el("button", {
-      type: "button",
-      className: "btn ghost sm tg-web-add-acc-btn",
-      title: "Подключить ещё один Telegram-аккаунт",
-      onclick: () => {
-        activateSheet("accounts");
-        switchAuthTab("phone");
-        openSheetPopup("login");
-        const phoneInput = document.querySelector("#phone");
-        if (phoneInput) phoneInput.focus();
-      },
-    }, ["+ Аккаунт"]);
-    const delAccBtn = el("button", {
-      type: "button",
-      id: "tg-web-delete-session-btn",
-      className: "btn ghost sm danger-text tg-web-del-acc-btn",
-      title: `Удалить сессию ${target.telegram_username ? `@${target.telegram_username}` : target.phone}`,
-      "aria-label": "Удалить текущую сессию",
-      onclick: (e) => deleteAccount(target, e.currentTarget),
-    }, ["✕ Удалить"]);
-    pillsHost.append(addAccBtn, delAccBtn);
-  }
-  if (btnTgWeb && btnCrm) {
-    btnTgWeb.className = mode === "tgweb" ? "btn secondary sm" : "btn ghost sm";
-    btnTgWeb.setAttribute("aria-pressed", mode === "tgweb" ? "true" : "false");
-    btnCrm.className = mode === "crm" ? "btn secondary sm" : "btn ghost sm";
-    btnCrm.setAttribute("aria-pressed", mode === "crm" ? "true" : "false");
-    if (!btnTgWeb.dataset.bound) {
-      btnTgWeb.dataset.bound = "1";
-      btnTgWeb.addEventListener("click", () => setInboxChatMode("tgweb"));
-    }
-    if (!btnCrm.dataset.bound) {
-      btnCrm.dataset.bound = "1";
-      btnCrm.addEventListener("click", () => setInboxChatMode("crm"));
-    }
-  }
-  frameWrap.hidden = mode === "crm";
-  if (mode !== "tgweb") {
-    [...frameWrap.querySelectorAll("iframe")].forEach((node) => {
-      try { node.src = "about:blank"; } catch (_e) {}
-      node.remove();
-    });
-  }
-
-  const inboxVisible = state.viewMode !== "sheet" || state.activeSheet === "inbox";
-  if (mode === "tgweb" && inboxVisible) {
-    const targetKey = String(target.id);
-    const placeholder = frameWrap.querySelector("iframe#tg-web-a-frame:not([data-account-id])");
-    if (placeholder) {
-      placeholder.dataset.accountId = targetKey;
-      placeholder.dataset.slot = String(targetSlot);
-    }
-
-    // Strictly 1 active iframe at a time: terminate background WebWorkers before switching shared localStorage
-    [...frameWrap.querySelectorAll("iframe")].forEach((node) => {
-      if (String(node.dataset.accountId || "") !== targetKey) {
-        try { node.src = "about:blank"; } catch (_e) {}
-        node.remove();
-      }
-    });
-
-    let accFrame = frameWrap.querySelector(`iframe[data-account-id="${targetKey}"]`);
-    if (!accFrame) {
-      accFrame = el("iframe", {
-        className: "tg-web-a-frame",
-        "data-account-id": targetKey,
-        "data-slot": String(targetSlot),
-        title: `Telegram Web A (${target.telegram_username || target.phone})`,
-        src: targetUrl,
-        allow: "clipboard-read; clipboard-write",
-      }, []);
-      accFrame.dataset.loadedUrl = targetUrl;
-      frameWrap.append(accFrame);
-    } else {
-      accFrame.hidden = false;
-      accFrame.dataset.slot = String(targetSlot);
-      if (accFrame.dataset.loadedUrl !== targetUrl) {
-        accFrame.dataset.loadedUrl = targetUrl;
-        accFrame.src = targetUrl;
-      }
     }
   }
 }
@@ -3279,10 +3166,9 @@ async function switchInboxSession(sessionKey) {
 }
 
 const INBOX_CHIP_LABELS = {
-  waiting: "Ждёт ответа",
-  our_turn: "Ждём ответа от лида",
+  waiting: "Ждут ответа",
+  our_turn: "Ждём лида",
   unread: "Непрочитанные",
-  groups: "Группы",
   muted: "Без звука",
 };
 
@@ -3293,9 +3179,17 @@ function chipOn(name) {
 
 function activeInboxChips() {
   return [...document.querySelectorAll("#s04 [data-chip]")]
-    .filter((btn) => btn.getAttribute("aria-pressed") === "true")
+    .filter((btn) => !btn.hidden && btn.getAttribute("aria-pressed") === "true")
     .map((btn) => btn.dataset.chip)
     .filter(Boolean);
+}
+
+function syncChipNote() {
+  const note = document.querySelector("#chip-note");
+  if (!note) return;
+  const inTelegramSearch = state.searchMode === "telegram" && Boolean(String(state.dialogQuery || "").trim());
+  const hasChip = activeInboxChips().length > 0;
+  note.hidden = !(inTelegramSearch && hasChip);
 }
 
 function matchesInboxSessionFilter(dialog) {
@@ -3306,21 +3200,29 @@ function matchesInboxSessionFilter(dialog) {
   return true;
 }
 
+function isDialogWaitingOurAnswer(dialog) {
+  if (!dialog) return false;
+  const linkedLead = leadForDialog(dialog);
+  const rawStatus = (linkedLead && linkedLead.status) || dialog.lead_status || "";
+  if (isLeadStatusClosed(rawStatus)) return false;
+  if (dialog.waiting_our_answer != null) return Boolean(dialog.waiting_our_answer);
+  return Number(dialog.last_from_peer || 0) === 1 || Boolean(dialog.waiting) || Boolean(dialog.last_from_other);
+}
+
 function dialogCountFlags(dialog) {
   if (!dialog) {
-    return { waiting: false, our_turn: false, unread: false, groups: false, muted: false };
+    return { waiting: false, our_turn: false, unread: false, muted: false };
   }
   return {
-    waiting: Number(dialog.last_from_peer || 0) === 1 || Boolean(dialog.waiting) || Boolean(dialog.last_from_other),
+    waiting: isDialogWaitingOurAnswer(dialog),
     our_turn: Number(dialog.last_from_peer || 0) === 0,
     unread: Number(dialog.unread_count || 0) > 0,
-    groups: dialog.peer_type === "group" || dialog.peer_type === "chat" || Boolean(dialog.is_group),
     muted: Boolean(dialog.muted),
   };
 }
 
 function computeLocalInboxCounts(dialogs) {
-  const counts = { waiting: 0, our_turn: 0, unread: 0, groups: 0, muted: 0 };
+  const counts = { waiting: 0, our_turn: 0, unread: 0, muted: 0 };
   (Array.isArray(dialogs) ? dialogs : []).forEach((dialog) => {
     if (!matchesInboxSessionFilter(dialog)) return;
     const flags = dialogCountFlags(dialog);
@@ -3334,10 +3236,21 @@ function computeLocalInboxCounts(dialogs) {
 function applyInboxCountsFromResponse(res) {
   const connectedCount = (state.accounts || []).filter((acc) => acc.status === "connected").length;
   const useAll = state.inboxSessionFilter === "all" && connectedCount > 1;
-  if (res && useAll && res.all_counts) {
-    state.inboxCounts = { ...res.all_counts };
-  } else if (res && res.counts) {
-    state.inboxCounts = { ...res.counts };
+  const incoming = (res && useAll && res.all_counts)
+    ? { ...res.all_counts }
+    : ((res && res.counts) ? { ...res.counts } : null);
+  if (incoming) {
+    if (incoming.waiting_active != null) {
+      incoming.waiting = Number(incoming.waiting_active);
+    } else if (state.allDialogsLoaded && Array.isArray(state.allDialogs) && state.allDialogs.length) {
+      incoming.waiting = computeLocalInboxCounts(state.allDialogs).waiting;
+    }
+    state.inboxCounts = incoming;
+  }
+  if (res && res.workspace_total_dialogs != null) {
+    state.workspaceTotalDialogs = Number(res.workspace_total_dialogs);
+  } else if (res && res.total_dialogs != null && state.inboxSessionFilter === "all") {
+    state.workspaceTotalDialogs = Number(res.total_dialogs);
   }
   renderInboxChipCounts();
 }
@@ -3366,6 +3279,9 @@ function renderInboxChipCounts(explicitCounts = null) {
     if (!button) return;
     const val = Number(counts && counts[key] != null ? counts[key] : 0) || 0;
     button.dataset.count = String(val);
+    if (key === "muted") {
+      button.hidden = val === 0 && button.getAttribute("aria-pressed") !== "true";
+    }
     button.replaceChildren(
       `${label} (`,
       el("span", { className: "chip-count", "data-chip-count": key }, [String(val)]),
@@ -3378,8 +3294,9 @@ function passChips(dialog) {
   if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
     if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
   }
-  const searchRaw = String(state.inboxSearchQuery || state.dialogQuery || "").trim().toLowerCase();
-  if (searchRaw) {
+  const isTelegramServerSearch = state.searchMode === "telegram" && Boolean(String(state.dialogQuery || "").trim());
+  const searchRaw = isTelegramServerSearch ? "" : String(state.inboxSearchQuery || "").trim().toLowerCase();
+  if (searchRaw && !state.crmSearchServerApplied) {
     const cleanQ = searchRaw.replace(/^@/, "");
     const linkedLead = leadForDialog(dialog);
     const haystack = [
@@ -3410,10 +3327,9 @@ function passChips(dialog) {
   ) {
     return true;
   }
-  if (chipOn("waiting") && !(Number(dialog.last_from_peer || 0) === 1 || Boolean(dialog.waiting) || Boolean(dialog.last_from_other))) return false;
+  if (chipOn("waiting") && !isDialogWaitingOurAnswer(dialog)) return false;
   if (chipOn("our_turn") && !(Number(dialog.last_from_peer || 0) === 0)) return false;
   if (chipOn("unread") && !(Number(dialog.unread_count || 0) > 0)) return false;
-  if (chipOn("groups") && dialog.peer_type !== "group" && dialog.peer_type !== "chat" && !dialog.is_group) return false;
   if (chipOn("muted") && !dialog.muted) return false;
   return true;
 }
@@ -3452,12 +3368,12 @@ function renderDialogs() {
       ])
       : null;
     let statusBadge = null;
-    if (Number(dialog.last_from_peer) === 1) {
-      statusBadge = el("span", { className: "badge b-ok dialog-turn-badge" }, ["Клиент ответил"]);
+    if (isDialogWaitingOurAnswer(dialog)) {
+      statusBadge = el("span", { className: "badge b-ok dialog-turn-badge" }, ["Ждёт ответа"]);
     } else if (Number(dialog.last_from_peer) === 0 && dialog.last_message_at) {
       const shortTime = formatShortTime(dialog.last_message_at);
       statusBadge = el("span", { className: "badge b-off dialog-turn-badge" }, [
-        shortTime ? `Вы писали · ${shortTime}` : "Вы писали",
+        shortTime ? `Ждём лида · ${shortTime}` : "Ждём лида",
       ]);
     }
     const dialogLead = leadForDialog(dialog);
@@ -4049,6 +3965,35 @@ function renderThread() {
       leadId: lead ? lead.id : null,
     }),
   }, ["👤 Профиль"]);
+  const cleanUname = String(dialog.username || (lead && lead.username) || "").trim().replace(/^@+/, "");
+  const cleanPhoneDigits = String(dialog.phone || (lead && lead.phone) || "").replace(/\D+/g, "");
+  const numericPeerId = dialog.peer_id || dialog.telegram_user_id || (lead && lead.telegram_user_id) || "";
+  let tgDeepHref = "https://t.me/";
+  let tgFallbackHref = "https://t.me/";
+  let tgOpenLabel = "Открыть в Telegram ↗";
+  if (provider === "whatsapp" && cleanPhoneDigits) {
+    tgDeepHref = `https://wa.me/${cleanPhoneDigits}`;
+    tgFallbackHref = tgDeepHref;
+    tgOpenLabel = "Открыть в WhatsApp ↗";
+  } else if (cleanUname) {
+    tgDeepHref = `tg://resolve?domain=${encodeURIComponent(cleanUname)}`;
+    tgFallbackHref = `https://t.me/${encodeURIComponent(cleanUname)}`;
+  } else if (cleanPhoneDigits) {
+    tgDeepHref = `tg://resolve?phone=${encodeURIComponent(cleanPhoneDigits)}`;
+    tgFallbackHref = `https://t.me/+${encodeURIComponent(cleanPhoneDigits)}`;
+  } else if (numericPeerId) {
+    tgDeepHref = `tg://openmessage?user_id=${encodeURIComponent(String(numericPeerId))}`;
+    tgFallbackHref = `https://web.telegram.org/a/#${encodeURIComponent(String(numericPeerId))}`;
+  }
+  const openInTelegramBtn = el("a", {
+    id: "thread-open-tg-btn",
+    className: "btn secondary sm thread-open-tg-btn",
+    href: tgDeepHref,
+    "data-fallback-url": tgFallbackHref,
+    target: "_blank",
+    rel: "noreferrer noopener",
+    title: cleanUname ? `Открыть @${cleanUname} в Telegram` : "Открыть диалог в Telegram",
+  }, [tgOpenLabel]);
   const titleGroup = el("div", {
     className: "thread-title-group thread-title-trigger",
     title: "Открыть полный профиль клиента",
@@ -4067,6 +4012,7 @@ function renderThread() {
     el("div", { className: "thread-head-meta row" }, [
       el("p", { className: "hint" }, [`С аккаунта ${ownerAccLabel}`]),
       el("p", { className: "hint" }, [contactHint]),
+      openInTelegramBtn,
       clientProfileBtn,
       dealPopupBtn,
     ]),
@@ -4971,7 +4917,14 @@ function updateWorkspaceStats(opts = {}) {
   const leadsNode = document.querySelector("#stat-leads");
   if (leadsNode) leadsNode.textContent = String(leadCount);
   const dialogsNode = document.querySelector("#stat-dialogs");
-  if (dialogsNode) dialogsNode.textContent = String((state.dialogs || []).length);
+  if (dialogsNode) {
+    const stableTotal = state.workspaceTotalDialogs != null
+      ? Number(state.workspaceTotalDialogs)
+      : (Array.isArray(state.allDialogs) && state.allDialogs.length
+        ? state.allDialogs.length
+        : (state.dialogs || []).length);
+    dialogsNode.textContent = String(stableTotal);
+  }
   const campNode = document.querySelector("#stat-campaigns");
   if (campNode) campNode.textContent = String((state.campaigns || []).length);
   const remNode = document.querySelector("#stat-reminders");
@@ -5054,7 +5007,7 @@ function renderBoard() {
   setBoardKpi("#analytics-kpi-won-sub", `${wonLeadsCount} выиграно · всего ${totalLeadsCount}`);
   setBoardKpi("#analytics-kpi-win-rate", boardWinRate);
   setBoardKpi("#analytics-kpi-win-rate-sub", `Общий объём: ${boardTotalVal}`);
-  setBoardKpi("#quick-waiting-count", String(waitingCount));
+  syncQuickWaitingCount(waitingCount);
 
   const counterStrip = document.querySelector("#pipeline-counter-strip");
   if (counterStrip) {
@@ -5629,6 +5582,10 @@ function reminderCard(reminder) {
 
 function renderReminders() {
   const host = document.querySelector("#reminder-list");
+  if (!host) {
+    updateWorkspaceStats();
+    return;
+  }
   host.replaceChildren();
   const groups = [
     ["overdue", "Просрочено", "late"],
@@ -5907,8 +5864,14 @@ function upsertDialog(dialog) {
   state.dialogs = sortDialogsByRecency(state.dialogs);
   if (Array.isArray(state.allDialogs)) {
     const allIdx = state.allDialogs.findIndex((row) => isSameDialog(row, mergedDialog));
-    if (allIdx >= 0) state.allDialogs[allIdx] = mergedDialog;
-    else state.allDialogs.unshift(mergedDialog);
+    if (allIdx >= 0) {
+      state.allDialogs[allIdx] = mergedDialog;
+    } else {
+      state.allDialogs.unshift(mergedDialog);
+      if (state.workspaceTotalDialogs != null) {
+        state.workspaceTotalDialogs = Number(state.workspaceTotalDialogs) + 1;
+      }
+    }
     state.allDialogs = sortDialogsByRecency(state.allDialogs);
   }
   if (state.allDialogsLoaded && Array.isArray(state.allDialogs) && state.allDialogs.length < 2000) {
@@ -5963,10 +5926,23 @@ function openInboxLive(accountId) {
     }
     setInboxLive(ok);
   });
-  source.addEventListener("snapshot", (event) => {
-    if (inboxSource !== source || state.dialogQuery) return;
+  source.addEventListener("meta", (event) => {
+    if (inboxSource !== source) return;
     try {
-      const rows = JSON.parse(event.data);
+      const meta = JSON.parse(event.data);
+      if (meta && meta.workspace_total_dialogs != null) {
+        state.workspaceTotalDialogs = Number(meta.workspace_total_dialogs);
+        updateWorkspaceStats({ refreshAnalytics: false });
+      }
+    } catch (_err) { /* ignore malformed meta */ }
+  });
+  source.addEventListener("snapshot", (event) => {
+    if (inboxSource !== source || state.dialogQuery || String(state.inboxSearchQuery || "").trim()) return;
+    try {
+      const parsed = JSON.parse(event.data);
+      const rows = Array.isArray(parsed)
+        ? parsed
+        : (parsed && Array.isArray(parsed.dialogs) ? parsed.dialogs : null);
       if (!Array.isArray(rows)) return;
       const sanitizedRows = sortDialogsByRecency(rows.map((row) => {
         if (!row || row.id == null) return row;
@@ -5981,6 +5957,11 @@ function openInboxLive(accountId) {
         }
         return row;
       }));
+      if (parsed && !Array.isArray(parsed) && parsed.workspace_total_dialogs != null) {
+        state.workspaceTotalDialogs = Number(parsed.workspace_total_dialogs);
+      } else if (state.inboxSessionFilter === "all" && (id === "0" || (state.accounts || []).filter((a) => a.status === "connected").length <= 1)) {
+        state.workspaceTotalDialogs = sanitizedRows.length;
+      }
       state.allDialogs = [...sanitizedRows];
       state.allDialogsLoaded = sanitizedRows.length < 2000;
       if (state.allDialogsLoaded) {
@@ -6019,57 +6000,96 @@ function openInboxLive(accountId) {
   });
 }
 
-async function loadInbox() {
+async function loadInbox(opts = {}) {
   const select = document.querySelector("#tg-account");
-  if (!select.value) {
+  const connected = (state.accounts || []).filter((acc) => acc.status === "connected");
+  if (!select || (!select.value && !connected.length)) {
     ++inboxListLoadToken;
     ++inboxCountSyncToken;
     state.dialogs = [];
     state.allDialogs = [];
     state.allDialogsLoaded = false;
-    state.inboxCounts = { waiting: 0, our_turn: 0, unread: 0, groups: 0, muted: 0 };
+    state.workspaceTotalDialogs = 0;
+    state.inboxCounts = { waiting: 0, our_turn: 0, unread: 0, muted: 0 };
     state.inbox = "empty";
     state.dialogQuery = "";
+    state.crmSearchServerApplied = false;
+    syncChipNote();
     renderDialogs();
     closeInboxLive();
     return;
   }
   const listToken = ++inboxListLoadToken;
   const syncToken = ++inboxCountSyncToken;
-  const connectedCount = (state.accounts || []).filter((acc) => acc.status === "connected").length;
+  const connectedCount = connected.length;
   const targetAccountId = (state.inboxSessionFilter === "all" && connectedCount > 1)
     ? "0"
-    : select.value;
+    : (state.inboxSessionFilter !== "all" ? String(state.inboxSessionFilter) : (select.value || "0"));
   const activeChips = activeInboxChips().join(",");
+  const effectiveQuery = opts && opts.query != null
+    ? String(opts.query).trim()
+    : String(state.inboxSearchQuery || "").trim();
   const qs = new URLSearchParams({ account_id: String(targetAccountId), with_counts: "1", crm_only: "1" });
   if (activeChips) qs.set("chip", activeChips);
+  if (effectiveQuery) qs.set("q", effectiveQuery);
   const res = await api(`/api/inbox?${qs.toString()}`);
   if (listToken !== inboxListLoadToken) return;
   const dialogs = sortDialogsByRecency(
     Array.isArray(res) ? res : (res && Array.isArray(res.dialogs) ? res.dialogs : []),
   );
+  const resolvedTotal = res && !Array.isArray(res)
+    ? (res.workspace_total_dialogs ?? res.total_dialogs ?? null)
+    : null;
+  if (resolvedTotal != null) {
+    state.workspaceTotalDialogs = Number(resolvedTotal);
+  } else if (state.inboxSessionFilter === "all" && !activeChips && !effectiveQuery) {
+    state.workspaceTotalDialogs = dialogs.length;
+  }
   if (syncToken === inboxCountSyncToken) {
+    const allUnfiltered = state.inboxSessionFilter === "all" && !activeChips && !effectiveQuery;
+    const localPool = allUnfiltered
+      ? dialogs
+      : (state.allDialogsLoaded && Array.isArray(state.allDialogs) && state.allDialogs.length ? state.allDialogs : null);
+    const localAdjusted = localPool ? computeLocalInboxCounts(localPool) : null;
     if (res && res.counts && typeof res.counts === "object") {
-      state.inboxCounts = res.counts;
+      state.inboxCounts = {
+        ...res.counts,
+        waiting: (res.counts.waiting_active != null
+          ? Number(res.counts.waiting_active)
+          : (localAdjusted ? localAdjusted.waiting : Number(res.counts.waiting || 0))),
+      };
     } else {
-      state.inboxCounts = computeLocalInboxCounts(dialogs);
+      state.inboxCounts = localAdjusted || computeLocalInboxCounts(dialogs);
+    }
+    if (allUnfiltered && state.inboxCounts && state.inboxCounts.waiting != null && state.canonicalWaitingCount == null) {
+      state.canonicalWaitingCount = Number(state.inboxCounts.waiting);
     }
   }
-  if (!activeChips) {
+  if (!activeChips && !effectiveQuery) {
     state.allDialogs = [...dialogs];
     state.allDialogsLoaded = dialogs.length < 2000;
   }
+  state.crmSearchServerApplied = Boolean(
+    effectiveQuery && res && !Array.isArray(res) && (res.q_applied === true || res.search_applied === true),
+  );
   state.dialogs = dialogs;
   state.dialogQuery = "";
   state.inbox = "filled";
+  syncChipNote();
   renderDialogs();
   openInboxLive(targetAccountId);
 }
 
 async function searchTelegram(query) {
   const select = document.querySelector("#tg-account");
-  state.dialogQuery = query || "";
-  if (!select.value) {
+  const connected = (state.accounts || []).filter((acc) => acc.status === "connected");
+  state.mode = "telegram";
+  state.searchMode = "telegram";
+  state.dialogQuery = String(query || "").trim();
+  state.inboxSearchQuery = "";
+  state.crmSearchServerApplied = false;
+  syncChipNote();
+  if (!connected.length && (!select || !select.value)) {
     state.dialogs = [];
     state.inbox = "error";
     document.querySelector("#inbox-error").textContent = "Нет подключённого аккаунта";
@@ -6078,9 +6098,22 @@ async function searchTelegram(query) {
   }
   setView("#inbox-view", "loading");
   state.inbox = "loading";
-  const dialogs = await api(`/api/accounts/${select.value}/dialogs?q=${encodeURIComponent(query || "")}&crm_only=1`);
-  state.dialogs = dialogs;
+  const targetAccId = state.inboxSessionFilter === "all"
+    ? "0"
+    : String(state.inboxSessionFilter || (select && select.value) || "0");
+  let dialogs;
+  try {
+    dialogs = await api(`/api/accounts/${encodeURIComponent(targetAccId)}/dialogs?q=${encodeURIComponent(state.dialogQuery)}&crm_only=1`);
+  } catch (err) {
+    if (targetAccId === "0" && select && select.value) {
+      dialogs = await api(`/api/accounts/${encodeURIComponent(select.value)}/dialogs?q=${encodeURIComponent(state.dialogQuery)}&crm_only=1`);
+    } else {
+      throw err;
+    }
+  }
+  state.dialogs = Array.isArray(dialogs) ? dialogs : (dialogs && Array.isArray(dialogs.dialogs) ? dialogs.dialogs : []);
   state.inbox = "filled";
+  syncChipNote();
   renderDialogs();
 }
 
@@ -6549,25 +6582,51 @@ document.querySelector("#tg-account").addEventListener("change", (event) => {
   });
 });
 
+let crmSearchDebounceTimer = 0;
+
 document.querySelector("#search-mode").addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
   state.mode = button.dataset.mode;
+  state.searchMode = state.mode;
   press(document.querySelector("#search-mode"), "data-mode", state.mode);
   const telegram = state.mode === "telegram";
   if (telegram && state.inboxSearchQuery) {
     state.inboxSearchQuery = "";
-    renderDialogs();
+    state.crmSearchServerApplied = false;
+  } else if (!telegram && state.dialogQuery) {
+    state.dialogQuery = "";
+    loadInbox({ query: state.inboxSearchQuery }).catch(() => {});
   }
+  syncChipNote();
+  renderDialogs();
   document.querySelectorAll(".tg-only").forEach((item) => { item.hidden = !telegram; });
 });
 
 document.querySelector("#q").addEventListener("input", (event) => {
-  document.querySelector("#search-form").dataset.typing = event.target.value ? "true" : "false";
+  const val = String(event.target.value || "");
+  document.querySelector("#search-form").dataset.typing = val ? "true" : "false";
+  if (state.mode !== "telegram") {
+    state.inboxSearchQuery = val;
+    state.crmSearchServerApplied = false;
+    syncChipNote();
+    if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") {
+      renderDialogs();
+    }
+    window.clearTimeout(crmSearchDebounceTimer);
+    crmSearchDebounceTimer = window.setTimeout(() => {
+      loadInbox({ query: val }).catch(() => {});
+    }, 220);
+  } else if (!val.trim() && state.dialogQuery) {
+    state.dialogQuery = "";
+    syncChipNote();
+    loadInbox().catch(() => {});
+  }
 });
 
 document.querySelector("#search-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  window.clearTimeout(crmSearchDebounceTimer);
   showError(null);
   const query = String(new FormData(event.target).get("q") || "");
   const button = event.target.querySelector("button[type=submit]");
@@ -6575,27 +6634,23 @@ document.querySelector("#search-form").addEventListener("submit", async (event) 
   button.setAttribute("aria-busy", "true");
   try {
     if (state.mode === "telegram") {
+      state.searchMode = "telegram";
       state.inboxSearchQuery = "";
+      state.crmSearchServerApplied = false;
       await searchTelegram(query);
     } else {
+      state.searchMode = "crm";
       state.inboxSearchQuery = query;
-      if (state.dialogQuery && Array.isArray(state.allDialogs) && state.allDialogs.length) {
-        state.dialogs = [...state.allDialogs];
-        state.dialogQuery = "";
-      }
-      await loadLeads(query);
-      renderDialogs();
+      state.crmSearchServerApplied = false;
+      state.dialogQuery = "";
+      syncChipNote();
+      await loadInbox({ query });
     }
   } catch (error) {
-    if (state.mode === "telegram") {
-      state.inbox = "error";
-      document.querySelector("#inbox-error").textContent = error.message;
-      setView("#inbox-view", "error");
-    } else {
-      failRegion("#leads-view", "#leads-error", error);
-      document.querySelector("#board-error").textContent = error.message;
-      setView("#board-view", "error");
-    }
+    state.inbox = "error";
+    const errNode = document.querySelector("#inbox-error");
+    if (errNode) errNode.textContent = error.message;
+    setView("#inbox-view", "error");
     toast(error.message, "error");
   } finally {
     button.disabled = false;
@@ -6617,28 +6672,33 @@ document.querySelector(".chips").addEventListener("click", async (event) => {
     const other = document.querySelector('#s04 [data-chip="waiting"]');
     if (other) other.setAttribute("aria-pressed", "false");
   }
-  const any = [...document.querySelectorAll("[data-chip]")].some((item) => item.getAttribute("aria-pressed") === "true");
-  document.querySelector("#chip-note").hidden = !any;
+  syncChipNote();
   if (!state.dialogQuery) {
     if (Array.isArray(state.allDialogs) && state.allDialogs.length) {
       state.dialogs = [...state.allDialogs];
     }
     if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") renderDialogs();
     try {
-      await loadInbox();
+      await loadInbox({ query: state.inboxSearchQuery });
     } catch (_err) { /* оставляем локальную фильтрацию */ }
   } else if (state.inbox !== "empty" && state.inbox !== "error" && state.inbox !== "loading") {
     renderDialogs();
   }
 });
 
-document.querySelector("#folder-account").addEventListener("change", () => {
-  loadFolderList();
-});
+const folderAccountSel = document.querySelector("#folder-account");
+if (folderAccountSel) {
+  folderAccountSel.addEventListener("change", () => {
+    loadFolderList();
+  });
+}
 
-document.querySelector("#folders-refresh").addEventListener("click", () => {
-  pullFolders();
-});
+const foldersRefreshBtn = document.querySelector("#folders-refresh");
+if (foldersRefreshBtn) {
+  foldersRefreshBtn.addEventListener("click", () => {
+    pullFolders();
+  });
+}
 
 const foldersSyncAllBtn = document.querySelector("#folders-sync-all");
 if (foldersSyncAllBtn) {
@@ -7185,21 +7245,27 @@ async function sendDigest() {
   }
 }
 
-document.querySelector("#digest-send").addEventListener("click", () => {
-  sendDigest();
-});
+const digestSendBtn = document.querySelector("#digest-send");
+if (digestSendBtn) {
+  digestSendBtn.addEventListener("click", () => {
+    sendDigest();
+  });
+}
 
-document.querySelector("#reminder-scopes").addEventListener("click", async (event) => {
-  const button = event.target.closest("button");
-  if (!button) return;
-  state.scope = button.dataset.scope;
-  press(document.querySelector("#reminder-scopes"), "data-scope", state.scope);
-  try {
-    await loadReminders();
-  } catch (error) {
-    failRegion("#digest-view", "#digest-error", error);
-  }
-});
+const reminderScopesEl = document.querySelector("#reminder-scopes");
+if (reminderScopesEl) {
+  reminderScopesEl.addEventListener("click", async (event) => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    state.scope = button.dataset.scope;
+    press(reminderScopesEl, "data-scope", state.scope);
+    try {
+      await loadReminders();
+    } catch (error) {
+      failRegion("#digest-view", "#digest-error", error);
+    }
+  });
+}
 
 document.querySelector("#stage-filter").addEventListener("change", () => {
   document.querySelector("#saved-view").value = "";
@@ -8155,6 +8221,10 @@ async function loadOutreachSchedule() {
 const openScheduleBtn = document.querySelector("#outreach-open-schedule-btn");
 if (openScheduleBtn) {
   openScheduleBtn.addEventListener("click", () => {
+    if (!state.outreachScheduleLoaded) {
+      state.outreachScheduleLoaded = true;
+      loadOutreachSchedule().catch(() => {});
+    }
     renderScheduleDays();
     openSheetPopup("schedule");
     if (state.viewMode !== "sheet") {
@@ -9163,10 +9233,10 @@ function buildDeepOutreachNode(deepData, hostPrefix) {
   const stalledItems = Array.isArray(deepData.stalled_items) ? deepData.stalled_items : [];
   const positiveItems = Array.isArray(deepData.positive_items) ? deepData.positive_items : [];
 
-  const quickCountEl = document.querySelector("#quick-waiting-count");
-  if (quickCountEl && s.waiting_our_answer != null) {
-    quickCountEl.textContent = String(s.waiting_our_answer);
+  if (s.waiting_our_answer != null) {
+    state.canonicalWaitingCount = Number(s.waiting_our_answer);
   }
+  syncQuickWaitingCount(s.waiting_our_answer || 0);
 
   // 1. Summary KPI Card (strictly SSOT from API, zero hardcoded figures)
   const kpiCard = el("div", { className: "surface-subcard stack" }, [
@@ -9932,7 +10002,6 @@ async function boot() {
     try {
       await loadAccounts();
       if (mySeq !== bootSeq) return;
-      loadPipelineFolders().catch(() => {});
     } catch (error) {
       if (mySeq !== bootSeq) return;
       failRegion("#accounts-view", "#accounts-error", error);
@@ -9967,9 +10036,21 @@ async function boot() {
       await loadCampaigns();
     } catch (_error) { /* рассылки могут загрузиться позже */ }
     if (mySeq !== bootSeq) return;
-    loadOutreachSchedule().catch(() => {});
-    loadCrmProperties().catch(() => {});
-    loadAiBotConfig().catch(() => {});
+    if (state.activeSheet === "outreach" || state.viewMode !== "sheet") {
+      if (!state.outreachScheduleLoaded) {
+        state.outreachScheduleLoaded = true;
+        loadOutreachSchedule().catch(() => {});
+      }
+      loadLeadgenHealthSummary().catch(() => {});
+    }
+    if (state.activeSheet === "calendar" && !state.calendarLoaded) {
+      state.calendarLoaded = true;
+      loadCalendar().catch(() => {});
+    }
+    if (state.activeSheet === "crm-properties" && !state.crmPropsLoaded) {
+      state.crmPropsLoaded = true;
+      loadCrmProperties().catch(() => {});
+    }
     await loadSnippets();
     if (mySeq !== bootSeq) return;
     await loadAnalyticsSummary();
@@ -9988,20 +10069,9 @@ async function boot() {
       renderBoard();
     }
     if (mySeq !== bootSeq) return;
-    const focusRefreshBtn = document.querySelector("#focus-today-refresh");
-    if (focusRefreshBtn && !focusRefreshBtn.dataset.bound) {
-      focusRefreshBtn.dataset.bound = "1";
-      focusRefreshBtn.addEventListener("click", () => {
-        loadFocusToday().then(() => toast("Фокус на сегодня обновлён", "ok"));
-      });
-    }
-    await loadFocusToday();
-    if (mySeq !== bootSeq) return;
     updateWorkspaceStats({ refreshAnalytics: false });
     loadAirtableStatus().catch(() => {});
     loadMcpInfo().catch(() => {});
-    loadCalendar().catch(() => {});
-    loadLeadgenConfig().catch(() => {});
     loadCrmAuthStatus().catch(() => {});
     if (window.location.hash === "#login" || window.location.hash === "#auth") {
       const authModal = document.querySelector("#crm-auth-modal");
@@ -13591,6 +13661,20 @@ function buildCampaignCellCard(campaign) {
     .map((r) => [r.name, r.username ? `@${r.username}` : "", r.company, r.website, r.error_text, r.step1_text].filter(Boolean).join(" "))
     .join(" | ");
 
+  const leadgenEnabled = Boolean(campaign.leadgen_enabled);
+  const campHealthRow = (state.leadgenHealth && Array.isArray(state.leadgenHealth.campaigns))
+    ? state.leadgenHealth.campaigns.find((c) => Number(c.campaign_id ?? c.id) === Number(campaign.id))
+    : null;
+  const isLeadgenStarved = leadgenEnabled && campaign.status === "running" && (
+    st.queued === 0 || Boolean(campHealthRow && campHealthRow.sources_exhausted)
+  );
+  const leadgenCellBadge = leadgenEnabled
+    ? el("span", {
+      className: `badge ${isLeadgenStarved ? "b-bad" : "b-won"} campaign-leadgen-badge`,
+      "data-leadgen-starved": isLeadgenStarved ? "true" : "false",
+    }, [isLeadgenStarved ? "0 pending · источники исчерпаны" : `Лидген: ${st.queued} в очереди`])
+    : null;
+
   return el("article", { className: "campaign-card campaign-cell", "data-campaign-id": String(campaign.id) }, [
     el("div", { className: "campaign-cell-head" }, [
       el("div", { className: "campaign-cell-title-wrap" }, [
@@ -13599,7 +13683,8 @@ function buildCampaignCellCard(campaign) {
       el("div", { className: "campaign-cell-badges" }, [
         ...channelBadges,
         el("span", { className: `badge ${st.badgeClass}` }, [st.badgeLabel]),
-      ]),
+        leadgenCellBadge,
+      ].filter(Boolean)),
     ]),
     el("div", { className: "campaign-cell-metrics" }, [
       el("div", { className: "campaign-cell-metric" }, [
@@ -13750,7 +13835,254 @@ function renderOutreachCampaigns() {
 }
 
 function renderCampaigns() {
+  renderLeadgenHealthStrip();
   return renderOutreachCampaigns();
+}
+
+/* =========================================================================
+ * Leadgen Health Strip & Direct X Leads Drawer (inside Рассылки)
+ * ========================================================================= */
+function buildFallbackLeadgenHealthFromCampaigns() {
+  const camps = (state.campaigns || [])
+    .filter((c) => Boolean(c.leadgen_enabled) || String(c.status || "").toLowerCase() === "running")
+    .map((c) => {
+      const pending = Number(c.pending_count ?? c.stats?.queued ?? 0);
+      const isRunning = String(c.status || "").toLowerCase() === "running";
+      return {
+        campaign_id: c.id,
+        name: c.name,
+        status: c.status,
+        leadgen_enabled: Boolean(c.leadgen_enabled),
+        pending,
+        ingested_24h: Number(c.ingested_24h ?? 0),
+        sources_exhausted: Boolean(c.sources_exhausted || (isRunning && Boolean(c.leadgen_enabled) && pending === 0)),
+        low_water_alert: Boolean(isRunning && Boolean(c.leadgen_enabled) && pending < 15),
+      };
+    });
+  return {
+    campaigns: camps,
+    last_run: null,
+    direct_x_leads: Array.isArray(state.directXLeads) ? state.directXLeads : [],
+    direct_x_count: Array.isArray(state.directXLeads) ? state.directXLeads.length : 0,
+    _fallback: true,
+  };
+}
+
+function renderLeadgenHealthStrip() {
+  const strip = document.querySelector("#leadgen-health-strip");
+  const runBadge = document.querySelector("#leadgen-health-run-badge");
+  const campsHost = document.querySelector("#leadgen-health-campaigns");
+  const dxBtn = document.querySelector("#leadgen-direct-x-btn");
+  const dxCountEl = document.querySelector("#leadgen-direct-x-count");
+  if (!strip || !campsHost) return;
+
+  const data = state.leadgenHealth || buildFallbackLeadgenHealthFromCampaigns();
+  const campaigns = Array.isArray(data.campaigns) ? data.campaigns : [];
+  const lastRun = data.last_run || data.last_run_summary || null;
+  const dxItems = Array.isArray(data.direct_x_leads)
+    ? data.direct_x_leads
+    : (Array.isArray(state.directXLeads) ? state.directXLeads : []);
+  const dxCount = Number(data.direct_x_count ?? data.direct_x_leads_count ?? dxItems.length ?? 0);
+
+  if (dxCountEl) dxCountEl.textContent = String(dxCount);
+  if (dxBtn) {
+    dxBtn.hidden = dxCount === 0 && !data.direct_x_available;
+  }
+
+  const anyStarved = campaigns.some((c) => c.sources_exhausted || (Number(c.pending || 0) === 0 && c.leadgen_enabled && c.status === "running"));
+  if (runBadge) {
+    if (lastRun) {
+      const rc = lastRun.rc ?? lastRun.returncode ?? lastRun.exit_code ?? 0;
+      const stageErrs = Number(lastRun.stage_error_count ?? 0);
+      const runTime = lastRun.finished_at || lastRun.started_at || lastRun.updated_at || "";
+      const timeSuffix = runTime ? ` · ${formatShortTime(runTime)}` : "";
+      if (Number(rc) !== 0 || stageErrs > 0) {
+        runBadge.className = "badge b-bad";
+        runBadge.textContent = `Последний прогон: ошибка (rc=${rc}${stageErrs ? `, err=${stageErrs}` : ""})${timeSuffix}`;
+      } else if (anyStarved) {
+        runBadge.className = "badge b-wait";
+        runBadge.textContent = `Прогон OK (rc=0)${timeSuffix} · есть истощённые кампании`;
+      } else {
+        runBadge.className = "badge b-ok";
+        runBadge.textContent = `Последний прогон: OK (rc=0)${timeSuffix}`;
+      }
+    } else if (anyStarved) {
+      runBadge.className = "badge b-bad";
+      runBadge.textContent = "Источники исчерпаны";
+    } else {
+      runBadge.className = "badge b-new";
+      runBadge.textContent = campaigns.length ? "Активен" : "Нет авто-кампаний";
+    }
+  }
+
+  campsHost.replaceChildren();
+  if (!campaigns.length) {
+    campsHost.append(el("span", { className: "hint" }, ["Нет активных кампаний с авто-лидгеном"]));
+    return;
+  }
+
+  campaigns.forEach((c) => {
+    const pending = Number(c.pending ?? c.pending_count ?? 0);
+    const inflow24 = Number(c.ingested_24h ?? c.inflow_24h ?? 0);
+    const exhausted = Boolean(c.sources_exhausted) || (pending === 0 && Boolean(c.leadgen_enabled !== false) && String(c.status || "running") === "running");
+    const low = !exhausted && (Boolean(c.low_water_alert) || (pending > 0 && pending < 15 && Boolean(c.leadgen_enabled !== false)));
+    const stateCls = exhausted ? "is-starved" : (low ? "is-low" : "is-ok");
+    const statusText = exhausted
+      ? "0 pending · источники исчерпаны"
+      : (low ? `мало в очереди (${pending})` : "очередь в норме");
+    campsHost.append(
+      el("div", {
+        className: `leadgen-health-pill ${stateCls}`,
+        "data-health-campaign-id": String(c.campaign_id ?? c.id ?? ""),
+        "data-starved": exhausted ? "true" : "false",
+      }, [
+        el("span", { className: "leadgen-health-pill-name" }, [c.name || `Кампания #${c.campaign_id ?? c.id}`]),
+        el("span", { className: "leadgen-health-pill-metrics" }, [`pending: ${pending} · 24ч: +${inflow24}`]),
+        el("span", { className: "leadgen-health-pill-status" }, [statusText]),
+      ]),
+    );
+  });
+}
+
+async function loadLeadgenHealthSummary() {
+  try {
+    const res = await api("/api/leadgen/health-summary");
+    if (res && typeof res === "object") {
+      state.leadgenHealth = res;
+      if (Array.isArray(res.direct_x_leads)) {
+        state.directXLeads = res.direct_x_leads;
+      }
+      renderLeadgenHealthStrip();
+      renderOutreachCampaigns();
+      return res;
+    }
+  } catch (_err) {
+    state.leadgenHealth = buildFallbackLeadgenHealthFromCampaigns();
+    renderLeadgenHealthStrip();
+  }
+  return state.leadgenHealth;
+}
+
+function closeDirectXLeadsDrawer() {
+  const modal = document.querySelector("#direct-x-leads-modal");
+  if (modal) modal.hidden = true;
+}
+
+function downloadBlobFile(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportDirectXLeadsCsv(items) {
+  const cols = ["company", "name", "x_handle", "x_url", "website", "niche", "source", "reason"];
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = [cols.join(",")];
+  (items || []).forEach((it) => {
+    lines.push([
+      it.company || it.product || "",
+      it.name || it.founder || "",
+      it.x_handle || it.twitter || it.handle || "",
+      it.x_url || it.twitter_url || "",
+      it.website || it.url || "",
+      it.niche || it.category || "",
+      it.source || it.lead_source || "direct_x",
+      it.reason || it.hook || "",
+    ].map(esc).join(","));
+  });
+  downloadBlobFile("direct_x_leads.csv", lines.join("\n"), "text/csv;charset=utf-8");
+}
+
+function renderDirectXLeadsDrawerBody(items) {
+  const body = document.querySelector("#direct-x-leads-body");
+  const badge = document.querySelector("#direct-x-leads-drawer-badge");
+  const list = Array.isArray(items) ? items : [];
+  if (badge) badge.textContent = String(list.length);
+  if (!body) return;
+  if (!list.length) {
+    body.replaceChildren(el("p", { className: "hint empty-state" }, ["В пуле Direct X пока нет лидов."]));
+    return;
+  }
+  body.replaceChildren(
+    ...list.map((it) => {
+      const title = it.company || it.product || it.name || it.x_handle || "Лид";
+      const handleRaw = String(it.x_handle || it.twitter || it.handle || "").trim().replace(/^@+/, "");
+      const xHref = it.x_url || it.twitter_url || (handleRaw ? `https://x.com/${encodeURIComponent(handleRaw)}` : "");
+      const siteHref = it.website || it.url || "";
+      const links = [];
+      if (xHref) {
+        links.push(el("a", { href: safeHref(xHref) || xHref, target: "_blank", rel: "noreferrer noopener" }, [handleRaw ? `X: @${handleRaw} ↗` : "Профиль X ↗"]));
+      }
+      if (siteHref) {
+        links.push(el("a", { href: safeHref(siteHref) || siteHref, target: "_blank", rel: "noreferrer noopener" }, ["Сайт ↗"]));
+      }
+      return el("article", { className: "direct-x-lead-card" }, [
+        el("div", { className: "direct-x-lead-head" }, [
+          el("strong", {}, [title]),
+          el("span", { className: "badge b-new" }, [it.niche || it.category || it.source || "Direct X"]),
+        ]),
+        it.name && it.name !== title ? el("div", { className: "hint" }, [`Контакт: ${it.name}`]) : null,
+        it.hook || it.reason ? el("p", { className: "hint" }, [it.hook || it.reason]) : null,
+        links.length ? el("div", { className: "direct-x-lead-links" }, links) : null,
+      ].filter(Boolean));
+    }),
+  );
+}
+
+async function openDirectXLeadsDrawer() {
+  const modal = document.querySelector("#direct-x-leads-modal");
+  const body = document.querySelector("#direct-x-leads-body");
+  if (!modal || !body) return;
+  modal.hidden = false;
+  if (!state.directXLeads || !state.directXLeads.length) {
+    body.replaceChildren(el("p", { className: "hint" }, ["Загрузка Direct X лидов…"]));
+    try {
+      const res = await api("/api/leadgen/direct-x-leads");
+      state.directXLeads = Array.isArray(res) ? res : (res && Array.isArray(res.items) ? res.items : []);
+    } catch (_err) {
+      state.directXLeads = (state.leadgenHealth && Array.isArray(state.leadgenHealth.direct_x_leads))
+        ? state.leadgenHealth.direct_x_leads
+        : [];
+    }
+  }
+  renderDirectXLeadsDrawerBody(state.directXLeads);
+}
+
+const leadgenHealthRefreshBtn = document.querySelector("#leadgen-health-refresh-btn");
+if (leadgenHealthRefreshBtn) {
+  leadgenHealthRefreshBtn.addEventListener("click", () => {
+    loadLeadgenHealthSummary().then(() => toast("Статус лидгена обновлён", "ok"));
+  });
+}
+const leadgenDirectXBtn = document.querySelector("#leadgen-direct-x-btn");
+if (leadgenDirectXBtn) {
+  leadgenDirectXBtn.addEventListener("click", () => {
+    openDirectXLeadsDrawer();
+  });
+}
+const directXCloseBtn = document.querySelector("#direct-x-leads-close-btn");
+if (directXCloseBtn) directXCloseBtn.addEventListener("click", closeDirectXLeadsDrawer);
+const directXDismissBtn = document.querySelector("#direct-x-leads-dismiss");
+if (directXDismissBtn) directXDismissBtn.addEventListener("click", closeDirectXLeadsDrawer);
+const directXExportCsvBtn = document.querySelector("#direct-x-export-csv-btn");
+if (directXExportCsvBtn) {
+  directXExportCsvBtn.addEventListener("click", () => {
+    exportDirectXLeadsCsv(state.directXLeads || []);
+    toast("Direct X лиды экспортированы в CSV", "ok");
+  });
+}
+const directXExportJsonBtn = document.querySelector("#direct-x-export-json-btn");
+if (directXExportJsonBtn) {
+  directXExportJsonBtn.addEventListener("click", () => {
+    downloadBlobFile("direct_x_leads.json", JSON.stringify(state.directXLeads || [], null, 2), "application/json;charset=utf-8");
+    toast("Direct X лиды экспортированы в JSON", "ok");
+  });
 }
 
 function bindOutreachFilterEvents() {

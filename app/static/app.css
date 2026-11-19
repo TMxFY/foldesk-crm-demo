@@ -1,9 +1,9 @@
 * { box-sizing: border-box; }
 
 :root {
-  --text-xs: 13px;
-  --leading-xs: 18px;
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --text-xs: 12px;
+  --leading-xs: 16px;
+  --ease-out: cubic-bezier(0.24, 1, 0.4, 1);
   --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -84,7 +84,7 @@ body {
 
 :focus-visible {
   outline: var(--focus) solid var(--accent);
-  outline-offset: var(--focus);
+  outline-offset: var(--focus-offset, 3px);
 }
 
 [hidden] { display: none !important; }
@@ -7049,6 +7049,276 @@ body:has(.workspace[data-view-mode="sheet"]) .sidebar-footer {
     grid-template-columns: 1fr;
   }
 }
+
+/* =========================================================================
+ * Meta Astryx Phase 0 Design System Layer
+ * Neutral OKLCH hierarchy, Cyrillic Inter + JetBrains Mono,
+ * semantic inset focus rings, dark-mode Figma-style 1px white inset bezel,
+ * native-grade Inbox Thread Pane, and Leadgen Health Strip.
+ * ========================================================================= */
+
+body {
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  text-rendering: optimizeLegibility;
+}
+
+code,
+pre,
+.dialog-time-stamp,
+.msg-time,
+.limit-counter,
+.stat-chip strong,
+.campaign-cell-metric-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Dark-mode Figma-style 1px white inset bezel on elevated cards, panels, modals, popovers & composer */
+:root[data-theme="dark"] .surface-box,
+:root[data-theme="dark"] .topbar,
+:root[data-theme="dark"] .lead-card,
+:root[data-theme="dark"] .campaign-card,
+:root[data-theme="dark"] .account {
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.28), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+:root[data-theme="dark"] .surface-subcard,
+:root[data-theme="dark"] .reply-form,
+:root[data-theme="dark"] .client-profile-outreach-card,
+:root[data-theme="dark"] .client-profile-dialog-row,
+:root[data-theme="dark"] .client-profile-kpi {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+:root[data-theme="dark"] .modal,
+:root[data-theme="dark"] .client-profile-drawer,
+:root[data-theme="dark"] .mcp-modal-box,
+:root[data-theme="dark"] .toolbar-more-popover,
+:root[data-theme="dark"] .workspace[data-view-mode="sheet"][data-active-popup] [data-popup-box] {
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.62), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* Astryx subtle border + inset focus rings on form controls */
+input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+select,
+textarea {
+  border-color: var(--border);
+  transition: border-color var(--motion-fast) var(--ease), box-shadow var(--motion-fast) var(--ease), background var(--motion-fast) var(--ease);
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):hover,
+select:hover,
+textarea:hover {
+  border-color: var(--border-emphasized, var(--border-input));
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-inset-focus, inset 0 0 0 2px rgba(109, 156, 254, 0.55));
+  outline: none;
+}
+
+/* Astryx dense tactile buttons & chips */
+.btn {
+  border-radius: var(--radius-sm);
+  letter-spacing: -0.005em;
+  transition: background var(--motion-fast) var(--ease), border-color var(--motion-fast) var(--ease), color var(--motion-fast) var(--ease), transform var(--motion-fast) var(--ease);
+}
+
+.chip {
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
+  transition: background var(--motion-fast) var(--ease), border-color var(--motion-fast) var(--ease), color var(--motion-fast) var(--ease);
+}
+
+/* Polished Native-Grade Inbox Thread Pane (#s04 / #s05) */
+#s05.chat-pane {
+  display: flex;
+  flex-direction: column;
+}
+
+#s05 .thread-head {
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  border: var(--line) solid var(--border);
+  box-shadow: var(--bezel-low);
+}
+
+.thread-open-tg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  text-decoration: none;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.thread-open-tg-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#s05 .messages {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  border: var(--line) solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+#s05 .messages li {
+  border-radius: 14px 14px 14px 4px;
+  border: var(--line) solid var(--border);
+  box-shadow: var(--bezel-low);
+  line-height: 1.45;
+}
+
+#s05 .messages li.out {
+  border-radius: 14px 14px 4px 14px;
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+}
+
+#s05 .reply-form {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  border: var(--line) solid var(--border);
+}
+
+#s05 .reply-form textarea {
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+}
+
+/* Subtle amber proxy warning badge for NodeMaven rotating proxies */
+.proxy-mode-badge {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: var(--line) solid color-mix(in srgb, var(--warning) 45%, transparent);
+  font-weight: 600;
+}
+
+/* Leadgen Health Strip inside Рассылки */
+.leadgen-health-strip {
+  margin-bottom: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  gap: var(--space-2);
+}
+
+.leadgen-health-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.leadgen-health-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.leadgen-health-campaigns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.leadgen-health-pill {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: var(--line) solid var(--border);
+  box-shadow: var(--bezel-low);
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
+}
+
+.leadgen-health-pill.is-starved {
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+  color: var(--text);
+}
+
+.leadgen-health-pill.is-low {
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+  color: var(--text);
+}
+
+.leadgen-health-pill-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.leadgen-health-pill-metrics {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.leadgen-health-pill.is-starved .leadgen-health-pill-status {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.leadgen-health-pill.is-low .leadgen-health-pill-status {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.leadgen-health-pill.is-ok .leadgen-health-pill-status {
+  color: var(--success);
+  font-weight: 600;
+}
+
+/* Direct X Leads Drawer */
+.direct-x-lead-card {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  border: var(--line) solid var(--border);
+  box-shadow: var(--bezel-low);
+  display: grid;
+  gap: 6px;
+}
+
+.direct-x-lead-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.direct-x-lead-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: var(--text-xs);
+}
+
+.direct-x-lead-links a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.direct-x-lead-links a:hover {
+  text-decoration: underline;
+}
+
 
 
 
