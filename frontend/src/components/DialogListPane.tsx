@@ -237,7 +237,15 @@ export function DialogListPane({
             Аккаунт
             <select
               id="tg-account"
-              value={sessionFilter === "all" ? String(connectedAccounts[0]?.id || "") : sessionFilter}
+              value={
+                sessionFilter === "all"
+                  ? String(
+                      connectedAccounts.find((a) => normalizeProvider(a.provider) !== "whatsapp")?.id ||
+                        connectedAccounts[0]?.id ||
+                        "",
+                    )
+                  : sessionFilter
+              }
               onChange={(ev) => onSessionChange(ev.target.value || "all")}
             >
               {connectedAccounts.map((acc) => (

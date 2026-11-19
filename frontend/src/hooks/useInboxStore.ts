@@ -47,6 +47,7 @@ import {
   matchLeadForDialog,
   messageIdentityKey,
   normalizeDialogStamp,
+  normalizeProvider,
   sortDialogsByRecency,
 } from "../utils/format";
 import { draftKeyForDialog, listDraftKeysSnapshot, writeDraft } from "../utils/drafts";
@@ -134,6 +135,134 @@ function resolveCountsFromResponse(
     };
   }
   return computeLocalCounts(fallbackPool, sessionFilter, leads);
+}
+
+function unifiedGroupKey(dialog: DialogItem): string {
+  const provider = normalizeProvider(dialog.provider);
+  if (dialog.lead_id != null) {
+    return `${provider}:lead:${Number(dialog.lead_id)}`;
+  }
+  const peerId = dialog.peer_id ?? dialog.telegram_user_id;
+  if (peerId != null) {
+    return `${provider}:peer:${Number(peerId)}`;
+  }
+  const uname = String(dialog.username || "").trim().replace(/^@+/, "").toLowerCase();
+  if (uname) {
+    return `${provider}:uname:${uname}`;
+  }
+  return `${provider}:dlg:${Number(dialog.id)}`;
+}
+
+function findUnifiedPrimaryId(
+  dialogsById: Record<number, DialogItem>,
+  order: number[],
+  incoming: DialogItem,
+): number | null {
+  const dlgId = Number(incoming.id);
+  if (order.includes(dlgId) && dialogsById[dlgId]) {
+    return dlgId;
+  }
+  for (const primaryId of order) {
+    const primary = dialogsById[primaryId];
+    if (!primary) continue;
+    if (primary.peer_dialogs?.some((p) => Number(p.dialog_id) === dlgId)) {
+      return primaryId;
+    }
+  }
+  const targetKey = unifiedGroupKey(incoming);
+  for (const primaryId of order) {
+    const primary = dialogsById[primaryId];
+    if (!primary) continue;
+    if (unifiedGroupKey(primary) === targetKey) {
+      return primaryId;
+    }
+  }
+  return null;
+}
+
+function patchGroupWithRawDialog(
+  primaryRow: DialogItem,
+  incoming: DialogItem,
+  leads: LeadItem[],
+  pendingReadIds: Set<number>,
+): DialogItem {
+  const primaryId = Number(primaryRow.id);
+  const incomingId = Number(incoming.id);
+  const forcedZero = pendingReadIds.has(primaryId) || pendingReadIds.has(incomingId);
+  const effectiveUnread = forcedZero ? 0 : Number(incoming.unread_count ?? 0);
+
+  let base: DialogItem =
+    primaryId === incomingId
+      ? {
+          ...primaryRow,
+          ...incoming,
+          peer_dialogs:
+            Array.isArray(incoming.peer_dialogs) && incoming.peer_dialogs.length
+              ? incoming.peer_dialogs
+              : primaryRow.peer_dialogs,
+        }
+      : { ...primaryRow };
+
+  if (primaryId !== incomingId) {
+    const curStamp = normalizeDialogStamp(base.last_message_at);
+    const incStamp = normalizeDialogStamp(incoming.last_message_at);
+    if (incStamp && (!curStamp || incStamp >= curStamp)) {
+      base.last_message_at = incoming.last_message_at;
+      if (incoming.last_message_preview != null) {
+        base.last_message_preview = incoming.last_message_preview;
+      }
+      if (incoming.last_from_peer != null) base.last_from_peer = incoming.last_from_peer;
+    }
+    if (base.lead_id == null && incoming.lead_id != null) base.lead_id = incoming.lead_id;
+    if (!base.lead_status && incoming.lead_status) base.lead_status = incoming.lead_status;
+  }
+
+  const existingPeers = Array.isArray(base.peer_dialogs) ? base.peer_dialogs : [];
+  if (existingPeers.length > 0) {
+    let matchedPeer = false;
+    const nextPeers = existingPeers.map((p) => {
+      if (Number(p.dialog_id) === incomingId) {
+        matchedPeer = true;
+        return {
+          ...p,
+          unread_count: effectiveUnread,
+          last_message_at: incoming.last_message_at ?? p.last_message_at,
+          last_from_peer: incoming.last_from_peer ?? p.last_from_peer,
+          is_waiting_our_answer: incoming.is_waiting_our_answer ?? p.is_waiting_our_answer,
+        };
+      }
+      return p;
+    });
+    if (!matchedPeer && incomingId && incoming.account_id) {
+      nextPeers.push({
+        dialog_id: incomingId,
+        account_id: Number(incoming.account_id),
+        unread_count: effectiveUnread,
+        last_message_at: incoming.last_message_at,
+        last_from_peer: incoming.last_from_peer ?? undefined,
+        is_waiting_our_answer: incoming.is_waiting_our_answer ?? undefined,
+      });
+    }
+    const lead = matchLeadForDialog(base, leads);
+    const aggUnread = nextPeers.reduce((sum, p) => sum + Number(p.unread_count || 0), 0);
+    const anyWaiting = nextPeers.some(
+      (p) =>
+        Boolean(p.is_waiting_our_answer) ||
+        isDialogWaitingOurAnswer({ ...base, last_from_peer: p.last_from_peer }, lead),
+    );
+    base = {
+      ...base,
+      peer_dialogs: nextPeers,
+      unread_count: pendingReadIds.has(primaryId) ? 0 : aggUnread,
+      is_waiting_our_answer: anyWaiting,
+    };
+  } else if (primaryId === incomingId) {
+    const lead = matchLeadForDialog(base, leads);
+    base.unread_count = effectiveUnread;
+    base.is_waiting_our_answer =
+      incoming.is_waiting_our_answer ?? isDialogWaitingOurAnswer(base, lead);
+  }
+  return base;
 }
 
 function mergeMessageLists(existing: MessageItem[], incoming: MessageItem[]): MessageItem[] {
@@ -249,9 +378,19 @@ export function useInboxStore() {
   };
 
   const inboxFetchTokenRef = useRef(0);
+  const inboxLoadingRef = useRef(false);
   const dialogLoadTokenRef = useRef(0);
   const pendingReadIdsRef = useRef<Set<number>>(new Set());
   const sseRef = useRef<EventSource | null>(null);
+  const loadInboxListRef = useRef<
+    ((opts?: {
+      session?: string;
+      mode?: InboxMode;
+      chips?: ChipKey[];
+      q?: string;
+      silent?: boolean;
+    }) => Promise<DialogItem[]>) | null
+  >(null);
   const draftKeys = useMemo(() => listDraftKeysSnapshot(), [draftRevision, selectedDialogId]);
 
   const connectedAccounts = useMemo(
@@ -320,10 +459,16 @@ export function useInboxStore() {
       if (replaceList) {
         const nextIds = sorted.map((d) => Number(d.id));
         const curPinned = stateRef.current.pinnedDialogId;
+        const isCoveredByPeer =
+          curPinned != null &&
+          sorted.some((d) =>
+            d.peer_dialogs?.some((p) => Number(p.dialog_id) === Number(curPinned)),
+          );
         if (
           curPinned != null &&
           stateRef.current.selectedDialogId === curPinned &&
-          !nextIds.includes(Number(curPinned))
+          !nextIds.includes(Number(curPinned)) &&
+          !isCoveredByPeer
         ) {
           nextIds.unshift(Number(curPinned));
         }
@@ -346,7 +491,7 @@ export function useInboxStore() {
       chips?: ChipKey[];
       q?: string;
       silent?: boolean;
-    }) => {
+    }): Promise<DialogItem[]> => {
       const cur = stateRef.current;
       const effSession = opts?.session ?? cur.sessionFilter;
       const effMode = opts?.mode ?? cur.inboxMode;
@@ -360,10 +505,11 @@ export function useInboxStore() {
         setCounts(EMPTY_COUNTS);
         setInboxViewState("empty");
         syncWorkspaceTotal(0);
-        return;
+        return [];
       }
 
       const token = ++inboxFetchTokenRef.current;
+      inboxLoadingRef.current = true;
       if (!opts?.silent && !cur.dialogOrder.length) {
         setInboxViewState("loading");
       }
@@ -383,9 +529,33 @@ export function useInboxStore() {
           chips: effChips,
           q: effQuery,
         });
-        if (token !== inboxFetchTokenRef.current) return;
+        if (token !== inboxFetchTokenRef.current) return [];
 
-        const sorted = sortDialogsByRecency(res.dialogs || []);
+        let sorted = sortDialogsByRecency(res.dialogs || []);
+        const latestCur = stateRef.current;
+        if (effMode === "unified" && effSession === "all" && latestCur.selectedDialogId != null) {
+          const activeId = Number(latestCur.selectedDialogId);
+          const activeStored = latestCur.dialogsById[activeId];
+          if (activeStored && !sorted.some((r) => Number(r.id) === activeId)) {
+            const grpIdx = sorted.findIndex((r) =>
+              r.peer_dialogs?.some((p) => Number(p.dialog_id) === activeId),
+            );
+            if (grpIdx >= 0) {
+              const grp = sorted[grpIdx];
+              sorted = sorted.map((r, idx) =>
+                idx === grpIdx
+                  ? {
+                      ...grp,
+                      id: activeId,
+                      account_id: activeStored.account_id,
+                      peer_dialogs: grp.peer_dialogs,
+                    }
+                  : r,
+              );
+            }
+          }
+        }
+
         upsertDialogsBatch(sorted, true);
         setServerQueryApplied(Boolean(effQuery.trim() && (res.q_applied || res.search_applied)));
 
@@ -407,15 +577,22 @@ export function useInboxStore() {
         const poolForCounts = isUnfilteredAll ? sorted : allDialogsPool.length ? allDialogsPool : sorted;
         setCounts(resolveCountsFromResponse(res, effSession, connected.length, poolForCounts, cur.leads));
         setInboxViewState(sorted.length ? "filled" : effQuery.trim() || effChips.length ? "none" : "empty");
+        return sorted;
       } catch (err) {
-        if (token !== inboxFetchTokenRef.current) return;
+        if (token !== inboxFetchTokenRef.current) return [];
         const msg = err instanceof Error ? err.message : "Ошибка загрузки диалогов";
         setInboxError(msg);
         setInboxViewState("error");
+        return [];
+      } finally {
+        if (token === inboxFetchTokenRef.current) {
+          inboxLoadingRef.current = false;
+        }
       }
     },
     [allDialogsPool, upsertDialogsBatch],
   );
+  loadInboxListRef.current = loadInboxList;
 
   // Trigger initial load once connected accounts appear or change
   const connectedIdsKey = useMemo(
@@ -628,16 +805,45 @@ export function useInboxStore() {
           setWorkspaceTotalDialogs(sorted.length);
           syncWorkspaceTotal(sorted.length);
         }
-        setAllDialogsPool(sorted);
         if (cur.inboxMode !== "unified") {
+          setAllDialogsPool(sorted);
           upsertDialogsBatch(sorted, true);
           if (!cur.activeChips.length && cur.sessionFilter === "all") {
             setCounts(computeLocalCounts(sorted, "all", cur.leads));
             setInboxViewState(sorted.length ? "filled" : "empty");
           }
         } else {
-          // In unified mode, patch individual dialog updates cleanly without breaking peer_dialogs grouping
-          upsertDialogsBatch(sorted, false);
+          // In unified mode, SSE emits raw ungrouped dialogs: only patch existing primary rows
+          // and their peer_dialogs; never append ungrouped secondary rows into dialogOrder.
+          const patchedOrder = [...cur.dialogOrder];
+          const hasUnknown =
+            (!patchedOrder.length && sorted.length > 0) ||
+            sorted.some(
+              (raw) =>
+                Boolean(raw?.id) &&
+                findUnifiedPrimaryId(cur.dialogsById, patchedOrder, raw) == null,
+            );
+          if (patchedOrder.length) {
+            setDialogsById((prev) => {
+              const next = { ...prev };
+              for (const raw of sorted) {
+                if (!raw?.id) continue;
+                const primaryId = findUnifiedPrimaryId(next, patchedOrder, raw);
+                if (primaryId != null && next[primaryId]) {
+                  next[primaryId] = patchGroupWithRawDialog(
+                    next[primaryId],
+                    raw,
+                    cur.leads,
+                    pendingReadIdsRef.current,
+                  );
+                }
+              }
+              return next;
+            });
+          }
+          if (hasUnknown && !inboxLoadingRef.current && !cur.activeChips.length) {
+            loadInboxListRef.current?.({ silent: true });
+          }
         }
       } catch {
         /* ignore malformed snapshot */
@@ -658,17 +864,38 @@ export function useInboxStore() {
               cur.dialogsById[cur.selectedDialogId]?.peer_dialogs?.some((p) => Number(p.dialog_id) === dlgId),
           );
 
-        setDialogsById((prev) => {
-          const prevRow = prev[dlgId];
-          const merged = { ...(prevRow || {}), ...incoming };
-          if (pendingReadIdsRef.current.has(dlgId)) merged.unread_count = 0;
-          return { ...prev, [dlgId]: merged };
-        });
+        if (cur.inboxMode === "unified") {
+          const primaryId = findUnifiedPrimaryId(cur.dialogsById, cur.dialogOrder, incoming);
+          if (primaryId != null && cur.dialogsById[primaryId]) {
+            setDialogsById((prev) => {
+              const target = prev[primaryId];
+              if (!target) return prev;
+              return {
+                ...prev,
+                [primaryId]: patchGroupWithRawDialog(
+                  target,
+                  incoming,
+                  cur.leads,
+                  pendingReadIdsRef.current,
+                ),
+              };
+            });
+          } else if (!inboxLoadingRef.current) {
+            loadInboxListRef.current?.({ silent: true });
+          }
+        } else {
+          setDialogsById((prev) => {
+            const prevRow = prev[dlgId];
+            const merged = { ...(prevRow || {}), ...incoming };
+            if (pendingReadIdsRef.current.has(dlgId)) merged.unread_count = 0;
+            return { ...prev, [dlgId]: merged };
+          });
 
-        setDialogOrder((prevOrder) => {
-          if (prevOrder.includes(dlgId)) return prevOrder;
-          return [dlgId, ...prevOrder];
-        });
+          setDialogOrder((prevOrder) => {
+            if (prevOrder.includes(dlgId)) return prevOrder;
+            return [dlgId, ...prevOrder];
+          });
+        }
 
         // Incrementally patch active thread messages without full redraw or scroll jump
         if (isCurrentSelected) {
@@ -838,9 +1065,28 @@ export function useInboxStore() {
     async (nextSession: string) => {
       setSessionFilter(nextSession);
       setPinnedDialogId(null);
-      await loadInboxList({ session: nextSession });
+      const cur = stateRef.current;
+      const curDlg =
+        cur.selectedDialogId != null ? cur.dialogsById[cur.selectedDialogId] || null : null;
+      if (curDlg && nextSession !== "all" && String(curDlg.account_id) !== String(nextSession)) {
+        setSelectedDialogId(null);
+        setThreadViewState("empty");
+        setThreadError("");
+        setReplyToMessage(null);
+        setEditingMessage(null);
+      }
+      const loaded = await loadInboxList({ session: nextSession });
+      if (nextSession !== "all") {
+        const firstMatch =
+          loaded.find((d) => String(d.account_id) === String(nextSession)) || loaded[0] || null;
+        if (firstMatch) {
+          await selectDialog(firstMatch, { markRead: false });
+        } else {
+          await selectDialog(null);
+        }
+      }
     },
-    [loadInboxList],
+    [loadInboxList, selectDialog],
   );
 
   const handleInboxModeChange = useCallback(
@@ -1203,17 +1449,45 @@ export function useInboxStore() {
           phone: dlg.phone ?? selectedLead?.phone ?? null,
         });
         if (res?.dialog?.id) {
+          const basePeers = Array.isArray(dlg.peer_dialogs) ? [...dlg.peer_dialogs] : [];
+          if (!basePeers.some((p) => Number(p.dialog_id) === Number(res.dialog.id))) {
+            basePeers.push({
+              dialog_id: Number(res.dialog.id),
+              account_id: Number(res.dialog.account_id),
+              unread_count: Number(res.dialog.unread_count || 0),
+              last_message_at: res.dialog.last_message_at,
+              last_from_peer: res.dialog.last_from_peer ?? undefined,
+              is_waiting_our_answer: res.dialog.is_waiting_our_answer ?? undefined,
+            });
+          }
           const nextDlg: DialogItem = {
             ...res.dialog,
-            peer_dialogs: dlg.peer_dialogs,
+            peer_dialogs: basePeers,
           };
+          const groupIds = new Set<number>([
+            Number(dlg.id),
+            Number(nextDlg.id),
+            ...basePeers.map((p) => Number(p.dialog_id)),
+          ]);
           setDialogsById((prev) => ({
             ...prev,
             [nextDlg.id]: nextDlg,
           }));
           setDialogOrder((prevOrder) => {
-            if (prevOrder.includes(nextDlg.id)) return prevOrder;
-            return prevOrder.map((id) => (id === dlg.id ? nextDlg.id : id));
+            const out: number[] = [];
+            let inserted = false;
+            for (const id of prevOrder) {
+              if (groupIds.has(Number(id))) {
+                if (!inserted) {
+                  out.push(Number(nextDlg.id));
+                  inserted = true;
+                }
+              } else {
+                out.push(id);
+              }
+            }
+            if (!inserted) out.unshift(Number(nextDlg.id));
+            return out;
           });
           if (Array.isArray(res.messages)) {
             setMessagesByDialog((prev) => ({
@@ -1326,13 +1600,46 @@ export function useInboxStore() {
           notifyToast("Этот чат ещё не открыт в списке", "error");
           return;
         }
-        upsertDialogsBatch([found], false);
+        if (stateRef.current.inboxMode === "unified") {
+          const existingPrimary = findUnifiedPrimaryId(
+            stateRef.current.dialogsById,
+            stateRef.current.dialogOrder,
+            found,
+          );
+          if (existingPrimary != null && existingPrimary !== Number(found.id)) {
+            const existingRow = stateRef.current.dialogsById[existingPrimary];
+            const peers = Array.isArray(existingRow?.peer_dialogs)
+              ? [...existingRow.peer_dialogs]
+              : [];
+            if (!peers.some((p) => Number(p.dialog_id) === Number(found!.id))) {
+              peers.push({
+                dialog_id: Number(found.id),
+                account_id: Number(found.account_id),
+                unread_count: Number(found.unread_count || 0),
+                last_message_at: found.last_message_at,
+                last_from_peer: found.last_from_peer ?? undefined,
+                is_waiting_our_answer: found.is_waiting_our_answer ?? undefined,
+              });
+            }
+            found = { ...found, peer_dialogs: peers };
+            setDialogsById((prev) => ({ ...prev, [found!.id]: found! }));
+            setDialogOrder((prevOrder) =>
+              prevOrder.map((id) => (id === existingPrimary ? Number(found!.id) : id)),
+            );
+          } else {
+            upsertDialogsBatch([found], false);
+          }
+        } else {
+          upsertDialogsBatch([found], false);
+        }
         window.__CRM_BRIDGE__?.switchSheet?.("inbox");
         await selectDialog(found, { markRead: true });
       },
-      refresh: async () => {
+      refresh: async (opts?: { accountId?: string | number }) => {
+        const nextSess = opts?.accountId != null ? String(opts.accountId) : undefined;
+        if (nextSess != null) setSessionFilter(nextSess);
         await Promise.all([
-          loadInboxList({ silent: true }),
+          loadInboxList({ silent: true, ...(nextSess != null ? { session: nextSess } : {}) }),
           fetchSnippetsApi().then(setSnippets).catch(() => {}),
         ]);
       },

@@ -260,7 +260,7 @@ export interface CrmBridge {
 export interface InboxV2Bridge {
   selectDialogById: (dialogId: number) => Promise<void>;
   openLeadDialog: (leadOrId: number | LeadItem) => Promise<void>;
-  refresh: () => Promise<void>;
+  refresh: (opts?: { accountId?: string | number }) => Promise<void>;
   setAccounts: (accounts: AccountItem[]) => void;
   setLeads: (leads: LeadItem[]) => void;
   setStages: (stages: StageItem[]) => void;
