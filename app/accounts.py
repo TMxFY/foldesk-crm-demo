@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import time
 import zipfile
 
 from app.db import DEFAULT_DB, ROOT, as_dict, resolve_session, utc_now, utc_today
@@ -17,8 +18,14 @@ ORPHAN_DEAD_ACCOUNT_ERROR = "Цепочка остановлена: исходн
 from app.telegram_gateway import (
     SESSION_HEALTH,
     GatewayError,
+    classify_proxy_mode,
+    deterministic_device_profile,
+    extract_auth_key_sha256_from_sqlite,
+    extract_auth_key_sha256_from_string,
     extract_string_session_from_sqlite,
     mask_proxy_url,
+    resolve_nodemaven_config,
+    write_sqlite_session_from_string,
 )
 from app.whatsapp_gateway import (
     DEFAULT_WA_DAILY_LIMIT,
@@ -82,7 +89,18 @@ PUBLIC_FIELDS = (
 )
 
 
-def _public(row: dict) -> dict:
+def _is_nodemaven_configured(conn=None) -> bool:
+    try:
+        if conn is not None:
+            return resolve_nodemaven_config(conn) is not None
+    except Exception:
+        pass
+    user = os.getenv("NODEMAVEN_USER", "").strip()
+    pwd = os.getenv("NODEMAVEN_PASS", "").strip() or os.getenv("NODEMAVEN_PASSWORD", "").strip()
+    return bool(user and pwd)
+
+
+def _public(row: dict, *, nodemaven_configured: bool | None = None) -> dict:
     today = utc_today()
     daily_limit = int(row.get("daily_limit") or 20)
     sent_today = int(row.get("sent_today") or 0) if row.get("sent_date") == today else 0
@@ -133,12 +151,24 @@ def _public(row: dict) -> dict:
         else:
             connection_label = "Подключён · сессия сохранена"
 
+    eff_nm = (
+        False
+        if provider == "whatsapp"
+        else (
+            bool(nodemaven_configured)
+            if nodemaven_configured is not None
+            else _is_nodemaven_configured(None)
+        )
+    )
+    proxy_mode = classify_proxy_mode(row.get("proxy_url"), nodemaven_configured=eff_nm)
+
     out = {key: row.get(key) for key in PUBLIC_FIELDS}
     out["provider"] = provider
     out["daily_limit"] = daily_limit
     out["sent_today"] = sent_today
     out["sent_date"] = row.get("sent_date") or today
     out["proxy_url"] = row.get("proxy_url")
+    out["proxy_mode"] = proxy_mode
     out["access_scope"] = row.get("access_scope") or "workspace"
     out["health_status"] = health
     out["is_demo"] = is_demo
@@ -157,7 +187,7 @@ def set_daily_limit(conn, account_id: int, daily_limit: int) -> dict:
         (int(daily_limit), utc_now(), account_id),
     )
     conn.commit()
-    return _public(_load(conn, account_id))
+    return _public(_load(conn, account_id), nodemaven_configured=_is_nodemaven_configured(conn))
 
 
 def update_account_settings(
@@ -197,7 +227,7 @@ def update_account_settings(
         (new_limit, new_proxy, new_scope, utc_now(), account_id),
     )
     conn.commit()
-    return _public(_load(conn, account_id))
+    return _public(_load(conn, account_id), nodemaven_configured=_is_nodemaven_configured(conn))
 
 
 def _unlink_account_refs(conn, account_ids: list[int]) -> None:
@@ -476,7 +506,7 @@ def increment_daily_sent(conn, account_id: int) -> dict:
         (today, today, utc_now(), account_id),
     )
     conn.commit()
-    return _public(_load(conn, account_id))
+    return _public(_load(conn, account_id), nodemaven_configured=_is_nodemaven_configured(conn))
 
 
 def _load(conn, account_id: int) -> dict:
@@ -572,7 +602,216 @@ def deduplicate_accounts(conn) -> int:
 def list_accounts(conn) -> list:
     deduplicate_accounts(conn)
     rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
-    return [_public(as_dict(row)) for row in rows]
+    nm_configured = _is_nodemaven_configured(conn)
+    return [_public(as_dict(row), nodemaven_configured=nm_configured) for row in rows]
+
+
+def compute_account_pool_summary(
+    conn, *, now_epoch: float | None = None
+) -> dict:
+    """Compute send-eligible account pool excluding frozen/dead/offline and active cooldowns."""
+    today = utc_today()
+    now_ts = float(now_epoch) if now_epoch is not None else time.time()
+    cooldown_ids: set[int] = set()
+    try:
+        kv_rows = conn.execute(
+            "SELECT key, value FROM kv_settings WHERE key LIKE 'account_cooldown_until:%'"
+        ).fetchall()
+        for k, v in kv_rows:
+            try:
+                acc_id = int(str(k).split(":", 1)[1])
+                until_ts = float(v)
+                if until_ts > now_ts:
+                    cooldown_ids.add(acc_id)
+            except (IndexError, TypeError, ValueError):
+                continue
+    except sqlite3.OperationalError:
+        pass
+
+    rows = conn.execute(
+        """
+        SELECT id, health, daily_limit, sent_today, sent_date
+        FROM accounts
+        WHERE status = 'connected'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+
+    connected_accounts = 0
+    active_accounts = 0
+    daily_pool = 0
+    sent_today_total = 0
+    remaining_today = 0
+    frozen_accounts = 0
+    cooldown_accounts = 0
+    offline_accounts = 0
+    dead_accounts = 0
+
+    for raw in rows:
+        row = as_dict(raw)
+        acc_id = int(row["id"])
+        health_norm = str(row.get("health") or "active").strip().lower()
+        limit_val = max(0, int(row.get("daily_limit") or 20))
+        sent_val = int(row.get("sent_today") or 0) if row.get("sent_date") == today else 0
+        in_cd = acc_id in cooldown_ids
+
+        connected_accounts += 1
+        if health_norm == "frozen":
+            frozen_accounts += 1
+        elif health_norm in ("unauthorized", "banned"):
+            dead_accounts += 1
+        elif health_norm == "offline":
+            offline_accounts += 1
+        if in_cd:
+            cooldown_accounts += 1
+
+        if health_norm == "active" and not in_cd:
+            active_accounts += 1
+            daily_pool += limit_val
+            sent_today_total += sent_val
+            remaining_today += max(0, limit_val - sent_val)
+
+    return {
+        "connected_accounts": connected_accounts,
+        "active_accounts": active_accounts,
+        "daily_pool": daily_pool,
+        "sent_today": sent_today_total,
+        "remaining_today": remaining_today,
+        "frozen_accounts": frozen_accounts,
+        "cooldown_accounts": cooldown_accounts,
+        "offline_accounts": offline_accounts,
+        "dead_accounts": dead_accounts,
+    }
+
+
+def backfill_account_device_profiles(conn, *, account_id: int | None = None) -> int:
+    """Assign deterministic per-account device profiles only for rows missing explicit fields."""
+    if account_id is not None:
+        rows = conn.execute(
+            """
+            SELECT id, device_model, system_version, app_version, lang_code, system_lang_code
+            FROM accounts
+            WHERE id = ? AND COALESCE(provider, 'telegram') != 'whatsapp'
+            """,
+            (int(account_id),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, device_model, system_version, app_version, lang_code, system_lang_code
+            FROM accounts
+            WHERE COALESCE(provider, 'telegram') != 'whatsapp'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    updated = 0
+    for r in rows:
+        aid = int(r[0])
+        cur_vals = {
+            "device_model": str(r[1] or "").strip(),
+            "system_version": str(r[2] or "").strip(),
+            "app_version": str(r[3] or "").strip(),
+            "lang_code": str(r[4] or "").strip(),
+            "system_lang_code": str(r[5] or "").strip(),
+        }
+        if all(cur_vals.values()):
+            continue
+        prof = deterministic_device_profile(aid)
+        merged = {k: (cur_vals[k] or prof[k]) for k in cur_vals}
+        conn.execute(
+            """
+            UPDATE accounts
+            SET device_model = ?, system_version = ?, app_version = ?, lang_code = ?, system_lang_code = ?
+            WHERE id = ?
+            """,
+            (
+                merged["device_model"],
+                merged["system_version"],
+                merged["app_version"],
+                merged["lang_code"],
+                merged["system_lang_code"],
+                aid,
+            ),
+        )
+        updated += 1
+    if updated > 0:
+        conn.commit()
+    return updated
+
+
+def reconcile_disk_sessions_with_db(conn) -> dict:
+    """Enforce accounts.session_string as canonical SSOT; repair mismatched disk .session & session_blob."""
+    rows = conn.execute(
+        """
+        SELECT id, session_path, session_string, session_blob, provider
+        FROM accounts
+        WHERE COALESCE(provider, 'telegram') != 'whatsapp'
+          AND session_path IS NOT NULL
+          AND session_path != ''
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    repaired_ids: list[int] = []
+    backfilled_ids: list[int] = []
+    skipped_protected = 0
+
+    for raw in rows:
+        row = as_dict(raw)
+        aid = int(row["id"])
+        session_path = str(row.get("session_path") or "").strip()
+        if not session_path or session_path.startswith("data/sessions/demo"):
+            continue
+        abs_p = resolve_session(session_path)
+        str_sess = str(row.get("session_string") or "").strip()
+
+        if _is_valid_string_session(str_sess):
+            db_sha = extract_auth_key_sha256_from_string(str_sess)
+            disk_sha = extract_auth_key_sha256_from_sqlite(abs_p) if abs_p.exists() else None
+            if db_sha and disk_sha != db_sha:
+                if _can_mutate_session_file_on_disk(conn, abs_p):
+                    new_bytes = write_sqlite_session_from_string(str_sess, abs_p)
+                    if new_bytes:
+                        conn.execute(
+                            "UPDATE accounts SET session_blob = ? WHERE id = ?",
+                            (new_bytes, aid),
+                        )
+                        repaired_ids.append(aid)
+                        logger.warning(
+                            "Reconciled mismatched disk .session for account_id=%s (%s) from canonical session_string",
+                            aid,
+                            session_path,
+                        )
+                else:
+                    skipped_protected += 1
+            elif db_sha and disk_sha == db_sha and abs_p.exists():
+                try:
+                    cur_bytes = abs_p.read_bytes()
+                    blob = row.get("session_blob")
+                    if not blob or bytes(blob) != cur_bytes:
+                        conn.execute(
+                            "UPDATE accounts SET session_blob = ? WHERE id = ?",
+                            (cur_bytes, aid),
+                        )
+                except Exception:
+                    pass
+        elif abs_p.exists():
+            extracted = extract_string_session_from_sqlite(abs_p)
+            if extracted and _is_valid_string_session(extracted):
+                conn.execute(
+                    "UPDATE accounts SET session_string = ? WHERE id = ?",
+                    (extracted, aid),
+                )
+                backfilled_ids.append(aid)
+
+    if repaired_ids or backfilled_ids:
+        conn.commit()
+    return {
+        "repaired": len(repaired_ids),
+        "repaired_ids": repaired_ids,
+        "backfilled": len(backfilled_ids),
+        "backfilled_ids": backfilled_ids,
+        "skipped_protected": skipped_protected,
+    }
 
 
 def _sync_session_blob(conn, account_id: int) -> None:
@@ -587,14 +826,27 @@ def _sync_session_blob(conn, account_id: int) -> None:
         existing_str = str(row[1] or "").strip()
         prov = str(row[2] or "telegram").strip().lower()
         abs_p = resolve_session(session_path)
-        if prov != "whatsapp" and not existing_str:
-            extracted = extract_string_session_from_sqlite(abs_p)
-            if extracted:
-                conn.execute(
-                    "UPDATE accounts SET session_string = ? WHERE id = ?",
-                    (extracted, account_id),
-                )
-                conn.commit()
+        if prov != "whatsapp":
+            if _is_valid_string_session(existing_str):
+                db_sha = extract_auth_key_sha256_from_string(existing_str)
+                disk_sha = extract_auth_key_sha256_from_sqlite(abs_p) if abs_p.exists() else None
+                if db_sha and disk_sha != db_sha and _can_mutate_session_file_on_disk(conn, abs_p):
+                    new_bytes = write_sqlite_session_from_string(existing_str, abs_p)
+                    if new_bytes:
+                        conn.execute(
+                            "UPDATE accounts SET session_blob = ? WHERE id = ?",
+                            (new_bytes, account_id),
+                        )
+                        conn.commit()
+                        return
+            elif not existing_str:
+                extracted = extract_string_session_from_sqlite(abs_p)
+                if extracted:
+                    conn.execute(
+                        "UPDATE accounts SET session_string = ? WHERE id = ?",
+                        (extracted, account_id),
+                    )
+                    conn.commit()
         if (
             _inspect_telethon_session(session_path) is None
             and _inspect_whatsmeow_db(session_path) is None
@@ -794,6 +1046,8 @@ def restore_disk_sessions(conn) -> int:
                 )
 
     deduplicate_accounts(conn)
+    reconcile_disk_sessions_with_db(conn)
+    backfill_account_device_profiles(conn)
     conn.commit()
     return restored
 
@@ -1518,9 +1772,19 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             )
             account_id = int(cur.lastrowid)
 
+        backfill_account_device_profiles(conn, account_id=account_id)
+        if (
+            provider != "whatsapp"
+            and gateway is not None
+            and hasattr(gateway, "set_device_profile")
+            and not any((device_model, system_version, app_version, lang_code, system_lang_code))
+        ):
+            gateway.set_device_profile(session_path, **deterministic_device_profile(account_id))
         _sync_session_blob(conn, account_id)
 
-        imported.append(_public(_load(conn, account_id)))
+        imported.append(
+            _public(_load(conn, account_id), nodemaven_configured=_is_nodemaven_configured(conn))
+        )
 
     conn.commit()
     return imported
@@ -1769,6 +2033,8 @@ async def _finish_login(conn, account_id: int, result: dict, gateway) -> dict:
             conn.commit()
             if gateway is not None and hasattr(gateway, "set_session_string"):
                 gateway.set_session_string(account["session_path"], sess_str)
+        backfill_account_device_profiles(conn, account_id=account_id)
+        _sync_session_blob(conn, account_id)
         probe = await _probe_health(gateway, account["session_path"])
         _write_health(conn, account_id, probe["health"], probe["last_error"])
     return {"status": result["status"]}

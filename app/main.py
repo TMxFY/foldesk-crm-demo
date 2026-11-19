@@ -473,11 +473,12 @@ def should_enable_live_tg_runtime(conn=None, gateway=None) -> bool:
         return True
     if is_ephemeral_runtime():
         return False
-    if (
-        is_vps_runtime()
-        or os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes")
-        or os.getenv("ALLOW_LOCAL_TG_SESSIONS", "").strip().lower() in ("1", "true", "yes")
-    ):
+    if is_vps_runtime():
+        return True
+    # Render containers must never auto-connect MTProto sessions (VPS is the sole canonical runtime).
+    if os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if os.getenv("ALLOW_LOCAL_TG_SESSIONS", "").strip().lower() in ("1", "true", "yes"):
         return True
     from app.cloud_persistence import _resolve_r2_config
 
@@ -508,10 +509,10 @@ def _resolve_app_gateway(app, provider: str = "telegram"):
             wa_gw = WhatsAppGateway()
             app.state.wa_gateway = wa_gw
         return wa_gw
-    if app.state.gateway is not None:
-        return app.state.gateway
     if not getattr(app.state, "tg_lease_ready", True):
         return None
+    if app.state.gateway is not None:
+        return app.state.gateway
     conn = getattr(app.state, "conn", None)
     with locked_conn(conn):
         if not should_enable_live_tg_runtime(conn, None):
@@ -526,21 +527,21 @@ def _resolve_app_gateway(app, provider: str = "telegram"):
 
 
 def _gateway(request: Request):
-    gateway = request.app.state.gateway
-    if gateway is not None:
-        return gateway
     if not getattr(request.app.state, "tg_lease_ready", True):
         raise HTTPException(
             status_code=503,
             detail="Переключение релиза Telegram-сессий, повторите через 5 сек",
         )
+    gateway = request.app.state.gateway
+    if gateway is not None:
+        return gateway
     conn = getattr(request.app.state, "conn", None)
     with locked_conn(conn):
         enable_live = should_enable_live_tg_runtime(conn, None)
     if not enable_live and not is_ephemeral_runtime():
         raise HTTPException(
             status_code=409,
-            detail="Локальное подключение Telegram отключено для защиты прод-сессий на Render от AUTH_KEY_DUPLICATED. Задайте ALLOW_LOCAL_TG_SESSIONS=1 для явного локального входа.",
+            detail="Локальное подключение Telegram отключено для защиты прод-сессий на VPS от AUTH_KEY_DUPLICATED. Задайте ALLOW_LOCAL_TG_SESSIONS=1 для явного локального входа.",
         )
     with locked_conn(conn):
         api_id, api_hash = _resolve_tg_creds(conn)
@@ -1045,21 +1046,30 @@ async def start_account_watch(app, account_id: int) -> None:
                     "Watch disconnected normally for account_id=%s, scheduling reconnect...",
                     account_id,
                 )
+                if hasattr(gateway, "record_disconnect"):
+                    gateway.record_disconnect(account_id, reason="watch_eof")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                err_low = str(exc).lower()
+                err_low = f"{type(exc).__name__} {exc}".lower()
                 if any(
                     fatal in err_low
                     for fatal in (
                         "unauthorized",
                         "auth_key_duplicated",
+                        "authkeyduplicated",
+                        "auth_key_unregistered",
+                        "authkeyunregistered",
+                        "authkeyinvalid",
+                        "key is not registered",
                         "two different ip",
                         "sessionrevoked",
                         "deactivated",
                         "userdeactivated",
                     )
                 ):
+                    if hasattr(gateway, "record_disconnect"):
+                        gateway.record_disconnect(account_id, reason="watch_fatal")
                     _runtime_logger.error(
                         "Permanent watch failure for account_id=%s: %s", account_id, exc
                     )
@@ -1078,6 +1088,8 @@ async def start_account_watch(app, account_id: int) -> None:
                             account_id,
                         )
                     return
+                if hasattr(gateway, "record_disconnect"):
+                    gateway.record_disconnect(account_id, reason=type(exc).__name__)
                 _runtime_logger.warning(
                     "Transient watch disconnect for account_id=%s (%s), retrying...",
                     account_id,
@@ -1136,6 +1148,7 @@ async def stop_inbox_watches(app) -> None:
                 await gw.close_all()
             except Exception:
                 pass
+    app.state.gateway = None
 
 
 async def sync_live_tg_read_receipts_once(
@@ -1545,57 +1558,62 @@ async def stop_airtable_sync_loop(app: FastAPI) -> None:
         app.state.airtable_sync_task = None
 
 
+async def _tg_lease_heartbeat_loop(app: FastAPI) -> None:
+    from app.cloud_persistence import (
+        check_tg_runtime_lease_owned,
+        release_tg_local_lock,
+        wait_and_acquire_tg_runtime_lease,
+        write_tg_runtime_lease,
+    )
+
+    is_vps_canonical = os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    while True:
+        try:
+            await asyncio.sleep(20.0)
+            owned = await asyncio.to_thread(check_tg_runtime_lease_owned, None)
+            if not owned:
+                # Strictly close all local MTProto sessions BEFORE attempting any re-acquisition
+                # so split-brain window is 0s even on canonical VPS host.
+                app.state.tg_lease_ready = False
+                await stop_autopilot_loop(app)
+                await stop_inbox_watches(app)
+                app.state.gateway = None
+                await asyncio.to_thread(release_tg_local_lock)
+                if not is_vps_canonical:
+                    return
+                reacquired = bool(
+                    await asyncio.to_thread(
+                        wait_and_acquire_tg_runtime_lease,
+                        None,
+                        max_wait_seconds=10.0,
+                    )
+                )
+                if reacquired:
+                    app.state.tg_lease_ready = True
+                    await start_connected_watches(app)
+                    await start_autopilot_loop(app)
+                continue
+            await asyncio.to_thread(
+                write_tg_runtime_lease, released=False, conn=None
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _runtime_logger.warning("tg_lease_heartbeat_loop error: %s", exc)
+            continue
+
+
 def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     load_env_file()
-
-    async def _tg_lease_heartbeat_loop(app: FastAPI) -> None:
-        from app.cloud_persistence import (
-            check_tg_runtime_lease_owned,
-            wait_and_acquire_tg_runtime_lease,
-            write_tg_runtime_lease,
-        )
-
-        is_vps_canonical = os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        while True:
-            try:
-                await asyncio.sleep(20.0)
-                owned = await asyncio.to_thread(check_tg_runtime_lease_owned, None)
-                if not owned:
-                    if is_vps_canonical:
-                        reacquired = bool(
-                            await asyncio.to_thread(
-                                wait_and_acquire_tg_runtime_lease,
-                                None,
-                                max_wait_seconds=10.0,
-                            )
-                        )
-                        if reacquired:
-                            app.state.tg_lease_ready = True
-                            await start_connected_watches(app)
-                            await start_autopilot_loop(app)
-                            continue
-                    app.state.tg_lease_ready = False
-                    await stop_autopilot_loop(app)
-                    await stop_inbox_watches(app)
-                    if not is_vps_canonical:
-                        return
-                    continue
-                await asyncio.to_thread(
-                    write_tg_runtime_lease, released=False, conn=None
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _runtime_logger.warning("tg_lease_heartbeat_loop error: %s", exc)
-                continue
 
     async def _leased_tg_runtime_boot(app: FastAPI) -> None:
         from app.cloud_persistence import (
             _resolve_r2_config,
+            acquire_tg_local_lock,
             schedule_cloud_backup,
             wait_and_acquire_tg_runtime_lease,
         )
@@ -1617,10 +1635,17 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             except Exception as exc:
                 _runtime_logger.error("Failed acquiring R2 TG lease on boot: %s", exc)
                 acquired = False
+        else:
+            try:
+                acquired = bool(await asyncio.to_thread(acquire_tg_local_lock))
+            except Exception as exc:
+                _runtime_logger.error("Failed acquiring local TG OS lock on boot: %s", exc)
+                acquired = False
         if not acquired:
             app.state.tg_lease_ready = False
+            app.state.gateway = None
             _runtime_logger.warning(
-                "Another host holds active R2 TG runtime lease; refusing to start local TG sessions to prevent AUTH_KEY_DUPLICATED."
+                "Another host or local process holds active TG runtime lease/lock; refusing to start local TG sessions to prevent AUTH_KEY_DUPLICATED."
             )
             if is_vps_canonical:
                 app.state.tg_lease_heartbeat_task = asyncio.create_task(
@@ -1704,18 +1729,24 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 close_auth_connection(app)
             except Exception:
                 pass
-            if (
-                live_tg_enabled
-                and not is_ephemeral_runtime()
-                and os.getenv("CLOUD_BACKUP_ENABLED", "1").strip().lower()
-                not in ("0", "false", "no", "off")
-            ):
-                try:
-                    from app.cloud_persistence import release_tg_runtime_lease
+            if live_tg_enabled and not is_ephemeral_runtime():
+                if (
+                    os.getenv("CLOUD_BACKUP_ENABLED", "1").strip().lower()
+                    not in ("0", "false", "no", "off")
+                ):
+                    try:
+                        from app.cloud_persistence import release_tg_runtime_lease
 
-                    await asyncio.to_thread(release_tg_runtime_lease, None)
-                except Exception:
-                    pass
+                        await asyncio.to_thread(release_tg_runtime_lease, None)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        from app.cloud_persistence import release_tg_local_lock
+
+                        await asyncio.to_thread(release_tg_local_lock)
+                    except Exception:
+                        pass
 
     app = FastAPI(title="CRM Telegram", lifespan=lifespan)
     cloud_backup_enabled = (
@@ -1851,6 +1882,17 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         db_ok = False
         active_accounts = 0
         healthy_accounts = 0
+        account_pool: dict = {
+            "connected_accounts": 0,
+            "active_accounts": 0,
+            "daily_pool": 0,
+            "sent_today": 0,
+            "remaining_today": 0,
+            "frozen_accounts": 0,
+            "cooldown_accounts": 0,
+            "offline_accounts": 0,
+            "dead_accounts": 0,
+        }
         running_campaigns = 0
         pending_step1_total = 0
         reply_alert_guard_ok = True
@@ -1863,18 +1905,11 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                     conn_obj.execute("SELECT 1").fetchone()
                     db_ok = True
                     if deep:
-                        acc_row = conn_obj.execute(
-                            """
-                            SELECT
-                                COUNT(*) AS active_cnt,
-                                SUM(CASE WHEN coalesce(health, 'active') = 'active' THEN 1 ELSE 0 END) AS healthy_cnt
-                            FROM accounts
-                            WHERE status = 'connected'
-                            """
-                        ).fetchone()
-                        if acc_row is not None:
-                            active_accounts = int(acc_row["active_cnt"] or 0)
-                            healthy_accounts = int(acc_row["healthy_cnt"] or 0)
+                        from app.accounts import compute_account_pool_summary
+
+                        account_pool = compute_account_pool_summary(conn_obj)
+                        active_accounts = int(account_pool["connected_accounts"])
+                        healthy_accounts = int(account_pool["active_accounts"])
                         rc_row = conn_obj.execute(
                             "SELECT COUNT(*) AS cnt FROM campaigns WHERE status = 'running'"
                         ).fetchone()
@@ -1909,10 +1944,35 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             )
         payload = {"ok": True, "status": "healthy", "db_ok": db_ok}
         if deep:
+            from app.cloud_persistence import INSTANCE_ID, get_last_seen_tg_lease_owner
+
             ap_task = getattr(request.app.state, "autopilot_task", None)
+            inbox_tasks = getattr(request.app.state, "inbox_tasks", None) or {}
+            active_watches = sum(
+                1 for t in inbox_tasks.values() if t is not None and not t.done()
+            )
+            gw_obj = getattr(request.app.state, "gateway", None)
+            if gw_obj is not None and hasattr(gw_obj, "get_telemetry"):
+                gw_tel = gw_obj.get_telemetry()
+            else:
+                gw_tel = {
+                    "disconnects_1h_by_account": {},
+                    "disconnects_1h_total": 0,
+                    "leaked_tasks_1h": 0,
+                    "connected_clients": 0,
+                }
+            tg_lease_ready = bool(getattr(request.app.state, "tg_lease_ready", True))
+            tg_lease_owner = get_last_seen_tg_lease_owner() or (
+                INSTANCE_ID if tg_lease_ready else None
+            )
             payload.update(
                 {
-                    "tg_lease_ready": bool(getattr(request.app.state, "tg_lease_ready", True)),
+                    "tg_lease_ready": tg_lease_ready,
+                    "tg_lease_owner": tg_lease_owner,
+                    "active_watches": active_watches,
+                    "disconnects_1h_by_account": gw_tel["disconnects_1h_by_account"],
+                    "disconnects_1h_total": int(gw_tel["disconnects_1h_total"]),
+                    "leaked_tasks_1h": int(gw_tel["leaked_tasks_1h"]),
                     "autopilot_running": bool(ap_task is not None and not ap_task.done()),
                     "autopilot_error_count": int(
                         getattr(request.app.state, "autopilot_error_count", 0) or 0
@@ -1925,6 +1985,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                     ),
                     "active_accounts": active_accounts,
                     "healthy_accounts": healthy_accounts,
+                    "send_eligible_accounts": int(account_pool["active_accounts"]),
+                    "daily_pool": int(account_pool["daily_pool"]),
+                    "account_pool": account_pool,
                     "running_campaigns": running_campaigns,
                     "pending_step1_total": pending_step1_total,
                     "reply_alert_guard_ok": reply_alert_guard_ok,
@@ -2035,9 +2098,12 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                         raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
                 gw = getattr(request.app.state, "gateway", None)
-                if gw is not None and hasattr(gw, "set_proxy"):
+                if gw is not None:
                     try:
-                        gw.set_proxy(row["session_path"], updated.get("proxy_url"))
+                        if hasattr(gw, "apply_proxy"):
+                            await gw.apply_proxy(row["session_path"], updated.get("proxy_url"))
+                        elif hasattr(gw, "set_proxy"):
+                            gw.set_proxy(row["session_path"], updated.get("proxy_url"))
                     except Exception:
                         pass
         return updated

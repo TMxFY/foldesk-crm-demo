@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime
+import fcntl
 import gzip
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import socket
@@ -29,11 +31,198 @@ from app.db import (
     locked_raw_connection,
     utc_now,
 )
-from app.runtime_config import is_ephemeral_runtime, should_skip_dotenv
+from app.runtime_config import is_ephemeral_runtime, is_vps_runtime, should_skip_dotenv
+
+logger = logging.getLogger(__name__)
 
 R2_OBJECT_KEY = "foldesk-crm/crm_state.bundle.json.gz"
 R2_LEASE_KEY = "foldesk-crm/tg_runtime_lease.json"
 INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+DEFAULT_TG_LOCK_PATH = Path("/run/crmtg-tg.lock")
+FALLBACK_TG_LOCK_PATH = Path("/tmp/crmtg-tg.lock")
+
+_TG_LOCAL_LOCK_MUTEX = threading.Lock()
+_TG_LOCAL_LOCK_FILE: Any | None = None
+_TG_LOCAL_LOCK_ACTIVE_PATH: Path | None = None
+_CACHED_GIT_SHA: str | None = None
+_CACHED_PUBLIC_IP: str | None = None
+_LAST_SEEN_LEASE_OWNER: str | None = None
+
+
+def _resolve_git_sha() -> str:
+    global _CACHED_GIT_SHA
+    env_sha = os.getenv("CRMTG_GIT_SHA", "").strip()
+    if env_sha:
+        return env_sha[:12]
+    if _CACHED_GIT_SHA is not None:
+        return _CACHED_GIT_SHA
+    sha = "unknown"
+    try:
+        git_entry = ROOT / ".git"
+        git_dir: Path | None = None
+        if git_entry.is_dir():
+            git_dir = git_entry
+        elif git_entry.is_file():
+            raw_gitdir = git_entry.read_text(encoding="utf-8", errors="ignore").strip()
+            if raw_gitdir.startswith("gitdir:"):
+                rel = raw_gitdir.split(":", 1)[1].strip()
+                cand = Path(rel)
+                git_dir = cand if cand.is_absolute() else (ROOT / cand).resolve()
+        if git_dir is not None:
+            head_file = git_dir / "HEAD"
+            if head_file.is_file():
+                head_txt = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+                if head_txt.startswith("ref:"):
+                    ref_name = head_txt.split(":", 1)[1].strip()
+                    ref_path = git_dir / ref_name
+                    if not ref_path.is_file() and (git_dir / "commondir").is_file():
+                        common_rel = (git_dir / "commondir").read_text(encoding="utf-8", errors="ignore").strip()
+                        common_dir = (git_dir / common_rel).resolve()
+                        ref_path = common_dir / ref_name
+                    if ref_path.is_file():
+                        sha = ref_path.read_text(encoding="utf-8", errors="ignore").strip()[:12] or "unknown"
+                    else:
+                        packed = git_dir / "packed-refs"
+                        if not packed.is_file() and (git_dir / "commondir").is_file():
+                            common_rel = (git_dir / "commondir").read_text(encoding="utf-8", errors="ignore").strip()
+                            packed = (git_dir / common_rel).resolve() / "packed-refs"
+                        if packed.is_file():
+                            for line in packed.read_text(encoding="utf-8", errors="ignore").splitlines():
+                                if line and not line.startswith("#") and line.endswith(f" {ref_name}"):
+                                    sha = line.split()[0][:12]
+                                    break
+                elif len(head_txt) >= 7:
+                    sha = head_txt[:12]
+    except Exception:
+        sha = "unknown"
+    _CACHED_GIT_SHA = sha
+    return sha
+
+
+def _resolve_public_ip() -> str:
+    global _CACHED_PUBLIC_IP
+    env_ip = os.getenv("CRMTG_PUBLIC_IP", "").strip()
+    if env_ip:
+        return env_ip
+    if _CACHED_PUBLIC_IP is not None:
+        return _CACHED_PUBLIC_IP
+    ip_val = ""
+    if is_vps_runtime() and not is_ephemeral_runtime():
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen("https://api.ipify.org", timeout=1.5) as resp:
+                raw_ip = resp.read(64).decode("ascii", errors="ignore").strip()
+                if raw_ip:
+                    ip_val = raw_ip
+        except Exception:
+            ip_val = ""
+    if not ip_val:
+        try:
+            ip_val = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip_val = "unknown"
+    _CACHED_PUBLIC_IP = ip_val or "unknown"
+    return _CACHED_PUBLIC_IP
+
+
+def acquire_tg_local_lock(lock_path: Path | str | None = None) -> bool:
+    """Acquire non-blocking OS flock preventing two local processes from opening TG sessions."""
+    global _TG_LOCAL_LOCK_FILE, _TG_LOCAL_LOCK_ACTIVE_PATH
+    with _TG_LOCAL_LOCK_MUTEX:
+        if _TG_LOCAL_LOCK_FILE is not None:
+            if lock_path is None or _TG_LOCAL_LOCK_ACTIVE_PATH == Path(lock_path):
+                return True
+        candidates: list[Path] = []
+        if lock_path is not None:
+            candidates.append(Path(lock_path))
+        else:
+            env_p = os.getenv("CRMTG_TG_LOCK_PATH", "").strip()
+            if env_p:
+                candidates.append(Path(env_p))
+            else:
+                candidates.extend([DEFAULT_TG_LOCK_PATH, FALLBACK_TG_LOCK_PATH])
+
+        last_err: Exception | None = None
+        for cand in candidates:
+            fh = None
+            try:
+                cand.parent.mkdir(parents=True, exist_ok=True)
+                fh = open(cand, "a+", encoding="utf-8")
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError) as exc:
+                    fh.close()
+                    fh = None
+                    if isinstance(exc, BlockingIOError) or getattr(exc, "errno", None) in (11, 35):
+                        logger.warning("Local TG OS lock already held at %s", cand)
+                        return False
+                    last_err = exc
+                    continue
+                try:
+                    fh.seek(0)
+                    fh.truncate()
+                    fh.write(f"{os.getpid()} {INSTANCE_ID}\n")
+                    fh.flush()
+                except Exception:
+                    pass
+                prev_fh = _TG_LOCAL_LOCK_FILE
+                _TG_LOCAL_LOCK_FILE = fh
+                _TG_LOCAL_LOCK_ACTIVE_PATH = cand
+                if prev_fh is not None:
+                    try:
+                        fcntl.flock(prev_fh.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                    try:
+                        prev_fh.close()
+                    except Exception:
+                        pass
+                return True
+            except PermissionError as exc:
+                last_err = exc
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                continue
+            except OSError as exc:
+                last_err = exc
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                continue
+        logger.warning("Failed to acquire local TG OS lock (%s): %s", candidates, last_err)
+        return False
+
+
+def release_tg_local_lock() -> None:
+    global _TG_LOCAL_LOCK_FILE, _TG_LOCAL_LOCK_ACTIVE_PATH
+    with _TG_LOCAL_LOCK_MUTEX:
+        fh = _TG_LOCAL_LOCK_FILE
+        _TG_LOCAL_LOCK_FILE = None
+        _TG_LOCAL_LOCK_ACTIVE_PATH = None
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def is_tg_local_lock_held() -> bool:
+    with _TG_LOCAL_LOCK_MUTEX:
+        return _TG_LOCAL_LOCK_FILE is not None
+
+
+def get_last_seen_tg_lease_owner() -> str | None:
+    return _LAST_SEEN_LEASE_OWNER
 
 
 def _read_dotenv() -> dict[str, str]:
@@ -618,6 +807,7 @@ def get_cloud_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
 def read_tg_runtime_lease(
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any] | None:
+    global _LAST_SEEN_LEASE_OWNER
     cfg = _resolve_r2_config(conn)
     if not cfg:
         return None
@@ -634,7 +824,12 @@ def read_tg_runtime_lease(
                     parsed = json.loads(resp.content.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     return None
-                return parsed if isinstance(parsed, dict) else None
+                if isinstance(parsed, dict):
+                    owner = parsed.get("instance_id")
+                    if owner:
+                        _LAST_SEEN_LEASE_OWNER = str(owner)
+                    return parsed
+                return None
             return {"_read_error": True, "status_code": resp.status_code}
     except Exception:
         return {"_read_error": True}
@@ -693,6 +888,7 @@ def write_tg_runtime_lease(
     conn: sqlite3.Connection | None = None,
     lease_ttl_seconds: float = 45.0,
 ) -> bool:
+    global _LAST_SEEN_LEASE_OWNER
     cfg = _resolve_r2_config(conn)
     if not cfg:
         return False
@@ -700,6 +896,10 @@ def write_tg_runtime_lease(
     payload = json.dumps(
         {
             "instance_id": INSTANCE_ID,
+            "host": socket.gethostname(),
+            "public_ip": _resolve_public_ip(),
+            "pid": os.getpid(),
+            "git_sha": _resolve_git_sha(),
             "heartbeat_epoch": now_epoch,
             "expires_at": now_epoch + max(1.0, float(lease_ttl_seconds)),
             "updated_at": utc_now(),
@@ -711,7 +911,10 @@ def write_tg_runtime_lease(
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.put(url, content=payload, headers=headers)
-            return resp.status_code in (200, 201, 204)
+            ok = resp.status_code in (200, 201, 204)
+            if ok and not released:
+                _LAST_SEEN_LEASE_OWNER = INSTANCE_ID
+            return ok
     except Exception:
         return False
 
@@ -722,7 +925,12 @@ def wait_and_acquire_tg_runtime_lease(
     max_wait_seconds: float = 45.0,
     poll_interval: float = 2.5,
     lease_ttl_seconds: float = 45.0,
+    verify_delay_seconds: float = 1.5,
+    lock_path: Path | str | None = None,
+    acquire_local_lock: bool = True,
 ) -> bool:
+    if acquire_local_lock and not acquire_tg_local_lock(lock_path=lock_path):
+        return False
     cfg = _resolve_r2_config(conn)
     if not cfg:
         return True
@@ -743,25 +951,46 @@ def wait_and_acquire_tg_runtime_lease(
         ):
             free = True
         if free:
-            return write_tg_runtime_lease(
+            wrote = write_tg_runtime_lease(
                 released=False, conn=conn, lease_ttl_seconds=lease_ttl_seconds
             )
+            if wrote:
+                delay = max(0.0, float(verify_delay_seconds))
+                if delay > 0:
+                    time.sleep(delay)
+                confirmed = read_tg_runtime_lease(conn)
+                if (
+                    confirmed is not None
+                    and not confirmed.get("_read_error")
+                    and confirmed.get("instance_id") == INSTANCE_ID
+                    and bool(confirmed.get("released")) is False
+                ):
+                    return True
+                logger.warning(
+                    "R2 TG lease read-after-write verification lost race (observed owner=%s)",
+                    confirmed.get("instance_id") if isinstance(confirmed, dict) else None,
+                )
         remaining = max_wait_seconds - (time.monotonic() - started)
         if remaining <= 0:
+            if acquire_local_lock:
+                release_tg_local_lock()
             return False
         time.sleep(min(poll_interval, max(0.01, remaining)))
 
 
 def release_tg_runtime_lease(conn: sqlite3.Connection | None = None) -> bool:
-    cfg = _resolve_r2_config(conn)
-    if not cfg:
-        return True
-    cur = read_tg_runtime_lease(conn)
-    if cur and cur.get("_read_error"):
-        return False
-    if cur and cur.get("instance_id") not in (None, INSTANCE_ID):
-        return False
-    return write_tg_runtime_lease(released=True, conn=conn)
+    try:
+        cfg = _resolve_r2_config(conn)
+        if not cfg:
+            return True
+        cur = read_tg_runtime_lease(conn)
+        if cur and cur.get("_read_error"):
+            return False
+        if cur and cur.get("instance_id") not in (None, INSTANCE_ID):
+            return False
+        return write_tg_runtime_lease(released=True, conn=conn)
+    finally:
+        release_tg_local_lock()
 
 
 def schedule_cloud_backup(app: Any, delay_seconds: float = 1.5) -> None:

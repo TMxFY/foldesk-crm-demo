@@ -3,10 +3,12 @@ import hashlib
 import html
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import weakref
@@ -17,6 +19,8 @@ from urllib.parse import unquote, urlparse
 from datetime import datetime, timezone
 
 from app.db import DEFAULT_DB, resolve_session, utc_now
+
+logger = logging.getLogger(__name__)
 
 
 def _should_use_global_db_fallback(session_path: str | None = None) -> bool:
@@ -814,6 +818,96 @@ def extract_string_session_from_sqlite(path: Path) -> str | None:
         return None
 
 
+def extract_auth_key_sha256_from_string(session_string: str | None) -> str | None:
+    raw = str(session_string or "").strip()
+    if not raw:
+        return None
+    try:
+        from telethon.sessions import StringSession
+
+        ss = StringSession(raw)
+        ak = getattr(ss, "auth_key", None)
+        key = getattr(ak, "key", None) if ak is not None else None
+        if key and len(bytes(key)) == 256:
+            return hashlib.sha256(bytes(key)).hexdigest()
+    except Exception:
+        return None
+    return None
+
+
+def extract_auth_key_sha256_from_sqlite(path: Path) -> str | None:
+    if not path:
+        return None
+    try:
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+        with sqlite3.connect(p) as sconn:
+            row = sconn.execute(
+                "SELECT auth_key FROM sessions WHERE auth_key IS NOT NULL AND length(auth_key) = 256 LIMIT 1"
+            ).fetchone()
+            if row and row[0] and len(bytes(row[0])) == 256:
+                return hashlib.sha256(bytes(row[0])).hexdigest()
+    except Exception:
+        return None
+    return None
+
+
+def write_sqlite_session_from_string(session_string: str, dest_path: Path) -> bytes | None:
+    """Atomically materialize a canonical Telethon SQLite .session file from StringSession."""
+    raw = str(session_string or "").strip()
+    if not raw or not dest_path:
+        return None
+    try:
+        from telethon.crypto import AuthKey
+        from telethon.sessions import SQLiteSession, StringSession
+
+        ss = StringSession(raw)
+        ak = getattr(ss, "auth_key", None)
+        key = getattr(ak, "key", None) if ak is not None else None
+        if not key or len(bytes(key)) != 256:
+            return None
+        dc_id = int(getattr(ss, "dc_id", 2) or 2)
+        default_ip, default_port = _TELEGRAM_DC_IPV4.get(dc_id, ("149.154.167.50", 443))
+        server_address = str(getattr(ss, "server_address", "") or default_ip).strip() or default_ip
+        port = int(getattr(ss, "port", default_port) or default_port)
+
+        target = Path(dest_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".tmp_sess_", suffix=".session", dir=str(target.parent)
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            sq = SQLiteSession(str(tmp_path))
+            try:
+                sq.set_dc(dc_id, server_address, port)
+                sq.auth_key = AuthKey(bytes(key))
+                sq.save()
+            finally:
+                sq.close()
+            for suffix in ("-journal", "-wal", "-shm"):
+                tmp_side = tmp_path.with_name(tmp_path.name + suffix)
+                if tmp_side.exists():
+                    tmp_side.unlink(missing_ok=True)
+            os.replace(str(tmp_path), str(target))
+            for suffix in ("-journal", "-wal", "-shm"):
+                sidecar = target.with_name(target.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink(missing_ok=True)
+            return target.read_bytes()
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                tmp_side = tmp_path.with_name(tmp_path.name + suffix)
+                if tmp_side.exists():
+                    tmp_side.unlink(missing_ok=True)
+            raise
+    except Exception:
+        return None
+
+
 def _person_name(user) -> str:
     first = getattr(user, "first_name", None) or ""
     last = getattr(user, "last_name", None) or ""
@@ -914,16 +1008,31 @@ _PROXY_PRESET_COUNTRIES = {
 }
 
 _PHONE_PREFIX_COUNTRIES = (
+    # 3-digit prefixes first (longest-prefix match)
+    ("381", "rs"),
     ("380", "ua"),
     ("375", "by"),
-    ("998", "uz"),
     ("374", "am"),
     ("995", "ge"),
+    ("994", "az"),
+    ("996", "kg"),
+    ("998", "uz"),
+    ("992", "tj"),
+    ("993", "tm"),
+    ("373", "md"),
+    ("371", "lv"),
+    ("372", "ee"),
+    ("370", "lt"),
     ("971", "ae"),
+    ("972", "il"),
+    ("351", "pt"),
+    ("420", "cz"),
+    ("358", "fi"),
+    ("385", "hr"),
+    ("382", "me"),
+    ("359", "bg"),
+    # 2-digit prefixes
     ("77", "kz"),
-    # Direct MTProto TCP to Telegram DCs is blocked/throttled by TSPU on Russian residential ISPs;
-    # route +7 numbers via CIS Kazakhstan residential nodes by default.
-    ("7", "kz"),
     ("44", "gb"),
     ("49", "de"),
     ("33", "fr"),
@@ -934,8 +1043,148 @@ _PHONE_PREFIX_COUNTRIES = (
     ("90", "tr"),
     ("62", "id"),
     ("55", "br"),
+    ("43", "at"),
+    ("41", "ch"),
+    ("46", "se"),
+    ("47", "no"),
+    ("45", "dk"),
+    ("40", "ro"),
+    ("36", "hu"),
+    ("30", "gr"),
+    ("61", "au"),
+    ("81", "jp"),
+    ("82", "kr"),
+    ("65", "sg"),
+    ("91", "in"),
+    ("52", "mx"),
+    ("54", "ar"),
+    # 1-digit prefixes
+    # Direct MTProto TCP to Telegram DCs is blocked/throttled by TSPU on Russian residential ISPs;
+    # route +7 numbers via CIS Kazakhstan residential nodes by default.
+    ("7", "kz"),
     ("1", "us"),
 )
+
+CURATED_DEVICE_PROFILES: tuple[dict[str, str], ...] = (
+    {
+        "device_model": "MacBookPro18,3",
+        "system_version": "macOS 14.5",
+        "app_version": "5.12.3 macOS",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "MacBookAir10,1",
+        "system_version": "macOS 14.6",
+        "app_version": "5.12.1 macOS",
+        "lang_code": "en",
+        "system_lang_code": "en-GB",
+    },
+    {
+        "device_model": "Mac14,9",
+        "system_version": "macOS 15.1",
+        "app_version": "5.13.0 macOS",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Mac15,6",
+        "system_version": "macOS 15.2",
+        "app_version": "5.13.1 macOS",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "iMac21,1",
+        "system_version": "macOS 14.7",
+        "app_version": "5.12.2 macOS",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "ThinkPad X1 Carbon Gen 11",
+        "system_version": "Windows 11",
+        "app_version": "5.12.3 x64",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Dell XPS 13 9320",
+        "system_version": "Windows 11",
+        "app_version": "5.13.0 x64",
+        "lang_code": "en",
+        "system_lang_code": "en-GB",
+    },
+    {
+        "device_model": "HP Spectre x360 14",
+        "system_version": "Windows 11",
+        "app_version": "5.12.1 x64",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "ASUS Zenbook 14 OLED",
+        "system_version": "Windows 11",
+        "app_version": "5.13.1 x64",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Surface Laptop 5",
+        "system_version": "Windows 11",
+        "app_version": "5.12.2 x64",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Mac14,2",
+        "system_version": "macOS 14.4",
+        "app_version": "5.11.4 macOS",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Lenovo Yoga Slim 7",
+        "system_version": "Windows 11",
+        "app_version": "5.11.4 x64",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+)
+
+
+def deterministic_device_profile(account_id: int | None) -> dict[str, str]:
+    if account_id is None:
+        return dict(CURATED_DEVICE_PROFILES[0])
+    try:
+        idx = (abs(int(account_id)) - 1) % len(CURATED_DEVICE_PROFILES) if int(account_id) != 0 else 0
+    except (TypeError, ValueError):
+        idx = 0
+    return dict(CURATED_DEVICE_PROFILES[idx])
+
+
+def classify_proxy_mode(
+    proxy_url: str | None, *, nodemaven_configured: bool = False
+) -> str:
+    """Classify an account's effective proxy mode: rotating_nodemaven | static_isp | direct."""
+    raw = str(proxy_url or "").strip()
+    low = raw.lower()
+    if low in ("direct", "none", "off"):
+        return "direct"
+    if not raw:
+        return "rotating_nodemaven" if nodemaven_configured else "direct"
+    if (
+        low == "auto"
+        or low in _PROXY_PRESET_COUNTRIES
+        or low.startswith(("nodemaven:", "country-"))
+        or (len(low) == 2 and low.isalpha())
+    ):
+        return "rotating_nodemaven" if nodemaven_configured else "direct"
+    if "nodemaven.com" in low or ("-sid-" in low and "-ttl-" in low):
+        return "rotating_nodemaven"
+    if _parse_proxy_for_telethon(raw) is not None:
+        return "static_isp"
+    return "rotating_nodemaven" if nodemaven_configured else "direct"
 
 
 def infer_proxy_country(
@@ -1299,12 +1548,22 @@ class TelethonGateway(TelegramGateway):
         self._clients = {}
         self._locks = {}
         self._proxies = {}
+        self._proxy_changed: set[str] = set()
+        self._account_ids: dict[str, int] = {}
         self._app_credentials = {}
         self._device_profiles = {}
         self._session_strings: dict[str, str] = {}
         self._warmed_dialogs: set[str] = set()
+        self._warmed_sids: dict[str, float] = {}
+        self._sid_warmup_locks_by_loop: weakref.WeakKeyDictionary = (
+            weakref.WeakKeyDictionary()
+        )
+        self._disconnect_events: dict[str, list[float]] = {}
+        self._leaked_task_events: list[float] = []
         self._rpc_timeout: float = float(os.getenv("TG_RPC_TIMEOUT", "25.0") or "25.0")
-        self._disconnect_timeout: float = 2.0
+        self._disconnect_timeout: float = float(
+            os.getenv("TG_DISCONNECT_TIMEOUT", "5.0") or "5.0"
+        )
         self._connect_retry_delay: float = float(
             os.getenv("TG_CONNECT_RETRY_DELAY", "0.25") or "0.25"
         )
@@ -1327,32 +1586,116 @@ class TelethonGateway(TelegramGateway):
         )
         self._avatar_cooldowns: dict[tuple[str, str], float] = {}
         self._avatar_last_outcomes: dict[tuple[str, str], str] = {}
-        self._bg_disconnect_tasks: set[asyncio.Task] = set()
+
+    def _sid_key_from_proxy(self, proxy_url: str | None) -> str | None:
+        raw = str(proxy_url or "").strip()
+        if not raw:
+            return None
+        m = re.search(r"-sid-([a-zA-Z0-9_]+)", raw)
+        if m:
+            return f"sid:{m.group(1).lower()}"
+        parsed = _parse_proxy_for_telethon(raw)
+        if parsed:
+            return f"proxy:{parsed[1]}:{parsed[2]}:{parsed[4] or ''}"
+        return None
+
+    def _sid_warmup_lock(self, sid_key: str) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        loop_locks = self._sid_warmup_locks_by_loop.get(loop)
+        if loop_locks is None:
+            loop_locks = {}
+            self._sid_warmup_locks_by_loop[loop] = loop_locks
+        lock = loop_locks.get(sid_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            loop_locks[sid_key] = lock
+        return lock
+
+    def _account_telemetry_key(self, account_key: int | str) -> str:
+        if isinstance(account_key, int):
+            return str(account_key)
+        raw = str(account_key or "").strip()
+        if not raw:
+            return "unknown"
+        if raw in self._account_ids:
+            return str(self._account_ids[raw])
+        stem = Path(raw).stem if raw.endswith(".session") else raw
+        if stem.isdigit():
+            return stem
+        return raw
+
+    def record_disconnect(
+        self, account_key: int | str, reason: str = "", *, now_epoch: float | None = None
+    ) -> None:
+        ts = float(now_epoch) if now_epoch is not None else time.time()
+        cutoff = ts - 3600.0
+        key = self._account_telemetry_key(account_key)
+        events = [t for t in self._disconnect_events.get(key, []) if t >= cutoff]
+        events.append(ts)
+        self._disconnect_events[key] = events
+        logger.warning(
+            "TG disconnect account=%s reason=%s disconnects_1h=%d",
+            key,
+            reason or "unknown",
+            len(events),
+        )
+
+    def _record_leaked_tasks(self, count: int, *, now_epoch: float | None = None) -> None:
+        if count <= 0:
+            return
+        ts = float(now_epoch) if now_epoch is not None else time.time()
+        cutoff = ts - 3600.0
+        self._leaked_task_events = [t for t in self._leaked_task_events if t >= cutoff]
+        self._leaked_task_events.extend([ts] * int(count))
+
+    def get_telemetry(self, *, now_epoch: float | None = None) -> dict:
+        ts = float(now_epoch) if now_epoch is not None else time.time()
+        cutoff = ts - 3600.0
+        by_acc: dict[str, int] = {}
+        for k, timestamps in list(self._disconnect_events.items()):
+            recent = [t for t in timestamps if t >= cutoff]
+            if recent:
+                self._disconnect_events[k] = recent
+                by_acc[k] = len(recent)
+            else:
+                self._disconnect_events.pop(k, None)
+        self._leaked_task_events = [t for t in self._leaked_task_events if t >= cutoff]
+        connected_clients = 0
+        for client in list(self._clients.values()):
+            try:
+                if callable(getattr(client, "is_connected", None)) and client.is_connected():
+                    connected_clients += 1
+            except Exception:
+                pass
+        return {
+            "disconnects_1h_by_account": by_acc,
+            "disconnects_1h_total": sum(by_acc.values()),
+            "leaked_tasks_1h": len(self._leaked_task_events),
+            "connected_clients": connected_clients,
+        }
 
     def invalidate_proxy(self, key: str | int | None) -> None:
         if key is None:
             return
-        self._proxies.pop(key, None)
+        old = self._proxies.pop(key, None)
+        sid_key = self._sid_key_from_proxy(old)
+        if sid_key:
+            self._warmed_sids.pop(sid_key, None)
         key_str = str(key).strip()
         if not key_str:
             return
-        self._proxies.pop(key_str, None)
+        old_str = self._proxies.pop(key_str, None)
+        sid_key2 = self._sid_key_from_proxy(old_str)
+        if sid_key2:
+            self._warmed_sids.pop(sid_key2, None)
         if isinstance(key, int) or key_str.isdigit():
             stems = {key_str, f"acc{key_str}", f"acc_{key_str}"}
             for k in list(self._proxies.keys()):
                 if Path(str(k)).stem in stems:
-                    self._proxies.pop(k, None)
-
-    def _schedule_bg_disconnect(self, client) -> None:
-        if client is None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        task = loop.create_task(self._safe_disconnect(client))
-        self._bg_disconnect_tasks.add(task)
-        task.add_done_callback(self._bg_disconnect_tasks.discard)
+                    popped = self._proxies.pop(k, None)
+                    sk = self._sid_key_from_proxy(popped)
+                    if sk:
+                        self._warmed_sids.pop(sk, None)
 
     def set_session_string(self, session_path: str, session_string: str | None) -> None:
         if not session_path:
@@ -1373,6 +1716,7 @@ class TelethonGateway(TelegramGateway):
             return
         self._session_strings.pop(session_path, None)
         self._warmed_dialogs.discard(session_path)
+        self._proxy_changed.discard(session_path)
 
     def _resolve_session_string(self, session_path: str) -> str | None:
         if not session_path:
@@ -1432,9 +1776,33 @@ class TelethonGateway(TelegramGateway):
         else:
             self._proxies.pop(session_path, None)
         if clean != old_proxy:
-            old_client = self._clients.pop(session_path, None)
-            if old_client is not None:
-                self._schedule_bg_disconnect(old_client)
+            old_sid = self._sid_key_from_proxy(old_proxy)
+            if old_sid:
+                self._warmed_sids.pop(old_sid, None)
+            if session_path in self._clients:
+                self._proxy_changed.add(session_path)
+
+    async def apply_proxy(self, session_path: str, proxy_url: str | None) -> None:
+        """Safely swap proxy under per-session lock, awaiting full disconnect of any existing client."""
+        if not session_path:
+            return
+        async with self._session_lock(session_path):
+            clean = (proxy_url or "").strip() or None
+            old_proxy = self._proxies.get(session_path)
+            if clean:
+                self._proxies[session_path] = clean
+            else:
+                self._proxies.pop(session_path, None)
+            self._proxy_changed.discard(session_path)
+            if clean != old_proxy:
+                old_sid = self._sid_key_from_proxy(old_proxy)
+                if old_sid:
+                    self._warmed_sids.pop(old_sid, None)
+                old_client = self._clients.pop(session_path, None)
+                self._warmed_dialogs.discard(session_path)
+                if old_client is not None:
+                    await self._safe_disconnect(old_client)
+                    self.record_disconnect(session_path, reason="proxy_changed")
 
     def set_app_credentials(
         self, session_path: str, app_id: int | str | None, app_hash: str | None
@@ -1473,13 +1841,14 @@ class TelethonGateway(TelegramGateway):
             self._device_profiles[session_path] = prof
 
     def _resolve_device_profile(self, session_path: str | None = None) -> dict[str, str]:
-        defaults = {
-            "device_model": "MacBookPro18,3",
-            "system_version": "macOS 14.5",
-            "app_version": "5.12.3 macOS",
-            "lang_code": "en",
-            "system_lang_code": "en-US",
-        }
+        acc_id_hint: int | None = None
+        if session_path:
+            acc_id_hint = self._account_ids.get(session_path)
+            if acc_id_hint is None:
+                stem = Path(session_path).stem
+                if stem.isdigit():
+                    acc_id_hint = int(stem)
+        defaults = deterministic_device_profile(acc_id_hint)
         if not session_path:
             return defaults
         cached = self._device_profiles.get(session_path)
@@ -1490,7 +1859,7 @@ class TelethonGateway(TelegramGateway):
                 with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                     row = c.execute(
                         """
-                        SELECT device_model, system_version, app_version, lang_code, system_lang_code
+                        SELECT id, device_model, system_version, app_version, lang_code, system_lang_code
                         FROM accounts
                         WHERE session_path = ?
                         ORDER BY id DESC LIMIT 1
@@ -1498,11 +1867,14 @@ class TelethonGateway(TelegramGateway):
                         (session_path,),
                     ).fetchone()
                     if row:
+                        if row[0] is not None:
+                            self._account_ids[session_path] = int(row[0])
+                            defaults = deterministic_device_profile(int(row[0]))
                         db_prof = {
                             k: str(v).strip()
                             for k, v in zip(
                                 ("device_model", "system_version", "app_version", "lang_code", "system_lang_code"),
-                                row,
+                                row[1:],
                             )
                             if v and str(v).strip()
                         }
@@ -1518,48 +1890,75 @@ class TelethonGateway(TelegramGateway):
         if cached and _parse_proxy_for_telethon(cached) is not None:
             return cached
 
-        acc_id = None
-        phone = None
+        acc_id: int | None = self._account_ids.get(session_path)
+        phone: str | None = None
         db_proxy = cached
-        try:
-            if conn is not None:
+        if conn is not None:
+            try:
                 row = conn.execute(
                     "SELECT id, phone, proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
                     (session_path,),
                 ).fetchone()
                 if row:
-                    acc_id, phone, db_proxy = row[0], row[1], db_proxy or row[2]
-            elif DEFAULT_DB.exists():
+                    acc_id = int(row[0])
+                    self._account_ids[session_path] = acc_id
+                    phone = row[1]
+                    db_proxy = db_proxy or row[2]
+            except Exception as exc:
+                raise GatewayError(
+                    f"Ошибка чтения конфигурации прокси из БД для {session_path}: {exc}"
+                ) from exc
+        elif _should_use_global_db_fallback(session_path):
+            try:
                 with sqlite3.connect(DEFAULT_DB, timeout=15.0) as c:
                     row = c.execute(
                         "SELECT id, phone, proxy_url FROM accounts WHERE session_path = ? ORDER BY id DESC LIMIT 1",
                         (session_path,),
                     ).fetchone()
                     if row:
-                        acc_id, phone, db_proxy = row[0], row[1], db_proxy or row[2]
-        except Exception:
-            pass
+                        acc_id = int(row[0])
+                        self._account_ids[session_path] = acc_id
+                        phone = row[1]
+                        db_proxy = db_proxy or row[2]
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise GatewayError(
+                        f"БД недоступна при чтении прокси для {session_path}: {exc}"
+                    ) from exc
+            except Exception as exc:
+                raise GatewayError(
+                    f"Ошибка чтения конфигурации прокси из БД для {session_path}: {exc}"
+                ) from exc
 
         proxy_val = str(db_proxy or "").strip()
+        if proxy_val.lower() in ("direct", "none", "off"):
+            return None
         if proxy_val and _parse_proxy_for_telethon(proxy_val) is not None:
             self._proxies[session_path] = proxy_val
             return proxy_val
 
-        # Preset or empty -> try building sticky NodeMaven URL for this account
+        nm_cfg = resolve_nodemaven_config(conn)
+        proxy_required = bool(nm_cfg) or bool(proxy_val)
+        if not proxy_required:
+            return None
+
+        if acc_id is None:
+            raise GatewayError(
+                f"Не удалось определить account_id для стабильного прокси ({session_path}); прямое подключение заблокировано"
+            )
+
         nm_url = build_nodemaven_proxy_url(
-            account_key=acc_id or session_path,
+            account_key=int(acc_id),
             phone=phone,
             preset=proxy_val or "auto",
             conn=conn,
         )
-        if nm_url:
-            self._proxies[session_path] = nm_url
-            return nm_url
-
-        if proxy_val:
-            self._proxies[session_path] = proxy_val
-            return proxy_val
-        return None
+        if not nm_url:
+            raise GatewayError(
+                f"Прокси '{proxy_val or 'auto'}' для аккаунта #{acc_id} не разрешился; откат на прямой VPS IP заблокирован"
+            )
+        self._proxies[session_path] = nm_url
+        return nm_url
 
     def _session_lock(self, session_path: str) -> asyncio.Lock:
         lock = self._locks.get(session_path)
@@ -1614,29 +2013,91 @@ class TelethonGateway(TelegramGateway):
         try:
             is_conn_fn = getattr(client, "is_connected", None)
             has_sender = getattr(client, "_sender", None) is not None
-            should_disc = True if not callable(is_conn_fn) else bool(is_conn_fn() or has_sender)
+            has_borrowed = bool(getattr(client, "_borrowed_senders", None))
+            should_disc = (
+                True
+                if not callable(is_conn_fn)
+                else bool(is_conn_fn() or has_sender or has_borrowed)
+            )
             if should_disc and hasattr(client, "disconnect"):
                 disc_res = client.disconnect()
                 if inspect.isawaitable(disc_res):
                     await asyncio.wait_for(disc_res, timeout=self._disconnect_timeout)
         except (asyncio.TimeoutError, Exception):
             pass
-        try:
-            sender = getattr(client, "_sender", None)
-            if sender is not None:
-                lingering: list[asyncio.Task] = []
-                for attr_name in ("_send_loop_handle", "_recv_loop_handle", "_reconnect_task"):
-                    handle = getattr(sender, attr_name, None)
-                    if isinstance(handle, asyncio.Task) and not handle.done():
-                        handle.cancel()
-                        lingering.append(handle)
-                if lingering:
-                    await asyncio.wait_for(
-                        asyncio.gather(*lingering, return_exceptions=True),
-                        timeout=0.5,
-                    )
-        except (asyncio.TimeoutError, Exception):
-            pass
+
+        # Reap every lingering Telethon sender/connection/borrowed task to eliminate
+        # "Task was destroyed but it is pending!" leaks (Telethon 1.45 Connection.disconnect bug).
+        lingering: list[asyncio.Task] = []
+        seen_task_ids: set[int] = set()
+
+        def _collect_task(task_obj) -> None:
+            if isinstance(task_obj, asyncio.Task) and not task_obj.done():
+                tid = id(task_obj)
+                if tid not in seen_task_ids:
+                    seen_task_ids.add(tid)
+                    lingering.append(task_obj)
+
+        for attr_name in ("_updates_handle", "_keepalive_handle", "_ping_task"):
+            _collect_task(getattr(client, attr_name, None))
+
+        senders: list = []
+        main_sender = getattr(client, "_sender", None)
+        if main_sender is not None:
+            senders.append(main_sender)
+        borrowed = getattr(client, "_borrowed_senders", None)
+        if isinstance(borrowed, dict):
+            for entry in list(borrowed.values()):
+                if isinstance(entry, tuple):
+                    for part in entry:
+                        if part is not None and (
+                            hasattr(part, "_connection")
+                            or hasattr(part, "_send_loop_handle")
+                            or hasattr(part, "disconnect")
+                        ):
+                            senders.append(part)
+                elif entry is not None:
+                    senders.append(entry)
+            borrowed.clear()
+        elif isinstance(borrowed, (list, set, tuple)):
+            for entry in list(borrowed):
+                if entry is not None:
+                    senders.append(entry)
+
+        for sender in senders:
+            for attr_name in (
+                "_send_loop_handle",
+                "_recv_loop_handle",
+                "_reconnect_task",
+                "_ack_handle",
+                "_send_queue_task",
+            ):
+                _collect_task(getattr(sender, attr_name, None))
+            conn_obj = getattr(sender, "_connection", None)
+            if conn_obj is not None:
+                for conn_attr in ("_send_task", "_recv_task"):
+                    _collect_task(getattr(conn_obj, conn_attr, None))
+                writer = getattr(conn_obj, "_writer", None)
+                if writer is not None and hasattr(writer, "close"):
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+
+        if lingering:
+            self._record_leaked_tasks(len(lingering))
+            for task_obj in lingering:
+                try:
+                    task_obj.cancel()
+                except Exception:
+                    pass
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*lingering, return_exceptions=True),
+                    timeout=1.0,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
         try:
             sess = getattr(client, "session", None)
             if sess is not None and hasattr(sess, "close"):
@@ -1647,10 +2108,21 @@ class TelethonGateway(TelegramGateway):
     async def _drop_zombie_client_unlocked(self, session_path: str) -> None:
         client = self._clients.pop(session_path, None)
         self._warmed_dialogs.discard(session_path)
+        self._proxy_changed.discard(session_path)
         self.invalidate_proxy(session_path)
+        if client is not None:
+            self.record_disconnect(session_path, reason="zombie_drop")
         await self._safe_disconnect(client)
 
-    async def _open(self, session_path: str):
+    async def _ensure_connected(self, session_path: str):
+        if session_path in self._proxy_changed:
+            self._proxy_changed.discard(session_path)
+            old_client = self._clients.pop(session_path, None)
+            self._warmed_dialogs.discard(session_path)
+            if old_client is not None:
+                await self._safe_disconnect(old_client)
+                self.record_disconnect(session_path, reason="proxy_changed")
+
         client = self._clients.get(session_path)
         if client is not None:
             if client.is_connected():
@@ -1662,7 +2134,9 @@ class TelethonGateway(TelegramGateway):
                 await self._safe_disconnect(client)
                 self._clients.pop(session_path, None)
                 self._warmed_dialogs.discard(session_path)
-                if not isinstance(exc, Exception):
+                if isinstance(exc, Exception):
+                    self.record_disconnect(session_path, reason="reconnect_failed")
+                else:
                     raise
         from telethon import TelegramClient
         from telethon.sessions import StringSession
@@ -1672,7 +2146,19 @@ class TelethonGateway(TelegramGateway):
         dev_profile = self._resolve_device_profile(session_path)
         sess_str = self._resolve_session_string(session_path)
         proxy_tuple = _parse_proxy_for_telethon(primary_url)
+        sid_key = self._sid_key_from_proxy(primary_url)
+        proxy_mode = classify_proxy_mode(
+            primary_url, nodemaven_configured=bool(primary_url and "nodemaven.com" in primary_url.lower())
+        )
         last_exc: Exception | None = None
+
+        async def _connect_once(cl) -> None:
+            if sid_key and sid_key not in self._warmed_sids:
+                async with self._sid_warmup_lock(sid_key):
+                    await asyncio.wait_for(cl.connect(), timeout=self._rpc_timeout)
+                    self._warmed_sids[sid_key] = time.monotonic()
+            else:
+                await asyncio.wait_for(cl.connect(), timeout=self._rpc_timeout)
 
         for attempt in range(2):
             if sess_str:
@@ -1694,13 +2180,21 @@ class TelethonGateway(TelegramGateway):
                 kwargs["retry_delay"] = 1
             client = TelegramClient(session_obj, api_id, api_hash, **kwargs)
             try:
-                await asyncio.wait_for(client.connect(), timeout=self._rpc_timeout)
+                await _connect_once(client)
                 self._clients[session_path] = client
+                logger.info(
+                    "TG connected account=%s session=%s proxy_mode=%s",
+                    self._account_telemetry_key(session_path),
+                    session_path,
+                    proxy_mode,
+                )
                 return client, False
             except BaseException as exc:
                 await self._safe_disconnect(client)
                 if not isinstance(exc, Exception):
                     raise
+                if sid_key:
+                    self._warmed_sids.pop(sid_key, None)
                 last_exc = exc
                 if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
                     break
@@ -1717,9 +2211,13 @@ class TelethonGateway(TelegramGateway):
             raise last_exc
         raise GatewayError("Не удалось подключиться к Telegram")
 
+    async def _open(self, session_path: str):
+        return await self._ensure_connected(session_path)
+
     async def _close(self, session_path: str) -> None:
         async with self._session_lock(session_path):
             client = self._clients.pop(session_path, None)
+            self._proxy_changed.discard(session_path)
             self.invalidate_proxy(session_path)
             self._app_credentials.pop(session_path, None)
             self._device_profiles.pop(session_path, None)
@@ -1732,19 +2230,7 @@ class TelethonGateway(TelegramGateway):
                 await self._close(path)
             except Exception:
                 pass
-        pending_bg = [t for t in list(self._bg_disconnect_tasks) if not t.done()]
-        if pending_bg:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending_bg, return_exceptions=True),
-                    timeout=self._disconnect_timeout,
-                )
-            except (asyncio.TimeoutError, Exception):
-                for t in pending_bg:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*pending_bg, return_exceptions=True)
-        self._bg_disconnect_tasks.clear()
+        self._proxy_changed.clear()
 
     def _reset_corrupted_session_file(self, session_path: str) -> None:
         try:

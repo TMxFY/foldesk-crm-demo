@@ -21,10 +21,10 @@ Environment="CRMTG_VPS_RUNTIME=1"
 Environment="ENABLE_TG_PERSISTENT_WATCHES=1"
 Environment="CRM_REQUIRE_AUTH=1"
 Environment="PORT=18084"
-ExecStart=/opt/crmtg/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 18084 --timeout-graceful-shutdown 5
+ExecStart=/opt/crmtg/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 18084 --timeout-graceful-shutdown 25
 Restart=always
 RestartSec=5
-TimeoutStopSec=15
+TimeoutStopSec=35
 
 [Install]
 WantedBy=multi-user.target
