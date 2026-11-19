@@ -24,6 +24,7 @@ from app.db import (
     is_newer_dialog_snapshot_unbacked,
     is_recipient_contacted_outreach,
     is_vacancy_campaign_meta,
+    is_waiting_our_answer,
     locked_conn,
     normalize_status,
     safe_int,
@@ -364,6 +365,9 @@ def _public(row) -> dict:
         out["account_username"] = data["account_username"]
     if "lead_status" in data and data["lead_status"] is not None:
         out["lead_status"] = data["lead_status"]
+    out["is_waiting_our_answer"] = is_waiting_our_answer(
+        out["last_from_peer"], out.get("lead_status")
+    )
     return out
 
 
@@ -2174,6 +2178,7 @@ def sync_inbox(
             )
             if item is not None:
                 saved.append(item)
+        repair_dialog_last_from_peer_drift(conn, account_id=account_id, commit=False)
         conn.commit()
     except (sqlite3.IntegrityError, TypeError, ValueError) as exc:
         conn.rollback()
@@ -2181,8 +2186,111 @@ def sync_inbox(
     return saved
 
 
+def repair_dialog_last_from_peer_drift(
+    conn,
+    *,
+    account_id: int | None = None,
+    commit: bool = True,
+) -> dict[str, int]:
+    """Reconcile dialogs.last_from_peer against the actual latest row in messages.
+
+    Preserves dialogs whose snapshot is genuinely newer than the latest cached
+    message (is_newer_dialog_snapshot_unbacked == True).
+    """
+    params: list = []
+    where = ""
+    if account_id is not None and int(account_id) != 0:
+        where = "WHERE d.account_id = ?"
+        params.append(int(account_id))
+
+    dlg_rows = conn.execute(
+        f"""
+        SELECT d.id, d.last_from_peer, d.last_message_at, d.last_message_preview
+        FROM dialogs d
+        {where}
+        """,
+        params,
+    ).fetchall()
+    if not dlg_rows:
+        return {"checked": 0, "repaired": 0, "repaired_to_in": 0, "repaired_to_out": 0}
+
+    dlg_map = {int(r["id"]): r for r in dlg_rows}
+    latest_by_dlg: dict[int, tuple[tuple[str, int], str, str, str]] = {}
+    dids = list(dlg_map.keys())
+    for start in range(0, len(dids), 400):
+        chunk = dids[start : start + 400]
+        ph = ",".join("?" for _ in chunk)
+        for m in conn.execute(
+            f"""
+            SELECT id, dialog_id, direction, text, sent_at
+            FROM messages
+            WHERE dialog_id IN ({ph})
+            """,
+            chunk,
+        ).fetchall():
+            did = int(m["dialog_id"])
+            direction = str(m["direction"] or "").strip().lower()
+            if direction not in ("in", "out"):
+                continue
+            ts = _norm_ts(m["sent_at"])
+            key = (ts, int(m["id"]))
+            prev = latest_by_dlg.get(did)
+            if prev is None or key > prev[0]:
+                latest_by_dlg[did] = (
+                    key,
+                    direction,
+                    str(m["sent_at"] or ""),
+                    str(m["text"] or ""),
+                )
+
+    now = utc_now()
+    checked = 0
+    repaired = 0
+    repaired_in = 0
+    repaired_out = 0
+    for did, (_key, m_dir, m_sent_at, m_text) in latest_by_dlg.items():
+        drow = dlg_map[did]
+        checked += 1
+        cur_lfp = int(drow["last_from_peer"] or 0)
+        expected_lfp = 1 if m_dir == "in" else 0
+        if cur_lfp == expected_lfp:
+            continue
+        if is_newer_dialog_snapshot_unbacked(
+            drow["last_message_preview"],
+            drow["last_message_at"],
+            cur_lfp,
+            m_text,
+            m_sent_at,
+            m_dir,
+        ):
+            continue
+        conn.execute(
+            "UPDATE dialogs SET last_from_peer = ?, updated_at = ? WHERE id = ?",
+            (expected_lfp, now, did),
+        )
+        repaired += 1
+        if expected_lfp == 1:
+            repaired_in += 1
+        else:
+            repaired_out += 1
+
+    if repaired and commit:
+        conn.commit()
+    return {
+        "checked": checked,
+        "repaired": repaired,
+        "repaired_to_in": repaired_in,
+        "repaired_to_out": repaired_out,
+    }
+
+
 class InboxResultList(list):
-    def __init__(self, items=(), counts: dict | None = None):
+    def __init__(
+        self,
+        items=(),
+        counts: dict | None = None,
+        workspace_total_dialogs: int | None = None,
+    ):
         super().__init__(items)
         self.counts = counts or {
             "waiting": 0,
@@ -2191,6 +2299,11 @@ class InboxResultList(list):
             "groups": 0,
             "muted": 0,
         }
+        self.workspace_total_dialogs = (
+            int(workspace_total_dialogs)
+            if workspace_total_dialogs is not None
+            else len(self)
+        )
 
 
 _INBOX_SELECT_SQL = """
@@ -2264,6 +2377,9 @@ def _resolve_missing_lead_status_by_phone(conn, dialogs: list[dict]) -> None:
             d["lead_status"] = best["status"]
         if not d.get("lead_id") and best.get("id"):
             d["lead_id"] = best["id"]
+        d["is_waiting_our_answer"] = is_waiting_our_answer(
+            d.get("last_from_peer"), d.get("lead_status")
+        )
 
 
 def _filter_crm_only_rows(conn, rows: list[dict]) -> list[dict]:
@@ -2492,16 +2608,38 @@ def _query_inbox_rows(
     if needle:
         folded = needle.casefold()
         needle_digits = re.sub(r"\D", "", needle)
+        lead_search_by_id: dict[int, tuple[str, str, str]] = {}
+        try:
+            for lr in conn.execute(
+                "SELECT id, name, company, note FROM leads"
+            ).fetchall():
+                lead_search_by_id[int(lr["id"])] = (
+                    str(lr["name"] or ""),
+                    str(lr["company"] or ""),
+                    str(lr["note"] or ""),
+                )
+        except Exception:
+            pass
         matched = []
         for row in found:
             phone_str = row.get("phone") or ""
             phone_digits = re.sub(r"\D", "", phone_str)
+            lid = row.get("lead_id")
+            l_name, l_company, l_note = (
+                lead_search_by_id.get(int(lid), ("", "", ""))
+                if lid is not None
+                else ("", "", "")
+            )
             blob = " ".join((
                 row.get("name") or "",
                 row.get("username") or "",
                 phone_str,
                 phone_digits,
                 str(row.get("telegram_user_id") or ""),
+                row.get("last_message_preview") or "",
+                l_name,
+                l_company,
+                l_note,
                 row.get("account_name") or "",
                 row.get("account_phone") or "",
                 row.get("provider") or "",
@@ -2515,12 +2653,20 @@ def _query_inbox_rows(
 
 def compute_inbox_counts(dialogs: list[dict]) -> dict:
     return {
-        "waiting": sum(1 for d in dialogs if int(d.get("last_from_peer") or 0) == 1),
+        "waiting": sum(
+            1
+            for d in dialogs
+            if is_waiting_our_answer(d.get("last_from_peer"), d.get("lead_status"))
+        ),
         "our_turn": sum(1 for d in dialogs if int(d.get("last_from_peer") or 0) == 0),
         "unread": sum(1 for d in dialogs if int(d.get("unread_count") or 0) > 0),
         "groups": sum(1 for d in dialogs if int(d.get("is_group") or 0) == 1),
         "muted": sum(1 for d in dialogs if int(d.get("muted") or 0) == 1),
     }
+
+
+def get_workspace_total_dialogs(conn, *, crm_only: bool = True) -> int:
+    return len(_query_inbox_rows(conn, account_id=None, crm_only=crm_only))
 
 
 def get_inbox_counts(
@@ -2543,7 +2689,9 @@ def get_inbox_counts(
 
 
 def _matches_chips(row: dict, chips: set[str]) -> bool:
-    if "waiting" in chips and int(row.get("last_from_peer") or 0) != 1:
+    if "waiting" in chips and not is_waiting_our_answer(
+        row.get("last_from_peer"), row.get("lead_status")
+    ):
         return False
     if "our_turn" in chips and int(row.get("last_from_peer") or 0) != 0:
         return False
@@ -2576,6 +2724,17 @@ def list_inbox(
         crm_only=crm_only,
     )
     counts = compute_inbox_counts(base_rows)
+    is_unfiltered_workspace = (
+        (account_id is None or int(account_id) == 0)
+        and not (q or "").strip()
+        and not (provider or "").strip()
+        and not (status or "").strip()
+    )
+    workspace_total = (
+        len(base_rows)
+        if is_unfiltered_workspace
+        else len(_query_inbox_rows(conn, account_id=None, crm_only=crm_only))
+    )
 
     chips = {c.strip().lower() for c in (chip or "").split(",") if c.strip()}
     if chips:
@@ -2601,8 +2760,14 @@ def list_inbox(
         capped = filtered[:cap]
 
     if with_counts:
-        return {"dialogs": capped, "counts": counts}
-    return InboxResultList(capped, counts=counts)
+        return {
+            "dialogs": capped,
+            "items": capped,
+            "counts": counts,
+            "workspace_total_dialogs": workspace_total,
+            "total_dialogs": workspace_total,
+        }
+    return InboxResultList(capped, counts=counts, workspace_total_dialogs=workspace_total)
 
 
 def _load_dialog_public(conn, dialog_id: int) -> dict:

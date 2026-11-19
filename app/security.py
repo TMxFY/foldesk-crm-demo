@@ -107,10 +107,7 @@ _MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 def is_auth_enforced() -> bool:
     if os.getenv("CRM_REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes"):
         return True
-    if (
-        os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in ("1", "true", "yes")
-        and os.getenv("BOT_TOKEN") != "e2e-not-a-secret"
-    ):
+    if os.getenv("CRMTG_VPS_RUNTIME", "").strip().lower() in ("1", "true", "yes"):
         return True
     return False
 
@@ -191,7 +188,8 @@ def has_valid_mcp_api_key(request: Request) -> bool:
         provided = auth_hdr[7:].strip()
     if not provided:
         provided = (
-            request.headers.get("x-mcp-api-key")
+            request.headers.get("x-api-key")
+            or request.headers.get("x-mcp-api-key")
             or request.headers.get("x-mcp-key")
             or request.headers.get("x-bot-webhook-secret")
             or ""
@@ -239,6 +237,7 @@ def is_blocked_user_agent(request: Request, path: str) -> bool:
     if path.startswith("/api/") and (
         (request.headers.get("authorization") or "").strip()
         or (request.headers.get("x-foldesk-token") or "").strip()
+        or (request.headers.get("x-api-key") or "").strip()
         or (request.headers.get("x-mcp-api-key") or "").strip()
         or (request.headers.get("x-mcp-key") or "").strip()
         or (request.headers.get("x-bot-webhook-secret") or "").strip()
@@ -334,6 +333,8 @@ def _has_auth_credentials(request: Request) -> bool:
         return True
     if (request.headers.get("x-foldesk-token") or "").strip():
         return True
+    if (request.headers.get("x-api-key") or "").strip():
+        return True
     if (request.headers.get("x-mcp-api-key") or "").strip():
         return True
     if (request.headers.get("x-mcp-key") or "").strip():
@@ -350,6 +351,7 @@ def _is_loopback_direct(request: Request) -> bool:
     has_forwarded = bool(
         (request.headers.get("x-forwarded-for") or "").strip()
         or (request.headers.get("x-real-ip") or "").strip()
+        or (request.headers.get("cf-connecting-ip") or "").strip()
     )
     client_ip = extract_client_ip(request)
     return (
@@ -357,6 +359,24 @@ def _is_loopback_direct(request: Request) -> bool:
         and client_host in ("127.0.0.1", "::1", "testclient")
         and client_ip in ("127.0.0.1", "::1", "testclient")
     )
+
+
+def is_strict_loopback_direct(request: Request) -> bool:
+    """Strict loopback check for /api/health?deep=1 (127.0.0.1 / ::1 only, no proxy headers)."""
+    client_host = (request.client.host or "").strip() if request.client else ""
+    has_forwarded = bool(
+        (request.headers.get("x-forwarded-for") or "").strip()
+        or (request.headers.get("x-real-ip") or "").strip()
+        or (request.headers.get("cf-connecting-ip") or "").strip()
+    )
+    return not has_forwarded and client_host in ("127.0.0.1", "::1")
+
+
+def _is_deep_health_request(request: Request, path: str) -> bool:
+    if path != "/api/health":
+        return False
+    raw_deep = (request.query_params.get("deep") or "").strip().lower()
+    return raw_deep not in ("", "0", "false", "no", "off")
 
 
 def _get_rate_buckets(request: Request, attr_name: str) -> dict[str, list[float]]:
@@ -563,6 +583,18 @@ def register_security_middleware(app: FastAPI) -> None:
                             return _rate_limited_response(path, retry_after)
 
             is_authenticated = user is not None or api_mcp_ok
+            if (
+                _is_deep_health_request(request, path)
+                and not is_authenticated
+                and not is_strict_loopback_direct(request)
+            ):
+                return apply_security_headers(
+                    JSONResponse(
+                        {"detail": "Требуется авторизация для deep health"},
+                        status_code=401,
+                    ),
+                    path,
+                )
             if not _is_public_path(path) and not is_authenticated:
                 if path.startswith("/api/"):
                     return apply_security_headers(

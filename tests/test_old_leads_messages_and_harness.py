@@ -394,9 +394,10 @@ def test_old_won_lead_unread_counts_in_waiting_without_colleague_alert(tmp_path,
     )
     assert len(sent_alerts) == 1
 
-    # Yet stats MUST count the unread message from the won client too!
+    # Closed won client counts in direct_client_replies, while canonical SSOT
+    # waiting_our_answer strictly counts active open deals only (talking_lead).
     summary = get_analytics_summary(conn, period="7d")
-    assert summary["deep_outreach"]["summary"]["waiting_our_answer"] == 2
+    assert summary["deep_outreach"]["summary"]["waiting_our_answer"] == 1
     assert summary["deep_outreach"]["summary"]["direct_client_replies"] >= 2
 
 

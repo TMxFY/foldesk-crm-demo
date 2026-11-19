@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 
@@ -718,6 +719,28 @@ def _find_matching_crm_lead(
     return None
 
 
+def _next_monotonic_sync_ts(
+    synced_at: str,
+    old_synced: str | None,
+    old_updated: str | None,
+) -> str:
+    cand = str(synced_at or "").strip() or utc_now()
+    prev_s = str(old_synced or "").strip()
+    prev_u = str(old_updated or "").strip()
+    ceiling = max(prev_s, prev_u)
+    if not ceiling or cand > ceiling:
+        return cand
+    base = ceiling[:19] if len(ceiling) >= 19 else cand[:19]
+    try:
+        dt = datetime.fromisoformat(base.replace(" ", "T"))
+        advanced = (dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        if advanced > ceiling:
+            return advanced
+    except Exception:
+        pass
+    return f"{ceiling}z"
+
+
 def _mark_lead_synced(
     conn: sqlite3.Connection,
     lead_id: int,
@@ -725,7 +748,14 @@ def _mark_lead_synced(
     airtable_record_id: str | None,
     airtable_status: str | None,
     synced_at: str,
-) -> None:
+) -> str:
+    row = conn.execute(
+        "SELECT updated_at, airtable_synced_at FROM leads WHERE id = ?",
+        (int(lead_id),),
+    ).fetchone()
+    old_updated = row["updated_at"] if row is not None else None
+    old_synced = row["airtable_synced_at"] if row is not None else None
+    effective_ts = _next_monotonic_sync_ts(synced_at, old_synced, old_updated)
     conn.execute(
         """
         UPDATE leads
@@ -735,8 +765,86 @@ def _mark_lead_synced(
             airtable_synced_at = ?
         WHERE id = ?
         """,
-        (airtable_record_id, airtable_status, synced_at, synced_at, int(lead_id)),
+        (airtable_record_id, airtable_status, effective_ts, effective_ts, int(lead_id)),
     )
+    return effective_ts
+
+
+def _normalize_lead_compare_value(
+    key: str,
+    val: Any,
+    conn: sqlite3.Connection | None = None,
+) -> Any:
+    if key in ("amount", "monthly_value"):
+        try:
+            return int(val or 0)
+        except (TypeError, ValueError):
+            return 0
+    if key == "offer_type":
+        return tuple(_parse_offer_type(val))
+    if key == "username":
+        return (_clean_username(val) or "").casefold()
+    if key == "status":
+        raw = str(val or "").strip()
+        if not raw:
+            return "new"
+        try:
+            return normalize_status(raw, conn).strip().lower()
+        except ValueError:
+            return raw.lower()
+    if key in ("next_follow_up", "last_contacted"):
+        return _clean_date(val) or ""
+    return str(val or "").strip()
+
+
+def _compute_effective_lead_patch(
+    existing: dict[str, Any],
+    patch: dict[str, Any],
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    diff: dict[str, Any] = {}
+    for key, new_val in patch.items():
+        old_norm = _normalize_lead_compare_value(key, existing.get(key), conn)
+        new_norm = _normalize_lead_compare_value(key, new_val, conn)
+        if old_norm != new_norm:
+            diff[key] = new_val
+    return diff
+
+
+def prune_redundant_airtable_synced_events(conn: sqlite3.Connection) -> dict[str, int]:
+    """Compact bloated lead_events by keeping only the latest airtable_synced event per lead_id.
+
+    Never touches any non-'airtable_synced' event_type.
+    """
+    before = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM lead_events WHERE event_type = 'airtable_synced'"
+        ).fetchone()[0]
+        or 0
+    )
+    if before == 0:
+        return {"deleted": 0, "remaining": 0}
+    cur = conn.execute(
+        """
+        DELETE FROM lead_events
+        WHERE event_type = 'airtable_synced'
+          AND id NOT IN (
+              SELECT MAX(id)
+              FROM lead_events
+              WHERE event_type = 'airtable_synced'
+              GROUP BY lead_id
+          )
+        """
+    )
+    deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+    conn.commit()
+    remaining = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM lead_events WHERE event_type = 'airtable_synced'"
+        ).fetchone()[0]
+        or 0
+    )
+    return {"deleted": deleted, "remaining": remaining}
 
 
 def _resolve_related_lead_id(
@@ -957,8 +1065,9 @@ def pull_from_airtable(
                     amt_patch["monthly_value"] = int(mapped["monthly_value"])
                 if not existing.get("airtable_record_id") and mapped.get("airtable_record_id"):
                     amt_patch["airtable_record_id"] = mapped["airtable_record_id"]
-                if amt_patch:
-                    update_lead(conn, lead_id, **amt_patch)
+                effective_amt_patch = _compute_effective_lead_patch(existing, amt_patch, conn)
+                if effective_amt_patch:
+                    update_lead(conn, lead_id, **effective_amt_patch)
                     updated_in_crm += 1
                 continue
 
@@ -1007,8 +1116,20 @@ def pull_from_airtable(
             ):
                 patch["monthly_value"] = mapped["monthly_value"]
 
-            update_lead(conn, lead_id, **patch)
-            _mark_lead_synced(
+            effective_patch = _compute_effective_lead_patch(existing, patch, conn)
+            if not effective_patch:
+                if not existing.get("airtable_synced_at"):
+                    _mark_lead_synced(
+                        conn,
+                        lead_id,
+                        airtable_record_id=mapped["airtable_record_id"],
+                        airtable_status=mapped["airtable_status"],
+                        synced_at=now,
+                    )
+                continue
+
+            update_lead(conn, lead_id, **effective_patch)
+            synced_ts = _mark_lead_synced(
                 conn,
                 lead_id,
                 airtable_record_id=mapped["airtable_record_id"],
@@ -1025,7 +1146,7 @@ def pull_from_airtable(
                     "airtable_status": mapped["airtable_status"],
                     "direction": "pull",
                 },
-                created_at=now,
+                created_at=synced_ts,
             )
             updated_in_crm += 1
         else:

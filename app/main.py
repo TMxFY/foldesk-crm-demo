@@ -35,7 +35,6 @@ from app.accounts import (
     update_account_settings,
 )
 from app.accounts import _load as load_account
-from app.tg_web_proxy import register_tg_web_routes
 import app.inbox as _inbox_mod
 import app.outreach as _outreach_mod
 from app.runtime_config import (
@@ -51,6 +50,7 @@ from app.db import (
     connect,
     create_pipeline_stage,
     init_db,
+    is_waiting_our_answer,
     list_pipeline_stages,
     locked_conn,
     update_pipeline_stage,
@@ -76,12 +76,14 @@ from app.inbox import (
     get_dialog_avatar_with_cache,
     get_inbox_counts,
     get_thread,
+    get_workspace_total_dialogs,
     list_inbox,
     list_messages,
     mark_dialog_read,
     mark_dialog_unread,
     open_dialog_by_lead,
     remember_dialogs,
+    repair_dialog_last_from_peer_drift,
     send_dialog_media,
     send_reply,
     start_direct_dialog,
@@ -137,7 +139,7 @@ from app.telegram_gateway import GatewayError, TelethonGateway, listening_event
 from app.views import list_views, save_view
 from app.snippets import create_snippet, delete_snippet, list_snippets
 from app.whatsapp_gateway import WhatsAppGateway
-from app.analytics import get_analytics_summary
+from app.analytics import get_analytics_summary, get_deep_outreach_bucket
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -1847,6 +1849,20 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
     @app.get("/api/health")
     def api_health(request: Request, deep: int = 0):
+        if deep and is_auth_enforced():
+            from app.crm_auth import resolve_request_crm_user
+            from app.security import is_strict_loopback_direct
+
+            authed = has_valid_mcp_api_key(request) or is_strict_loopback_direct(request)
+            if not authed:
+                conn_chk = getattr(request.app.state, "conn", None)
+                if conn_chk is not None:
+                    with locked_conn(conn_chk):
+                        authed = resolve_request_crm_user(conn_chk, request) is not None
+            if not authed:
+                raise HTTPException(
+                    status_code=401, detail="Требуется авторизация для deep health"
+                )
         conn_obj = getattr(request.app.state, "conn", None)
         db_ok = False
         active_accounts = 0
@@ -1950,7 +1966,6 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
     app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
-    register_tg_web_routes(app)
 
     @app.get("/design/tokens.css")
     def design_tokens():
@@ -1958,9 +1973,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
-        default_view_mode = os.getenv("CRM_VIEW_MODE") or (
-            "all" if os.getenv("BOT_TOKEN") == "e2e-not-a-secret" else "sheet"
-        )
+        default_view_mode = os.getenv("CRM_VIEW_MODE") or "sheet"
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -2201,21 +2214,17 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             body.folder_ids,
         )
 
-    @app.get("/api/accounts/{account_id}/dialogs")
-    async def account_dialogs(
-        account_id: int,
+    async def _search_account_dialogs_for_one(
         request: Request,
-        q: str = "",
-        crm_only: bool = False,
-    ):
-        try:
-            with locked_conn(request.app.state.conn):
-                account = load_account(request.app.state.conn, account_id)
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail="Не найдено") from exc
+        acc_id: int,
+        q: str,
+        crm_only: bool,
+    ) -> list[dict]:
+        with locked_conn(request.app.state.conn):
+            account = load_account(request.app.state.conn, acc_id)
         if account["status"] != "connected":
             raise HTTPException(status_code=400, detail="Аккаунт не подключён")
-        gateway = _gateway_for_account(request, account_id)
+        gateway = _gateway_for_account(request, acc_id)
         try:
             found = await gateway.search_dialogs(account["session_path"], q, limit=30)
         except GatewayError as exc:
@@ -2225,7 +2234,11 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             for item in (found or [])[:30]:
                 if not isinstance(item, dict):
                     continue
-                pid = item.get("telegram_user_id") if item.get("telegram_user_id") is not None else item.get("peer_id")
+                pid = (
+                    item.get("telegram_user_id")
+                    if item.get("telegram_user_id") is not None
+                    else item.get("peer_id")
+                )
                 try:
                     pid_int = int(pid) if pid is not None else None
                 except (TypeError, ValueError):
@@ -2235,14 +2248,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                     peer_id=pid_int,
                     username=item.get("username"),
                     phone=item.get("phone"),
-                    account_id=account_id,
+                    account_id=acc_id,
                     is_bot=bool(item.get("is_bot")),
                 )
                 if inelig:
                     continue
                 if crm_only and pid_int is not None and not _person_is_crm_relevant(
                     request.app.state.conn,
-                    account_id,
+                    acc_id,
                     pid_int,
                     item.get("username"),
                     item.get("phone"),
@@ -2250,11 +2263,97 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 ):
                     continue
                 eligible_found.append(item)
-            saved = remember_dialogs(request.app.state.conn, account_id, eligible_found)
-            sync_dialog_read_receipts(request.app.state.conn, account_id, eligible_found)
+            saved = remember_dialogs(request.app.state.conn, acc_id, eligible_found)
+            sync_dialog_read_receipts(request.app.state.conn, acc_id, eligible_found)
             if crm_only:
                 saved = _filter_crm_only_rows(request.app.state.conn, saved)
         return saved
+
+    async def _search_dialogs_multi_or_single(
+        request: Request,
+        account_id: int,
+        q: str = "",
+        crm_only: bool = False,
+    ) -> list[dict]:
+        if int(account_id) != 0:
+            try:
+                return await _search_account_dialogs_for_one(
+                    request, int(account_id), q, bool(crm_only)
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail="Не найдено") from exc
+
+        with locked_conn(request.app.state.conn):
+            acc_rows = request.app.state.conn.execute(
+                """
+                SELECT id FROM accounts
+                WHERE status = 'connected'
+                  AND COALESCE(health, 'active') = 'active'
+                  AND lower(COALESCE(provider, 'telegram')) = 'telegram'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            if not acc_rows:
+                acc_rows = request.app.state.conn.execute(
+                    """
+                    SELECT id FROM accounts
+                    WHERE status = 'connected'
+                    ORDER BY id ASC
+                    """
+                ).fetchall()
+        combined: list[dict] = []
+        seen_keys: set[tuple] = set()
+        for row in acc_rows:
+            aid = int(row["id"])
+            try:
+                part = await _search_account_dialogs_for_one(
+                    request, aid, q, bool(crm_only)
+                )
+            except HTTPException:
+                continue
+            except Exception:
+                continue
+            for item in part:
+                did = item.get("id")
+                k = ("id", int(did)) if did is not None else (
+                    "peer",
+                    int(item.get("account_id") or aid),
+                    item.get("telegram_user_id"),
+                )
+                if k in seen_keys:
+                    continue
+                seen_keys.add(k)
+                combined.append(item)
+        combined.sort(
+            key=lambda d: (
+                str(d.get("last_message_at") or ""),
+                int(d.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        return combined
+
+    @app.get("/api/accounts/{account_id}/dialogs")
+    async def account_dialogs(
+        account_id: int,
+        request: Request,
+        q: str = "",
+        crm_only: bool = False,
+    ):
+        return await _search_dialogs_multi_or_single(
+            request, account_id, q=q, crm_only=bool(crm_only)
+        )
+
+    @app.get("/api/inbox/telegram-search")
+    async def inbox_telegram_search(
+        request: Request,
+        account_id: int = 0,
+        q: str = "",
+        crm_only: bool = True,
+    ):
+        return await _search_dialogs_multi_or_single(
+            request, account_id, q=q, crm_only=bool(crm_only)
+        )
 
     @app.post("/api/leads")
     async def leads_create(body: LeadIn, request: Request):
@@ -2327,7 +2426,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         folder_id: int | None = None,
         provider: str = "",
     ):
-        return _call(
+        rows = _call(
             search_leads,
             request.app.state.conn,
             q,
@@ -2335,6 +2434,15 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             folder_id,
             provider=provider or None,
         )
+        if isinstance(rows, list):
+            for ld in rows:
+                if isinstance(ld, dict):
+                    ld["is_waiting_our_answer"] = is_waiting_our_answer(
+                        ld.get("last_from_peer"),
+                        ld.get("status"),
+                        ld.get("airtable_status"),
+                    )
+        return rows
 
     class LeadBulkIn(BaseModel):
         lead_ids: list[int]
@@ -2907,7 +3015,17 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             status,
             crm_only=bool(crm_only),
         )
-        return {"counts": counts, **counts}
+        workspace_total = _call(
+            get_workspace_total_dialogs,
+            request.app.state.conn,
+            crm_only=bool(crm_only),
+        )
+        return {
+            "counts": counts,
+            "workspace_total_dialogs": workspace_total,
+            "total_dialogs": workspace_total,
+            **counts,
+        }
 
     @app.post("/api/inbox/dialogs/{dialog_id}/unread")
     @app.post("/api/dialogs/{dialog_id}/unread")
@@ -3055,6 +3173,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 with locked_conn(conn):
                     snap = list_inbox(conn, account_id, "", crm_only=bool(crm_only))
                 yield _sse("snapshot", snap)
+                yield _sse(
+                    "meta",
+                    {
+                        "workspace_total_dialogs": getattr(
+                            snap, "workspace_total_dialogs", len(snap)
+                        )
+                    },
+                )
                 while True:
                     try:
                         dialog = await asyncio.wait_for(queue.get(), timeout=15)
@@ -3135,6 +3261,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 request.app, account_id=None, max_dialogs=80
             )
             with locked_conn(conn):
+                repair_dialog_last_from_peer_drift(conn, account_id=None)
                 dialogs = list_inbox(conn, 0, "", crm_only=crm_only)
             return {"synced": len(rows), "dialogs": dialogs}
         aid = int(target_id)
@@ -3145,6 +3272,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             request.app, account_id=aid, max_dialogs=80
         )
         with locked_conn(conn):
+            repair_dialog_last_from_peer_drift(conn, account_id=aid)
             dialogs = list_inbox(conn, aid, "", crm_only=crm_only)
         return {"synced": 1, "dialogs": dialogs}
 
@@ -3768,6 +3896,23 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     @app.get("/api/analytics/summary")
     def analytics_summary(request: Request, period: str = "30d"):
         return _call(get_analytics_summary, request.app.state.conn, period=period)
+
+    @app.get("/api/analytics/deep-outreach")
+    def analytics_deep_outreach(
+        request: Request,
+        bucket: str = "waiting",
+        limit: int = 50,
+        offset: int = 0,
+        account: str | None = None,
+    ):
+        return _call(
+            get_deep_outreach_bucket,
+            request.app.state.conn,
+            bucket=bucket,
+            limit=limit,
+            offset=offset,
+            account=account,
+        )
 
     @app.get("/api/analytics/outreach-funnel")
     def analytics_outreach_funnel(
