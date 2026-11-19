@@ -608,3 +608,47 @@ def test_is_bot_without_suffix_and_account_search_crm_only(conn):
         assert resp.status_code == 200
         assert [d["username"] for d in resp.json()] == ["live_out_lead"]
         assert conn.execute("SELECT id FROM dialogs WHERE peer_id = 94099").fetchone() is None
+
+
+def test_airtable_sync_blocks_and_scrubs_service_telegram_handles(tmp_path):
+    from app.airtable_sync import parse_airtable_contact, pull_from_airtable
+    from app.digest import audit_reply_notifications
+
+    for raw_contact in ("@Telegram", "Telegram", "https://t.me/Telegram", "@SpamBot", "@BotFather"):
+        assert parse_airtable_contact(raw_contact) == (None, None)
+
+    conn = connect(tmp_path / "airtable_service_handle.db")
+    init_db(conn)
+    existing = create_lead(
+        conn,
+        name="Александр Сидорин",
+        username="real_temp_u",
+        status="lost",
+        airtable_record_id="recServiceTg1",
+    )
+    conn.execute(
+        "UPDATE leads SET username = 'Telegram', updated_at = '2026-11-18T10:00:00', airtable_synced_at = '2026-11-18T10:00:00' WHERE id = ?",
+        (existing["id"],),
+    )
+    conn.commit()
+
+    class _FakeAirtableClient:
+        table_name = "Leads"
+
+        def list_records(self, table_name: str):
+            return [
+                {
+                    "id": "recServiceTg1",
+                    "fields": {
+                        "Lead Name": "Александр Сидорин",
+                        "Contact": "@Telegram",
+                        "Status": "Cancelled",
+                    },
+                }
+            ]
+
+    pull_from_airtable(conn, client=_FakeAirtableClient())
+    row = conn.execute("SELECT username FROM leads WHERE id = ?", (existing["id"],)).fetchone()
+    assert row["username"] is None
+    assert audit_reply_notifications(conn)["ok"] is True
+

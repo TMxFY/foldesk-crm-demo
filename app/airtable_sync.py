@@ -487,9 +487,9 @@ def parse_airtable_contact(raw_contact: Any) -> tuple[str | None, str | None]:
 
     cleaned_u = _clean_username(username)
     if cleaned_u:
-        from app.digest import is_likely_telegram_bot_username
+        from app.digest import is_bot_or_service_telegram_username
 
-        if is_likely_telegram_bot_username(cleaned_u):
+        if is_bot_or_service_telegram_username(cleaned_u):
             cleaned_u = None
 
     return cleaned_u, phone
@@ -984,6 +984,12 @@ def pull_from_airtable(
             ):
                 if mapped.get(key) is not None:
                     patch[key] = mapped[key]
+            from app.digest import is_bot_or_service_telegram_username
+
+            if mapped.get("username") is None and is_bot_or_service_telegram_username(
+                existing.get("username") if isinstance(existing, dict) else None
+            ):
+                patch["username"] = None
             if mapped.get("offer_type"):
                 patch["offer_type"] = mapped["offer_type"]
             raw_val = raw_fields.get("Value")

@@ -19,6 +19,7 @@ from app.reminders import complete_reminder, list_reminders, normalize_due
 logger = logging.getLogger(__name__)
 
 TELEGRAM_SERVICE_PEER_IDS = frozenset({777000, 178220800, 1271266957, 93372553})
+TELEGRAM_SERVICE_USERNAMES = frozenset({"telegram", "replies", "spambot", "botfather"})
 INTERNAL_TEAM_USERNAMES = frozenset(
     {
         "vladwilhelm",
@@ -68,6 +69,13 @@ def is_likely_telegram_bot_username(username: str | None) -> bool:
     if len(clean) >= 4 and clean.endswith("bot") and re.fullmatch(r"[a-z0-9_]{4,32}", clean):
         return True
     return bool(_BOT_USERNAME_SUFFIX_RE.search(clean))
+
+
+def is_bot_or_service_telegram_username(username: str | None) -> bool:
+    clean = str(username or "").strip().lstrip("@").lower()
+    if not clean:
+        return False
+    return clean in TELEGRAM_SERVICE_USERNAMES or is_likely_telegram_bot_username(clean)
 
 
 def is_closed_lead_status(
@@ -1404,8 +1412,7 @@ def audit_reply_notifications(conn, *, since_hours: int | None = None) -> dict:
             for lr in conn.execute(
                 "SELECT id, name, username, status FROM leads WHERE username IS NOT NULL AND trim(username) != ''"
             ).fetchall():
-                clean_lu = str(lr["username"] or "").strip().lstrip("@").lower()
-                if is_likely_telegram_bot_username(lr["username"]) or clean_lu == "telegram":
+                if is_bot_or_service_telegram_username(lr["username"]):
                     bot_username_leads.append(
                         {
                             "id": int(lr["id"]),
