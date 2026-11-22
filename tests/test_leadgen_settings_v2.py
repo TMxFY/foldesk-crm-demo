@@ -49,10 +49,13 @@ def isolated_crm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         conn.close()
 
 
-def test_default_leadgen_config_and_disk_json_v2_sections() -> None:
-    on_disk_path = ROOT / "data" / "leadgen_config.json"
-    assert on_disk_path.exists()
-    on_disk = json.loads(on_disk_path.read_text(encoding="utf-8"))
+def test_default_leadgen_config_and_disk_json_v2_sections(
+    isolated_crm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, _state_dir, cfg_path = isolated_crm
+    save_leadgen_config(conn, DEFAULT_LEADGEN_CONFIG)
+    assert cfg_path.exists()
+    on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
 
     for cfg in (DEFAULT_LEADGEN_CONFIG, on_disk):
         # Enrichment budget & alert guardrails
@@ -117,6 +120,31 @@ def test_default_leadgen_config_and_disk_json_v2_sections() -> None:
             assert src_toggle in b2b["sources"]
 
     assert DEFAULT_LEADGEN_CONFIG["ru_experts"]["ig_handles"] == []
+
+    # Backward compatibility: legacy on-disk JSON without 'enrichment' and with custom vacancies.layers
+    legacy_cfg_path = cfg_path.parent / "legacy_leadgen_config.json"
+    legacy_disk_payload = {
+        "enabled": True,
+        "vacancies": {
+            "enabled": False,
+            "layers": {
+                "AI-контент": True,
+                "трафик": True,
+                "автоматизация": True,
+                "AI-роль": True,
+            },
+        },
+    }
+    legacy_cfg_path.write_text(json.dumps(legacy_disk_payload, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(legacy_cfg_path))
+    legacy_conn = connect(cfg_path.parent / "legacy_cfg.db")
+    init_db(legacy_conn)
+    try:
+        loaded_legacy = get_leadgen_config(legacy_conn)
+        assert loaded_legacy["enrichment"]["per_lead_cap_usd"] == 0.05
+        assert loaded_legacy["vacancies"]["layers"] == legacy_disk_payload["vacancies"]["layers"]
+    finally:
+        legacy_conn.close()
 
 
 def test_normalize_and_get_leadgen_config_unlinks_legacy_baza_and_noisy_groups(isolated_crm) -> None:
