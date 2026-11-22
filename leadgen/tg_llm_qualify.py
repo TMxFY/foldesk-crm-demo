@@ -148,7 +148,7 @@ SYSTEM_PROMPT = """You qualify Whale B2B/consumer product leads for SoftUGC (Sni
 
 SoftUGC sells high-volume organic short-form video user acquisition (AI UGC + owned-network clipping, 183.5M views in 90 days, 1,500+ reels/mo mass production) to founders, CEOs, CMOs, and marketing/growth leads who own a MONETIZED product (real paid monetization + budget evidence) and short-form viral potential.
 
-Golden ICP clusters (icp_score 80..100 when monetized product + budget/scale evidence matches):
+Golden ICP clusters (icp_score 80..100 when LTV $50-$100+ consumer/prosumer product + budget/scale evidence matches):
 1. High-LTV Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, trading tools, video/creator tools) with paid subscriptions/trials and growth scale.
 2. E-com / Shopify / TikTok Shop D2C brands (cosmetics/skincare, supplements/vitamins, health/wellness, consumer household/beauty/fitness brands) with paid ads or shop volume.
 3. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, payment apps, and prop trading challenges / options & trading platforms with deposit/subscription/challenge monetization.
@@ -160,7 +160,7 @@ Paid Scale Evidence rule (CRITICAL):
 
 REJECT (is_lead=false, icp_score < 80, or monetization="none"):
 - Gaming / Roblox / Fortnite / FiveM / UEFN, mobile & PC games, low-CPM gaming studios, game servers, hobby browser games, and 3D modeler / Roblox builder recruitment threads.
-- Free hobby/weekend/side projects with zero monetization (monetization="none"), pre-monetization experiments without budget or paid ads, micro-arbitrage, and cheap generic trinket dropshipping.
+- Solopreneurs, indie hackers without revenue (no verified MRR/paying scale and no active paid video ads), hobby/weekend/side projects without budget (monetization="none"), micro-arbitrage, and cheap low-margin e-com (cheap dropshipping gadgets, low-AOV trinkets under $50 LTV).
 - Agencies, PR firms (e.g. FINPR, Marketacross), GTM/marketing/SEO/dev consultancies, outsource studios, recruiters, B2B sales agencies, targetologists, mentors, storymakers ("Сервис / агентство").
 - Bot hosting / managed server hosting, pure B2D dev-only CLI/SDKs/APIs/infra with no consumer/prosumer short-form angle, open-source repos/tools without paid product monetization, ethical hacking/recovery APIs, coding quizzes.
 - Forum job seekers, freelancers, pure traders/investors without a product, community mods.
