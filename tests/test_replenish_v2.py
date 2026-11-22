@@ -523,6 +523,126 @@ def test_layer2_phone_resolver_checker_session_safety_and_social_manual_routing(
     conn.close()
 
 
+def test_hlr_pending_wa_routes_without_fake_auto_send_into_social_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, state_dir, sessions_dir = _setup_isolated_env(tmp_path, monkeypatch)
+    _make_sqlite_session(sessions_dir / "phone_checker_01.session")
+
+    class NotFoundTGChecker:
+        async def __call__(self, req: object) -> object:
+            return SimpleNamespace(users=[], imported=[])
+
+    # No connected WA account in DB + TG checker returns not_found -> must mark wa_check_pending=True
+    rows = [
+        {
+            "id": "hlr_only_1",
+            "name": "Mark Founder",
+            "company": "Mark Builds Brands",
+            "phone": "+14158210199",
+            "icp_score": 90,
+            "source": "meta_ads",
+            "language": "en",
+        },
+        {
+            "id": "cform_dx_1",
+            "name": "Small Newsletter",
+            "company": "0dtenews",
+            "project_url": "https://0dtenews.com",
+            "contact_form_url": "https://0dtenews.com/advertise",
+            "icp_score": 82,
+            "source": "meta_ads",
+            "language": "en",
+        },
+    ]
+
+    routed, stats = vps_autonomous_replenish.resolve_and_route_phone_leads(
+        conn,
+        rows,
+        wa_gateway=None,
+        tg_checker_client=NotFoundTGChecker(),
+        scraper_sessions_dir=sessions_dir,
+    )
+    assert stats["routed_wa_pending"] == 1
+    assert routed[0]["wa_check_pending"] is True
+    assert routed[0].get("provider") != "whatsapp"
+
+    final_jsonl = state_dir / "final.jsonl"
+    dx_jsonl = state_dir / "direct_x_leads.jsonl"
+    ms_jsonl = state_dir / "manual_social.jsonl"
+    final_jsonl.write_text("\n".join(json.dumps(r) for r in routed) + "\n", encoding="utf-8")
+
+    split_res = vps_autonomous_replenish.split_tg_and_direct_x_leads(
+        final_jsonl,
+        dx_jsonl,
+        manual_social_jsonl=ms_jsonl,
+    )
+    # Never pushed into tg_wa_kept auto-send; HLR WA lead enters manual_social_jsonl; low-ICP contact form goes to direct_x
+    assert split_res["tg_wa_kept"] == 0
+    assert split_res["social_manual_added"] == 1
+    assert split_res["direct_x_added"] == 1
+
+    ms_rows = [json.loads(ln) for ln in ms_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert ms_rows[0]["segment"] == "social_manual"
+    assert ms_rows[0]["manual_action_url"] == "https://wa.me/14158210199"
+    assert ms_rows[0]["manual_channel"] == "whatsapp_hlr"
+    assert ms_rows[0]["phone"] == "+14158210199"
+
+    dx_rows = [json.loads(ln) for ln in dx_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert dx_rows[0]["contact_form_url"] == "https://0dtenews.com/advertise"
+
+    ingest_res = vps_autonomous_replenish.ingest_v2_routed_leads(conn, ms_rows)
+    assert ingest_res["social_manual_ingested"] == 1
+    lead_db = conn.execute(
+        "SELECT phone, segment, manual_action_url FROM leads WHERE company = 'Mark Builds Brands'"
+    ).fetchone()
+    assert lead_db is not None
+    assert lead_db["phone"] == "+14158210199"
+    assert lead_db["segment"] == "social_manual"
+    assert lead_db["manual_action_url"] == "https://wa.me/14158210199"
+    assert conn.execute("SELECT COUNT(*) FROM campaign_recipients").fetchone()[0] == 0
+
+    # Duplicate manual_action_url insert must preserve original draft while backfilling missing email
+    orig_draft = ms_rows[0]["manual_draft_text"]
+    dup_row = dict(ms_rows[0])
+    dup_row["manual_draft_text"] = "OVERWRITTEN DRAFT SHOULD NOT REPLACE"
+    dup_row["work_email"] = "mark@ecommercescalingsecrets.com"
+    dup_res = vps_autonomous_replenish.ingest_v2_routed_leads(conn, [dup_row])
+    assert dup_res["social_manual_ingested"] == 0
+    lead_after = conn.execute(
+        "SELECT email, manual_draft_text FROM leads WHERE company = 'Mark Builds Brands'"
+    ).fetchone()
+    assert lead_after["email"] == "mark@ecommercescalingsecrets.com"
+    assert lead_after["manual_draft_text"] == orig_draft
+
+    # Even if stale row has wa_check_pending=True AND leftover whatsapp url, split_tg_and_direct_x_leads never emits tg_wa_kept
+    stale_pending = {
+        "id": "stale_pend_1",
+        "name": "Stale Pending",
+        "company": "PendingBrand",
+        "phone": "+14158210888",
+        "whatsapp": "https://wa.me/14158210888",
+        "provider": "whatsapp",
+        "wa_check_pending": True,
+        "icp_score": 89,
+        "language": "en",
+    }
+    routed_stale = vps_autonomous_replenish.route_resolved_lead(stale_pending, {})
+    assert not routed_stale.get("whatsapp")
+    assert routed_stale.get("provider") != "whatsapp"
+    stale_final = state_dir / "stale_final.jsonl"
+    stale_ms = state_dir / "stale_ms.jsonl"
+    stale_final.write_text(json.dumps(stale_pending) + "\n", encoding="utf-8")
+    stale_split = vps_autonomous_replenish.split_tg_and_direct_x_leads(
+        stale_final,
+        state_dir / "stale_dx.jsonl",
+        manual_social_jsonl=stale_ms,
+    )
+    assert stale_split["tg_wa_kept"] == 0
+    assert stale_split["social_manual_added"] == 1
+    conn.close()
+
+
 def test_wave2_vacancies_and_wave3_ru_experts_orchestration_and_airtable_isolation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

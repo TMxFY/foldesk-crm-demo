@@ -978,4 +978,241 @@ def test_root_company_domain_stripping_and_geo_local_phone_normalization() -> No
     assert out_uk["phone_line_type"] == "MOBILE"
 
 
+def test_contactout_company_hard_cap_max_one_hit_and_icp_gate() -> None:
+    # 1) Super-whale (icp=95, pool=20000) with 2 DMs BOTH having ContactOut phone=True
+    # must NEVER invoke contactout.people.contact.phone more than ONCE (<= $0.25, never $0.50).
+    sw_calls: list[str] = []
+
+    def treg_sw_both(ep: str, **kw: Any) -> dict[str, Any]:
+        sw_calls.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        if ep == "contactout.people.contact.phone":
+            prof = str((kw.get("query") or {}).get("profile") or "")
+            num = "+14155550111" if "dm-one" in prof else "+14155550222"
+            return {"status_code": 200, "profile": {"phone": [num]}, "_treg": {"cost_usd": 0.25}}
+        if ep == "hlrlookup.people.phone.validate":
+            return {"results": [{"telephone_number_type": "LANDLINE"}]}
+        return {}
+
+    out_sw = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "sw_2dm_cap",
+            "company": "SuperWhale Co",
+            "project_url": "https://superwhale.io",
+            "work_email": "dm1@superwhale.io",
+            "icp_score": 95,
+            "pool_usd": 20000,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_sw_both,
+        dm_multi_finder_fn=lambda c, d, limit=2: [
+            {"founder_name": "DM One", "founder_linkedin": "https://www.linkedin.com/in/dm-one-sw"},
+            {"founder_name": "DM Two", "founder_linkedin": "https://www.linkedin.com/in/dm-two-sw"},
+        ],
+        tg_bridge_fn=lambda r: r,
+    )
+    assert sw_calls.count("contactout.people.contact.phone") == 1
+    assert out_sw["lead_cost"] <= 0.25 + 1e-6
+
+    # 2) If DM1 already got a mobile phone via cheap Tier2, ContactOut for DM2 must be skipped (0 calls),
+    # while DM2 can still attempt cheap phone lookup for secondary_contact_json.
+    dm1_phone_calls: list[tuple[str, str]] = []
+
+    def treg_dm1_cheap_hit(ep: str, **kw: Any) -> dict[str, Any]:
+        li = str((kw.get("query") or {}).get("linkedin") or (kw.get("query") or {}).get("profile") or "")
+        dm1_phone_calls.append((ep, li))
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        if ep == "crawl4ai.people.phone.find":
+            if "dm-one" in li:
+                return {"data": {"phone": "+14155550191"}, "_treg": {"cost_usd": 0.00095}}
+            return {}
+        if ep == "hlrlookup.people.phone.validate":
+            return {"results": [{"telephone_number_type": "MOBILE"}]}
+        if ep == "treg.people.phone.find":
+            if "dm-two" in str((kw.get("data") or {}).get("linkedin_url") or ""):
+                return {"output": {"phone": "+14155550192"}, "_treg": {"cost_usd": 0.01}}
+            return {}
+        if ep == "contactout.people.contact.phone":
+            raise AssertionError("ContactOut $0.25 must NOT run when DM1 already has a valid mobile phone")
+        return {}
+
+    out_dm1 = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "dm1_hit_no_co",
+            "company": "AlreadyPhone Co",
+            "project_url": "https://alreadyphone.io",
+            "work_email": "dm1@alreadyphone.io",
+            "icp_score": 96,
+            "pool_usd": 25000,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_dm1_cheap_hit,
+        dm_multi_finder_fn=lambda c, d, limit=2: [
+            {"founder_name": "DM One", "founder_linkedin": "https://www.linkedin.com/in/dm-one-ap"},
+            {"founder_name": "DM Two", "founder_linkedin": "https://www.linkedin.com/in/dm-two-ap"},
+        ],
+        tg_bridge_fn=lambda r: r,
+    )
+    assert out_dm1["phone"] == "+14155550191"
+    sec = json.loads(out_dm1["secondary_contact_json"])
+    assert sec["phone"] == "+14155550192"
+    assert not any(ep == "contactout.people.contact.phone" for ep, _ in dm1_phone_calls)
+
+    # 3) icp_score < 85 NEVER calls ContactOut $0.25 even if pool_usd >= 10000
+    low_icp_calls: list[str] = []
+
+    def treg_low_icp_whale(ep: str, **kw: Any) -> dict[str, Any]:
+        low_icp_calls.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        return {}
+
+    contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "low_icp_pool",
+            "company": "PoolOnly Co",
+            "project_url": "https://poolonly.io",
+            "work_email": "ceo@poolonly.io",
+            "founder_linkedin": "https://www.linkedin.com/in/ceo-poolonly",
+            "icp_score": 82,
+            "pool_usd": 15000,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_low_icp_whale,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+    )
+    assert "contactout.people.contact.phone" not in low_icp_calls
+
+
+def test_free_tier1_contact_form_and_root_domain_fallback() -> None:
+    # 1) Search form on homepage MUST NOT count as contact form; /contact with real <form> + email MUST be picked at $0
+    pages_internal = {
+        "https://acme-d2c.com": (
+            '<html><form role="search" action="/search"><input type="search" name="q"></form>'
+            '<a href="/contact">Contact Us</a></html>'
+        ),
+        "https://acme-d2c.com/contact": (
+            '<html><h1>Contact</h1><form method="post" action="/send">'
+            '<input type="email" name="email"><textarea name="message"></textarea></form></html>'
+        ),
+    }
+    out_form = contact_waterfall.enrich_lead_contacts(
+        {"id": "cf_1", "company": "Acme D2C", "project_url": "https://acme-d2c.com", "icp_score": 88},
+        allow_paid_tier2=False,
+        http_get_fn=lambda url, **kw: SimpleNamespace(
+            status_code=200,
+            text=pages_internal.get(url.rstrip("/"), ""),
+        ),
+        tg_bridge_fn=lambda r: r,
+    )
+    assert out_form["lead_cost"] == 0.0
+    assert out_form["contact_form_url"] == "https://acme-d2c.com/contact"
+    assert "https://acme-d2c.com/contact" in out_form["links"]
+    assert out_form["contact_waterfall_tier"] == "tier1"
+
+    # 2) External Typeform/Calendly takes priority over generic /contact link
+    pages_ext = {
+        "https://glowshop.io": (
+            '<html><a href="/contact">Contact</a>'
+            '<a href="https://glowshop.typeform.com/to/partner99">Book Collab</a></html>'
+        ),
+        "https://glowshop.io/contact": '<form><input type="email"><textarea></textarea></form>',
+    }
+    out_ext = contact_waterfall.enrich_lead_contacts(
+        {"id": "cf_ext", "company": "Glow Shop", "project_url": "https://glowshop.io", "icp_score": 88},
+        allow_paid_tier2=False,
+        http_get_fn=lambda url, **kw: SimpleNamespace(
+            status_code=200,
+            text=pages_ext.get(url.rstrip("/"), ""),
+        ),
+        tg_bridge_fn=lambda r: r,
+    )
+    assert out_ext["contact_form_url"] == "https://glowshop.typeform.com/to/partner99"
+
+    # 3) Root-domain fallback (t.0dtenews.com -> 0dtenews.com) extracts hello@ & contact_form_url at $0
+    pages_sub = {
+        "https://t.0dtenews.com": "<html><body>Tracking link</body></html>",
+        "https://0dtenews.com": '<html><a href="/advertise">Advertise</a></html>',
+        "https://0dtenews.com/advertise": '<html>Email hello@0dtenews.com <form><input type="email"><textarea name="msg"></textarea></form></html>',
+    }
+    out_sub = contact_waterfall.enrich_lead_contacts(
+        {"id": "cf_sub", "company": "0dtenews", "project_url": "https://t.0dtenews.com/click", "icp_score": 86},
+        allow_paid_tier2=False,
+        http_get_fn=lambda url, **kw: SimpleNamespace(
+            status_code=200,
+            text=pages_sub.get(url.rstrip("/"), pages_sub.get("https://t.0dtenews.com" if url.startswith("https://t.0dtenews.com") else "", "")),
+        ),
+        tg_bridge_fn=lambda r: r,
+    )
+    assert out_sub["lead_cost"] == 0.0
+    assert out_sub["company_domain"] == "0dtenews.com"
+    assert out_sub["work_email"] == "hello@0dtenews.com"
+    assert out_sub["contact_form_url"] == "https://0dtenews.com/advertise"
+
+    # 4) Broken 404 /contact link MUST NOT be selected as contact_form_url
+    out_404 = contact_waterfall.enrich_lead_contacts(
+        {"id": "cf_404", "company": "BrokenCo", "project_url": "https://brokenco.io", "icp_score": 88},
+        allow_paid_tier2=False,
+        http_get_fn=lambda url, **kw: SimpleNamespace(
+            status_code=404 if "/contact" in url else 200,
+            text='<a href="/contact">Contact</a>' if url.rstrip("/") == "https://brokenco.io" else "Not Found",
+        ),
+        tg_bridge_fn=lambda r: r,
+    )
+    assert not out_404.get("contact_form_url")
+
+
+def test_sacred_no_fake_wa_from_plain_phone_and_contactout_empty_slot_cap() -> None:
+    # 1) Plain E.164 phone MUST NOT be fabricated into whatsapp="https://wa.me/..."
+    out_plain = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "no_fake_wa",
+            "company": "PlainPhoneCo",
+            "project_url": "https://plainphone.io",
+            "phone": "+14155550199",
+            "icp_score": 88,
+        },
+        allow_paid_tier2=False,
+        http_get_fn=_empty_http,
+        tg_bridge_fn=lambda r: r,
+    )
+    assert out_plain["phone"] == "+14155550199"
+    assert not out_plain.get("whatsapp")
+
+    # 2) If DM1's ContactOut returns empty/0-cost response, DM2 must STILL NOT invoke ContactOut again
+    empty_co_calls: list[str] = []
+
+    def treg_co_empty(ep: str, **kw: Any) -> dict[str, Any]:
+        empty_co_calls.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        if ep == "contactout.people.contact.phone":
+            return {"status_code": 200, "profile": {}}
+        return {}
+
+    contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "co_empty_1",
+            "company": "EmptyCo",
+            "project_url": "https://emptyco.io",
+            "work_email": "dm1@emptyco.io",
+            "icp_score": 96,
+            "pool_usd": 20000,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_co_empty,
+        dm_multi_finder_fn=lambda c, d, limit=2: [
+            {"founder_name": "DM One", "founder_linkedin": "https://www.linkedin.com/in/dm1-empty"},
+            {"founder_name": "DM Two", "founder_linkedin": "https://www.linkedin.com/in/dm2-empty"},
+        ],
+        tg_bridge_fn=lambda r: r,
+    )
+    assert empty_co_calls.count("contactout.people.contact.phone") == 1
+
+
+
+
 

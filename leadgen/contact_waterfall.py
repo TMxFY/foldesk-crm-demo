@@ -398,6 +398,12 @@ _URL_IN_TEXT_RE = re.compile(r"""https?://[^\s"'<>\]\)]+""", re.I)
 
 _INTERNAL_LINK_KEYWORDS = (
     "contact",
+    "get-in-touch",
+    "work-with-us",
+    "advertise",
+    "partner",
+    "sponsor",
+    "inquiry",
     "about",
     "team",
     "founder",
@@ -408,7 +414,45 @@ _INTERNAL_LINK_KEYWORDS = (
     "privacy",
     "legal",
 )
-_PROBE_PATHS = ("/contact", "/about", "/terms")
+_PROBE_PATHS = ("/contact", "/contact-us", "/about", "/terms")
+_CONTACT_FORM_HOSTS = (
+    "typeform.com",
+    "tally.so",
+    "calendly.com",
+    "cal.com",
+    "jotform.com",
+    "forms.gle",
+    "docs.google.com/forms",
+    "share.hsforms.com",
+    "meetings.hubspot.com",
+    "fillout.com",
+    "paperform.co",
+)
+_CONTACT_PAGE_TOKENS = (
+    "contact",
+    "get-in-touch",
+    "reach-us",
+    "inquiry",
+    "advertise",
+    "sponsor",
+    "partner",
+    "work-with-us",
+    "feedback",
+)
+_CONTACT_LINK_PATH_TOKENS = (
+    "contact",
+    "contact-us",
+    "advertise",
+    "partners",
+    "partnerships",
+    "work-with-us",
+)
+_FORM_BLOCK_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.I | re.S)
+_FORM_FIELD_RE = re.compile(
+    r"""(?:<textarea\b|<input\b[^>]*\btype\s*=\s*["']?(?:email|text|tel)\b|<input\b[^>]*\bname\s*=\s*["']?(?:email|message|msg|body|comment|inquiry)\b)""",
+    re.I,
+)
+_TITLE_OR_H1_RE = re.compile(r"<(?:title|h1)\b[^>]*>(.*?)</(?:title|h1)>", re.I | re.S)
 
 _DM_TIER2_RE = re.compile(
     r"\b(?:co-?\s*founder|founder|ceo|chief executive|owner|cmo|chief marketing|growth|marketing|head)\b",
@@ -818,6 +862,111 @@ def _discover_links_from_html(
     return [u for _, u in internal[:MAX_DISCOVERED_INTERNAL]], bio_hubs
 
 
+def _is_external_contact_form_url(url: str) -> bool:
+    norm = _normalize_http_url(url)
+    if not norm:
+        return False
+    parsed = urlparse(norm)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    path_low = (parsed.path or "").lower()
+    if not host or path_low.endswith(_IMAGE_OR_ASSET_EXTS) or "embed.js" in path_low:
+        return False
+    for cf_host in _CONTACT_FORM_HOSTS:
+        if "/" in cf_host:
+            prefix_host, _, prefix_path = cf_host.partition("/")
+            if (host == prefix_host or host.endswith("." + prefix_host)) and path_low.startswith(f"/{prefix_path}"):
+                return True
+        elif host == cf_host or host.endswith("." + cf_host):
+            return True
+    if host == "airtable.com" or host.endswith(".airtable.com"):
+        return "/shr" in path_low or "/pag" in path_low or "form" in path_low
+    return False
+
+
+def _html_has_non_search_form(html_text: str) -> bool:
+    for m in _FORM_BLOCK_RE.finditer(html_text or ""):
+        attrs = (m.group(1) or "").lower()
+        body = m.group(2) or ""
+        if 'role="search"' in attrs or "role='search'" in attrs:
+            continue
+        if re.search(r"""\baction\s*=\s*["']?[^"'\s>]*search""", attrs) and "<textarea" not in body.lower():
+            continue
+        if 'type="search"' in body.lower() or "type='search'" in body.lower():
+            if "<textarea" not in body.lower() and 'type="email"' not in body.lower() and "type='email'" not in body.lower():
+                continue
+        if _FORM_FIELD_RE.search(body):
+            return True
+    return False
+
+
+def _looks_like_soft_404(html_text: str) -> bool:
+    for m in _TITLE_OR_H1_RE.finditer(html_text or ""):
+        heading = re.sub(r"<[^>]+>", " ", m.group(1) or "").lower()
+        if any(tok in heading for tok in ("404", "not found", "page missing", "error")):
+            return True
+    return False
+
+
+def _path_has_any_token(url: str, tokens: tuple[str, ...]) -> bool:
+    path_low = (urlparse(url).path or "").lower()
+    return any(tok in path_low for tok in tokens)
+
+
+def _extract_contact_form_url(
+    fetched_pages: list[tuple[str, str]],
+    all_blobs: list[str],
+    discovered_internal: list[str],
+    root_html: str = "",
+    failed_keys: set[str] | None = None,
+) -> str:
+    # Priority 1: External form / booking host (Typeform, Tally, Calendly, Airtable share form, etc.)
+    for blob in all_blobs:
+        unescaped = html_mod.unescape(blob or "")
+        for m in _HREF_RE.finditer(unescaped):
+            raw_href = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+            if raw_href and _is_external_contact_form_url(raw_href):
+                return _normalize_http_url(raw_href)
+        for m in _URL_IN_TEXT_RE.finditer(unescaped):
+            cand = m.group(0).rstrip(".,;:)'\"")
+            if _is_external_contact_form_url(cand):
+                return _normalize_http_url(cand)
+
+    # Priority 2: Fetched internal page matching contact tokens with a real non-search <form>
+    for page_url, page_html in fetched_pages:
+        if _path_has_any_token(page_url, _CONTACT_PAGE_TOKENS) and _html_has_non_search_form(page_html):
+            return page_url
+
+    # Priority 3: Discovered contact/advertise/partner link (verified 200 OK if fetched, or linked on site; never failed 4xx/5xx)
+    fetched_map = {_url_dedup_key(u): h for u, h in fetched_pages}
+    failed_set = failed_keys or set()
+    discovered_keys = {_url_dedup_key(u) for u in discovered_internal}
+    for cand_url in discovered_internal:
+        if not _path_has_any_token(cand_url, _CONTACT_LINK_PATH_TOKENS):
+            continue
+        ckey = _url_dedup_key(cand_url)
+        if ckey in failed_set:
+            continue
+        html_body = fetched_map.get(ckey)
+        if html_body is not None:
+            if not _looks_like_soft_404(html_body):
+                return cand_url
+        else:
+            return cand_url
+
+    # Probed page without root <a> tag: accept only if distinct from homepage & not a 404 page
+    root_norm = (root_html or "").strip()
+    for page_url, page_html in fetched_pages:
+        if _url_dedup_key(page_url) in discovered_keys:
+            continue
+        if not _path_has_any_token(page_url, _CONTACT_LINK_PATH_TOKENS):
+            continue
+        if not page_html.strip() or (root_norm and page_html.strip() == root_norm):
+            continue
+        if not _looks_like_soft_404(page_html):
+            return page_url
+    return ""
+
+
 def _extract_whatsapp_url(text: str) -> str:
     raw = str(text or "")
     if not raw:
@@ -837,7 +986,11 @@ def crawl_domain_and_bio_links(
     dom = "" if root_is_bio else domain_of(norm_root)
 
     fetched_keys: set[str] = set()
+    failed_keys: set[str] = set()
     page_blobs: list[str] = []
+    fetched_pages: list[tuple[str, str]] = []
+    discovered_internal_all: list[str] = []
+    root_html = ""
     bio_queue: list[str] = []
     seen_bio_keys: set[str] = set()
 
@@ -863,9 +1016,11 @@ def crawl_domain_and_bio_links(
         root_html = _fetch_html(norm_root, http_get_fn=http_get_fn)
         if root_html:
             page_blobs.append(root_html)
+            fetched_pages.append((norm_root, root_html))
             discovered_internal, discovered_bio = _discover_links_from_html(root_html, norm_root, dom)
         else:
             discovered_internal, discovered_bio = [], []
+        discovered_internal_all.extend(discovered_internal)
 
         for bu in discovered_bio:
             _enqueue_bio(bu)
@@ -894,9 +1049,13 @@ def crawl_domain_and_bio_links(
             html_body = _fetch_html(target_url, http_get_fn=http_get_fn)
             if html_body:
                 page_blobs.append(html_body)
-                _, more_bio = _discover_links_from_html(html_body, target_url, dom)
+                fetched_pages.append((target_url, html_body))
+                more_int, more_bio = _discover_links_from_html(html_body, target_url, dom)
+                discovered_internal_all.extend(more_int)
                 for bu in more_bio:
                     _enqueue_bio(bu)
+            else:
+                failed_keys.add(tkey)
 
     bio_fetched = 0
     for bio_url in bio_queue:
@@ -952,11 +1111,18 @@ def crawl_domain_and_bio_links(
                 instagram_url = ig
 
     tg_username = _pick_best_tg_handle(tg_handles)
+    contact_form_url = _extract_contact_form_url(
+        fetched_pages,
+        all_blobs,
+        discovered_internal_all,
+        root_html=root_html,
+        failed_keys=failed_keys,
+    )
     discovered_urls: list[str] = []
     for u in (
         bio_queue[:MAX_BIO_HUB_PAGES]
         + ([f"https://t.me/{tg_username}"] if tg_username else [])
-        + [u for u in (whatsapp, founder_x, founder_linkedin, instagram_url) if u]
+        + [u for u in (whatsapp, founder_x, founder_linkedin, instagram_url, contact_form_url) if u]
     ):
         if u and u not in discovered_urls:
             discovered_urls.append(u)
@@ -968,6 +1134,7 @@ def crawl_domain_and_bio_links(
         "founder_x": founder_x,
         "founder_linkedin": founder_linkedin,
         "instagram_url": instagram_url,
+        "contact_form_url": contact_form_url,
         "discovered_links": discovered_urls,
         "pages_fetched": internal_count + bio_fetched,
     }
@@ -2024,7 +2191,7 @@ def _run_phone_waterfall_for_dm(
         and dm_li
         and co_cap > 0.0
         and co_lead_rem_ok
-        and (icp_score >= CONTACTOUT_VERIFIED_MIN_ICP or is_super_whale)
+        and icp_score >= CONTACTOUT_VERIFIED_MIN_ICP
         and batch_rem_ok
         and _check_budget_guard(budget_guard_fn, "treg", co_cap, endpoint="contactout.people.contact.phone")
     ):
@@ -2039,10 +2206,11 @@ def _run_phone_waterfall_for_dm(
             co_phone_resp = None
         co_cands = _extract_phones_with_hints_from_payload(co_phone_resp, default_country=default_country)
         co_cost = _extract_payload_cost(co_phone_resp, co_cap) if (co_cands or _extract_payload_cost(co_phone_resp, 0.0) > 0) else 0.0
+        # Always reserve the single per-company ContactOut attempt slot even on empty/timeout response.
+        if co_budget_remaining is not None and len(co_budget_remaining) > 0:
+            co_budget_remaining[0] = max(0.0, co_budget_remaining[0] - max(co_cost, co_cap))
         if co_cost > 0:
             spent += co_cost
-            if co_budget_remaining is not None and len(co_budget_remaining) > 0:
-                co_budget_remaining[0] = max(0.0, co_budget_remaining[0] - co_cost)
             _record_cost_event(
                 cost_record_fn,
                 provider="treg",
@@ -2125,17 +2293,25 @@ def enrich_lead_contacts(
         dom
         and raw_dom
         and dom != raw_dom
-        and not (crawled.get("telegram_username") or crawled.get("whatsapp") or crawled.get("founder_linkedin"))
+        and not (
+            crawled.get("telegram_username")
+            or crawled.get("whatsapp")
+            or crawled.get("founder_linkedin")
+            or crawled.get("contact_form_url")
+        )
     ):
         root_crawled = crawl_domain_and_bio_links(f"https://{dom}", http_get_fn=http_get_fn)
         crawled["emails"] = list(crawled.get("emails") or []) + list(root_crawled.get("emails") or [])
-        for ck in ("founder_x", "founder_linkedin", "whatsapp", "telegram_username", "instagram_url"):
+        for ck in ("founder_x", "founder_linkedin", "whatsapp", "telegram_username", "instagram_url", "contact_form_url"):
             if not crawled.get(ck) and root_crawled.get(ck):
                 crawled[ck] = root_crawled[ck]
         crawled["discovered_links"] = list(crawled.get("discovered_links") or []) + list(
             root_crawled.get("discovered_links") or []
         )
     email_pool.extend(crawled.get("emails") or [])
+
+    if not str(out.get("contact_form_url") or "").strip() and crawled.get("contact_form_url"):
+        out["contact_form_url"] = crawled["contact_form_url"]
 
     best_tier1_email = rank_and_pick_best_email(email_pool, domain=dom)
     if best_tier1_email:
@@ -2150,7 +2326,11 @@ def enrich_lead_contacts(
             out["founder_x"] = crawled["founder_x"]
     if not linkedin_in_url(out.get("founder_linkedin") or "") and crawled.get("founder_linkedin"):
         out["founder_linkedin"] = crawled["founder_linkedin"]
-    existing_wa = _extract_whatsapp_url(out.get("whatsapp") or out.get("phone") or "")
+    raw_wa_in = str(out.get("whatsapp") or "").strip()
+    raw_phone_in = str(out.get("phone") or "").strip()
+    existing_wa = _extract_whatsapp_url(raw_wa_in)
+    if not existing_wa and ("wa.me/" in raw_phone_in.lower() or "whatsapp" in raw_phone_in.lower()):
+        existing_wa = _extract_whatsapp_url(raw_phone_in)
     if not existing_wa and crawled.get("whatsapp"):
         existing_wa = _extract_whatsapp_url(crawled["whatsapp"])
     if existing_wa:
@@ -2253,6 +2433,8 @@ def enrich_lead_contacts(
                     out["founder_x"] = extra_crawled["founder_x"]
                 if not linkedin_in_url(out.get("founder_linkedin") or "") and extra_crawled.get("founder_linkedin"):
                     out["founder_linkedin"] = extra_crawled["founder_linkedin"]
+                if not str(out.get("contact_form_url") or "").strip() and extra_crawled.get("contact_form_url"):
+                    out["contact_form_url"] = extra_crawled["contact_form_url"]
                 if not _extract_whatsapp_url(out.get("whatsapp") or "") and extra_crawled.get("whatsapp"):
                     out["whatsapp"] = extra_crawled["whatsapp"]
                     extra_wa_digits = re.sub(r"\D", "", extra_crawled["whatsapp"])
@@ -2700,10 +2882,11 @@ def enrich_lead_contacts(
                 enr_cfg = cfg.get("enrichment") if isinstance(cfg, Mapping) and isinstance(cfg.get("enrichment"), Mapping) else {}
                 raw_co_cap = enr_cfg.get("contactout_verified_cap_usd", CONTACTOUT_VERIFIED_PHONE_CAP_USD)
                 base_co_cap = CONTACTOUT_VERIFIED_PHONE_CAP_USD if raw_co_cap is None else max(0.0, float(raw_co_cap))
-                co_lead_budget = [base_co_cap * (2.0 if is_super_whale else 1.0)]
+                co_lead_budget = [base_co_cap]
                 for dm_item in dm_candidates[:2]:
                     if dm_item.get("phone"):
                         continue
+                    company_has_phone = any(bool(d.get("phone")) for d in dm_candidates)
                     wf_res = _run_phone_waterfall_for_dm(
                         dm_item,
                         dom=dom,
@@ -2721,7 +2904,7 @@ def enrich_lead_contacts(
                             if (budget_usd is not None and len(budget_usd) > 0)
                             else None
                         ),
-                        co_budget_remaining=co_lead_budget,
+                        co_budget_remaining=[0.0] if company_has_phone else co_lead_budget,
                         default_country=row_cc,
                     )
                     lead_cost += float(wf_res.get("cost") or 0.0)
@@ -2783,7 +2966,7 @@ def enrich_lead_contacts(
     final_tg = _has_personal_tg(out)
     if final_tg:
         _add_link(f"https://t.me/{final_tg}")
-    for key in ("whatsapp", "founder_x", "founder_linkedin", "instagram_url", "telegram_url"):
+    for key in ("whatsapp", "founder_x", "founder_linkedin", "instagram_url", "telegram_url", "contact_form_url"):
         _add_link(out.get(key))
     out["links"] = merged_links
 
@@ -2795,6 +2978,7 @@ def enrich_lead_contacts(
         or str(out.get("founder_x") or "").strip()
         or linkedin_in_url(out.get("founder_linkedin") or "")
         or str(out.get("instagram_url") or "").strip()
+        or str(out.get("contact_form_url") or "").strip()
         or final_email
     )
     if tier2_unlocked_contact:

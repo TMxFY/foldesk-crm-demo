@@ -1123,6 +1123,12 @@
             <button type="button" id="manual-queue-refresh-btn" class="btn secondary sm">↻ Обновить</button>
           </div>
         </div>
+        <div id="manual-social-channel-pills" class="segment-filter-bar" role="group" aria-label="Фильтр ручной очереди по каналу" hidden>
+          <button type="button" class="chip seg-filter-pill is-active" data-manual-channel="all" aria-pressed="true">Все</button>
+          <button type="button" class="chip seg-filter-pill" data-manual-channel="social" aria-pressed="false">LinkedIn / X / IG</button>
+          <button type="button" class="chip seg-filter-pill" data-manual-channel="whatsapp_hlr" aria-pressed="false">WhatsApp (HLR)</button>
+          <button type="button" class="chip seg-filter-pill" data-manual-channel="form_email" aria-pressed="false">Форма / Email</button>
+        </div>
         <p id="manual-queue-subtitle" class="hint"></p>
         <div id="manual-queue-view" data-state="empty">
           <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>

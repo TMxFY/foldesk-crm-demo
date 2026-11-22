@@ -7845,6 +7845,20 @@ dialog.accounts-modal::backdrop {
   text-transform: uppercase;
 }
 
+.manual-queue-phone-badge {
+  background: var(--surface);
+  color: var(--text);
+  border: var(--line) solid var(--border);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.manual-queue-phone-badge:hover {
+  border-color: var(--accent);
+}
+
 .manual-queue-draft {
   margin: 0;
   padding: 10px 12px;

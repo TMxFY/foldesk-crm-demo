@@ -1737,6 +1737,9 @@ def _normalize_direct_x_record(row: dict[str, Any]) -> dict[str, Any]:
     out["project_url"] = url
     out["their_angle"] = angle
     out["what_they_do"] = angle or out.get("what_they_do")
+    cform = _safe_http_url(out.get("contact_form_url") or "")
+    if cform:
+        out["contact_form_url"] = cform
     out["lead_source"] = lead_src
     return out
 
@@ -1744,7 +1747,7 @@ def _normalize_direct_x_record(row: dict[str, Any]) -> dict[str, Any]:
 def append_direct_x_lead(state_dir: Path, payload: dict[str, Any]) -> bool:
     """Append a contactless direct/X/email/LinkedIn ICP lead to state_dir/direct_x_leads.jsonl without duplicates."""
     norm = _normalize_direct_x_record(payload)
-    if not any((norm.get("email"), norm.get("x_url"), norm.get("linkedin_url"), norm.get("url"))):
+    if not any((norm.get("email"), norm.get("x_url"), norm.get("linkedin_url"), norm.get("url"), norm.get("contact_form_url"))):
         return False
 
     state_dir.mkdir(parents=True, exist_ok=True)

@@ -135,6 +135,7 @@ const state = {
   manualSocialQueue: [],
   assistedJobsQueue: [],
   manualQueueSearch: "",
+  manualSocialChannelFilter: "all",
   manualSocialLoaded: false,
   assistedJobsLoaded: false,
   enrichmentBudget: null,
@@ -4883,6 +4884,13 @@ function selectedLead() {
 function safeHref(url) {
   const text = String(url || "").trim();
   return /^https?:\/\//i.test(text) ? text : "";
+}
+
+function safeActionHref(url) {
+  const text = String(url || "").trim();
+  if (/^https?:\/\//i.test(text)) return text;
+  if (/^mailto:[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/i.test(text)) return text;
+  return "";
 }
 
 function sideNoteText(lead) {
@@ -15807,12 +15815,44 @@ async function copyTextToClipboard(text) {
   return ok;
 }
 
+function _isContactFormManualUrl(url) {
+  const lower = String(url || "").trim().toLowerCase();
+  if (!lower || lower.startsWith("mailto:")) return false;
+  if (
+    lower.includes("typeform.com")
+    || lower.includes("tally.so")
+    || lower.includes("calendly.com")
+    || lower.includes("cal.com/")
+    || lower.includes("jotform.com")
+    || lower.includes("forms.gle")
+    || lower.includes("docs.google.com/forms")
+    || lower.includes("hsforms.com")
+    || lower.includes("meetings.hubspot.com")
+    || lower.includes("fillout.com")
+    || lower.includes("paperform.co")
+    || (lower.includes("airtable.com/") && (/\/(?:shr|pag)/.test(lower) || lower.includes("form")))
+  ) {
+    return true;
+  }
+  return /\/(?:contact(?:-[a-z0-9-]+)?|get-in-touch|reach-us|advertise|partner|partners|partnerships|sponsor|inquiry|work-with-us|feedback)(?:[/?#]|$)/.test(lower);
+}
+
+function _inferManualChannelBucket(item) {
+  const url = String(item.manual_action_url || "").trim().toLowerCase();
+  if (url.includes("wa.me/") || url.includes("whatsapp.com/")) return "whatsapp_hlr";
+  if (url.startsWith("mailto:") || _isContactFormManualUrl(url)) return "form_email";
+  return "social";
+}
+
 function _inferManualPlatformLabel(item) {
-  const url = String(item.manual_action_url || "").toLowerCase();
+  const url = String(item.manual_action_url || "").trim().toLowerCase();
   if (url.includes("hh.ru")) return "hh.ru";
   if (url.includes("profi.ru")) return "Profi.ru";
   if (url.includes("kwork.ru")) return "Kwork";
   if (url.includes("upwork.com")) return "Upwork";
+  if (url.includes("wa.me/") || url.includes("whatsapp.com/")) return "WhatsApp (HLR)";
+  if (url.startsWith("mailto:")) return "Email";
+  if (_isContactFormManualUrl(url)) return "Contact Form";
   if (url.includes("linkedin.com")) return "LinkedIn";
   if (url.includes("instagram.com")) return "Instagram";
   if (url.includes("x.com") || url.includes("twitter.com")) return "X";
@@ -15827,6 +15867,7 @@ function renderManualQueueSection(queueType = state.leadsSubView) {
   const badgeEl = document.querySelector("#manual-queue-active-badge");
   const emptyEl = document.querySelector("#manual-queue-empty-msg");
   const gridEl = document.querySelector("#manual-queue-grid");
+  const channelPillsEl = document.querySelector("#manual-social-channel-pills");
   if (!gridEl) return;
 
   if (titleEl) {
@@ -15834,16 +15875,33 @@ function renderManualQueueSection(queueType = state.leadsSubView) {
   }
   if (subEl) {
     subEl.textContent = isSocial
-      ? "Крупные бренды без TG/WA (ICP ≥ 85): быстрый 1-строчный перевод из X / LinkedIn / Instagram в мессенджер."
+      ? "Крупные бренды без TG (ICP ≥ 85): быстрый 1-клик заход в LinkedIn / X / IG, WhatsApp (HLR) или форму / Email."
       : "Закрытые биржи и работные сайты (hh.ru / Profi.ru / Kwork / Upwork): готовый отклик в 1 клик.";
+  }
+
+  const chFilter = isSocial ? (state.manualSocialChannelFilter || "all") : "all";
+  if (channelPillsEl) {
+    channelPillsEl.hidden = !isSocial;
+    if (isSocial) {
+      channelPillsEl.querySelectorAll("[data-manual-channel]").forEach((btn) => {
+        const act = (btn.getAttribute("data-manual-channel") || "all") === chFilter;
+        btn.classList.toggle("is-active", act);
+        btn.setAttribute("aria-pressed", act ? "true" : "false");
+      });
+    }
   }
 
   const q = String(state.manualQueueSearch || "").trim().toLowerCase();
   const filtered = items.filter((item) => {
+    if (isSocial && chFilter !== "all" && _inferManualChannelBucket(item) !== chFilter) {
+      return false;
+    }
     if (!q) return true;
     const hay = [
       item.company,
       item.name,
+      item.phone,
+      item.email,
       item.manual_action_url,
       item.manual_draft_text,
       item.lead_source,
@@ -15857,8 +15915,8 @@ function renderManualQueueSection(queueType = state.leadsSubView) {
   if (!filtered.length) {
     gridEl.replaceChildren();
     if (emptyEl) {
-      emptyEl.textContent = q
-        ? "По запросу ничего не найдено"
+      emptyEl.textContent = q || (isSocial && chFilter !== "all")
+        ? "По фильтру ничего не найдено"
         : (isSocial ? "Очередь Manual Social Queue пока пуста" : "Очередь Assisted Job Queue пока пуста");
     }
     setView("#manual-queue-view", "empty");
@@ -15876,12 +15934,48 @@ function renderManualQueueSection(queueType = state.leadsSubView) {
       if (item.company_domain) subParts.push(item.company_domain);
       const poolVal = Number(item.pool_usd) || 0;
       const lang = String(item.language || (isSocial ? "en" : "ru")).toUpperCase();
-      const actionHref = safeHref(item.manual_action_url || "");
+      const actionHref = safeActionHref(item.manual_action_url || "");
+      const isMailto = actionHref.toLowerCase().startsWith("mailto:");
       const draftText = String(item.manual_draft_text || "").trim();
+      const phoneStr = String(item.phone || "").trim();
+
+      const phoneBadge = phoneStr
+        ? el("button", {
+          type: "button",
+          className: "badge manual-queue-phone-badge",
+          title: "Скопировать телефон для WhatsApp / звонка",
+          "data-copy-manual-phone": String(item.id),
+          onclick: async () => {
+            const ok = await copyTextToClipboard(phoneStr);
+            if (ok) toast(`Телефон ${phoneStr} скопирован`, "ok");
+            else toast("Не удалось скопировать телефон", "error");
+          },
+        }, [phoneStr])
+        : null;
+
+      const openCopyBtn = actionHref
+        ? el("button", {
+          type: "button",
+          className: "btn secondary sm",
+          "data-open-copy-manual": String(item.id),
+          onclick: async () => {
+            const copyPromise = draftText ? copyTextToClipboard(draftText) : Promise.resolve(false);
+            if (isMailto) {
+              window.location.href = actionHref;
+            } else {
+              window.open(actionHref, "_blank", "noopener,noreferrer");
+            }
+            if (draftText) {
+              await copyPromise;
+              toast("Текст скопирован — открываю канал", "ok");
+            }
+          },
+        }, ["Открыть + скопировать ↗"])
+        : null;
 
       const copyBtn = el("button", {
         type: "button",
-        className: "btn secondary sm",
+        className: "btn ghost sm",
         "data-copy-manual-draft": String(item.id),
         onclick: async () => {
           if (!draftText) {
@@ -15941,22 +16035,23 @@ function renderManualQueueSection(queueType = state.leadsSubView) {
           el("div", { className: "manual-queue-badges" }, [
             segmentBadgeEl(item.segment || (isSocial ? "social_manual" : "vacancy_assisted")),
             el("span", { className: "badge manual-queue-lang-badge" }, [lang]),
+            phoneBadge,
             poolVal > 0 ? el("span", { className: "badge b-won" }, [`$${poolVal.toLocaleString("en-US")} pool`]) : null,
           ].filter(Boolean)),
         ]),
         el("pre", { className: "manual-queue-draft" }, [draftText || "Текст отклика ещё не сгенерирован."]),
         el("div", { className: "manual-queue-actions" }, [
+          openCopyBtn,
           actionHref
             ? el("a", {
-              className: "btn secondary sm",
+              className: "btn ghost sm",
               href: actionHref,
-              target: "_blank",
-              rel: "noopener",
+              ...(isMailto ? {} : { target: "_blank", rel: "noopener" }),
             }, ["Открыть ↗"])
             : el("span", { className: "hint" }, ["Нет ссылки"]),
           copyBtn,
           markSentBtn,
-        ]),
+        ].filter(Boolean)),
       ]);
     }),
   );
@@ -16299,6 +16394,13 @@ function bindOutreachV2Events() {
 
   document.querySelector("#manual-queue-search")?.addEventListener("input", (event) => {
     state.manualQueueSearch = event.target.value || "";
+    renderManualQueueSection(state.leadsSubView);
+  });
+
+  document.querySelector("#manual-social-channel-pills")?.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-manual-channel]");
+    if (!btn) return;
+    state.manualSocialChannelFilter = btn.getAttribute("data-manual-channel") || "all";
     renderManualQueueSection(state.leadsSubView);
   });
 

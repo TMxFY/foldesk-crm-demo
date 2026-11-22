@@ -74,6 +74,7 @@ from leadgen.linkedin_jobs import collect as collect_linkedin_jobs
 from leadgen.outreach_copy import build_outreach_sequence, resolve_copy_profile
 from leadgen.phone_messenger_resolver import (
     ResolvedMessenger,
+    build_fallback_contact_draft,
     merge_resolved_messengers,
     normalize_e164,
     resolve_phones_telegram,
@@ -248,6 +249,9 @@ def _direct_x_dedup_keys(row: dict[str, Any]) -> list[str]:
     fli = linkedin_of(row)
     if fli:
         keys.append(f"li:{fli.casefold()}")
+    cform = str(row.get("contact_form_url") or "").strip()
+    if cform:
+        keys.append(f"cform:{cform.casefold()}")
     purl = str(row.get("project_url") or row.get("website") or row.get("site") or "").strip()
     if purl:
         host = (urllib.parse.urlparse(purl if "://" in purl else f"https://{purl}").hostname or "").lower().removeprefix("www.")
@@ -328,8 +332,18 @@ def split_tg_and_direct_x_leads(
 
         raw_tg = row.get("username") or row.get("telegram_username") or row.get("tg_username") or ""
         has_real_tg = _is_real_personal_tg_handle(raw_tg)
-        wa = whatsapp_url(row.get("whatsapp") or "") or (
-            whatsapp_url(row.get("phone") or "") if str(row.get("provider") or "").lower() == "whatsapp" else ""
+        is_wa_pending = bool(row.get("wa_check_pending"))
+        wa = (
+            ""
+            if is_wa_pending
+            else (
+                whatsapp_url(row.get("whatsapp") or "")
+                or (
+                    whatsapp_url(row.get("phone") or "")
+                    if str(row.get("provider") or "").lower() == "whatsapp"
+                    else ""
+                )
+            )
         )
         if has_real_tg or wa:
             if has_real_tg:
@@ -343,8 +357,33 @@ def split_tg_and_direct_x_leads(
             tg_wa_rows.append(row)
             continue
 
-        # Preserve Manual Social Queue rows routed by phone_messenger_resolver (X/LinkedIn/IG ICP >= 85)
-        if str(row.get("segment") or "").strip().lower() == "social_manual" and str(row.get("manual_action_url") or "").strip():
+        # Preserve Manual Social Queue rows routed by phone_messenger_resolver (X/LinkedIn/IG/ContactForm/Email ICP >= 85)
+        if (
+            manual_social_jsonl is not None
+            and str(row.get("segment") or "").strip().lower() == "social_manual"
+            and str(row.get("manual_action_url") or "").strip()
+        ):
+            manual_social_rows.append(row)
+            continue
+
+        # Preserve verified HLR/pending WA phone numbers into Manual Social Queue as click-to-WA + phone outreach
+        pending_e164 = normalize_e164(str(row.get("phone") or ""))
+        if manual_social_jsonl is not None and is_wa_pending and pending_e164:
+            lang = str(row.get("language") or "").strip().lower() or detect_lead_language(row)
+            row["phone"] = pending_e164
+            row.pop("whatsapp", None)
+            if str(row.get("provider") or "").strip().lower() == "whatsapp":
+                row.pop("provider", None)
+            row["segment"] = "social_manual"
+            row["manual_action_url"] = (
+                str(row.get("wa_click_url") or "").strip()
+                or f"https://wa.me/{pending_e164.lstrip('+')}"
+            )
+            row["manual_draft_text"] = (
+                str(row.get("wa_manual_draft_text") or "").strip()
+                or build_fallback_contact_draft(row, lang, "whatsapp_hlr")
+            )
+            row["manual_channel"] = "whatsapp_hlr"
             manual_social_rows.append(row)
             continue
 
@@ -355,7 +394,10 @@ def split_tg_and_direct_x_leads(
         em = email_of_text(row.get("work_email") or row.get("email") or "")
         fx = x_profile_url(row)
         fli = linkedin_of(row)
-        if em or fx or fli:
+        cform = str(row.get("contact_form_url") or "").strip()
+        if not cform.lower().startswith(("http://", "https://")):
+            cform = ""
+        if em or fx or fli or cform:
             comp_val = str(row.get("company") or row.get("project") or "").strip()
             angle_val = str(row.get("their_angle") or row.get("what_they_do") or "").strip()
             if comp_val:
@@ -376,7 +418,9 @@ def split_tg_and_direct_x_leads(
             if fli:
                 row["founder_linkedin"] = fli
                 row["linkedin_url"] = fli
-            row["route_channel"] = "x" if (fx and not em and not fli) else "direct"
+            if cform:
+                row["contact_form_url"] = cform
+            row["route_channel"] = "x" if (fx and not em and not fli and not cform) else "direct"
             d_keys = _direct_x_dedup_keys(row)
             if d_keys and any(k in existing_dx_keys for k in d_keys):
                 continue
@@ -1570,6 +1614,7 @@ def resolve_and_route_phone_leads(
 
     if unique_phones:
         eff_wa_sess = str(wa_session_path or "").strip() or find_connected_wa_session(conn)
+        active_gw = None
         if eff_wa_sess:
             active_gw = wa_gateway
             if active_gw is None and Path(eff_wa_sess).exists():
@@ -1580,10 +1625,14 @@ def resolve_and_route_phone_leads(
                 except Exception as exc:
                     logger.debug("WhatsAppGateway unavailable for phone check: %s", exc)
                     active_gw = None
-            if active_gw is not None:
-                wa_results = _run_coro_sync(
-                    resolve_phones_whatsapp(active_gw, eff_wa_sess, unique_phones)
-                ) or {}
+        if eff_wa_sess and active_gw is not None:
+            wa_results = _run_coro_sync(
+                resolve_phones_whatsapp(active_gw, eff_wa_sess, unique_phones)
+            ) or {}
+        else:
+            wa_results = _run_coro_sync(
+                resolve_phones_whatsapp(None, "", unique_phones)
+            ) or {}
 
         checker_sess: Path | None = None
         if checker_session_path is not None:
@@ -2202,7 +2251,23 @@ def _insert_manual_queue_lead(conn: sqlite3.Connection, row: Mapping[str, Any]) 
         (manual_url,),
     ).fetchone()
     if dup is not None:
-        _persist_lead_v2_columns(conn, int(dup["id"]), row)
+        dup_id = int(dup["id"])
+        dup_phone = normalize_e164(str(row.get("phone") or "")) or None
+        dup_email = str(row.get("work_email") or row.get("email") or "").strip() or None
+        dup_domain = str(row.get("company_domain") or row.get("domain") or "").strip() or None
+        dup_draft = str(row.get("manual_draft_text") or "").strip() or None
+        conn.execute(
+            """
+            UPDATE leads
+            SET phone = COALESCE(NULLIF(trim(COALESCE(phone, '')), ''), ?),
+                email = COALESCE(NULLIF(trim(COALESCE(email, '')), ''), ?),
+                company_domain = COALESCE(NULLIF(trim(COALESCE(company_domain, '')), ''), ?),
+                manual_draft_text = COALESCE(NULLIF(trim(COALESCE(manual_draft_text, '')), ''), ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (dup_phone, dup_email, dup_domain, dup_draft, utc_now(), dup_id),
+        )
         conn.commit()
         return None
 
@@ -2225,6 +2290,7 @@ def _insert_manual_queue_lead(conn: sqlite3.Connection, row: Mapping[str, Any]) 
     created = crm_create_lead(
         conn,
         name=name,
+        phone=normalize_e164(str(row.get("phone") or "")) or None,
         company=company or None,
         description=desc,
         niche=niche,

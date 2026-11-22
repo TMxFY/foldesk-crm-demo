@@ -50,6 +50,8 @@ def _insert_lead(
     provider: str = "telegram",
     lead_source: str | None = None,
     niche: str | None = None,
+    phone: str | None = None,
+    email: str | None = None,
 ) -> int:
     ts = created_at or utc_now()
     cur = conn.execute(
@@ -58,8 +60,8 @@ def _insert_lead(
             account_id, telegram_user_id, username, name, company, segment, language,
             exclude_from_airtable, company_domain, pool_usd, manual_action_url,
             manual_draft_text, status, last_contacted, provider, lead_source, niche,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            phone, email, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             account_id,
@@ -79,6 +81,8 @@ def _insert_lead(
             provider,
             lead_source,
             niche,
+            phone,
+            email,
             ts,
             ts,
         ),
@@ -294,8 +298,10 @@ def test_manual_queues_ordering_and_mark_manual_sent_lifecycle(tmp_path: Path, m
             language="en",
             company_domain="smallbounty.io",
             pool_usd=5000,
-            manual_action_url="https://x.com/smallbounty",
+            manual_action_url="https://wa.me/14155550177",
             manual_draft_text="Want 3 demo reels for SmallBounty? Drop TG/WA.",
+            phone="+14155550177",
+            email="founder@smallbounty.io",
             status="new",
             created_at="2026-11-22T15:00:00",
         )
@@ -405,10 +411,14 @@ def test_manual_queues_ordering_and_mark_manual_sent_lifecycle(tmp_path: Path, m
                 "pool_usd",
                 "manual_action_url",
                 "manual_draft_text",
+                "phone",
+                "email",
                 "status",
                 "created_at",
             }
             assert required_keys.issubset(ms_data["items"][0].keys())
+            assert ms_data["items"][1]["phone"] == "+14155550177"
+            assert ms_data["items"][1]["email"] == "founder@smallbounty.io"
 
             aj_resp = client.get("/api/queues/assisted-jobs")
             assert aj_resp.status_code == 200

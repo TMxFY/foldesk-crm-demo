@@ -514,3 +514,67 @@ def test_route_resolved_lead_priorities_and_social_manual() -> None:
     assert routed_existing_wa["provider"] == "whatsapp"
     assert routed_existing_wa["phone"] == "+14155550199"
     assert routed_existing_wa.get("segment") != "social_manual"
+
+
+def test_route_resolved_lead_fallback_contact_form_email_and_wa_pending_draft() -> None:
+    # 1) icp >= 85 without TG/WA/socials routes contact_form_url -> social_manual
+    routed_cf = route_resolved_lead(
+        {
+            "icp_score": 88,
+            "company": "Breakout Report",
+            "contact_form_url": "https://0dtenews.com/advertise",
+            "work_email": "hello@0dtenews.com",
+        },
+        {},
+        language="en",
+    )
+    assert routed_cf["segment"] == "social_manual"
+    assert routed_cf["manual_action_url"] == "https://0dtenews.com/advertise"
+    assert routed_cf["manual_channel"] == "contact_form"
+    assert "SoftUGC" in routed_cf["manual_draft_text"]
+
+    # 2) Without contact_form_url -> mailto:hello@... with RU/EN SoftUGC pitch
+    routed_em = route_resolved_lead(
+        {
+            "icp_score": 86,
+            "company": "BeautyLab",
+            "founder_name": "Ольга",
+            "email": "hello@beautylab.ru",
+        },
+        {},
+        language="ru",
+    )
+    assert routed_em["segment"] == "social_manual"
+    assert routed_em["manual_action_url"] == "mailto:hello@beautylab.ru"
+    assert routed_em["manual_channel"] == "email"
+    assert "SoftUGC" in routed_em["manual_draft_text"]
+    assert "Ольга" in routed_em["manual_draft_text"]
+
+    # 3) icp == 84 stays out of social_manual even with contact_form_url / email
+    routed_low = route_resolved_lead(
+        {
+            "icp_score": 84,
+            "contact_form_url": "https://small.io/contact",
+            "work_email": "hello@small.io",
+        },
+        {},
+    )
+    assert routed_low.get("segment") != "social_manual"
+    assert "manual_action_url" not in routed_low
+
+    # 4) wa_check_pending preserves phone & adds honest click-to-WA URL/draft without fake whatsapp provider
+    routed_pending = route_resolved_lead(
+        {
+            "icp_score": 90,
+            "company": "Mark Builds Brands",
+            "phone": "+14155550133",
+        },
+        {"+14155550133": ResolvedMessenger(phone_e164="+14155550133", wa_check_pending=True)},
+        language="en",
+    )
+    assert routed_pending["wa_check_pending"] is True
+    assert routed_pending.get("provider") != "whatsapp"
+    assert routed_pending.get("segment") != "social_manual"
+    assert routed_pending["wa_click_url"] == "https://wa.me/14155550133"
+    assert "SoftUGC" in routed_pending["wa_manual_draft_text"]
+

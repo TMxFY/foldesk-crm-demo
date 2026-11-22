@@ -535,8 +535,8 @@ def _list_manual_queue_leads(
     sql = f"""
         SELECT id, name, company, segment, language, company_domain, pool_usd,
                manual_action_url, manual_draft_text, status, created_at,
-               updated_at, last_contacted, username, url, lead_source, niche,
-               exclude_from_airtable
+               updated_at, last_contacted, username, phone, email, url,
+               lead_source, niche, exclude_from_airtable
         FROM leads
         WHERE {' AND '.join(clauses)}
         ORDER BY COALESCE(pool_usd, 0) DESC, created_at DESC, id DESC
@@ -563,6 +563,8 @@ def _list_manual_queue_leads(
                     "lead_source",
                     "niche",
                     "username",
+                    "phone",
+                    "email",
                 )
             ).lower()
             if needle not in blob:

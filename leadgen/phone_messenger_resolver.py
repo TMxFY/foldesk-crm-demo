@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ResolvedMessenger",
+    "build_fallback_contact_draft",
     "merge_resolved_messengers",
     "normalize_e164",
     "resolve_phones_telegram",
@@ -30,6 +31,8 @@ __all__ = [
 _PLACEHOLDER_VALUES = frozenset({"", "none", "null", "n/a", "na", "-", "—"})
 _X_HANDLE_RE = re.compile(r"^@?[A-Za-z0-9_]{1,15}$")
 _IG_HANDLE_RE = re.compile(r"^@?[A-Za-z0-9_.]{1,30}$")
+_EMAIL_SIMPLE_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+_NOREPLY_EMAIL_PREFIXES = ("noreply@", "no-reply@", "no_reply@", "donotreply@", "do-not-reply@")
 
 
 @dataclass
@@ -506,7 +509,7 @@ def _extract_first_name(row: Mapping[str, Any]) -> str:
 
 
 def _extract_brand_name(row: Mapping[str, Any]) -> str:
-    for key in ("brand_name", "company", "company_name"):
+    for key in ("brand_name", "company", "company_name", "project"):
         raw = _clean_field(row.get(key))
         if raw:
             return raw
@@ -535,6 +538,61 @@ def _build_bridge_dm(row: Mapping[str, Any], language: str) -> str:
     return " ".join(text.split())
 
 
+def _pick_fallback_contact_url(row: Mapping[str, Any]) -> tuple[str, str]:
+    cform = _clean_field(row.get("contact_form_url"))
+    if cform.lower().startswith(("http://", "https://")):
+        return cform, "contact_form"
+    for key in ("work_email", "email"):
+        raw_em = _clean_field(row.get(key)).lower()
+        if not raw_em:
+            continue
+        if raw_em.startswith("mailto:"):
+            raw_em = raw_em[7:].split("?", 1)[0].strip()
+        if any(raw_em.startswith(p) for p in _NOREPLY_EMAIL_PREFIXES):
+            continue
+        if _EMAIL_SIMPLE_RE.fullmatch(raw_em):
+            return f"mailto:{raw_em}", "email"
+    return "", ""
+
+
+def build_fallback_contact_draft(row: Mapping[str, Any], language: str, channel: str) -> str:
+    first_name = _extract_first_name(row)
+    brand = _extract_brand_name(row)
+    lang = (language or "en").strip().lower()
+    ch = (channel or "").strip().lower()
+
+    if ch == "whatsapp_hlr":
+        if lang.startswith("ru"):
+            greet = f"Привет, {first_name}!" if first_name else "Привет!"
+            target = f"под {brand}" if brand else "под ваш бренд"
+            text = (
+                f"{greet} Пишу из SoftUGC — могу скинуть здесь 3 коротких "
+                f"демо-рилса и кейсы {target}?"
+            )
+        else:
+            greet = f"Hey {first_name}, " if first_name else "Hey, "
+            target = f"for {brand}" if brand else "for your brand"
+            text = (
+                f"{greet}quick note from SoftUGC — mind if I send 3 short "
+                f"custom demo reels {target} here?"
+            )
+        return " ".join(text.split())
+
+    if lang.startswith("ru"):
+        greet = f"Привет, {first_name}!" if first_name else "Привет!"
+        target = f"под {brand}" if brand else "под ваш бренд"
+        return (
+            f"{greet} Мы в SoftUGC делаем AI UGC-рилсы под ключ (1,500+ роликов/мес).\n"
+            f"Подскажите ваш WhatsApp или Telegram — скину 3 демо-ролика {target}?"
+        )
+    greet = f"Hey {first_name}, " if first_name else "Hey, "
+    target = f"for {brand}" if brand else "for your brand"
+    return (
+        f"{greet}we produce performance AI UGC reels at SoftUGC (1,500+ videos/mo).\n"
+        f"What's the best WhatsApp or Telegram to send 3 custom demo reels {target}?"
+    )
+
+
 def route_resolved_lead(
     row: Mapping[str, Any],
     resolved_by_phone: Mapping[str, ResolvedMessenger],
@@ -546,11 +604,12 @@ def route_resolved_lead(
     Priority order:
       1. Telegram username found -> provider='telegram', username, telegram_user_id.
       2. WhatsApp verified -> provider='whatsapp', phone=<e164>, whatsapp='https://wa.me/<digits>'.
-      3. WhatsApp check pending -> preserve phone, wa_check_pending=True.
-      4. Neither TG nor WA, icp_score >= 85, and X/LinkedIn/IG present ->
-         segment='social_manual', manual_action_url (X > LinkedIn > IG), manual_draft_text.
+      3. WhatsApp check pending -> preserve phone, wa_check_pending=True (+ click-to-WA URL/draft).
+      4. Neither TG nor WA, icp_score >= 85 ->
+         segment='social_manual' via X > LinkedIn > IG, else Contact Form / Email fallback.
     """
     out = dict(row)
+    eff_lang = (language or _clean_field(out.get("language")) or "en").strip().lower()
     resolved = _lookup_resolved(out, resolved_by_phone)
 
     tg_username = (
@@ -579,7 +638,7 @@ def route_resolved_lead(
         out["wa_check_pending"] = False
         return out
 
-    if resolved is None:
+    if resolved is None and not bool(out.get("wa_check_pending")):
         existing_wa = _clean_field(out.get("whatsapp"))
         if existing_wa and ("wa.me/" in existing_wa.lower() or "whatsapp.com/" in existing_wa.lower()):
             e164 = _extract_wa_url_e164(existing_wa) or normalize_e164(str(out.get("phone") or ""))
@@ -599,6 +658,11 @@ def route_resolved_lead(
         )
         if e164:
             out["phone"] = e164
+            out["wa_click_url"] = f"https://wa.me/{e164.lstrip('+')}"
+            out["wa_manual_draft_text"] = build_fallback_contact_draft(out, eff_lang, "whatsapp_hlr")
+        out.pop("whatsapp", None)
+        if str(out.get("provider") or "").strip().lower() == "whatsapp":
+            out.pop("provider", None)
         out["wa_check_pending"] = True
         return out
 
@@ -606,10 +670,16 @@ def route_resolved_lead(
     if icp_score >= 85:
         social_url = _pick_manual_social_url(out)
         if social_url:
-            eff_lang = (language or _clean_field(out.get("language")) or "en").strip().lower()
             out["segment"] = "social_manual"
             out["manual_action_url"] = social_url
             out["manual_draft_text"] = _build_bridge_dm(out, eff_lang)
+            return out
+        fb_url, fb_kind = _pick_fallback_contact_url(out)
+        if fb_url:
+            out["segment"] = "social_manual"
+            out["manual_action_url"] = fb_url
+            out["manual_draft_text"] = build_fallback_contact_draft(out, eff_lang, fb_kind)
+            out["manual_channel"] = fb_kind
             return out
 
     return out
