@@ -915,6 +915,7 @@ def test_paid_discovery_stages_skipped_when_budget_low_in_real_runner_mode(
     scraper_sess = _make_sqlite_session(sessions_dir / "signals_ro.session")
     monkeypatch.setenv("SCRAPER_TG_SESSION", str(scraper_sess))
     monkeypatch.setenv("HH_API_TOKEN", "hh-test-token")
+    monkeypatch.setattr(vps_autonomous_replenish, "check_treg_ready", lambda: True)
 
     save_leadgen_config(
         conn,

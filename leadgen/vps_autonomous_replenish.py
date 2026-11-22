@@ -1941,17 +1941,16 @@ def run_wave2_vacancies_pipeline(
         stats["freelance_count"] = len(fl_rows)
         raw_candidates.extend(fl_rows)
 
-    # 4) LinkedIn Jobs (when collector hook injected or treg CLI is ready + paid budget allows)
+    # 4) LinkedIn Jobs (when collector hook injected or paid budget + treg CLI ready)
     if (
         vac_sources.get("linkedin_jobs", True)
         and b2b_sources.get("linkedin_jobs", True)
         and "linkedin_jobs" not in quarantined
-        and (linkedin_collector_fn is not None or treg_ready)
     ):
         if linkedin_collector_fn is None and not budget_state.paid_allowed:
             if "budget_guard_skipped:linkedin_jobs" not in replenish_reasons:
                 replenish_reasons.append("budget_guard_skipped:linkedin_jobs")
-        else:
+        elif linkedin_collector_fn is not None or treg_ready:
             try:
                 li_rows = (
                     linkedin_collector_fn()
@@ -3157,12 +3156,11 @@ def _run_autonomous_replenish_locked(
                 if (
                     sources_cfg.get("facebook_groups", False)
                     and "facebook_groups" not in quarantined
-                    and (treg_ready or not is_real_subprocess_runner)
                 ):
                     if not paid_cli_discovery_allowed:
                         if "budget_guard_skipped:facebook_groups" not in replenish_reasons:
                             replenish_reasons.append("budget_guard_skipped:facebook_groups")
-                    else:
+                    elif treg_ready or not is_real_subprocess_runner:
                         fb_cmd = [
                             py_bin,
                             str(ROOT / "leadgen" / "ofm_and_groups.py"),
@@ -3177,6 +3175,8 @@ def _run_autonomous_replenish_locked(
                         if fb_urls:
                             fb_cmd.extend(["--fb-urls", ",".join(fb_urls), "--max-groups", str(max(5, len(fb_urls)))])
                         _exec_stage("facebook_groups", fb_cmd)
+                    elif "missing_treg_cli" not in replenish_reasons:
+                        replenish_reasons.append("missing_treg_cli")
 
                 if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
                     if not paid_cli_discovery_allowed:
@@ -3219,6 +3219,18 @@ def _run_autonomous_replenish_locked(
                         )
                     elif is_real_subprocess_runner and "missing_treg_cli" not in replenish_reasons:
                         replenish_reasons.append("missing_treg_cli")
+                if (
+                    is_real_subprocess_runner
+                    and not treg_ready
+                    and "missing_treg_cli" not in replenish_reasons
+                    and (
+                        (sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined)
+                        or (sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined)
+                        or (sources_cfg.get("facebook_groups", False) and "facebook_groups" not in quarantined)
+                        or (enabled_veins and "high_yield_veins" not in quarantined)
+                    )
+                ):
+                    replenish_reasons.append("missing_treg_cli")
                 if (
                     sources_cfg.get("yc_ph", True)
                     and "yc_ph" not in quarantined
