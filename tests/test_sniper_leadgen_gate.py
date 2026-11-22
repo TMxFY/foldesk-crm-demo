@@ -759,3 +759,27 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
     assert not dup_final.exists()
 
     conn.close()
+
+
+def test_tg_llm_qualify_lead_view_and_paid_scale_evidence_prompt() -> None:
+    assert tg_llm_qualify.MIN_ICP_SCORE == 80
+    assert "Paid Scale Evidence rule" in tg_llm_qualify.SYSTEM_PROMPT
+    assert "Roblox" in tg_llm_qualify.SYSTEM_PROMPT
+
+    view = tg_llm_qualify.lead_view(
+        0,
+        {
+            "name": "TradeMachine",
+            "source": "meta_ads",
+            "cta_type": "LEARN_MORE",
+            "pool_usd": 12000,
+            "rating_count": 2400,
+            "country_code": "US",
+            "has_monetization_signal": True,
+        },
+    )
+    assert view["cta_type"] == "LEARN_MORE"
+    assert view["pool_usd"] == 12000
+    assert view["rating_count"] == 2400
+    assert view["country_code"] == "US"
+

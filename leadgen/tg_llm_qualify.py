@@ -146,24 +146,28 @@ MIN_ICP_SCORE = 80
 
 SYSTEM_PROMPT = """You qualify Whale B2B/consumer product leads for SoftUGC (Sniper ICP Gate >= 80).
 
-SoftUGC sells high-volume organic short-form video user acquisition (AI UGC + owned-network clipping, 183.5M views in 90 days, 1,500+ reels/mo mass production) ONLY to founders, CEOs, CMOs, and marketing/growth leads who own a high-LTV MONETIZED product (LTV $50-$100+ with clear budget and monetization scale) and short-form viral potential.
+SoftUGC sells high-volume organic short-form video user acquisition (AI UGC + owned-network clipping, 183.5M views in 90 days, 1,500+ reels/mo mass production) to founders, CEOs, CMOs, and marketing/growth leads who own a MONETIZED product (real paid monetization + budget evidence) and short-form viral potential.
 
-Golden ICP clusters (icp_score 80..100 ONLY with LTV $50-$100+ and verified budget/monetization scale):
-1. High-LTV Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, video/creator tools) with verified paid subscriptions and growth scale.
-2. Major E-com / Shopify D2C brands (cosmetics/skincare, supplements/vitamins, health/wellness, high-AOV/multi-SKU household & consumer brands with LTV $50-$100+ and paid ad scale).
-3. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, payment apps, and prop trading challenges with verified deposit/challenge monetization.
-4. High-ticket info-products and education businesses ($50K+/mo revenue scale or high-LTV cohorts/programs with verified budget).
+Golden ICP clusters (icp_score 80..100 when monetized product + budget/scale evidence matches):
+1. High-LTV Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, trading tools, video/creator tools) with paid subscriptions/trials and growth scale.
+2. E-com / Shopify / TikTok Shop D2C brands (cosmetics/skincare, supplements/vitamins, health/wellness, consumer household/beauty/fitness brands) with paid ads or shop volume.
+3. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, payment apps, and prop trading challenges / options & trading platforms with deposit/subscription/challenge monetization.
+4. High-ticket info-products, coaching programs, and education businesses with paid cohorts/ads.
+
+Paid Scale Evidence rule (CRITICAL):
+- Active paid video advertising (source in ["meta_ads", "tiktok_ads", "tiktok_shop", "whop_content_rewards", "d2c_whatsapp"]), proven store traction (source="app_stores" with rating_count >= 300), active hiring for UGC/Short-Form/Paid Social (source="ats_hiring"), or monetized YC/PH consumer/prosumer products (subscription, app IAP, paid product) ALREADY prove commercial budget and monetization. Do NOT lower icp_score below 80 solely because an ad snippet or short bio does not print explicit MRR or LTV dollar numbers.
+- Real consumer/prosumer/fintech/trading/AI/D2C advertisers running video ads with monetized plans/apps and short_form_fit=true should score icp_score 80..95 with is_lead=true.
 
 REJECT (is_lead=false, icp_score < 80, or monetization="none"):
 - Gaming / Roblox / Fortnite / FiveM / UEFN, mobile & PC games, low-CPM gaming studios, game servers, hobby browser games, and 3D modeler / Roblox builder recruitment threads.
-- Solopreneurs, indie hackers without revenue (no verified MRR/paying scale), hobby/weekend/side projects without budget, micro-arbitrage, and cheap low-margin e-com (cheap dropshipping gadgets, low-AOV trinkets under $50 LTV).
+- Free hobby/weekend/side projects with zero monetization (monetization="none"), pre-monetization experiments without budget or paid ads, micro-arbitrage, and cheap generic trinket dropshipping.
 - Agencies, PR firms (e.g. FINPR, Marketacross), GTM/marketing/SEO/dev consultancies, outsource studios, recruiters, B2B sales agencies, targetologists, mentors, storymakers ("Сервис / агентство").
-- Bot hosting / managed server hosting, pure B2D dev-only CLI/SDKs, open-source repos/tools without paid product monetization, ethical hacking/recovery APIs, coding quizzes.
-- Forum job seekers, freelancers, pure traders/investors, community mods.
+- Bot hosting / managed server hosting, pure B2D dev-only CLI/SDKs/APIs/infra with no consumer/prosumer short-form angle, open-source repos/tools without paid product monetization, ethical hacking/recovery APIs, coding quizzes.
+- Forum job seekers, freelancers, pure traders/investors without a product, community mods.
 
 For EACH lead in the input array decide:
-- is_lead: true ONLY if Founder/CEO/CMO/Marketing/Growth of an own scaled monetized product (LTV $50-$100+, clear budget/monetization scale) discovered directly or via paid ads/stores/launches (e.g. source=meta_ads, app_store, tiktok_ads, tiktok_shop, whop, d2c_whatsapp, yc, ph_detailed) — NEVER Gaming/Roblox/Fortnite/FiveM, low-CPM gaming studios, solopreneurs, indie hackers without revenue, micro-arbitrage, cheap low-margin e-com, agencies, consultancies, pure B2D CLI/SDK, robotics/hardware makers, universities, or hobbies
-- icp_score: integer 0..100 (80+ ONLY for verified Whale ICP products with LTV $50-$100+ and clear budget/monetization scale; < 80 for unscaled, low-LTV, or unverified leads)
+- is_lead: true ONLY if Founder/CEO/CMO/Marketing/Growth/Advertiser of an own monetized product with short-form viral potential and commercial budget/ads/store evidence — NEVER Gaming/Roblox/Fortnite/FiveM, agencies, consultancies, pure B2D dev-only CLI/SDK/infra, robotics/hardware makers, universities, or free hobbies
+- icp_score: integer 0..100 (80..95 for verified monetized products with Paid Scale Evidence or clear monetization + short_form_fit; < 80 for unmonetized, pure enterprise B2B ERP/devops without short-form consumer angle, agencies, or weak fit)
 - monetization: one of ["subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none"]
 - short_form_fit: bool (true if product can convert from TikTok/Reels/Shorts)
 - category: one of [SaaS / AI app, E-com / D2C, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
@@ -188,6 +192,10 @@ def lead_view(i, r):
         "project": r.get("project") or r.get("company") or "",
         "project_url": r.get("project_url") or "",
         "what_they_do": (r.get("what_they_do") or "")[:200],
+        "cta_type": r.get("cta_type") or "",
+        "pool_usd": r.get("pool_usd"),
+        "rating_count": r.get("rating_count"),
+        "country_code": r.get("country_code") or "",
         "has_monetization_signal": bool(r.get("has_monetization_signal")),
         "has_agency_signal": bool(r.get("has_agency_signal")),
         "links": [l for l in (r.get("links") or []) if isinstance(l, str)][:5],

@@ -318,3 +318,52 @@ def test_fb_and_ig_metadata_preservation():
     assert r_velvet["instagram_url"] == "https://instagram.com/velvetserumco"
     assert r_velvet["country_code"] == "GB"
     assert r_velvet["segment"] == "whale"
+
+
+def test_meta_ad_leads_cursor_rotation_and_channel_handle_routing(monkeypatch) -> None:
+    d0 = date(2026, 11, 22)
+    q0 = meta_ad_leads.queries_for_day(d0, count=6, cursor=0)
+    q1 = meta_ad_leads.queries_for_day(d0, count=6, cursor=1)
+    assert len(q0) == 6 and len(q1) == 6
+    assert set(q0).isdisjoint(set(q1))
+
+    c0 = meta_ad_leads.countries_for_day(d0, count=6, cursor=0)
+    c1 = meta_ad_leads.countries_for_day(d0, count=6, cursor=1)
+    assert len(c0) == 6 and len(c1) == 6
+    assert set(c0) != set(c1)
+
+    monkeypatch.setattr(
+        meta_ad_leads,
+        "_scrape_site_contacts",
+        lambda _url: {"username": "Plus500_Official", "founder_x": "https://x.com/plus500"},
+    )
+    payload = {
+        "searchResults": [
+            {
+                "is_active": True,
+                "page_id": "398561793349460",
+                "snapshot": {
+                    "display_format": "VIDEO",
+                    "page_name": "Plus500 US",
+                    "cta_type": "INSTALL_MOBILE_APP",
+                    "body": {"text": "Start Trading Today"},
+                    "link_url": "https://us.plus500.com",
+                },
+            }
+        ]
+    }
+    rows, _ = meta_ad_leads.collect(
+        day=d0,
+        seen={},
+        cap=5,
+        countries=("US",),
+        search_fn=lambda q, country="US": payload,
+        enrich_fn=None,
+        store_resolver_fn=lambda _u: {},
+    )
+    assert len(rows) == 1
+    assert rows[0]["username"] == ""
+    assert rows[0]["provider"] == ""
+    assert rows[0]["telegram_group"] == "https://t.me/Plus500_Official"
+    assert "https://t.me/Plus500_Official" in rows[0]["links"]
+

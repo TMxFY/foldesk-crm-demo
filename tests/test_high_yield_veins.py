@@ -1266,3 +1266,55 @@ def test_hardening_edge_cases_and_stdlib_dotenv(tmp_path: Path, monkeypatch) -> 
     )
     assert weak_res == ("", "", {}, [])
 
+
+def test_app_store_vein_falls_back_to_web_landing_discovery_when_website_missing() -> None:
+    target_kw = high_yield_veins._rotate_for_day(
+        high_yield_veins.APP_STORE_VEIN_QUERIES, date(2026, 11, 22), 2
+    )[0]
+    rows, _ = high_yield_veins.collect_scaling_store_apps(
+        limit=4,
+        day=date(2026, 11, 22),
+        seen={},
+        apple_search_fn=lambda kw: (
+            {
+                "results": [
+                    {
+                        "trackViewUrl": "https://apps.apple.com/us/app/eatlike-ai/id6744646858",
+                        "trackName": "AI Calorie Counter: Eatlike",
+                    }
+                ]
+            }
+            if kw == target_kw
+            else {"results": []}
+        ),
+        play_search_fn=lambda kw: {"results": []},
+        store_resolver_fn=lambda _u: {
+            "developer": "Lunapark Media",
+            "app_name": "AI Calorie Counter: Eatlike",
+            "website": "",
+            "domain": "",
+            "email": "",
+            "rating_count": 1424,
+            "is_megacorp": False,
+        },
+        web_search_fn=lambda q: {
+            "results": [
+                {
+                    "url": "https://eatlike.app/",
+                    "title": "Eatlike - AI Calorie Counter App",
+                    "snippet": "Scan meals in 1 tap. Subscription plan.",
+                }
+            ]
+        }
+        if "eatlike" in q.lower()
+        else {"results": []},
+        enrich_fn=lambda _b, dom: {"work_email": f"growth@{dom}"} if dom == "eatlike.app" else {},
+        site_scrape_fn=lambda _u: {},
+    )
+    assert len(rows) == 1
+    assert rows[0]["source"] == "app_stores"
+    assert rows[0]["project_url"] == "https://eatlike.app/"
+    assert rows[0]["work_email"] == "growth@eatlike.app"
+    assert rows[0]["rating_count"] == 1424
+
+

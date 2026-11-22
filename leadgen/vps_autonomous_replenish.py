@@ -99,6 +99,24 @@ from leadgen.treg_client import check_treg_ready as _client_check_treg_ready, tr
 DEFAULT_DB_PATH = "/opt/crmtg/data/crm.db"
 DEFAULT_SCRAPER_SESSIONS_DIR = "/opt/crmtg/data/scraper_sessions"
 _NOISE_TG_HANDLES = frozenset({"joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "socks"})
+_NON_PERSONAL_TG_SUFFIXES = (
+    "_official",
+    "official",
+    "_channel",
+    "channel",
+    "_news",
+    "_announcements",
+    "_announcement",
+    "_community",
+    "_group",
+    "_chat",
+    "_support",
+    "_helpdesk",
+    "_updates",
+    "_alerts",
+    "bot",
+    "_bot",
+)
 
 
 def check_treg_ready() -> bool:
@@ -233,9 +251,29 @@ def _is_real_personal_tg_handle(raw_username: Any) -> bool:
     if not u or len(u) < 4 or len(u) > 32:
         return False
     low = u.lower()
-    if low in _NOISE_TG_HANDLES or low.endswith("bot") or low.endswith("_bot"):
+    if low in _NOISE_TG_HANDLES or any(low.endswith(sfx) for sfx in _NON_PERSONAL_TG_SUFFIXES):
         return False
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u))
+
+
+def _strip_tg_handle_from_row(row: dict[str, Any], handle: str, *, move_to_group: bool) -> None:
+    row["username"] = ""
+    if "telegram_username" in row:
+        row["telegram_username"] = ""
+    if "tg_username" in row:
+        row["tg_username"] = ""
+    if "telegram_url" in row:
+        row["telegram_url"] = ""
+    if str(row.get("provider") or "").strip().lower() == "telegram":
+        row["provider"] = ""
+    if move_to_group and handle:
+        grp_url = f"https://t.me/{handle}"
+        if not str(row.get("telegram_group") or "").strip():
+            row["telegram_group"] = grp_url
+        links = list(row.get("links") or []) if isinstance(row.get("links"), list) else []
+        if grp_url not in links:
+            links.append(grp_url)
+        row["links"] = links
 
 
 def _direct_x_dedup_keys(row: dict[str, Any]) -> list[str]:
@@ -1425,6 +1463,133 @@ def run_contact_waterfall_with_budget(
         )
         out_rows.append(dict(enriched) if isinstance(enriched, Mapping) else item)
     return out_rows, state
+
+
+def verify_personal_tg_handles_live(
+    rows: list[dict[str, Any]],
+    *,
+    client: Any = None,
+    scraper_session: Path | None = None,
+    entity_resolver_fn: Callable[[Any, str], Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Strip channel/group/bot handles from personal username fields, resolving PeerType live."""
+    stats = {
+        "checked": 0,
+        "verified_users": 0,
+        "heuristic_stripped": 0,
+        "channels_stripped": 0,
+        "bots_or_invalid_stripped": 0,
+    }
+    if not rows:
+        return [], stats
+
+    out_rows = [dict(r) for r in rows]
+    pending_handles: list[str] = []
+    seen_handles: set[str] = set()
+
+    for row in out_rows:
+        raw_h = str(
+            row.get("username") or row.get("telegram_username") or row.get("tg_username") or ""
+        ).strip().lstrip("@")
+        if not raw_h:
+            continue
+        if not _is_real_personal_tg_handle(raw_h):
+            is_bot_like = raw_h.lower().endswith(("bot", "_bot"))
+            _strip_tg_handle_from_row(row, raw_h, move_to_group=not is_bot_like)
+            stats["heuristic_stripped"] += 1
+            continue
+        if row.get("telegram_user_id"):
+            continue
+        low = raw_h.lower()
+        if low not in seen_handles:
+            seen_handles.add(low)
+            pending_handles.append(raw_h)
+
+    has_live_resolver = (
+        entity_resolver_fn is not None
+        or client is not None
+        or (scraper_session is not None and Path(scraper_session).is_file())
+    )
+    if not pending_handles or not has_live_resolver:
+        return out_rows, stats
+
+    async def _resolve_all(active_client: Any) -> dict[str, tuple[str, int | None]]:
+        cache: dict[str, tuple[str, int | None]] = {}
+        for handle in pending_handles:
+            stats["checked"] += 1
+            try:
+                if entity_resolver_fn is not None:
+                    res = entity_resolver_fn(active_client, handle)
+                    ent = await res if inspect.isawaitable(res) else res
+                else:
+                    ent = await active_client.get_entity(handle)
+            except Exception as exc:
+                cls_exc = exc.__class__.__name__
+                if cls_exc == "FloodWaitError":
+                    logger.warning("verify_personal_tg_handles_live hit FloodWaitError; pausing live checks")
+                    break
+                if cls_exc in {"UsernameNotOccupiedError", "UsernameInvalidError"} or isinstance(exc, ValueError):
+                    cache[handle.lower()] = ("drop", None)
+                else:
+                    logger.debug("verify_personal_tg_handles_live(%s) warning: %s", handle, exc)
+                continue
+
+            if ent is None:
+                cache[handle.lower()] = ("drop", None)
+                continue
+            cls_name = type(ent).__name__
+            if (
+                cls_name in {"Channel", "Chat"}
+                or getattr(ent, "broadcast", False)
+                or getattr(ent, "megagroup", False)
+            ):
+                cache[handle.lower()] = ("channel", None)
+            elif (
+                getattr(ent, "bot", False)
+                or getattr(ent, "deleted", False)
+                or getattr(ent, "scam", False)
+                or getattr(ent, "fake", False)
+            ):
+                cache[handle.lower()] = ("drop", None)
+            elif cls_name == "User" or getattr(ent, "id", None) is not None:
+                raw_uid = getattr(ent, "id", None)
+                cache[handle.lower()] = ("user", int(raw_uid) if raw_uid is not None else None)
+            else:
+                cache[handle.lower()] = ("drop", None)
+        return cache
+
+    verdicts: dict[str, tuple[str, int | None]] = {}
+    if entity_resolver_fn is not None or client is not None:
+        verdicts = _run_coro_sync(_resolve_all(client)) or {}
+    elif scraper_session is not None and Path(scraper_session).is_file():
+        try:
+            verdicts = _with_isolated_tg_client(Path(scraper_session), _resolve_all) or {}
+        except Exception as exc:
+            logger.warning("verify_personal_tg_handles_live skipped live lookup (%s)", exc)
+            verdicts = {}
+
+    for row in out_rows:
+        raw_h = str(
+            row.get("username") or row.get("telegram_username") or row.get("tg_username") or ""
+        ).strip().lstrip("@")
+        if not raw_h:
+            continue
+        outcome = verdicts.get(raw_h.lower())
+        if outcome is None:
+            continue
+        verdict, uid = outcome
+        if verdict == "user":
+            if uid is not None:
+                row["telegram_user_id"] = uid
+            stats["verified_users"] += 1
+        elif verdict == "channel":
+            _strip_tg_handle_from_row(row, raw_h, move_to_group=True)
+            stats["channels_stripped"] += 1
+        elif verdict == "drop":
+            _strip_tg_handle_from_row(row, raw_h, move_to_group=False)
+            stats["bots_or_invalid_stripped"] += 1
+
+    return out_rows, stats
 
 
 def enrich_whales_with_tg_group_admins(
@@ -2846,6 +3011,7 @@ def run_autonomous_replenish(
     waterfall_monid_fn: Callable[..., Any] | None = None,
     tg_client: Any = None,
     tg_admin_extractor_fn: Callable[..., Any] | None = None,
+    tg_entity_resolver_fn: Callable[..., Any] | None = None,
     wa_gateway: Any = None,
     tg_checker_client: Any = None,
     scraper_sessions_dir: Path | str | None = None,
@@ -2885,6 +3051,7 @@ def run_autonomous_replenish(
             waterfall_monid_fn=waterfall_monid_fn,
             tg_client=tg_client,
             tg_admin_extractor_fn=tg_admin_extractor_fn,
+            tg_entity_resolver_fn=tg_entity_resolver_fn,
             wa_gateway=wa_gateway,
             tg_checker_client=tg_checker_client,
             scraper_sessions_dir=scraper_sessions_dir,
@@ -2916,6 +3083,7 @@ def _run_autonomous_replenish_locked(
     waterfall_monid_fn: Callable[..., Any] | None = None,
     tg_client: Any = None,
     tg_admin_extractor_fn: Callable[..., Any] | None = None,
+    tg_entity_resolver_fn: Callable[..., Any] | None = None,
     wa_gateway: Any = None,
     tg_checker_client: Any = None,
     scraper_sessions_dir: Path | str | None = None,
@@ -3013,6 +3181,13 @@ def _run_autonomous_replenish_locked(
     )
     budget_state: EnrichmentBudgetState | None = None
     tg_admin_stats: dict[str, int] = {"groups_checked": 0, "admins_resolved": 0, "leads_promoted": 0}
+    tg_verify_stats: dict[str, int] = {
+        "checked": 0,
+        "verified_users": 0,
+        "heuristic_stripped": 0,
+        "channels_stripped": 0,
+        "bots_or_invalid_stripped": 0,
+    }
     phone_res_stats: dict[str, int] = {
         "phones_checked": 0,
         "wa_verified": 0,
@@ -3230,12 +3405,14 @@ def _run_autonomous_replenish_locked(
                                 str(high_yield_out),
                                 "--seen",
                                 str(state_dir / "high_yield_seen.json"),
+                                "--limit",
+                                "48",
                                 "--veins",
                                 ",".join(enabled_veins),
                                 "--whop-min-pool-usd",
                                 str(max(0, whop_min_pool)),
                                 "--max-runtime-sec",
-                                str(min(200, max(60, int(stage_timeout) - 60))),
+                                str(min(220, max(60, int(stage_timeout) - 60))),
                             ],
                         )
                     elif "missing_treg_cli" not in replenish_reasons:
@@ -3608,6 +3785,31 @@ def _run_autonomous_replenish_locked(
                                     ],
                                 )
                                 if curate_ok:
+                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                        v_rows_pre = _read_jsonl_dicts(curated_jsonl)
+                                        if v_rows_pre:
+                                            live_sess_pre = (
+                                                isolated_session
+                                                if (
+                                                    is_real_subprocess_runner
+                                                    or tg_client is not None
+                                                    or tg_entity_resolver_fn is not None
+                                                )
+                                                else None
+                                            )
+                                            v_rows_pre, v_st_pre = verify_personal_tg_handles_live(
+                                                v_rows_pre,
+                                                client=tg_client,
+                                                scraper_session=live_sess_pre,
+                                                entity_resolver_fn=tg_entity_resolver_fn,
+                                            )
+                                            for k, val in v_st_pre.items():
+                                                tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+                                            curated_jsonl.write_text(
+                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_pre)
+                                                + ("\n" if v_rows_pre else ""),
+                                                encoding="utf-8",
+                                            )
                                     pre_wf_tg_cnt = (
                                         _count_personal_tg_rows(curated_jsonl)
                                         if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0
@@ -3750,6 +3952,31 @@ def _run_autonomous_replenish_locked(
                                             bridge_tmp_jsonl.replace(curated_jsonl)
                                         elif bridge_tmp_jsonl.is_file():
                                             bridge_tmp_jsonl.unlink(missing_ok=True)
+                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                        v_rows_post = _read_jsonl_dicts(curated_jsonl)
+                                        if v_rows_post:
+                                            live_sess_post = (
+                                                isolated_session
+                                                if (
+                                                    is_real_subprocess_runner
+                                                    or tg_client is not None
+                                                    or tg_entity_resolver_fn is not None
+                                                )
+                                                else None
+                                            )
+                                            v_rows_post, v_st_post = verify_personal_tg_handles_live(
+                                                v_rows_post,
+                                                client=tg_client,
+                                                scraper_session=live_sess_post,
+                                                entity_resolver_fn=tg_entity_resolver_fn,
+                                            )
+                                            for k, val in v_st_post.items():
+                                                tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+                                            curated_jsonl.write_text(
+                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_post)
+                                                + ("\n" if v_rows_post else ""),
+                                                encoding="utf-8",
+                                            )
                                     # Layer 2 ($0): Phone -> WA + dedicated TG checker + Manual Social Queue routing
                                     run_l2_phone_resolver = is_real_subprocess_runner or any(
                                         x is not None
@@ -4099,6 +4326,7 @@ def _run_autonomous_replenish_locked(
         "low_water_alert": low_water_alert,
         "budget_state": budget_summary,
         "tg_group_admins": tg_admin_stats,
+        "tg_handle_verification": tg_verify_stats,
         "phone_resolution": phone_res_stats,
         "wave2_vacancies": wave2_stats,
         "wave3_ru_experts": wave3_stats,
@@ -4139,6 +4367,7 @@ def _run_autonomous_replenish_locked(
                         "reasons": replenish_reasons,
                         "budget_state": budget_summary,
                         "tg_group_admins": tg_admin_stats,
+                        "tg_handle_verification": tg_verify_stats,
                         "phone_resolution": phone_res_stats,
                         "wave2_vacancies": wave2_stats,
                         "wave3_ru_experts": wave3_stats,

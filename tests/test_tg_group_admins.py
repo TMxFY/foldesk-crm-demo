@@ -428,3 +428,54 @@ def test_tg_group_admins_lazy_telethon_import(monkeypatch: pytest.MonkeyPatch) -
     ] == ["jane_ceo"]
     client = _FakeTelethonClient(entity=SimpleNamespace(id=1, title="Group"), response=[])
     assert asyncio.run(extract_brand_tg_admins(client, "acme_group")) == []
+
+
+def test_extract_brand_tg_admins_falls_back_to_broadcast_channel_about() -> None:
+    from telethon.tl.functions.channels import GetFullChannelRequest
+
+    broadcast_chan = Channel(
+        id=1461231130,
+        title="Plus500 Official",
+        photo=None,
+        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        broadcast=True,
+        megagroup=False,
+        username="Plus500_Official",
+        access_hash=777,
+    )
+    founder_user = _make_tg_user(901122, username="kate_growth", first_name="Kate", last_name="Bell")
+    bot_user = _make_tg_user(901133, username="helper_bot", bot=True)
+
+    class _BroadcastAboutClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def get_entity(self, target: Any) -> Any:
+            key = str(target).strip().lstrip("@").lower()
+            self.queries.append(key)
+            if key == "plus500_official":
+                return broadcast_chan
+            if key == "kate_growth":
+                return founder_user
+            if key == "helper_bot":
+                return bot_user
+            raise UsernameNotOccupiedError(request=None)
+
+        async def __call__(self, request: Any) -> Any:
+            if isinstance(request, GetParticipantsRequest):
+                raise ChatAdminRequiredError(request=request)
+            if isinstance(request, GetFullChannelRequest):
+                return SimpleNamespace(
+                    full_chat=SimpleNamespace(
+                        about="Official channel @Plus500_Official. Support @helpdesk_team Bot @helper_bot Growth @kate_growth"
+                    )
+                )
+            return SimpleNamespace(users=[])
+
+    contacts = asyncio.run(extract_brand_tg_admins(_BroadcastAboutClient(), "https://t.me/Plus500_Official"))
+    assert len(contacts) == 1
+    assert contacts[0].username == "kate_growth"
+    assert contacts[0].user_id == 901122
+    assert contacts[0].role_guess == "Channel Contact"
+    assert contacts[0].admin_rank == "Channel About"
+

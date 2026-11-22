@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sys
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -40,11 +41,17 @@ except ImportError:
 
 
 SEEN_DAYS = 90
-MAX_API_CALLS_PER_RUN = 25
+MAX_API_CALLS_PER_RUN = 60
 
 WHOP_QUERIES = (
     'site:whop.com/discover ("per 1,000 views" OR "content rewards") ("Budget" OR "CPM") -blog -docs -terms',
     'site:apps.whop.com/discover ("per 1,000 views" OR "CPM") -terms',
+    'site:whop.com/discover "content rewards" (AI OR SaaS OR app OR coaching OR trading OR fitness) -blog -docs -terms',
+    'site:whop.com/discover "per 1k views" (app OR software OR skincare OR supplement OR course) -blog -terms',
+    'site:whop.com ("Bounty" OR "Content Rewards") "CPM" (trading OR crypto OR mentor OR cohort OR app) -blog -docs',
+    'site:whop.com/discover ("clipping" OR "clippers") ("Budget" OR "max payout") -portfolio -docs',
+    'site:whop.com/discover ("TikTok" OR "Reels") ("per 1,000 views" OR "rewards") (SaaS OR brand OR AI) -blog',
+    'site:apps.whop.com/discover ("content rewards" OR "budget") -docs -terms',
 )
 
 TIKTOK_AD_QUERIES = (
@@ -266,6 +273,30 @@ def _is_noise_brand(brand: str) -> bool:
 
 def _split_primary_brand(brand: str) -> str:
     return re.split(r"\s*[–—:|]\s*|\s+-\s+", str(brand or "").strip())[0].strip()
+
+
+def _store_landing_search_candidates(app_name: str, dev: str) -> list[str]:
+    """Order the most distinctive brand strings for App Store domain lookup."""
+    cands: list[str] = []
+    seen_c: set[str] = set()
+
+    def _push(val: str) -> None:
+        v = str(val or "").strip()
+        if v and v.lower() not in seen_c:
+            seen_c.add(v.lower())
+            cands.append(v)
+
+    parts = [p.strip() for p in re.split(r"\s*[:|–—]\s*|\s+-\s+", str(app_name or "").strip()) if p.strip()]
+    if len(parts) >= 2 and 1 <= len(parts[1].split()) <= 3 and len(parts[0].split()) >= 2:
+        _push(parts[1])
+    _push(app_name)
+    for part in parts:
+        if 1 <= len(part.split()) <= 3:
+            _push(part)
+    clean_dev = re.sub(r",?\s*\b(?:inc|llc|ltd|corp|co|gmbh|limited|s\.?l\.?|s\.?a\.?)\b\.?$", "", str(dev or "").strip(), flags=re.I).strip()
+    if clean_dev and 1 <= len(clean_dev.split()) <= 4:
+        _push(clean_dev)
+    return cands
 
 
 def _brand_distinctive_tokens(brand: str) -> list[str]:
@@ -644,7 +675,12 @@ def collect_whop_content_rewards(
     rows: list[dict[str, Any]] = []
     local_keys: set[str] = set()
 
-    for query in WHOP_QUERIES:
+    whop_queries = (
+        [WHOP_QUERIES[0], *_rotate_for_day(WHOP_QUERIES[1:], today, 3)]
+        if len(WHOP_QUERIES) > 1
+        else list(WHOP_QUERIES)
+    )
+    for query in whop_queries:
         if len(rows) >= limit or budget[0] <= 0:
             break
         budget[0] -= 1
@@ -1713,6 +1749,10 @@ APP_STORE_VEIN_QUERIES = (
 ATS_HIRING_QUERIES = (
     'site:jobs.ashbyhq.com ("UGC" OR "Short-Form" OR "TikTok" OR "Paid Social" OR "Creator Partnerships")',
     'site:job-boards.greenhouse.io ("UGC" OR "Short-Form" OR "TikTok" OR "Paid Social" OR "Creator")',
+    'site:boards.greenhouse.io ("UGC" OR "Short-Form" OR "TikTok" OR "Paid Social" OR "Creator")',
+    'site:jobs.ashbyhq.com ("Performance Creative" OR "Creative Strategist" OR "Growth Marketing") (TikTok OR Reels OR Shorts)',
+    'site:job-boards.greenhouse.io ("Performance Creative" OR "Creative Strategist" OR "Content Creator") (TikTok OR Reels)',
+    'site:jobs.ashbyhq.com ("Social Media Manager" OR "Brand Marketing") (TikTok OR Reels OR UGC)',
 )
 
 _ATS_ROLE_RE = re.compile(
@@ -1794,17 +1834,19 @@ def collect_scaling_store_apps(
     apple_search_fn=None,
     play_search_fn=None,
     store_resolver_fn=None,
+    web_search_fn=None,
     enrich_fn=None,
     site_scrape_fn=None,
     call_budget: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Collect scaling subscription/IAP mobile apps in the 300..30,000 rating sweet spot."""
+    """Collect scaling subscription/IAP mobile apps in the 300..50,000 rating sweet spot."""
     today = day or date.today()
     current = fresh_seen(seen or {}, today)
     stamp = today.isoformat()
     apple_search = _default_apple_search if apple_search_fn is None else apple_search_fn
     play_search = _default_play_search if play_search_fn is None else play_search_fn
     resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
+    web_search = _default_web_search if (web_search_fn is None and store_resolver_fn is None) else web_search_fn
     enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
     scraper = _scrape_site_contacts if site_scrape_fn is None else site_scrape_fn
     budget = call_budget if call_budget is not None else [MAX_API_CALLS_PER_RUN]
@@ -1812,6 +1854,10 @@ def collect_scaling_store_apps(
     rows: list[dict[str, Any]] = []
     local_keys: set[str] = set()
     queries = _rotate_for_day(APP_STORE_VEIN_QUERIES, today, 2)
+    extra_app_queries = [
+        q for q in _rotate_for_day(APP_STORE_VEIN_QUERIES, today, 2, cursor=1) if q not in queries
+    ]
+    queries.extend(extra_app_queries[:2])
 
     for kw in queries:
         if len(rows) >= limit or budget[0] <= 0:
@@ -1825,7 +1871,7 @@ def collect_scaling_store_apps(
                 res = fn(kw)
             except Exception:
                 res = None
-            candidates.extend(_extract_store_urls(res, kind)[:6])
+            candidates.extend(_extract_store_urls(res, kind)[:8])
 
         for s_url, title_hint in candidates:
             if len(rows) >= limit or budget[0] <= 0:
@@ -1842,10 +1888,29 @@ def collect_scaling_store_apps(
             rc_raw = st.get("rating_count")
             rc_digits = re.sub(r"\D", "", str(rc_raw)) if rc_raw is not None else ""
             rcount = int(rc_digits) if rc_digits else 0
-            if rcount < 300 or rcount > 30000:
+            if rcount < 300 or rcount > 50000:
                 continue
             if st.get("is_megacorp") or is_megacorp_app(dev, app_name, dom, rcount):
                 continue
+            extra_store_links: list[str] = []
+            if (not dom or not website) and web_search is not None and (app_name or dev):
+                for cand_brand in _store_landing_search_candidates(app_name, dev):
+                    if budget[0] <= 0 or dom:
+                        break
+                    land_url, land_dom, _, cand_extra = _discover_brand_landing(
+                        cand_brand,
+                        search_fn=web_search,
+                        store_resolver_fn=resolve_store,
+                        budget=budget,
+                    )
+                    if cand_extra:
+                        extra_store_links.extend(cand_extra)
+                    if land_dom and not dom:
+                        dom = land_dom
+                    if land_url and not website:
+                        website = land_url
+                if dom and is_megacorp_app(dev, app_name, dom, rcount):
+                    continue
             blob = f"{app_name} {dev} {st.get('description') or ''}"
             store_cat = str(st.get("category") or st.get("genre") or "")
             if (
@@ -1872,7 +1937,9 @@ def collect_scaling_store_apps(
                 brand=dev or app_name,
                 domain=dom,
                 project_url=website,
-                extra_text=str(st.get("description") or ""),
+                extra_text=" ".join(
+                    x for x in (str(st.get("description") or ""), *extra_store_links) if x
+                ),
                 enrich_fn=enricher,
                 site_scrape_fn=scraper,
                 budget=budget,
@@ -1992,7 +2059,13 @@ def collect_ats_ugc_hiring(
     local_keys: set[str] = set()
     boards: list[tuple[str, str, str]] = []
 
-    for q in ATS_HIRING_QUERIES:
+    selected_ats_queries = list(ATS_HIRING_QUERIES[:2])
+    if len(ATS_HIRING_QUERIES) > 2:
+        for extra_q in _rotate_for_day(ATS_HIRING_QUERIES[2:], today, 2):
+            if extra_q not in selected_ats_queries:
+                selected_ats_queries.append(extra_q)
+
+    for q in selected_ats_queries:
         if budget[0] <= 0 or search is None:
             break
         budget[0] -= 1
@@ -2341,7 +2414,7 @@ def collect_all_veins(
     *,
     day: date | None = None,
     seen: dict[str, str] | None = None,
-    limit: int = 24,
+    limit: int = 48,
     veins: tuple[str, ...] = ("whop", "tiktok_ads", "tiktok_shop"),
     cursor: int = 0,
     max_runtime_sec: float = 180.0,
@@ -2357,37 +2430,38 @@ def collect_all_veins(
         shift = int(cursor) % len(ordered_veins)
         ordered_veins = ordered_veins[shift:] + ordered_veins[:shift]
 
-    per_vein_cap = max(2, min(6, limit // max(1, len(ordered_veins)) + 1))
+    per_vein_cap = max(4, min(10, limit // max(1, len(ordered_veins)) + 2))
     deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
 
     vein_runners: dict[str, Any] = {
         "d2c_whatsapp": lambda rem, cur_seen: collect_d2c_whatsapp_brands(
-            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+            limit=rem, day=today, seen=cur_seen, call_budget=[18]
         ),
         "whop": lambda rem, cur_seen: collect_whop_content_rewards(
             limit=rem,
             day=today,
             seen=cur_seen,
             min_pool_usd=max(0, int(whop_min_pool_usd or 0)),
-            call_budget=[8],
+            call_budget=[18],
         ),
         "tiktok_ads": lambda rem, cur_seen: collect_tiktok_creative_ads(
-            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+            limit=rem, day=today, seen=cur_seen, call_budget=[18]
         ),
         "tiktok_shop": lambda rem, cur_seen: collect_tiktok_shop_brands(
-            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+            limit=rem, day=today, seen=cur_seen, call_budget=[18]
         ),
         "app_stores": lambda rem, cur_seen: collect_scaling_store_apps(
-            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+            limit=rem, day=today, seen=cur_seen, call_budget=[18]
         ),
         "ats_hiring": lambda rem, cur_seen: collect_ats_ugc_hiring(
-            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+            limit=rem, day=today, seen=cur_seen, call_budget=[18]
         ),
         "ph_detailed": lambda rem, cur_seen: collect_producthunt_detailed(
-            limit=rem, day=today, seen=cur_seen, call_budget=[6]
+            limit=rem, day=today, seen=cur_seen, call_budget=[10]
         ),
     }
 
+    per_vein_counts: dict[str, int] = {}
     prev_cursor = _ACTIVE_RUN_CURSOR
     _ACTIVE_RUN_CURSOR = max(0, int(cursor))
     try:
@@ -2404,10 +2478,16 @@ def collect_all_veins(
                 v_rows, merged_seen = fn(rem, merged_seen)
             except Exception:
                 v_rows = []
+            per_vein_counts[v_name] = len(v_rows)
             all_rows.extend(v_rows)
     finally:
         _ACTIVE_RUN_CURSOR = prev_cursor
 
+    print(
+        f"high_yield_veins breakdown: {json.dumps(per_vein_counts, ensure_ascii=False)}",
+        file=sys.stderr,
+        flush=True,
+    )
     return all_rows[:limit], merged_seen
 
 
@@ -2415,7 +2495,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Collect SoftUGC high-yield veins")
     parser.add_argument("--output", required=True)
     parser.add_argument("--seen", default="data/leadgen_state/high_yield_seen.json")
-    parser.add_argument("--limit", type=int, default=24)
+    parser.add_argument("--limit", type=int, default=48)
     parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop,app_stores,ats_hiring,ph_detailed,d2c_whatsapp")
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
     parser.add_argument("--max-runtime-sec", type=float, default=180.0)

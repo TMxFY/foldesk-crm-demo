@@ -749,11 +749,92 @@ async def extract_brand_tg_admins(
             UsernameInvalidError,
             UsernameNotOccupiedError,
         )
-        from telethon.tl.functions.channels import GetParticipantsRequest
+        from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
         from telethon.tl.types import ChannelParticipantsAdmins
     except ImportError as exc:
         logger.debug("Telethon unavailable in extract_brand_tg_admins: %s", exc)
         return []
+
+    async def _extract_from_full_about(entity: Any) -> list[GroupAdminContact]:
+        try:
+            full = await client(GetFullChannelRequest(channel=entity))
+        except (
+            ChatAdminRequiredError,
+            ChannelPrivateError,
+            UsernameInvalidError,
+            UsernameNotOccupiedError,
+            FloodWaitError,
+            RPCError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as exc:
+            logger.debug("GetFullChannelRequest(%s) unavailable: %s", target, exc)
+            return []
+
+        about = str(getattr(getattr(full, "full_chat", None), "about", None) or getattr(full, "about", None) or "").strip()
+        if not about:
+            return []
+
+        candidates: list[str] = []
+        seen_cands: set[str] = {target.lower()}
+        for m in _TG_URL_RE.finditer(about):
+            seg = m.group(1).split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].lstrip("@")
+            if _ADMIN_USERNAME_RE.fullmatch(seg) and seg.lower() not in seen_cands:
+                seen_cands.add(seg.lower())
+                candidates.append(seg)
+        for cand in re.findall(r"(?<![A-Za-z0-9._])@([A-Za-z][A-Za-z0-9_]{3,31})", about):
+            if cand.lower() not in seen_cands:
+                seen_cands.add(cand.lower())
+                candidates.append(cand)
+
+        about_contacts: list[GroupAdminContact] = []
+        resolved_users: set[str] = set()
+        for cand in candidates[: min(6, max(1, int(max_admins)))]:
+            if cand.lower() in _TG_URL_NOISE or cand.lower().endswith(("bot", "_bot")):
+                continue
+            if _is_noisy_support_or_mod(cand, "", "", ""):
+                continue
+            try:
+                ent = await client.get_entity(cand)
+            except (
+                FloodWaitError,
+            ):
+                break
+            except (
+                ChannelPrivateError,
+                UsernameInvalidError,
+                UsernameNotOccupiedError,
+                RPCError,
+                ValueError,
+                TypeError,
+            ):
+                continue
+            if ent is None or type(ent).__name__ != "User":
+                continue
+            if getattr(ent, "bot", False) or getattr(ent, "deleted", False) or getattr(ent, "scam", False) or getattr(ent, "fake", False):
+                continue
+            resolved_u = str(getattr(ent, "username", None) or cand).strip().lstrip("@")
+            if not resolved_u or _is_noisy_support_or_mod(resolved_u, "", "", ""):
+                continue
+            low_u = resolved_u.lower()
+            if low_u in resolved_users:
+                continue
+            resolved_users.add(low_u)
+            about_contacts.append(
+                GroupAdminContact(
+                    username=resolved_u,
+                    user_id=int(ent.id) if getattr(ent, "id", None) is not None else None,
+                    first_name=str(getattr(ent, "first_name", "") or "").strip(),
+                    last_name=str(getattr(ent, "last_name", "") or "").strip(),
+                    admin_rank="Channel About",
+                    role_guess="Channel Contact",
+                    group_handle=target,
+                )
+            )
+            if len(about_contacts) >= max_results:
+                break
+        return about_contacts
 
     try:
         entity = await client.get_entity(target)
@@ -769,7 +850,10 @@ async def extract_brand_tg_admins(
             limit=max(1, int(max_admins)),
             hash=0,
         )
-        response = await client(request)
+        try:
+            response = await client(request)
+        except ChatAdminRequiredError:
+            return await _extract_from_full_about(entity)
     except (
         ChatAdminRequiredError,
         ChannelPrivateError,

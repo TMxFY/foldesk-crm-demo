@@ -1238,3 +1238,41 @@ def test_atomic_curated_tmp_not_exposed_on_bridge_fail_and_sigterm_records_error
     assert row is not None and "SIGTERM" in row[0] and "vps_autonomous_replenish_crash" in row[0]
 
 
+def test_treg_social_leads_multi_subreddit_fallback_when_x_fails() -> None:
+    from datetime import date
+    from leadgen import treg_social_leads
+
+    joined_reddit = " ".join(f"{s} {t}" for s, t in treg_social_leads.REDDIT_ROTATION).lower()
+    assert "roblox" not in joined_reddit
+    assert "fivem" not in joined_reddit
+
+    reddit_calls: list[tuple[str, str]] = []
+
+    def fake_reddit(subreddit: str, theme: str):
+        reddit_calls.append((subreddit, theme))
+        return {
+            "posts": [
+                {
+                    "author": f"founder_{subreddit.lower()}",
+                    "title": f"Looking for UGC creators for our {subreddit} brand",
+                    "selftext": f"Paying creators per video. Website https://brand-{subreddit.lower()}.com",
+                    "permalink": f"/r/{subreddit}/comments/xyz/",
+                }
+            ]
+        }
+
+    rows, _, stats = treg_social_leads.discover(
+        day=date(2026, 11, 22),
+        seen={},
+        cap=10,
+        search_x_fn=lambda _q: None,
+        search_comments_fn=lambda _u: None,
+        search_reddit_fn=fake_reddit,
+    )
+    assert stats.get("x_call_failed") is True
+    assert len(reddit_calls) == 3
+    assert len(rows) == 3
+    assert {r["group"] for r in rows} == {f"r/{s}" for s, _ in reddit_calls}
+
+
+

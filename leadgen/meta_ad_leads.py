@@ -101,8 +101,34 @@ TARGET_COUNTRIES = (
     "CA",
     "AU",
 )
-CAP = int(os.getenv("META_ADS_CAP", "15"))
+CAP = int(os.getenv("META_ADS_CAP", "35"))
 SEEN_DAYS = 90
+_NON_PERSONAL_TG_SUFFIXES = (
+    "_official",
+    "official",
+    "_channel",
+    "channel",
+    "_news",
+    "_announcements",
+    "_announcement",
+    "_community",
+    "_group",
+    "_chat",
+    "_support",
+    "_helpdesk",
+    "_updates",
+    "_alerts",
+    "bot",
+    "_bot",
+)
+
+
+def _is_personal_tg_username(handle: str) -> bool:
+    u = str(handle or "").strip().lstrip("@")
+    if not u or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u):
+        return False
+    low = u.lower()
+    return not any(low.endswith(sfx) for sfx in _NON_PERSONAL_TG_SUFFIXES)
 
 GIANT_BRANDS = {
     "facebook",
@@ -188,20 +214,20 @@ _BARE_PHONE_RE = re.compile(r"^\s*\+?(\d[\d\s().\-]{7,18}\d)\s*$")
 _TOLLFREE_WA_PREFIXES = ("1800", "1833", "1844", "1855", "1866", "1877", "1888", "44800", "44808")
 
 
-def queries_for_day(day: date, count: int = 3) -> list[str]:
+def queries_for_day(day: date, count: int = 3, cursor: int = 0) -> list[str]:
     total = len(SEARCH_QUERIES)
     if not total or count <= 0:
         return []
-    start = (day.toordinal() * count) % total
+    start = ((day.toordinal() + max(0, int(cursor))) * count) % total
     return [SEARCH_QUERIES[(start + i) % total] for i in range(min(count, total))]
 
 
-def countries_for_day(day: date, count: int = 3) -> list[str]:
+def countries_for_day(day: date, count: int = 3, cursor: int = 0) -> list[str]:
     """Return a deterministic daily slice of TARGET_COUNTRIES for multi-GEO rotation."""
     total = len(TARGET_COUNTRIES)
     if not total or count <= 0:
         return []
-    start = (day.toordinal() * count) % total
+    start = ((day.toordinal() + max(0, int(cursor))) * count) % total
     return [TARGET_COUNTRIES[(start + i) % total] for i in range(min(count, total))]
 
 
@@ -877,6 +903,8 @@ def collect(
     seen: dict[str, str] | None = None,
     cap: int = CAP,
     countries: Sequence[str] | None = None,
+    cursor: int = 0,
+    query_count: int | None = None,
     search_fn=None,
     enrich_fn=None,
     store_resolver_fn=None,
@@ -892,11 +920,12 @@ def collect(
     rows: list[dict] = []
     local_keys: set[str] = set()
 
-    selected_queries = queries_for_day(today)
+    q_count = int(query_count) if query_count is not None else (3 if countries is not None else 6)
+    selected_queries = queries_for_day(today, count=q_count, cursor=cursor)
     if countries is not None:
         selected_countries = [str(c).strip().upper() for c in countries if str(c).strip()]
     else:
-        selected_countries = countries_for_day(today, count=len(selected_queries) or 3)
+        selected_countries = countries_for_day(today, count=len(selected_queries) or 6, cursor=cursor)
     if not selected_countries:
         selected_countries = ["US"]
 
@@ -988,7 +1017,14 @@ def collect(
                 work_email = site_contacts["work_email"]
             if not work_email and store_info.get("email"):
                 work_email = str(store_info["email"]).strip()
-            username = site_contacts.get("username", "")
+            raw_tg = str(site_contacts.get("username", "") or "").strip().lstrip("@")
+            tg_group_url = ""
+            if raw_tg and not _is_personal_tg_username(raw_tg):
+                username = ""
+                if not raw_tg.lower().endswith(("bot", "_bot")):
+                    tg_group_url = f"https://t.me/{raw_tg}"
+            else:
+                username = raw_tg
             founder_x = site_contacts.get("founder_x", "")
 
             wa_url = cand["whatsapp"]
@@ -1007,6 +1043,7 @@ def collect(
                 or wa_phone
                 or ig_url
                 or fb_page_url
+                or tg_group_url
             ):
                 continue
 
@@ -1018,6 +1055,7 @@ def collect(
                         project_url,
                         store_url,
                         wa_url,
+                        tg_group_url,
                         founder_linkedin,
                         founder_x,
                         ig_url,
@@ -1031,6 +1069,7 @@ def collect(
                 "id": f"meta_ads:{slug}",
                 "name": page_name,
                 "username": username,
+                "telegram_group": tg_group_url,
                 "whatsapp": wa_url,
                 "phone": wa_phone,
                 "provider": provider,
@@ -1083,10 +1122,23 @@ def _load_seen(path: Path) -> dict[str, str]:
     return {}
 
 
-def _save_seen(path: Path, seen: dict[str, str]) -> None:
+def _load_cursor(path: Path) -> int:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return max(0, int(raw.get("cursor") or 0))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return 0
+
+
+def _save_seen(path: Path, seen: dict[str, str], *, cursor: int | None = None) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"advertisers": seen}, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload: dict[str, Any] = {"advertisers": seen}
+        if cursor is not None:
+            payload["cursor"] = max(0, int(cursor))
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -1108,11 +1160,19 @@ def main() -> None:
     )
     seen_path = Path(args.seen)
     before = _load_seen(seen_path)
+    cursor = _load_cursor(seen_path)
     try:
-        rows, updated = collect(day=day, seen=before, cap=max(0, args.limit), countries=countries)
+        rows, updated = collect(
+            day=day,
+            seen=before,
+            cap=max(0, args.limit),
+            countries=countries,
+            cursor=cursor,
+            query_count=6,
+        )
     except Exception:
         rows, updated = [], before
-    _save_seen(seen_path, updated)
+    _save_seen(seen_path, updated, cursor=cursor + 1)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as handle:

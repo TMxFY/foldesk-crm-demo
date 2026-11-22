@@ -49,8 +49,8 @@ REDDIT_ROTATION = (
     ("Entrepreneur", "growing"),
     ("PaidSocial", "scaling"),
     ("artificial", "agent"),
-    ("RobloxDevelopers", "hiring"),
-    ("FiveM", "server"),
+    ("ecommerce", "UGC"),
+    ("shopify", "ads"),
     ("musicmarketing", "label"),
 )
 # No bare -clipper: "looking for clippers" is a buyer.
@@ -818,17 +818,26 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
     for key in remember:
         current[key] = stamp
 
-    subreddit, theme = rotation_for(day)
-    reddit_payload = search_reddit_fn(subreddit, theme)
-    if reddit_payload is None:
-        errors += 1
-    else:
-        picked, remember = _take(
-            reddit_candidates(reddit_payload, subreddit), seen=set(current), cap=cap,
+    base_idx = day.toordinal() % len(REDDIT_ROTATION)
+    reddit_targets = [REDDIT_ROTATION[base_idx]]
+    if x_fail and not x_ok:
+        reddit_targets.extend(
+            REDDIT_ROTATION[(base_idx + offset) % len(REDDIT_ROTATION)]
+            for offset in (1, 2)
         )
-        rows.extend(picked)
-        for key in remember:
-            current[key] = stamp
+    for subreddit, theme in reddit_targets:
+        if budget_sec > 0 and time.monotonic() >= deadline:
+            break
+        reddit_payload = search_reddit_fn(subreddit, theme)
+        if reddit_payload is None:
+            errors += 1
+        else:
+            picked, remember = _take(
+                reddit_candidates(reddit_payload, subreddit), seen=set(current), cap=cap,
+            )
+            rows.extend(picked)
+            for key in remember:
+                current[key] = stamp
 
     stats = {
         "posts": posts,

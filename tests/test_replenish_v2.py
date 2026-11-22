@@ -1792,3 +1792,111 @@ def test_multi_phone_checker_failover_rotation(
     conn.close()
 
 
+def test_verify_personal_tg_handles_live_strips_channels_and_promotes_about_contact() -> None:
+    from datetime import datetime, timezone
+    from telethon.errors import UsernameNotOccupiedError
+    from telethon.tl.types import Channel, User
+
+    chan_brand = Channel(
+        id=1461231130,
+        title="Brand Broadcast",
+        photo=None,
+        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        broadcast=True,
+        megagroup=False,
+        username="brand_broadcast",
+        access_hash=11,
+    )
+    bot_user = User(id=55001, username="assistant_x9", first_name="Bot", bot=True)
+    real_user = User(id=77123, username="real_founder", first_name="Alex", bot=False)
+
+    def fake_resolver(_cli: object, handle: str) -> object:
+        low = handle.lower()
+        if low == "brand_broadcast":
+            return chan_brand
+        if low == "assistant_x9":
+            return bot_user
+        if low == "real_founder":
+            return real_user
+        raise UsernameNotOccupiedError(request=None)
+
+    rows = [
+        {
+            "id": "r_off",
+            "name": "Plus500 US",
+            "username": "Plus500_Official",
+            "telegram_username": "Plus500_Official",
+            "provider": "telegram",
+            "links": ["https://us.plus500.com"],
+        },
+        {
+            "id": "r_chan",
+            "name": "Acme Brand",
+            "username": "brand_broadcast",
+            "telegram_username": "brand_broadcast",
+            "provider": "telegram",
+            "links": ["https://acme.io"],
+        },
+        {
+            "id": "r_bot",
+            "name": "Helper Bot",
+            "username": "assistant_x9",
+            "provider": "telegram",
+            "links": [],
+        },
+        {
+            "id": "r_user",
+            "name": "Alex Founder",
+            "username": "real_founder",
+            "provider": "telegram",
+            "links": [],
+        },
+    ]
+
+    verified, stats = vps_autonomous_replenish.verify_personal_tg_handles_live(
+        rows,
+        entity_resolver_fn=fake_resolver,
+    )
+    assert stats["heuristic_stripped"] == 1
+    assert stats["channels_stripped"] == 1
+    assert stats["bots_or_invalid_stripped"] == 1
+    assert stats["verified_users"] == 1
+
+    # Heuristic-stripped channel handle moved to telegram_group for admin/contact fallback
+    assert verified[0]["username"] == ""
+    assert verified[0]["provider"] == ""
+    assert verified[0]["telegram_group"] == "https://t.me/Plus500_Official"
+    assert "https://t.me/Plus500_Official" in verified[0]["links"]
+
+    # Live-resolved broadcast Channel stripped from username & moved to telegram_group
+    assert verified[1]["username"] == ""
+    assert verified[1]["provider"] == ""
+    assert verified[1]["telegram_group"] == "https://t.me/brand_broadcast"
+    assert "https://t.me/brand_broadcast" in verified[1]["links"]
+
+    # Bot removed without turning into telegram_group
+    assert verified[2]["username"] == ""
+    assert verified[2]["provider"] == ""
+    assert not verified[2].get("telegram_group")
+
+    # Real user kept with resolved telegram_user_id
+    assert verified[3]["username"] == "real_founder"
+    assert verified[3]["telegram_user_id"] == 77123
+    assert verified[3]["provider"] == "telegram"
+
+    # Follow-up admin enrichment promotes resolved Contact from stripped channel row
+    promoted, admin_stats = vps_autonomous_replenish.enrich_whales_with_tg_group_admins(
+        verified,
+        admin_extractor_fn=lambda _cli, h: (
+            [{"username": "alice_cmo", "user_id": 889911, "role_guess": "Channel Contact"}]
+            if h.lower() == "plus500_official"
+            else []
+        ),
+    )
+    assert admin_stats["leads_promoted"] == 1
+    assert promoted[0]["username"] == "alice_cmo"
+    assert promoted[0]["telegram_user_id"] == 889911
+    assert promoted[0]["provider"] == "telegram"
+
+
+

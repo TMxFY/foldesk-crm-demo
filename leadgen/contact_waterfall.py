@@ -347,6 +347,24 @@ _TG_EXPLICIT_RE = re.compile(
     re.I,
 )
 _TG_LOW_PRIORITY_HINTS = ("community", "channel", "announcements", "news", "chat", "official", "group")
+_NON_PERSONAL_TG_SUFFIXES = (
+    "_official",
+    "official",
+    "_channel",
+    "channel",
+    "_news",
+    "_announcements",
+    "_announcement",
+    "_community",
+    "_group",
+    "_chat",
+    "_support",
+    "_helpdesk",
+    "_updates",
+    "_alerts",
+    "bot",
+    "_bot",
+)
 
 _X_RESERVED = frozenset(
     {
@@ -717,7 +735,7 @@ def _is_valid_tg_handle(handle: str) -> bool:
     if not u or len(u) < 4 or len(u) > 32:
         return False
     low = u.lower()
-    if low in _TG_RESERVED or low.endswith("bot") or low.endswith("_bot"):
+    if low in _TG_RESERVED or any(low.endswith(sfx) for sfx in _NON_PERSONAL_TG_SUFFIXES):
         return False
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u))
 
