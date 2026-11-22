@@ -1693,3 +1693,102 @@ def test_ingest_v2_routed_leads_handles_middle_duplicate_via_lead_id_by_index_an
     conn.close()
 
 
+def test_multi_phone_checker_failover_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon.errors import FloodWaitError
+
+    conn, _state_dir, sessions_dir = _setup_isolated_env(tmp_path, monkeypatch)
+    outreach_auth_key = os.urandom(256)
+    outreach_sess = _make_sqlite_session(tmp_path / "sessions" / "outreach_main.session", auth_key=outreach_auth_key)
+    conn.execute(
+        "INSERT INTO accounts (phone, session_path, status, health, provider, created_at) VALUES (?, ?, 'connected', 'active', 'telegram', ?)",
+        ("+15550009911", str(outreach_sess), "2026-11-22T12:00:00Z"),
+    )
+    conn.commit()
+
+    # Colliding phone_checker_0 must be skipped, while distinct phone_checker_1 & phone_checker_2 stay active
+    _make_sqlite_session(sessions_dir / "phone_checker_0.session", auth_key=outreach_auth_key)
+    sess1 = sessions_dir / "phone_checker_1.session"
+    sess2 = sessions_dir / "phone_checker_2.session"
+    _make_sqlite_session(sess1, auth_key=os.urandom(256))
+    _make_sqlite_session(sess2, auth_key=os.urandom(256))
+
+    found_sessions = vps_autonomous_replenish.find_phone_checker_sessions(conn, sessions_dir)
+    assert found_sessions == [sess1, sess2]
+    assert vps_autonomous_replenish.find_phone_checker_session(conn, sessions_dir) == sess1
+
+    class CheckerOneFloodOnSecond:
+        def __init__(self) -> None:
+            self.imported_batches: list[list[str]] = []
+
+        async def __call__(self, req: object) -> object:
+            if type(req).__name__ == "ImportContactsRequest":
+                phones = [str(getattr(c, "phone", "")) for c in getattr(req, "contacts", [])]
+                self.imported_batches.append(phones)
+                if phones == ["+14158210171"]:
+                    return SimpleNamespace(
+                        users=[SimpleNamespace(id=990171, username="founder_one", phone="14158210171", bot=False)]
+                    )
+                raise FloodWaitError(request=req, capture=120)
+            return SimpleNamespace(users=[])
+
+    class CheckerTwoFallback:
+        def __init__(self) -> None:
+            self.imported_batches: list[list[str]] = []
+
+        async def __call__(self, req: object) -> object:
+            if type(req).__name__ == "ImportContactsRequest":
+                phones = [str(getattr(c, "phone", "")) for c in getattr(req, "contacts", [])]
+                self.imported_batches.append(phones)
+                if phones == ["+14158210172"]:
+                    return SimpleNamespace(
+                        users=[SimpleNamespace(id=990172, username="founder_two", phone="14158210172", bot=False)]
+                    )
+            return SimpleNamespace(users=[])
+
+    cli1 = CheckerOneFloodOnSecond()
+    cli2 = CheckerTwoFallback()
+    rows = [
+        {
+            "id": "rot_1",
+            "name": "Founder One",
+            "company": "Brand One",
+            "phone": "+14158210171",
+            "icp_score": 91,
+            "source": "meta_ads",
+            "language": "en",
+        },
+        {
+            "id": "rot_2",
+            "name": "Founder Two",
+            "company": "Brand Two",
+            "phone": "+14158210172",
+            "icp_score": 92,
+            "source": "meta_ads",
+            "language": "en",
+        },
+    ]
+
+    routed, stats = vps_autonomous_replenish.resolve_and_route_phone_leads(
+        conn,
+        rows,
+        cfg={"whales": {"phone_tg_checker_batch_size": 1}},
+        wa_gateway=None,
+        tg_checker_clients={
+            "phone_checker_1.session": cli1,
+            "phone_checker_2.session": cli2,
+        },
+        scraper_sessions_dir=sessions_dir,
+    )
+
+    assert cli1.imported_batches == [["+14158210171"], ["+14158210172"]]
+    assert cli2.imported_batches == [["+14158210172"]]
+    assert stats["phones_checked"] == 2
+    assert stats["tg_verified"] == 2
+    assert stats["routed_telegram"] == 2
+    assert [r["provider"] for r in routed] == ["telegram", "telegram"]
+    assert [r["username"] for r in routed] == ["founder_one", "founder_two"]
+    conn.close()
+
+

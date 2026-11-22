@@ -1548,25 +1548,124 @@ def find_connected_wa_session(conn: sqlite3.Connection) -> str:
     return ""
 
 
-def find_phone_checker_session(
+_TG_TERMINAL_CHECK_STATUSES = frozenset({"found", "not_found"})
+
+
+def find_phone_checker_sessions(
     conn: sqlite3.Connection,
     sessions_dir: Path | str | None = None,
-) -> Path | None:
-    """Strictly locate a dedicated isolated `phone_checker_*.session` file; never use outreach sessions."""
+) -> list[Path]:
+    """Return all dedicated isolated ``phone_checker_*.session`` paths sorted deterministically."""
     base_dir = Path(sessions_dir or DEFAULT_SCRAPER_SESSIONS_DIR)
     if not base_dir.is_dir():
-        return None
+        return []
+    found: list[Path] = []
     for cand in sorted(base_dir.glob("phone_checker_*.session")):
         if not cand.is_file():
             continue
         try:
             validated = validate_isolated_scraper_session(conn, cand)
             if validated is not None and validated.is_file():
-                return validated
+                found.append(validated)
         except ValueError as exc:
             logger.warning("Rejected non-isolated phone_checker session %s: %s", cand, exc)
             continue
+    return found
+
+
+def find_phone_checker_session(
+    conn: sqlite3.Connection,
+    sessions_dir: Path | str | None = None,
+) -> Path | None:
+    """Strictly locate the first dedicated isolated ``phone_checker_*.session`` file; never use outreach sessions."""
+    sessions = find_phone_checker_sessions(conn, sessions_dir)
+    return sessions[0] if sessions else None
+
+
+def _lookup_injected_checker_client(
+    checker_clients: Mapping[str, Any] | None,
+    sess_path: Path,
+) -> Any:
+    if not checker_clients:
+        return None
+    for key in (sess_path.name, str(sess_path), sess_path.stem):
+        if key in checker_clients:
+            return checker_clients[key]
     return None
+
+
+def _run_tg_checker_pool(
+    checker_sessions: list[Path],
+    unique_phones: list[str],
+    *,
+    batch_size: int,
+    daily_limit: int,
+    tg_checker_client: Any = None,
+    tg_checker_clients: Mapping[str, Any] | None = None,
+) -> dict[str, ResolvedMessenger]:
+    """Run ``resolve_phones_telegram`` across checker sessions, failing over unfinished phones cleanly."""
+    if not checker_sessions or not unique_phones:
+        return {}
+    if tg_checker_client is not None and tg_checker_clients is None:
+        return _run_coro_sync(
+            resolve_phones_telegram(
+                tg_checker_client,
+                unique_phones,
+                batch_size=batch_size,
+                daily_limit=daily_limit,
+                pause_s=0.0,
+                is_checker_session=True,
+            )
+        ) or {}
+
+    tg_results: dict[str, ResolvedMessenger] = {}
+    for sess_path in checker_sessions:
+        pending_phones = [
+            p
+            for p in unique_phones
+            if p not in tg_results
+            or tg_results[p].tg_check_status not in _TG_TERMINAL_CHECK_STATUSES
+        ]
+        if not pending_phones:
+            break
+
+        batch_res: dict[str, ResolvedMessenger] = {}
+        try:
+            if tg_checker_clients is not None:
+                injected_cli = _lookup_injected_checker_client(tg_checker_clients, sess_path)
+                if injected_cli is None:
+                    logger.warning("No injected checker client provided for %s; skipping", sess_path.name)
+                    continue
+                batch_res = _run_coro_sync(
+                    resolve_phones_telegram(
+                        injected_cli,
+                        pending_phones,
+                        batch_size=batch_size,
+                        daily_limit=daily_limit,
+                        pause_s=0.0,
+                        is_checker_session=True,
+                    )
+                ) or {}
+            else:
+                batch_res = _with_isolated_tg_client(
+                    sess_path,
+                    lambda cli, phones=pending_phones: resolve_phones_telegram(
+                        cli,
+                        phones,
+                        batch_size=batch_size,
+                        daily_limit=daily_limit,
+                        is_checker_session=True,
+                    ),
+                ) or {}
+        except Exception as exc:
+            logger.warning("Phone checker session %s failed (%s); failing over if possible", sess_path.name, exc)
+            continue
+
+        for phone, res_obj in batch_res.items():
+            if res_obj.tg_check_status in _TG_TERMINAL_CHECK_STATUSES or phone not in tg_results:
+                tg_results[phone] = res_obj
+
+    return tg_results
 
 
 def resolve_and_route_phone_leads(
@@ -1578,6 +1677,7 @@ def resolve_and_route_phone_leads(
     wa_session_path: str | None = None,
     checker_session_path: Path | str | None = None,
     tg_checker_client: Any = None,
+    tg_checker_clients: Mapping[str, Any] | None = None,
     scraper_sessions_dir: Path | str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Layer 2 ($0): Verify discovered E.164 phones on WA + dedicated TG checker, then route TG > WA > social_manual."""
@@ -1634,37 +1734,25 @@ def resolve_and_route_phone_leads(
                 resolve_phones_whatsapp(None, "", unique_phones)
             ) or {}
 
-        checker_sess: Path | None = None
+        checker_sessions: list[Path] = []
         if checker_session_path is not None:
             cand_p = Path(checker_session_path)
             if cand_p.name.startswith("phone_checker_") and cand_p.suffix == ".session" and cand_p.is_file():
-                checker_sess = validate_isolated_scraper_session(conn, cand_p)
+                validated = validate_isolated_scraper_session(conn, cand_p)
+                if validated is not None and validated.is_file():
+                    checker_sessions = [validated]
         else:
-            checker_sess = find_phone_checker_session(conn, scraper_sessions_dir)
+            checker_sessions = find_phone_checker_sessions(conn, scraper_sessions_dir)
 
-        if checker_sess is not None and checker_sess.is_file():
-            if tg_checker_client is not None:
-                tg_results = _run_coro_sync(
-                    resolve_phones_telegram(
-                        tg_checker_client,
-                        unique_phones,
-                        batch_size=batch_sz,
-                        daily_limit=daily_lim,
-                        pause_s=0.0,
-                        is_checker_session=True,
-                    )
-                ) or {}
-            else:
-                tg_results = _with_isolated_tg_client(
-                    checker_sess,
-                    lambda cli: resolve_phones_telegram(
-                        cli,
-                        unique_phones,
-                        batch_size=batch_sz,
-                        daily_limit=daily_lim,
-                        is_checker_session=True,
-                    ),
-                ) or {}
+        if checker_sessions:
+            tg_results = _run_tg_checker_pool(
+                checker_sessions,
+                unique_phones,
+                batch_size=batch_sz,
+                daily_limit=daily_lim,
+                tg_checker_client=tg_checker_client,
+                tg_checker_clients=tg_checker_clients,
+            )
 
     stats["wa_verified"] = sum(1 for v in wa_results.values() if v.whatsapp_exists)
     stats["tg_verified"] = sum(1 for v in tg_results.values() if v.telegram_username)
