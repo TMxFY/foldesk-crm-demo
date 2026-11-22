@@ -279,8 +279,8 @@ def _requires_admin_role(path: str, method: str) -> bool:
     if method in _MUTATION_METHODS and (
         path == "/api/leadgen"
         or path.startswith("/api/leadgen/")
-        or path == "/api/accounts"
-        or path.startswith("/api/accounts/")
+        or (method == "DELETE" and (path == "/api/accounts" or path.startswith("/api/accounts/")))
+        or path.rstrip("/") == "/api/accounts/purge-dead"
         or path == "/api/leads/bulk"
         or path.startswith("/api/leads/bulk/")
         or path == "/api/outreach/autopilot"

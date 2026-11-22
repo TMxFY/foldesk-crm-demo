@@ -2636,6 +2636,33 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     def landing(request: Request):
         return templates.TemplateResponse(request, "landing.html", {"request": request})
 
+    def _mask_account_payload_for_caller(request: Request, payload):
+        if not (is_auth_enforced() and not has_valid_mcp_api_key(request)):
+            return payload
+        from app.accounts import mask_proxy_url
+        from app.crm_auth import resolve_request_crm_user
+
+        with locked_conn(request.app.state.conn):
+            caller = resolve_request_crm_user(request.app.state.conn, request)
+        if caller is not None and caller.get("role") == "admin":
+            return payload
+
+        def _mask_item(item):
+            if isinstance(item, dict) and "proxy_url" in item:
+                return {**item, "proxy_url": mask_proxy_url(item.get("proxy_url"))}
+            return item
+
+        if isinstance(payload, list):
+            return [_mask_item(item) for item in payload]
+        if isinstance(payload, dict):
+            out = _mask_item(payload)
+            if isinstance(out.get("imported"), list):
+                out = {**out, "imported": [_mask_item(item) for item in out["imported"]]}
+            if isinstance(out.get("accounts"), list):
+                out = {**out, "accounts": [_mask_item(item) for item in out["accounts"]]}
+            return out
+        return payload
+
     @app.post("/api/accounts/start")
     async def accounts_start(body: StartIn, request: Request):
         gateway = _gateway_for_provider(request, body.provider)
@@ -2643,7 +2670,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         has_proxy = ("proxy_url" in fields) or ("proxy" in fields)
         proxy_url = body.proxy_url if body.proxy_url is not None else body.proxy
         access_scope = body.access_scope or body.access or "workspace"
-        return await _call_async(
+        res = await _call_async(
             start_login,
             request.app.state.conn,
             body.phone,
@@ -2654,6 +2681,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             auth_mode=body.auth_mode,
             has_proxy=has_proxy,
         )
+        return _mask_account_payload_for_caller(request, res)
 
     @app.post("/api/accounts/import-session")
     async def accounts_import_session(request: Request):
@@ -2672,7 +2700,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         for acc in imported:
             if isinstance(acc, dict) and acc.get("id") and acc.get("status") == "connected":
                 await start_account_watch(request.app, int(acc["id"]))
-        return {"imported": imported, "count": len(imported)}
+        return _mask_account_payload_for_caller(
+            request, {"imported": imported, "count": len(imported)}
+        )
 
     @app.patch("/api/accounts/{account_id}/settings")
     async def accounts_settings_patch(
@@ -2711,7 +2741,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                             gw.set_proxy(row["session_path"], updated.get("proxy_url"))
                     except Exception:
                         pass
-        return updated
+        return _mask_account_payload_for_caller(request, updated)
 
     @app.post("/api/accounts/{account_id}/code")
     async def accounts_code(account_id: int, body: CodeIn, request: Request):
@@ -2721,7 +2751,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         )
         if result.get("status") == "connected":
             await start_account_watch(request.app, account_id)
-        return result
+        return _mask_account_payload_for_caller(request, result)
 
     @app.post("/api/accounts/{account_id}/password")
     async def accounts_password(account_id: int, body: PasswordIn, request: Request):
@@ -2731,27 +2761,13 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         )
         if result.get("status") == "connected":
             await start_account_watch(request.app, account_id)
-        return result
+        return _mask_account_payload_for_caller(request, result)
 
     @app.get("/api/accounts")
     def accounts_list(request: Request):
         with locked_conn(request.app.state.conn):
             items = list_accounts(request.app.state.conn)
-            caller = None
-            check_mask = is_auth_enforced() and not has_valid_mcp_api_key(request)
-            if check_mask:
-                from app.crm_auth import resolve_request_crm_user
-
-                caller = resolve_request_crm_user(request.app.state.conn, request)
-        if check_mask:
-            from app.accounts import mask_proxy_url
-
-            if caller is None or caller.get("role") != "admin":
-                items = [
-                    {**acc, "proxy_url": mask_proxy_url(acc.get("proxy_url"))}
-                    for acc in items
-                ]
-        return items
+        return _mask_account_payload_for_caller(request, items)
 
     async def _cleanup_deleted_account_runtime(app, account_id: int, session_path: str | None) -> None:
         task = app.state.inbox_tasks.pop(account_id, None)
@@ -2809,18 +2825,20 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
     @app.post("/api/accounts/check-all")
     async def accounts_check_all(request: Request):
-        return await _call_async(
+        res = await _call_async(
             check_all_accounts,
             request.app.state.conn,
             _resolve_app_gateway(request.app, "telegram"),
             _resolve_app_gateway(request.app, "whatsapp"),
         )
+        return _mask_account_payload_for_caller(request, res)
 
     @app.patch("/api/accounts/{account_id}/limit")
     def accounts_limit_patch(account_id: int, body: AccountLimitPatch, request: Request):
-        return _call(
+        res = _call(
             set_daily_limit, request.app.state.conn, account_id, body.daily_limit
         )
+        return _mask_account_payload_for_caller(request, res)
 
     @app.post("/api/accounts/{account_id}/reconnect")
     async def accounts_reconnect(account_id: int, request: Request):
@@ -2831,7 +2849,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         if isinstance(result, dict) and result.get("status") == "connected":
             request.app.state.inbox_synced.discard(account_id)
             await start_account_watch(request.app, account_id)
-        return result
+        return _mask_account_payload_for_caller(request, result)
 
     @app.get("/api/folders")
     def folders_list(request: Request, account_id: int):

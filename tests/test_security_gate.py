@@ -5,7 +5,7 @@ from app.db import connect, init_db
 from app.main import create_app
 
 
-def _make_secured_client(tmp_path, monkeypatch):
+def _make_secured_client(tmp_path, monkeypatch, gateway=None):
     monkeypatch.setenv("CRM_REQUIRE_AUTH", "1")
     monkeypatch.setenv("MCP_API_KEY", "test-mcp-secret-999")
     monkeypatch.setenv("CRM_ADMIN_PASSWORD", "StrongTimPass#2026")
@@ -13,7 +13,7 @@ def _make_secured_client(tmp_path, monkeypatch):
     monkeypatch.setenv("CRM_OPERATOR_PASSWORD", "StrongOpPass#2026")
     conn = connect(tmp_path / "crm_sec.db")
     init_db(conn)
-    app = create_app(conn=conn)
+    app = create_app(conn=conn, gateway=gateway)
     return TestClient(app, follow_redirects=False), conn
 
 
@@ -292,4 +292,121 @@ def test_admin_register_preserves_admin_cookie_and_csrf_origin_check(tmp_path, m
     r_me = client.get("/api/auth/me", headers={"User-Agent": "Mozilla/5.0"})
     assert r_me.status_code == 200
     assert r_me.json()["user"]["username"] == "tim"
+
+
+def test_non_admin_roles_can_add_and_manage_accounts_without_delete_or_proxy_leak(tmp_path, monkeypatch):
+    from app.telegram_gateway import FakeGateway
+
+    class _MultiAccountFakeGateway(FakeGateway):
+        async def confirm_code(self, phone: str, code: str, phone_code_hash: str, session_path: str) -> dict:
+            res = await super().confirm_code(phone, code, phone_code_hash, session_path)
+            if res.get("status") == "connected":
+                uid = int("".join(ch for ch in str(phone) if ch.isdigit()) or "1001")
+                res["telegram_user_id"] = uid
+                res["telegram_username"] = f"user_{uid}"
+            return res
+
+    gateway = _MultiAccountFakeGateway(code="11111")
+    client, _ = _make_secured_client(tmp_path, monkeypatch, gateway=gateway)
+    proxy_secret_url = "socks5://nmuser:supersecretpass@gate.nodemaven.com:1080"
+
+    assert (
+        client.post(
+            "/api/accounts/start",
+            json={"phone": "+15551110000"},
+            headers={"User-Agent": "Mozilla/5.0"},
+        ).status_code
+        == 401
+    )
+
+    created_ids: list[int] = []
+    for username, password, phone in (
+        ("vlad", "StrongVladPass#2026", "+15551110001"),
+        ("operator", "StrongOpPass#2026", "+15551110002"),
+    ):
+        r_login = client.post(
+            "/api/auth/login",
+            json={"username": username, "password": password},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        assert r_login.status_code == 200
+        hdrs = {
+            "Authorization": f"Bearer {r_login.json()['token']}",
+            "User-Agent": "Mozilla/5.0",
+        }
+
+        r_start = client.post(
+            "/api/accounts/start",
+            json={"phone": phone, "proxy_url": proxy_secret_url},
+            headers=hdrs,
+        )
+        assert r_start.status_code == 200, f"{username} start failed: {r_start.text}"
+        start_data = r_start.json()
+        acc_id = int(start_data["id"])
+        created_ids.append(acc_id)
+        if "proxy_url" in start_data and start_data["proxy_url"] is not None:
+            assert "supersecretpass" not in str(start_data["proxy_url"])
+            assert "***" in str(start_data["proxy_url"])
+
+        r_code = client.post(
+            f"/api/accounts/{acc_id}/code",
+            json={"code": "11111"},
+            headers=hdrs,
+        )
+        assert r_code.status_code == 200, f"{username} code failed: {r_code.text}"
+        code_data = r_code.json()
+        assert code_data["status"] == "connected"
+        assert "supersecretpass" not in str(code_data.get("proxy_url") or "")
+
+        r_limit = client.patch(
+            f"/api/accounts/{acc_id}/limit",
+            json={"daily_limit": 25},
+            headers=hdrs,
+        )
+        assert r_limit.status_code == 200, f"{username} limit failed: {r_limit.text}"
+        limit_data = r_limit.json()
+        assert "supersecretpass" not in str(limit_data.get("proxy_url") or "")
+        assert "***" in str(limit_data.get("proxy_url") or "")
+
+        r_settings = client.patch(
+            f"/api/accounts/{acc_id}/settings",
+            json={"daily_limit": 30},
+            headers=hdrs,
+        )
+        assert r_settings.status_code == 200, f"{username} settings failed: {r_settings.text}"
+        settings_data = r_settings.json()
+        assert "supersecretpass" not in str(settings_data.get("proxy_url") or "")
+        assert "***" in str(settings_data.get("proxy_url") or "")
+
+        r_reconnect = client.post(
+            f"/api/accounts/{acc_id}/reconnect",
+            headers=hdrs,
+        )
+        assert r_reconnect.status_code == 200, f"{username} reconnect failed: {r_reconnect.text}"
+        assert "supersecretpass" not in str(r_reconnect.json().get("proxy_url") or "")
+
+        r_check = client.post("/api/accounts/check-all", headers=hdrs)
+        assert r_check.status_code == 200, f"{username} check-all failed: {r_check.text}"
+        for acc_row in r_check.json().get("accounts") or []:
+            assert "supersecretpass" not in str(acc_row.get("proxy_url") or "")
+
+        assert client.post("/api/accounts/purge-dead", headers=hdrs).status_code == 403
+        assert client.delete(f"/api/accounts/{acc_id}", headers=hdrs).status_code == 403
+
+    r_admin = client.post(
+        "/api/auth/login",
+        json={"username": "tim", "password": "StrongTimPass#2026"},
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    assert r_admin.status_code == 200
+    admin_hdrs = {
+        "Authorization": f"Bearer {r_admin.json()['token']}",
+        "User-Agent": "Mozilla/5.0",
+    }
+    admin_accs = client.get("/api/accounts", headers=admin_hdrs)
+    assert admin_accs.status_code == 200
+    by_id = {int(item["id"]): item for item in admin_accs.json()}
+    for acc_id in created_ids:
+        assert by_id[acc_id]["proxy_url"] == proxy_secret_url
+        assert client.delete(f"/api/accounts/{acc_id}", headers=admin_hdrs).status_code == 200
 
