@@ -846,6 +846,19 @@ export function ThreadPane({
                           );
                         })}
                       </div>
+                      <div className="inbox-popover-footer">
+                        <button
+                          type="button"
+                          id="inbox-picker-manage-accounts-btn"
+                          className="btn ghost sm"
+                          onClick={() => {
+                            accountPopoverRef.current?.hidePopover?.();
+                            window.__CRM_BRIDGE__?.openAccountsModal?.({ openAuth: true });
+                          }}
+                        >
+                          + Подключить / переподключить аккаунты…
+                        </button>
+                      </div>
                     </div>
                   </div>
 

@@ -164,6 +164,29 @@
   border-color: color-mix(in srgb, var(--danger, #ff7b6b) 50%, var(--border, #2e2e33));
 }
 
+#inbox-v2-host .session-connect-pill {
+  font-size: 11.5px;
+  padding: 4px 9px;
+  border-radius: 9999px;
+  border: 1px dashed var(--border, #2e2e33);
+  background: transparent;
+  color: var(--text, #f5f5f7);
+  cursor: pointer;
+}
+
+#inbox-v2-host .session-connect-pill:hover {
+  border-color: var(--accent, #6d9cfe);
+  color: var(--accent, #6d9cfe);
+}
+
+#inbox-v2-host .session-connect-pill.is-warn {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--warning, #f59e0b) 60%, var(--border, #2e2e33));
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+  font-weight: 600;
+}
+
 /* Search Panel */
 #inbox-v2-host .search-panel {
   display: flex;
@@ -567,6 +590,19 @@
   align-items: flex-end;
   gap: 3px;
   flex-shrink: 0;
+}
+
+#inbox-v2-host .inbox-popover-footer {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border, #2e2e33);
+  display: flex;
+  justify-content: flex-end;
+}
+
+#inbox-v2-host .inbox-popover-footer button {
+  width: 100%;
+  justify-content: center;
 }
 
 #inbox-v2-host .inbox-shortcuts-list {

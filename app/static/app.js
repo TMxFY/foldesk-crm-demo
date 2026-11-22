@@ -132,6 +132,8 @@ const state = {
   leadsSubView: "kanban",
   outreachSubView: "campaigns",
   loginId: null,
+  reauthAccountId: null,
+  reauthAccountMaskedProxy: false,
   accounts: [],
   leads: [],
   leadCache: {},
@@ -215,6 +217,7 @@ const state = {
 let modalSubmit = null;
 let modalReturn = null;
 let toastTimer = 0;
+let modalStatusTimer = 0;
 let inboxSource = null;
 let inboxLiveAccount = "";
 let cardToken = 0;
@@ -291,10 +294,332 @@ function syncPopupState() {
   }
 }
 
-function openSheetPopup(kind) {
+function isAccountsInModal() {
+  return Boolean(
+    document.querySelector("#accounts-modal")?.open
+    && document.querySelector("#accounts")?.dataset.inModal === "true",
+  );
+}
+
+function isMaskedProxy(raw) {
+  return /\*\*\*/.test(String(raw || ""));
+}
+
+function isSpambotFrozenAccount(account) {
+  if (!account) return false;
+  if (String(account.health || "").trim().toLowerCase() !== "frozen") return false;
+  return /spambot|спамблок|ограничени[ея]|ограничен|limited until/i.test(String(account.last_error || ""));
+}
+
+function clearAccountsModalStatus() {
+  window.clearTimeout(modalStatusTimer);
+  const modalStatus = document.querySelector("#accounts-modal-status");
+  if (modalStatus) {
+    modalStatus.hidden = true;
+    modalStatus.textContent = "";
+    modalStatus.removeAttribute("data-kind");
+    modalStatus.setAttribute("role", "status");
+  }
+}
+
+function resetAccountAuthFormState({ clearInputs = true } = {}) {
+  if (typeof stopWaPoll === "function") stopWaPoll();
+  waCurrentAccountId = null;
+  waCurrentPairingCode = "";
+  state.loginId = null;
+  const codeForm = document.querySelector("#code-form");
+  const pwdForm = document.querySelector("#password-form");
+  const waPairingBox = document.querySelector("#wa-pairing-box");
+  const codeInput = document.querySelector("#code");
+  const pwdInput = document.querySelector("#password");
+  const loginMsg = document.querySelector("#login-msg");
+  if (codeForm) codeForm.hidden = true;
+  if (pwdForm) pwdForm.hidden = true;
+  if (waPairingBox) waPairingBox.hidden = true;
+  if (codeInput) codeInput.value = "";
+  if (pwdInput) pwdInput.value = "";
+  if (loginMsg) {
+    loginMsg.textContent = "";
+    loginMsg.setAttribute("role", "status");
+  }
+  if (clearInputs) {
+    state.reauthAccountMaskedProxy = false;
+    const phoneEl = document.querySelector("#phone");
+    const customProxyEl = document.querySelector("#account-proxy-custom");
+    const waPhoneEl = document.querySelector("#wa-phone-input");
+    const waProxyEl = document.querySelector("#wa-proxy-input");
+    const sessProxyEl = document.querySelector("#session-proxy-custom");
+    if (phoneEl) phoneEl.value = "";
+    if (customProxyEl) {
+      customProxyEl.value = "";
+      customProxyEl.placeholder = "socks5://user:pass@host:port";
+    }
+    if (waPhoneEl) waPhoneEl.value = "";
+    if (waProxyEl) {
+      waProxyEl.value = "";
+      waProxyEl.placeholder = "socks5://user:pass@host:1080";
+    }
+    if (sessProxyEl) sessProxyEl.value = "";
+  }
+}
+
+function clearReauthBanner() {
+  state.reauthAccountId = null;
+  state.reauthAccountMaskedProxy = false;
+  const banner = document.querySelector("#account-reauth-banner");
+  const bannerText = document.querySelector("#account-reauth-banner-text");
+  const titleEl = document.querySelector("#account-auth-box-title");
+  if (banner) banner.hidden = true;
+  if (bannerText) bannerText.textContent = "";
+  if (titleEl) titleEl.textContent = "Подключение и переподключение аккаунта";
+}
+
+function isCustomProxyAddress(raw) {
+  return /^(socks5h?|https?):\/\//i.test(String(raw || "").trim());
+}
+
+function prepareReauthForm(account) {
+  if (!account) return;
+  if (account.status !== "pending_code" && account.status !== "pending_password") {
+    resetAccountAuthFormState({ clearInputs: false });
+  }
+  state.reauthAccountId = account.id;
+  const isWa = normalizeProvider(account.provider) === "whatsapp";
+  switchAuthTab(isWa ? "whatsapp" : "phone");
+
+  const proxyVal = String(account.proxy_url || account.proxy || "").trim();
+  const maskedProxy = isMaskedProxy(proxyVal);
+  state.reauthAccountMaskedProxy = maskedProxy;
+  const maskedPlaceholder = "Текущий прокси сохранён (оставьте пустым или введите новый)";
+  const proxySelect = document.querySelector("#account-proxy-select");
+  const proxyCustom = document.querySelector("#account-proxy-custom");
+  const accessSelect = document.querySelector("#account-access-select");
+  const phoneInput = document.querySelector("#phone");
+  const waPhoneInput = document.querySelector("#wa-phone-input");
+  const waProxyInput = document.querySelector("#wa-proxy-input");
+  const waScopeSelect = document.querySelector("#wa-scope-select");
+
+  if (isWa) {
+    if (waPhoneInput) waPhoneInput.value = account.phone || "";
+    if (waProxyInput) {
+      waProxyInput.value = (isCustomProxyAddress(proxyVal) && !maskedProxy) ? proxyVal : "";
+      waProxyInput.placeholder = maskedProxy ? maskedPlaceholder : "socks5://user:pass@host:1080";
+    }
+    if (waScopeSelect && account.access_scope) waScopeSelect.value = account.access_scope;
+  } else {
+    if (phoneInput) phoneInput.value = account.phone || "";
+    if (proxySelect) {
+      if (proxyVal && !maskedProxy && [...proxySelect.options].some((o) => o.value === proxyVal)) {
+        proxySelect.value = proxyVal;
+        if (proxyCustom) {
+          proxyCustom.value = "";
+          proxyCustom.placeholder = "socks5://user:pass@host:port";
+        }
+      } else {
+        proxySelect.value = "auto";
+        if (proxyCustom) {
+          proxyCustom.value = (isCustomProxyAddress(proxyVal) && !maskedProxy) ? proxyVal : "";
+          proxyCustom.placeholder = maskedProxy ? maskedPlaceholder : "socks5://user:pass@host:port";
+        }
+      }
+    }
+    if (accessSelect && account.access_scope) accessSelect.value = account.access_scope;
+  }
+
+  const label = account.telegram_username
+    ? `@${account.telegram_username}`
+    : (account.telegram_name || account.phone || `#${account.id}`);
+  const reasonRaw = String(account.last_error || accountConnectionLabel(account) || "Требуется повторная авторизация");
+  const reasonShort = reasonRaw.length > 160 ? `${reasonRaw.slice(0, 157)}…` : reasonRaw;
+  const spambotHint = isSpambotFrozenAccount(account) ? " — сессия жива, сначала нажмите ↻ Проверить" : "";
+  const banner = document.querySelector("#account-reauth-banner");
+  const bannerText = document.querySelector("#account-reauth-banner-text");
+  const titleEl = document.querySelector("#account-auth-box-title");
+  if (titleEl) titleEl.textContent = `Переподключение аккаунта ${label}`;
+  if (bannerText) {
+    const phoneSuffix = account.phone && !label.includes(account.phone) ? ` (${account.phone})` : "";
+    bannerText.textContent = `Переподключение ${label}${phoneSuffix} · Причина: ${reasonShort}${spambotHint}`;
+  }
+  if (banner) banner.hidden = false;
+
+  if (account.status === "pending_code" || account.status === "pending_password") {
+    resumeLogin(account);
+  }
+}
+
+function updateAccountsModalTriggers(activeCount = null, totalCount = null, deadAccounts = null) {
+  const accounts = Array.isArray(state.accounts) ? state.accounts : [];
+  const activeList = activeCount == null ? accounts.filter(isAccountPoolActive) : null;
+  const deadList = deadAccounts == null ? accounts.filter((a) => !isAccountPoolActive(a)) : deadAccounts;
+  const active = activeCount == null ? activeList.length : Number(activeCount || 0);
+  const total = totalCount == null ? accounts.length : Number(totalCount || 0);
+  const deadLen = Array.isArray(deadList) ? deadList.length : Number(deadList || 0);
+
+  const topbarBtn = document.querySelector("#open-accounts-modal-btn");
+  if (topbarBtn) {
+    topbarBtn.classList.remove("primary", "secondary", "is-warn", "is-ok");
+    if (total === 0) {
+      topbarBtn.textContent = "Подключить аккаунт";
+      topbarBtn.classList.add("primary");
+    } else if (deadLen > 0) {
+      topbarBtn.textContent = `Аккаунты ${active}/${total} · ⚠ ${deadLen}`;
+      topbarBtn.classList.add("secondary", "is-warn");
+    } else {
+      topbarBtn.textContent = `Аккаунты ${active}/${total}`;
+      topbarBtn.classList.add("secondary", "is-ok");
+    }
+  }
+
+  const modalBadge = document.querySelector("#accounts-modal-badge");
+  if (modalBadge) {
+    modalBadge.textContent = `Активных: ${active} / ${total}`;
+    modalBadge.className = `badge ${deadLen > 0 ? "b-wait" : (total > 0 ? "b-ok" : "b-new")}`;
+  }
+
+  const outreachAccTab = document.querySelector("#outreach-tab-accounts");
+  if (outreachAccTab) {
+    outreachAccTab.dataset.deadCount = String(deadLen);
+  }
+}
+
+function pickReauthTargetAccount(account, accountId) {
+  if (account) return account;
+  const accounts = Array.isArray(state.accounts) ? state.accounts : [];
+  if (accountId != null) {
+    const byId = accounts.find((a) => Number(a.id) === Number(accountId));
+    if (byId) return byId;
+  }
+  const dead = accounts.filter((a) => !isAccountPoolActive(a) && !isSpambotFrozenAccount(a));
+  if (!dead.length) return null;
+  const priority = dead.find((a) => {
+    const h = String(a.health || "").toLowerCase();
+    return a.status !== "connected" || h === "unauthorized" || h === "offline" || h === "banned";
+  });
+  return priority || dead[0];
+}
+
+function focusAccountsModalAuthField(tabMode) {
+  window.requestAnimationFrame(() => {
+    const box = document.querySelector("#account-auth-box");
+    if (!box) return;
+    if (tabMode === "session") {
+      const target = box.querySelector("#session-import-text");
+      if (target && target.focus) target.focus();
+      return;
+    }
+    if (tabMode === "whatsapp") {
+      const waPhone = box.querySelector("#wa-phone-input");
+      if (waPhone && waPhone.focus) waPhone.focus();
+      return;
+    }
+    const codeForm = box.querySelector("#code-form");
+    const pwdForm = box.querySelector("#password-form");
+    if (pwdForm && !pwdForm.hidden) {
+      box.querySelector("#password")?.focus();
+      return;
+    }
+    if (codeForm && !codeForm.hidden) {
+      box.querySelector("#code")?.focus();
+      return;
+    }
+    const phoneInput = box.querySelector("#phone");
+    if (phoneInput && phoneInput.value) {
+      const submitBtn = box.querySelector('#login-form button[type="submit"]');
+      if (submitBtn && submitBtn.focus) submitBtn.focus();
+    } else if (phoneInput && phoneInput.focus) {
+      phoneInput.focus();
+    }
+  });
+}
+
+function openAccountsModal(opts = {}) {
+  const {
+    openAuth = true,
+    tab = null,
+    account = null,
+    accountId = null,
+    reauth = false,
+  } = opts || {};
+  const dialog = document.querySelector("#accounts-modal");
+  const slot = document.querySelector("#accounts-modal-slot");
+  const accountsSection = document.querySelector("#accounts");
+  if (!dialog || !slot || !accountsSection) {
+    state.outreachSubView = "accounts";
+    activateSheet("outreach", true);
+    return;
+  }
+
+  clearAccountsModalStatus();
+  if (accountsSection.parentElement !== slot) {
+    slot.append(accountsSection);
+  }
+  accountsSection.dataset.inModal = "true";
+  accountsSection.hidden = false;
+
+  if (!dialog.open && typeof dialog.showModal === "function") {
+    dialog.showModal();
+  } else if (!dialog.open) {
+    dialog.setAttribute("open", "");
+  }
+
+  const targetAccount = reauth ? pickReauthTargetAccount(account, accountId) : account;
+  let activeTab = tab || "phone";
+  if (targetAccount && reauth) {
+    prepareReauthForm(targetAccount);
+    accountsSection.dataset.authOpen = "true";
+    activeTab = normalizeProvider(targetAccount.provider) === "whatsapp" ? "whatsapp" : "phone";
+  } else if (openAuth) {
+    clearReauthBanner();
+    resetAccountAuthFormState();
+    switchAuthTab(activeTab);
+    accountsSection.dataset.authOpen = "true";
+  } else {
+    clearReauthBanner();
+    resetAccountAuthFormState();
+    delete accountsSection.dataset.authOpen;
+  }
+
+  updateAccountsModalTriggers();
+  if (openAuth || (targetAccount && reauth)) {
+    focusAccountsModalAuthField(activeTab);
+  }
+  if (!Array.isArray(state.accounts) || !state.accounts.length) {
+    loadAccounts().catch(() => {});
+  }
+}
+
+function closeAccountsModal() {
+  const dialog = document.querySelector("#accounts-modal");
+  if (!dialog || !dialog.open) return;
+  if (typeof dialog.close === "function") dialog.close();
+  else dialog.removeAttribute("open");
+}
+
+function openReauthForAccount(account) {
+  if (!account) return;
+  if (isAccountsInModal()) {
+    const accountsSection = document.querySelector("#accounts");
+    prepareReauthForm(account);
+    if (accountsSection) accountsSection.dataset.authOpen = "true";
+    const box = document.querySelector("#account-auth-box");
+    if (box && typeof box.scrollIntoView === "function") {
+      box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    const activeTab = normalizeProvider(account.provider) === "whatsapp" ? "whatsapp" : "phone";
+    focusAccountsModalAuthField(activeTab);
+    return;
+  }
+  openAccountsModal({ openAuth: true, account, reauth: true });
+}
+
+function openSheetPopup(kind, opts = {}) {
   const accountsSection = document.querySelector("#accounts");
   if (kind === "login" && accountsSection) {
     accountsSection.dataset.authOpen = "true";
+    if (isAccountsInModal()) {
+      focusAccountsModalAuthField(opts?.tab);
+      return;
+    }
   }
   if (state.viewMode !== "sheet") return;
   state.activePopup = kind || null;
@@ -313,6 +638,10 @@ function closeSheetPopup() {
   const accountsSection = document.querySelector("#accounts");
   if (accountsSection) {
     delete accountsSection.dataset.authOpen;
+  }
+  clearReauthBanner();
+  if (isAccountsInModal()) {
+    return;
   }
   const scheduleBox = document.querySelector("#outreach-schedule-box");
   const fromLeadsBox = document.querySelector("#outreach-from-leads-box");
@@ -335,7 +664,7 @@ function closeToolbarMoreMenus(exceptMenu = null) {
   });
 }
 
-function syncSheetVisibility() {
+function syncSheetVisibility(opts = {}) {
   closeToolbarMoreMenus();
   const main = document.querySelector("#workspace-main");
   if (!main) return;
@@ -470,7 +799,8 @@ function syncSheetVisibility() {
   if (outreach) outreach.hidden = active !== "outreach";
   if (outreachCampaignsPane) outreachCampaignsPane.hidden = outreachSub !== "campaigns";
   if (outreachAccountsPane) outreachAccountsPane.hidden = outreachSub !== "accounts";
-  if (accounts) accounts.hidden = active !== "outreach" || outreachSub !== "accounts";
+  const accountsInModal = isAccountsInModal();
+  if (accounts) accounts.hidden = accountsInModal ? false : (active !== "outreach" || outreachSub !== "accounts");
   if (leads) {
     const showLeadsTable = showLeads && leadsSub === "table";
     leads.hidden = !(showLeadsTable || leadPopupOpen);
@@ -509,8 +839,10 @@ function syncSheetVisibility() {
   }
 
   const activeNode = active === "inbox" ? messengerGrid : (showLeads && leadsSub === "kanban" ? s07 : document.querySelector(`#${active}`));
-  triggerSheetEntrance(activeNode);
-  window.requestAnimationFrame(() => window.scrollTo(0, 0));
+  if (!opts || !opts.preserveScroll) {
+    triggerSheetEntrance(activeNode);
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
+  }
 }
 
 function activateSheet(sheetId, forceSheetMode) {
@@ -551,14 +883,42 @@ function setView(selector, status) {
 
 function toast(message, kind) {
   const node = document.querySelector("#toast");
+  const modalStatus = document.querySelector("#accounts-modal-status");
   window.clearTimeout(toastTimer);
+  window.clearTimeout(modalStatusTimer);
+  const isError = kind === "error" || kind === "err";
+  if (isAccountsInModal() && modalStatus) {
+    if (node) {
+      node.hidden = true;
+      node.textContent = "";
+    }
+    if (!message) {
+      modalStatus.hidden = true;
+      modalStatus.textContent = "";
+      modalStatus.removeAttribute("data-kind");
+      modalStatus.setAttribute("role", "status");
+      return;
+    }
+    modalStatus.hidden = false;
+    modalStatus.dataset.kind = isError ? "error" : "ok";
+    modalStatus.setAttribute("role", isError ? "alert" : "status");
+    modalStatus.textContent = message;
+    modalStatusTimer = window.setTimeout(() => {
+      modalStatus.hidden = true;
+    }, 4000);
+    return;
+  }
+  if (modalStatus) {
+    modalStatus.hidden = true;
+    modalStatus.textContent = "";
+  }
+  if (!node) return;
   if (!message) {
     node.hidden = true;
     node.textContent = "";
     return;
   }
   node.hidden = false;
-  const isError = kind === "error" || kind === "err";
   node.dataset.kind = isError ? "error" : "ok";
   node.setAttribute("role", isError ? "alert" : "status");
   node.textContent = message;
@@ -1208,6 +1568,9 @@ function resumeLogin(account) {
     if (codeDisplay) codeDisplay.textContent = waCurrentPairingCode || "—";
     if (qrImage) qrImage.src = realQr;
   } else {
+    switchAuthTab("phone");
+    const phoneEl = document.querySelector("#phone");
+    if (phoneEl && account.phone) phoneEl.value = account.phone;
     document.querySelector("#code-form").hidden = account.status !== "pending_code";
     document.querySelector("#password-form").hidden = account.status !== "pending_password";
   }
@@ -1241,8 +1604,9 @@ async function deleteAccount(account, button) {
     if (String(state.inboxSessionFilter) === String(account.id)) {
       state.inboxSessionFilter = "all";
     }
-    if (String(state.loginId) === String(account.id)) {
-      state.loginId = null;
+    if (String(state.reauthAccountId) === String(account.id) || String(state.loginId) === String(account.id)) {
+      clearReauthBanner();
+      resetAccountAuthFormState();
     }
     await loadAccounts();
     await loadCampaigns();
@@ -1266,6 +1630,14 @@ async function purgeDeadAccounts(button) {
     const res = await api("/api/accounts/purge-dead", { method: "POST" });
     await loadAccounts();
     await loadCampaigns();
+    const stillHasReauth = state.reauthAccountId != null
+      && (state.accounts || []).some((a) => String(a.id) === String(state.reauthAccountId));
+    const stillHasLogin = state.loginId != null
+      && (state.accounts || []).some((a) => String(a.id) === String(state.loginId));
+    if ((state.reauthAccountId != null && !stillHasReauth) || (state.loginId != null && !stillHasLogin)) {
+      clearReauthBanner();
+      resetAccountAuthFormState();
+    }
     toast(`Удалено слетевших сессий: ${(res && res.count) || 0}`, "ok");
   } catch (error) {
     toast(error.message || "Не удалось очистить сессии", "error");
@@ -1412,6 +1784,7 @@ function renderAccounts() {
   }
   if (!state.accounts.length) {
     if (accountsSection) accountsSection.dataset.hasConnected = "false";
+    updateAccountsModalTriggers(0, 0, []);
     fillFolderAccounts();
     fillCampaignAccounts();
     renderInboxSessionSwitcher();
@@ -1421,6 +1794,7 @@ function renderAccounts() {
     setView("#accounts-view", "empty");
     return;
   }
+  updateAccountsModalTriggers(activePoolAccounts.length, state.accounts.length, deadAccounts);
   let pending = null;
   state.accounts.forEach((account) => {
     const label = account.telegram_name || account.telegram_username || account.phone;
@@ -1515,10 +1889,33 @@ function renderAccounts() {
     ]);
 
     const actionsWrap = el("div", { className: "account-col-actions row" }, []);
+    const isSpambotFrozen = isSpambotFrozenAccount(account);
+    const needsReauth = !isAccountPoolActive(account)
+      && !isSpambotFrozen
+      && account.status !== "pending_code"
+      && account.status !== "pending_password";
     if (account.status === "pending_code" || account.status === "pending_password") {
       pending = account;
       const caption = account.status === "pending_password" ? "Пароль" : "Код";
-      actionsWrap.append(el("button", { type: "button", className: "btn primary sm", onclick: () => resumeLogin(account) }, [caption]));
+      actionsWrap.append(
+        el("button", {
+          type: "button",
+          className: "btn primary sm",
+          "data-resume-account-id": String(account.id),
+          onclick: () => resumeLogin(account),
+        }, [caption]),
+      );
+    }
+    if (needsReauth) {
+      actionsWrap.append(
+        el("button", {
+          type: "button",
+          className: "btn primary sm account-reauth-btn",
+          "data-reauth-account-id": String(account.id),
+          title: "Переподключить аккаунт (войти заново по коду)",
+          onclick: () => openReauthForAccount(account),
+        }, ["Войти заново"]),
+      );
     }
     if (account.status === "connected") {
       actionsWrap.append(
@@ -1527,6 +1924,7 @@ function renderAccounts() {
           className: "btn secondary sm",
           title: "Открыть диалоги в CRM",
           onclick: async () => {
+            closeAccountsModal();
             if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__) {
               activateSheet("inbox");
               if (typeof window.__INBOX_V2_BRIDGE__.refresh === "function") {
@@ -1547,7 +1945,7 @@ function renderAccounts() {
         el("button", {
           type: "button",
           className: "btn ghost sm account-reconnect-btn",
-          title: "Переподключить сессию",
+          title: isSpambotFrozen ? "Проверить статус @SpamBot" : "Переподключить сессию",
           "aria-label": "Переподключить",
           onclick: () => reconnectAccount(account),
         }, ["↻"]),
@@ -1564,14 +1962,20 @@ function renderAccounts() {
       }, ["✕ Удалить"]),
     );
 
-    const row = el("li", { className: "account account-compact-row" }, [
+    const errFull = String(account.last_error || "").trim();
+    const errShort = errFull.length > 180 ? `${errFull.slice(0, 177)}…` : errFull;
+    const rowChildren = [
       el("div", { className: "account-row-line" }, [
         identityCol,
         badgesCol,
         limitCol,
         actionsWrap,
       ]),
-    ]);
+    ];
+    if (errShort && !isAccountPoolActive(account)) {
+      rowChildren.push(el("p", { className: "hint account-row-error", title: errFull }, [errShort]));
+    }
+    const row = el("li", { className: "account account-compact-row" }, rowChildren);
     list.append(row);
   });
   if (pending && state.loginId == null && connected.length === 0) resumeLogin(pending);
@@ -1579,7 +1983,7 @@ function renderAccounts() {
   if (accountsSection) {
     accountsSection.dataset.hasConnected = (connected.length > 0 && state.loginId == null) ? "true" : "false";
   }
-  if (select) {
+  if (select && !isInboxV2Active()) {
     const previous = select.value;
     select.replaceChildren();
     connected.forEach((account) => {
@@ -6368,7 +6772,7 @@ async function startWhatsappLogin(mode) {
     return;
   }
   const phone = rawPhone;
-  const proxyUrl = (proxyInput && proxyInput.value.trim()) || null;
+  const rawProxy = (proxyInput && proxyInput.value.trim()) || "";
   const accessScope = (scopeSelect && scopeSelect.value) || "workspace";
   const btn = mode === "qr" ? document.querySelector("#wa-qr-btn") : document.querySelector("#wa-code-btn");
   if (btn) {
@@ -6376,15 +6780,20 @@ async function startWhatsappLogin(mode) {
     btn.setAttribute("aria-busy", "true");
   }
   try {
+    const payload = {
+      phone,
+      provider: "whatsapp",
+      auth_mode: mode,
+      access_scope: accessScope,
+    };
+    if (rawProxy) {
+      payload.proxy_url = rawProxy;
+    } else if (!(state.reauthAccountMaskedProxy && state.reauthAccountId)) {
+      payload.proxy_url = null;
+    }
     const res = await api("/api/accounts/start", {
       method: "POST",
-      body: {
-        phone,
-        provider: "whatsapp",
-        auth_mode: mode,
-        proxy_url: proxyUrl,
-        access_scope: accessScope,
-      },
+      body: payload,
     });
     waCurrentAccountId = res.id;
     state.loginId = res.id;
@@ -6483,24 +6892,50 @@ if (waConfirmBtn) {
 const openSessionImportPopupBtn = document.querySelector("#open-session-import-popup");
 if (openSessionImportPopupBtn) {
   openSessionImportPopupBtn.addEventListener("click", () => {
+    clearReauthBanner();
+    resetAccountAuthFormState();
     switchAuthTab("session");
-    openSheetPopup("login");
+    openSheetPopup("login", { tab: "session" });
+  });
+}
+
+const accountProxySelectEl = document.querySelector("#account-proxy-select");
+if (accountProxySelectEl) {
+  accountProxySelectEl.addEventListener("change", () => {
+    const customProxyEl = document.querySelector("#account-proxy-custom");
+    if (customProxyEl) {
+      customProxyEl.value = "";
+      customProxyEl.placeholder = "socks5://user:pass@host:port";
+    }
+    state.reauthAccountMaskedProxy = false;
   });
 }
 
 bindBusy(document.querySelector("#login-form"), async (event) => {
   const formData = new FormData(event.target);
   const phone = formData.get("phone");
-  const proxy = document.querySelector("#account-proxy-select")?.value || "auto";
+  const selectProxyVal = document.querySelector("#account-proxy-select")?.value || "auto";
+  const customProxy = document.querySelector("#account-proxy-custom")?.value?.trim() || "";
   const access = document.querySelector("#account-access-select")?.value || "workspace";
+  const keepMaskedProxy = !customProxy
+    && selectProxyVal === "auto"
+    && state.reauthAccountMaskedProxy
+    && state.reauthAccountId != null;
+  const payload = { phone, access_scope: access, access };
+  if (!keepMaskedProxy) {
+    const proxy = customProxy || selectProxyVal || "auto";
+    payload.proxy_url = proxy;
+    payload.proxy = proxy;
+  }
   const result = await api("/api/accounts/start", {
     method: "POST",
-    body: { phone, proxy_url: proxy, access_scope: access, proxy, access },
+    body: payload,
   });
   state.loginId = result.id;
   document.querySelector("#code-form").hidden = false;
   document.querySelector("#password-form").hidden = true;
   await loadAccounts();
+  document.querySelector("#code")?.focus();
 });
 
 let uploadedSessionFilename = "";
@@ -6537,7 +6972,9 @@ if (importSessionBtn) {
     const area = document.querySelector("#session-import-text") || document.querySelector("#session-json-input");
     const rawJson = (area && area.value.trim()) || "";
     const provider = document.querySelector("#session-provider-select")?.value || "telegram";
-    const proxy = document.querySelector("#session-proxy-select")?.value
+    const customSessionProxy = document.querySelector("#session-proxy-custom")?.value?.trim() || "";
+    const proxy = customSessionProxy
+      || document.querySelector("#session-proxy-select")?.value
       || document.querySelector("#account-proxy-select")?.value
       || "auto";
     const effectiveProxy = provider === "whatsapp" && !/^(socks5h?|https?):\/\//i.test(String(proxy || "").trim())
@@ -6595,6 +7032,8 @@ if (importSessionBtn) {
         || {};
       await loadAccounts();
       await loadInbox();
+      const customProxyField = document.querySelector("#session-proxy-custom");
+      if (customProxyField) customProxyField.value = "";
       closeSheetPopup();
       const accLabel = firstAcc.telegram_username
         ? `@${firstAcc.telegram_username}`
@@ -6614,9 +7053,11 @@ bindBusy(document.querySelector("#code-form"), async (event) => {
   const result = await api(`/api/accounts/${state.loginId}/code`, { method: "POST", body: { code } });
   document.querySelector("#password-form").hidden = result.status !== "pending_password";
   if (result.status === "connected") {
-    state.loginId = null;
-    document.querySelector("#code-form").hidden = true;
+    resetAccountAuthFormState();
     closeSheetPopup();
+    toast("Аккаунт подключён", "ok");
+  } else if (result.status === "pending_password") {
+    document.querySelector("#password")?.focus();
   }
   await loadAccounts();
   if (result.status === "connected") await loadInbox();
@@ -6625,10 +7066,9 @@ bindBusy(document.querySelector("#code-form"), async (event) => {
 bindBusy(document.querySelector("#password-form"), async (event) => {
   const password = new FormData(event.target).get("password");
   await api(`/api/accounts/${state.loginId}/password`, { method: "POST", body: { password } });
-  state.loginId = null;
-  document.querySelector("#password-form").hidden = true;
-  document.querySelector("#code-form").hidden = true;
+  resetAccountAuthFormState();
   closeSheetPopup();
+  toast("Аккаунт подключён", "ok");
   await loadAccounts();
   await loadInbox();
 });
@@ -8086,7 +8526,13 @@ popupOpenMap.forEach(([selector, kind]) => {
   const btn = document.querySelector(selector);
   if (!btn) return;
   btn.addEventListener("click", () => {
-    if (selector === "#open-login-popup") switchAuthTab("phone");
+    if (selector === "#open-login-popup") {
+      clearReauthBanner();
+      resetAccountAuthFormState();
+      switchAuthTab("phone");
+      openSheetPopup(kind, { tab: "phone" });
+      return;
+    }
     openSheetPopup(kind);
   });
 });
@@ -8119,9 +8565,76 @@ document.addEventListener("click", (event) => {
   closeToolbarMoreMenus(insideMenu);
 });
 
+const openAccountsModalBtn = document.querySelector("#open-accounts-modal-btn");
+if (openAccountsModalBtn) {
+  openAccountsModalBtn.addEventListener("click", () => {
+    const dead = (state.accounts || []).filter((a) => !isAccountPoolActive(a));
+    openAccountsModal({ openAuth: true, reauth: dead.length > 0 });
+  });
+}
+
+const accountsModalCloseBtn = document.querySelector("#accounts-modal-close-btn");
+if (accountsModalCloseBtn) {
+  accountsModalCloseBtn.addEventListener("click", () => closeAccountsModal());
+}
+
+const accountReauthResetBtn = document.querySelector("#account-reauth-reset-btn");
+if (accountReauthResetBtn) {
+  accountReauthResetBtn.addEventListener("click", () => {
+    clearReauthBanner();
+    resetAccountAuthFormState();
+    switchAuthTab("phone");
+    document.querySelector("#phone")?.focus();
+  });
+}
+
+const accountsDialogEl = document.querySelector("#accounts-modal");
+if (accountsDialogEl) {
+  accountsDialogEl.addEventListener("close", () => {
+    accountsDialogEl.returnValue = "";
+    const accountsSection = document.querySelector("#accounts");
+    const homePane = document.querySelector("#outreach-accounts-pane");
+    if (accountsSection) {
+      delete accountsSection.dataset.inModal;
+      delete accountsSection.dataset.authOpen;
+      if (homePane && accountsSection.parentElement !== homePane) {
+        homePane.append(accountsSection);
+      }
+    }
+    clearReauthBanner();
+    resetAccountAuthFormState();
+    clearAccountsModalStatus();
+    syncSheetVisibility({ preserveScroll: true });
+  });
+
+  if (!("closedBy" in HTMLDialogElement.prototype)) {
+    const isOutsideDialog = (e, dlg) => {
+      const r = dlg.getBoundingClientRect();
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+    };
+    let pressedOutside = false;
+    accountsDialogEl.addEventListener("pointerdown", (e) => {
+      pressedOutside = e.target === accountsDialogEl && isOutsideDialog(e, accountsDialogEl);
+    });
+    accountsDialogEl.addEventListener("pointercancel", () => {
+      pressedOutside = false;
+    });
+    accountsDialogEl.addEventListener("close", () => {
+      pressedOutside = false;
+    });
+    accountsDialogEl.addEventListener("pointerup", (e) => {
+      const shouldClose = pressedOutside && e.target === accountsDialogEl && isOutsideDialog(e, accountsDialogEl);
+      pressedOutside = false;
+      if (shouldClose) accountsDialogEl.close();
+    });
+  }
+}
+
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   closeToolbarMoreMenus();
+  const accountsDlg = document.querySelector("#accounts-modal");
+  if (accountsDlg && accountsDlg.open) return;
   const modalNode = document.querySelector("#modal");
   if (modalNode && !modalNode.hidden) return;
   if (state.activePopup || state.activeSheet === "s09") {
@@ -9226,10 +9739,7 @@ function renderStatsExecutiveBlocks(summary) {
           el("button", {
             type: "button",
             className: "btn secondary sm",
-            onclick: () => {
-              state.outreachSubView = "accounts";
-              activateSheet("outreach", true);
-            },
+            onclick: () => openAccountsModal({ openAuth: true, accountId: dropped[0]?.id, reauth: true }),
           }, ["Переподключить →"]),
         ]),
         ...dropped.map((acc) => el("div", {
@@ -9250,7 +9760,15 @@ function renderStatsExecutiveBlocks(summary) {
               `${acc.last_error || "Требуется повторная авторизация"}${acc.dropped_at ? ` · с ${formatDue(acc.dropped_at)}` : ""}`,
             ]),
           ]),
-          el("span", { className: "hint" }, [`Отправлено: ${acc.campaign_sent_count || 0} · Ответов: ${acc.campaign_replied_count || 0}`]),
+          el("div", { className: "row" }, [
+            el("span", { className: "hint" }, [`Отправлено: ${acc.campaign_sent_count || 0} · Ответов: ${acc.campaign_replied_count || 0}`]),
+            el("button", {
+              type: "button",
+              className: "btn secondary sm",
+              "data-stats-reauth-id": String(acc.id),
+              onclick: () => openAccountsModal({ openAuth: true, accountId: acc.id, reauth: true }),
+            }, ["Переподключить"]),
+          ]),
         ])),
       ])
       : el("div", { className: "row" }, [
@@ -10185,6 +10703,9 @@ function registerCrmBridge() {
     },
     switchSheet(sheetName) {
       showSheet(sheetName);
+    },
+    openAccountsModal(opts) {
+      return openAccountsModal(opts);
     },
     getBootData() {
       return {

@@ -2084,6 +2084,8 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     @app.post("/api/accounts/start")
     async def accounts_start(body: StartIn, request: Request):
         gateway = _gateway_for_provider(request, body.provider)
+        fields = body.model_dump(exclude_unset=True)
+        has_proxy = ("proxy_url" in fields) or ("proxy" in fields)
         proxy_url = body.proxy_url if body.proxy_url is not None else body.proxy
         access_scope = body.access_scope or body.access or "workspace"
         return await _call_async(
@@ -2095,6 +2097,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             access_scope=access_scope,
             provider=body.provider,
             auth_mode=body.auth_mode,
+            has_proxy=has_proxy,
         )
 
     @app.post("/api/accounts/import-session")

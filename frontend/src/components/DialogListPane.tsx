@@ -104,6 +104,7 @@ export function DialogListPane({
     Boolean(query.trim()) &&
     Boolean(telegramSubmittedQuery.trim()) &&
     activeChips.length > 0;
+  const deadAccounts = accounts.filter((a) => a.status !== "connected" || isAccountDead(a));
 
   return (
     <section
@@ -197,6 +198,24 @@ export function DialogListPane({
             </button>
           );
         })}
+        <button
+          type="button"
+          id="inbox-connect-account-btn"
+          className={`chip session-connect-pill${deadAccounts.length > 0 ? " is-warn" : ""}`}
+          title={
+            deadAccounts.length > 0
+              ? "Есть отключённые аккаунты — нажмите для переподключения"
+              : "Подключить или переподключить аккаунт"
+          }
+          onClick={() =>
+            window.__CRM_BRIDGE__?.openAccountsModal?.({
+              openAuth: true,
+              reauth: deadAccounts.length > 0,
+            })
+          }
+        >
+          {deadAccounts.length > 0 ? `⚠ Переподключить (${deadAccounts.length})` : "+ Аккаунт"}
+        </button>
       </div>
 
       <section id="search" className="search-panel" aria-labelledby="search-title">

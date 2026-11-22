@@ -250,6 +250,12 @@ export interface CrmBridge {
   setLiveStatus?: (ok: boolean) => void;
   onLeadUpdated?: (updatedLead: LeadItem) => void;
   switchSheet?: (sheetName: string) => void;
+  openAccountsModal?: (opts?: {
+    openAuth?: boolean;
+    tab?: "phone" | "session" | "whatsapp";
+    accountId?: number;
+    reauth?: boolean;
+  }) => void;
   getBootData?: () => {
     accounts?: AccountItem[];
     leads?: LeadItem[];

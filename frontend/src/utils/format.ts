@@ -53,7 +53,7 @@ export function isAccountDead(acc: AccountItem | null | undefined): boolean {
   const status = String(acc.status || "").trim().toLowerCase();
   const health = String(acc.health || "active").trim().toLowerCase();
   if (status && status !== "connected") return true;
-  return health === "frozen" || health === "unauthorized" || health === "banned";
+  return health === "frozen" || health === "unauthorized" || health === "banned" || health === "offline";
 }
 
 export function accountRemainingQuota(acc: AccountItem): { sent: number; limit: number; remaining: number } {

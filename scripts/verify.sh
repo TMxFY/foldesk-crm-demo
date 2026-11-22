@@ -959,6 +959,65 @@ if (root / "app" / "inbox.py").is_file() or idx_path.is_file() or (root / "front
             if re.search(r"figtree", fe_file.read_text(encoding="utf-8"), flags=re.IGNORECASE):
                 errors.append(f"Gate T violation in {fe_file.relative_to(root)}: forbidden font 'Figtree'")
 
+# Gate U: Global Accounts Connect / Reconnect Modal Contract
+if idx_path.is_file():
+    for tok_u in (
+        'id="open-accounts-modal-btn"',
+        '<dialog id="accounts-modal"',
+        'closedby="any"',
+        'id="account-reauth-banner"',
+        'id="accounts-modal-status"',
+    ):
+        if tok_u not in idx_html:
+            errors.append(f"Gate U violation in app/templates/index.html: missing '{tok_u}'")
+    m_dlg_u = re.search(r"<dialog\b[^>]*id=\"accounts-modal\"[^>]*>", idx_html)
+    if m_dlg_u and re.search(r"\brole=\"dialog\"|\baria-modal\b", m_dlg_u.group(0)):
+        errors.append("Gate U violation in app/templates/index.html: <dialog id='accounts-modal'> must use native modal semantics without role='dialog' or aria-modal")
+
+if idx_path.is_file() and js_path.is_file():
+    js_src_u = js_path.read_text(encoding="utf-8")
+    for js_tok_u in (
+        "function openAccountsModal(",
+        "function openReauthForAccount(",
+        "openAccountsModal(opts)",
+        "if (select && !isInboxV2Active())",
+        "function resetAccountAuthFormState(",
+    ):
+        if js_tok_u not in js_src_u:
+            errors.append(f"Gate U violation in app/static/app.js: missing '{js_tok_u}'")
+
+css_path_u = root / "app" / "static" / "app.css"
+if css_path_u.is_file():
+    css_src_u = css_path_u.read_text(encoding="utf-8")
+    if not re.search(r"dialog\.accounts-modal:modal\s*\{[^}]*overscroll-behavior:\s*contain", css_src_u):
+        errors.append("Gate U violation in app/static/app.css: missing overscroll-behavior: contain on dialog.accounts-modal:modal")
+    if not re.search(r"dialog\.accounts-modal::backdrop\s*\{[^}]*overscroll-behavior:\s*contain", css_src_u):
+        errors.append("Gate U violation in app/static/app.css: missing overscroll-behavior: contain on dialog.accounts-modal::backdrop")
+
+fe_dlg_pane = root / "frontend" / "src" / "components" / "DialogListPane.tsx"
+if fe_dlg_pane.is_file():
+    if 'id="inbox-connect-account-btn"' not in fe_dlg_pane.read_text(encoding="utf-8"):
+        errors.append("Gate U violation in frontend/src/components/DialogListPane.tsx: missing id='inbox-connect-account-btn'")
+
+fe_thread_pane = root / "frontend" / "src" / "components" / "ThreadPane.tsx"
+if fe_thread_pane.is_file():
+    if 'id="inbox-picker-manage-accounts-btn"' not in fe_thread_pane.read_text(encoding="utf-8"):
+        errors.append("Gate U violation in frontend/src/components/ThreadPane.tsx: missing id='inbox-picker-manage-accounts-btn'")
+
+fe_bundle_js = root / "app" / "static" / "inbox-v2" / "inbox-v2.js"
+if fe_bundle_js.is_file() and fe_dlg_pane.is_file():
+    bundle_txt = fe_bundle_js.read_text(encoding="utf-8")
+    for b_tok in ("inbox-connect-account-btn", "inbox-picker-manage-accounts-btn"):
+        if b_tok not in bundle_txt:
+            errors.append(f"Gate U violation in app/static/inbox-v2/inbox-v2.js: stale bundle missing '{b_tok}' (run npm run build --prefix frontend)")
+
+acc_py_u = root / "app" / "accounts.py"
+if acc_py_u.is_file() and fe_thread_pane.is_file():
+    acc_src_u = acc_py_u.read_text(encoding="utf-8")
+    m_apply = re.search(r"def _apply_result\b[\s\S]{0,900}", acc_src_u)
+    if m_apply and '"offline"' not in m_apply.group(0):
+        errors.append("Gate U violation in app/accounts.py: _apply_result() must include 'offline' in replaceable health statuses")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

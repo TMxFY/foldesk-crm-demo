@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import time
+from urllib.parse import urlparse
 import zipfile
 
 from app.db import DEFAULT_DB, ROOT, as_dict, resolve_session, utc_now, utc_today
@@ -197,6 +198,22 @@ def set_daily_limit(conn, account_id: int, daily_limit: int) -> dict:
     return _public(_load(conn, account_id), nodemaven_configured=_is_nodemaven_configured(conn))
 
 
+def _is_masked_proxy_url(proxy_url: str | None) -> bool:
+    raw = str(proxy_url or "").strip()
+    if not raw or "://" not in raw:
+        return False
+    try:
+        parsed = urlparse(raw)
+        userinfo = parsed.netloc.split("@", 1)[0] if "@" in (parsed.netloc or "") else ""
+        return (
+            "***" in userinfo
+            or "***" in (parsed.password or "")
+            or "***" in (parsed.username or "")
+        )
+    except Exception:
+        return "***" in raw
+
+
 def update_account_settings(
     conn,
     account_id: int,
@@ -214,7 +231,10 @@ def update_account_settings(
         new_limit = int(daily_limit)
     new_proxy = current.get("proxy_url")
     if has_proxy or proxy_url is not None:
-        new_proxy = (proxy_url or "").strip() or None
+        candidate_proxy = (proxy_url or "").strip() or None
+        if _is_masked_proxy_url(candidate_proxy):
+            raise ValueError("Укажите полный URL прокси без маски *** или оставьте поле пустым")
+        new_proxy = candidate_proxy
         if str(current.get("provider") or "telegram").strip().lower() == "whatsapp":
             from app.whatsapp_gateway import _validate_wa_proxy_url
 
@@ -569,7 +589,13 @@ def _find_duplicate_account(
 
 def deduplicate_accounts(conn) -> int:
     rows = conn.execute(
-        "SELECT * FROM accounts ORDER BY CASE WHEN status = 'connected' THEN 0 ELSE 1 END, id ASC"
+        """
+        SELECT * FROM accounts
+        ORDER BY
+            CASE WHEN status = 'connected' THEN 0 ELSE 1 END,
+            CASE WHEN COALESCE(health, 'active') IN ('active', 'ok') THEN 0 ELSE 1 END,
+            id ASC
+        """
     ).fetchall()
     seen_phones: dict[tuple[str, str], int] = {}
     seen_uids: dict[tuple[str, int], int] = {}
@@ -1086,6 +1112,7 @@ async def start_login(
     access_scope: str = "workspace",
     provider: str = "telegram",
     auth_mode: str = "code",
+    has_proxy: bool = False,
 ) -> dict:
     norm_provider = "whatsapp" if str(provider or "").strip().lower() == "whatsapp" else "telegram"
     norm_mode = "qr" if str(auth_mode or "").strip().lower() == "qr" else "code"
@@ -1097,72 +1124,120 @@ async def start_login(
     if norm_provider == "whatsapp" and norm_mode == "code" and len(_phone_digits(phone)) < 8:
         raise ValueError("Укажите номер телефона в международном формате (+...)")
     clean_proxy = (proxy_url or "").strip() or None
-    clean_scope = (access_scope or "workspace").strip() or "workspace"
+    if _is_masked_proxy_url(clean_proxy):
+        raise ValueError(
+            "Передан замаскированный прокси (***). Оставьте поле пустым для сохранения текущего прокси или укажите новый."
+        )
+    if norm_provider == "whatsapp" and clean_proxy:
+        from app.whatsapp_gateway import _validate_wa_proxy_url
+
+        clean_proxy = _validate_wa_proxy_url(clean_proxy)
+    clean_scope = (access_scope or "").strip() or None
 
     existing_connected = _find_duplicate_account(conn, norm_provider, phone=phone, connected_only=True)
     if existing_connected and str(existing_connected.get("health") or "active") not in (
         "unauthorized",
         "banned",
         "frozen",
+        "offline",
     ):
         raise ValueError(f"Аккаунт {existing_connected['phone']} уже добавлен")
 
-    # Remove previous unfinished/error attempts for the same phone + provider
+    if (
+        existing_connected
+        and str(existing_connected.get("health") or "").strip().lower() == "frozen"
+        and _is_spambot_restriction_error(existing_connected.get("last_error"))
+    ):
+        existing_sess_rel = str(
+            existing_connected.get("session_path") or f"data/sessions/{int(existing_connected['id'])}.session"
+        )
+        if _is_valid_string_session(existing_connected.get("session_string")) or (
+            _inspect_telethon_session(existing_sess_rel) is not None
+        ):
+            raise ValueError(
+                "Сессия аккаунта жива (временное ограничение @SpamBot). "
+                "Повторный вход по коду не снимет спамблок — нажмите ↻ Проверить."
+            )
+
+    # Reuse matching unfinished/error row in-place so account_id and dialogs stay intact across retries
     target_digits = _phone_digits(phone)
     all_pending = conn.execute(
         """
-        SELECT id, phone, session_path FROM accounts
+        SELECT * FROM accounts
         WHERE COALESCE(provider, 'telegram') = ? AND status IN ('pending_code', 'error')
+        ORDER BY CASE WHEN telegram_user_id IS NOT NULL THEN 0 ELSE 1 END, id ASC
         """,
         (norm_provider,),
     ).fetchall()
     stale_rows = [
-        r
+        as_dict(r)
         for r in all_pending
-        if str(r[1] or "").strip() == phone or (target_digits and _phone_digits(r[1]) == target_digits)
+        if str(r["phone"] or "").strip() == phone or (target_digits and _phone_digits(r["phone"]) == target_digits)
     ]
-    stale_ids = [int(r[0]) for r in stale_rows]
-    if stale_ids:
+
+    target_row = existing_connected or (stale_rows[0] if stale_rows else None)
+    extra_stale = [
+        r for r in stale_rows if target_row is None or int(r["id"]) != int(target_row["id"])
+    ]
+    extra_stale_ids = [int(r["id"]) for r in extra_stale]
+    if extra_stale_ids:
         if gateway is not None:
-            for r in stale_rows:
-                old_path = str(r[2] or "").strip() or f"data/sessions/{int(r[0])}.session"
+            for r in extra_stale:
+                old_path = str(r.get("session_path") or "").strip() or f"data/sessions/{int(r['id'])}.session"
                 if hasattr(gateway, "_close"):
                     try:
                         await gateway._close(old_path)
-                    except Exception:
-                        pass
+                    except Exception as err:
+                        logger.debug("gateway._close stale %s failed: %s", old_path, err)
                 if hasattr(gateway, "clear_session"):
                     gateway.clear_session(old_path)
-        _unlink_account_refs(conn, stale_ids)
-        for sid in stale_ids:
+        _unlink_account_refs(conn, extra_stale_ids)
+        for sid in extra_stale_ids:
             conn.execute("DELETE FROM accounts WHERE id = ?", (sid,))
-    conn.commit()
-    if existing_connected:
-        account_id = int(existing_connected["id"])
-        old_sess_rel = existing_connected["session_path"] or f"data/sessions/{account_id}.session"
+        conn.commit()
+
+    if target_row:
+        if norm_provider == "whatsapp":
+            effective_proxy = clean_proxy if has_proxy else target_row.get("proxy_url")
+        else:
+            effective_proxy = clean_proxy if clean_proxy is not None else target_row.get("proxy_url")
+        effective_scope = clean_scope or (target_row.get("access_scope") or "workspace")
+    else:
+        effective_proxy = clean_proxy
+        effective_scope = clean_scope or "workspace"
+
+    prev_snapshot: dict | None = None
+    moved_backup: tuple[Path, Path] | None = None
+    if target_row:
+        account_id = int(target_row["id"])
+        old_sess_rel = str(target_row.get("session_path") or f"data/sessions/{account_id}.session")
+        prev_snapshot = {
+            "status": target_row.get("status"),
+            "health": target_row.get("health"),
+            "last_error": target_row.get("last_error"),
+            "session_blob": target_row.get("session_blob"),
+            "session_string": target_row.get("session_string"),
+            "proxy_url": target_row.get("proxy_url"),
+            "access_scope": target_row.get("access_scope"),
+            "session_path": old_sess_rel,
+        }
         old_sess = resolve_session(old_sess_rel)
-        is_dead_health = str(existing_connected.get("health") or "") in (
-            "unauthorized",
-            "banned",
-            "frozen",
-        )
-        has_live_sess = not is_dead_health and (
-            _is_valid_string_session(existing_connected.get("session_string"))
-            or _inspect_telethon_session(old_sess_rel) is not None
-            or _inspect_whatsmeow_db(old_sess_rel) is not None
-        )
         if gateway is not None and hasattr(gateway, "_close"):
             try:
                 await gateway._close(old_sess_rel)
             except Exception:
                 pass
-        if not has_live_sess and gateway is not None and hasattr(gateway, "clear_session"):
+        if gateway is not None and hasattr(gateway, "clear_session"):
             gateway.clear_session(old_sess_rel)
-        if old_sess.exists() and not has_live_sess:
+        if old_sess.exists():
             try:
-                if _inspect_telethon_session(old_sess_rel) is not None:
+                if (
+                    _inspect_telethon_session(old_sess_rel) is not None
+                    or _inspect_whatsmeow_db(old_sess_rel) is not None
+                ):
                     backup_p = old_sess.parent / f"backup_{old_sess.name}"
                     shutil.move(str(old_sess), str(backup_p))
+                    moved_backup = (old_sess, backup_p)
                 else:
                     old_sess.unlink()
                 for suffix in ("-journal", "-wal", "-shm"):
@@ -1171,20 +1246,16 @@ async def start_login(
                         sidecar.unlink()
             except Exception:
                 pass
-        if not has_live_sess:
-            conn.execute(
-                "UPDATE accounts SET session_blob = NULL, session_string = NULL, health = NULL, last_error = NULL WHERE id = ?",
-                (account_id,),
-            )
     else:
         cur = conn.execute(
             """
             INSERT INTO accounts (phone, session_path, status, created_at, proxy_url, access_scope, provider)
             VALUES (?, '', 'pending_code', ?, ?, ?, ?)
             """,
-            (phone, utc_now(), clean_proxy, clean_scope, norm_provider),
+            (phone, utc_now(), effective_proxy, effective_scope, norm_provider),
         )
         account_id = cur.lastrowid
+
     db_main_file = None
     try:
         for r_db in conn.execute("PRAGMA database_list").fetchall():
@@ -1204,7 +1275,7 @@ async def start_login(
         session_path = f"data/sessions/{account_id}.session"
     abs_target_sess = resolve_session(session_path)
     abs_target_sess.parent.mkdir(parents=True, exist_ok=True)
-    if norm_provider == "whatsapp" and not existing_connected and abs_target_sess.exists():
+    if norm_provider == "whatsapp" and not target_row and abs_target_sess.exists():
         for orphan_p in (
             abs_target_sess,
             abs_target_sess.with_name(abs_target_sess.name + "-wal"),
@@ -1229,11 +1300,11 @@ async def start_login(
     req_sess_str: str | None = None
     try:
         if gateway is not None and hasattr(gateway, "set_proxy"):
-            gateway.set_proxy(session_path, clean_proxy)
+            gateway.set_proxy(session_path, effective_proxy)
         if norm_provider == "whatsapp":
             if gateway is None:
                 gateway = WhatsAppGateway()
-                gateway.set_proxy(session_path, clean_proxy)
+                gateway.set_proxy(session_path, effective_proxy)
             sent_res = await gateway.request_code(
                 phone, session_path, auth_mode=norm_mode
             )
@@ -1250,7 +1321,62 @@ async def start_login(
             if gateway is not None and hasattr(gateway, "get_session_string"):
                 req_sess_str = (gateway.get_session_string(session_path) or "").strip() or None
     except Exception as exc:
-        _mark_error(conn, account_id)
+        if gateway is not None and hasattr(gateway, "_close"):
+            try:
+                await gateway._close(session_path)
+            except Exception as err:
+                logger.debug("gateway._close rollback %s failed: %s", session_path, err)
+        if moved_backup is not None:
+            orig_p, backup_p = moved_backup
+            try:
+                if backup_p.exists():
+                    for partial_p in (
+                        orig_p,
+                        orig_p.with_name(orig_p.name + "-journal"),
+                        orig_p.with_name(orig_p.name + "-wal"),
+                        orig_p.with_name(orig_p.name + "-shm"),
+                    ):
+                        if partial_p.exists():
+                            partial_p.unlink()
+                    shutil.move(str(backup_p), str(orig_p))
+            except Exception as err:
+                logger.debug("backup session restore %s failed: %s", orig_p, err)
+        if prev_snapshot and prev_snapshot.get("status") == "connected":
+            restored_path = str(prev_snapshot.get("session_path") or session_path)
+            conn.execute(
+                """
+                UPDATE accounts
+                SET status = 'connected',
+                    health = ?,
+                    last_error = ?,
+                    session_blob = ?,
+                    session_string = ?,
+                    proxy_url = ?,
+                    access_scope = ?,
+                    session_path = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    prev_snapshot.get("health"),
+                    _clip_error(exc) or prev_snapshot.get("last_error"),
+                    prev_snapshot.get("session_blob"),
+                    prev_snapshot.get("session_string"),
+                    prev_snapshot.get("proxy_url"),
+                    prev_snapshot.get("access_scope") or "workspace",
+                    restored_path,
+                    utc_now(),
+                    account_id,
+                ),
+            )
+            conn.commit()
+            if gateway is not None:
+                if hasattr(gateway, "set_proxy"):
+                    gateway.set_proxy(restored_path, prev_snapshot.get("proxy_url"))
+                if prev_snapshot.get("session_string") and hasattr(gateway, "set_session_string"):
+                    gateway.set_session_string(restored_path, prev_snapshot["session_string"])
+        else:
+            _mark_error(conn, account_id)
         if isinstance(exc, GatewayError):
             raise
         raise GatewayError(str(exc) or "Не удалось отправить код") from exc
@@ -1264,7 +1390,8 @@ async def start_login(
             SET phone_code_hash = ?, status = 'connected', health = 'active', last_error = NULL,
                 phone = COALESCE(?, phone), telegram_user_id = COALESCE(?, telegram_user_id),
                 telegram_name = COALESCE(?, telegram_name), wa_jid = COALESCE(?, wa_jid),
-                pairing_code = NULL, qr_code = NULL, provider = ?, updated_at = ?
+                pairing_code = NULL, qr_code = NULL, provider = ?,
+                proxy_url = ?, access_scope = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -1274,6 +1401,8 @@ async def start_login(
                 wa_info.get("name"),
                 wa_info.get("wa_jid"),
                 norm_provider,
+                effective_proxy,
+                effective_scope,
                 utc_now(),
                 account_id,
             ),
@@ -1286,17 +1415,28 @@ async def start_login(
             "provider": norm_provider,
             "pairing_code": None,
             "qr_code": None,
-            "proxy_url": clean_proxy,
-            "access_scope": clean_scope,
+            "proxy_url": effective_proxy,
+            "access_scope": effective_scope,
         }
     conn.execute(
         """
         UPDATE accounts
-        SET phone_code_hash = ?, status = 'pending_code', pairing_code = ?, qr_code = ?,
-            provider = ?, session_string = COALESCE(?, session_string)
+        SET phone_code_hash = ?, status = 'pending_code', health = NULL, last_error = NULL,
+            session_blob = NULL, session_string = ?, pairing_code = ?, qr_code = ?,
+            provider = ?, proxy_url = ?, access_scope = ?, updated_at = ?
         WHERE id = ?
         """,
-        (phone_code_hash, pairing_code, qr_code, norm_provider, req_sess_str, account_id),
+        (
+            phone_code_hash,
+            req_sess_str,
+            pairing_code,
+            qr_code,
+            norm_provider,
+            effective_proxy,
+            effective_scope,
+            utc_now(),
+            account_id,
+        ),
     )
     conn.commit()
     return {
@@ -1305,8 +1445,8 @@ async def start_login(
         "provider": norm_provider,
         "pairing_code": pairing_code,
         "qr_code": qr_code,
-        "proxy_url": clean_proxy,
-        "access_scope": clean_scope,
+        "proxy_url": effective_proxy,
+        "access_scope": effective_scope,
     }
 
 
@@ -1710,6 +1850,7 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             "unauthorized",
             "banned",
             "frozen",
+            "offline",
         ):
             raise ValueError(f"Аккаунт {dup_connected['phone']} уже добавлен")
 
@@ -2165,6 +2306,7 @@ def _apply_result(conn, account_id: int, result: dict) -> None:
             "unauthorized",
             "banned",
             "frozen",
+            "offline",
         ):
             _unlink_account_refs(conn, [int(account_id)])
             conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))

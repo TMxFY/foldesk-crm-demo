@@ -10,8 +10,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap&subset=cyrillic,latin">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261119w2">
-  <link rel="stylesheet" href="/static/inbox-v2/inbox-v2.css?v=20261119w2">
+  <link rel="stylesheet" href="/static/app.css?v=20261122acc2">
+  <link rel="stylesheet" href="/static/inbox-v2/inbox-v2.css?v=20261122acc2">
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
 </head>
 <body>
@@ -73,6 +73,7 @@
           <span class="stat-chip">Диалоги: <strong id="stat-dialogs">0</strong></span>
           <span class="stat-chip stat-chip-secondary" hidden>Рассылки: <strong id="stat-campaigns">0</strong></span>
           <span class="stat-chip stat-chip-secondary" hidden>Напоминания: <strong id="stat-reminders">0</strong></span>
+          <button type="button" id="open-accounts-modal-btn" class="btn secondary sm topbar-accounts-btn" title="Подключить или переподключить аккаунты Telegram и WhatsApp">Аккаунты</button>
           <button type="button" id="crm-user-btn" class="btn secondary sm" title="Сменить аккаунт или зарегистрировать пользователя">👤 Войти / Регистрация</button>
           <button type="button" id="open-mcp-modal-btn" class="btn ghost sm" title="Подключить AI-агента по MCP">MCP</button>
           <button type="button" id="toggle-view-mode" class="btn ghost sm" hidden>Все блоки</button>
@@ -564,8 +565,12 @@
             </div>
             <div id="account-auth-box" class="account-auth-box" data-popup-box="login">
               <div class="popup-box-head sheet-only-flex">
-                <strong>Подключение Telegram-аккаунта</strong>
+                <strong id="account-auth-box-title">Подключение и переподключение аккаунта</strong>
                 <button type="button" class="btn ghost sm popup-close-btn" data-close-popup aria-label="Закрыть">Закрыть ×</button>
+              </div>
+              <div id="account-reauth-banner" class="account-reauth-banner" hidden>
+                <span id="account-reauth-banner-text"></span>
+                <button type="button" id="account-reauth-reset-btn" class="btn ghost sm">Новый номер</button>
               </div>
 
               <div class="auth-mode-tabs" role="tablist" aria-label="Способ подключения аккаунта">
@@ -597,6 +602,9 @@
                       </select>
                     </label>
                   </div>
+                  <label for="account-proxy-custom">Свой прокси (необязательно, статический ISP)
+                    <input id="account-proxy-custom" name="proxy_custom" type="text" autocomplete="off" placeholder="socks5://user:pass@host:port">
+                  </label>
                 </form>
                 <p id="operator-msg" class="msg" role="status"></p>
                 <form id="code-form" class="compact-form" hidden>
@@ -649,6 +657,9 @@
                       </select>
                     </label>
                   </div>
+                  <label for="session-proxy-custom">Свой прокси для импорта (необязательно)
+                    <input id="session-proxy-custom" type="text" autocomplete="off" placeholder="socks5://user:pass@host:port">
+                  </label>
                   <div class="row">
                     <button type="button" id="import-session-btn" class="btn primary sm">Импортировать Session + JSON</button>
                   </div>
@@ -1421,8 +1432,21 @@
       <form id="modal-form"></form>
     </div>
   </div>
-  <script src="/static/app.js?v=20261119w2"></script>
-  <script type="module" src="/static/inbox-v2/inbox-v2.js?v=20261119w2"></script>
+  <dialog id="accounts-modal" class="accounts-modal" closedby="any" aria-labelledby="accounts-modal-title">
+    <div class="accounts-modal-shell">
+      <div class="accounts-modal-topbar">
+        <div class="pipeline-title-row">
+          <h2 id="accounts-modal-title">Подключение и переподключение аккаунтов</h2>
+          <span id="accounts-modal-badge" class="badge b-new">0 / 0</span>
+        </div>
+        <button type="button" id="accounts-modal-close-btn" class="btn ghost sm" aria-label="Закрыть окно аккаунтов">Закрыть ×</button>
+      </div>
+      <div id="accounts-modal-status" class="accounts-modal-status" role="status" aria-live="polite" hidden></div>
+      <div id="accounts-modal-slot" class="accounts-modal-body"></div>
+    </div>
+  </dialog>
+  <script src="/static/app.js?v=20261122acc2"></script>
+  <script type="module" src="/static/inbox-v2/inbox-v2.js?v=20261122acc2"></script>
   <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
