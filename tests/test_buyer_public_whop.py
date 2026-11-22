@@ -405,7 +405,7 @@ def test_anchor_card_bare_domain_boundary_pool_and_super_whale_cap():
     assert r["icp_score"] == 85
     assert r["project_url"] == "https://fundedfox.io"
     assert r["domain"] == "fundedfox.io"
-    assert contact_waterfall.resolve_per_lead_cap_usd(r) == pytest.approx(0.04)
+    assert contact_waterfall.resolve_per_lead_cap_usd(r) == pytest.approx(0.05)
 
     big_rows = buyer_public.whop_rows(
         fetch_fn=lambda _u: '<div class="campaign-card"><h3>MegaApp</h3> $10,000 pool <a href="https://megaapp.ai">Site</a></div>'

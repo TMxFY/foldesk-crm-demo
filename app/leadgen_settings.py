@@ -163,8 +163,9 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
     },
     "enrichment": {
         "daily_budget_cap_usd": 5.0,
-        "per_lead_cap_usd": 0.04,
+        "per_lead_cap_usd": 0.05,
         "super_whale_cap_usd": 0.15,
+        "contactout_verified_cap_usd": 0.25,
         "super_whale_icp_min": 92,
         "super_whale_pool_min_usd": 10000,
         "low_balance_warn_usd": 2.0,
@@ -339,6 +340,11 @@ def _normalize_enrichment_config(raw: Any) -> dict[str, Any]:
         ),
         "super_whale_cap_usd": _parse_non_neg_float(
             enr.get("super_whale_cap_usd"), defaults["super_whale_cap_usd"], "enrichment.super_whale_cap_usd"
+        ),
+        "contactout_verified_cap_usd": _parse_non_neg_float(
+            enr.get("contactout_verified_cap_usd"),
+            defaults["contactout_verified_cap_usd"],
+            "enrichment.contactout_verified_cap_usd",
         ),
         "super_whale_icp_min": _parse_int_range(
             enr.get("super_whale_icp_min"), defaults["super_whale_icp_min"], 0, 100, "enrichment.super_whale_icp_min"

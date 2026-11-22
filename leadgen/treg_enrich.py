@@ -51,6 +51,77 @@ FOREX_KEYWORDS = ["forex trading signals", "crypto trading channel"]
 AD_COMPANY = {"creator": "Creatify", "forex": "FTMO"}
 
 
+_TRACKING_SUBDOMAIN_LABELS = frozenset(
+    {
+        "lp",
+        "t",
+        "go",
+        "get",
+        "try",
+        "shop",
+        "store",
+        "offer",
+        "offers",
+        "promo",
+        "interview",
+        "pages",
+        "page",
+        "click",
+        "track",
+        "link",
+        "links",
+        "m",
+        "my",
+        "web",
+        "join",
+        "start",
+        "quiz",
+        "blog",
+        "info",
+        "app",
+    }
+)
+_MULTI_PART_PUBLIC_SUFFIXES = frozenset(
+    {
+        "co.uk",
+        "org.uk",
+        "ac.uk",
+        "com.au",
+        "net.au",
+        "org.au",
+        "com.br",
+        "co.za",
+        "co.nz",
+        "com.sg",
+        "co.il",
+        "co.jp",
+        "co.kr",
+        "com.tr",
+        "com.mx",
+        "co.in",
+        "com.ua",
+        "com.ae",
+    }
+)
+
+
+def root_company_domain(url_or_domain: str) -> str:
+    """Strip tracking/landing subdomains (`lp.`, `t.`, `shop.`, `interview.`, etc.) preserving apex domain."""
+    host = domain_of(url_or_domain)
+    if not host:
+        raw = str(url_or_domain or "").strip().lower().removeprefix("www.")
+        host = raw.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].rstrip(".")
+    if not host or "." not in host:
+        return host
+    parts = [p for p in host.split(".") if p]
+    if len(parts) < 3:
+        return host
+    suffix_len = 2 if ".".join(parts[-2:]) in _MULTI_PART_PUBLIC_SUFFIXES else 1
+    while len(parts) > suffix_len + 1 and parts[0] in _TRACKING_SUBDOMAIN_LABELS:
+        parts = parts[1:]
+    return ".".join(parts)
+
+
 def domain_of(url: str) -> str:
     raw_in = str(url or "").strip()
     if not raw_in:
@@ -708,6 +779,8 @@ def find_company_decision_makers(
         clean_domain = domain_of(raw_domain) or raw_domain.lower().removeprefix("www.").split("/", 1)[0]
     else:
         clean_domain = raw_domain.lower().removeprefix("www.")
+    if clean_domain:
+        clean_domain = root_company_domain(clean_domain) or clean_domain
     target = clean_company or clean_domain
     if not target:
         return []

@@ -59,8 +59,9 @@ def test_default_leadgen_config_and_disk_json_v2_sections() -> None:
         enr = cfg["enrichment"]
         assert enr == {
             "daily_budget_cap_usd": 5.0,
-            "per_lead_cap_usd": 0.04,
+            "per_lead_cap_usd": 0.05,
             "super_whale_cap_usd": 0.15,
+            "contactout_verified_cap_usd": 0.25,
             "super_whale_icp_min": 92,
             "super_whale_pool_min_usd": 10000,
             "low_balance_warn_usd": 2.0,

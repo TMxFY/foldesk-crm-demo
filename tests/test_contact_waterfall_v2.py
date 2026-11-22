@@ -108,13 +108,14 @@ def test_tier2_skipped_when_tg_or_wa_present_or_icp_low() -> None:
 
 
 def test_per_lead_cap_and_super_whale_cap() -> None:
-    assert contact_waterfall.PER_LEAD_CAP_USD == pytest.approx(0.04)
+    assert contact_waterfall.PER_LEAD_CAP_USD == pytest.approx(0.05)
     assert contact_waterfall.SUPER_WHALE_CAP_USD == pytest.approx(0.15)
-    assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 85}) == pytest.approx(0.04)
+    assert contact_waterfall.CONTACTOUT_VERIFIED_PHONE_CAP_USD == pytest.approx(0.25)
+    assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 85}) == pytest.approx(0.05)
     assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 92}) == pytest.approx(0.15)
     assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 84, "pool_usd": 10000}) == pytest.approx(0.15)
     assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 84, "pool_usd": "$12,500"}) == pytest.approx(0.15)
-    assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 84, "pool_usd": 5000}) == pytest.approx(0.04)
+    assert contact_waterfall.resolve_per_lead_cap_usd({"icp_score": 84, "pool_usd": 5000}) == pytest.approx(0.05)
 
     seen_headers: list[tuple[int, str]] = []
 
@@ -147,7 +148,7 @@ def test_per_lead_cap_and_super_whale_cap() -> None:
     _run_for(84, 10000)
 
     assert len(seen_headers) == 3
-    assert float(seen_headers[0][1]) == pytest.approx(0.04, abs=1e-4)
+    assert float(seen_headers[0][1]) == pytest.approx(0.05, abs=1e-4)
     assert float(seen_headers[1][1]) == pytest.approx(0.15, abs=1e-4)
     assert float(seen_headers[2][1]) == pytest.approx(0.15, abs=1e-4)
 
@@ -763,5 +764,218 @@ def test_budget_guard_denying_spend_blocks_paid_bridge_x_and_search(
     )
     assert bridged["username"] == "alex_gb"
     assert ("monid", "twitterdata.io:/users", 0.001, True) in recorded
+
+
+def test_contactout_verified_phone_fallback_and_profile_parsing() -> None:
+    from leadgen.contact_waterfall import _parse_contactout_phone_available
+
+    assert _parse_contactout_phone_available({"status_code": 200, "profile": {"phone": True}}) is True
+    assert _parse_contactout_phone_available({"status_code": 200, "profile": {"phone": False}}) is False
+    assert _parse_contactout_phone_available({"status_code": 200, "profile": {}}) is None
+
+    # 1) When pre-check confirms profile.phone=True and cheap Tier 2 misses -> ContactOut $0.25 runs & hits
+    called: list[str] = []
+    recorded: list[tuple[str, float]] = []
+
+    def treg_hit_on_contactout(ep: str, **kw: Any) -> dict[str, Any]:
+        called.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        if ep == "contactout.people.contact.phone":
+            assert kw.get("query") == {
+                "profile": "https://www.linkedin.com/in/jane-contactout",
+                "email_type": "none",
+                "include_phone": "true",
+            }
+            return {"status_code": 200, "profile": {"phone": ["+44 7700 900456"]}, "_treg": {"cost_usd": 0.25}}
+        if ep == "hlrlookup.people.phone.validate":
+            return {"results": [{"telephone_number_type": "MOBILE"}]}
+        return {}
+
+    budget = [0.50]
+    out_hit = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "co_hit_1",
+            "company": "Verve Labs",
+            "project_url": "https://vervelabs.io",
+            "work_email": "jane@vervelabs.io",
+            "founder_linkedin": "https://www.linkedin.com/in/jane-contactout",
+            "icp_score": 86,
+        },
+        budget_usd=budget,
+        http_get_fn=_empty_http,
+        treg_fn=treg_hit_on_contactout,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+        cost_record_fn=lambda *, provider, endpoint, lead_key, cost_usd, hit: recorded.append((endpoint, cost_usd)),
+    )
+    assert "contactout.people.contact.phone" in called
+    assert out_hit["phone"] == "+447700900456"
+    assert out_hit["lead_cost"] == pytest.approx(0.25)
+    assert budget[0] == pytest.approx(0.25)
+    assert ("contactout.people.contact.phone", 0.25) in recorded
+
+    # 2) When profile.phone=False or remaining budget < $0.25 -> NEVER call contactout.people.contact.phone
+    called_false: list[str] = []
+
+    def treg_false(ep: str, **kw: Any) -> dict[str, Any]:
+        called_false.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": False}}
+        return {}
+
+    out_false = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "co_false_1",
+            "company": "NoPhone Co",
+            "project_url": "https://nophone.io",
+            "work_email": "bob@nophone.io",
+            "founder_linkedin": "https://www.linkedin.com/in/bob-nophone",
+            "icp_score": 90,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_false,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+    )
+    assert "contactout.people.contact.phone" not in called_false
+    assert not out_false.get("phone")
+
+    called_low_budget: list[str] = []
+
+    def treg_true_low_budget(ep: str, **kw: Any) -> dict[str, Any]:
+        called_low_budget.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        return {}
+
+    contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "co_low_budget",
+            "company": "SmallCap Co",
+            "project_url": "https://smallcap.io",
+            "work_email": "ana@smallcap.io",
+            "founder_linkedin": "https://www.linkedin.com/in/ana-smallcap",
+            "icp_score": 90,
+        },
+        budget_usd=[0.10],
+        http_get_fn=_empty_http,
+        treg_fn=treg_true_low_budget,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+    )
+    assert "contactout.people.contact.phone" not in called_low_budget
+
+    # 3) Standard lead (icp=86) with 2 DMs caps ContactOut to 1 verified reveal ($0.25) per lead if DM1 returned landline
+    co_2dm_calls: list[str] = []
+
+    def treg_2dm_landline(ep: str, **kw: Any) -> dict[str, Any]:
+        co_2dm_calls.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        if ep == "contactout.people.contact.phone":
+            return {"status_code": 200, "profile": {"phone": ["+14155550111"]}, "_treg": {"cost_usd": 0.25}}
+        if ep == "hlrlookup.people.phone.validate":
+            return {"results": [{"telephone_number_type": "LANDLINE"}]}
+        return {}
+
+    out_2dm = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "co_2dm_cap",
+            "company": "TwoDM Co",
+            "project_url": "https://twodm.io",
+            "work_email": "dm1@twodm.io",
+            "icp_score": 86,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_2dm_landline,
+        dm_multi_finder_fn=lambda c, d, limit=2: [
+            {"founder_name": "DM One", "founder_linkedin": "https://www.linkedin.com/in/dm-one-twodm"},
+            {"founder_name": "DM Two", "founder_linkedin": "https://www.linkedin.com/in/dm-two-twodm"},
+        ],
+        tg_bridge_fn=lambda r: r,
+    )
+    assert co_2dm_calls.count("contactout.people.contact.phone") == 1
+    assert out_2dm["lead_cost"] == pytest.approx(0.25)
+    assert not out_2dm.get("phone")
+
+
+def test_root_company_domain_stripping_and_geo_local_phone_normalization() -> None:
+    from leadgen import treg_enrich
+
+    assert treg_enrich.root_company_domain("https://lp.ecommercescalingsecrets.com/offer") == "ecommercescalingsecrets.com"
+    assert treg_enrich.root_company_domain("https://t.0dtenews.com") == "0dtenews.com"
+    assert treg_enrich.root_company_domain("https://interview.lovi.care") == "lovi.care"
+    assert treg_enrich.root_company_domain("https://shop.glowbrand.co.uk") == "glowbrand.co.uk"
+
+    # Tier 1 free crawl visits root apex domain when lp. subdomain lacks team/contact links
+    visited_urls: list[str] = []
+
+    def fake_http(url: str, **kw: Any):
+        visited_urls.append(url)
+        if url.startswith("https://acme-scale.io"):
+            return SimpleNamespace(
+                status_code=200,
+                text='<a href="https://www.linkedin.com/in/alex-acme-founder">Founder</a>',
+                url=url,
+            )
+        return SimpleNamespace(status_code=200, text="<html>LP hero</html>", url=url)
+
+    out_root = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "lp_lead_1",
+            "company": "Acme Scale",
+            "project_url": "https://lp.acme-scale.io/promo",
+            "icp_score": 88,
+        },
+        allow_paid_tier2=False,
+        http_get_fn=fake_http,
+        tg_bridge_fn=lambda r: r,
+    )
+    assert any(u.startswith("https://acme-scale.io") for u in visited_urls)
+    assert out_root["company_domain"] == "acme-scale.io"
+    assert out_root["founder_linkedin"] == "https://www.linkedin.com/in/alex-acme-founder"
+
+    # GEO-aware normalization: GB landline 0208... -> +44208... -> HLR LANDLINE drops cleanly,
+    # allowing DM waterfall to proceed to personal mobile! Also test GB mobile 07700 900123 -> +447700900123.
+    assert contact_waterfall._normalize_phone_e164("0208 555 0085", default_country="GB") == "+442085550085"
+    assert contact_waterfall._normalize_phone_e164("07700 900123", default_country="GB") == "+447700900123"
+    assert contact_waterfall._normalize_phone_e164("415-555-0199", default_country="US") == "+14155550199"
+    assert contact_waterfall._normalize_phone_e164("+1 (415) 555-0144", default_country="GB") == "+14155550144"
+
+    hlr_checked_numbers: list[str] = []
+
+    def treg_uk_fallback(ep: str, **kw: Any) -> dict[str, Any]:
+        if ep == "hlrlookup.people.phone.validate":
+            tel = (kw.get("data") or {}).get("telephone_number", "")
+            hlr_checked_numbers.append(tel)
+            if tel.startswith("44208"):
+                return {"results": [{"telephone_number_type": "LANDLINE"}]}
+            return {"results": [{"telephone_number_type": "MOBILE"}]}
+        if ep == "treg.people.phone.find":
+            return {"output": {"phone": "+447700900777"}, "_treg": {"cost_usd": 0.01}}
+        return {}
+
+    out_uk = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "uk_fb_landline",
+            "company": "London Glow",
+            "project_url": "https://londonglow.co.uk",
+            "fb_page_url": "https://www.facebook.com/londonglow",
+            "founder_linkedin": "https://www.linkedin.com/in/claire-london",
+            "work_email": "claire@londonglow.co.uk",
+            "country_code": "GB",
+            "icp_score": 88,
+        },
+        http_get_fn=_empty_http,
+        monid_fn=lambda prov, ep, **kw: {"phone": "02085550085", "website": "https://londonglow.co.uk"},
+        treg_fn=treg_uk_fallback,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+    )
+    assert "442085550085" in hlr_checked_numbers
+    assert out_uk["phone"] == "+447700900777"
+    assert out_uk["phone_line_type"] == "MOBILE"
+
 
 

@@ -55,14 +55,14 @@ try:
     from leadgen import treg_enrich as _treg_enrich_mod
     from leadgen.monid_client import check_monid_ready, run_monid
     from leadgen.treg_client import call as treg_call, check_treg_ready, walk_strings
-    from leadgen.treg_enrich import domain_of, find_company_decision_maker
+    from leadgen.treg_enrich import domain_of, find_company_decision_maker, root_company_domain
     from leadgen.tg_identity_bridge import bridge_lead_to_telegram
     from leadgen.tg_to_gsheet import linkedin_in_url, whatsapp_url, x_profile_url
 except ImportError:
     import treg_enrich as _treg_enrich_mod
     from monid_client import check_monid_ready, run_monid
     from treg_client import call as treg_call, check_treg_ready, walk_strings
-    from treg_enrich import domain_of, find_company_decision_maker
+    from treg_enrich import domain_of, find_company_decision_maker, root_company_domain
     from tg_identity_bridge import bridge_lead_to_telegram
     from tg_to_gsheet import linkedin_in_url, whatsapp_url, x_profile_url
 
@@ -77,11 +77,82 @@ HTTP_TIMEOUT_S = 6
 MAX_INTERNAL_PAGES = 4
 MAX_DISCOVERED_INTERNAL = 2
 MAX_BIO_HUB_PAGES = 2
-PER_LEAD_CAP_USD = 0.04
+PER_LEAD_CAP_USD = 0.05
 SUPER_WHALE_CAP_USD = 0.15
+CONTACTOUT_VERIFIED_PHONE_CAP_USD = 0.25
+CONTACTOUT_VERIFIED_MIN_ICP = 85
 SUPER_WHALE_ICP_MIN = 92
 SUPER_WHALE_POOL_MIN_USD = 10000
 SECONDARY_DM_FALLBACK_DAYS = 6
+
+_GEO_CALLING_CODES: dict[str, str] = {
+    "US": "1",
+    "CA": "1",
+    "GB": "44",
+    "UK": "44",
+    "AE": "971",
+    "SA": "966",
+    "DE": "49",
+    "FR": "33",
+    "NL": "31",
+    "ES": "34",
+    "IT": "39",
+    "SE": "46",
+    "AU": "61",
+    "RU": "7",
+    "KZ": "7",
+    "UA": "380",
+    "IE": "353",
+    "CH": "41",
+    "AT": "43",
+    "BE": "32",
+    "PL": "48",
+    "IL": "972",
+    "SG": "65",
+    "NZ": "64",
+}
+_GEO_ZERO_TRUNK_COUNTRIES = frozenset(
+    {"GB", "UK", "DE", "FR", "NL", "IT", "SE", "AU", "AE", "SA", "UA", "IE", "CH", "AT", "BE", "PL", "IL", "NZ"}
+)
+_TLD_TO_GEO: dict[str, str] = {
+    "uk": "GB",
+    "de": "DE",
+    "fr": "FR",
+    "nl": "NL",
+    "es": "ES",
+    "it": "IT",
+    "se": "SE",
+    "ca": "CA",
+    "au": "AU",
+    "ae": "AE",
+    "sa": "SA",
+    "ru": "RU",
+    "su": "RU",
+    "kz": "KZ",
+    "ua": "UA",
+    "ie": "IE",
+    "ch": "CH",
+    "at": "AT",
+    "be": "BE",
+    "pl": "PL",
+    "il": "IL",
+    "sg": "SG",
+    "nz": "NZ",
+}
+
+
+def _infer_row_country_code(row: Mapping[str, Any] | None, domain: str = "") -> str:
+    if isinstance(row, Mapping):
+        for key in ("country_code", "country", "geo", "meta_country"):
+            val = str(row.get(key) or "").strip().upper()
+            if val in _GEO_CALLING_CODES:
+                return "GB" if val == "UK" else val
+    dom_clean = str(domain or "").strip().lower().rstrip(".")
+    if dom_clean and "." in dom_clean:
+        tld = dom_clean.rsplit(".", 1)[-1]
+        if tld in _TLD_TO_GEO:
+            return _TLD_TO_GEO[tld]
+    return ""
 
 COST_CRAWL4AI_EMAIL_USD = 0.00095
 COST_CRAWL4AI_PHONE_USD = 0.00095
@@ -939,7 +1010,7 @@ def resolve_per_lead_cap_usd(
     row: Mapping[str, Any],
     cfg: Mapping[str, Any] | None = None,
 ) -> float:
-    """Return $0.04 default cap, or $0.15 for super-whales (icp >= 92 or pool_usd >= 10000)."""
+    """Return $0.05 default cap, or $0.15 for super-whales (icp >= 92 or pool_usd >= 10000)."""
     enr_cfg = cfg.get("enrichment") if isinstance(cfg, Mapping) and isinstance(cfg.get("enrichment"), Mapping) else {}
     default_cap = float(enr_cfg.get("per_lead_cap_usd") or PER_LEAD_CAP_USD)
     super_cap = float(enr_cfg.get("super_whale_cap_usd") or SUPER_WHALE_CAP_USD)
@@ -1148,8 +1219,8 @@ def _merge_bridge_result(out: dict[str, Any], bridged: Any) -> None:
         out["links"] = existing
 
 
-def _normalize_phone_e164(raw: Any) -> str:
-    """Normalize a phone string or wa.me URL to E.164 '+<digits>', or ''."""
+def _normalize_phone_e164(raw: Any, *, default_country: str = "") -> str:
+    """Normalize a phone string or wa.me URL to E.164 '+<digits>', with optional GEO fallback."""
     text = str(raw or "").strip()
     if not text:
         return ""
@@ -1161,11 +1232,36 @@ def _normalize_phone_e164(raw: Any) -> str:
     if re.fullmatch(r"\d{4}[-/]\d{2}[-/]\d{2}(?:[T\s].*)?", text):
         return ""
     digits = re.sub(r"\D", "", text)
-    if text.startswith("00") and len(digits) > 9:
-        digits = digits[2:]
-    if not (7 <= len(digits) <= 15):
+    if not digits or len(set(digits)) == 1:
         return ""
-    if len(set(digits)) == 1:
+
+    if text.startswith("+"):
+        return f"+{digits}" if 7 <= len(digits) <= 15 else ""
+    if text.startswith("00") and len(digits) > 9:
+        intl = digits[2:]
+        return f"+{intl}" if 7 <= len(intl) <= 15 else ""
+
+    cc = str(default_country or "").strip().upper()
+    dial = _GEO_CALLING_CODES.get(cc, "")
+    if dial:
+        if cc in {"RU", "KZ"} and len(digits) == 11 and digits[0] in {"7", "8"}:
+            return f"+7{digits[1:]}"
+        if cc in {"US", "CA"} and len(digits) == 10 and digits[0] in "23456789":
+            return f"+1{digits}"
+        if cc in _GEO_ZERO_TRUNK_COUNTRIES and digits.startswith("0"):
+            national = digits.lstrip("0")
+            if national and 7 <= len(dial) + len(national) <= 15:
+                return f"+{dial}{national}"
+        if (
+            digits.startswith(dial)
+            and 9 <= len(digits) <= 15
+            and not (cc in {"GB", "UK"} and len(digits) == 10 and digits.startswith(("20", "7")))
+        ):
+            return f"+{digits}"
+        if cc in _GEO_ZERO_TRUNK_COUNTRIES and not digits.startswith(dial) and 8 <= len(digits) <= 10:
+            return f"+{dial}{digits}"
+
+    if not (7 <= len(digits) <= 15):
         return ""
     return f"+{digits}"
 
@@ -1293,7 +1389,8 @@ def fetch_fb_ig_business_contacts(
                 if _add_phone(item):
                     added = True
             return added
-        norm = _normalize_phone_e164(raw_p)
+        cc = _infer_row_country_code(row, domain_of(website or str(row.get("project_url") or row.get("website") or "")))
+        norm = _normalize_phone_e164(raw_p, default_country=cc)
         if not norm:
             return False
         key = norm.lstrip("+")
@@ -1354,18 +1451,18 @@ def fetch_fb_ig_business_contacts(
             total_cost += _extract_payload_cost(raw_fb, COST_MONID_FB_CONTACT_USD)
             sources.append("facebook.page_contact:giraffe")
             fb_data = _unwrap_monid_payload(raw_fb)
-            _add_phone(fb_data.get("phone"))
-            _add_phone(fb_data.get("phones"))
-            _add_email(fb_data.get("email"))
-            _add_email(fb_data.get("emails"))
             _maybe_set_website(fb_data.get("website"))
             _add_link(fb_data.get("links"))
-            if isinstance(fb_data.get("about"), str):
-                text_blobs.append(fb_data["about"])
             for cand_u in links:
                 if not website and not _is_bio_hub_url(cand_u) and domain_of(cand_u):
                     website = cand_u
                     break
+            _add_phone(fb_data.get("phone"))
+            _add_phone(fb_data.get("phones"))
+            _add_email(fb_data.get("email"))
+            _add_email(fb_data.get("emails"))
+            if isinstance(fb_data.get("about"), str):
+                text_blobs.append(fb_data["about"])
 
     # 2) Instagram Profile contact (route="octopus" -> fallback route="chameleon")
     ig_handle = _extract_ig_handle(row.get("instagram_handle") or row.get("instagram_url") or "")
@@ -1437,7 +1534,11 @@ def fetch_fb_ig_business_contacts(
     }
 
 
-def _extract_phones_with_hints_from_payload(payload: Any) -> list[tuple[str, str]]:
+def _extract_phones_with_hints_from_payload(
+    payload: Any,
+    *,
+    default_country: str = "",
+) -> list[tuple[str, str]]:
     """Extract ordered unique (phone_e164, line_type_hint) tuples from treg phone payloads."""
     if not payload:
         return []
@@ -1466,7 +1567,7 @@ def _extract_phones_with_hints_from_payload(payload: Any) -> list[tuple[str, str
     )
 
     def _add(raw_val: Any, hint: str = "") -> None:
-        norm = _normalize_phone_e164(raw_val)
+        norm = _normalize_phone_e164(raw_val, default_country=default_country)
         if not norm:
             return
         dkey = norm.lstrip("+")
@@ -1585,12 +1686,15 @@ def _parse_contactout_phone_available(payload: Any) -> bool | None:
     if not isinstance(payload, dict):
         return None
     containers: list[dict[str, Any]] = [payload]
-    for sub in ("output", "result", "data"):
+    for sub in ("output", "result", "data", "profile"):
         child = payload.get(sub)
         if isinstance(child, dict):
             containers.append(child)
+            prof = child.get("profile")
+            if isinstance(prof, dict):
+                containers.append(prof)
     for cont in containers:
-        for key in ("available", "has_phone", "phone_available", "hasPhone"):
+        for key in ("available", "has_phone", "phone_available", "hasPhone", "phone"):
             if key in cont and isinstance(cont[key], bool):
                 return cont[key]
         status = cont.get("phone_status") or cont.get("status")
@@ -1773,14 +1877,20 @@ def _run_phone_waterfall_for_dm(
     hlr_cache: dict[str, dict[str, Any]],
     budget_guard_fn: Callable[..., Any] | None = None,
     cost_record_fn: Callable[..., Any] | None = None,
+    icp_score: int = 0,
+    cfg: Mapping[str, Any] | None = None,
+    batch_budget_remaining_fn: Callable[[], float] | None = None,
+    co_budget_remaining: list[float] | None = None,
+    default_country: str = "",
 ) -> dict[str, Any]:
     """Run Layer 1 phone waterfall + free HLR mobile filter for one DM.
 
     Logic for ContactOut pre-check (`contactout.people.phone.available`, $0):
     - Only runs when `founder_linkedin` is present.
-    - If it explicitly returns `available=False` / `has_phone=False`, we STILL allow
-      `crawl4ai.people.phone.find` ($0.00095) and cap `treg.people.phone.find` at
-      `<= $0.01` unless the lead is a super-whale (`icp >= 92` or `pool_usd >= 10000`).
+    - If `available=False`: still tries `crawl4ai` ($0.00095) and caps `treg.people.phone.find`
+      at <= $0.01 unless super-whale.
+    - If cheap Tier 2 misses AND `available=True` AND `(icp >= 85 or is_super_whale)`:
+      triggers `contactout.people.contact.phone` ($0.25/success) within budget guard.
     """
     dm_li = linkedin_in_url(dm.get("founder_linkedin") or "")
     dm_name = str(dm.get("founder_name") or "").strip()
@@ -1807,6 +1917,7 @@ def _run_phone_waterfall_for_dm(
         return "", ""
 
     # a) Free ContactOut availability pre-check ($0) when LinkedIn URL is known
+    co_avail: bool | None = None
     co_explicit_false = False
     if dm_li:
         try:
@@ -1841,7 +1952,7 @@ def _run_phone_waterfall_for_dm(
             )
         except Exception:
             c4_resp = None
-        c4_cands = _extract_phones_with_hints_from_payload(c4_resp)
+        c4_cands = _extract_phones_with_hints_from_payload(c4_resp, default_country=default_country)
         c4_cost = _extract_payload_cost(c4_resp, COST_CRAWL4AI_PHONE_USD) if (c4_cands or _extract_payload_cost(c4_resp, 0.0) > 0) else 0.0
         if c4_cost > 0:
             spent += c4_cost
@@ -1885,7 +1996,7 @@ def _run_phone_waterfall_for_dm(
             )
         except Exception:
             tr_resp = None
-        tr_cands = _extract_phones_with_hints_from_payload(tr_resp)
+        tr_cands = _extract_phones_with_hints_from_payload(tr_resp, default_country=default_country)
         tr_cost = _extract_payload_cost(tr_resp, COST_TREG_PHONE_MIN_USD) if (tr_cands or _extract_payload_cost(tr_resp, 0.0) > 0) else 0.0
         if tr_cost > 0:
             spent += tr_cost
@@ -1899,6 +2010,49 @@ def _run_phone_waterfall_for_dm(
             )
         if tr_cands:
             mob_phone, mob_type = _pick_first_mobile(tr_cands)
+            if mob_phone:
+                return {"phone": mob_phone, "line_type": mob_type, "cost": round(spent, 6)}
+
+    # d) ContactOut verified fallback ($0.25/hit): ONLY when ContactOut pre-check confirmed phone exists
+    enr_cfg = cfg.get("enrichment") if isinstance(cfg, Mapping) and isinstance(cfg.get("enrichment"), Mapping) else {}
+    raw_co_cap = enr_cfg.get("contactout_verified_cap_usd", CONTACTOUT_VERIFIED_PHONE_CAP_USD)
+    co_cap = CONTACTOUT_VERIFIED_PHONE_CAP_USD if raw_co_cap is None else max(0.0, float(raw_co_cap))
+    co_lead_rem_ok = co_budget_remaining is None or (len(co_budget_remaining) > 0 and co_budget_remaining[0] + 1e-9 >= co_cap)
+    batch_rem_ok = batch_budget_remaining_fn is None or (max(0.0, batch_budget_remaining_fn() - spent) + 1e-9 >= co_cap)
+    if (
+        co_avail is True
+        and dm_li
+        and co_cap > 0.0
+        and co_lead_rem_ok
+        and (icp_score >= CONTACTOUT_VERIFIED_MIN_ICP or is_super_whale)
+        and batch_rem_ok
+        and _check_budget_guard(budget_guard_fn, "treg", co_cap, endpoint="contactout.people.contact.phone")
+    ):
+        try:
+            co_phone_resp = _call_treg_with_cap(
+                active_treg,
+                "contactout.people.contact.phone",
+                max_cost=co_cap,
+                query={"profile": dm_li, "email_type": "none", "include_phone": "true"},
+            )
+        except Exception:
+            co_phone_resp = None
+        co_cands = _extract_phones_with_hints_from_payload(co_phone_resp, default_country=default_country)
+        co_cost = _extract_payload_cost(co_phone_resp, co_cap) if (co_cands or _extract_payload_cost(co_phone_resp, 0.0) > 0) else 0.0
+        if co_cost > 0:
+            spent += co_cost
+            if co_budget_remaining is not None and len(co_budget_remaining) > 0:
+                co_budget_remaining[0] = max(0.0, co_budget_remaining[0] - co_cost)
+            _record_cost_event(
+                cost_record_fn,
+                provider="treg",
+                endpoint="contactout.people.contact.phone",
+                lead_key=lead_key,
+                cost_usd=co_cost,
+                hit=bool(co_cands),
+            )
+        if co_cands:
+            mob_phone, mob_type = _pick_first_mobile(co_cands)
             if mob_phone:
                 return {"phone": mob_phone, "line_type": mob_type, "cost": round(spent, 6)}
 
@@ -1951,7 +2105,11 @@ def enrich_lead_contacts(
         links_list = []
 
     project_url = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
-    dom = domain_of(project_url) or domain_of(str(out.get("domain") or out.get("company_domain") or ""))
+    raw_dom = domain_of(project_url) or domain_of(str(out.get("domain") or out.get("company_domain") or ""))
+    dom = root_company_domain(raw_dom) or raw_dom
+    if dom and not str(out.get("company_domain") or "").strip():
+        out["company_domain"] = dom
+    row_cc = _infer_row_country_code(out, dom or raw_dom)
     company = str(out.get("company") or out.get("project") or out.get("name") or "").strip()
     lead_key = str(out.get("id") or dom or company or "lead").strip()
 
@@ -1963,6 +2121,20 @@ def enrich_lead_contacts(
 
     # --- Tier 1: free local crawl ---
     crawled = crawl_domain_and_bio_links(project_url, extra_links=links_list, http_get_fn=http_get_fn)
+    if (
+        dom
+        and raw_dom
+        and dom != raw_dom
+        and not (crawled.get("telegram_username") or crawled.get("whatsapp") or crawled.get("founder_linkedin"))
+    ):
+        root_crawled = crawl_domain_and_bio_links(f"https://{dom}", http_get_fn=http_get_fn)
+        crawled["emails"] = list(crawled.get("emails") or []) + list(root_crawled.get("emails") or [])
+        for ck in ("founder_x", "founder_linkedin", "whatsapp", "telegram_username", "instagram_url"):
+            if not crawled.get(ck) and root_crawled.get(ck):
+                crawled[ck] = root_crawled[ck]
+        crawled["discovered_links"] = list(crawled.get("discovered_links") or []) + list(
+            root_crawled.get("discovered_links") or []
+        )
     email_pool.extend(crawled.get("emails") or [])
 
     best_tier1_email = rank_and_pick_best_email(email_pool, domain=dom)
@@ -2063,7 +2235,8 @@ def enrich_lead_contacts(
             if discovered_site and not project_url:
                 project_url = discovered_site
                 out["project_url"] = discovered_site
-                dom = dom or domain_of(discovered_site)
+                dom = dom or root_company_domain(discovered_site) or domain_of(discovered_site)
+                row_cc = row_cc or _infer_row_country_code(out, dom or domain_of(discovered_site))
                 if monid_cost > 0:
                     tier2_unlocked_contact = True
 
@@ -2524,6 +2697,10 @@ def enrich_lead_contacts(
                     elif fallback_email and is_personal_or_exec_email(fallback_email, dom):
                         _add_dm_candidate(dm_candidates, {"work_email": fallback_email})
 
+                enr_cfg = cfg.get("enrichment") if isinstance(cfg, Mapping) and isinstance(cfg.get("enrichment"), Mapping) else {}
+                raw_co_cap = enr_cfg.get("contactout_verified_cap_usd", CONTACTOUT_VERIFIED_PHONE_CAP_USD)
+                base_co_cap = CONTACTOUT_VERIFIED_PHONE_CAP_USD if raw_co_cap is None else max(0.0, float(raw_co_cap))
+                co_lead_budget = [base_co_cap * (2.0 if is_super_whale else 1.0)]
                 for dm_item in dm_candidates[:2]:
                     if dm_item.get("phone"):
                         continue
@@ -2537,6 +2714,15 @@ def enrich_lead_contacts(
                         hlr_cache=hlr_cache,
                         budget_guard_fn=budget_guard_fn,
                         cost_record_fn=cost_record_fn,
+                        icp_score=icp_score,
+                        cfg=cfg,
+                        batch_budget_remaining_fn=(
+                            (lambda: max(0.0, float(budget_usd[0]) - lead_cost))
+                            if (budget_usd is not None and len(budget_usd) > 0)
+                            else None
+                        ),
+                        co_budget_remaining=co_lead_budget,
+                        default_country=row_cc,
                     )
                     lead_cost += float(wf_res.get("cost") or 0.0)
                     if wf_res.get("phone"):

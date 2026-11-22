@@ -12852,7 +12852,7 @@ function ensureLeadgenState() {
       total_daily_quota: 50,
       enrichment: {
         daily_budget_cap_usd: 5.0,
-        per_lead_cap_usd: 0.04,
+        per_lead_cap_usd: 0.05,
         super_whale_cap_usd: 0.15,
         super_whale_icp_min: 92,
         super_whale_pool_min_usd: 10000,
@@ -13329,7 +13329,7 @@ function renderLeadgenConfig() {
   setVal("#leadgen-total-quota", cfg.total_daily_quota ?? 50);
 
   setVal("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 5.0);
-  setVal("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.04);
+  setVal("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.05);
   setVal("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15);
 
   setCheck("#leadgen-b2b-enabled", b2b.enabled !== false);
@@ -13455,7 +13455,7 @@ function collectLeadgenFormPayload() {
     enrichment: {
       ...enr,
       daily_budget_cap_usd: getNum("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 5.0, 0, 500),
-      per_lead_cap_usd: getNum("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.04, 0, 10),
+      per_lead_cap_usd: getNum("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.05, 0, 10),
       super_whale_cap_usd: getNum("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15, 0, 10),
     },
     whales: {
