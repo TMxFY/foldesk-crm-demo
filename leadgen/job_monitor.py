@@ -45,10 +45,15 @@ except ImportError:
         try_acquire_session_locks = None  # type: ignore
 
 VAULT = "/Users/timofei/obsidian/Second Brain"
-SESSION = os.environ.get(
-    "TG_JOBS_SESSION",
-    os.path.expanduser("~/.claude/skill-telegram/tim2.session"),
-)
+DEFAULT_VPS_JOBS_SESSION = "/opt/crmtg/data/scraper_sessions/jobs_reader.session"
+_LEGACY_LOCAL_JOBS_SESSION = "~/.claude/skill-telegram/tim2.session"
+
+DEFAULT_VACANCY_LAYERS: dict[str, bool] = {
+    "AI-контент": True,
+    "трафик": True,
+    "автоматизация": False,
+    "AI-роль": False,
+}
 
 _DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or str(WORKTREE_ROOT / "data" / "leadgen_state")
 OUTDIR = _DEFAULT_STATE_DIR
@@ -70,27 +75,118 @@ EXTRA_USERS = {"itconnectbelgrade"}
 EXTRA_TITLE = re.compile(r"\bit connect\b", re.I)
 
 
+def _config_json_path() -> Path:
+    return Path(os.environ.get("LEADGEN_CONFIG_PATH") or (WORKTREE_ROOT / "data" / "leadgen_config.json"))
+
+
 def _load_vacancies_ui_config() -> dict:
     try:
         from app.leadgen_settings import get_leadgen_config
 
-        return (get_leadgen_config().get("vacancies") or {})
+        return dict(get_leadgen_config().get("vacancies") or {})
     except Exception:
         pass
-    cfg_path = Path(os.environ.get("LEADGEN_CONFIG_PATH") or (WORKTREE_ROOT / "data" / "leadgen_config.json"))
+    cfg_path = _config_json_path()
     if cfg_path.exists():
         try:
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("vacancies"), dict):
-                return data["vacancies"]
+                return dict(data["vacancies"])
         except Exception:
             pass
     return {}
 
 
+def resolve_jobs_session_path(cfg: dict | None = None) -> str:
+    """Resolve the Telegram session path for job-chat reading without hardcoding Mac paths on VPS.
+
+    Priority:
+    1. ``TG_JOBS_SESSION`` environment variable
+    2. ``cfg["vacancies"]["vps_scraper_session"]`` (or ``cfg["vps_scraper_session"]``)
+    3. ``/opt/crmtg/data/scraper_sessions/jobs_reader.session`` (when on VPS / path exists)
+    4. Fallbacks: ``SCRAPER_TG_SESSION`` -> local repo ``data/scraper_sessions/jobs_reader.session``
+       -> local workstation fallback -> ``DEFAULT_VPS_JOBS_SESSION``.
+    """
+    env_sess = (os.environ.get("TG_JOBS_SESSION") or "").strip()
+    if env_sess:
+        return os.path.expanduser(env_sess)
+
+    if cfg is None:
+        vac_cfg = _load_vacancies_ui_config()
+    elif isinstance(cfg, dict):
+        vac_cfg = cfg["vacancies"] if isinstance(cfg.get("vacancies"), dict) else cfg
+    else:
+        vac_cfg = {}
+
+    cfg_sess = str((vac_cfg or {}).get("vps_scraper_session") or "").strip()
+    if cfg_sess:
+        return os.path.expanduser(cfg_sess)
+
+    if (
+        os.path.exists(DEFAULT_VPS_JOBS_SESSION)
+        or os.environ.get("CRMTG_VPS_RUNTIME") == "1"
+        or os.path.isdir("/opt/crmtg")
+    ):
+        return DEFAULT_VPS_JOBS_SESSION
+
+    scraper_env = (os.environ.get("SCRAPER_TG_SESSION") or "").strip()
+    if scraper_env:
+        return os.path.expanduser(scraper_env)
+
+    repo_jobs_sess = WORKTREE_ROOT / "data" / "scraper_sessions" / "jobs_reader.session"
+    if repo_jobs_sess.exists():
+        return str(repo_jobs_sess)
+
+    local_fallback = os.path.expanduser(_LEGACY_LOCAL_JOBS_SESSION)
+    if os.path.exists(local_fallback):
+        return local_fallback
+
+    return DEFAULT_VPS_JOBS_SESSION
+
+
+_IMPORT_TIME_SESSION = resolve_jobs_session_path()
+SESSION = _IMPORT_TIME_SESSION
+
+
+def resolve_enabled_layers(vac_cfg: dict | None = None) -> set[str]:
+    """Return enabled vacancy layers; default ONLY ``AI-контент`` and ``трафик``."""
+    raw_layers: dict | None = None
+    if vac_cfg is not None:
+        sub = vac_cfg["vacancies"] if isinstance(vac_cfg, dict) and isinstance(vac_cfg.get("vacancies"), dict) else vac_cfg
+        if isinstance(sub, dict) and isinstance(sub.get("layers"), dict) and sub["layers"]:
+            raw_layers = sub["layers"]
+    else:
+        cfg_path = _config_json_path()
+        loaded = _load_vacancies_ui_config()
+        loaded_layers = loaded.get("layers") if isinstance(loaded, dict) and isinstance(loaded.get("layers"), dict) else None
+        if cfg_path.exists() and loaded_layers:
+            raw_layers = loaded_layers
+        elif loaded_layers:
+            try:
+                from app.leadgen_settings import DEFAULT_LEADGEN_CONFIG
+
+                app_def_layers = (DEFAULT_LEADGEN_CONFIG.get("vacancies") or {}).get("layers") or {}
+            except Exception:
+                app_def_layers = {}
+            if loaded_layers != app_def_layers:
+                raw_layers = loaded_layers
+
+    merged = dict(DEFAULT_VACANCY_LAYERS)
+    if raw_layers:
+        for k, v in raw_layers.items():
+            merged[str(k)] = bool(v)
+    return {k for k, v in merged.items() if v}
+
+
 def apply_vacancies_config(vac_cfg: dict | None = None) -> dict:
     global PAUSE_BETWEEN_CHATS, SOURCE_WORDS, SOURCE_STOP, EXTRA_USERS
-    cfg = vac_cfg if isinstance(vac_cfg, dict) else _load_vacancies_ui_config()
+    cfg = dict(vac_cfg) if isinstance(vac_cfg, dict) else _load_vacancies_ui_config()
+    enabled_layers = resolve_enabled_layers(vac_cfg)
+    raw_layers = cfg.get("layers") if isinstance(cfg.get("layers"), dict) else {}
+    merged_layers = dict(DEFAULT_VACANCY_LAYERS)
+    for k in set(merged_layers) | set(raw_layers):
+        merged_layers[str(k)] = str(k) in enabled_layers
+    cfg["layers"] = merged_layers
     if cfg.get("source_words"):
         try:
             SOURCE_WORDS = re.compile(str(cfg["source_words"]), re.I)
@@ -119,11 +215,35 @@ RESUME_RX = re.compile(
     r"|мо[её] портфолио|моё резюме|мое резюме|о себе:|стаж работы",
     re.I,
 )
+_VIDEO_SIGNAL_PATTERN = (
+    r"(?<!без\s)(?:видео|ролик\w*|рилс\w*|reels|shorts|шортс|tiktok|тик[\s_-]*ток|"
+    r"ugc|клип\w*|монтаж\w*|аватар\w*|нейрокреатор\w*|нейровидео)"
+)
 VACANCY_JUNK_RX = re.compile(
     r"стори[сз][\s_-]*мейкер|story[\s_-]*mak|(?:оформлени|ведени|монтаж)\w*\s+стори[сз]"
     r"|иллюстра(?:тор|ц)\w*[\s\S]{0,80}детск\w*\s+книг"
-    r"|(?:монтаж|нарезк|рилсмейкер)\w*[\s\S]{0,35}\bмем(?:ов|ы|ами|ам)?\b",
-    re.I,
+    r"|(?:монтаж|нарезк|рилсмейкер)\w*[\s\S]{0,35}\bмем(?:ов|ы|ами|ам)?\b"
+    r"|\bпрограммист\w*\b"
+    r"|\b(?:python|php|java|golang|rust|c\+\+|c#|swift|kotlin|typescript|javascript|"
+    r"react|vue|angular|node\.?js|django|fastapi|laravel|1с|1c|bitrix|битрикс|"
+    r"wordpress|вордпресс|tilda|тильд\w*|webflow|frontend|backend|fullstack|full[-\s]*stack|"
+    r"software|mobile|ios|android|web|веб|telegram|tg|тг|чат[-\s]*бот\w*|ai[-\s]*агент\w*)"
+    r"[\s_-]+(?:разработчик\w*|программист\w*|developer\w*|engineer\w*)\b"
+    r"|(?:ищем|нужен|нужна|требуются?|требуется|вакансия|позиция|роль)\s+(?:[\w/+-]+\s+){0,3}?"
+    r"(?:разработчик\w*|кодер\w*|верстальщик\w*|тестировщик\w*|devops|qa[\s_-]*инженер\w*|"
+    r"software\s+engineer\w*|web\s+developer\w*|вайб[-\s]*кодер\w*)"
+    r"|\b(?:вайб[-\s]*кодинг\w*|vibe[\s_-]*coding|claude\s*code)\b"
+    r"|(?:разработка|создание|вёрстка|верстка)\s+(?:сайт(?:а|ов)?|лендинг(?:а|ов)?|"
+    r"интернет[-\s]*магазин\w*|веб[-\s]*приложени\w*|мобильн\w*\s+приложени\w*|"
+    r"парсер\w*|скрипт\w*|бэкенд\w*|фронтенд\w*|\bapi\b)"
+    r"|\b(?:n8n|make\.com|integromat|zapier)\b"
+    r"|(?:n8n\s*[/+,и]\s*make|make\s*[/+,и]\s*n8n|(?:настройк\w*|сценари\w*|автоматизац\w*|интеграц\w*|связк\w*|специалист\w*)\s+(?:в|на|через|по)\s+make)\b"
+    r"|(?:интеграц\w*|настройк\w*|внедрени\w*|автоматизац\w*)\s+(?:[\w-]+\s+){0,2}?"
+    r"(?:crm|срм|amocrm|амосрм|bitrix24|битрикс24|битрикс|airtable|google\s*sheets)"
+    r"|(?:специалист\w*|подрядчик\w*|настройщик\w*)\s+по\s+(?:n8n|make|crm|срм|amocrm|bitrix|автоматизац\w*)"
+    rf"|\A(?!.*{_VIDEO_SIGNAL_PATTERN}).*(?:(?:чат|телеграм|telegram|тг|tg)[-\s]*бот\w*|"
+    r"(?:созда|сдела|разработ|настро|написа)\w*\s+(?:[\w-]+\s+){0,2}?бот(?:а|ов|ами|у|е)?\b)",
+    re.I | re.S,
 )
 CONTACT_RX = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,31}|t\.me/|https?://")
 NOISE_RX = re.compile(
@@ -131,17 +251,23 @@ NOISE_RX = re.compile(
     re.I,
 )
 
-TRIAGE = """Ниже {n} сообщений из телеграм-чатов с вакансиями. Отбери те, где
-ЗАКАЗЧИК ИЩЕТ ИСПОЛНИТЕЛЯ по теме: AI-контент, видео, UGC, монтаж, соцсети и
-трафик, AI-автоматизация, боты, воронки, AI-разработка.
+TRIAGE = """Ниже {n} сообщений из телеграм-чатов с вакансиями. Отбери ТОЛЬКО те, где
+ЗАКАЗЧИК ИЩЕТ ИСПОЛНИТЕЛЯ на: AI-контент, AI-видео, AI-аватары, короткие
+вертикальные видео (Reels / Shorts / TikTok), UGC, монтаж рилс/клипов,
+контент-завод, органический трафик и контент-воронки (в т.ч. видео + ManyChat).
 
-Выкидывай: резюме и саморекламу исполнителей («делаю», «помогу», «мой опыт»,
-портфолио), рекламу курсов и услуг, приглашения на опросы, обсуждения и болтовню
-в чате, офлайн и физический труд, сторисмейкеров и ведение сторис, иллюстрации
-детских книг, монтаж/нарезку мемов для новичков, мелкие подработки, вакансии без
-всякой связи с темой выше (бухгалтер, продавец, грузчик, оператор колл-центра).
+Жёстко выкидывай:
+— программистов и разработчиков любого стека (Python, JS, React, 1C, веб, мобилка,
+  бэкенд, фронтенд, AI-разработка, вайб-кодинг, Claude Code, парсеры, верстка);
+— автоматизацию и CRM (n8n, Make / Integromat, Zapier, amoCRM, Bitrix24, интеграции);
+— ботов и автоворонки БЕЗ видео/рилсов/UGC-контента;
+— сторисмейкеров и ведение/оформление сторис;
+— иллюстрации детских книг, нарезку мемов для новичков, мелкие разовые подработки;
+— резюме и саморекламу исполнителей («делаю», «помогу», «мой опыт», портфолио),
+  рекламу курсов, опросы, болтовню в чате, офлайн и физический труд, HR, бухгалтерию.
 
-Сомневаешься — оставляй: дальше есть второй, более строгий проход.
+Сомневаешься между валидным видео/трафик-проектом и отсевом — оставляй: дальше
+есть второй, более строгий проход.
 
 {items}
 
@@ -150,33 +276,34 @@ TRIAGE = """Ниже {n} сообщений из телеграм-чатов с 
 Ничего кроме массива."""
 
 VERDICT = """Ты отбираешь вакансии и заказы для Тима. Он — практик AI-UGC:
-делает контент нейросетями, строит органические воронки и контент-заводы, и
-раздаёт руки — часть работы выполняет сам, часть отдаёт своей команде.
+делает контент нейросетями, строит органические контент-заводы и видео-воронки
+(ролики + ManyChat + аналитика) и отдаёт производство своей команде.
 
-Что он забирал сам (выведено из 410 его сохранённых объявлений, не выдумано):
+Что подходит (только 2 активных направления):
 1. AI-контент и короткое вертикальное видео — нейрокреатор, AI-видео,
-   ИИ-аватары и липсинк, UGC для Reels/Shorts/TikTok, монтаж вертикалок,
-   рилсмейкер, клипер-нарезчик, AI-дизайн и визуал, сценарист под рилсы.
-2. AI-автоматизация и техспец — n8n, Make, телеграм-боты, автоворонки,
-   ManyChat, AI-агенты, вайб-кодинг, Claude Code, интеграции с CRM, парсинг.
-3. Трафик и контент-система — SMM и Head of SMM, где реально нужен AI,
-   контент-завод, контент-продюсер, УБТ и органика, growth и воронки,
-   продюсер запусков.
-4. Сильные AI-first роли — Head of Content GenAI, Product Lead, CTO или
-   техпартнёр в AI-агентство, инженер в AI-продукт. Здесь планка выше: берём,
-   только если AI в ядре продукта и оплата или доля названы серьёзные.
+   ИИ-аватары и липсинк, AI UGC и креативы для Reels/Shorts/TikTok, монтаж
+   вертикалок на потоке, рилсмейкер под воронку/продукт, клипер-нарезчик,
+   сценарист под рилсы и видео-контент.
+2. Трафик и контент-система — SMM и Head of SMM с фокусом на видео/AI,
+   контент-завод, контент-продюсер, УБТ и органика (Reels/Shorts/TikTok),
+   видео-воронки с ManyChat и переливом трафика, продюсер запусков через контент.
 
-Условия, которые выполнялись почти во всех его сохранённых:
+Обязательные условия:
 — работа удалённая (офис допустим только как опция, не требование);
 — в объявлении есть контакт для отклика;
 — ищут исполнителя, а не предлагают свои услуги;
-— формат любой: штат, проект, разовый заказ, подряд, партнёрство.
+— формат: проект, поток задач, подряд, штат на контент-систему.
 
-Чего среди сохранённых нет вообще: резюме исполнителей, офлайн и физический
-труд, сторисмейкеры и ведение/оформление сторис, иллюстрации детских книг,
-нарезка/монтаж мемов для новичков, продажи и менеджмент без AI, HR, бухгалтерия,
-обычная разработка без AI, дизайн и копирайтинг без AI, обучение с оплатой ОТ
-соискателя, «заработок на дому», крипто-схемы и опросы.
+ЖЁСТКО ОТСЕИВАЙ (fit=false):
+— любых программистов и разработчиков (Python, JS, React, 1C, веб-сайты,
+  мобильные приложения, бэкенд/фронтенд, AI-инженеры, CTO, вайб-кодинг, Claude Code);
+— n8n, Make / Integromat, Zapier, интеграции и настройку CRM (amoCRM, Битрикс24);
+— разработку телеграм-ботов и автоворонок БЕЗ видео/рилсов/UGC;
+— сторисмейкеров и ведение/оформление сторис;
+— иллюстрации детских книг, нарезку/монтаж мемов для новичков;
+— резюме исполнителей, офлайн/физический труд, продажи без контента, HR,
+  бухгалтерию, копирайтинг/дизайн без видео, обучение с оплатой ОТ соискателя,
+  «заработок на дому», крипто-схемы и опросы.
 
 Объявление:
 Источник: {source}
@@ -184,7 +311,7 @@ VERDICT = """Ты отбираешь вакансии и заказы для Т�
 
 Верни СТРОГО один JSON, без пояснений:
 {{"fit": true/false,
-  "layer": "AI-контент|автоматизация|трафик|AI-роль|нет",
+  "layer": "AI-контент|трафик|автоматизация|AI-роль|нет",
   "mode": "руками|отдать своим|оба",
   "role": "должность или суть заказа, до 6 слов",
   "why": "одной строкой по-русски, почему подходит именно ему — по фактам из
@@ -196,7 +323,8 @@ VERDICT = """Ты отбираешь вакансии и заказы для Т�
 
 Правила:
 — fit=false для резюме и саморекламы исполнителя, даже если тема совпала.
-— fit=false, если AI, контент, трафик или автоматизация в задаче не при чём.
+— fit=false для программистов, разработчиков, n8n/Make/CRM, ботов без видео и сторисмейкеров.
+— fit=false, если AI-контент, видео или органический трафик в задаче не при чём.
 — fit=false, если требуется присутствие в офисе или личное появление в кадре в
   конкретном городе.
 — «Нужен человек в кадр» без привязки к городу — fit=true.
@@ -528,14 +656,57 @@ def triage(posts, batch=12):
     return kept
 
 
-def verdict(p):
-    src = p["src"] + (f" (+ ещё {len(p['also'])} чата)" if p["also"] else "")
+def verdict(p, *, vac_cfg: dict | None = None):
+    text = p.get("text") or ""
+    if VACANCY_JUNK_RX.search(text):
+        return {
+            "fit": False,
+            "layer": "нет",
+            "mode": "",
+            "remote": False,
+            "hot": False,
+            "why": "отсеяно фильтром нерелевантных вакансий",
+        }
+    also = p.get("also") or []
+    src = (p.get("src") or "") + (f" (+ ещё {len(also)} чата)" if also else "")
     try:
-        res = ask_llm(VERDICT.format(source=src, text=p["text"][:3500]))
+        res = ask_llm(VERDICT.format(source=src, text=text[:3500]))
     except Exception as e:
         return {"fit": False, "why": f"модель не ответила: {type(e).__name__}"}
     v = _json_block(res)
-    return v if isinstance(v, dict) else {"fit": False, "why": "ответ без JSON"}
+    if not isinstance(v, dict):
+        return {"fit": False, "why": "ответ без JSON"}
+    enabled_layers = resolve_enabled_layers(vac_cfg)
+    layer = (v.get("layer") or "").strip()
+    if v.get("fit") and layer and layer not in enabled_layers:
+        v = dict(v)
+        v["fit"] = False
+        if not v.get("why"):
+            v["why"] = f"слой '{layer}' отключён в настройках"
+    return v
+
+
+def filter_qualified_fits(judged: list[dict], vac_cfg: dict | None = None) -> list[dict]:
+    """Filter judged vacancy rows by enabled layers, deterministic junk guard, and remote_only."""
+    applied_cfg = apply_vacancies_config(vac_cfg)
+    enabled_layers = resolve_enabled_layers(vac_cfg)
+    remote_only = bool(applied_cfg.get("remote_only", True))
+    fits: list[dict] = []
+    for p in judged:
+        v = p.get("v") or {}
+        if not v.get("fit"):
+            continue
+        if VACANCY_JUNK_RX.search(p.get("text") or ""):
+            continue
+        layer = (v.get("layer") or "").strip()
+        if not enabled_layers:
+            continue
+        if layer and layer not in enabled_layers:
+            continue
+        if remote_only and v.get("remote") is False:
+            continue
+        fits.append(p)
+    return fits
 
 
 def judge(posts):
@@ -550,9 +721,10 @@ def judge(posts):
 
 
 def extract_card(p):
-    src = p["src"] + (f" (+ ещё {len(p['also'])} чата)" if p["also"] else "")
+    also = p.get("also") or []
+    src = (p.get("src") or "") + (f" (+ ещё {len(also)} чата)" if also else "")
     try:
-        res = ask_llm(EXTRACT.format(source=src, text=p["text"][:3500]), timeout=240)
+        res = ask_llm(EXTRACT.format(source=src, text=(p.get("text") or "")[:3500]), timeout=240)
     except Exception as e:
         return {"why": f"карточка не собрана: {type(e).__name__}"}
     v = _json_block(res)
@@ -571,17 +743,7 @@ def judge_jev(posts):
         v = p["v"]
         mark = "ФИТ" if v.get("fit") else "мимо"
         print(f"  {mark:5} {v.get('layer','') or '-':14} {p['text'][:52].splitlines()[0]}")
-    fits = [p for p in judged if p["v"].get("fit")]
-    vac_cfg = apply_vacancies_config()
-    enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
-    if enabled_layers:
-        fits = [
-            p
-            for p in fits
-            if not (p["v"].get("layer") or "").strip() or (p["v"].get("layer") or "").strip() in enabled_layers
-        ]
-    if vac_cfg.get("remote_only", True):
-        fits = [p for p in fits if p["v"].get("remote") is not False]
+    fits = filter_qualified_fits(judged)
     if fits:
         print(f"\nкарточки для {len(fits)} фитов (LLM, только они):")
         with futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -645,15 +807,18 @@ def sidecar(fits):
             "layer": p["v"].get("layer") or "",
             "mode": p["v"].get("mode") or "",
             "hot": bool(p["v"].get("hot")),
-            "src": p["src"],
-            "src_user": p["src_user"],
+            "segment": "vacancy",
+            "language": "ru",
+            "source": "tg_jobs",
+            "src": p.get("src") or "",
+            "src_user": p.get("src_user") or "",
             "chat_id": p.get("chat_id"),
-            "msg_id": p["id"],
+            "msg_id": p.get("id"),
             "posted_at": p.get("date") or "",
-            "url": p["url"],
-            "text": p["text"],
-            "hash": p["hash"],
-            "sig": p["sig"],
+            "url": p.get("url") or "",
+            "text": p.get("text") or "",
+            "hash": p.get("hash") or "",
+            "sig": p.get("sig") or [],
         }
         for p in fits
     ]
@@ -682,9 +847,10 @@ class _JobMonitorLockGuard:
             self._monitor_fh = None
 
 
-def lock() -> _JobMonitorLockGuard:
+def lock(session_path: str | None = None) -> _JobMonitorLockGuard:
     import fcntl as _fcntl
 
+    target_session = session_path or SESSION
     os.makedirs(OUTDIR, exist_ok=True)
     path = os.path.join(OUTDIR, "job_monitor.lock")
     fh = open(path, "a+", encoding="utf-8")
@@ -696,14 +862,14 @@ def lock() -> _JobMonitorLockGuard:
 
     sess_held = None
     if try_acquire_session_locks is not None:
-        sess_held = try_acquire_session_locks([SESSION])
+        sess_held = try_acquire_session_locks([target_session])
         if sess_held is None:
             try:
                 _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
             except OSError:
                 pass
             fh.close()
-            sys.exit(f"сессия Telegram ({SESSION}) занята другим процессом — выхожу")
+            sys.exit(f"сессия Telegram ({target_session}) занята другим процессом — выхожу")
 
     fh.seek(0)
     fh.truncate()
@@ -727,16 +893,18 @@ def main():
         print("мониторинг вакансий отключён в настройках (используйте --force для ручного прогона)")
         return
 
+    session_path = SESSION if SESSION != _IMPORT_TIME_SESSION else resolve_jobs_session_path({"vacancies": vac_ui_cfg})
+
     os.makedirs(OUTDIR, exist_ok=True)
     held_lock = None
     if not a.sources:
-        held_lock = lock()
+        held_lock = lock(session_path)
         atexit.register(held_lock.close)
 
     load_env()
     from telethon.sync import TelegramClient
 
-    client = TelegramClient(SESSION, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+    client = TelegramClient(session_path, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
     client.start()
 
     print("источники из диалогов:")
@@ -778,17 +946,7 @@ def main():
         cands = triage(posts)
         print(f"\nк разбору: {len(cands)}\n")
         judged = judge(cands) if cands else []
-    fits = [p for p in judged if p["v"].get("fit")]
-    vac_cfg = apply_vacancies_config()
-    enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
-    if enabled_layers:
-        fits = [
-            p
-            for p in fits
-            if not (p["v"].get("layer") or "").strip() or (p["v"].get("layer") or "").strip() in enabled_layers
-        ]
-    if vac_cfg.get("remote_only", True):
-        fits = [p for p in fits if p["v"].get("remote") is not False]
+    fits = filter_qualified_fits(judged)
 
     text = report(fits, a.hours, len(posts))
     out = a.out or os.path.join(OUTDIR, f"job_monitor_{dt.date.today()}.md")

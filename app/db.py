@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 import os
 import re
 import sqlite3
@@ -641,6 +642,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             leadgen_enabled INTEGER NOT NULL DEFAULT 0,
             leadgen_daily_quota INTEGER NOT NULL DEFAULT 20,
             leadgen_sources_json TEXT NOT NULL DEFAULT '[]',
+            segment TEXT DEFAULT 'b2b',
+            language TEXT DEFAULT 'en',
+            copy_profile TEXT DEFAULT 'default',
+            exclude_from_airtable INTEGER DEFAULT 0,
+            custom_step_templates_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -793,6 +799,20 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_peer_profiles_peer ON peer_profiles(peer_id);
+
+        CREATE TABLE IF NOT EXISTS enrichment_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            lead_key TEXT NOT NULL,
+            cost_usd REAL NOT NULL,
+            hit INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_enrichment_ledger_day_provider
+            ON enrichment_ledger(day, provider);
         """
     )
     _migrate(conn)
@@ -897,6 +917,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "leads", "airtable_status", "TEXT")
     _ensure_column(conn, "leads", "airtable_synced_at", "TEXT")
     _migrate_legacy_leads_status_check(conn)
+    _ensure_column(conn, "leads", "segment", "TEXT DEFAULT 'b2b'")
+    _ensure_column(conn, "leads", "language", "TEXT DEFAULT 'en'")
+    _ensure_column(conn, "leads", "exclude_from_airtable", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "leads", "company_domain", "TEXT")
+    _ensure_column(conn, "leads", "pool_usd", "INTEGER")
+    _ensure_column(conn, "leads", "secondary_contact_json", "TEXT")
+    _ensure_column(conn, "leads", "manual_action_url", "TEXT")
+    _ensure_column(conn, "leads", "manual_draft_text", "TEXT")
     _ensure_column(conn, "accounts", "health", "TEXT")
     _ensure_column(conn, "accounts", "last_error", "TEXT")
     _ensure_column(conn, "accounts", "updated_at", "TEXT")
@@ -944,6 +972,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "campaigns", "leadgen_enabled", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "campaigns", "leadgen_daily_quota", "INTEGER NOT NULL DEFAULT 20")
     _ensure_column(conn, "campaigns", "leadgen_sources_json", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "campaigns", "segment", "TEXT DEFAULT 'b2b'")
+    _ensure_column(conn, "campaigns", "language", "TEXT DEFAULT 'en'")
+    _ensure_column(conn, "campaigns", "copy_profile", "TEXT DEFAULT 'default'")
+    _ensure_column(conn, "campaigns", "exclude_from_airtable", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "campaigns", "custom_step_templates_json", "TEXT")
+    ensure_enrichment_ledger_table(conn)
     _ensure_column(conn, "campaign_steps", "image_url", "TEXT")
     _ensure_column(
         conn,
@@ -2752,4 +2786,202 @@ def sql_is_waiting_our_answer_expr(
         f"(COALESCE({last_from_peer_col}, 0) = 1 "
         f"AND lower(trim(COALESCE({lead_status_col}, ''))) NOT IN ({closed_sql}))"
     )
+
+
+class EnrichmentProviderSpend(TypedDict):
+    provider: str
+    total_usd: float
+    calls: int
+    hits: int
+
+
+class EnrichmentSpendSummary(TypedDict):
+    day: str
+    total_usd: float
+    calls: int
+    hits: int
+    by_provider: dict[str, EnrichmentProviderSpend]
+
+
+def ensure_enrichment_ledger_table(conn: sqlite3.Connection) -> None:
+    """Idempotently create enrichment_ledger and its (day, provider) index."""
+    with locked_conn(conn):
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'enrichment_ledger'"
+        ).fetchone()
+        if has_table is not None:
+            has_idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_enrichment_ledger_day_provider'"
+            ).fetchone()
+            if has_idx is not None:
+                return
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS enrichment_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                lead_key TEXT NOT NULL,
+                cost_usd REAL NOT NULL,
+                hit INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_enrichment_ledger_day_provider
+                ON enrichment_ledger(day, provider)
+            """
+        )
+
+
+def _normalize_enrichment_day(day: str | None) -> str:
+    clean = str(day or "").strip()
+    return clean or utc_today()
+
+
+def _normalize_enrichment_provider(provider: str) -> str:
+    clean = str(provider or "").strip().lower()
+    if not clean:
+        raise ValueError("provider is required")
+    return clean
+
+
+def _coerce_hit_flag(hit: bool | int | str | None) -> int:
+    if isinstance(hit, str):
+        return 1 if hit.strip().lower() in ("1", "true", "yes", "hit") else 0
+    return 1 if hit else 0
+
+
+def record_enrichment_ledger_entry(
+    conn: sqlite3.Connection,
+    *,
+    day: str,
+    provider: str,
+    endpoint: str,
+    lead_key: str,
+    cost_usd: float,
+    hit: bool | int = 0,
+    created_at: str | None = None,
+    commit: bool = True,
+) -> int:
+    """Record a single enrichment API call in enrichment_ledger and return its row id."""
+    clean_day = _normalize_enrichment_day(day)
+    clean_provider = _normalize_enrichment_provider(provider)
+    clean_endpoint = str(endpoint or "").strip()
+    clean_lead_key = str(lead_key or "").strip()
+    clean_cost = float(cost_usd if cost_usd is not None else 0.0)
+    if not math.isfinite(clean_cost) or clean_cost < 0.0:
+        raise ValueError("cost_usd must be a finite non-negative number")
+    clean_hit = _coerce_hit_flag(hit)
+    clean_created_at = (
+        str(created_at).strip()
+        if created_at is not None and str(created_at).strip()
+        else utc_now()
+    )
+    with locked_conn(conn):
+        ensure_enrichment_ledger_table(conn)
+        cur = conn.execute(
+            """
+            INSERT INTO enrichment_ledger (
+                day, provider, endpoint, lead_key, cost_usd, hit, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_day,
+                clean_provider,
+                clean_endpoint,
+                clean_lead_key,
+                clean_cost,
+                clean_hit,
+                clean_created_at,
+            ),
+        )
+        row_id = int(cur.lastrowid or 0)
+        if commit:
+            conn.commit()
+        return row_id
+
+
+def get_enrichment_spend_for_day(
+    conn: sqlite3.Connection,
+    day: str,
+    provider: str | None = None,
+) -> float:
+    """Return total USD spent in enrichment_ledger for a UTC day (all or one provider)."""
+    clean_day = _normalize_enrichment_day(day)
+    clean_provider = str(provider).strip().lower() if provider is not None else ""
+    with locked_conn(conn):
+        if clean_provider:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(cost_usd), 0.0)
+                FROM enrichment_ledger
+                WHERE day = ? AND provider = ?
+                """,
+                (clean_day, clean_provider),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(cost_usd), 0.0)
+                FROM enrichment_ledger
+                WHERE day = ?
+                """,
+                (clean_day,),
+            ).fetchone()
+    return round(float(row[0] or 0.0), 8) if row is not None else 0.0
+
+
+def list_enrichment_spend_summary(
+    conn: sqlite3.Connection,
+    day: str,
+) -> EnrichmentSpendSummary:
+    """Return daily enrichment spend summary with total_usd, calls, hits, and by_provider."""
+    clean_day = _normalize_enrichment_day(day)
+    with locked_conn(conn):
+        rows = conn.execute(
+            """
+            SELECT
+                provider,
+                COALESCE(SUM(cost_usd), 0.0),
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN hit != 0 THEN 1 ELSE 0 END), 0)
+            FROM enrichment_ledger
+            WHERE day = ?
+            GROUP BY provider
+            ORDER BY provider ASC
+            """,
+            (clean_day,),
+        ).fetchall()
+
+    by_provider: dict[str, EnrichmentProviderSpend] = {}
+    total_usd = 0.0
+    total_calls = 0
+    total_hits = 0
+    for row in rows:
+        prov = str(row[0] or "").strip().lower()
+        raw_usd = float(row[1] or 0.0)
+        prov_calls = int(row[2] or 0)
+        prov_hits = int(row[3] or 0)
+        by_provider[prov] = {
+            "provider": prov,
+            "total_usd": round(raw_usd, 8),
+            "calls": prov_calls,
+            "hits": prov_hits,
+        }
+        total_usd += raw_usd
+        total_calls += prov_calls
+        total_hits += prov_hits
+
+    return {
+        "day": clean_day,
+        "total_usd": round(total_usd, 8),
+        "calls": total_calls,
+        "hits": total_hits,
+        "by_provider": by_provider,
+    }
+
 

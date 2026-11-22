@@ -76,6 +76,7 @@ except ImportError:
 try:
     from supply_side import (
         NON_BUYER_ROLES,
+        classify_whale_segment,
         has_insufficient_product_info,
         is_invalid_product_name,
         is_rejected_buyer_category,
@@ -83,11 +84,14 @@ try:
         sanitize_person_and_company,
         sniper_reject_reason,
         supply_reason,
+        tag_whale_lead,
+        whale_icp_reject_reason,
     )
 except ImportError:
     try:
         from leadgen.supply_side import (
             NON_BUYER_ROLES,
+            classify_whale_segment,
             has_insufficient_product_info,
             is_invalid_product_name,
             is_rejected_buyer_category,
@@ -95,10 +99,13 @@ except ImportError:
             sanitize_person_and_company,
             sniper_reject_reason,
             supply_reason,
+            tag_whale_lead,
+            whale_icp_reject_reason,
         )
     except ImportError:
         from scripts.supply_side import (
             NON_BUYER_ROLES,
+            classify_whale_segment,
             has_insufficient_product_info,
             is_invalid_product_name,
             is_rejected_buyer_category,
@@ -106,6 +113,8 @@ except ImportError:
             sanitize_person_and_company,
             sniper_reject_reason,
             supply_reason,
+            tag_whale_lead,
+            whale_icp_reject_reason,
         )
 
 if os.environ.get("CRMTG_SKIP_DOTENV") != "1":
@@ -135,27 +144,29 @@ ROLES = ["Founder", "Marketing", "Community", "Creator/KOL", "Dev", "Trader", ""
 VALID_MONETIZATIONS = ("subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none")
 MIN_ICP_SCORE = 80
 
-SYSTEM_PROMPT = """You qualify B2B/consumer product leads for SoftUGC (Sniper ICP Gate >= 80).
+SYSTEM_PROMPT = """You qualify Whale B2B/consumer product leads for SoftUGC (Sniper ICP Gate >= 80).
 
-SoftUGC sells organic short-form video user acquisition (AI UGC + clipping across owned account networks, 183.5M views in 90 days, revshare/CPA deals) ONLY to founders, CMOs, and marketing/growth leads who own a MONETIZED product with short-form viral potential.
+SoftUGC sells high-volume organic short-form video user acquisition (AI UGC + owned-network clipping, 183.5M views in 90 days, 1,500+ reels/mo mass production) ONLY to founders, CEOs, CMOs, and marketing/growth leads who own a high-LTV MONETIZED product (LTV $50-$100+ with clear budget and monetization scale) and short-form viral potential.
 
-Golden ICP clusters (icp_score 80..100):
-1. Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, video/creator tools).
-2. Gaming / Roblox / Fortnite / FiveM / mobile & PC games with IAP, passes, or paid items.
-3. E-com / Shopify D2C brands (cosmetics/skincare, supplements/vitamins, household products).
-4. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, and prop trading challenges.
+Golden ICP clusters (icp_score 80..100 ONLY with LTV $50-$100+ and verified budget/monetization scale):
+1. High-LTV Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, video/creator tools) with verified paid subscriptions and growth scale.
+2. Major E-com / Shopify D2C brands (cosmetics/skincare, supplements/vitamins, health/wellness, high-AOV/multi-SKU household & consumer brands with LTV $50-$100+ and paid ad scale).
+3. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, payment apps, and prop trading challenges with verified deposit/challenge monetization.
+4. High-ticket info-products and education businesses ($50K+/mo revenue scale or high-LTV cohorts/programs with verified budget).
 
 REJECT (is_lead=false, icp_score < 80, or monetization="none"):
+- Gaming / Roblox / Fortnite / FiveM / UEFN, mobile & PC games, low-CPM gaming studios, game servers, hobby browser games, and 3D modeler / Roblox builder recruitment threads.
+- Solopreneurs, indie hackers without revenue (no verified MRR/paying scale), hobby/weekend/side projects without budget, micro-arbitrage, and cheap low-margin e-com (cheap dropshipping gadgets, low-AOV trinkets under $50 LTV).
 - Agencies, PR firms (e.g. FINPR, Marketacross), GTM/marketing/SEO/dev consultancies, outsource studios, recruiters, B2B sales agencies, targetologists, mentors, storymakers ("Сервис / агентство").
-- Bot hosting / managed server hosting, pure B2D dev-only CLI/SDKs, open-source repos/tools without paid product monetization, ethical hacking/recovery APIs, coding quizzes, free hobby browser games.
-- Forum job seekers, freelancers, 3D modeler / Roblox builder recruitment threads, pure traders/investors, community mods.
+- Bot hosting / managed server hosting, pure B2D dev-only CLI/SDKs, open-source repos/tools without paid product monetization, ethical hacking/recovery APIs, coding quizzes.
+- Forum job seekers, freelancers, pure traders/investors, community mods.
 
 For EACH lead in the input array decide:
-- is_lead: true ONLY if Founder/Marketing/Growth of an own monetized product OR a monetized consumer/prosumer SaaS/AI/D2C/Gaming brand discovered via paid ads/stores/launches (e.g. source=meta_ads, app_store, tiktok_ads, tiktok_shop, whop, d2c_whatsapp, yc, ph_detailed) whose decision-maker contact is enriched downstream — NOT an agency, consultancy, pure B2D CLI/SDK, robotics/hardware maker, university, or hobby
-- icp_score: integer 0..100 (80+ ONLY for verified monetized products in target clusters)
+- is_lead: true ONLY if Founder/CEO/CMO/Marketing/Growth of an own scaled monetized product (LTV $50-$100+, clear budget/monetization scale) discovered directly or via paid ads/stores/launches (e.g. source=meta_ads, app_store, tiktok_ads, tiktok_shop, whop, d2c_whatsapp, yc, ph_detailed) — NEVER Gaming/Roblox/Fortnite/FiveM, low-CPM gaming studios, solopreneurs, indie hackers without revenue, micro-arbitrage, cheap low-margin e-com, agencies, consultancies, pure B2D CLI/SDK, robotics/hardware makers, universities, or hobbies
+- icp_score: integer 0..100 (80+ ONLY for verified Whale ICP products with LTV $50-$100+ and clear budget/monetization scale; < 80 for unscaled, low-LTV, or unverified leads)
 - monetization: one of ["subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none"]
 - short_form_fit: bool (true if product can convert from TikTok/Reels/Shorts)
-- category: one of [SaaS / AI app, E-com / D2C, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Gaming / AI, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
+- category: one of [SaaS / AI app, E-com / D2C, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
 - role: one of [Founder, Marketing, Community, Creator/KOL, Dev, Trader, ""]
 - project: clean product/brand name (strip "Show HN:", numbering, URLs, human names) or ""
 - project_url: product website URL (not t.me/twitter/linkedin), else ""
@@ -336,10 +347,18 @@ def lead_text(row):
     return "\n".join(parts)
 
 
+def annotate_whale_segment(row: dict[str, Any], *, min_icp_score: int = MIN_ICP_SCORE) -> dict[str, Any]:
+    """Tag a qualified Whale ICP lead with segment='whale' without overwriting non-whale segments."""
+    return tag_whale_lead(row, min_icp_score=min_icp_score, require_qualified=False)
+
+
 def _product_reality_reject_reason(row: dict) -> str:
     cat = str(row.get("category") or "").strip()
     if is_rejected_buyer_category(cat):
         return f"rejected_category:{cat}"
+    whale_err = whale_icp_reject_reason(row, category=cat or None)
+    if whale_err:
+        return whale_err
     role = str(row.get("role") or "").strip()
     if role and role in NON_BUYER_ROLES:
         return f"non_buyer_role:{role}"
@@ -503,7 +522,7 @@ def qualify_loaded(
             if bad_reason:
                 routed.append(row)
                 continue
-            out.append(row)
+            out.append(annotate_whale_segment(row))
             continue
         routed.append(row)
 
@@ -633,7 +652,7 @@ def qualify_loaded(
 
             r2["llm_qualified"] = True
             r2["qualified"] = True
-            out.append(r2)
+            out.append(annotate_whale_segment(r2))
         print(f"  batch {bno}/{nbatches}: kept {len(out)} so far, dropped {dropped}",
               file=sys.stderr)
 

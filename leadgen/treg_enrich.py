@@ -9,12 +9,15 @@ names them, plus the same weekly demand note.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import inspect
 import json
 import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 try:
     from treg_client import call, walk_strings
@@ -163,29 +166,522 @@ def _brand_match_tokens(company: str, domain: str) -> list[str]:
     return tokens
 
 
-def find_company_decision_maker(company: str, domain: str = "") -> dict:
-    clean_company = (company or "").strip()
-    clean_domain = (domain or "").strip().lower().removeprefix("www.")
-    target = clean_company or clean_domain
-    if not target:
-        return {}
-    tokens = _brand_match_tokens(clean_company, clean_domain)
-    if not tokens:
-        return {}
-    payload = call(
-        "crawl4ai.web.search",
-        query={
-            "q": (
-                f'site:linkedin.com/in "{clean_domain or clean_company}" '
-                "(Founder OR CEO OR CMO OR Marketing OR Growth)"
-            ),
-        },
+_FORMER_ROLE_RE = re.compile(
+    r"\b(?:former|ex[\s\-]+|previously)\s+"
+    r"(?:co[\s\-]?founders?|founders?|ceo|chief\s+executive\s+officer|"
+    r"cmo|chief\s+marketing\s+officer|cgo|chief\s+growth\s+officer|owners?|"
+    r"(?:vp|vice\s+president)(?:\s+of|,)?\s+(?:marketing|growth|ua|user\s+acquisition)|"
+    r"head\s+of\s+(?:growth|ua|user\s+acquisition|marketing|performance|brand|content)|"
+    r"(?:marketing|growth|ua)\s+director|director\s+of\s+(?:marketing|growth|ua|user\s+acquisition))",
+    re.I,
+)
+_ASSISTANT_TO_RE = re.compile(
+    r"\b(?:(?:executive|personal|virtual|administrative)\s+assistant\s+to|"
+    r"assistant\s+to|intern\s+to|chief\s+of\s+staff\s+to|"
+    r"supporting|assisting|reporting\s+to|working\s+(?:with|for))"
+    r"\s+(?:the\s+)?(?:ceo|founder|co[\s\-]?founder|owner|cmo|vp)\b",
+    re.I,
+)
+_SLOT1_ROLE_RE = re.compile(
+    r"\b(?:"
+    r"co[\s\-]?founders?|"
+    r"founders?|"
+    r"ceo|"
+    r"chief\s+executive\s+officer|"
+    r"(?<!product\s)(?<!process\s)(?<!program\s)(?<!project\s)(?<!system\s)"
+    r"(?<!platform\s)(?<!technical\s)(?<!data\s)(?<!account\s)owners?"
+    r")\b",
+    re.I,
+)
+_SLOT2_ROLE_RE = re.compile(
+    r"\b(?:"
+    r"cmo|chief\s+marketing\s+officer|"
+    r"cgo|chief\s+growth\s+officer|"
+    r"(?:vp|vice\s+president)(?:\s+of|,)?\s+(?:marketing|growth|ua|user\s+acquisition|performance\s+marketing)|"
+    r"head\s+of\s+(?:growth|ua|user\s+acquisition|marketing|performance(?:\s+marketing)?|paid\s+acquisition|digital\s+marketing|brand|content)|"
+    r"(?:marketing|growth|ua|user\s+acquisition|performance\s+marketing)\s+director|"
+    r"director\s+of\s+(?:marketing|growth|ua|user\s+acquisition|performance\s+marketing)|"
+    r"(?:growth|marketing|ua|user\s+acquisition)\s+lead"
+    r")\b",
+    re.I,
+)
+_EXEC_ROLE_RE = re.compile(
+    r"\b(?:"
+    r"coo|cro|chief\s+(?:operating|revenue|commercial)\s+officer|"
+    r"president|managing\s+director|general\s+manager|"
+    r"head\s+of\s+(?:partnerships|bd|business\s+development|sales|revenue)|"
+    r"(?:vp|vice\s+president)(?:\s+of|,)?\s+(?:sales|revenue|partnerships|business\s+development)"
+    r")\b",
+    re.I,
+)
+_NON_DM_ROLE_RE = re.compile(
+    r"\b(?:"
+    r"interns?|trainees?|apprentices?|students?|"
+    r"(?:software|backend|frontend|full[\s\-]?stack|qa|test|devops|data|ml|ai|cloud|mobile|ios|android)\s+(?:engineer|developer)s?|"
+    r"programmers?|coders?|"
+    r"recruiters?|talent\s+acquisition|hr\s+(?:manager|specialist|generalist)|"
+    r"customer\s+(?:support|service|success)|support\s+(?:specialist|agent|engineer)|"
+    r"(?:virtual|executive|personal|administrative)\s+assistant|"
+    r"assistant\s+to\s+(?:the\s+)?(?:ceo|founder|co[\s\-]?founder|owner|cmo|vp)|"
+    r"receptionist|office\s+manager|"
+    r"accountants?|bookkeepers?|copywriters?|video\s+editors?|graphic\s+designers?"
+    r")\b",
+    re.I,
+)
+_ROLE_PHRASE_RE = re.compile(
+    r"(?:"
+    r"co[\s\-]?founder|founder|ceo|chief\s+executive\s+officer|owner|"
+    r"cmo|chief\s+marketing\s+officer|cgo|chief\s+growth\s+officer|"
+    r"(?:vp|vice\s+president)(?:\s+of|,)?\s+(?:marketing|growth|ua|user\s+acquisition|performance\s+marketing|sales|revenue)|"
+    r"head\s+of\s+(?:growth|ua|user\s+acquisition|marketing|performance(?:\s+marketing)?|paid\s+acquisition|digital\s+marketing|brand|content|partnerships|bd|business\s+development|sales|revenue)|"
+    r"(?:marketing|growth|ua|user\s+acquisition|performance\s+marketing)\s+director|"
+    r"director\s+of\s+(?:marketing|growth|ua|user\s+acquisition|performance\s+marketing)|"
+    r"(?:growth|marketing|ua|user\s+acquisition)\s+lead|"
+    r"coo|cro|managing\s+director|general\s+manager|president"
+    r")(?:\s*(?:&|and|/|\+)\s*(?:"
+    r"co[\s\-]?founder|founder|ceo|owner|cmo|cgo|coo|cro|"
+    r"(?:vp|vice\s+president)(?:\s+of|,)?\s+(?:marketing|growth|ua|user\s+acquisition)|"
+    r"head\s+of\s+(?:growth|ua|user\s+acquisition|marketing|brand|content)"
+    r"))*",
+    re.I,
+)
+_NON_PERSON_NAME_WORDS = frozenset({
+    "founder", "cofounder", "co-founder", "ceo", "cmo", "cto", "coo", "cfo", "cgo",
+    "owner", "vp", "director", "marketing", "growth", "president", "officer",
+    "linkedin", "official", "careers", "career", "jobs", "job", "team",
+    "inc", "llc", "ltd", "corp", "company", "studio", "studios", "labs", "advisor",
+})
+
+
+@dataclass
+class _DecisionMakerCandidate:
+    founder_name: str
+    founder_linkedin: str
+    work_email: str
+    project_url: str
+    role_title: str
+    role_bucket: str
+    matches_slot1: bool
+    matches_slot2: bool
+    is_exec: bool
+    is_non_dm: bool
+    slot1_score: int
+    slot2_score: int
+    exec_score: int
+    order: int
+
+
+def _normalize_linkedin_in_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"linkedin\.com/in/([A-Za-z0-9_\-%]+)", raw, re.I)
+    if not match:
+        return ""
+    slug = match.group(1).strip("._-")
+    if not slug:
+        return ""
+    return f"https://www.linkedin.com/in/{slug}"
+
+
+def _linkedin_dedup_key(url: str) -> str:
+    norm = _normalize_linkedin_in_url(url)
+    if not norm:
+        return ""
+    slug = norm.rsplit("/in/", 1)[-1]
+    return unquote(slug).strip().lower()
+
+
+def _normalize_name_key(name: str) -> str:
+    return " ".join((name or "").lower().split())
+
+
+def _matching_project_url(payload: Any, tokens: list[str]) -> str:
+    for text in walk_strings(payload):
+        for match in re.finditer(r"https?://[^\s<>\]\)\"']+", text):
+            candidate = match.group(0).rstrip(".,;:)")
+            dom = domain_of(candidate)
+            if dom and any(
+                tok in dom or re.search(rf"\b{re.escape(tok)}\b", candidate.lower())
+                for tok in tokens
+            ):
+                return f"https://{dom}"
+    return ""
+
+
+def _sanitize_role_text(text: str) -> str:
+    cleaned = _ASSISTANT_TO_RE.sub(" ", text or "")
+    cleaned = _FORMER_ROLE_RE.sub(" ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _slot1_score(text: str, *, in_headline: bool, brand_in_title: bool) -> int:
+    cleaned = _sanitize_role_text(text)
+    if not _SLOT1_ROLE_RE.search(cleaned):
+        return 0
+    low = cleaned.lower()
+    base = 22
+    if re.search(r"\b(?:ceo|chief\s+executive\s+officer)\b", low) and re.search(r"\bfounders?\b", low):
+        base = 40
+    elif re.search(r"\b(?:ceo|chief\s+executive\s+officer)\b", low):
+        base = 36
+    elif re.search(r"\bfounders?\b", low) and not re.search(r"\bco[\s\-]?founders?\b", low):
+        base = 34
+    elif re.search(r"\bco[\s\-]?founders?\b", low):
+        base = 30
+    return base + (20 if in_headline else 0) + (10 if brand_in_title else 0)
+
+
+def _slot2_score(text: str, *, in_headline: bool, brand_in_title: bool) -> int:
+    cleaned = _sanitize_role_text(text)
+    if not _SLOT2_ROLE_RE.search(cleaned):
+        return 0
+    low = cleaned.lower()
+    base = 18
+    if re.search(r"\b(?:cmo|chief\s+marketing\s+officer|cgo|chief\s+growth\s+officer)\b", low):
+        base = 40
+    elif re.search(r"\b(?:vp|vice\s+president)(?:\s+of|,)?\s+(?:marketing|growth|ua|user\s+acquisition)", low):
+        base = 35
+    elif re.search(r"\b(?:head\s+of\s+(?:growth|ua|user\s+acquisition|marketing)|(?:marketing|growth|ua)\s+director|director\s+of\s+(?:marketing|growth|ua|user\s+acquisition))\b", low):
+        base = 30
+    elif re.search(r"\bhead\s+of\s+(?:performance|paid\s+acquisition|digital\s+marketing|brand|content)\b", low):
+        base = 24
+    return base + (20 if in_headline else 0) + (10 if brand_in_title else 0)
+
+
+def _clean_person_name_candidate(raw: str, clean_company: str) -> str:
+    text = re.sub(r"\([^)]*\)", " ", str(raw or ""))
+    text = re.sub(r",\s*(?:mba|phd|cpa|md|cfa)\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" -–—|·,:")
+    if len(text) < 4 or " " not in text:
+        return ""
+    if re.search(r"https?://|t\.me/|@|\d|[|/]", text):
+        return ""
+    if clean_company and text.lower() == clean_company.lower():
+        return ""
+    words = [w for w in re.split(r"\s+", text) if re.search(r"[A-Za-zА-Яа-я]", w)]
+    if not (2 <= len(words) <= 4):
+        return ""
+    lowered_words = {w.strip(".,:;").lower() for w in words}
+    if lowered_words & _NON_PERSON_NAME_WORDS:
+        return ""
+    if _SLOT2_ROLE_RE.search(text) or _NON_DM_ROLE_RE.search(text):
+        return ""
+    return " ".join(words)
+
+
+def _extract_role_title_from_headline(headline: str, tokens: list[str]) -> str:
+    if not headline:
+        return ""
+    clauses = [c.strip() for c in re.split(r"\s*[|·;]\s*|\s+[-–—]\s+", headline) if c.strip()]
+    for clause in clauses:
+        sanitized = _sanitize_role_text(clause)
+        if not (
+            _SLOT1_ROLE_RE.search(sanitized)
+            or _SLOT2_ROLE_RE.search(sanitized)
+            or _EXEC_ROLE_RE.search(sanitized)
+        ):
+            continue
+        trimmed = re.sub(r"\s+(?:at|@|with|for)\s+.+$", "", clause, flags=re.I).strip(" ,.-")
+        if "," in trimmed and tokens:
+            head_part, tail_part = trimmed.rsplit(",", 1)
+            tail_low = tail_part.strip().lower()
+            if any(re.search(rf"\b{re.escape(tok)}\b", tail_low) for tok in tokens):
+                trimmed = head_part.strip(" ,.-")
+        if trimmed and len(trimmed) <= 80:
+            return trimmed
+    match = _ROLE_PHRASE_RE.search(_sanitize_role_text(headline))
+    return re.sub(r"\s+", " ", match.group(0)).strip() if match else ""
+
+
+def _parse_candidate_from_hit(
+    hit: dict,
+    *,
+    clean_company: str,
+    clean_domain: str,
+    tokens: list[str],
+    default_project_url: str,
+    order: int,
+) -> _DecisionMakerCandidate | None:
+    linkedin = _normalize_linkedin_in_url(_first_linkedin(hit))
+    email = _first_email(hit)
+
+    explicit_name = _clean_person_name_candidate(
+        str(hit.get("founder_name") or hit.get("name") or ""),
+        clean_company,
     )
-    hits = _search_hits_from_payload(payload)
+    raw_title = str(hit.get("title") or "").strip()
+    stripped_title = re.sub(r"\s*(?:[|\-–—]\s*LinkedIn|on\s+LinkedIn)\s*$", "", raw_title, flags=re.I).strip()
+    segments = [s.strip() for s in re.split(r"\s+[-–—|·]\s+", stripped_title) if s.strip()]
+
+    parsed_name = explicit_name
+    headline = ""
+    if not parsed_name and segments:
+        candidate_name = _clean_person_name_candidate(segments[0], clean_company)
+        if candidate_name:
+            parsed_name = candidate_name
+            headline = " - ".join(segments[1:]).strip()
+        else:
+            headline = " - ".join(segments).strip()
+    elif segments:
+        if len(segments) > 1 and _clean_person_name_candidate(segments[0], clean_company):
+            headline = " - ".join(segments[1:]).strip()
+        else:
+            headline = " - ".join(segments).strip()
+
+    explicit_role = str(hit.get("role_title") or hit.get("role") or "").strip()
+    if explicit_role:
+        headline = explicit_role if not headline else f"{explicit_role} | {headline}"
+
+    if not linkedin and not parsed_name and not email:
+        return None
+
+    snippet_blob = " ".join(str(hit.get(k) or "") for k in ("snippet", "description")).strip()
+    title_low = raw_title.lower()
+    brand_in_title = bool(
+        (clean_domain and clean_domain in title_low)
+        or any(re.search(rf"\b{re.escape(tok)}\b", title_low) for tok in tokens)
+    )
+
+    h_clean = _sanitize_role_text(headline)
+    s_clean = _sanitize_role_text(snippet_blob)
+    h_raw_role = _FORMER_ROLE_RE.sub(" ", headline)
+    s_raw_role = _FORMER_ROLE_RE.sub(" ", snippet_blob)
+
+    h_s1 = _slot1_score(headline, in_headline=True, brand_in_title=brand_in_title)
+    h_s2 = _slot2_score(headline, in_headline=True, brand_in_title=brand_in_title)
+    h_exec = bool(_EXEC_ROLE_RE.search(h_clean))
+    h_nondm = bool(_NON_DM_ROLE_RE.search(h_raw_role)) and not (h_s1 or h_s2 or h_exec)
+
+    if h_nondm:
+        return None
+
+    s_s1 = _slot1_score(snippet_blob, in_headline=False, brand_in_title=brand_in_title) if not h_s1 else 0
+    s_s2 = _slot2_score(snippet_blob, in_headline=False, brand_in_title=brand_in_title) if not h_s2 else 0
+    s_exec = bool(_EXEC_ROLE_RE.search(s_clean))
+
+    slot1_score = max(h_s1, s_s1)
+    slot2_score = max(h_s2, s_s2)
+    matches_slot1 = slot1_score > 0
+    matches_slot2 = slot2_score > 0
+    is_exec = (h_exec or s_exec) and not matches_slot1 and not matches_slot2
+
+    s_nondm = bool(_NON_DM_ROLE_RE.search(s_raw_role)) and not (matches_slot1 or matches_slot2 or is_exec)
+    if s_nondm:
+        return None
+
+    role_title = explicit_role or _extract_role_title_from_headline(headline, tokens)
+    if not role_title and (matches_slot1 or matches_slot2 or is_exec):
+        role_match = _ROLE_PHRASE_RE.search(s_clean)
+        if role_match:
+            role_title = re.sub(r"\s+", " ", role_match.group(0)).strip()
+
+    if matches_slot1:
+        role_bucket = "founder"
+    elif matches_slot2:
+        role_bucket = "marketing"
+    elif is_exec:
+        role_bucket = "executive"
+    else:
+        role_bucket = "other"
+
+    proj_url = default_project_url or _matching_project_url(hit, tokens)
+    return _DecisionMakerCandidate(
+        founder_name=parsed_name,
+        founder_linkedin=linkedin,
+        work_email=email,
+        project_url=proj_url,
+        role_title=role_title,
+        role_bucket=role_bucket,
+        matches_slot1=matches_slot1,
+        matches_slot2=matches_slot2,
+        is_exec=is_exec,
+        is_non_dm=False,
+        slot1_score=slot1_score,
+        slot2_score=slot2_score,
+        exec_score=15 + (20 if h_exec else 0) + (10 if brand_in_title else 0) if is_exec else 0,
+        order=order,
+    )
+
+
+def _merge_candidate(target: _DecisionMakerCandidate, incoming: _DecisionMakerCandidate) -> None:
+    if not target.founder_name and incoming.founder_name:
+        target.founder_name = incoming.founder_name
+    if not target.founder_linkedin and incoming.founder_linkedin:
+        target.founder_linkedin = incoming.founder_linkedin
+    if not target.work_email and incoming.work_email:
+        target.work_email = incoming.work_email
+    if not target.project_url and incoming.project_url:
+        target.project_url = incoming.project_url
+    if not target.role_title and incoming.role_title:
+        target.role_title = incoming.role_title
+    target.matches_slot1 = target.matches_slot1 or incoming.matches_slot1
+    target.matches_slot2 = target.matches_slot2 or incoming.matches_slot2
+    target.is_exec = target.is_exec or incoming.is_exec
+    target.slot1_score = max(target.slot1_score, incoming.slot1_score)
+    target.slot2_score = max(target.slot2_score, incoming.slot2_score)
+    target.exec_score = max(target.exec_score, incoming.exec_score)
+    if target.role_bucket == "other" and incoming.role_bucket != "other":
+        target.role_bucket = incoming.role_bucket
+
+
+def _deduplicate_candidates(candidates: list[_DecisionMakerCandidate]) -> list[_DecisionMakerCandidate]:
+    unique: list[_DecisionMakerCandidate] = []
+    by_li: dict[str, int] = {}
+    by_name: dict[str, int] = {}
+    for cand in candidates:
+        li_key = _linkedin_dedup_key(cand.founder_linkedin)
+        name_key = _normalize_name_key(cand.founder_name)
+        existing_idx = by_li.get(li_key) if li_key else None
+        if existing_idx is None and name_key:
+            existing_idx = by_name.get(name_key)
+        if existing_idx is not None:
+            _merge_candidate(unique[existing_idx], cand)
+            if li_key and li_key not in by_li:
+                by_li[li_key] = existing_idx
+            if name_key and name_key not in by_name:
+                by_name[name_key] = existing_idx
+            continue
+        idx = len(unique)
+        unique.append(cand)
+        if li_key:
+            by_li[li_key] = idx
+        if name_key:
+            by_name[name_key] = idx
+    return unique
+
+
+def _candidate_to_dict(cand: _DecisionMakerCandidate, role_bucket_override: str | None = None) -> dict[str, str]:
+    return {
+        "founder_name": cand.founder_name,
+        "founder_linkedin": cand.founder_linkedin,
+        "work_email": cand.work_email,
+        "project_url": cand.project_url,
+        "role_title": cand.role_title,
+        "role_bucket": role_bucket_override or cand.role_bucket,
+    }
+
+
+def _select_prioritized_candidates(
+    candidates: list[_DecisionMakerCandidate],
+    limit: int,
+) -> list[dict[str, str]]:
+    if not candidates or limit <= 0:
+        return []
+
+    if limit == 1:
+        best = max(
+            candidates,
+            key=lambda c: (
+                1 if c.matches_slot1 else 0,
+                c.slot1_score,
+                1 if c.matches_slot2 else 0,
+                c.slot2_score,
+                1 if c.is_exec else 0,
+                c.exec_score,
+                1 if c.founder_linkedin else 0,
+                1 if c.work_email else 0,
+                -c.order,
+            ),
+        )
+        bucket = "founder" if best.matches_slot1 else ("marketing" if best.matches_slot2 else best.role_bucket)
+        return [_candidate_to_dict(best, bucket)]
+
+    selected_entries: list[tuple[_DecisionMakerCandidate, str]] = []
+    used_ids: set[int] = set()
+
+    slot1_cands = [c for c in candidates if c.matches_slot1]
+    slot2_cands = [c for c in candidates if c.matches_slot2]
+
+    best_pair: tuple[tuple[int, int, int, int], _DecisionMakerCandidate, _DecisionMakerCandidate] | None = None
+    for c1 in slot1_cands:
+        for c2 in slot2_cands:
+            if c1 is c2:
+                continue
+            pair_key = (
+                c1.slot1_score + c2.slot2_score,
+                min(c1.slot1_score, c2.slot2_score),
+                (1 if c1.founder_linkedin else 0) + (1 if c2.founder_linkedin else 0),
+                -(c1.order + c2.order),
+            )
+            if best_pair is None or pair_key > best_pair[0]:
+                best_pair = (pair_key, c1, c2)
+
+    if best_pair is not None:
+        _, c1, c2 = best_pair
+        selected_entries.append((c1, "founder"))
+        selected_entries.append((c2, "marketing"))
+        used_ids.add(id(c1))
+        used_ids.add(id(c2))
+    else:
+        if slot1_cands:
+            c1 = max(
+                slot1_cands,
+                key=lambda c: (c.slot1_score, 1 if c.founder_linkedin else 0, -c.order),
+            )
+            selected_entries.append((c1, "founder"))
+            used_ids.add(id(c1))
+        if slot2_cands and len(selected_entries) < limit:
+            rem_s2 = [c for c in slot2_cands if id(c) not in used_ids]
+            if rem_s2:
+                c2 = max(
+                    rem_s2,
+                    key=lambda c: (c.slot2_score, 1 if c.founder_linkedin else 0, -c.order),
+                )
+                selected_entries.append((c2, "marketing"))
+                used_ids.add(id(c2))
+
+    if len(selected_entries) < limit:
+        remaining_dms = [
+            c
+            for c in candidates
+            if id(c) not in used_ids and (c.matches_slot1 or c.matches_slot2 or c.is_exec)
+        ]
+        remaining_dms.sort(
+            key=lambda c: (
+                1 if c.matches_slot1 else 0,
+                1 if c.matches_slot2 else 0,
+                max(c.slot1_score, c.slot2_score, c.exec_score),
+                1 if c.founder_linkedin else 0,
+                -c.order,
+            ),
+            reverse=True,
+        )
+        for cand in remaining_dms:
+            if len(selected_entries) >= limit:
+                break
+            bucket = "founder" if cand.matches_slot1 else ("marketing" if cand.matches_slot2 else cand.role_bucket)
+            selected_entries.append((cand, bucket))
+            used_ids.add(id(cand))
+
+    if not selected_entries:
+        fallback = max(
+            candidates,
+            key=lambda c: (1 if c.founder_linkedin else 0, 1 if c.work_email else 0, -c.order),
+        )
+        selected_entries.append((fallback, fallback.role_bucket))
+
+    return [_candidate_to_dict(cand, bucket) for cand, bucket in selected_entries[:limit]]
+
+
+def _invoke_search_caller(caller: Callable[..., Any], q: str) -> Any:
+    try:
+        sig = inspect.signature(caller)
+        params = list(sig.parameters.values())
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        if not accepts_var_kw and len(params) == 1 and params[0].name not in {"endpoint", "ep"}:
+            return caller(q)
+    except (TypeError, ValueError):
+        pass
+    return caller("crawl4ai.web.search", query={"q": q})
+
+
+def _filter_brand_hits(hits: list[dict], clean_domain: str, tokens: list[str]) -> list[dict]:
     matched_hits: list[dict] = []
     for hit in hits:
         blob = " ".join(
-            str(hit.get(k) or "") for k in ("title", "snippet", "description", "url")
+            str(hit.get(k) or "")
+            for k in ("title", "snippet", "description", "url", "link", "founder_linkedin", "founder_name", "role_title", "work_email")
         ).lower()
         if not blob:
             continue
@@ -193,26 +689,104 @@ def find_company_decision_maker(company: str, domain: str = "") -> dict:
             matched_hits.append(hit)
         elif any(re.search(rf"\b{re.escape(tok)}\b", blob) for tok in tokens):
             matched_hits.append(hit)
-    if not matched_hits:
-        return {}
+    return matched_hits
 
-    matched_payload = {"results": matched_hits}
-    found: dict[str, str] = {}
-    linkedin = _first_linkedin(matched_payload)
-    if linkedin:
-        found["founder_linkedin"] = linkedin
-    email = _first_email(matched_payload)
-    if email:
-        found["work_email"] = email
-    if not clean_domain:
-        site = _first_project_url(matched_payload)
-        site_dom = (domain_of(site) or "").lower() if site else ""
-        if site and any(
-            tok in site_dom or re.search(rf"\b{re.escape(tok)}\b", site.lower())
-            for tok in tokens
-        ):
-            found["project_url"] = site
-    return {k: v for k, v in found.items() if v}
+
+def find_company_decision_makers(
+    company: str,
+    domain: str = "",
+    *,
+    limit: int = 2,
+    treg_fn: Callable[..., Any] | None = None,
+) -> list[dict[str, str]]:
+    """Find up to `limit` distinct company decision makers prioritized by Founder/CEO then CMO/Growth."""
+    if limit <= 0:
+        return []
+    clean_company = (company or "").strip()
+    raw_domain = (domain or "").strip()
+    if "://" in raw_domain or "/" in raw_domain:
+        clean_domain = domain_of(raw_domain) or raw_domain.lower().removeprefix("www.").split("/", 1)[0]
+    else:
+        clean_domain = raw_domain.lower().removeprefix("www.")
+    target = clean_company or clean_domain
+    if not target:
+        return []
+    tokens = _brand_match_tokens(clean_company, clean_domain)
+    if not tokens:
+        return []
+
+    caller = call if treg_fn is None else treg_fn
+    target_quote = clean_domain or clean_company
+    primary_query = (
+        f'site:linkedin.com/in "{target_quote}" '
+        '(Founder OR "Co-Founder" OR CEO OR Owner OR CMO OR "VP Marketing" OR "Head of Growth" OR "Head of UA" OR "Marketing Director")'
+    )
+    payload = _invoke_search_caller(caller, primary_query)
+    matched_hits = _filter_brand_hits(_search_hits_from_payload(payload), clean_domain, tokens)
+    if not matched_hits:
+        return []
+
+    valid_domain = domain_of(clean_domain) if clean_domain else ""
+    default_project_url = f"https://{valid_domain}" if valid_domain else ""
+
+    def _collect_candidates(hits_batch: list[dict], start_order: int = 0) -> list[_DecisionMakerCandidate]:
+        out: list[_DecisionMakerCandidate] = []
+        for idx, hit in enumerate(hits_batch):
+            cand = _parse_candidate_from_hit(
+                hit,
+                clean_company=clean_company,
+                clean_domain=clean_domain,
+                tokens=tokens,
+                default_project_url=default_project_url,
+                order=start_order + idx,
+            )
+            if cand is not None:
+                out.append(cand)
+        return out
+
+    candidates = _deduplicate_candidates(_collect_candidates(matched_hits, 0))
+
+    if limit > 1 and candidates:
+        has_slot1 = any(c.matches_slot1 for c in candidates)
+        has_slot2 = any(c.matches_slot2 for c in candidates)
+        followup_query = ""
+        if has_slot1 and not has_slot2:
+            followup_query = (
+                f'site:linkedin.com/in "{target_quote}" '
+                '(CMO OR "VP Marketing" OR "Head of Growth" OR "Head of UA" OR "Marketing Director")'
+            )
+        elif has_slot2 and not has_slot1:
+            followup_query = (
+                f'site:linkedin.com/in "{target_quote}" '
+                '(Founder OR "Co-Founder" OR CEO OR Owner)'
+            )
+        if followup_query:
+            try:
+                extra_payload = _invoke_search_caller(caller, followup_query)
+            except StopIteration:
+                extra_payload = None
+            extra_hits = _filter_brand_hits(_search_hits_from_payload(extra_payload), clean_domain, tokens)
+            if extra_hits:
+                candidates = _deduplicate_candidates(
+                    candidates + _collect_candidates(extra_hits, len(matched_hits))
+                )
+
+    if not default_project_url:
+        shared_project_url = next((c.project_url for c in candidates if c.project_url), "")
+        if shared_project_url:
+            for cand in candidates:
+                if not cand.project_url:
+                    cand.project_url = shared_project_url
+
+    return _select_prioritized_candidates(candidates, limit)
+
+
+def find_company_decision_maker(company: str, domain: str = "") -> dict[str, str]:
+    """Return the primary company decision maker dict (backward-compatible wrapper)."""
+    matches = find_company_decision_makers(company, domain, limit=1)
+    if not matches:
+        return {}
+    return {k: v for k, v in matches[0].items() if v}
 
 
 def _status(payload: dict) -> str:

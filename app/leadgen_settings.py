@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import glob
 import json
+import logging
+import math
 import os
 import re
 import sqlite3
@@ -12,10 +14,53 @@ from urllib.parse import urlparse
 
 from app.db import CANONICAL_STEP3_IMAGE_URL, ROOT, as_dict, utc_now, utc_today
 from app.outreach import create_campaign, get_campaign, update_campaign
-from leadgen.outreach_copy import VLAD_STEP2_TEMPLATE, VLAD_STEP3_TEXT
+from leadgen.language_router import (
+    CAMPAIGN_OFM_TG,
+    CAMPAIGN_RU_EXPERTS_TG,
+    CAMPAIGN_VACANCY_EN_TG,
+    CAMPAIGN_VACANCY_RU_TG,
+    CAMPAIGN_VACANCY_RU_WA,
+    CAMPAIGN_WHALES_EN_TG,
+    CAMPAIGN_WHALES_EN_WA,
+    QUEUE_ASSISTED_JOB,
+    QUEUE_MANUAL_SOCIAL,
+    detect_lead_language,
+    detect_lead_segment,
+    route_lead,
+)
+from leadgen.outreach_copy import (
+    DEFAULT_VACANCY_SHOWCASE_URL,
+    VLAD_STEP2_TEMPLATE,
+    VLAD_STEP3_TEXT,
+    sanitize_copy_text,
+)
 from leadgen.tg_to_gsheet import whatsapp_url
 
+logger = logging.getLogger(__name__)
+
 CASES_BANK_PATH = ROOT / "leadgen" / "job_cases_bank.md"
+REMOVED_LEGACY_TG_GROUPS: frozenset[str] = frozenset(
+    {"solofounderschat", "indiehackers", "buildinpublic"}
+)
+DEFAULT_WHALES_GEOS: list[str] = [
+    "US",
+    "GB",
+    "AE",
+    "SA",
+    "DE",
+    "FR",
+    "NL",
+    "ES",
+    "IT",
+    "SE",
+    "CA",
+    "AU",
+]
+DEFAULT_VPS_JOBS_SESSION = "/opt/crmtg/data/scraper_sessions/jobs_reader.session"
+
+
+def is_legacy_baza_vse2_name(name: str | None) -> bool:
+    return "база все2" in str(name or "").casefold()
 
 
 def _resolve_config_json_path() -> Path:
@@ -48,9 +93,9 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
     "b2b": {
         "enabled": True,
         "touch_mode": "direct",  # "direct" | "micro_ping"
-        "target_campaign_tg": "Leadgen Auto (TG)",
-        "target_campaign_wa": "Leadgen Auto (WA)",
-        "target_campaign_ofm": "SoftUGC — OFM (TG)",
+        "target_campaign_tg": CAMPAIGN_WHALES_EN_TG,
+        "target_campaign_wa": CAMPAIGN_WHALES_EN_WA,
+        "target_campaign_ofm": CAMPAIGN_OFM_TG,
         "ofm_outreach_enabled": False,
         "ofm_daily_limit": 25,
         "campaign_daily_limit": 30,
@@ -59,6 +104,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "tg_comments": True,
             "channel_graph": True,
             "tg_ad_spy": True,
+            "tg_group_admins": True,
             "whop_content_rewards": True,
             "tiktok_ads": True,
             "tiktok_shop": True,
@@ -74,17 +120,19 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "buyer_catalogs": True,
             "linkedin_jobs": True,
             "tg_identity_bridge": True,
+            "hh_ru": True,
+            "profi_ru": True,
+            "kwork": True,
+            "upwork": True,
+            "ru_experts": False,
         },
         "tg_groups_old": ["producthunt_heroes", "id1613398776"],
         "tg_groups_new": [
             "productcircle_chat",
-            "solofounderschat",
             "saasfounders",
-            "indiehackers",
             "saas_chat",
             "founders_chat",
             "startupchat",
-            "buildinpublic",
             "appfounders",
             "marketing_chat",
         ],
@@ -110,8 +158,27 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "ph_limit": 0,
             "msg_limit": 1800,
             "lurker_limit": 1000,
-            "external_limit": 0,
+            "external_limit": 40,
         },
+    },
+    "enrichment": {
+        "daily_budget_cap_usd": 5.0,
+        "per_lead_cap_usd": 0.04,
+        "super_whale_cap_usd": 0.15,
+        "super_whale_icp_min": 92,
+        "super_whale_pool_min_usd": 10000,
+        "low_balance_warn_usd": 2.0,
+        "low_balance_stop_usd": 0.50,
+        "alert_chat_id": "",
+    },
+    "whales": {
+        "geos": list(DEFAULT_WHALES_GEOS),
+        "whop_min_pool_usd": 5000,
+        "max_dms_per_company": 2,
+        "secondary_dm_wait_days": 6,
+        "tg_group_admins_enabled": True,
+        "phone_tg_checker_daily_limit": 120,
+        "phone_tg_checker_batch_size": 15,
     },
     "vacancies": {
         "enabled": False,
@@ -122,10 +189,21 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "hot_priority": True,
         "layers": {
             "AI-контент": True,
-            "автоматизация": True,
             "трафик": True,
-            "AI-роль": True,
+            "автоматизация": False,
+            "AI-роль": False,
         },
+        "sources": {
+            "tg_chats": True,
+            "hh_ru": True,
+            "profi_ru": True,
+            "kwork": True,
+            "linkedin_jobs": True,
+            "upwork": True,
+        },
+        "vps_scraper_session": DEFAULT_VPS_JOBS_SESSION,
+        "editable_prompt_override": "",
+        "showcase_url": DEFAULT_VACANCY_SHOWCASE_URL,
         "source_words": (
             r"ваканс|vacanc|работ[аыу]|\bjob|фриланс|freelance|биржа|удал[её]н|подработ"
             r"|\bhr\b|hr'?tg|найм|hiring|карьер|career|заказ"
@@ -133,6 +211,20 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "source_stop": r"kurilo|аренда|прокат|spam|premium bot|wallet",
         "extra_chats": ["itconnectbelgrade"],
         "pause_between_chats": 1.5,
+    },
+    "ru_experts": {
+        "enabled": False,
+        "target_campaign": CAMPAIGN_RU_EXPERTS_TG,
+        "exclude_from_airtable": True,
+        "niches": [],
+        "min_subs": 1000,
+        "max_subs": 50000,
+        "stop_words": [],
+        "seed_channels": [],
+        "seed_chats": [],
+        "ig_handles": [],
+        "ig_to_tg_enabled": True,
+        "daily_limit": 20,
     },
     "cases_bank_md": "",
 }
@@ -161,6 +253,175 @@ def _clean_chat_list(raw: Any) -> list[str]:
             seen.add(low)
             out.append(val)
     return out
+
+
+def _clean_ig_handle_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        parts = re.split(r"[\n,;]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(x) for x in raw]
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        val = str(p or "").strip()
+        if not val:
+            continue
+        val = re.sub(r"^https?://(?:www\.)?(?:instagram\.com|instagr\.am)/", "", val, flags=re.I)
+        val = val.split("?", 1)[0].split("#", 1)[0].strip().strip("/").lstrip("@").lower()
+        if not val or val in seen:
+            continue
+        seen.add(val)
+        out.append(val)
+    return out
+
+
+def _clean_str_list(raw: Any, *, uppercase: bool = False) -> list[str]:
+    if isinstance(raw, str):
+        parts = re.split(r"[\n,;]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(x) for x in raw]
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        val = str(p or "").strip()
+        if not val:
+            continue
+        if uppercase:
+            val = val.upper()
+        key = val.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(val)
+    return out
+
+
+def _parse_non_neg_float(raw: Any, default: float, label: str) -> float:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{label} должно быть числом >= 0")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} должно быть числом >= 0") from None
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"{label} должно быть конечным числом >= 0")
+    return round(val, 6)
+
+
+def _parse_int_range(raw: Any, default: int, lo: int, hi: int, label: str) -> int:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{label} должно быть целым числом от {lo} до {hi}")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} должно быть целым числом от {lo} до {hi}") from None
+    if not (lo <= val <= hi):
+        raise ValueError(f"{label} должно быть от {lo} до {hi}")
+    return val
+
+
+def _normalize_enrichment_config(raw: Any) -> dict[str, Any]:
+    enr = dict(raw) if isinstance(raw, dict) else {}
+    defaults = DEFAULT_LEADGEN_CONFIG["enrichment"]
+    return {
+        "daily_budget_cap_usd": _parse_non_neg_float(
+            enr.get("daily_budget_cap_usd"), defaults["daily_budget_cap_usd"], "enrichment.daily_budget_cap_usd"
+        ),
+        "per_lead_cap_usd": _parse_non_neg_float(
+            enr.get("per_lead_cap_usd"), defaults["per_lead_cap_usd"], "enrichment.per_lead_cap_usd"
+        ),
+        "super_whale_cap_usd": _parse_non_neg_float(
+            enr.get("super_whale_cap_usd"), defaults["super_whale_cap_usd"], "enrichment.super_whale_cap_usd"
+        ),
+        "super_whale_icp_min": _parse_int_range(
+            enr.get("super_whale_icp_min"), defaults["super_whale_icp_min"], 0, 100, "enrichment.super_whale_icp_min"
+        ),
+        "super_whale_pool_min_usd": _parse_int_range(
+            enr.get("super_whale_pool_min_usd"),
+            defaults["super_whale_pool_min_usd"],
+            0,
+            10_000_000,
+            "enrichment.super_whale_pool_min_usd",
+        ),
+        "low_balance_warn_usd": _parse_non_neg_float(
+            enr.get("low_balance_warn_usd"), defaults["low_balance_warn_usd"], "enrichment.low_balance_warn_usd"
+        ),
+        "low_balance_stop_usd": _parse_non_neg_float(
+            enr.get("low_balance_stop_usd"), defaults["low_balance_stop_usd"], "enrichment.low_balance_stop_usd"
+        ),
+        "alert_chat_id": str(enr.get("alert_chat_id") or "").strip(),
+    }
+
+
+def _normalize_whales_config(raw: Any) -> dict[str, Any]:
+    wh = dict(raw) if isinstance(raw, dict) else {}
+    defaults = DEFAULT_LEADGEN_CONFIG["whales"]
+    geos = _clean_str_list(wh.get("geos", defaults["geos"]), uppercase=True)
+    if not geos and "geos" not in wh:
+        geos = list(DEFAULT_WHALES_GEOS)
+    return {
+        "geos": geos,
+        "whop_min_pool_usd": _parse_int_range(
+            wh.get("whop_min_pool_usd"), defaults["whop_min_pool_usd"], 0, 10_000_000, "whales.whop_min_pool_usd"
+        ),
+        "max_dms_per_company": _parse_int_range(
+            wh.get("max_dms_per_company"), defaults["max_dms_per_company"], 1, 10, "whales.max_dms_per_company"
+        ),
+        "secondary_dm_wait_days": _parse_int_range(
+            wh.get("secondary_dm_wait_days"), defaults["secondary_dm_wait_days"], 1, 60, "whales.secondary_dm_wait_days"
+        ),
+        "tg_group_admins_enabled": bool(wh.get("tg_group_admins_enabled", defaults["tg_group_admins_enabled"])),
+        "phone_tg_checker_daily_limit": _parse_int_range(
+            wh.get("phone_tg_checker_daily_limit"),
+            defaults["phone_tg_checker_daily_limit"],
+            0,
+            2000,
+            "whales.phone_tg_checker_daily_limit",
+        ),
+        "phone_tg_checker_batch_size": _parse_int_range(
+            wh.get("phone_tg_checker_batch_size"),
+            defaults["phone_tg_checker_batch_size"],
+            1,
+            100,
+            "whales.phone_tg_checker_batch_size",
+        ),
+    }
+
+
+def _normalize_ru_experts_config(raw: Any) -> dict[str, Any]:
+    ru = dict(raw) if isinstance(raw, dict) else {}
+    defaults = DEFAULT_LEADGEN_CONFIG["ru_experts"]
+    min_subs = _parse_int_range(
+        ru.get("min_subs"), defaults["min_subs"], 0, 50_000_000, "ru_experts.min_subs"
+    )
+    max_subs = _parse_int_range(
+        ru.get("max_subs"), defaults["max_subs"], 0, 50_000_000, "ru_experts.max_subs"
+    )
+    if max_subs < min_subs:
+        raise ValueError("ru_experts.max_subs должен быть >= ru_experts.min_subs")
+    return {
+        "enabled": bool(ru.get("enabled", defaults["enabled"])),
+        "target_campaign": str(ru.get("target_campaign") or CAMPAIGN_RU_EXPERTS_TG).strip() or CAMPAIGN_RU_EXPERTS_TG,
+        "exclude_from_airtable": True,
+        "niches": _clean_str_list(ru.get("niches", defaults["niches"])),
+        "min_subs": min_subs,
+        "max_subs": max_subs,
+        "stop_words": _clean_str_list(ru.get("stop_words", defaults["stop_words"])),
+        "seed_channels": _clean_chat_list(ru.get("seed_channels", defaults["seed_channels"])),
+        "seed_chats": _clean_chat_list(ru.get("seed_chats", defaults["seed_chats"])),
+        "ig_handles": _clean_ig_handle_list(ru.get("ig_handles", defaults.get("ig_handles", []))),
+        "ig_to_tg_enabled": bool(ru.get("ig_to_tg_enabled", defaults["ig_to_tg_enabled"])),
+        "daily_limit": _parse_int_range(
+            ru.get("daily_limit"), defaults["daily_limit"], 0, 500, "ru_experts.daily_limit"
+        ),
+    }
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -195,9 +456,16 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("b2b.touch_mode должен быть 'direct'")
     b2b["touch_mode"] = b2b_mode
 
-    b2b["target_campaign_tg"] = str(b2b.get("target_campaign_tg") or "Leadgen Auto (TG)").strip() or "Leadgen Auto (TG)"
-    b2b["target_campaign_wa"] = str(b2b.get("target_campaign_wa") or "Leadgen Auto (WA)").strip() or "Leadgen Auto (WA)"
-    b2b["target_campaign_ofm"] = str(b2b.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip() or "SoftUGC — OFM (TG)"
+    raw_tg_target = str(b2b.get("target_campaign_tg") or "").strip()
+    if not raw_tg_target or is_legacy_baza_vse2_name(raw_tg_target):
+        raw_tg_target = CAMPAIGN_WHALES_EN_TG
+    b2b["target_campaign_tg"] = raw_tg_target
+
+    raw_wa_target = str(b2b.get("target_campaign_wa") or "").strip()
+    if not raw_wa_target or raw_wa_target.lower() == "leadgen auto (wa)":
+        raw_wa_target = CAMPAIGN_WHALES_EN_WA if not raw_wa_target else raw_wa_target
+    b2b["target_campaign_wa"] = raw_wa_target
+    b2b["target_campaign_ofm"] = str(b2b.get("target_campaign_ofm") or CAMPAIGN_OFM_TG).strip() or CAMPAIGN_OFM_TG
     b2b["ofm_outreach_enabled"] = bool(b2b.get("ofm_outreach_enabled", False))
     try:
         ofm_limit = int(b2b.get("ofm_daily_limit", 25))
@@ -249,7 +517,10 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     b2b["sources"] = norm_sources
 
     b2b["tg_groups_old"] = _clean_chat_list(b2b.get("tg_groups_old", DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_old"]))
-    b2b["tg_groups_new"] = _clean_chat_list(b2b.get("tg_groups_new", DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]))
+    cleaned_new_groups = _clean_chat_list(b2b.get("tg_groups_new", DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]))
+    b2b["tg_groups_new"] = [
+        g for g in cleaned_new_groups if g.lower() not in REMOVED_LEGACY_TG_GROUPS
+    ]
     b2b["tg_comment_channels"] = _clean_chat_list(b2b.get("tg_comment_channels", []))
     b2b["ofm_tg_groups"] = _clean_chat_list(b2b.get("ofm_tg_groups", DEFAULT_LEADGEN_CONFIG["b2b"]["ofm_tg_groups"]))
     raw_fb_urls = b2b.get("fb_group_urls", [])
@@ -281,6 +552,10 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     b2b["limits"] = norm_limits
     merged["b2b"] = b2b
 
+    merged["enrichment"] = _normalize_enrichment_config(merged.get("enrichment"))
+    merged["whales"] = _normalize_whales_config(merged.get("whales"))
+    merged["ru_experts"] = _normalize_ru_experts_config(merged.get("ru_experts"))
+
     vac = merged.get("vacancies") or {}
     vac["enabled"] = bool(vac.get("enabled", False))
     vac_mode = str(vac.get("touch_mode") or "direct").strip().lower()
@@ -310,6 +585,23 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
             norm_layers[str(layer_k)] = bool(layer_v)
     vac["layers"] = norm_layers
 
+    raw_vac_sources = vac.get("sources") or {}
+    norm_vac_sources = {}
+    for src_k, def_src in DEFAULT_LEADGEN_CONFIG["vacancies"]["sources"].items():
+        norm_vac_sources[src_k] = bool(raw_vac_sources.get(src_k, def_src))
+    for src_k, src_v in raw_vac_sources.items():
+        if src_k not in norm_vac_sources:
+            norm_vac_sources[str(src_k)] = bool(src_v)
+    vac["sources"] = norm_vac_sources
+
+    vac["vps_scraper_session"] = (
+        str(vac.get("vps_scraper_session") or DEFAULT_VPS_JOBS_SESSION).strip() or DEFAULT_VPS_JOBS_SESSION
+    )
+    vac["editable_prompt_override"] = sanitize_copy_text(str(vac.get("editable_prompt_override") or ""))
+    vac["showcase_url"] = (
+        str(vac.get("showcase_url") or DEFAULT_VACANCY_SHOWCASE_URL).strip() or DEFAULT_VACANCY_SHOWCASE_URL
+    )
+
     vac["source_words"] = str(
         vac.get("source_words") or DEFAULT_LEADGEN_CONFIG["vacancies"]["source_words"]
     ).strip()
@@ -334,12 +626,12 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def find_existing_softugc_tg_campaign(conn: sqlite3.Connection | None) -> dict[str, Any] | None:
-    """Find existing non-vacancy, non-WA, non-OFM SoftUGC TG B2B campaign (preferring 'SoftUGC — База Все2*')."""
+    """Find existing active-tier Whales/SoftUGC TG campaign (NEVER 'SoftUGC — База Все2*')."""
     if conn is None:
         return None
     try:
         rows = conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
-    except Exception:
+    except sqlite3.Error:
         return None
 
     from app.hygiene import is_ofm_campaign_name
@@ -351,15 +643,19 @@ def find_existing_softugc_tg_campaign(conn: sqlite3.Connection | None) -> dict[s
         cname_low = cname.lower()
         if not cname_low:
             continue
+        if is_legacy_baza_vse2_name(cname):
+            continue
         if any(k in cname_low for k in ("ваканс", "vacanc", "job")):
             continue
-        if "(wa)" in cname_low or "whatsapp" in cname_low:
+        if "(wa)" in cname_low or "whatsapp" in cname_low or " — wa" in cname_low:
             continue
         if is_ofm_campaign_name(cname, cdict.get("leadgen_sources_json")):
             continue
-        if cname_low.startswith("softugc — база все2"):
+        if str(cdict.get("segment") or "").strip().lower() == "ru_expert":
+            continue
+        if cname_low == CAMPAIGN_WHALES_EN_TG.lower():
             return cdict
-        if fallback_softugc is None and "softugc" in cname_low:
+        if fallback_softugc is None and ("softugc" in cname_low or str(cdict.get("segment") or "").lower() == "whale"):
             fallback_softugc = cdict
     return fallback_softugc
 
@@ -368,22 +664,23 @@ def resolve_target_b2b_tg_campaign_name(
     conn: sqlite3.Connection | None,
     requested_name: str | None = None,
     *,
-    fallback_default: str = "Leadgen Auto (TG)",
+    fallback_default: str = CAMPAIGN_WHALES_EN_TG,
 ) -> str:
-    """Resolve TG B2B campaign name: if empty/default, prefer existing 'SoftUGC — База Все2*' / non-OFM 'SoftUGC*' in DB."""
+    """Resolve TG B2B/Whales campaign name; unlinks legacy 'SoftUGC — База Все2*' onto 'Whales EN — TG'."""
     from app.hygiene import is_ofm_campaign_name
 
     clean_req = str(requested_name or "").strip()
-    req_low = clean_req.lower()
+    if is_legacy_baza_vse2_name(clean_req):
+        clean_req = ""
     if clean_req and is_ofm_campaign_name(clean_req):
         clean_req = ""
-        req_low = ""
+    req_low = clean_req.lower()
     if clean_req and req_low not in ("leadgen auto (tg)", "leadgen autopilot"):
         return clean_req
     found = find_existing_softugc_tg_campaign(conn)
     if found is not None and str(found.get("name") or "").strip():
         return str(found["name"]).strip()
-    return clean_req or fallback_default
+    return fallback_default or CAMPAIGN_WHALES_EN_TG
 
 
 def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -394,8 +691,8 @@ def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]
             data = json.loads(json_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 stored = _deep_merge(stored, data)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("Failed reading leadgen config JSON %s: %s", json_path, exc)
 
     if conn is not None:
         try:
@@ -406,15 +703,15 @@ def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                 db_data = json.loads(row["value"])
                 if isinstance(db_data, dict):
                     stored = _deep_merge(stored, db_data)
-        except Exception:
-            pass
+        except (sqlite3.Error, json.JSONDecodeError) as exc:
+            logger.debug("Failed reading leadgen config from kv_settings: %s", exc)
 
     cfg = _normalize_config(stored)
     if conn is not None:
         cfg["b2b"]["target_campaign_tg"] = resolve_target_b2b_tg_campaign_name(
             conn,
             cfg["b2b"].get("target_campaign_tg"),
-            fallback_default="Leadgen Auto (TG)",
+            fallback_default=CAMPAIGN_WHALES_EN_TG,
         )
     disk_bank = _read_cases_bank()
     if disk_bank and not stored.get("cases_bank_md"):
@@ -497,6 +794,42 @@ def save_leadgen_config(
     return normalized
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row[1]) for row in rows if len(row) > 1}
+
+
+def _apply_campaign_v2_metadata(
+    conn: sqlite3.Connection,
+    campaign_id: int,
+    *,
+    segment: str,
+    language: str,
+    copy_profile: str,
+    exclude_from_airtable: int,
+) -> None:
+    cols = _table_columns(conn, "campaigns")
+    updates: list[str] = []
+    params: list[Any] = []
+    for col_name, col_val in (
+        ("segment", str(segment or "b2b")),
+        ("language", str(language or "en")),
+        ("copy_profile", str(copy_profile or "default")),
+        ("exclude_from_airtable", 1 if int(exclude_from_airtable or 0) else 0),
+    ):
+        if col_name in cols:
+            updates.append(f"{col_name} = ?")
+            params.append(col_val)
+    if not updates:
+        return
+    params.append(int(campaign_id))
+    conn.execute(f"UPDATE campaigns SET {', '.join(updates)} WHERE id = ?", params)
+    conn.commit()
+
+
 def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     state_dir = _resolve_state_dir()
     last_run_summary: dict[str, Any] | None = None
@@ -506,8 +839,8 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
             data = json.loads(summary_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 last_run_summary = data
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("Failed reading %s: %s", summary_file, exc)
 
     latest_vacancy_report: dict[str, Any] | None = None
     if state_dir.is_dir():
@@ -531,8 +864,8 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                     "vacancies_count": count,
                     "hot_count": hot_count,
                 }
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.debug("Failed reading vacancy report %s: %s", latest_path, exc)
 
     from app.hygiene import read_direct_x_leads, read_ofm_review_leads
 
@@ -548,6 +881,10 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
         "total_leadgen_leads": 0,
         "vacancies_leads": 0,
         "b2b_leads": 0,
+        "whales_leads": 0,
+        "ru_experts_leads": 0,
+        "manual_social_queue": 0,
+        "assisted_job_queue": 0,
         "whatsapp_leads_count": 0,
         "active_leadgen_campaigns": 0,
         "direct_x_leads_count": direct_x_leads_count,
@@ -555,15 +892,23 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
     }
     if conn is not None:
         try:
+            lead_cols = _table_columns(conn, "leads")
+            seg_sel = "COALESCE(segment, '')" if "segment" in lead_cols else "''"
             rows = conn.execute(
-                """
-                SELECT lead_source, COALESCE(provider, 'telegram') AS provider, COALESCE(username, '') AS username
+                f"""
+                SELECT lead_source, COALESCE(provider, 'telegram') AS provider,
+                       COALESCE(username, '') AS username, {seg_sel} AS segment
                 FROM leads
-                WHERE lead_source IS NOT NULL AND trim(lead_source) != ''
+                WHERE (lead_source IS NOT NULL AND trim(lead_source) != '')
+                   OR ({seg_sel} != '')
                 """
             ).fetchall()
             vac_c = 0
             b2b_c = 0
+            whales_c = 0
+            ru_exp_c = 0
+            manual_soc_c = 0
+            assisted_job_c = 0
             b2b_kws = (
                 "leadgen",
                 "google sheet",
@@ -587,20 +932,44 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                 "shopify",
                 "fb_groups",
                 "facebook_groups",
+                "crypto",
             )
             for r in rows:
                 src = str(r["lead_source"] or "").lower()
                 prov = str(r["provider"] or "telegram").strip().lower()
                 uname_val = str(r["username"] or "").strip()
-                if "ваканс" in src or "job" in src:
+                seg = str(r["segment"] or "").strip().lower()
+                if seg == "social_manual":
+                    manual_soc_c += 1
+                    continue
+                if seg == "vacancy_assisted":
+                    assisted_job_c += 1
                     vac_c += 1
+                    continue
+                if seg == "ru_expert" or src.startswith("ru_expert"):
+                    ru_exp_c += 1
+                    continue
+                if (
+                    seg in ("vacancy", "client_reels")
+                    or "ваканс" in src
+                    or "job" in src
+                    or src.startswith(("hh_ru", "hh_vacancies", "hh.ru", "profi_ru", "kwork", "upwork"))
+                ):
+                    vac_c += 1
+                elif seg == "whale":
+                    whales_c += 1
+                    b2b_c += 1
                 elif prov == "whatsapp" and not uname_val:
                     continue
                 elif any(kw in src for kw in b2b_kws):
                     b2b_c += 1
             crm_counts["vacancies_leads"] = vac_c
             crm_counts["b2b_leads"] = b2b_c
-            crm_counts["total_leadgen_leads"] = vac_c + b2b_c
+            crm_counts["whales_leads"] = whales_c
+            crm_counts["ru_experts_leads"] = ru_exp_c
+            crm_counts["manual_social_queue"] = manual_soc_c
+            crm_counts["assisted_job_queue"] = assisted_job_c
+            crm_counts["total_leadgen_leads"] = vac_c + b2b_c + ru_exp_c
 
             wa_row = conn.execute(
                 "SELECT COUNT(*) FROM leads WHERE lower(COALESCE(provider, '')) = 'whatsapp' AND lower(COALESCE(status, '')) != 'lost'"
@@ -634,8 +1003,8 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                 if enabled and cdict.get("status") != "completed":
                     active_lg += 1
             crm_counts["active_leadgen_campaigns"] = active_lg
-        except Exception:
-            pass
+        except sqlite3.Error as exc:
+            logger.debug("Failed computing leadgen status counts: %s", exc)
 
     return {
         "state_dir": str(state_dir),
@@ -667,7 +1036,26 @@ DEFAULT_B2B_WA_STEPS = [
     {
         "step_order": 3,
         "delay_hours": 24,
+        "template_text": "{followup_2}",
+    },
+]
+DEFAULT_WHALES_TG_STEPS = [
+    {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+    {"step_order": 2, "delay_hours": 48, "template_text": VLAD_STEP2_TEMPLATE},
+    {
+        "step_order": 3,
+        "delay_hours": 96,
         "template_text": VLAD_STEP3_TEXT,
+        "image_url": CANONICAL_STEP3_IMAGE_URL,
+    },
+]
+DEFAULT_WHALES_WA_STEPS = [
+    {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+    {"step_order": 2, "delay_hours": 48, "template_text": VLAD_STEP2_TEMPLATE},
+    {
+        "step_order": 3,
+        "delay_hours": 96,
+        "template_text": "{followup_2}",
     },
 ]
 DEFAULT_VACANCY_STEPS = [
@@ -675,7 +1063,15 @@ DEFAULT_VACANCY_STEPS = [
     {"step_order": 2, "delay_hours": 24, "template_text": "{followup_1}"},
     {"step_order": 3, "delay_hours": 72, "template_text": "{followup_2}"},
 ]
-DEFAULT_LEADGEN_STEPS = DEFAULT_B2B_STEPS
+DEFAULT_VACANCY_WA_STEPS = [
+    {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+    {"step_order": 2, "delay_hours": 48, "template_text": "{followup_1}"},
+]
+DEFAULT_RU_EXPERTS_STEPS = [
+    {"step_order": 1, "delay_hours": 0, "template_text": "{first_touch}"},
+    {"step_order": 2, "delay_hours": 48, "template_text": "{followup_1}"},
+]
+DEFAULT_LEADGEN_STEPS = DEFAULT_WHALES_TG_STEPS
 
 
 def _has_whatsapp_readiness(conn: sqlite3.Connection) -> bool:
@@ -698,6 +1094,178 @@ def _has_whatsapp_readiness(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def build_segment_campaign_targets(
+    cfg: dict[str, Any],
+    *,
+    wa_ready: bool = False,
+) -> list[dict[str, Any]]:
+    """Build canonical segment campaign definitions for idempotent draft provisioning."""
+    from app.whatsapp_gateway import DEFAULT_WA_DAILY_LIMIT
+
+    b2b = cfg.get("b2b") or {}
+    vac = cfg.get("vacancies") or {}
+    ru_exp = cfg.get("ru_experts") or {}
+
+    b2b_enabled = bool(b2b.get("enabled", True))
+    b2b_daily_lim = max(1, min(500, int(b2b.get("campaign_daily_limit") or 30)))
+    b2b_quota = max(0, min(500, int(b2b.get("campaign_daily_limit") or 30)))
+    b2b_enabled_sources = [
+        k for k, v in (b2b.get("sources") or {}).items()
+        if v and k not in ("ofm_groups", "ru_experts", "hh_ru", "profi_ru", "kwork", "upwork")
+    ]
+    wa_daily_lim = min(b2b_daily_lim, DEFAULT_WA_DAILY_LIMIT)
+
+    vac_enabled = bool(vac.get("enabled", False))
+    raw_vac_lim = vac.get("daily_limit")
+    resolved_vac_lim = 20 if raw_vac_lim is None else int(raw_vac_lim)
+    vac_lim = max(1, min(500, resolved_vac_lim if resolved_vac_lim > 0 else 20))
+    vac_quota = max(0, min(500, resolved_vac_lim if vac_enabled else 0))
+    vac_wa_lim = min(vac_lim, DEFAULT_WA_DAILY_LIMIT)
+    vac_sources_list = [f"vacancies:{k}" for k, v in (vac.get("layers") or {}).items() if v]
+    for v_src, v_on in (vac.get("sources") or {}).items():
+        if v_on:
+            vac_sources_list.append(str(v_src))
+    if not vac_sources_list:
+        vac_sources_list = ["vacancies"]
+
+    ru_enabled = bool(ru_exp.get("enabled", False))
+    raw_ru_lim = ru_exp.get("daily_limit")
+    resolved_ru_lim = 20 if raw_ru_lim is None else int(raw_ru_lim)
+    ru_lim = max(1, min(500, resolved_ru_lim if resolved_ru_lim > 0 else 20))
+    ru_quota = max(0, min(500, resolved_ru_lim if ru_enabled else 0))
+    ru_camp_name = str(ru_exp.get("target_campaign") or CAMPAIGN_RU_EXPERTS_TG).strip() or CAMPAIGN_RU_EXPERTS_TG
+
+    targets: list[dict[str, Any]] = [
+        {
+            "name": CAMPAIGN_WHALES_EN_TG,
+            "daily_limit": b2b_daily_lim,
+            "leadgen_daily_quota": b2b_quota if b2b_enabled else 0,
+            "leadgen_sources": b2b_enabled_sources,
+            "default_steps": DEFAULT_WHALES_TG_STEPS,
+            "is_b2b": True,
+            "segment": "whale",
+            "language": "en",
+            "copy_profile": "whale_mass",
+            "exclude_from_airtable": 0,
+            "initial_leadgen_enabled": b2b_enabled,
+        },
+        {
+            "name": CAMPAIGN_WHALES_EN_WA,
+            "daily_limit": wa_daily_lim,
+            "leadgen_daily_quota": min(b2b_quota, wa_daily_lim) if b2b_enabled else 0,
+            "leadgen_sources": b2b_enabled_sources,
+            "default_steps": DEFAULT_WHALES_WA_STEPS,
+            "is_b2b": True,
+            "segment": "whale",
+            "language": "en",
+            "copy_profile": "whale_mass",
+            "exclude_from_airtable": 0,
+            "initial_leadgen_enabled": bool(b2b_enabled and wa_ready),
+        },
+        {
+            "name": CAMPAIGN_VACANCY_RU_TG,
+            "daily_limit": vac_lim,
+            "leadgen_daily_quota": vac_quota,
+            "leadgen_sources": vac_sources_list,
+            "default_steps": DEFAULT_VACANCY_STEPS,
+            "is_b2b": False,
+            "segment": "vacancy",
+            "language": "ru",
+            "copy_profile": "vacancy_ru",
+            "exclude_from_airtable": 0,
+            "initial_leadgen_enabled": bool(vac_enabled and resolved_vac_lim > 0),
+        },
+        {
+            "name": CAMPAIGN_VACANCY_RU_WA,
+            "daily_limit": vac_wa_lim,
+            "leadgen_daily_quota": min(vac_quota, vac_wa_lim),
+            "leadgen_sources": vac_sources_list,
+            "default_steps": DEFAULT_VACANCY_WA_STEPS,
+            "is_b2b": False,
+            "segment": "vacancy",
+            "language": "ru",
+            "copy_profile": "vacancy_ru",
+            "exclude_from_airtable": 0,
+            "initial_leadgen_enabled": bool(vac_enabled and resolved_vac_lim > 0 and wa_ready),
+        },
+        {
+            "name": CAMPAIGN_VACANCY_EN_TG,
+            "daily_limit": vac_lim,
+            "leadgen_daily_quota": vac_quota,
+            "leadgen_sources": vac_sources_list,
+            "default_steps": DEFAULT_VACANCY_STEPS,
+            "is_b2b": False,
+            "segment": "vacancy",
+            "language": "en",
+            "copy_profile": "vacancy_en",
+            "exclude_from_airtable": 0,
+            "initial_leadgen_enabled": bool(vac_enabled and resolved_vac_lim > 0),
+        },
+        {
+            "name": ru_camp_name,
+            "daily_limit": ru_lim,
+            "leadgen_daily_quota": ru_quota,
+            "leadgen_sources": ["ru_experts"],
+            "default_steps": DEFAULT_RU_EXPERTS_STEPS,
+            "is_b2b": False,
+            "segment": "ru_expert",
+            "language": "ru",
+            "copy_profile": "ru_expert",
+            "exclude_from_airtable": 1,
+            "initial_leadgen_enabled": bool(ru_enabled and resolved_ru_lim > 0),
+        },
+    ]
+
+    known_low = {str(t["name"]).strip().lower() for t in targets}
+
+    custom_tg = str(b2b.get("target_campaign_tg") or "").strip()
+    if (
+        b2b_enabled
+        and custom_tg
+        and not is_legacy_baza_vse2_name(custom_tg)
+        and custom_tg.lower() not in known_low
+        and custom_tg.lower() not in ("leadgen auto (tg)", "leadgen autopilot")
+    ):
+        targets.append(
+            {
+                "name": custom_tg,
+                "daily_limit": b2b_daily_lim,
+                "leadgen_daily_quota": b2b_quota,
+                "leadgen_sources": b2b_enabled_sources,
+                "default_steps": DEFAULT_WHALES_TG_STEPS,
+                "is_b2b": True,
+                "segment": "whale",
+                "language": "en",
+                "copy_profile": "whale_mass",
+                "exclude_from_airtable": 0,
+                "initial_leadgen_enabled": True,
+            }
+        )
+        known_low.add(custom_tg.lower())
+
+    ofm_name = str(b2b.get("target_campaign_ofm") or CAMPAIGN_OFM_TG).strip()
+    if b2b.get("ofm_outreach_enabled", False) and ofm_name and ofm_name.lower() not in known_low:
+        ofm_lim = max(1, min(500, int(b2b.get("ofm_daily_limit") or 25)))
+        targets.append(
+            {
+                "name": ofm_name,
+                "daily_limit": ofm_lim,
+                "leadgen_daily_quota": ofm_lim,
+                "leadgen_sources": ["ofm_groups"],
+                "default_steps": DEFAULT_B2B_STEPS,
+                "is_b2b": True,
+                "segment": "ofm",
+                "language": "en",
+                "copy_profile": "ofm",
+                "exclude_from_airtable": 0,
+                "initial_leadgen_enabled": True,
+            }
+        )
+        known_low.add(ofm_name.lower())
+
+    return targets
+
+
 def sync_leadgen_campaigns(
     conn: sqlite3.Connection,
     config: dict[str, Any] | None = None,
@@ -714,104 +1282,19 @@ def sync_leadgen_campaigns(
         or (isinstance(config, dict) and "sync_leadgen_enabled" in config)
     )
     cfg = _normalize_config(config) if isinstance(config, dict) else get_leadgen_config(conn)
-    b2b = cfg["b2b"]
-    vac = cfg["vacancies"]
-
-    b2b_enabled_sources = [
-        k for k, v in (b2b.get("sources") or {}).items() if v and k != "ofm_groups"
-    ]
-    vac_enabled_layers = [f"vacancies:{k}" for k, v in (vac.get("layers") or {}).items() if v]
-    if not vac_enabled_layers:
-        vac_enabled_layers = ["vacancies"]
 
     all_existing_camps = [
         as_dict(r)
         for r in conn.execute("SELECT * FROM campaigns ORDER BY id ASC").fetchall()
     ]
-    existing_names_low = {
-        str(c.get("name") or "").strip().lower() for c in all_existing_camps
-    }
     wa_ready = _has_whatsapp_readiness(conn)
-
-    tg_name = resolve_target_b2b_tg_campaign_name(
-        conn,
-        b2b.get("target_campaign_tg"),
-        fallback_default="Leadgen Auto (TG)",
-    )
-    targets: list[dict[str, Any]] = []
-    if b2b.get("enabled", True):
-        daily_lim = max(1, min(500, int(b2b.get("campaign_daily_limit") or 30)))
-        quota = max(0, min(500, int(b2b.get("campaign_daily_limit") or 30)))
-        wa_name = str(b2b.get("target_campaign_wa") or "Leadgen Auto (WA)").strip()
-        if tg_name:
-            targets.append(
-                {
-                    "name": tg_name,
-                    "daily_limit": daily_lim,
-                    "leadgen_daily_quota": quota,
-                    "leadgen_sources": b2b_enabled_sources,
-                    "default_steps": DEFAULT_B2B_STEPS,
-                    "is_b2b": True,
-                }
-            )
-        if (
-            wa_name
-            and wa_name.lower() != tg_name.lower()
-            and (wa_ready or wa_name.lower() in existing_names_low)
-        ):
-            from app.whatsapp_gateway import DEFAULT_WA_DAILY_LIMIT
-
-            wa_daily_lim = min(daily_lim, DEFAULT_WA_DAILY_LIMIT)
-            targets.append(
-                {
-                    "name": wa_name,
-                    "daily_limit": wa_daily_lim,
-                    "leadgen_daily_quota": min(quota, wa_daily_lim),
-                    "leadgen_sources": b2b_enabled_sources,
-                    "default_steps": DEFAULT_B2B_WA_STEPS,
-                    "is_b2b": True,
-                }
-            )
-
-    ofm_name = str(b2b.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip()
-    if (
-        b2b.get("ofm_outreach_enabled", False)
-        and ofm_name
-        and ofm_name.lower() != tg_name.lower()
-    ):
-        ofm_lim = max(1, min(500, int(b2b.get("ofm_daily_limit") or 25)))
-        targets.append(
-            {
-                "name": ofm_name,
-                "daily_limit": ofm_lim,
-                "leadgen_daily_quota": ofm_lim,
-                "leadgen_sources": ["ofm_groups"],
-                "default_steps": DEFAULT_B2B_STEPS,
-                "is_b2b": True,
-            }
-        )
-
-    raw_vac_lim = vac.get("daily_limit")
-    resolved_vac_lim = 20 if raw_vac_lim is None else int(raw_vac_lim)
-    if vac.get("enabled", False) and resolved_vac_lim > 0:
-        vac_name = str(vac.get("campaign_name") or "TG Вакансии").strip()
-        vac_lim = max(1, min(500, resolved_vac_lim))
-        vac_quota = max(0, min(500, resolved_vac_lim))
-        if vac_name:
-            targets.append(
-                {
-                    "name": vac_name,
-                    "daily_limit": vac_lim,
-                    "leadgen_daily_quota": vac_quota,
-                    "leadgen_sources": vac_enabled_layers,
-                    "default_steps": DEFAULT_VACANCY_STEPS,
-                    "is_b2b": False,
-                }
-            )
+    targets = build_segment_campaign_targets(cfg, wa_ready=wa_ready)
 
     synced_campaigns: list[dict[str, Any]] = []
     for spec in targets:
         spec_name_low = str(spec["name"] or "").strip().lower()
+        if is_legacy_baza_vse2_name(spec_name_low):
+            continue
         matched_existing = next(
             (c for c in all_existing_camps if str(c.get("name") or "").strip().lower() == spec_name_low),
             None,
@@ -833,7 +1316,7 @@ def sync_leadgen_campaigns(
                 req_enabled = (
                     bool(config.get("sync_leadgen_enabled"))
                     if isinstance(config, dict) and "sync_leadgen_enabled" in config
-                    else True
+                    else bool(spec.get("initial_leadgen_enabled", True))
                 )
                 effective_leadgen_enabled = False if keep_paused_disabled else req_enabled
             else:
@@ -847,9 +1330,20 @@ def sync_leadgen_campaigns(
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
             )
+            _apply_campaign_v2_metadata(
+                conn,
+                cid,
+                segment=spec["segment"],
+                language=spec["language"],
+                copy_profile=spec["copy_profile"],
+                exclude_from_airtable=int(spec.get("exclude_from_airtable") or 0),
+            )
+            updated = get_campaign(conn, cid)
             cur_steps = updated.get("steps") or []
-            needs_b2b_step_sync = bool(spec.get("is_b2b")) and (
-                len(cur_steps) == 3
+            needs_b2b_step_sync = (
+                bool(spec.get("is_b2b"))
+                and spec.get("segment") == "b2b"
+                and len(cur_steps) == 3
                 and (
                     any("{followup_" in str(s.get("template_text") or "") for s in cur_steps)
                     or any("\u2028" in str(s.get("template_text") or "") for s in cur_steps)
@@ -866,11 +1360,20 @@ def sync_leadgen_campaigns(
                 daily_limit=spec["daily_limit"],
                 status="draft",
                 steps=spec["default_steps"],
-                leadgen_enabled=True,
+                leadgen_enabled=bool(spec.get("initial_leadgen_enabled", False)),
                 leadgen_daily_quota=spec["leadgen_daily_quota"],
                 leadgen_sources=spec["leadgen_sources"],
             )
-            synced_campaigns.append(created)
+            cid = int(created["id"])
+            _apply_campaign_v2_metadata(
+                conn,
+                cid,
+                segment=spec["segment"],
+                language=spec["language"],
+                copy_profile=spec["copy_profile"],
+                exclude_from_airtable=int(spec.get("exclude_from_airtable") or 0),
+            )
+            synced_campaigns.append(get_campaign(conn, cid))
 
     return {
         "ok": True,
@@ -948,8 +1451,8 @@ def _load_push_watermark(conn: sqlite3.Connection) -> dict[str, Any]:
                     out["vacancies"] = dict(parsed["vacancies"])
                 if isinstance(parsed.get("ofm_files"), dict):
                     out["ofm_files"] = dict(parsed["ofm_files"])
-    except Exception:
-        pass
+    except (sqlite3.Error, json.JSONDecodeError) as exc:
+        logger.debug("Failed loading leadgen push watermark: %s", exc)
     return out
 
 
@@ -977,6 +1480,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
         }
 
     from app.hygiene import is_ofm_campaign_name
+    from app.whatsapp_gateway import DEFAULT_WA_DAILY_LIMIT
 
     total_quota = int(cfg.get("total_daily_quota") or 50)
     today = utc_today()
@@ -998,6 +1502,8 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     )
     remaining_quota = max(0, total_quota - int(already_today or 0))
     ofm_outreach_active = bool((cfg.get("b2b") or {}).get("ofm_outreach_enabled", False))
+    ru_exp_cfg = cfg.get("ru_experts") or {}
+    ru_exp_enabled = bool(ru_exp_cfg.get("enabled", False))
     if remaining_quota <= 0 and total_quota > 0 and not ofm_outreach_active:
         return {
             "ok": True,
@@ -1060,12 +1566,12 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                         for r in json.loads(rep_path.read_text(encoding="utf-8")):
                             if isinstance(r, dict) and r.get("hash") and r.get("text"):
                                 replies_by_hash[str(r["hash"])] = r
-                    except Exception:
-                        pass
+                    except (OSError, json.JSONDecodeError) as exc:
+                        logger.debug("Failed reading reply file %s: %s", rep_path, exc)
 
                 try:
                     mon_items = json.loads(mon_path.read_text(encoding="utf-8"))
-                except Exception:
+                except (OSError, json.JSONDecodeError):
                     mon_items = []
                 enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
                 vac_leads: list[dict[str, Any]] = []
@@ -1125,18 +1631,34 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 pending_vac_leads = vac_leads[start_vac_idx:]
                 if pending_vac_leads and vac_limit > 0:
                     slice_vac = pending_vac_leads[:vac_limit]
-                    added, created_c = _ingest_leads_without_campaign_limit_mutation(
-                        conn,
-                        call_mcp_tool_handler=call_mcp_tool_handler,
-                        leads_slice=slice_vac,
-                        enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
-                        campaign_name=str(vac_cfg.get("campaign_name") or "TG Вакансии"),
-                        default_quota=max(0, min(500, int(vac_cfg.get("daily_limit") or 20))),
-                        default_sources=vac_enabled_layers,
-                    )
-                    ingested_total += added
-                    campaigns_created += created_c
-                    remaining_quota = max(0, remaining_quota - added)
+                    vac_buckets: dict[tuple[str, bool, str], list[dict[str, Any]]] = {}
+                    for v_lead in slice_vac:
+                        route = route_lead(v_lead, cfg=cfg)
+                        v_lead.setdefault("segment", route.segment)
+                        v_lead.setdefault("language", route.language)
+                        v_lead.setdefault("provider", route.provider)
+                        is_manual_q = route.segment in ("social_manual", "vacancy_assisted") or route.target_campaign in (
+                            QUEUE_MANUAL_SOCIAL,
+                            QUEUE_ASSISTED_JOB,
+                        )
+                        b_key = (route.target_campaign, not is_manual_q, route.provider)
+                        vac_buckets.setdefault(b_key, []).append(v_lead)
+
+                    vac_lim_val = max(0, min(500, int(vac_cfg.get("daily_limit") or 20)))
+                    for (t_camp, do_enroll, t_prov), bucket_leads in vac_buckets.items():
+                        q_lim = min(vac_lim_val, DEFAULT_WA_DAILY_LIMIT) if t_prov == "whatsapp" else vac_lim_val
+                        added, created_c = _ingest_leads_without_campaign_limit_mutation(
+                            conn,
+                            call_mcp_tool_handler=call_mcp_tool_handler,
+                            leads_slice=bucket_leads,
+                            enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True) and do_enroll),
+                            campaign_name="" if not do_enroll else t_camp,
+                            default_quota=q_lim,
+                            default_sources=vac_enabled_layers,
+                        )
+                        ingested_total += added
+                        campaigns_created += created_c
+                        remaining_quota = max(0, remaining_quota - added)
                     new_vac_offset = start_vac_idx + len(slice_vac)
                     wm_vac[mon_path.name] = {
                         **vac_sig,
@@ -1155,9 +1677,10 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
     # 2. Local JSONL files in state_dir (*.treg.jsonl / *.final.jsonl / discovered_leads.jsonl) with per-file watermark
     b2b_cfg = cfg["b2b"]
     b2b_enabled_sources = [
-        k for k, v in (b2b_cfg.get("sources") or {}).items() if v and k != "ofm_groups"
+        k for k, v in (b2b_cfg.get("sources") or {}).items()
+        if v and k not in ("ofm_groups", "ru_experts")
     ]
-    if b2b_cfg.get("enabled", True) and state_dir.is_dir() and remaining_quota > 0:
+    if (b2b_cfg.get("enabled", True) or ru_exp_enabled or vac_cfg.get("enabled", False)) and state_dir.is_dir() and remaining_quota > 0:
         from app.hygiene import (
             _has_messenger_contact,
             append_direct_x_lead,
@@ -1182,6 +1705,12 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
             glob.glob(str(state_dir / "*.treg.jsonl"))
             + glob.glob(str(state_dir / "*.final.jsonl"))
             + glob.glob(str(state_dir / "discovered_leads*.jsonl"))
+            + (glob.glob(str(state_dir / "ru_experts*.jsonl")) if ru_exp_enabled else [])
+            + (
+                (glob.glob(str(state_dir / "hh_vacancies*.jsonl")) + glob.glob(str(state_dir / "freelance_orders*.jsonl")))
+                if vac_cfg.get("enabled", False)
+                else []
+            )
         )
         jsonl_candidates = sorted(
             [
@@ -1256,9 +1785,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     explicit_src = str(cand.get("source") or "").strip()
                     if not explicit_src and cand.get("group"):
                         explicit_src = "tg_groups"
-                    if explicit_src and explicit_src.lower() not in {"cold outreach", "leadgen"}:
-                        cand["lead_source"] = explicit_src
-                    elif explicit_src:
+                    if explicit_src:
                         cand["lead_source"] = explicit_src
                 if not str(cand.get("source") or "").strip() and cand.get("lead_source"):
                     cand["source"] = cand["lead_source"]
@@ -1284,6 +1811,41 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     cand["provider"] = "telegram"
                 elif cand.get("phone") and (canon_wa or str(cand.get("provider") or "").lower() == "whatsapp"):
                     cand["provider"] = "whatsapp"
+
+                cand_seg = detect_lead_segment(cand)
+                cand_lang = detect_lead_language(cand)
+
+                if cand_seg == "ru_expert":
+                    if not ru_exp_enabled:
+                        continue
+                    cand["segment"] = "ru_expert"
+                    cand["language"] = "ru"
+                    cand["exclude_from_airtable"] = 1
+                    if _has_messenger_contact(
+                        username=cand.get("username"),
+                        phone=cand.get("phone"),
+                        telegram_user_id=cand.get("telegram_user_id"),
+                    ):
+                        leads.append(cand)
+                    continue
+
+                if cand_seg in ("vacancy", "client_reels", "vacancy_assisted"):
+                    if not vac_cfg.get("enabled", False):
+                        continue
+                    cand["segment"] = cand_seg
+                    cand["language"] = cand_lang
+                    has_msg = _has_messenger_contact(
+                        username=cand.get("username"),
+                        phone=cand.get("phone"),
+                        telegram_user_id=cand.get("telegram_user_id"),
+                    )
+                    if has_msg or (cand_seg == "vacancy_assisted" and cand.get("manual_action_url")):
+                        leads.append(cand)
+                    continue
+
+                if not b2b_cfg.get("enabled", True):
+                    continue
+
                 if not cand.get("project") and cand.get("company"):
                     cand["project"] = cand["company"]
                 best_url = pick_best_product_url(cand)
@@ -1348,11 +1910,24 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     roles_set.add(str(cand["role"]).strip())
                 if roles_set and not (roles_set & {"Founder", "Marketing"}) and (roles_set & NON_BUYER_ROLES):
                     continue
+
+                is_manual_social = cand_seg == "social_manual"
                 if not _has_messenger_contact(
                     username=cand.get("username"),
                     phone=cand.get("phone"),
                     telegram_user_id=cand.get("telegram_user_id"),
                 ):
+                    if is_manual_social and (
+                        cand.get("manual_action_url")
+                        or cand.get("x_url")
+                        or cand.get("linkedin_url")
+                        or cand.get("founder_linkedin")
+                        or cand.get("instagram_url")
+                    ):
+                        cand["segment"] = "social_manual"
+                        cand["language"] = cand_lang
+                        leads.append(cand)
+                        continue
                     append_direct_x_lead(
                         state_dir,
                         {
@@ -1373,6 +1948,29 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     continue
 
                 built = _crm_mcp_push.build_lead_payload_from_dict(cand, touch_mode=touch_mode_val)
+                for v2_key in (
+                    "segment",
+                    "language",
+                    "exclude_from_airtable",
+                    "company_domain",
+                    "pool_usd",
+                    "bounty_usd",
+                    "secondary_contact_json",
+                    "secondary_contact",
+                    "manual_action_url",
+                    "manual_draft_text",
+                    "icp_score",
+                    "source",
+                ):
+                    if cand.get(v2_key) is not None and v2_key not in built:
+                        built[v2_key] = cand[v2_key]
+                if not built.get("segment"):
+                    built["segment"] = cand_seg
+                if not built.get("language"):
+                    built["language"] = cand_lang
+                if cand_seg == "whale" and not cand.get("step1_text") and not cand.get("first_touch"):
+                    for _k in ("first_touch", "step1_text", "followup_1", "step2_text", "followup_2", "step3_text"):
+                        built.pop(_k, None)
                 c_name, c_comp = clean_crm_lead_names(
                     built.get("name"), built.get("company"), built.get("url") or built.get("website")
                 )
@@ -1419,37 +2017,47 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
 
         if leads and b2b_limit > 0:
             batch = leads[:b2b_limit]
-            tg_leads = [l for l in batch if str(l.get("provider") or "telegram") != "whatsapp"]
-            wa_leads = [l for l in batch if str(l.get("provider") or "") == "whatsapp"]
-            if tg_leads:
-                target_tg_camp = resolve_target_b2b_tg_campaign_name(
-                    conn,
-                    b2b_cfg.get("target_campaign_tg"),
-                    fallback_default="Leadgen Auto (TG)",
+            routed_buckets: dict[tuple[str, bool, str, str], list[dict[str, Any]]] = {}
+            for item in batch:
+                route = route_lead(item, cfg=cfg)
+                item.setdefault("segment", route.segment)
+                item.setdefault("language", route.language)
+                target_camp = route.target_campaign
+                if is_legacy_baza_vse2_name(target_camp):
+                    target_camp = CAMPAIGN_WHALES_EN_TG
+                is_manual_q = route.segment in ("social_manual", "vacancy_assisted") or target_camp in (
+                    QUEUE_MANUAL_SOCIAL,
+                    QUEUE_ASSISTED_JOB,
                 )
-                added_tg, created_tg = _ingest_leads_without_campaign_limit_mutation(
+                do_enroll = bool(cfg.get("auto_push_to_crm", True) and not is_manual_q)
+                key = (target_camp, do_enroll, route.provider, route.segment)
+                routed_buckets.setdefault(key, []).append(item)
+
+            for (t_camp, do_enroll, t_prov, t_seg), bucket_leads in routed_buckets.items():
+                if t_seg == "ru_expert":
+                    q_val = max(0, min(500, int(ru_exp_cfg.get("daily_limit") or 20)))
+                    s_list = ["ru_experts"]
+                elif t_seg in ("vacancy", "client_reels"):
+                    v_lim_raw = max(0, min(500, int(vac_cfg.get("daily_limit") or 20)))
+                    q_val = min(v_lim_raw, DEFAULT_WA_DAILY_LIMIT) if t_prov == "whatsapp" else v_lim_raw
+                    s_list = vac_enabled_layers
+                elif t_prov == "whatsapp":
+                    q_val = min(b2b_quota_default, DEFAULT_WA_DAILY_LIMIT)
+                    s_list = b2b_enabled_sources
+                else:
+                    q_val = b2b_quota_default
+                    s_list = b2b_enabled_sources
+                added_b, created_b = _ingest_leads_without_campaign_limit_mutation(
                     conn,
                     call_mcp_tool_handler=call_mcp_tool_handler,
-                    leads_slice=tg_leads,
-                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
-                    campaign_name=target_tg_camp,
-                    default_quota=b2b_quota_default,
-                    default_sources=b2b_enabled_sources,
+                    leads_slice=bucket_leads,
+                    enroll_in_campaign=do_enroll,
+                    campaign_name="" if not do_enroll else t_camp,
+                    default_quota=q_val,
+                    default_sources=s_list,
                 )
-                ingested_total += added_tg
-                campaigns_created += created_tg
-            if wa_leads:
-                added_wa, created_wa = _ingest_leads_without_campaign_limit_mutation(
-                    conn,
-                    call_mcp_tool_handler=call_mcp_tool_handler,
-                    leads_slice=wa_leads,
-                    enroll_in_campaign=bool(cfg.get("auto_push_to_crm", True)),
-                    campaign_name=str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)"),
-                    default_quota=b2b_quota_default,
-                    default_sources=b2b_enabled_sources,
-                )
-                ingested_total += added_wa
-                campaigns_created += created_wa
+                ingested_total += added_b
+                campaigns_created += created_b
 
     # 3. OFM review leads -> separate isolated OFM campaign (only when explicitly enabled)
     ofm_path = state_dir / "ofm_review_leads.jsonl"
@@ -1457,7 +2065,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
         from app.hygiene import _normalize_ofm_review_record, _ofm_review_canonical_keys
         from leadgen.outreach_copy import build_ofm_vlad_copy_batch
 
-        ofm_camp_name = str(b2b_cfg.get("target_campaign_ofm") or "SoftUGC — OFM (TG)").strip() or "SoftUGC — OFM (TG)"
+        ofm_camp_name = str(b2b_cfg.get("target_campaign_ofm") or CAMPAIGN_OFM_TG).strip() or CAMPAIGN_OFM_TG
         ofm_daily_lim = max(1, min(500, int(b2b_cfg.get("ofm_daily_limit") or 25)))
         ofm_push_cap = max(100, ofm_daily_lim)
         wm_ofm = wm.setdefault("ofm_files", {})
@@ -1533,6 +2141,8 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                             "category": "OFM / AI UGC",
                             "lead_source": norm.get("source") or "ofm_tg",
                             "source": norm.get("source") or "ofm_tg",
+                            "segment": "ofm",
+                            "language": "en",
                             "ofm_tier": norm.get("ofm_tier") or "traffic_buyer",
                             "icp_score": int(norm.get("icp_score") or 90),
                             "their_angle": sig_tag,

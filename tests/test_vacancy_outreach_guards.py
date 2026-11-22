@@ -83,7 +83,8 @@ def test_vacancies_disabled_by_default_across_backend_json_and_ui(
         sync_res = sync_leadgen_campaigns(conn, cfg)
         synced_names = [c["name"] for c in sync_res["campaigns"]]
         assert "TG Вакансии" not in synced_names
-        assert any("Leadgen Auto (TG)" in n or "SoftUGC" in n for n in synced_names)
+        assert "Whales EN — TG" in synced_names
+        assert "Whales EN — WA" in synced_names
 
         # Frontend JS state and HTML checkbox must also default to disabled
         app_js = (_WORKTREE_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")

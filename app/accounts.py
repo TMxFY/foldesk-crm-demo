@@ -101,9 +101,18 @@ def _is_nodemaven_configured(conn=None) -> bool:
     return bool(user and pwd)
 
 
+def _coerce_account_daily_limit(raw_val: object, default: int = 20) -> int:
+    if raw_val is None:
+        return default
+    try:
+        return max(0, int(raw_val))
+    except (TypeError, ValueError):
+        return default
+
+
 def _public(row: dict, *, nodemaven_configured: bool | None = None) -> dict:
     today = utc_today()
-    daily_limit = int(row.get("daily_limit") or 20)
+    daily_limit = _coerce_account_daily_limit(row.get("daily_limit"), 20)
     sent_today = int(row.get("sent_today") or 0) if row.get("sent_date") == today else 0
     session_path = str(row.get("session_path") or "")
     is_demo = session_path.startswith("data/sessions/demo")
@@ -224,7 +233,7 @@ def update_account_settings(
     has_proxy: bool = False,
 ) -> dict:
     current = _load(conn, account_id)
-    new_limit = int(current.get("daily_limit") or 20)
+    new_limit = _coerce_account_daily_limit(current.get("daily_limit"), 20)
     if daily_limit is not None:
         if isinstance(daily_limit, bool) or not isinstance(daily_limit, int) or not (1 <= int(daily_limit) <= 500):
             raise ValueError("Лимит должен быть от 1 до 500 сообщений в сутки")
@@ -506,7 +515,7 @@ def purge_dead_accounts(conn, gateway=None) -> dict:
 def check_daily_limit(conn, account_id: int) -> tuple[int, int]:
     row = _load(conn, account_id)
     today = utc_today()
-    daily_limit = int(row.get("daily_limit") or 20)
+    daily_limit = _coerce_account_daily_limit(row.get("daily_limit"), 20)
     if row.get("sent_date") != today:
         conn.execute(
             "UPDATE accounts SET sent_today = 0, sent_date = ?, updated_at = ? WHERE id = ?",
@@ -689,7 +698,7 @@ def compute_account_pool_summary(
         acc_id = int(row["id"])
         health_norm = str(row.get("health") or "active").strip().lower()
         provider_norm = str(row.get("provider") or "telegram").strip().lower()
-        limit_val = max(0, int(row.get("daily_limit") or 20))
+        limit_val = _coerce_account_daily_limit(row.get("daily_limit"), 20)
         sent_val = int(row.get("sent_today") or 0) if row.get("sent_date") == today else 0
         in_cd = acc_id in cooldown_ids
 
@@ -1677,10 +1686,12 @@ def import_session_accounts(conn, gateway, payload: dict) -> list[dict]:
             str(entry.get("access_scope") or default_scope or "workspace").strip()
             or "workspace"
         )
-        try:
-            daily_limit = max(1, min(500, int(entry.get("daily_limit") or default_limit)))
-        except (TypeError, ValueError):
-            daily_limit = default_limit
+        raw_entry_dl = entry.get("daily_limit")
+        daily_limit = (
+            default_limit
+            if raw_entry_dl is None
+            else min(500, _coerce_account_daily_limit(raw_entry_dl, default_limit))
+        )
 
         raw_stem = stem or (f"wa_{phone_digits}" if provider == "whatsapp" else phone.lstrip("+"))
         safe_stem = re.sub(r"[^A-Za-z0-9_+-]", "", raw_stem) or f"session_{idx}"

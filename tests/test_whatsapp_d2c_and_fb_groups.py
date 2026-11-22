@@ -335,7 +335,7 @@ def test_fb_groups_extracts_anyapi_nested_output_and_whatsapp_crm_routing(tmp_pa
     assert wa_lead["lead_source"] == "d2c_whatsapp"
 
     wa_camp = conn.execute(
-        "SELECT id, name, status FROM campaigns WHERE name = 'Leadgen Auto (WA)'"
+        "SELECT id, name, status FROM campaigns WHERE name = 'Whales EN — WA'"
     ).fetchone()
     assert wa_camp is not None
     assert wa_camp["status"] == "draft"
@@ -353,7 +353,8 @@ def test_fb_groups_extracts_anyapi_nested_output_and_whatsapp_crm_routing(tmp_pa
     status = get_leadgen_status(conn)
     assert status["whatsapp_leads_count"] == 2
     assert status["crm_leadgen_counts"]["whatsapp_leads_count"] == 2
-    assert status["crm_leadgen_counts"]["b2b_leads"] == 0
+    assert status["crm_leadgen_counts"]["whales_leads"] == 2
+    assert status["crm_leadgen_counts"]["b2b_leads"] == 2
     conn.close()
 
 

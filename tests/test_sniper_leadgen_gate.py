@@ -233,12 +233,16 @@ def test_creator_external_buyer_catalogs_and_meta_ads_sniper_defaults(monkeypatc
     )
     assert buyer_catalogs.parse_catalog("devforum", devforum_json, "https://devforum.roblox.com/c/82.json") == []
 
-    # 4) meta_ad_leads covers all 4 golden clusters
+    # 4) meta_ad_leads bans gaming/roblox/fortnite/fivem and covers high-LTV whale clusters
     joined_queries = " | ".join(meta_ad_leads.SEARCH_QUERIES).lower()
-    assert "roblox" in joined_queries
+    for banned_q in ("roblox", "fortnite", "fivem"):
+        assert banned_q not in joined_queries, (
+            f"Banned low-LTV gaming query {banned_q!r} leaked into meta_ad_leads.SEARCH_QUERIES"
+        )
     assert any(k in joined_queries for k in ("astrology", "coaching", "language", "fitness"))
     assert any(k in joined_queries for k in ("skincare", "supplement", "cosmetic", "household", "detergent", "shopify"))
     assert any(k in joined_queries for k in ("crypto wallet", "prop trading", "portfolio"))
+    assert any(k in joined_queries for k in ("high ticket coaching", "mastermind", "executive coaching", "mentorship"))
 
 
 def test_tg_enrich_leads_parallel_threadpool_5s_timeout_and_monetization_xray(monkeypatch):
@@ -569,7 +573,7 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
     )
     create_campaign(
         conn,
-        name="SoftUGC — База Все2",
+        name="Whales EN — TG",
         daily_limit=50,
         status="running",
         steps=DEFAULT_B2B_STEPS,

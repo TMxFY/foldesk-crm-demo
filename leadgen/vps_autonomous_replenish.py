@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
+from collections.abc import Mapping
+import concurrent.futures
 import copy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -35,12 +39,51 @@ from app.db import ROOT, as_dict, connect, init_db, resolve_session, utc_now
 from app.leadgen_settings import (
     _clean_chat_list,
     _resolve_state_dir,
+    find_existing_softugc_tg_campaign,
     get_leadgen_config,
     push_discovered_now,
     resolve_target_b2b_tg_campaign_name,
 )
-from app.outreach import preview_outreach_batch
-from leadgen.supply_side import sanitize_person_and_company, sniper_reject_reason
+from app.leads import create_lead as crm_create_lead
+from app.outreach import create_campaign, preview_outreach_batch
+from leadgen.budget_guard import (
+    EnrichmentBudgetState,
+    check_balances_and_alert,
+    check_and_reserve_budget,
+    record_enrichment_spend,
+)
+from leadgen.contact_waterfall import enrich_lead_contacts
+from leadgen.freelance_monitors import monitor_all_sources
+from leadgen.hh_vacancies import collect_hh_vacancies
+from leadgen.language_router import (
+    CAMPAIGN_OFM_TG,
+    CAMPAIGN_RU_EXPERTS_TG,
+    CAMPAIGN_VACANCY_EN_TG,
+    CAMPAIGN_VACANCY_RU_TG,
+    CAMPAIGN_VACANCY_RU_WA,
+    CAMPAIGN_WHALES_EN_TG,
+    CAMPAIGN_WHALES_EN_WA,
+    QUEUE_ASSISTED_JOB,
+    QUEUE_MANUAL_SOCIAL,
+    detect_lead_language,
+    detect_lead_segment,
+    resolve_target_campaign,
+    route_lead,
+)
+from leadgen.linkedin_jobs import collect as collect_linkedin_jobs
+from leadgen.outreach_copy import build_outreach_sequence, resolve_copy_profile
+from leadgen.phone_messenger_resolver import (
+    ResolvedMessenger,
+    merge_resolved_messengers,
+    normalize_e164,
+    resolve_phones_telegram,
+    resolve_phones_whatsapp,
+    route_resolved_lead,
+)
+from leadgen.ru_experts import discover_ru_experts
+from leadgen.supply_side import sanitize_person_and_company, sniper_reject_reason, whale_icp_reject_reason
+from leadgen.tg_group_admins import extract_brand_tg_admins, extract_tg_group_handles_from_row
+from leadgen.tg_identity_bridge import bridge_lead_to_telegram
 from leadgen.tg_to_gsheet import (
     admit_discovered_row,
     apply_master_merge,
@@ -213,12 +256,19 @@ def _direct_x_dedup_keys(row: dict[str, Any]) -> list[str]:
     return keys
 
 
-def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict[str, int]:
-    """Keep TG/WA leads (icp_score >= 80) in final_jsonl; move Email/X/LinkedIn-only leads to direct_x_leads.jsonl."""
+def split_tg_and_direct_x_leads(
+    final_jsonl: Path,
+    direct_x_jsonl: Path,
+    manual_social_jsonl: Path | None = None,
+) -> dict[str, int]:
+    """Keep TG/WA leads (icp_score >= 80) in final_jsonl; preserve manual social & Direct/X queues."""
     if not final_jsonl.is_file() or final_jsonl.stat().st_size == 0:
         if final_jsonl.is_file():
             final_jsonl.unlink(missing_ok=True)
-        return {"tg_wa_kept": 0, "direct_x_added": 0, "dropped": 0}
+        empty_res = {"tg_wa_kept": 0, "direct_x_added": 0, "dropped": 0}
+        if manual_social_jsonl is not None:
+            empty_res["social_manual_added"] = 0
+        return empty_res
 
     existing_dx_keys: set[str] = set()
     if direct_x_jsonl.is_file():
@@ -235,6 +285,7 @@ def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict
 
     tg_wa_rows: list[dict[str, Any]] = []
     new_direct_x_rows: list[dict[str, Any]] = []
+    manual_social_rows: list[dict[str, Any]] = []
     dropped = 0
 
     for raw_line in final_jsonl.read_text(encoding="utf-8").splitlines():
@@ -292,6 +343,11 @@ def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict
             tg_wa_rows.append(row)
             continue
 
+        # Preserve Manual Social Queue rows routed by phone_messenger_resolver (X/LinkedIn/IG ICP >= 85)
+        if str(row.get("segment") or "").strip().lower() == "social_manual" and str(row.get("manual_action_url") or "").strip():
+            manual_social_rows.append(row)
+            continue
+
         # No personal TG and no WhatsApp -> check Direct/X channels
         row["username"] = ""
         row.pop("telegram_username", None)
@@ -335,6 +391,12 @@ def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict
             for dx_row in new_direct_x_rows:
                 dxfh.write(json.dumps(dx_row, ensure_ascii=False) + "\n")
 
+    if manual_social_rows and manual_social_jsonl is not None:
+        manual_social_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with manual_social_jsonl.open("a", encoding="utf-8") as msfh:
+            for ms_row in manual_social_rows:
+                msfh.write(json.dumps(ms_row, ensure_ascii=False) + "\n")
+
     if tg_wa_rows:
         final_jsonl.write_text(
             "\n".join(json.dumps(r, ensure_ascii=False) for r in tg_wa_rows) + "\n",
@@ -343,11 +405,14 @@ def split_tg_and_direct_x_leads(final_jsonl: Path, direct_x_jsonl: Path) -> dict
     else:
         final_jsonl.unlink(missing_ok=True)
 
-    return {
+    split_out = {
         "tg_wa_kept": len(tg_wa_rows),
         "direct_x_added": len(new_direct_x_rows),
         "dropped": dropped,
     }
+    if manual_social_jsonl is not None:
+        split_out["social_manual_added"] = len(manual_social_rows)
+    return split_out
 
 
 def _norm_quarantine_token(raw: Any) -> str:
@@ -1158,10 +1223,1460 @@ def _release_replenish_lock(lock_fh: Any | None) -> None:
         pass
 
 
+def _run_coro_sync(coro: Any) -> Any:
+    """Execute a coroutine from synchronous code safely even inside an active loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _call_with_supported_kwargs(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Invoke ``fn`` passing only keyword arguments it explicitly accepts unless ``**kwargs`` is present."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(*args, **kwargs)
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if accepts_var_kw:
+        return fn(*args, **kwargs)
+    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(*args, **filtered)
+
+
+def _with_isolated_tg_client(
+    session_path: Path | None,
+    work_coro_factory: Callable[[Any], Any],
+) -> Any:
+    """Run ``work_coro_factory(client)`` using a headless non-interactive Telethon session."""
+    if session_path is None or not session_path.is_file():
+        return None
+    raw_api_id = str(os.environ.get("TG_API_ID") or "").strip()
+    api_hash = str(os.environ.get("TG_API_HASH") or "").strip()
+    if not raw_api_id.isdigit() or not api_hash:
+        return None
+    try:
+        from telethon import TelegramClient
+    except ImportError as exc:
+        logger.debug("Telethon unavailable for isolated session %s: %s", session_path, exc)
+        return None
+
+    async def _runner() -> Any:
+        client = TelegramClient(str(session_path), int(raw_api_id), api_hash)
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                logger.warning("Isolated Telethon session not authorized: %s", session_path)
+                return None
+            return await work_coro_factory(client)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception as exc:
+                logger.debug("Telethon disconnect cleanup warning (%s): %s", session_path, exc)
+
+    return _run_coro_sync(_runner())
+
+
+def run_contact_waterfall_with_budget(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    cfg: Mapping[str, Any] | None = None,
+    budget_state: EnrichmentBudgetState | None = None,
+    treg_balance_fn: Callable[[], Any] | None = None,
+    monid_balance_fn: Callable[[], Any] | None = None,
+    notify_fn: Callable[[str], Any] | None = None,
+    enrich_fn: Callable[..., dict[str, Any]] | None = None,
+    http_get_fn: Callable[..., Any] | None = None,
+    treg_fn: Callable[..., Any] | None = None,
+    monid_fn: Callable[..., Any] | None = None,
+    dm_finder_fn: Callable[[str, str], dict[str, Any]] | None = None,
+    dm_multi_finder_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    tg_bridge_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], EnrichmentBudgetState]:
+    """Check balances/daily cap first, then run contact_waterfall with budget_guard_fn and ledger spend tracking."""
+    state = (
+        budget_state
+        if budget_state is not None
+        else check_balances_and_alert(
+            conn,
+            cfg=cfg,
+            treg_balance_fn=treg_balance_fn,
+            monid_balance_fn=monid_balance_fn,
+            notify_fn=notify_fn,
+        )
+    )
+    if not rows:
+        return [], state
+
+    def _guard_fn(provider: str = "treg", *rest: Any, estimated_cost: float = 0.0, **kwargs: Any) -> bool:
+        if not state.paid_allowed:
+            return False
+        if len(rest) == 1 and isinstance(rest[0], (int, float)):
+            est_cost = float(rest[0])
+        elif len(rest) >= 2 and isinstance(rest[1], (int, float)):
+            est_cost = float(rest[1])
+        else:
+            est_cost = float(estimated_cost or 0.0)
+        ok, _reason = check_and_reserve_budget(
+            conn,
+            provider=provider,
+            estimated_cost=est_cost,
+            cfg=cfg,
+        )
+        return ok
+
+    def _cost_fn(
+        *,
+        provider: str,
+        endpoint: str = "",
+        lead_key: str = "",
+        cost_usd: float = 0.0,
+        hit: bool = False,
+    ) -> None:
+        record_enrichment_spend(
+            conn,
+            provider=provider,
+            endpoint=endpoint,
+            lead_key=lead_key,
+            cost_usd=cost_usd,
+            hit=hit,
+        )
+
+    active_enrich = enrich_lead_contacts if enrich_fn is None else enrich_fn
+    eff_treg_fn = treg_fn if state.paid_allowed else (lambda *args, **kwargs: {})
+    eff_monid_fn = monid_fn if state.paid_allowed else (lambda *args, **kwargs: {})
+
+    def _budgeted_tg_bridge(row_arg: dict[str, Any]) -> dict[str, Any]:
+        return _call_with_supported_kwargs(
+            bridge_lead_to_telegram,
+            row_arg,
+            allow_paid=bool(state.paid_allowed),
+            budget_guard_fn=_guard_fn,
+            cost_record_fn=_cost_fn,
+            treg_fn=eff_treg_fn,
+            monid_fn=eff_monid_fn,
+        )
+
+    eff_tg_bridge_fn = tg_bridge_fn if tg_bridge_fn is not None else _budgeted_tg_bridge
+    out_rows: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        enriched = _call_with_supported_kwargs(
+            active_enrich,
+            item,
+            allow_paid_tier2=bool(state.paid_allowed),
+            budget_guard_fn=_guard_fn,
+            cost_record_fn=_cost_fn,
+            cfg=cfg,
+            http_get_fn=http_get_fn,
+            treg_fn=eff_treg_fn,
+            monid_fn=eff_monid_fn,
+            dm_finder_fn=dm_finder_fn,
+            dm_multi_finder_fn=dm_multi_finder_fn,
+            tg_bridge_fn=eff_tg_bridge_fn,
+        )
+        out_rows.append(dict(enriched) if isinstance(enriched, Mapping) else item)
+    return out_rows, state
+
+
+def enrich_whales_with_tg_group_admins(
+    rows: list[dict[str, Any]],
+    *,
+    client: Any = None,
+    scraper_session: Path | None = None,
+    admin_extractor_fn: Callable[..., Any] | None = None,
+    max_admins: int = 10,
+    max_results: int = 2,
+    max_groups: int = 25,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Layer 0 ($0): Resolve personal TG admins for whale rows linking TG communities."""
+    stats = {"groups_checked": 0, "admins_resolved": 0, "leads_promoted": 0}
+    if not rows:
+        return [], stats
+
+    targets: list[tuple[int, list[str]]] = []
+    for idx, row in enumerate(rows):
+        if _is_real_personal_tg_handle(row.get("username") or row.get("telegram_username")):
+            continue
+        handles = extract_tg_group_handles_from_row(row)
+        if handles:
+            targets.append((idx, handles))
+
+    if not targets:
+        return [dict(r) for r in rows], stats
+
+    out_rows = [dict(r) for r in rows]
+
+    async def _resolve_with_client(active_client: Any) -> dict[str, list[Any]]:
+        cache: dict[str, list[Any]] = {}
+        for _idx, handles in targets:
+            for handle in handles:
+                key = handle.lower()
+                if key in cache:
+                    continue
+                if len(cache) >= max_groups:
+                    break
+                stats["groups_checked"] += 1
+                try:
+                    if admin_extractor_fn is not None:
+                        res = admin_extractor_fn(active_client, handle)
+                        admins = await res if inspect.isawaitable(res) else res
+                    else:
+                        admins = await extract_brand_tg_admins(
+                            active_client,
+                            handle,
+                            max_admins=max_admins,
+                            max_results=max_results,
+                        )
+                    cache[key] = list(admins or [])
+                except Exception as exc:
+                    logger.debug("extract_brand_tg_admins failed for %s: %s", handle, exc)
+                    cache[key] = []
+        return cache
+
+    resolved_by_group: dict[str, list[Any]] = {}
+    if admin_extractor_fn is not None or client is not None:
+        resolved_by_group = _run_coro_sync(_resolve_with_client(client)) or {}
+    elif scraper_session is not None and scraper_session.is_file():
+        resolved_by_group = (
+            _with_isolated_tg_client(scraper_session, _resolve_with_client) or {}
+        )
+
+    for idx, handles in targets:
+        row = out_rows[idx]
+        if _is_real_personal_tg_handle(row.get("username") or row.get("telegram_username")):
+            continue
+        for handle in handles:
+            admins = resolved_by_group.get(handle.lower()) or []
+            if not admins:
+                continue
+            top = admins[0]
+            top_u = str(getattr(top, "username", "") or (top.get("username") if isinstance(top, Mapping) else "")).strip().lstrip("@")
+            if not top_u:
+                continue
+            stats["admins_resolved"] += len(admins)
+            stats["leads_promoted"] += 1
+            row["username"] = top_u
+            row["telegram_username"] = top_u
+            top_uid = getattr(top, "user_id", None) if not isinstance(top, Mapping) else top.get("user_id")
+            if top_uid is not None:
+                row["telegram_user_id"] = int(top_uid)
+            row["provider"] = "telegram"
+            top_role = getattr(top, "role_guess", "") if not isinstance(top, Mapping) else top.get("role_guess", "")
+            if top_role:
+                row["tg_admin_role"] = str(top_role)
+            row["tg_admin_group"] = str(handle)
+            row["tg_bridge_match"] = row.get("tg_bridge_match") or "tg_group_admins"
+            if len(admins) > 1 and not row.get("secondary_contact_json"):
+                sec = admins[1]
+                sec_u = str(getattr(sec, "username", "") or (sec.get("username") if isinstance(sec, Mapping) else "")).strip().lstrip("@")
+                if sec_u and sec_u.lower() != top_u.lower():
+                    sec_role = getattr(sec, "role_guess", "") if not isinstance(sec, Mapping) else sec.get("role_guess", "")
+                    row["secondary_contact_json"] = json.dumps(
+                        {"username": sec_u, "role": str(sec_role or "Admin"), "provider": "telegram"},
+                        ensure_ascii=False,
+                    )
+            break
+    return out_rows, stats
+
+
+def find_connected_wa_session(conn: sqlite3.Connection) -> str:
+    """Return session_path for a healthy connected WhatsApp account in DB, else ''."""
+    rows = conn.execute(
+        """
+        SELECT session_path, status, health
+        FROM accounts
+        WHERE lower(COALESCE(provider, 'telegram')) = 'whatsapp'
+          AND lower(COALESCE(status, '')) = 'connected'
+          AND lower(COALESCE(health, 'active')) NOT IN ('offline', 'unauthorized', 'disconnected', 'dead', 'banned', 'frozen', 'flood_wait')
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for r in rows:
+        raw_path = str(r["session_path"] or "").strip()
+        if not raw_path:
+            continue
+        return resolve_session(raw_path)
+    return ""
+
+
+def find_phone_checker_session(
+    conn: sqlite3.Connection,
+    sessions_dir: Path | str | None = None,
+) -> Path | None:
+    """Strictly locate a dedicated isolated `phone_checker_*.session` file; never use outreach sessions."""
+    base_dir = Path(sessions_dir or DEFAULT_SCRAPER_SESSIONS_DIR)
+    if not base_dir.is_dir():
+        return None
+    for cand in sorted(base_dir.glob("phone_checker_*.session")):
+        if not cand.is_file():
+            continue
+        try:
+            validated = validate_isolated_scraper_session(conn, cand)
+            if validated is not None and validated.is_file():
+                return validated
+        except ValueError as exc:
+            logger.warning("Rejected non-isolated phone_checker session %s: %s", cand, exc)
+            continue
+    return None
+
+
+def resolve_and_route_phone_leads(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    cfg: Mapping[str, Any] | None = None,
+    wa_gateway: Any = None,
+    wa_session_path: str | None = None,
+    checker_session_path: Path | str | None = None,
+    tg_checker_client: Any = None,
+    scraper_sessions_dir: Path | str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Layer 2 ($0): Verify discovered E.164 phones on WA + dedicated TG checker, then route TG > WA > social_manual."""
+    stats = {
+        "phones_checked": 0,
+        "wa_verified": 0,
+        "tg_verified": 0,
+        "routed_telegram": 0,
+        "routed_whatsapp": 0,
+        "routed_wa_pending": 0,
+        "routed_social_manual": 0,
+    }
+    if not rows:
+        return [], stats
+
+    unique_phones: list[str] = []
+    seen_phones: set[str] = set()
+    for row in rows:
+        if _is_real_personal_tg_handle(row.get("username") or row.get("telegram_username")):
+            continue
+        raw_p = str(row.get("phone") or row.get("mobile_phone") or row.get("whatsapp") or "").strip()
+        e164 = normalize_e164(raw_p)
+        if e164 and e164 not in seen_phones:
+            seen_phones.add(e164)
+            unique_phones.append(e164)
+
+    stats["phones_checked"] = len(unique_phones)
+    whales_cfg = (cfg or {}).get("whales") if isinstance(cfg, Mapping) and isinstance((cfg or {}).get("whales"), Mapping) else {}
+    daily_lim = int(whales_cfg.get("phone_tg_checker_daily_limit") or 120)
+    batch_sz = int(whales_cfg.get("phone_tg_checker_batch_size") or 15)
+
+    wa_results: dict[str, ResolvedMessenger] = {}
+    tg_results: dict[str, ResolvedMessenger] = {}
+
+    if unique_phones:
+        eff_wa_sess = str(wa_session_path or "").strip() or find_connected_wa_session(conn)
+        if eff_wa_sess:
+            active_gw = wa_gateway
+            if active_gw is None and Path(eff_wa_sess).exists():
+                try:
+                    from app.whatsapp_gateway import WhatsAppGateway
+
+                    active_gw = WhatsAppGateway()
+                except Exception as exc:
+                    logger.debug("WhatsAppGateway unavailable for phone check: %s", exc)
+                    active_gw = None
+            if active_gw is not None:
+                wa_results = _run_coro_sync(
+                    resolve_phones_whatsapp(active_gw, eff_wa_sess, unique_phones)
+                ) or {}
+
+        checker_sess: Path | None = None
+        if checker_session_path is not None:
+            cand_p = Path(checker_session_path)
+            if cand_p.name.startswith("phone_checker_") and cand_p.suffix == ".session" and cand_p.is_file():
+                checker_sess = validate_isolated_scraper_session(conn, cand_p)
+        else:
+            checker_sess = find_phone_checker_session(conn, scraper_sessions_dir)
+
+        if checker_sess is not None and checker_sess.is_file():
+            if tg_checker_client is not None:
+                tg_results = _run_coro_sync(
+                    resolve_phones_telegram(
+                        tg_checker_client,
+                        unique_phones,
+                        batch_size=batch_sz,
+                        daily_limit=daily_lim,
+                        pause_s=0.0,
+                        is_checker_session=True,
+                    )
+                ) or {}
+            else:
+                tg_results = _with_isolated_tg_client(
+                    checker_sess,
+                    lambda cli: resolve_phones_telegram(
+                        cli,
+                        unique_phones,
+                        batch_size=batch_sz,
+                        daily_limit=daily_lim,
+                        is_checker_session=True,
+                    ),
+                ) or {}
+
+    stats["wa_verified"] = sum(1 for v in wa_results.values() if v.whatsapp_exists)
+    stats["tg_verified"] = sum(1 for v in tg_results.values() if v.telegram_username)
+    merged = merge_resolved_messengers(wa_results, tg_results)
+
+    routed_rows: list[dict[str, Any]] = []
+    for row in rows:
+        lang = str(row.get("language") or "").strip().lower() or detect_lead_language(row)
+        routed = route_resolved_lead(row, merged, language=lang)
+        if str(routed.get("segment") or "").strip().lower() == "social_manual":
+            stats["routed_social_manual"] += 1
+        elif str(routed.get("provider") or "").strip().lower() == "telegram" and routed.get("username"):
+            stats["routed_telegram"] += 1
+        elif str(routed.get("provider") or "").strip().lower() == "whatsapp" and not routed.get("wa_check_pending"):
+            stats["routed_whatsapp"] += 1
+        elif routed.get("wa_check_pending"):
+            stats["routed_wa_pending"] += 1
+        routed_rows.append(routed)
+
+    return routed_rows, stats
+
+
+def _resolve_vac_jobs_session(
+    conn: sqlite3.Connection,
+    vac_cfg: Mapping[str, Any],
+    isolated_session: Path | None,
+    *,
+    sessions_dir: Path | str | None = None,
+) -> Path | None:
+    """Resolve isolated Telegram session for VPS `job_monitor` without falling back to outreach sessions."""
+    raw_cfg_sess = str(vac_cfg.get("vps_scraper_session") or "").strip()
+    if raw_cfg_sess:
+        cand = Path(os.path.expanduser(raw_cfg_sess))
+        if cand.is_file():
+            return validate_isolated_scraper_session(conn, cand)
+    if isolated_session is not None and isolated_session.is_file():
+        return isolated_session
+    default_jobs = Path(sessions_dir or DEFAULT_SCRAPER_SESSIONS_DIR) / "jobs_reader.session"
+    if default_jobs.is_file():
+        return validate_isolated_scraper_session(conn, default_jobs)
+    return None
+
+
+class _SafeDraftFormatDict(dict[str, str]):
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
+def _build_assisted_vacancy_draft(
+    row: Mapping[str, Any],
+    language: str,
+    *,
+    cfg: Mapping[str, Any] | None = None,
+) -> str:
+    """Build a short SoftUGC assisted outreach draft for job postings, applying editable_prompt_override."""
+    title = str(row.get("title") or row.get("role") or row.get("what_they_do") or "UGC / Short-Form role").strip()
+    company = str(row.get("company") or row.get("project") or row.get("name") or "").strip()
+    desc = str(row.get("description") or row.get("what_they_do") or "").strip()
+    url = str(row.get("manual_action_url") or row.get("job_url") or row.get("url") or "").strip()
+    vac_cfg = (cfg or {}).get("vacancies") if isinstance(cfg, Mapping) and isinstance((cfg or {}).get("vacancies"), Mapping) else {}
+    showcase_url = str(vac_cfg.get("showcase_url") or "https://tmxfy.github.io/").strip() or "https://tmxfy.github.io/"
+    override = str(vac_cfg.get("editable_prompt_override") or "").strip()
+    if override:
+        if "{" in override and "}" in override:
+            rendered = override.format_map(
+                _SafeDraftFormatDict(
+                    title=title,
+                    role=title,
+                    company=company,
+                    description=desc,
+                    showcase_url=showcase_url,
+                    url=url,
+                )
+            )
+        elif language == "ru":
+            head = f"Добрый день! По вакансии «{title}»" + (f" ({company})" if company else "") + "."
+            rendered = f"{head}\n\n{override}\n\nКейсы (SoftUGC): {showcase_url}"
+        else:
+            head_en = f"Hi! Saw your \"{title}\" opening" + (f" at {company}" if company else "") + "."
+            rendered = f"{head_en}\n\n{override}\n\nCases (SoftUGC): {showcase_url}"
+        return re.sub(r"\bcreator\s*os\b", "SoftUGC", rendered, flags=re.I).strip()
+
+    if language == "ru":
+        head = f"Добрый день! По вакансии «{title}»" + (f" ({company})" if company else "") + "."
+        return (
+            f"{head}\n\n"
+            "Внедряем AI UGC и системный продакшн Reels/Shorts/TikTok под ключ (SoftUGC): "
+            "консистентные AI-персонажи и серийный выпуск без затрат на съёмку.\n"
+            f"Портфолио и кейсы: {showcase_url} — могу собрать тестовый ролик 10–15 сек по вашему ТЗ."
+        )
+    head_en = f"Hi! Saw your \"{title}\" opening" + (f" at {company}" if company else "") + "."
+    return (
+        f"{head_en}\n\n"
+        "At SoftUGC we build scalable AI UGC & short-form video pipelines for TikTok, Reels, and Shorts "
+        f"with consistent AI creators and fast weekly hook testing (cases: {showcase_url}). "
+        "Happy to share a quick 10-15s sample tailored to your product."
+    )
+
+
+def run_wave2_vacancies_pipeline(
+    conn: sqlite3.Connection,
+    *,
+    cfg: Mapping[str, Any],
+    state_dir: Path,
+    isolated_session: Path | None,
+    has_llm_key: bool,
+    budget_state: EnrichmentBudgetState,
+    runner: Callable[..., Any],
+    exec_stage_fn: Callable[[str, list[str]], bool],
+    py_bin: str,
+    today_str: str,
+    sub_env: dict[str, str],
+    quarantined: set[str],
+    treg_ready: bool,
+    stage_errors: list[dict[str, Any]],
+    replenish_reasons: list[str],
+    hh_collector_fn: Callable[..., dict[str, Any]] | None = None,
+    freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
+    linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    http_get_fn: Callable[..., Any] | None = None,
+    waterfall_enrich_fn: Callable[..., dict[str, Any]] | None = None,
+    wa_gateway: Any = None,
+    tg_checker_client: Any = None,
+    scraper_sessions_dir: Path | str | None = None,
+    is_real_subprocess: bool | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Wave 2 Vacancy pipeline: TG job_monitor, hh.ru, Profi/Kwork/Upwork, LinkedIn Jobs -> waterfall -> language_router."""
+    vac_cfg = cfg.get("vacancies") if isinstance(cfg.get("vacancies"), Mapping) else {}
+    vac_sources = vac_cfg.get("sources") if isinstance(vac_cfg.get("sources"), Mapping) else {}
+    b2b_sources = (cfg.get("b2b") or {}).get("sources") if isinstance(cfg.get("b2b"), Mapping) else {}
+    b2b_sources = b2b_sources if isinstance(b2b_sources, Mapping) else {}
+    vac_limit = max(1, int(vac_cfg.get("daily_limit") or 20))
+    showcase_url = str(vac_cfg.get("showcase_url") or "https://tmxfy.github.io/").strip()
+
+    stats: dict[str, Any] = {
+        "tg_jobs_ran": False,
+        "hh_status": "skipped",
+        "hh_count": 0,
+        "freelance_status": "skipped",
+        "freelance_count": 0,
+        "freelance_sources": {},
+        "linkedin_jobs_count": 0,
+        "routed_vacancy": 0,
+        "routed_vacancy_assisted": 0,
+    }
+
+    # 1) TG job_monitor + job_reply (strictly isolated VPS jobs session)
+    vac_session = _resolve_vac_jobs_session(
+        conn,
+        vac_cfg,
+        isolated_session,
+        sessions_dir=scraper_sessions_dir,
+    )
+    if vac_sources.get("tg_chats", True) and "tg_chats" not in quarantined and vac_session is not None:
+        sub_env["TG_JOBS_SESSION"] = str(vac_session)
+        mon_out = state_dir / f"job_monitor_{today_str}.json"
+        rep_out = state_dir / f"job_replies_{today_str}.json"
+        exec_stage_fn(
+            "job_monitor",
+            [
+                py_bin,
+                str(WORKTREE_ROOT / "leadgen" / "job_monitor.py"),
+                "--hours",
+                "24",
+                "--out",
+                str(mon_out),
+            ],
+        )
+        stats["tg_jobs_ran"] = True
+        is_real_sub = (runner is None or runner is subprocess.run) if is_real_subprocess is None else bool(is_real_subprocess)
+        sub_env["BUDGET_PAID_ALLOWED"] = "1" if budget_state.paid_allowed else "0"
+        if has_llm_key and (
+            (mon_out.is_file() and mon_out.stat().st_size > 0)
+            or not is_real_sub
+        ):
+            exec_stage_fn(
+                "job_reply",
+                [
+                    py_bin,
+                    str(WORKTREE_ROOT / "leadgen" / "job_reply.py"),
+                    str(mon_out),
+                    "--out",
+                    str(rep_out),
+                    "--limit",
+                    str(vac_limit),
+                    "--no-crm",
+                ],
+            )
+
+    is_real_sub = (runner is None or runner is subprocess.run) if is_real_subprocess is None else bool(is_real_subprocess)
+    run_external_wave2 = is_real_sub or any(
+        fn is not None for fn in (hh_collector_fn, freelance_monitor_fn, linkedin_collector_fn, http_get_fn)
+    )
+    if not run_external_wave2:
+        return [], stats
+
+    raw_candidates: list[dict[str, Any]] = []
+
+    # 2) hh.ru API vacancies (works even when paid enrichment budget == $0)
+    custom_draft_tpl = str(vac_cfg.get("editable_prompt_override") or "").strip()
+    if vac_sources.get("hh_ru", True) and "hh_ru" not in quarantined:
+        try:
+            hh_res = (
+                _call_with_supported_kwargs(
+                    hh_collector_fn,
+                    limit=vac_limit,
+                    showcase_url=showcase_url,
+                    custom_draft_template=custom_draft_tpl,
+                    http_get_fn=http_get_fn,
+                    cfg=cfg,
+                )
+                if hh_collector_fn is not None
+                else collect_hh_vacancies(
+                    limit=vac_limit,
+                    showcase_url=showcase_url,
+                    custom_draft_template=custom_draft_tpl,
+                    http_get_fn=http_get_fn,
+                )
+            )
+        except Exception as exc:
+            stage_errors.append({"stage": "hh_vacancies", "error": str(exc), "at": utc_now()})
+            hh_res = {"status": "error", "rows": [], "error": str(exc)}
+        hh_status = str((hh_res or {}).get("status") or "error")
+        stats["hh_status"] = hh_status
+        if hh_status == "auth_required" and "hh_ru:auth_required" not in replenish_reasons:
+            replenish_reasons.append("hh_ru:auth_required")
+        hh_rows = list((hh_res or {}).get("rows") or [])
+        stats["hh_count"] = len(hh_rows)
+        raw_candidates.extend(hh_rows)
+
+    # 3) Profi.ru / Kwork / Upwork freelance monitors (free assisted feeds)
+    enabled_fl = [
+        src
+        for src in ("profi_ru", "kwork", "upwork")
+        if vac_sources.get(src, True) and src not in quarantined
+    ]
+    if enabled_fl:
+        custom_fl_map = {src: custom_draft_tpl for src in enabled_fl} if custom_draft_tpl else None
+        try:
+            fl_res = (
+                _call_with_supported_kwargs(
+                    freelance_monitor_fn,
+                    sources=tuple(enabled_fl),
+                    http_get_fn=http_get_fn,
+                    cfg=cfg,
+                    showcase_url=showcase_url,
+                    custom_template_by_source=custom_fl_map,
+                    max_items_per_source=vac_limit,
+                )
+                if freelance_monitor_fn is not None
+                else monitor_all_sources(
+                    sources=tuple(enabled_fl),
+                    http_get_fn=http_get_fn,
+                    cfg=cfg,
+                    showcase_url=showcase_url,
+                    custom_template_by_source=custom_fl_map,
+                    max_items_per_source=vac_limit,
+                )
+            )
+        except Exception as exc:
+            stage_errors.append({"stage": "freelance_monitors", "error": str(exc), "at": utc_now()})
+            fl_res = {"status": "error", "rows": [], "sources": {}}
+        stats["freelance_status"] = str((fl_res or {}).get("status") or "error")
+        fl_sources = dict((fl_res or {}).get("sources") or {})
+        stats["freelance_sources"] = {
+            k: str((v or {}).get("status") or "") for k, v in fl_sources.items()
+        }
+        for fl_src, fl_meta in fl_sources.items():
+            if str((fl_meta or {}).get("status") or "") == "blocked_by_antibot":
+                tag = f"{fl_src}:blocked_by_antibot"
+                if tag not in replenish_reasons:
+                    replenish_reasons.append(tag)
+        fl_rows = list((fl_res or {}).get("rows") or [])
+        stats["freelance_count"] = len(fl_rows)
+        raw_candidates.extend(fl_rows)
+
+    # 4) LinkedIn Jobs (when collector hook injected or treg CLI is ready + paid budget allows)
+    if (
+        vac_sources.get("linkedin_jobs", True)
+        and b2b_sources.get("linkedin_jobs", True)
+        and "linkedin_jobs" not in quarantined
+        and (linkedin_collector_fn is not None or treg_ready)
+    ):
+        if linkedin_collector_fn is None and not budget_state.paid_allowed:
+            if "budget_guard_skipped:linkedin_jobs" not in replenish_reasons:
+                replenish_reasons.append("budget_guard_skipped:linkedin_jobs")
+        else:
+            try:
+                li_rows = (
+                    linkedin_collector_fn()
+                    if linkedin_collector_fn is not None
+                    else collect_linkedin_jobs()
+                )
+            except Exception as exc:
+                stage_errors.append({"stage": "linkedin_jobs", "error": str(exc), "at": utc_now()})
+                li_rows = []
+            li_rows = list(li_rows or [])
+            stats["linkedin_jobs_count"] = len(li_rows)
+            raw_candidates.extend(li_rows)
+
+    if not raw_candidates:
+        return [], stats
+
+    # Enrich domain-bearing vacancy rows (LinkedIn Jobs & domain hh_ru) through budget-guarded contact_waterfall
+    enrich_indices: list[int] = []
+    enrich_batch: list[dict[str, Any]] = []
+    for idx, row in enumerate(raw_candidates):
+        has_tg = _is_real_personal_tg_handle(row.get("username") or row.get("telegram_username"))
+        has_dom = bool(str(row.get("company_domain") or row.get("project_url") or "").strip())
+        if not has_tg and has_dom:
+            enrich_indices.append(idx)
+            enrich_batch.append(row)
+
+    if enrich_batch:
+        wf_rows, _ = run_contact_waterfall_with_budget(
+            conn,
+            enrich_batch,
+            cfg=cfg,
+            budget_state=budget_state,
+            enrich_fn=waterfall_enrich_fn,
+            http_get_fn=http_get_fn,
+        )
+        for pos, wf_row in zip(enrich_indices, wf_rows):
+            raw_candidates[pos] = wf_row
+
+    # Layer 2 phone resolution on Wave 2 leads that yielded E.164 phone numbers
+    phone_candidates = [
+        r
+        for r in raw_candidates
+        if normalize_e164(str(r.get("phone") or r.get("whatsapp") or ""))
+        and not _is_real_personal_tg_handle(r.get("username") or r.get("telegram_username"))
+    ]
+    if phone_candidates:
+        routed_phones, _ = resolve_and_route_phone_leads(
+            conn,
+            raw_candidates,
+            cfg=cfg,
+            wa_gateway=wa_gateway,
+            tg_checker_client=tg_checker_client,
+            scraper_sessions_dir=scraper_sessions_dir,
+        )
+        raw_candidates = routed_phones
+
+    routed_vac_rows: list[dict[str, Any]] = []
+    for item in raw_candidates:
+        row = dict(item)
+        lang = str(row.get("language") or "").strip().lower() or detect_lead_language(row)
+        lang = "ru" if lang == "ru" else "en"
+        row["language"] = lang
+
+        has_tg = _is_real_personal_tg_handle(row.get("username") or row.get("telegram_username"))
+        wa = whatsapp_url(row.get("whatsapp") or "") or (
+            whatsapp_url(row.get("phone") or "")
+            if str(row.get("provider") or "").strip().lower() == "whatsapp"
+            and not bool(row.get("wa_check_pending"))
+            else ""
+        )
+        if has_tg:
+            row["username"] = str(row.get("username") or row.get("telegram_username") or "").strip().lstrip("@")
+            row["provider"] = "telegram"
+            row["segment"] = "vacancy"
+            if custom_draft_tpl:
+                row["step1_text"] = _build_assisted_vacancy_draft(row, lang, cfg=cfg)
+                row["first_touch"] = row["step1_text"]
+            stats["routed_vacancy"] += 1
+        elif wa:
+            wa_digits = re.sub(r"\D", "", wa)
+            row["whatsapp"] = f"https://wa.me/{wa_digits}"
+            row["phone"] = f"+{wa_digits}"
+            row["provider"] = "whatsapp"
+            row["segment"] = "vacancy"
+            if custom_draft_tpl:
+                row["step1_text"] = _build_assisted_vacancy_draft(row, lang, cfg=cfg)
+                row["first_touch"] = row["step1_text"]
+            stats["routed_vacancy"] += 1
+        else:
+            row["segment"] = "vacancy_assisted"
+            row["provider"] = "manual"
+            row["manual_action_url"] = str(
+                row.get("manual_action_url") or row.get("job_url") or row.get("url") or row.get("alternate_url") or ""
+            ).strip()
+            if custom_draft_tpl:
+                row["manual_draft_text"] = _build_assisted_vacancy_draft(row, lang, cfg=cfg)
+            else:
+                row["manual_draft_text"] = str(
+                    row.get("manual_draft_text") or row.get("step1_text") or _build_assisted_vacancy_draft(row, lang, cfg=cfg)
+                ).strip()
+            stats["routed_vacancy_assisted"] += 1
+
+        route_info = route_lead(row, cfg=cfg)
+        row["target_campaign"] = route_info.target_campaign
+        routed_vac_rows.append(row)
+
+    return routed_vac_rows, stats
+
+
+def run_wave3_ru_experts_pipeline(
+    conn: sqlite3.Connection,
+    *,
+    cfg: Mapping[str, Any],
+    budget_state: EnrichmentBudgetState,
+    tg_client: Any = None,
+    scraper_session: Path | None = None,
+    ru_experts_fn: Callable[..., Any] | None = None,
+    treg_fn: Callable[..., Any] | None = None,
+    monid_fn: Callable[..., Any] | None = None,
+    http_get_fn: Callable[..., Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Wave 3 RU Experts pipeline: discover RU creators/experts cleanly with exclude_from_airtable=1."""
+    ru_cfg = cfg.get("ru_experts") if isinstance(cfg.get("ru_experts"), Mapping) else {}
+    if not bool(ru_cfg.get("enabled", False)):
+        return [], {"enabled": False, "collected": 0}
+
+    def _ru_budget_guard(provider: str = "treg", estimated_cost: float = 0.0) -> bool:
+        if not budget_state.paid_allowed:
+            return False
+        ok, _ = check_and_reserve_budget(conn, provider=provider, estimated_cost=estimated_cost, cfg=cfg)
+        return ok
+
+    ig_enabled = bool(ru_cfg.get("ig_to_tg_enabled", True))
+    ig_handles_cfg = (
+        [str(h).strip() for h in (ru_cfg.get("ig_handles") or ()) if str(h or "").strip()]
+        if ig_enabled
+        else []
+    )
+
+    res: dict[str, Any]
+    if ru_experts_fn is not None:
+        raw_res = _call_with_supported_kwargs(
+            ru_experts_fn,
+            cfg=cfg,
+            ig_handles=ig_handles_cfg,
+            client=tg_client,
+            conn=conn,
+            budget_guard_fn=_ru_budget_guard,
+            treg_fn=treg_fn,
+            monid_fn=monid_fn,
+            http_get_fn=http_get_fn,
+        )
+        res = (_run_coro_sync(raw_res) if inspect.isawaitable(raw_res) else raw_res) or {}
+    else:
+        if tg_client is not None or not (ru_cfg.get("seed_chats") or []):
+            res = _run_coro_sync(
+                discover_ru_experts(
+                    cfg=cfg,
+                    ig_handles=ig_handles_cfg if ig_handles_cfg else None,
+                    client=tg_client,
+                    conn=conn,
+                    budget_guard_fn=_ru_budget_guard,
+                    treg_fn=treg_fn,
+                    monid_fn=monid_fn,
+                    http_get_fn=http_get_fn,
+                )
+            ) or {}
+        else:
+            res = _with_isolated_tg_client(
+                scraper_session,
+                lambda cli: discover_ru_experts(
+                    cfg=cfg,
+                    ig_handles=ig_handles_cfg if ig_handles_cfg else None,
+                    client=cli,
+                    conn=conn,
+                    budget_guard_fn=_ru_budget_guard,
+                    treg_fn=treg_fn,
+                    monid_fn=monid_fn,
+                    http_get_fn=http_get_fn,
+                ),
+            ) or {"status": "skipped", "rows": [], "stats": {}}
+
+    rows: list[dict[str, Any]] = []
+    target_camp = resolve_target_campaign("ru_expert", "ru", "telegram", cfg=cfg)
+    for item in res.get("rows") or ():
+        row = dict(item)
+        row["segment"] = "ru_expert"
+        row["language"] = "ru"
+        row["exclude_from_airtable"] = 1
+        row["target_campaign"] = target_camp
+        rows.append(row)
+    return rows, {
+        "enabled": True,
+        "status": str(res.get("status") or "ok"),
+        "collected": len(rows),
+        "target_campaign": target_camp,
+        "stats": dict(res.get("stats") or {}),
+    }
+
+
+def _copy_profile_for_segment_and_lang(segment: str, language: str) -> str:
+    return resolve_copy_profile(None, segment=segment, language=language, default_profile="b2b_legacy")
+
+
+def _ensure_v2_campaign(
+    conn: sqlite3.Connection,
+    campaign_name: str,
+    *,
+    segment: str,
+    language: str,
+    exclude_from_airtable: int = 0,
+    daily_limit: int = 20,
+) -> dict[str, Any]:
+    """Find or create a draft v2 campaign with segment, language, copy_profile, and Airtable isolation flags."""
+    existing = _find_campaign_by_name(conn, campaign_name)
+    copy_prof = _copy_profile_for_segment_and_lang(segment, language)
+    eff_excl = 1 if (exclude_from_airtable or segment == "ru_expert") else 0
+    if existing is not None:
+        conn.execute(
+            """
+            UPDATE campaigns
+            SET segment = ?, language = ?, copy_profile = ?, exclude_from_airtable = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (segment, language, copy_prof, eff_excl, utc_now(), int(existing["id"])),
+        )
+        conn.commit()
+        refreshed = _find_campaign_by_name(conn, campaign_name)
+        return refreshed or existing
+
+    steps = [
+        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+        {"step_order": 2, "delay_hours": 24, "template_text": "{step2_text}"},
+        {"step_order": 3, "delay_hours": 72, "template_text": "{step3_text}"},
+    ]
+    return create_campaign(
+        conn,
+        name=campaign_name,
+        daily_limit=max(1, min(500, int(daily_limit or 20))),
+        steps=steps,
+        status="draft",
+        leadgen_enabled=True,
+        segment=segment,
+        language=language,
+        copy_profile=copy_prof,
+        exclude_from_airtable=eff_excl,
+    )
+
+
+def _persist_lead_v2_columns(conn: sqlite3.Connection, lead_id: int, row: Mapping[str, Any]) -> None:
+    """Persist v2 metadata columns (segment, language, Airtable isolation, manual queue fields) on `leads`."""
+    seg = str(row.get("segment") or "").strip().lower() or "b2b"
+    lang = "ru" if str(row.get("language") or "").strip().lower() == "ru" else "en"
+    excl = 1 if (seg == "ru_expert" or bool(row.get("exclude_from_airtable"))) else 0
+    domain = str(row.get("company_domain") or row.get("domain") or "").strip() or None
+    raw_pool = row.get("pool_usd") if row.get("pool_usd") is not None else row.get("bounty_usd")
+    pool_val: int | None = None
+    if raw_pool is not None and str(raw_pool).strip() != "":
+        try:
+            pool_val = int(round(float(raw_pool)))
+        except (TypeError, ValueError):
+            pool_val = None
+    sec_json = row.get("secondary_contact_json")
+    if isinstance(sec_json, Mapping):
+        sec_json = json.dumps(dict(sec_json), ensure_ascii=False)
+    elif not sec_json:
+        sec_json = None
+    m_url = str(row.get("manual_action_url") or "").strip() or None
+    m_draft = str(row.get("manual_draft_text") or "").strip() or None
+    conn.execute(
+        """
+        UPDATE leads
+        SET segment = ?,
+            language = ?,
+            exclude_from_airtable = ?,
+            company_domain = COALESCE(?, company_domain),
+            pool_usd = COALESCE(?, pool_usd),
+            secondary_contact_json = COALESCE(?, secondary_contact_json),
+            manual_action_url = COALESCE(?, manual_action_url),
+            manual_draft_text = COALESCE(?, manual_draft_text),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (seg, lang, excl, domain, pool_val, sec_json, m_url, m_draft, utc_now(), int(lead_id)),
+    )
+
+
+def _insert_manual_queue_lead(conn: sqlite3.Connection, row: Mapping[str, Any]) -> int | None:
+    """Insert or skip duplicate Manual Social / Assisted Job queue lead into CRM `leads` without auto-sending."""
+    seg = str(row.get("segment") or "").strip().lower()
+    lang = "ru" if str(row.get("language") or "").strip().lower() == "ru" else "en"
+    manual_url = str(row.get("manual_action_url") or "").strip()
+    if not manual_url:
+        return None
+    dup = conn.execute(
+        "SELECT id FROM leads WHERE manual_action_url = ? LIMIT 1",
+        (manual_url,),
+    ).fetchone()
+    if dup is not None:
+        _persist_lead_v2_columns(conn, int(dup["id"]), row)
+        conn.commit()
+        return None
+
+    company = str(row.get("company") or row.get("project") or "").strip()
+    name = str(row.get("name") or company or row.get("title") or row.get("source") or "Manual Lead").strip()
+    source = str(row.get("lead_source") or row.get("source") or seg).strip()
+    email = str(row.get("work_email") or row.get("email") or "").strip() or None
+    site_url = str(row.get("project_url") or row.get("url") or manual_url).strip() or None
+    desc = str(row.get("what_they_do") or row.get("description") or row.get("bio") or "").strip() or None
+    note = str(row.get("note") or row.get("their_angle") or "").strip() or None
+    niche = str(row.get("category") or row.get("niche") or "").strip() or None
+    draft = str(row.get("manual_draft_text") or "").strip()
+    row_copy = dict(row)
+    row_copy["segment"] = seg
+    row_copy["language"] = lang
+    row_copy["manual_action_url"] = manual_url
+    if not draft:
+        row_copy["manual_draft_text"] = _build_assisted_vacancy_draft(row, lang) if seg == "vacancy_assisted" else ""
+
+    created = crm_create_lead(
+        conn,
+        name=name,
+        company=company or None,
+        description=desc,
+        niche=niche,
+        url=site_url,
+        lead_source=source,
+        email=email,
+        note=note,
+        provider="telegram",
+        next_step="Отправить вручную по ссылке",
+    )
+    lid = int(created["id"])
+    _persist_lead_v2_columns(conn, lid, row_copy)
+    conn.commit()
+    return lid
+
+
+def _insert_direct_segment_lead(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+    *,
+    campaign: dict[str, Any],
+    segment: str,
+    language: str,
+    enroll_in_campaign: bool,
+) -> tuple[int | None, bool]:
+    """Insert lead + campaign recipient cleanly for direct v2 segments (`ru_expert`, `vacancy`, `whale`)."""
+    username = str(row.get("username") or row.get("telegram_username") or "").strip().lstrip("@")
+    phone = normalize_e164(str(row.get("phone") or "")) or None
+    raw_uid = row.get("telegram_user_id")
+    tg_uid: int | None = int(raw_uid) if raw_uid not in (None, "", 0, "0") else None
+    if not (username or phone or tg_uid):
+        return None, False
+
+    existing_lead = None
+    if username:
+        existing_lead = conn.execute(
+            "SELECT * FROM leads WHERE lower(username) = lower(?) LIMIT 1", (username,)
+        ).fetchone()
+    if existing_lead is None and phone:
+        existing_lead = conn.execute(
+            "SELECT * FROM leads WHERE phone = ? LIMIT 1", (phone,)
+        ).fetchone()
+    if existing_lead is not None:
+        lid = int(existing_lead["id"])
+        lead_tg_id = existing_lead["telegram_user_id"]
+    else:
+        company = str(row.get("company") or row.get("project") or "").strip()
+        name = str(row.get("name") or company or username or phone or "Lead").strip()
+        prov = "whatsapp" if str(row.get("provider") or "").lower() == "whatsapp" and not username else "telegram"
+        created = crm_create_lead(
+            conn,
+            telegram_user_id=tg_uid,
+            username=username or None,
+            name=name,
+            phone=phone,
+            company=company or None,
+            description=str(row.get("what_they_do") or row.get("bio") or "").strip() or None,
+            niche=str(row.get("category") or row.get("niche") or "").strip() or None,
+            url=str(row.get("project_url") or row.get("url") or "").strip() or None,
+            lead_source=str(row.get("lead_source") or row.get("source") or segment).strip(),
+            email=str(row.get("work_email") or row.get("email") or "").strip() or None,
+            note=str(row.get("note") or row.get("their_angle") or "").strip() or None,
+            offer_details=str(row.get("our_angle") or "").strip() or None,
+            provider=prov,
+            next_step="Отправить цепочку рассылки" if enroll_in_campaign else None,
+        )
+        lid = int(created["id"])
+        lead_tg_id = created.get("telegram_user_id") or tg_uid or (900000 + lid)
+        conn.execute(
+            "UPDATE leads SET telegram_user_id = ? WHERE id = ? AND telegram_user_id IS NULL",
+            (int(lead_tg_id), lid),
+        )
+
+    _persist_lead_v2_columns(conn, lid, {**dict(row), "segment": segment, "language": language})
+
+    enrolled = False
+    cid = int(campaign["id"])
+    if enroll_in_campaign:
+        dup_rec = conn.execute(
+            """
+            SELECT id FROM campaign_recipients
+            WHERE campaign_id = ?
+              AND (lead_id = ? OR (? != '' AND lower(username) = lower(?)) OR (? != '' AND phone = ?))
+            LIMIT 1
+            """,
+            (cid, lid, username, username, phone or "", phone or ""),
+        ).fetchone()
+        if dup_rec is None:
+            copy_prof = _copy_profile_for_segment_and_lang(segment, language)
+            seq = build_outreach_sequence(
+                dict(row),
+                copy_profile=copy_prof,
+                segment=segment,
+                language=language,
+                provider=str(row.get("provider") or "telegram"),
+            )
+            step1 = str(row.get("step1_text") or row.get("first_touch") or seq.step1_text).strip()
+            step2 = str(row.get("step2_text") or row.get("followup_1") or seq.step2_text).strip()
+            step3 = str(row.get("step3_text") or row.get("followup_2") or seq.step3_text).strip()
+            now_s = utc_now()
+            conn.execute(
+                """
+                INSERT INTO campaign_recipients (
+                    campaign_id, lead_id, telegram_user_id, username, name,
+                    phone, company, note, website, category, their_angle,
+                    our_angle, hook, step1_text, step2_text, step3_text,
+                    current_step, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?)
+                """,
+                (
+                    cid,
+                    lid,
+                    int(lead_tg_id) if lead_tg_id is not None else None,
+                    username or None,
+                    str(row.get("name") or row.get("company") or username or phone or f"Лид #{lid}"),
+                    phone,
+                    str(row.get("company") or row.get("project") or "").strip() or None,
+                    str(row.get("note") or row.get("their_angle") or "").strip() or None,
+                    str(row.get("project_url") or row.get("url") or "").strip() or None,
+                    str(row.get("category") or row.get("niche") or "").strip() or None,
+                    str(row.get("their_angle") or row.get("what_they_do") or "").strip() or None,
+                    str(row.get("our_angle") or "").strip() or None,
+                    step1,
+                    step1,
+                    step2,
+                    step3,
+                    now_s,
+                    now_s,
+                ),
+            )
+            enrolled = True
+    conn.commit()
+    return lid, enrolled
+
+
+def _lookup_ingested_lead_id(conn: sqlite3.Connection, item: Mapping[str, Any]) -> int | None:
+    """Resolve an ingested lead's SQLite ID cleanly by stable identity keys (never by positional zip)."""
+    uname = str(item.get("username") or item.get("telegram_username") or "").strip().lstrip("@")
+    if uname:
+        row = conn.execute(
+            "SELECT id FROM leads WHERE lower(username) = lower(?) LIMIT 1", (uname,)
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+    phone = normalize_e164(str(item.get("phone") or ""))
+    if phone:
+        row = conn.execute("SELECT id FROM leads WHERE phone = ? LIMIT 1", (phone,)).fetchone()
+        if row is not None:
+            return int(row["id"])
+    manual_url = str(item.get("manual_action_url") or "").strip()
+    if manual_url:
+        row = conn.execute(
+            "SELECT id FROM leads WHERE manual_action_url = ? LIMIT 1", (manual_url,)
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+    comp = str(item.get("company") or item.get("project") or "").strip()
+    name = str(item.get("name") or "").strip()
+    if comp and name:
+        row = conn.execute(
+            "SELECT id FROM leads WHERE lower(COALESCE(company, '')) = lower(?) AND lower(COALESCE(name, '')) = lower(?) ORDER BY id DESC LIMIT 1",
+            (comp, name),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+    return None
+
+
+def ingest_v2_routed_leads(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    cfg: Mapping[str, Any] | None = None,
+    auto_push: bool = True,
+) -> dict[str, Any]:
+    """Ingest Wave 1-3 routed leads (`social_manual`, `vacancy_assisted`, `vacancy`, `ru_expert`, `whale`)."""
+    stats = {
+        "social_manual_ingested": 0,
+        "vacancy_assisted_ingested": 0,
+        "vacancy_ingested": 0,
+        "ru_experts_ingested": 0,
+        "whales_ingested": 0,
+        "campaigns": {},
+    }
+    if not rows:
+        return stats
+
+    from app.mcp_server import call_mcp_tool_handler
+
+    camp_cache: dict[str, dict[str, Any]] = {}
+    mcp_batches: dict[tuple[str, str, str, int], list[dict[str, Any]]] = {}
+
+    for raw in rows:
+        item = dict(raw)
+        route_info = route_lead(item, cfg=cfg)
+        seg = route_info.segment
+        lang = route_info.language
+        excl = 1 if (seg == "ru_expert" or bool(item.get("exclude_from_airtable"))) else 0
+
+        if seg == "social_manual":
+            if _insert_manual_queue_lead(conn, {**item, "segment": seg, "language": lang}):
+                stats["social_manual_ingested"] += 1
+            continue
+        if seg == "vacancy_assisted":
+            if _insert_manual_queue_lead(conn, {**item, "segment": seg, "language": lang}):
+                stats["vacancy_assisted_ingested"] += 1
+            continue
+        if seg == "ru_expert":
+            camp_name = route_info.target_campaign
+            if camp_name not in camp_cache:
+                camp_cache[camp_name] = _ensure_v2_campaign(
+                    conn,
+                    camp_name,
+                    segment="ru_expert",
+                    language="ru",
+                    exclude_from_airtable=1,
+                    daily_limit=int(((cfg or {}).get("ru_experts") or {}).get("daily_limit") or 20),
+                )
+            _lid, enrolled = _insert_direct_segment_lead(
+                conn,
+                item,
+                campaign=camp_cache[camp_name],
+                segment="ru_expert",
+                language="ru",
+                enroll_in_campaign=bool(auto_push),
+            )
+            if enrolled or _lid is not None:
+                stats["ru_experts_ingested"] += 1
+                stats["campaigns"][camp_name] = camp_cache[camp_name]
+            continue
+
+        camp_name = route_info.target_campaign
+        mcp_batches.setdefault((camp_name, seg, lang, excl), []).append(item)
+
+    for (camp_name, seg, lang, excl), batch in mcp_batches.items():
+        camp_obj = _ensure_v2_campaign(
+            conn,
+            camp_name,
+            segment=seg,
+            language=lang,
+            exclude_from_airtable=excl,
+            daily_limit=int(((cfg or {}).get("vacancies") or {}).get("daily_limit") or 20)
+            if seg == "vacancy"
+            else 30,
+        )
+        camp_cache[camp_name] = camp_obj
+        stats["campaigns"][camp_name] = camp_obj
+
+        enriched_batch: list[dict[str, Any]] = []
+        for item in batch:
+            copy_prof = _copy_profile_for_segment_and_lang(seg, lang)
+            seq = build_outreach_sequence(
+                item,
+                copy_profile=copy_prof,
+                segment=seg,
+                language=lang,
+                provider=str(item.get("provider") or "telegram"),
+            )
+            prepared = dict(item)
+            prepared.setdefault("step1_text", seq.step1_text)
+            prepared.setdefault("first_touch", seq.step1_text)
+            prepared.setdefault("step2_text", seq.step2_text)
+            prepared.setdefault("followup_1", seq.step2_text)
+            prepared.setdefault("step3_text", seq.step3_text)
+            prepared.setdefault("followup_2", seq.step3_text)
+            enriched_batch.append(prepared)
+
+        if seg == "vacancy":
+            for item in enriched_batch:
+                _lid, enrolled = _insert_direct_segment_lead(
+                    conn,
+                    item,
+                    campaign=camp_obj,
+                    segment=seg,
+                    language=lang,
+                    enroll_in_campaign=bool(auto_push),
+                )
+                if enrolled:
+                    stats["vacancy_ingested"] += 1
+            continue
+
+        mcp_res = call_mcp_tool_handler(
+            conn,
+            "ingest_discovered_leads",
+            {
+                "campaign_id": int(camp_obj["id"]),
+                "campaign_name": camp_name,
+                "enroll_in_campaign": bool(auto_push),
+                "leads": enriched_batch,
+            },
+        )
+        added_n = int((mcp_res or {}).get("enrolled_in_campaign") or 0)
+        by_idx = (mcp_res or {}).get("lead_id_by_index")
+        if isinstance(by_idx, list) and len(by_idx) == len(enriched_batch):
+            for idx, item in enumerate(enriched_batch):
+                lid_raw = by_idx[idx]
+                if lid_raw is None:
+                    continue
+                _persist_lead_v2_columns(
+                    conn,
+                    int(lid_raw),
+                    {**item, "segment": seg, "language": lang, "exclude_from_airtable": excl},
+                )
+        else:
+            for item in enriched_batch:
+                matched_lid = _lookup_ingested_lead_id(conn, item)
+                if matched_lid is not None:
+                    _persist_lead_v2_columns(
+                        conn,
+                        matched_lid,
+                        {**item, "segment": seg, "language": lang, "exclude_from_airtable": excl},
+                    )
+        conn.commit()
+        stats["whales_ingested"] += added_n
+
+    return stats
+
+
+def _stamp_new_lead_v2_fields(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Propagate v2 metadata (`segment`, `language`, `company_domain`, `pool_usd`, `secondary_contact_json`) onto newly ingested `leads`."""
+    if not rows:
+        return
+    for row in rows:
+        seg = str(row.get("segment") or "").strip().lower() or detect_lead_segment(row)
+        lang = str(row.get("language") or "").strip().lower() or detect_lead_language(row)
+        uname = str(row.get("username") or row.get("telegram_username") or "").strip().lstrip("@")
+        phone = normalize_e164(str(row.get("phone") or ""))
+        found = None
+        if uname:
+            found = conn.execute(
+                "SELECT id FROM leads WHERE lower(username) = lower(?) LIMIT 1", (uname,)
+            ).fetchone()
+        if found is None and phone:
+            found = conn.execute(
+                "SELECT id FROM leads WHERE phone = ? LIMIT 1", (phone,)
+            ).fetchone()
+        if found is not None:
+            _persist_lead_v2_columns(
+                conn,
+                int(found["id"]),
+                {**row, "segment": seg, "language": lang},
+            )
+    conn.commit()
+
+
+def _resolve_active_b2b_camp_fallback(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """Fallback to an active running leadgen B2B TG campaign when target name does not exist yet."""
+    soft_cand = find_existing_softugc_tg_campaign(conn)
+    if (
+        soft_cand is not None
+        and str(soft_cand.get("status") or "").strip().lower() == "running"
+        and int(soft_cand.get("leadgen_enabled") or 0) == 1
+    ):
+        return soft_cand
+
+    from app.hygiene import is_ofm_campaign_name
+
+    rows = conn.execute(
+        """
+        SELECT * FROM campaigns
+        WHERE lower(COALESCE(status, '')) = 'running'
+          AND leadgen_enabled = 1
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        cdict = as_dict(row)
+        cname = str(cdict.get("name") or "").strip()
+        cname_low = cname.lower()
+        seg = str(cdict.get("segment") or "").strip().lower()
+        if seg in {"ofm", "ru_expert", "vacancy", "vacancy_assisted", "social_manual"}:
+            continue
+        if any(k in cname_low for k in ("ваканс", "vacanc", "job")):
+            continue
+        if "(wa)" in cname_low or "whatsapp" in cname_low or " — wa" in cname_low:
+            continue
+        if is_ofm_campaign_name(cname, cdict.get("leadgen_sources_json")):
+            continue
+        return cdict
+    return None
+
+
+def _collect_vacancy_campaigns_state(
+    conn: sqlite3.Connection,
+    vac_name: str,
+    *,
+    vac_enabled: bool,
+    vac_low_water_mark: int,
+) -> tuple[bool, bool, int, list[dict[str, Any]]]:
+    """Evaluate active status & aggregate pending recipients across legacy + v2 vacancy campaigns."""
+    names_ordered: list[str] = []
+    seen_names: set[str] = set()
+    for cand_name in (
+        vac_name,
+        CAMPAIGN_VACANCY_RU_TG,
+        CAMPAIGN_VACANCY_EN_TG,
+        CAMPAIGN_VACANCY_RU_WA,
+    ):
+        clean_n = str(cand_name or "").strip()
+        if clean_n and clean_n.lower() not in seen_names:
+            seen_names.add(clean_n.lower())
+            names_ordered.append(clean_n)
+
+    found_camps: list[dict[str, Any]] = []
+    non_completed_camps: list[dict[str, Any]] = []
+    v2_camps: list[dict[str, Any]] = []
+    for cname in names_ordered:
+        camp = _find_campaign_by_name(conn, cname)
+        if camp is None:
+            continue
+        found_camps.append(camp)
+        if cname != vac_name:
+            v2_camps.append(camp)
+        st = str(camp.get("status") or "").strip().lower()
+        if st == "completed":
+            continue
+        if (
+            cname != vac_name
+            and st not in ("running", "active")
+            and int(camp.get("leadgen_enabled") or 0) != 1
+        ):
+            continue
+        non_completed_camps.append(camp)
+
+    all_completed = len(found_camps) == len(names_ordered) and not non_completed_camps
+    # Keep vacancies active if v2 campaigns can still accept leads even when legacy "TG Вакансии" is completed.
+    vac_active = bool(vac_enabled) and not all_completed
+    if found_camps and not non_completed_camps and not v2_camps:
+        vac_active = bool(vac_enabled)
+
+    pending_total = sum(_count_pending(conn, int(c["id"])) for c in non_completed_camps)
+    if not vac_active:
+        return False, False, pending_total, non_completed_camps
+
+    if not non_completed_camps:
+        return True, (0 < int(vac_low_water_mark)), 0, []
+
+    any_below = any(
+        _count_pending(conn, int(c["id"])) < int(vac_low_water_mark)
+        for c in non_completed_camps
+    )
+    needs = pending_total < int(vac_low_water_mark) or any_below
+    return True, needs, pending_total, non_completed_camps
+
+
 def run_autonomous_replenish(
     conn: sqlite3.Connection,
     *,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] | None = None,
     low_water_mark: int = 50,
     vac_low_water_mark: int = 10,
     critical_low_mark: int = 15,
@@ -1169,6 +2684,22 @@ def run_autonomous_replenish(
     scraper_session: str | Path | None = None,
     digest_opener: Any = None,
     lock_path: Path | None = None,
+    budget_treg_balance_fn: Callable[[], Any] | None = None,
+    budget_monid_balance_fn: Callable[[], Any] | None = None,
+    budget_notify_fn: Callable[[str], Any] | None = None,
+    waterfall_enrich_fn: Callable[..., dict[str, Any]] | None = None,
+    waterfall_http_get_fn: Callable[..., Any] | None = None,
+    waterfall_treg_fn: Callable[..., Any] | None = None,
+    waterfall_monid_fn: Callable[..., Any] | None = None,
+    tg_client: Any = None,
+    tg_admin_extractor_fn: Callable[..., Any] | None = None,
+    wa_gateway: Any = None,
+    tg_checker_client: Any = None,
+    scraper_sessions_dir: Path | str | None = None,
+    hh_collector_fn: Callable[..., dict[str, Any]] | None = None,
+    freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
+    linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    ru_experts_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     try:
         lock_fh = _acquire_replenish_lock(lock_path)
@@ -1192,6 +2723,22 @@ def run_autonomous_replenish(
             stage_timeout=stage_timeout,
             scraper_session=scraper_session,
             digest_opener=digest_opener,
+            budget_treg_balance_fn=budget_treg_balance_fn,
+            budget_monid_balance_fn=budget_monid_balance_fn,
+            budget_notify_fn=budget_notify_fn,
+            waterfall_enrich_fn=waterfall_enrich_fn,
+            waterfall_http_get_fn=waterfall_http_get_fn,
+            waterfall_treg_fn=waterfall_treg_fn,
+            waterfall_monid_fn=waterfall_monid_fn,
+            tg_client=tg_client,
+            tg_admin_extractor_fn=tg_admin_extractor_fn,
+            wa_gateway=wa_gateway,
+            tg_checker_client=tg_checker_client,
+            scraper_sessions_dir=scraper_sessions_dir,
+            hh_collector_fn=hh_collector_fn,
+            freelance_monitor_fn=freelance_monitor_fn,
+            linkedin_collector_fn=linkedin_collector_fn,
+            ru_experts_fn=ru_experts_fn,
         )
     finally:
         _release_replenish_lock(lock_fh)
@@ -1200,14 +2747,33 @@ def run_autonomous_replenish(
 def _run_autonomous_replenish_locked(
     conn: sqlite3.Connection,
     *,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] | None = None,
     low_water_mark: int = 50,
     vac_low_water_mark: int = 10,
     critical_low_mark: int = 15,
     stage_timeout: int = 300,
     scraper_session: str | Path | None = None,
     digest_opener: Any = None,
+    budget_treg_balance_fn: Callable[[], Any] | None = None,
+    budget_monid_balance_fn: Callable[[], Any] | None = None,
+    budget_notify_fn: Callable[[str], Any] | None = None,
+    waterfall_enrich_fn: Callable[..., dict[str, Any]] | None = None,
+    waterfall_http_get_fn: Callable[..., Any] | None = None,
+    waterfall_treg_fn: Callable[..., Any] | None = None,
+    waterfall_monid_fn: Callable[..., Any] | None = None,
+    tg_client: Any = None,
+    tg_admin_extractor_fn: Callable[..., Any] | None = None,
+    wa_gateway: Any = None,
+    tg_checker_client: Any = None,
+    scraper_sessions_dir: Path | str | None = None,
+    hh_collector_fn: Callable[..., dict[str, Any]] | None = None,
+    freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
+    linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    ru_experts_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
+    is_real_subprocess_runner = runner is None or runner is subprocess.run
+    active_runner = subprocess.run if runner is None else runner
+
     cfg = get_leadgen_config(conn)
     if not cfg.get("enabled"):
         return {"ok": True, "skipped": "disabled_in_config"}
@@ -1228,32 +2794,44 @@ def _run_autonomous_replenish_locked(
     eff_cfg = apply_quarantined_sources(cfg, quarantined)
     b2b_cfg = eff_cfg["b2b"]
     vac_cfg = eff_cfg["vacancies"]
+    whales_cfg = eff_cfg.get("whales") if isinstance(eff_cfg.get("whales"), Mapping) else {}
+    ru_cfg = eff_cfg.get("ru_experts") if isinstance(eff_cfg.get("ru_experts"), Mapping) else {}
 
     b2b_name = resolve_target_b2b_tg_campaign_name(
         conn, b2b_cfg.get("target_campaign_tg"), fallback_default="Leadgen Auto (TG)"
     )
     vac_name = str(vac_cfg.get("campaign_name") or "TG Вакансии").strip() or "TG Вакансии"
+    ru_name = str(ru_cfg.get("target_campaign") or CAMPAIGN_RU_EXPERTS_TG).strip() or CAMPAIGN_RU_EXPERTS_TG
 
-    b2b_camp = _find_campaign_by_name(conn, b2b_name)
+    b2b_camp = _find_campaign_by_name(conn, b2b_name) or _resolve_active_b2b_camp_fallback(conn)
     vac_camp = _find_campaign_by_name(conn, vac_name)
+    ru_camp = _find_campaign_by_name(conn, ru_name)
 
     pending_b2b_before = _count_pending(conn, b2b_camp["id"] if b2b_camp else None)
-    pending_vac_before = _count_pending(conn, vac_camp["id"] if vac_camp else None)
+    pending_ru_before = _count_pending(conn, ru_camp["id"] if ru_camp else None)
     pending_b2b = pending_b2b_before
-    pending_vac = pending_vac_before
 
     b2b_active = bool(b2b_cfg.get("enabled", True)) and (
         b2b_camp is None or str(b2b_camp.get("status") or "") != "completed"
     )
-    vac_active = bool(vac_cfg.get("enabled", False)) and (
-        vac_camp is None or str(vac_camp.get("status") or "") != "completed"
+    vac_active, needs_vac, pending_vac_before, _ = _collect_vacancy_campaigns_state(
+        conn,
+        vac_name,
+        vac_enabled=bool(vac_cfg.get("enabled", False)),
+        vac_low_water_mark=int(vac_low_water_mark),
+    )
+    pending_vac = pending_vac_before
+    ru_active = bool(ru_cfg.get("enabled", False)) and (
+        ru_camp is None or str(ru_camp.get("status") or "") != "completed"
     )
 
     needs_b2b = b2b_active and pending_b2b < int(low_water_mark)
-    needs_vac = vac_active and pending_vac < int(vac_low_water_mark)
+    ru_daily_lim = max(0, int(ru_cfg.get("daily_limit") or 20))
+    needs_ru = ru_active and ru_daily_lim > 0 and pending_ru_before < ru_daily_lim
 
     ingested_total = 0
     direct_x_routed = 0
+    social_manual_ingested = 0
     stages_run: list[str] = []
     stage_errors: list[dict[str, Any]] = []
     replenish_reasons: list[str] = []
@@ -1265,7 +2843,52 @@ def _run_autonomous_replenish_locked(
     treg_ready = check_treg_ready()
     monid_ready = check_monid_ready()
 
-    if needs_b2b or needs_vac:
+    offline_mock_mode = (
+        not is_real_subprocess_runner
+        and budget_treg_balance_fn is None
+        and budget_monid_balance_fn is None
+    )
+    eff_treg_bal_fn = (
+        budget_treg_balance_fn
+        if budget_treg_balance_fn is not None
+        else ((lambda: None) if offline_mock_mode else None)
+    )
+    eff_monid_bal_fn = (
+        budget_monid_balance_fn
+        if budget_monid_balance_fn is not None
+        else ((lambda: None) if offline_mock_mode else None)
+    )
+    budget_state: EnrichmentBudgetState | None = None
+    tg_admin_stats: dict[str, int] = {"groups_checked": 0, "admins_resolved": 0, "leads_promoted": 0}
+    phone_res_stats: dict[str, int] = {
+        "phones_checked": 0,
+        "wa_verified": 0,
+        "tg_verified": 0,
+        "routed_telegram": 0,
+        "routed_whatsapp": 0,
+        "routed_wa_pending": 0,
+        "routed_social_manual": 0,
+    }
+    wave2_stats: dict[str, Any] = {}
+    wave3_stats: dict[str, Any] = {"enabled": bool(ru_cfg.get("enabled", False)), "collected": 0}
+    wave_extra_campaigns: dict[str, dict[str, Any]] = {}
+    curated_v2_stamp_rows: list[dict[str, Any]] = []
+
+    if needs_b2b or needs_vac or needs_ru:
+        budget_state = _call_with_supported_kwargs(
+            check_balances_and_alert,
+            conn,
+            cfg=eff_cfg,
+            treg_balance_fn=eff_treg_bal_fn,
+            monid_balance_fn=eff_monid_bal_fn,
+            notify_fn=budget_notify_fn,
+            allow_unavailable=offline_mock_mode,
+        )
+        if not budget_state.paid_allowed:
+            reason_tag = f"budget_guard_stop:{budget_state.stop_reason or 'cap_reached'}"
+            if reason_tag not in replenish_reasons:
+                replenish_reasons.append(reason_tag)
+
         pre_existing_recipient_ids: set[int] = {
             int(r[0]) for r in conn.execute("SELECT id FROM campaign_recipients").fetchall()
         }
@@ -1274,16 +2897,25 @@ def _run_autonomous_replenish_locked(
         push_1 = push_discovered_now(conn)
         ingested_total += int(push_1.get("ingested") or 0)
 
-        b2b_camp = _find_campaign_by_name(conn, b2b_name)
+        b2b_camp = _find_campaign_by_name(conn, b2b_name) or _resolve_active_b2b_camp_fallback(conn)
         vac_camp = _find_campaign_by_name(conn, vac_name)
         pending_b2b = _count_pending(conn, b2b_camp["id"] if b2b_camp else None)
-        pending_vac = _count_pending(conn, vac_camp["id"] if vac_camp else None)
+        vac_active, still_needs_vac, pending_vac, _ = _collect_vacancy_campaigns_state(
+            conn,
+            vac_name,
+            vac_enabled=bool(vac_cfg.get("enabled", False)),
+            vac_low_water_mark=int(vac_low_water_mark),
+        )
 
         still_needs_b2b = b2b_active and pending_b2b < int(low_water_mark)
-        still_needs_vac = vac_active and pending_vac < int(vac_low_water_mark)
+        still_needs_ru = ru_active and ru_daily_lim > 0 and _count_pending(
+            conn, ru_camp["id"] if ru_camp else None
+        ) < ru_daily_lim
+        wa_camp: dict[str, Any] | None = None
+        ofm_camp: dict[str, Any] | None = None
 
-        # Step 2: Run server-available discovery stages via injectable runner
-        if still_needs_b2b or still_needs_vac:
+        # Step 2: Run server-available discovery stages via injectable runner + Wave 1-3 orchestrators
+        if still_needs_b2b or still_needs_vac or still_needs_ru:
             state_dir = _resolve_state_dir()
             state_dir.mkdir(parents=True, exist_ok=True)
             eff_cfg_path = state_dir / "effective_leadgen_config.json"
@@ -1294,6 +2926,7 @@ def _run_autonomous_replenish_locked(
             sub_env = dict(os.environ)
             sub_env["LEADGEN_STATE_DIR"] = str(state_dir)
             sub_env["LEADGEN_CONFIG_PATH"] = str(eff_cfg_path)
+            sub_env["BUDGET_PAID_ALLOWED"] = "1" if budget_state.paid_allowed else "0"
             if isolated_session is not None:
                 sub_env["TG_SESSION"] = str(isolated_session)
                 sub_env["TG_JOBS_SESSION"] = str(isolated_session)
@@ -1301,7 +2934,7 @@ def _run_autonomous_replenish_locked(
             def _exec_stage(stage_name: str, cmd: list[str]) -> bool:
                 stages_run.append(stage_name)
                 try:
-                    proc = runner(
+                    proc = active_runner(
                         cmd,
                         env=sub_env,
                         timeout=stage_timeout,
@@ -1376,17 +3009,25 @@ def _run_autonomous_replenish_locked(
                 limits_cfg = b2b_cfg.get("limits") or {}
 
                 # Web / API discovery stages (no TG session needed)
+                paid_cli_discovery_allowed = (
+                    (not is_real_subprocess_runner)
+                    or budget_state is None
+                    or budget_state.paid_allowed
+                )
                 if sources_cfg.get("buyer_catalogs", True) and "buyer_catalogs" not in quarantined:
                     if "buyer_public" not in quarantined:
-                        _exec_stage(
-                            "buyer_public",
-                            [
-                                py_bin,
-                                str(ROOT / "leadgen" / "buyer_public.py"),
-                                "--output",
-                                str(buyer_public_out),
-                            ],
-                        )
+                        if paid_cli_discovery_allowed:
+                            _exec_stage(
+                                "buyer_public",
+                                [
+                                    py_bin,
+                                    str(ROOT / "leadgen" / "buyer_public.py"),
+                                    "--output",
+                                    str(buyer_public_out),
+                                ],
+                            )
+                        elif "budget_guard_skipped:buyer_public" not in replenish_reasons:
+                            replenish_reasons.append("budget_guard_skipped:buyer_public")
                     _exec_stage(
                         "buyer_catalogs",
                         [
@@ -1418,7 +3059,15 @@ def _run_autonomous_replenish_locked(
                 if sources_cfg.get("d2c_whatsapp", False) and "d2c_whatsapp" not in quarantined:
                     enabled_veins.append("d2c_whatsapp")
                 if enabled_veins and "high_yield_veins" not in quarantined:
-                    if treg_ready or monid_ready or runner is not subprocess.run:
+                    if not paid_cli_discovery_allowed:
+                        if "budget_guard_skipped:high_yield_veins" not in replenish_reasons:
+                            replenish_reasons.append("budget_guard_skipped:high_yield_veins")
+                    elif treg_ready or monid_ready or not is_real_subprocess_runner:
+                        whop_min_pool = int(
+                            whales_cfg.get("whop_min_pool_usd")
+                            if whales_cfg.get("whop_min_pool_usd") is not None
+                            else 5000
+                        )
                         _exec_stage(
                             "high_yield_veins",
                             [
@@ -1430,6 +3079,8 @@ def _run_autonomous_replenish_locked(
                                 str(state_dir / "high_yield_seen.json"),
                                 "--veins",
                                 ",".join(enabled_veins),
+                                "--whop-min-pool-usd",
+                                str(max(0, whop_min_pool)),
                                 "--max-runtime-sec",
                                 str(min(200, max(60, int(stage_timeout) - 60))),
                             ],
@@ -1440,40 +3091,55 @@ def _run_autonomous_replenish_locked(
                 if (
                     sources_cfg.get("facebook_groups", False)
                     and "facebook_groups" not in quarantined
-                    and (treg_ready or runner is not subprocess.run)
+                    and (treg_ready or not is_real_subprocess_runner)
                 ):
-                    fb_cmd = [
-                        py_bin,
-                        str(ROOT / "leadgen" / "ofm_and_groups.py"),
-                        "--mode",
-                        "fb_groups",
-                        "--output",
-                        str(fb_groups_out),
-                        "--ofm-out",
-                        str(ofm_review_path),
-                    ]
-                    fb_urls = [str(u).strip() for u in (b2b_cfg.get("fb_group_urls") or []) if str(u).strip()]
-                    if fb_urls:
-                        fb_cmd.extend(["--fb-urls", ",".join(fb_urls), "--max-groups", str(max(5, len(fb_urls)))])
-                    _exec_stage("facebook_groups", fb_cmd)
+                    if not paid_cli_discovery_allowed:
+                        if "budget_guard_skipped:facebook_groups" not in replenish_reasons:
+                            replenish_reasons.append("budget_guard_skipped:facebook_groups")
+                    else:
+                        fb_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                            "--mode",
+                            "fb_groups",
+                            "--output",
+                            str(fb_groups_out),
+                            "--ofm-out",
+                            str(ofm_review_path),
+                        ]
+                        fb_urls = [str(u).strip() for u in (b2b_cfg.get("fb_group_urls") or []) if str(u).strip()]
+                        if fb_urls:
+                            fb_cmd.extend(["--fb-urls", ",".join(fb_urls), "--max-groups", str(max(5, len(fb_urls)))])
+                        _exec_stage("facebook_groups", fb_cmd)
 
                 if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
-                    if treg_ready or runner is not subprocess.run:
-                        _exec_stage(
-                            "meta_ad_leads",
-                            [
-                                py_bin,
-                                str(ROOT / "leadgen" / "meta_ad_leads.py"),
-                                "--output",
-                                str(meta_ads_out),
-                                "--seen",
-                                str(state_dir / "meta_ads_seen.json"),
-                            ],
-                        )
+                    if not paid_cli_discovery_allowed:
+                        if "budget_guard_skipped:meta_ad_leads" not in replenish_reasons:
+                            replenish_reasons.append("budget_guard_skipped:meta_ad_leads")
+                    elif treg_ready or not is_real_subprocess_runner:
+                        meta_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "meta_ad_leads.py"),
+                            "--output",
+                            str(meta_ads_out),
+                            "--seen",
+                            str(state_dir / "meta_ads_seen.json"),
+                        ]
+                        whales_geos = [
+                            str(g).strip().upper()
+                            for g in (whales_cfg.get("geos") or ())
+                            if str(g or "").strip()
+                        ]
+                        if whales_geos:
+                            meta_cmd.extend(["--country", ",".join(whales_geos)])
+                        _exec_stage("meta_ad_leads", meta_cmd)
                     elif "missing_treg_cli" not in replenish_reasons:
                         replenish_reasons.append("missing_treg_cli")
                 if sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined:
-                    if treg_ready:
+                    if not paid_cli_discovery_allowed:
+                        if "budget_guard_skipped:treg_social_leads" not in replenish_reasons:
+                            replenish_reasons.append("budget_guard_skipped:treg_social_leads")
+                    elif treg_ready:
                         _exec_stage(
                             "treg_social_leads",
                             [
@@ -1485,7 +3151,7 @@ def _run_autonomous_replenish_locked(
                                 str(state_dir / "treg_social_seen.json"),
                             ],
                         )
-                    elif runner is subprocess.run and "missing_treg_cli" not in replenish_reasons:
+                    elif is_real_subprocess_runner and "missing_treg_cli" not in replenish_reasons:
                         replenish_reasons.append("missing_treg_cli")
                 if (
                     sources_cfg.get("yc_ph", True)
@@ -1714,7 +3380,7 @@ def _run_autonomous_replenish_locked(
                 enrich_ok = False
                 qual_ok = False
                 curate_ok = True
-                if has_new_rows or runner is not subprocess.run:
+                if has_new_rows or not is_real_subprocess_runner:
                     enriched_jsonl = state_dir / f"raw_{ts}.enriched.jsonl"
                     enrich_ok = _exec_stage(
                         "tg_enrich_leads",
@@ -1781,7 +3447,37 @@ def _run_autonomous_replenish_locked(
                                         if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0
                                         else 0
                                     )
-                                    if treg_ready and curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                    # Layer 0 ($0): TG Group Admins for whale leads with TG communities
+                                    if (
+                                        whales_cfg.get("tg_group_admins_enabled", True)
+                                        and curated_jsonl.is_file()
+                                        and curated_jsonl.stat().st_size > 0
+                                        and (
+                                            is_real_subprocess_runner
+                                            or tg_client is not None
+                                            or tg_admin_extractor_fn is not None
+                                        )
+                                    ):
+                                        cur_rows = _read_jsonl_dicts(curated_jsonl)
+                                        if cur_rows:
+                                            cur_rows, tg_admin_stats = enrich_whales_with_tg_group_admins(
+                                                cur_rows,
+                                                client=tg_client,
+                                                scraper_session=isolated_session,
+                                                admin_extractor_fn=tg_admin_extractor_fn,
+                                            )
+                                            curated_jsonl.write_text(
+                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in cur_rows)
+                                                + ("\n" if cur_rows else ""),
+                                                encoding="utf-8",
+                                            )
+                                    # Paid Tier 1.5 treg_enrich (only when Budget Guard allows paid calls)
+                                    if (
+                                        treg_ready
+                                        and (budget_state is None or budget_state.paid_allowed)
+                                        and curated_jsonl.is_file()
+                                        and curated_jsonl.stat().st_size > 0
+                                    ):
                                         treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
                                         treg_ok = _exec_stage(
                                             "treg_enrich",
@@ -1804,11 +3500,40 @@ def _run_autonomous_replenish_locked(
                                             treg_tmp_jsonl.replace(curated_jsonl)
                                         elif treg_tmp_jsonl.is_file():
                                             treg_tmp_jsonl.unlink(missing_ok=True)
+                                    # Tier 1 + Budget-guarded Paid Tier 2 contact_waterfall
                                     if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
-                                        wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
-                                        wf_ok = _exec_stage(
-                                            "contact_waterfall",
-                                            [
+                                        use_inprocess_wf = is_real_subprocess_runner or any(
+                                            fn is not None
+                                            for fn in (
+                                                waterfall_enrich_fn,
+                                                waterfall_http_get_fn,
+                                                waterfall_treg_fn,
+                                                waterfall_monid_fn,
+                                                budget_treg_balance_fn,
+                                                budget_monid_balance_fn,
+                                            )
+                                        )
+                                        if use_inprocess_wf:
+                                            stages_run.append("contact_waterfall")
+                                            wf_input_rows = _read_jsonl_dicts(curated_jsonl)
+                                            wf_out_rows, budget_state = run_contact_waterfall_with_budget(
+                                                conn,
+                                                wf_input_rows,
+                                                cfg=eff_cfg,
+                                                budget_state=budget_state,
+                                                enrich_fn=waterfall_enrich_fn,
+                                                http_get_fn=waterfall_http_get_fn,
+                                                treg_fn=waterfall_treg_fn,
+                                                monid_fn=waterfall_monid_fn,
+                                            )
+                                            curated_jsonl.write_text(
+                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in wf_out_rows)
+                                                + ("\n" if wf_out_rows else ""),
+                                                encoding="utf-8",
+                                            )
+                                        else:
+                                            wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
+                                            wf_cmd = [
                                                 py_bin,
                                                 str(ROOT / "leadgen" / "contact_waterfall.py"),
                                                 "--input",
@@ -1816,19 +3541,24 @@ def _run_autonomous_replenish_locked(
                                                 "--output",
                                                 str(wf_tmp_jsonl),
                                                 "--max-budget-usd",
-                                                "0.08",
-                                            ],
-                                        )
-                                        if (
-                                            wf_ok
-                                            and wf_tmp_jsonl.is_file()
-                                            and wf_tmp_jsonl.stat().st_size > 0
-                                        ):
-                                            wf_tmp_jsonl.replace(curated_jsonl)
-                                        elif wf_tmp_jsonl.is_file():
-                                            wf_tmp_jsonl.unlink(missing_ok=True)
+                                                "0"
+                                                if (budget_state is not None and not budget_state.paid_allowed)
+                                                else "0.08",
+                                            ]
+                                            if budget_state is not None and not budget_state.paid_allowed:
+                                                wf_cmd.append("--no-paid-tier2")
+                                            wf_ok = _exec_stage("contact_waterfall", wf_cmd)
+                                            if (
+                                                wf_ok
+                                                and wf_tmp_jsonl.is_file()
+                                                and wf_tmp_jsonl.stat().st_size > 0
+                                            ):
+                                                wf_tmp_jsonl.replace(curated_jsonl)
+                                            elif wf_tmp_jsonl.is_file():
+                                                wf_tmp_jsonl.unlink(missing_ok=True)
                                     if (
-                                        (treg_ready or monid_ready or runner is not subprocess.run)
+                                        (treg_ready or monid_ready or not is_real_subprocess_runner)
+                                        and (budget_state is None or budget_state.paid_allowed or not is_real_subprocess_runner)
                                         and sources_cfg.get("tg_identity_bridge", True)
                                         and "tg_identity_bridge" not in quarantined
                                         and curated_jsonl.is_file()
@@ -1854,20 +3584,69 @@ def _run_autonomous_replenish_locked(
                                             bridge_tmp_jsonl.replace(curated_jsonl)
                                         elif bridge_tmp_jsonl.is_file():
                                             bridge_tmp_jsonl.unlink(missing_ok=True)
+                                    # Layer 2 ($0): Phone -> WA + dedicated TG checker + Manual Social Queue routing
+                                    run_l2_phone_resolver = is_real_subprocess_runner or any(
+                                        x is not None
+                                        for x in (
+                                            wa_gateway,
+                                            tg_checker_client,
+                                            scraper_sessions_dir,
+                                            waterfall_enrich_fn,
+                                            budget_treg_balance_fn,
+                                            budget_monid_balance_fn,
+                                        )
+                                    )
+                                    manual_social_jsonl = state_dir / f"manual_social_{ts}.jsonl"
+                                    if (
+                                        run_l2_phone_resolver
+                                        and curated_jsonl.is_file()
+                                        and curated_jsonl.stat().st_size > 0
+                                    ):
+                                        l2_rows = _read_jsonl_dicts(curated_jsonl)
+                                        if l2_rows:
+                                            routed_l2, phone_res_stats = resolve_and_route_phone_leads(
+                                                conn,
+                                                l2_rows,
+                                                cfg=eff_cfg,
+                                                wa_gateway=wa_gateway,
+                                                tg_checker_client=tg_checker_client,
+                                                scraper_sessions_dir=scraper_sessions_dir,
+                                            )
+                                            curated_jsonl.write_text(
+                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in routed_l2)
+                                                + ("\n" if routed_l2 else ""),
+                                                encoding="utf-8",
+                                            )
                                     if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
                                         post_tg_cnt = _count_personal_tg_rows(curated_jsonl)
+                                        curated_snapshot = _read_jsonl_dicts(curated_jsonl)
                                         bridged_tag_cnt = sum(
                                             1
-                                            for r in _read_jsonl_dicts(curated_jsonl)
+                                            for r in curated_snapshot
                                             if str(r.get("tg_bridge_match") or "").strip()
                                         )
                                         tg_bridged_count = max(
                                             0, post_tg_cnt - pre_wf_tg_cnt, bridged_tag_cnt
                                         )
                                         split_res = split_tg_and_direct_x_leads(
-                                            curated_jsonl, state_dir / "direct_x_leads.jsonl"
+                                            curated_jsonl,
+                                            state_dir / "direct_x_leads.jsonl",
+                                            manual_social_jsonl=(
+                                                manual_social_jsonl if run_l2_phone_resolver else None
+                                            ),
                                         )
                                         direct_x_routed += int(split_res.get("direct_x_added") or 0)
+                                        if manual_social_jsonl.is_file() and manual_social_jsonl.stat().st_size > 0:
+                                            ms_rows = _read_jsonl_dicts(manual_social_jsonl)
+                                            ms_ingest = ingest_v2_routed_leads(
+                                                conn,
+                                                ms_rows,
+                                                cfg=eff_cfg,
+                                                auto_push=bool(eff_cfg.get("auto_push_to_crm", True)),
+                                            )
+                                            social_manual_ingested += int(ms_ingest.get("social_manual_ingested") or 0)
+                                            manual_social_jsonl.unlink(missing_ok=True)
+                                        curated_v2_stamp_rows.extend(_read_jsonl_dicts(curated_jsonl))
                                     if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
                                         curated_jsonl.replace(final_jsonl)
                                     else:
@@ -1922,44 +3701,76 @@ def _run_autonomous_replenish_locked(
                 else:
                     pending_qualify_queue.unlink(missing_ok=True)
 
-            # Vacancy scraper ONLY if valid isolated SCRAPER_TG_SESSION is available
-            if still_needs_vac and isolated_session is not None:
-                mon_out = state_dir / f"job_monitor_{today_str}.json"
-                rep_out = state_dir / f"job_replies_{today_str}.json"
-                _exec_stage(
-                    "job_monitor",
-                    [
-                        py_bin,
-                        str(ROOT / "leadgen" / "job_monitor.py"),
-                        "--hours",
-                        "24",
-                        "--out",
-                        str(mon_out),
-                    ],
+            # Wave 2 Vacancy pipeline (TG job_monitor + hh.ru + Profi/Kwork/Upwork + LinkedIn Jobs)
+            if still_needs_vac:
+                wave2_rows, wave2_stats = run_wave2_vacancies_pipeline(
+                    conn,
+                    cfg=eff_cfg,
+                    state_dir=state_dir,
+                    isolated_session=isolated_session,
+                    has_llm_key=has_llm_key,
+                    budget_state=budget_state,
+                    runner=active_runner,
+                    exec_stage_fn=_exec_stage,
+                    py_bin=py_bin,
+                    today_str=today_str,
+                    sub_env=sub_env,
+                    quarantined=quarantined,
+                    treg_ready=treg_ready,
+                    stage_errors=stage_errors,
+                    replenish_reasons=replenish_reasons,
+                    hh_collector_fn=hh_collector_fn,
+                    freelance_monitor_fn=freelance_monitor_fn,
+                    linkedin_collector_fn=linkedin_collector_fn,
+                    http_get_fn=waterfall_http_get_fn,
+                    waterfall_enrich_fn=waterfall_enrich_fn,
+                    wa_gateway=wa_gateway,
+                    tg_checker_client=tg_checker_client,
+                    scraper_sessions_dir=scraper_sessions_dir,
+                    is_real_subprocess=is_real_subprocess_runner,
                 )
-                if has_llm_key and (
-                    (mon_out.is_file() and mon_out.stat().st_size > 0)
-                    or runner is not subprocess.run
-                ):
-                    _exec_stage(
-                        "job_reply",
-                        [
-                            py_bin,
-                            str(ROOT / "leadgen" / "job_reply.py"),
-                            str(mon_out),
-                            "--out",
-                            str(rep_out),
-                            "--limit",
-                            str(int(vac_cfg.get("daily_limit") or 20)),
-                            "--no-crm",
-                        ],
+                if wave2_rows:
+                    w2_ingest = ingest_v2_routed_leads(
+                        conn,
+                        wave2_rows,
+                        cfg=eff_cfg,
+                        auto_push=bool(eff_cfg.get("auto_push_to_crm", True)),
                     )
+                    ingested_total += int(w2_ingest.get("vacancy_ingested") or 0)
+                    social_manual_ingested += int(w2_ingest.get("social_manual_ingested") or 0)
+                    wave_extra_campaigns.update(w2_ingest.get("campaigns") or {})
+
+            # Wave 3 RU Experts pipeline (isolated from Airtable via exclude_from_airtable=1)
+            if still_needs_ru:
+                wave3_rows, wave3_stats = run_wave3_ru_experts_pipeline(
+                    conn,
+                    cfg=eff_cfg,
+                    budget_state=budget_state,
+                    tg_client=tg_client,
+                    scraper_session=isolated_session,
+                    ru_experts_fn=ru_experts_fn,
+                    treg_fn=waterfall_treg_fn,
+                    monid_fn=waterfall_monid_fn,
+                    http_get_fn=waterfall_http_get_fn,
+                )
+                if wave3_rows:
+                    w3_ingest = ingest_v2_routed_leads(
+                        conn,
+                        wave3_rows,
+                        cfg=eff_cfg,
+                        auto_push=bool(eff_cfg.get("auto_push_to_crm", True)),
+                    )
+                    ingested_total += int(w3_ingest.get("ru_experts_ingested") or 0)
+                    wave_extra_campaigns.update(w3_ingest.get("campaigns") or {})
 
             push_2 = push_discovered_now(conn)
             ingested_total += int(push_2.get("ingested") or 0)
+            if curated_v2_stamp_rows:
+                _stamp_new_lead_v2_fields(conn, curated_v2_stamp_rows)
 
-            b2b_camp = _find_campaign_by_name(conn, b2b_name)
+            b2b_camp = _find_campaign_by_name(conn, b2b_name) or _resolve_active_b2b_camp_fallback(conn)
             vac_camp = _find_campaign_by_name(conn, vac_name)
+            ru_camp = _find_campaign_by_name(conn, ru_name) if ru_active else ru_camp
             wa_name = str(b2b_cfg.get("target_campaign_wa") or "Leadgen Auto (WA)").strip() or "Leadgen Auto (WA)"
             wa_camp = _find_campaign_by_name(conn, wa_name)
             ofm_camp = None
@@ -1968,9 +3779,41 @@ def _run_autonomous_replenish_locked(
                 ofm_camp = _find_campaign_by_name(conn, ofm_name)
 
         # Step 3: Rule 5 Dry-Run quarantine rollback BEFORE finalizing replenish state
-        for camp_obj in (b2b_camp, vac_camp, wa_camp, ofm_camp):
+        gained_camp_ids: set[int] = {
+            int(r["campaign_id"])
+            for r in conn.execute("SELECT id, campaign_id FROM campaign_recipients").fetchall()
+            if int(r["id"]) not in pre_existing_recipient_ids and r["campaign_id"] is not None
+        }
+        dynamic_rule5_camps: list[dict[str, Any]] = []
+        for g_cid in sorted(gained_camp_ids):
+            crow = conn.execute("SELECT * FROM campaigns WHERE id = ?", (g_cid,)).fetchone()
+            if crow is not None:
+                dynamic_rule5_camps.append(as_dict(crow))
+        for rrow in conn.execute(
+            "SELECT * FROM campaigns WHERE lower(COALESCE(status, '')) = 'running' AND leadgen_enabled = 1 ORDER BY id ASC"
+        ).fetchall():
+            dynamic_rule5_camps.append(as_dict(rrow))
+
+        seen_camp_ids: set[int] = set()
+        rule5_targets: list[dict[str, Any]] = []
+        for camp_obj in (
+            b2b_camp,
+            vac_camp,
+            wa_camp,
+            ofm_camp,
+            ru_camp,
+            *wave_extra_campaigns.values(),
+            *dynamic_rule5_camps,
+        ):
             if camp_obj is None:
                 continue
+            if str(camp_obj.get("status") or "").strip().lower() == "completed":
+                continue
+            cid_k = int(camp_obj["id"])
+            if cid_k not in seen_camp_ids:
+                seen_camp_ids.add(cid_k)
+                rule5_targets.append(camp_obj)
+        for camp_obj in rule5_targets:
             preview_obj, q_ids = _enforce_rule5_quarantine_on_new_recipients(
                 conn,
                 campaign=camp_obj,
@@ -1984,7 +3827,12 @@ def _run_autonomous_replenish_locked(
                 rule5_previews[str(camp_obj["name"])] = preview_obj
 
         pending_b2b = _count_pending(conn, b2b_camp["id"] if b2b_camp else None)
-        pending_vac = _count_pending(conn, vac_camp["id"] if vac_camp else None)
+        _, _, pending_vac, _ = _collect_vacancy_campaigns_state(
+            conn,
+            vac_name,
+            vac_enabled=bool(vac_cfg.get("enabled", False)),
+            vac_low_water_mark=int(vac_low_water_mark),
+        )
 
     # Persist stage_errors in kv_settings for observability
     now_err_stamp = utc_now()
@@ -2035,7 +3883,21 @@ def _run_autonomous_replenish_locked(
     run_timestamp = utc_now()
     zero_streak = 0
     static_repeats: list[dict[str, Any]] = []
-    if stages_run or ingested_total > 0 or direct_x_routed > 0 or ofm_review_added > 0:
+    budget_summary = (
+        {
+            "day": budget_state.day,
+            "spent_usd": budget_state.spent_usd,
+            "daily_cap_usd": budget_state.daily_cap_usd,
+            "treg_balance_usd": budget_state.treg_balance_usd,
+            "monid_balance_usd": budget_state.monid_balance_usd,
+            "paid_allowed": budget_state.paid_allowed,
+            "alert_sent": budget_state.alert_sent,
+            "stop_reason": budget_state.stop_reason,
+        }
+        if budget_state is not None
+        else None
+    )
+    if stages_run or ingested_total > 0 or direct_x_routed > 0 or ofm_review_added > 0 or social_manual_ingested > 0:
         zero_streak, static_repeats = _update_run_history_and_detect(
             st_dir,
             {
@@ -2052,6 +3914,7 @@ def _run_autonomous_replenish_locked(
         "timestamp": run_timestamp,
         "ingested_total": ingested_total,
         "direct_x_routed": direct_x_routed,
+        "social_manual_ingested": social_manual_ingested,
         "ofm_review_added": ofm_review_added,
         "tg_bridged_count": tg_bridged_count,
         "tg_bridged_zero_streak": zero_streak,
@@ -2068,8 +3931,23 @@ def _run_autonomous_replenish_locked(
         "rule5_previews": rule5_previews,
         "rule5_quarantined": rule5_quarantined,
         "low_water_alert": low_water_alert,
+        "budget_state": budget_summary,
+        "tg_group_admins": tg_admin_stats,
+        "phone_resolution": phone_res_stats,
+        "wave2_vacancies": wave2_stats,
+        "wave3_ru_experts": wave3_stats,
     }
-    if stages_run or ingested_total > 0 or direct_x_routed > 0 or ofm_review_added > 0:
+    if (
+        stages_run
+        or ingested_total > 0
+        or direct_x_routed > 0
+        or ofm_review_added > 0
+        or social_manual_ingested > 0
+        or wave2_stats.get("hh_count")
+        or wave2_stats.get("freelance_count")
+        or wave2_stats.get("linkedin_jobs_count")
+        or wave3_stats.get("collected")
+    ):
         try:
             st_dir.mkdir(parents=True, exist_ok=True)
             summary_tmp = st_dir / "last_run_summary.json.tmp"
@@ -2079,6 +3957,7 @@ def _run_autonomous_replenish_locked(
                         "timestamp": result_payload["timestamp"],
                         "ingested_total": ingested_total,
                         "direct_x_routed": direct_x_routed,
+                        "social_manual_ingested": social_manual_ingested,
                         "ofm_review_added": ofm_review_added,
                         "tg_bridged_count": tg_bridged_count,
                         "tg_bridged_zero_streak": zero_streak,
@@ -2092,6 +3971,11 @@ def _run_autonomous_replenish_locked(
                         "stage_error_count": len(stage_errors),
                         "stage_errors": stage_errors,
                         "reasons": replenish_reasons,
+                        "budget_state": budget_summary,
+                        "tg_group_admins": tg_admin_stats,
+                        "phone_resolution": phone_res_stats,
+                        "wave2_vacancies": wave2_stats,
+                        "wave3_ru_experts": wave3_stats,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -2099,8 +3983,8 @@ def _run_autonomous_replenish_locked(
                 encoding="utf-8",
             )
             summary_tmp.replace(st_dir / "last_run_summary.json")
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("Failed writing last_run_summary.json: %s", exc)
 
     return result_payload
 

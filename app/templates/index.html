@@ -208,7 +208,19 @@
           <div class="switch" id="leads-view-toggle" role="group" aria-label="Вид раздела Лиды">
             <button type="button" id="leads-view-kanban-btn" data-leads-subview="kanban" class="btn primary sm" aria-pressed="true">Канбан</button>
             <button type="button" id="leads-view-table-btn" data-leads-subview="table" class="btn ghost sm" aria-pressed="false">Таблица</button>
+            <button type="button" id="leads-view-social-queue-btn" data-leads-subview="social_manual" class="btn ghost sm" aria-pressed="false">Social Queue <span id="manual-social-count-badge" class="badge b-new queue-pill-count">0</span></button>
+            <button type="button" id="leads-view-job-queue-btn" data-leads-subview="vacancy_assisted" class="btn ghost sm" aria-pressed="false">Job Queue <span id="assisted-jobs-count-badge" class="badge b-new queue-pill-count">0</span></button>
           </div>
+        </div>
+        <div id="leads-segment-pills" class="segment-filter-bar" role="group" aria-label="Фильтр лидов по сегменту">
+          <button type="button" class="chip seg-filter-pill is-active" data-leads-segment="" aria-pressed="true">Все</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="whale" aria-pressed="false">Whale</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="vacancy" aria-pressed="false">Vacancy</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="client_reels" aria-pressed="false">Client Reels</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="ru_expert" aria-pressed="false">RU Expert</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="social_manual" aria-pressed="false">Social Queue</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="vacancy_assisted" aria-pressed="false">Job Queue</button>
+          <button type="button" class="chip seg-filter-pill" data-leads-segment="ofm" aria-pressed="false">OFM</button>
         </div>
       </div>
 
@@ -385,6 +397,16 @@
               <button type="button" class="chip" data-chip="our_turn" aria-pressed="false">Ждём лида</button>
               <button type="button" class="chip" data-chip="unread" aria-pressed="false">Непрочитанные</button>
               <button type="button" class="chip" data-chip="muted" aria-pressed="false" hidden>Без звука</button>
+            </div>
+            <div id="inbox-segment-pills" class="segment-filter-bar inbox-segment-pills" role="group" aria-label="Фильтр входящих по сегменту">
+              <button type="button" class="chip seg-filter-pill is-active" data-inbox-segment="" aria-pressed="true">Все</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="whale" aria-pressed="false">Whale</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="vacancy" aria-pressed="false">Vacancy</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="client_reels" aria-pressed="false">Client Reels</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="ru_expert" aria-pressed="false">RU Expert</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="social_manual" aria-pressed="false">Social Queue</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="vacancy_assisted" aria-pressed="false">Job Queue</button>
+              <button type="button" class="chip seg-filter-pill" data-inbox-segment="ofm" aria-pressed="false">OFM</button>
             </div>
             <p id="chip-note" class="hint" hidden>В ответе поиска Telegram нет этого признака, поэтому список может опустеть.</p>
           </section>
@@ -725,12 +747,14 @@
               <span id="leadgen-health-run-badge" class="badge b-new">Проверка…</span>
             </div>
             <div class="row">
+              <button type="button" id="open-leadgen-settings-btn" class="btn secondary sm">Настройки лидгена и шаблоны</button>
+              <button type="button" id="outreach-open-social-queue-btn" class="btn ghost sm">Social Queue (<span id="outreach-social-queue-count">0</span>)</button>
+              <button type="button" id="outreach-open-job-queue-btn" class="btn ghost sm">Job Queue (<span id="outreach-job-queue-count">0</span>)</button>
               <button type="button" id="leadgen-direct-x-btn" class="btn secondary sm" hidden>Direct X лиды (<span id="leadgen-direct-x-count">0</span>)</button>
               <button type="button" id="leadgen-health-refresh-btn" class="btn ghost sm" title="Обновить статус лидгена">↻ Обновить</button>
             </div>
           </div>
           <div id="leadgen-health-campaigns" class="leadgen-health-campaigns"></div>
-          <input type="checkbox" id="leadgen-vacancies-enabled" hidden aria-hidden="true">
         </div>
 
         <div id="outreach-schedule-box" class="surface-subcard outreach-modal-box" data-popup-box="schedule" hidden>
@@ -1085,6 +1109,26 @@
               <tbody id="lead-rows"></tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section id="manual-queues-section" data-sheet="leads" class="surface-box manual-queue-section stack" aria-labelledby="manual-queues-title" hidden>
+        <div class="pane-head">
+          <div class="pipeline-title-row">
+            <h2 id="manual-queues-title">Ручная очередь</h2>
+            <span id="manual-queue-active-badge" class="badge b-new">0 карточек</span>
+          </div>
+          <div class="row">
+            <input type="search" id="manual-queue-search" class="leads-quick-search" placeholder="Поиск по бренду, источнику, тексту..." aria-label="Поиск по ручной очереди">
+            <button type="button" id="manual-queue-refresh-btn" class="btn secondary sm">↻ Обновить</button>
+          </div>
+        </div>
+        <p id="manual-queue-subtitle" class="hint"></p>
+        <div id="manual-queue-view" data-state="empty">
+          <div data-when="loading" class="skeleton" aria-hidden="true"><span class="sk"></span><span class="sk"></span></div>
+          <p data-when="empty" id="manual-queue-empty-msg" class="hint empty-state">В очереди пока нет карточек</p>
+          <p data-when="error" id="manual-queue-error" class="msg" role="alert"></p>
+          <div data-when="filled" id="manual-queue-grid" class="manual-queue-grid"></div>
         </div>
       </section>
 
@@ -1443,6 +1487,386 @@
       </div>
       <div id="accounts-modal-status" class="accounts-modal-status" role="status" aria-live="polite" hidden></div>
       <div id="accounts-modal-slot" class="accounts-modal-body"></div>
+    </div>
+  </dialog>
+
+  <dialog id="leadgen-settings-modal" class="accounts-modal leadgen-settings-modal" closedby="any" aria-labelledby="leadgen-settings-title">
+    <div class="accounts-modal-shell">
+      <div class="accounts-modal-topbar">
+        <div class="pipeline-title-row">
+          <h2 id="leadgen-settings-title">Настройки лидгена и шаблоны аутрича</h2>
+          <span id="leadgen-status-badge" class="badge b-new">Загрузка…</span>
+          <span id="leadgen-stats-badge" class="badge b-new">В CRM: 0</span>
+        </div>
+        <div class="row">
+          <button type="button" id="leadgen-sync-campaigns-btn" class="btn secondary sm">Синхронизировать кампании</button>
+          <button type="button" id="leadgen-push-now-btn" class="btn secondary sm">Залить лиды</button>
+          <button type="button" id="leadgen-save-btn" class="btn primary sm">Сохранить настройки</button>
+          <button type="button" id="leadgen-settings-close-btn" class="btn ghost sm" aria-label="Закрыть настройки лидгена">Закрыть ×</button>
+        </div>
+      </div>
+
+      <div class="lg-modal-tabs" role="tablist" aria-label="Разделы настроек лидгена">
+        <button type="button" class="auth-tab-btn" id="lg-tab-budget" data-lg-tab="budget" role="tab" aria-selected="true">Бюджет и источники</button>
+        <button type="button" class="auth-tab-btn" id="lg-tab-vacancies" data-lg-tab="vacancies" role="tab" aria-selected="false">Вакансии и копирайтинг</button>
+        <button type="button" class="auth-tab-btn" id="lg-tab-ru-experts" data-lg-tab="ru_experts" role="tab" aria-selected="false">РФ-Эксперты</button>
+        <button type="button" class="auth-tab-btn" id="lg-tab-templates" data-lg-tab="templates" role="tab" aria-selected="false">Шаблоны кампаний</button>
+      </div>
+
+      <div id="leadgen-settings-body" class="accounts-modal-body lg-settings-body">
+        <div id="lg-pane-budget" class="lg-tab-pane stack">
+          <section id="leadgen-enrichment-budget-card" class="surface-subcard lg-budget-card stack" aria-label="Бюджет обогащения контактов">
+            <div class="subcard-head">
+              <div class="pipeline-title-row">
+                <h3>Бюджет Phone Waterfall (treg / monid)</h3>
+                <span id="leadgen-paid-layer-badge" class="badge b-new">Проверка…</span>
+              </div>
+              <button type="button" id="leadgen-budget-refresh-btn" class="btn ghost sm">↻ Обновить баланс</button>
+            </div>
+            <div class="lg-budget-metrics">
+              <div class="lg-budget-metric">
+                <span class="hint">Расход за сегодня (UTC)</span>
+                <strong id="leadgen-budget-spent-value">$0.00 / $5.00</strong>
+                <div class="lg-budget-bar" aria-hidden="true">
+                  <span id="leadgen-budget-progress-fill" class="lg-budget-bar-fill" style="width: 0%"></span>
+                </div>
+              </div>
+              <div class="lg-budget-metric">
+                <span class="hint">Баланс treg</span>
+                <strong id="leadgen-treg-balance">—</strong>
+              </div>
+              <div class="lg-budget-metric">
+                <span class="hint">Баланс monid</span>
+                <strong id="leadgen-monid-balance">—</strong>
+              </div>
+              <div class="lg-budget-metric">
+                <span class="hint">Hit-rate сегодня</span>
+                <strong id="leadgen-budget-hits">—</strong>
+              </div>
+            </div>
+            <div class="leadgen-form-row-3">
+              <label for="leadgen-enrichment-daily-cap">Дневной потолок ($/сутки)
+                <input id="leadgen-enrichment-daily-cap" type="number" min="0" max="500" step="0.5" value="5.0">
+              </label>
+              <label for="leadgen-enrichment-per-lead-cap">Лимит на лида ($)
+                <input id="leadgen-enrichment-per-lead-cap" type="number" min="0" max="5" step="0.01" value="0.04">
+              </label>
+              <label for="leadgen-enrichment-super-cap">Супер-кит кап ($)
+                <input id="leadgen-enrichment-super-cap" type="number" min="0" max="5" step="0.01" value="0.15">
+              </label>
+            </div>
+          </section>
+
+          <section class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>Общий контур лидгена</h3>
+              <span class="hint">Новые кампании создаются в статусе draft (Rule 5)</span>
+            </div>
+            <div class="leadgen-form-row-3">
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-enabled-toggle" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Автопоиск лидов</strong>
+                  <span class="hint">Главный рубильник пайплайна</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-autopush-toggle" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Автозаливка в CRM</strong>
+                  <span class="hint">Постановка найденных контактов в CRM</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label for="leadgen-total-quota">Общая квота (лидов/сутки)
+                <input id="leadgen-total-quota" type="number" min="0" max="500" value="50">
+              </label>
+            </div>
+          </section>
+
+          <section class="surface-subcard stack">
+            <div class="subcard-head">
+              <h3>Источники Волн 1–3</h3>
+              <div class="row">
+                <label class="leadgen-pill-toggle">
+                  <input type="checkbox" id="leadgen-b2b-enabled" checked>
+                  <span>Whales &amp; B2B</span>
+                  <span class="badge b-ok" data-switch-pill="b2b-enabled">ВКЛ</span>
+                </label>
+              </div>
+            </div>
+            <div class="lg-sources-grid">
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-src-tg-group-admins" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>TG Group Admins</strong>
+                  <span class="hint">Слой 0 за $0 (админы групп брендов)</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-b2b-source="whop_content_rewards" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Whop / Content Rewards</strong>
+                  <span class="hint">Пулы от $5K+</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-b2b-source="meta_ads" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Meta Ads Library</strong>
+                  <span class="hint">Multi-GEO + Click-to-WA (без Gaming)</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-b2b-source="app_stores" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>App Store / Google Play</strong>
+                  <span class="hint">Подписные / IAP приложения</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-vac-source="hh_ru" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>hh.ru API</strong>
+                  <span class="hint">TG/WA или Assisted Job Queue</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-vac-source="profi_ru" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Profi.ru</strong>
+                  <span class="hint">Assisted Job Queue (без обхода защит)</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-vac-source="kwork" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Kwork</strong>
+                  <span class="hint">Assisted Job Queue (биржа заказов)</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-vac-source="upwork" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Upwork</strong>
+                  <span class="hint">Assisted Job Queue (EN заказы)</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-vac-source="linkedin_jobs" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>LinkedIn Jobs</strong>
+                  <span class="hint">Домен → 2 ЛПР → Phone Waterfall</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-vac-source="tg_chats" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>TG-чаты вакансий (VPS)</strong>
+                  <span class="hint">Автономный мониторинг на сервере</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-src-ru-experts-shortcut">
+                <span class="leadgen-switch-copy">
+                  <strong>РФ-Эксперты (Волна 3)</strong>
+                  <span class="hint">TG-каналы, чаты, IG → TG (без Airtable)</span>
+                </span>
+                <span class="badge b-off leadgen-row-badge">ВЫКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-b2b-source="tiktok_ads" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>TikTok Ads &amp; Shop</strong>
+                  <span class="hint">Крупные D2C-бренды</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+            </div>
+
+            <details class="leadgen-sources-spoiler">
+              <summary id="leadgen-b2b-sources-summary">Дополнительные B2B-источники и лимиты</summary>
+              <div class="lg-sources-grid lg-sources-extra">
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="yc_ph" checked><span class="leadgen-switch-copy"><strong>YC / Product Hunt</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="buyer_catalogs" checked><span class="leadgen-switch-copy"><strong>Crypto / Buyer Catalogs</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="tiktok_shop" checked><span class="leadgen-switch-copy"><strong>TikTok Shop</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="tg_groups" checked><span class="leadgen-switch-copy"><strong>TG Groups</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="tg_comments" checked><span class="leadgen-switch-copy"><strong>TG Comments</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="channel_graph" checked><span class="leadgen-switch-copy"><strong>Channel Graph</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="tg_ad_spy" checked><span class="leadgen-switch-copy"><strong>TG Ad Spy</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="tg_identity_bridge" checked><span class="leadgen-switch-copy"><strong>TG Identity Bridge</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="ofm_groups" checked><span class="leadgen-switch-copy"><strong>OFM Groups</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="facebook_groups" checked><span class="leadgen-switch-copy"><strong>Facebook Groups</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="ats_hiring" checked><span class="leadgen-switch-copy"><strong>ATS Hiring</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="ph_detailed" checked><span class="leadgen-switch-copy"><strong>PH Detailed</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="d2c_whatsapp" checked><span class="leadgen-switch-copy"><strong>D2C WhatsApp</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+                <label class="leadgen-switch-row"><input type="checkbox" data-b2b-source="social_x_reddit" checked><span class="leadgen-switch-copy"><strong>Social X / Reddit</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+              </div>
+              <div class="leadgen-form-row-3 lg-limits-row">
+                <label for="leadgen-b2b-daily-limit">Лимит B2B кампании/сут
+                  <input id="leadgen-b2b-daily-limit" type="number" min="0" max="500" value="30">
+                </label>
+                <label for="leadgen-limit-external">External / Whales limit
+                  <input id="leadgen-limit-external" type="number" min="0" max="1000" value="40">
+                </label>
+                <label for="leadgen-limit-yc">YC / PH limit
+                  <input id="leadgen-limit-yc" type="number" min="0" max="5000" value="50">
+                </label>
+              </div>
+            </details>
+          </section>
+        </div>
+
+        <div id="lg-pane-vacancies" class="lg-tab-pane stack" hidden>
+          <section class="surface-subcard stack">
+            <div class="subcard-head">
+              <div>
+                <h3>Поток Client Reels и Вакансии (Волна 2)</h3>
+                <p class="hint">Отдельный пул аккаунтов (`subscale`, `Tim Cros` для RU; `HeatherLopez478`, `vladwilhelm` для EN)</p>
+              </div>
+              <label class="leadgen-pill-toggle">
+                <input type="checkbox" id="leadgen-vacancies-enabled">
+                <strong>Монитор вакансий</strong>
+                <span class="badge b-off" data-switch-pill="vac-enabled">ВЫКЛ</span>
+              </label>
+            </div>
+            <div class="leadgen-form-row-3">
+              <label for="leadgen-vac-campaign">Целевая кампания
+                <input id="leadgen-vac-campaign" type="text" autocomplete="off" value="Client Reels &amp; Вакансии RU — TG">
+              </label>
+              <label for="leadgen-vac-daily-limit">Лимит откликов/сут
+                <input id="leadgen-vac-daily-limit" type="number" min="0" max="500" value="20">
+              </label>
+              <label for="leadgen-vac-showcase-url">Showcase URL (сайт под вакансии, Q20)
+                <input id="leadgen-vac-showcase-url" type="url" autocomplete="off" placeholder="https://tmxfy.github.io/">
+              </label>
+            </div>
+            <div class="lg-sources-grid">
+              <label class="leadgen-switch-row"><input type="checkbox" data-vac-layer="AI-контент" checked><span class="leadgen-switch-copy"><strong>Слой: AI-контент и рилсы</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+              <label class="leadgen-switch-row"><input type="checkbox" data-vac-layer="трафик" checked><span class="leadgen-switch-copy"><strong>Слой: Трафик и контент-заводы</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+              <label class="leadgen-switch-row"><input type="checkbox" data-vac-layer="автоматизация"><span class="leadgen-switch-copy"><strong>Слой: Автоматизация / боты</strong></span><span class="badge b-off leadgen-row-badge">ВЫКЛ</span></label>
+              <label class="leadgen-switch-row"><input type="checkbox" data-vac-layer="AI-роль"><span class="leadgen-switch-copy"><strong>Слой: AI-роли</strong></span><span class="badge b-off leadgen-row-badge">ВЫКЛ</span></label>
+              <label class="leadgen-switch-row"><input type="checkbox" id="leadgen-vac-remote-only" checked><span class="leadgen-switch-copy"><strong>Только удалённо</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+              <label class="leadgen-switch-row"><input type="checkbox" id="leadgen-vac-hot-priority" checked><span class="leadgen-switch-copy"><strong>Приоритет прямых заказчиков</strong></span><span class="badge b-ok leadgen-row-badge">ВКЛ</span></label>
+            </div>
+            <label for="leadgen-vac-prompt-override">Промпт-переопределение для откликов на вакансии (Q20)
+              <textarea id="leadgen-vac-prompt-override" rows="3" placeholder="Системный промпт или финальные тезисы для отклика на вакансии (упоминание кейсов + ссылка на showcase_url, без упоминания старого бренда)..."></textarea>
+            </label>
+            <label for="leadgen-cases-bank">Банк кейсов (Cases Bank Markdown)
+              <textarea id="leadgen-cases-bank" rows="4" placeholder="Кейсы для подстановки в отклики..."></textarea>
+            </label>
+          </section>
+        </div>
+
+        <div id="lg-pane-ru-experts" class="lg-tab-pane stack" hidden>
+          <section class="surface-subcard stack">
+            <div class="subcard-head">
+              <div>
+                <h3>РФ-Эксперты (Продюсирование, Волна 3)</h3>
+                <p class="hint">TG-каналы (similar-channels + channel-info + posts), профильные РФ чаты и IG → TG</p>
+              </div>
+              <span id="ru-experts-isolation-indicator" class="badge b-won" title="Лиды с сегментом ru_expert никогда не синхронизируются в Airtable SoftUGC">Изоляция: exclude_from_airtable = 1</span>
+            </div>
+            <div class="leadgen-form-row-3">
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-ru-experts-enabled">
+                <span class="leadgen-switch-copy">
+                  <strong>Включить поиск РФ-экспертов</strong>
+                  <span class="hint">После заполнения ниш и стоп-слов</span>
+                </span>
+                <span class="badge b-off leadgen-row-badge">ВЫКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-ru-experts-ig-tg" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Связка IG → TG</strong>
+                  <span class="hint">Пробив контакта TG из Instagram био</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label for="leadgen-ru-experts-daily-limit">Лимит РФ-экспертов/сут
+                <input id="leadgen-ru-experts-daily-limit" type="number" min="0" max="200" value="20">
+              </label>
+            </div>
+            <div class="leadgen-form-row-3">
+              <label for="leadgen-ru-experts-campaign">Кампания РФ-экспертов
+                <input id="leadgen-ru-experts-campaign" type="text" autocomplete="off" value="РФ-Эксперты (Продюсирование) — TG">
+              </label>
+              <label for="leadgen-ru-experts-min-subs">Мин. подписчиков
+                <input id="leadgen-ru-experts-min-subs" type="number" min="0" max="10000000" value="1000">
+              </label>
+              <label for="leadgen-ru-experts-max-subs">Макс. подписчиков
+                <input id="leadgen-ru-experts-max-subs" type="number" min="0" max="10000000" value="50000">
+              </label>
+            </div>
+            <div class="lg-two-col-grid">
+              <label for="leadgen-ru-experts-niches">Целевые ниши (через запятую или с новой строки)
+                <textarea id="leadgen-ru-experts-niches" rows="3" placeholder="инфобизнес, психология, фитнес, бьюти, наставничество..."></textarea>
+              </label>
+              <label for="leadgen-ru-experts-stop-words">Стоп-слова (исключить каналы/чаты)
+                <textarea id="leadgen-ru-experts-stop-words" rows="3" placeholder="ставки, казино, арбитраж, крипта, биржа рекламы..."></textarea>
+              </label>
+            </div>
+            <div class="lg-two-col-grid">
+              <label for="leadgen-ru-experts-seed-channels">Seed TG-каналы (@channel)
+                <textarea id="leadgen-ru-experts-seed-channels" rows="2" placeholder="@seed_channel_1, @seed_channel_2"></textarea>
+              </label>
+              <label for="leadgen-ru-experts-seed-chats">Seed РФ TG-чаты (@chat)
+                <textarea id="leadgen-ru-experts-seed-chats" rows="2" placeholder="@seed_chat_1, @seed_chat_2"></textarea>
+              </label>
+            </div>
+          </section>
+        </div>
+
+        <div id="lg-pane-templates" class="lg-tab-pane stack" hidden>
+          <section class="surface-subcard stack">
+            <div class="subcard-head">
+              <div>
+                <h3>Редактор шаблонов кампании</h3>
+                <p class="hint">Прямое редактирование Step 1 / Step 2 / Step 3 без деплоя. Поддерживаются переменные {name}, {company}, {pool_usd}, {showcase_url}.</p>
+              </div>
+              <button type="button" id="campaign-tpl-save-btn" class="btn primary sm">Сохранить шаблоны кампании</button>
+            </div>
+            <div class="outreach-form-row">
+              <label for="campaign-tpl-select">Кампания
+                <select id="campaign-tpl-select">
+                  <option value="">Выберите кампанию…</option>
+                </select>
+              </label>
+              <div id="campaign-tpl-meta" class="campaign-tpl-meta"></div>
+            </div>
+            <p id="campaign-tpl-status" class="msg" role="status" hidden></p>
+            <label for="campaign-tpl-step1">Step 1 (Первое касание)
+              <textarea id="campaign-tpl-step1" rows="4" placeholder="Текст первого сообщения…"></textarea>
+            </label>
+            <label for="campaign-tpl-step2">Step 2 (Фоллоу-ап 1)
+              <textarea id="campaign-tpl-step2" rows="3" placeholder="Текст второго касания…"></textarea>
+            </label>
+            <label for="campaign-tpl-step3">Step 3 (Фоллоу-ап 2)
+              <textarea id="campaign-tpl-step3" rows="3" placeholder="Текст третьего касания…"></textarea>
+            </label>
+            <div class="lg-two-col-grid">
+              <label for="campaign-tpl-system-prompt">Системный промпт персонализации
+                <textarea id="campaign-tpl-system-prompt" rows="2" placeholder="Тон, ограничения, запреты…"></textarea>
+              </label>
+              <label for="campaign-tpl-showcase-url">Showcase URL для кампании
+                <input id="campaign-tpl-showcase-url" type="url" autocomplete="off" placeholder="https://tmxfy.github.io/">
+              </label>
+            </div>
+          </section>
+        </div>
+      </div>
     </div>
   </dialog>
   <script src="/static/app.js?v=20261122acc2"></script>

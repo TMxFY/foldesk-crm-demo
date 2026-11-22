@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -72,6 +73,7 @@ from app.inbox import (  # noqa: E402
     repair_dialog_last_from_peer_drift,
 )
 from app.leads import create_lead, search_leads  # noqa: E402
+from app.leadgen_settings import get_leadgen_config  # noqa: E402
 from app.main import load_env_file  # noqa: E402
 from app.outreach import (  # noqa: E402
     _build_recipient_dialogs_index,
@@ -99,11 +101,16 @@ from app.hygiene import (  # noqa: E402
     inspect_leadgen_run_anomalies,
     read_stage_errors_list,
 )
+from leadgen.language_router import assert_copy_matches_language  # noqa: E402
 
 ANALYTICS_SUMMARY_MAX_BYTES = 60 * 1024
 AIRTABLE_SYNCED_24H_MAX = 500
 LEAD_EVENTS_MAX_BYTES = 10 * 1024 * 1024
 DISCONNECTS_1H_MAX_PER_ACCOUNT = 10
+DEFAULT_DAILY_ENRICHMENT_CAP_USD = 5.0
+MAX_UNGUARDED_DAILY_ENRICHMENT_CAP_USD = 100.0
+_CREATOROS_RE = re.compile(r"\bCreator\s*OS\b|creatoros", re.IGNORECASE)
+_PLACEHOLDER_TOKEN_RE = re.compile(r"\{[A-Za-z0-9_]+\}")
 
 
 def _audit_ssot_statistics(conn: sqlite3.Connection) -> dict:
@@ -921,6 +928,502 @@ def _heal_lead_dialog_links(conn: sqlite3.Connection) -> dict:
     return {"repaired": len(repaired_ids), "lead_ids": repaired_ids[:50]}
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(r[1]) for r in rows if len(r) > 1}
+
+
+def _audit_ru_expert_airtable_isolation(conn: sqlite3.Connection) -> dict:
+    """Verify every ru_expert lead and campaign enforces exclude_from_airtable == 1."""
+    lead_cols = _table_columns(conn, "leads")
+    camp_cols = _table_columns(conn, "campaigns")
+    rec_cols = _table_columns(conn, "campaign_recipients")
+    violations: list[dict] = []
+
+    bad_leads_count = 0
+    if "segment" in lead_cols:
+        if "exclude_from_airtable" in lead_cols:
+            rows = conn.execute(
+                """
+                SELECT id, name, username, segment, COALESCE(exclude_from_airtable, 0) AS excl
+                FROM leads
+                WHERE lower(trim(COALESCE(segment, ''))) = 'ru_expert'
+                  AND COALESCE(exclude_from_airtable, 0) != 1
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, name, username, segment, 0 AS excl
+                FROM leads
+                WHERE lower(trim(COALESCE(segment, ''))) = 'ru_expert'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        bad_leads_count = len(rows)
+        for r in rows[:20]:
+            violations.append(
+                {
+                    "kind": "ru_expert_lead_not_excluded",
+                    "lead_id": int(r["id"]),
+                    "username": r["username"],
+                    "exclude_from_airtable": int(r["excl"]),
+                }
+            )
+
+    bad_camps_count = 0
+    if "segment" in camp_cols:
+        if "exclude_from_airtable" in camp_cols:
+            c_rows = conn.execute(
+                """
+                SELECT id, name, segment, COALESCE(exclude_from_airtable, 0) AS excl
+                FROM campaigns
+                WHERE lower(trim(COALESCE(segment, ''))) = 'ru_expert'
+                  AND COALESCE(exclude_from_airtable, 0) != 1
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        else:
+            c_rows = conn.execute(
+                """
+                SELECT id, name, segment, 0 AS excl
+                FROM campaigns
+                WHERE lower(trim(COALESCE(segment, ''))) = 'ru_expert'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        bad_camps_count = len(c_rows)
+        for cr in c_rows[:20]:
+            violations.append(
+                {
+                    "kind": "ru_expert_campaign_not_excluded",
+                    "campaign_id": int(cr["id"]),
+                    "name": cr["name"],
+                    "exclude_from_airtable": int(cr["excl"]),
+                }
+            )
+
+    bad_linked_count = 0
+    if (
+        "segment" in camp_cols
+        and "lead_id" in rec_cols
+        and "campaign_id" in rec_cols
+        and "exclude_from_airtable" in lead_cols
+    ):
+        linked_rows = conn.execute(
+            """
+            SELECT DISTINCT l.id AS lead_id, l.username, c.id AS campaign_id,
+                   COALESCE(l.exclude_from_airtable, 0) AS excl
+            FROM campaign_recipients cr
+            JOIN campaigns c ON c.id = cr.campaign_id
+            JOIN leads l ON l.id = cr.lead_id
+            WHERE lower(trim(COALESCE(c.segment, ''))) = 'ru_expert'
+              AND COALESCE(l.exclude_from_airtable, 0) != 1
+            ORDER BY l.id ASC
+            """
+        ).fetchall()
+        bad_linked_count = len(linked_rows)
+        for lr in linked_rows[:20]:
+            violations.append(
+                {
+                    "kind": "ru_expert_campaign_lead_not_excluded",
+                    "lead_id": int(lr["lead_id"]),
+                    "campaign_id": int(lr["campaign_id"]),
+                    "username": lr["username"],
+                    "exclude_from_airtable": int(lr["excl"]),
+                }
+            )
+
+    return {
+        "ok": len(violations) == 0,
+        "unisolated_ru_expert_lead_count": bad_leads_count,
+        "unisolated_ru_expert_campaign_count": bad_camps_count,
+        "unisolated_linked_lead_count": bad_linked_count,
+        "violations": violations[:20],
+    }
+
+
+def _heal_ru_expert_airtable_isolation(conn: sqlite3.Connection) -> dict:
+    """Ensure every ru_expert lead and campaign sets exclude_from_airtable = 1."""
+    lead_cols = _table_columns(conn, "leads")
+    camp_cols = _table_columns(conn, "campaigns")
+    rec_cols = _table_columns(conn, "campaign_recipients")
+    healed_leads = 0
+    healed_camps = 0
+    if "segment" in lead_cols and "exclude_from_airtable" in lead_cols:
+        cur = conn.execute(
+            """
+            UPDATE leads
+            SET exclude_from_airtable = 1
+            WHERE lower(trim(COALESCE(segment, ''))) = 'ru_expert'
+              AND COALESCE(exclude_from_airtable, 0) != 1
+            """
+        )
+        healed_leads += int(cur.rowcount or 0)
+    if "segment" in camp_cols and "exclude_from_airtable" in camp_cols:
+        cur_c = conn.execute(
+            """
+            UPDATE campaigns
+            SET exclude_from_airtable = 1
+            WHERE lower(trim(COALESCE(segment, ''))) = 'ru_expert'
+              AND COALESCE(exclude_from_airtable, 0) != 1
+            """
+        )
+        healed_camps += int(cur_c.rowcount or 0)
+    if (
+        "segment" in camp_cols
+        and "lead_id" in rec_cols
+        and "campaign_id" in rec_cols
+        and "exclude_from_airtable" in lead_cols
+    ):
+        cur_l = conn.execute(
+            """
+            UPDATE leads
+            SET exclude_from_airtable = 1
+            WHERE id IN (
+                SELECT DISTINCT cr.lead_id
+                FROM campaign_recipients cr
+                JOIN campaigns c ON c.id = cr.campaign_id
+                WHERE cr.lead_id IS NOT NULL
+                  AND lower(trim(COALESCE(c.segment, ''))) = 'ru_expert'
+            )
+              AND COALESCE(exclude_from_airtable, 0) != 1
+            """
+        )
+        healed_leads += int(cur_l.rowcount or 0)
+    if healed_leads or healed_camps:
+        conn.commit()
+    return {"healed_leads": healed_leads, "healed_campaigns": healed_camps}
+
+
+def _has_non_placeholder_prose(text: str) -> bool:
+    stripped = _PLACEHOLDER_TOKEN_RE.sub(" ", str(text or ""))
+    stripped = re.sub(r"https?://\S+|www\.\S+|@[A-Za-z0-9_]+", " ", stripped)
+    return bool(re.search(r"[A-Za-z\u0400-\u04FF]", stripped))
+
+
+def _extract_custom_step_texts(custom_raw: str) -> list[tuple[str, str]]:
+    try:
+        parsed = json.loads(custom_raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    out: list[tuple[str, str]] = []
+    for key in (
+        "step1",
+        "step1_text",
+        "step1_template",
+        "first_touch",
+        "1",
+        "step2",
+        "step2_text",
+        "followup_1",
+        "2",
+        "step3",
+        "step3_text",
+        "followup_2",
+        "3",
+    ):
+        val = parsed.get(key)
+        if isinstance(val, str) and val.strip():
+            out.append((key, val))
+        elif isinstance(val, dict):
+            txt = val.get("template_text") if "template_text" in val else val.get("text")
+            if isinstance(txt, str) and txt.strip():
+                out.append((key, txt))
+    steps_val = parsed.get("steps")
+    if isinstance(steps_val, dict):
+        for s_key, entry in steps_val.items():
+            if isinstance(entry, str) and entry.strip():
+                out.append((f"steps.{s_key}", entry))
+            elif isinstance(entry, dict):
+                txt = entry.get("template_text") if "template_text" in entry else entry.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    out.append((f"steps.{s_key}", txt))
+    elif isinstance(steps_val, list):
+        for idx, entry in enumerate(steps_val, start=1):
+            if isinstance(entry, str) and entry.strip():
+                out.append((f"steps[{idx}]", entry))
+            elif isinstance(entry, dict):
+                txt = entry.get("template_text") if "template_text" in entry else entry.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    out.append((f"steps.{entry.get('step_order') or idx}", txt))
+    return out
+
+
+def _extract_custom_step1_texts(custom_raw: str) -> list[str]:
+    step1_keys = {"step1", "step1_text", "step1_template", "first_touch", "1", "steps.1", "steps[1]"}
+    return [txt for lbl, txt in _extract_custom_step_texts(custom_raw) if lbl in step1_keys]
+
+
+def _audit_ru_language_campaigns(conn: sqlite3.Connection) -> dict:
+    """Verify RU and EN campaigns never hold mismatched-language templates/copies or CreatorOS."""
+    camp_cols = _table_columns(conn, "campaigns")
+    if "language" not in camp_cols:
+        return {"ok": True, "checked_campaigns": 0, "violation_count": 0, "violations": []}
+
+    has_custom_col = "custom_step_templates_json" in camp_cols
+    sel_custom = ", custom_step_templates_json" if has_custom_col else ", NULL AS custom_step_templates_json"
+    lang_camps = conn.execute(
+        f"""
+        SELECT id, name, status, lower(trim(COALESCE(language, ''))) AS lang {sel_custom}
+        FROM campaigns
+        WHERE lower(trim(COALESCE(language, ''))) IN ('ru', 'en')
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    violations: list[dict] = []
+
+    for c in lang_camps:
+        cid = int(c["id"])
+        cname = str(c["name"] or "")
+        lang = str(c["lang"] or "").strip().lower()
+        if _CREATOROS_RE.search(cname):
+            violations.append(
+                {
+                    "kind": f"creatoros_in_{lang}_campaign_name",
+                    "language": lang,
+                    "campaign_id": cid,
+                    "campaign_name": cname,
+                }
+            )
+
+        custom_raw = str(c["custom_step_templates_json"] or "").strip()
+        if custom_raw:
+            if _CREATOROS_RE.search(custom_raw):
+                violations.append(
+                    {
+                        "kind": f"creatoros_in_{lang}_custom_templates",
+                        "language": lang,
+                        "campaign_id": cid,
+                        "campaign_name": cname,
+                    }
+                )
+            for key_lbl, s_txt in _extract_custom_step_texts(custom_raw):
+                if _has_non_placeholder_prose(s_txt):
+                    ok_lang, reason = assert_copy_matches_language(
+                        s_txt, lang, allow_cyrillic_name=False  # type: ignore[arg-type]
+                    )
+                    if not ok_lang:
+                        violations.append(
+                            {
+                                "kind": f"non_{lang}_custom_template",
+                                "language": lang,
+                                "step_key": key_lbl,
+                                "campaign_id": cid,
+                                "campaign_name": cname,
+                                "reason": reason,
+                            }
+                        )
+
+        step_rows = conn.execute(
+            "SELECT step_order, template_text FROM campaign_steps WHERE campaign_id = ? ORDER BY step_order ASC",
+            (cid,),
+        ).fetchall()
+        for sr in step_rows:
+            step_num = int(sr["step_order"] or 0)
+            tmpl = str(sr["template_text"] or "")
+            if _CREATOROS_RE.search(tmpl):
+                violations.append(
+                    {
+                        "kind": f"creatoros_in_{lang}_step_template",
+                        "language": lang,
+                        "campaign_id": cid,
+                        "campaign_name": cname,
+                        "step_order": step_num,
+                    }
+                )
+            if _has_non_placeholder_prose(tmpl):
+                ok_lang, reason = assert_copy_matches_language(
+                    tmpl, lang, allow_cyrillic_name=False  # type: ignore[arg-type]
+                )
+                if not ok_lang:
+                    violations.append(
+                        {
+                            "kind": f"non_{lang}_step_template",
+                            "language": lang,
+                            "step_order": step_num,
+                            "campaign_id": cid,
+                            "campaign_name": cname,
+                            "reason": reason,
+                            "sample": tmpl[:120],
+                        }
+                    )
+
+        rec_rows = conn.execute(
+            """
+            SELECT id, username, step1_text, status
+            FROM campaign_recipients
+            WHERE campaign_id = ?
+              AND lower(COALESCE(status, 'pending')) IN ('pending', 'in_progress')
+              AND step1_text IS NOT NULL
+              AND trim(step1_text) != ''
+            """,
+            (cid,),
+        ).fetchall()
+        for rr in rec_rows:
+            s1_rec = str(rr["step1_text"] or "")
+            if _CREATOROS_RE.search(s1_rec):
+                violations.append(
+                    {
+                        "kind": f"creatoros_in_{lang}_recipient_step1",
+                        "language": lang,
+                        "campaign_id": cid,
+                        "recipient_id": int(rr["id"]),
+                        "username": rr["username"],
+                    }
+                )
+            elif _has_non_placeholder_prose(s1_rec):
+                ok_lang, reason = assert_copy_matches_language(
+                    s1_rec, lang, allow_cyrillic_name=True  # type: ignore[arg-type]
+                )
+                if not ok_lang:
+                    violations.append(
+                        {
+                            "kind": f"non_{lang}_recipient_step1",
+                            "language": lang,
+                            "campaign_id": cid,
+                            "recipient_id": int(rr["id"]),
+                            "username": rr["username"],
+                            "reason": reason,
+                        }
+                    )
+
+    return {
+        "ok": len(violations) == 0,
+        "checked_campaigns": len(lang_camps),
+        "violation_count": len(violations),
+        "violations": violations[:20],
+    }
+
+
+def _resolve_enrichment_daily_cap_usd(
+    conn: sqlite3.Connection,
+    *,
+    daily_cap_usd: float | None = None,
+) -> float:
+    if daily_cap_usd is not None:
+        return float(daily_cap_usd)
+    try:
+        cfg = get_leadgen_config(conn)
+        enr = cfg.get("enrichment") if isinstance(cfg, dict) else None
+        if isinstance(enr, dict) and enr.get("daily_budget_cap_usd") is not None:
+            parsed = float(enr["daily_budget_cap_usd"])
+            if math.isfinite(parsed) and parsed >= 0.0:
+                return min(parsed, MAX_UNGUARDED_DAILY_ENRICHMENT_CAP_USD)
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        pass
+    return DEFAULT_DAILY_ENRICHMENT_CAP_USD
+
+
+def _audit_enrichment_ledger_bounds(
+    conn: sqlite3.Connection,
+    *,
+    daily_cap_usd: float | None = None,
+) -> dict:
+    """Verify enrichment_ledger daily spend per provider and per day stays within guarded caps."""
+    cols = _table_columns(conn, "enrichment_ledger")
+    if not cols:
+        return {
+            "ok": True,
+            "daily_cap_usd": DEFAULT_DAILY_ENRICHMENT_CAP_USD,
+            "checked_days": 0,
+            "violation_count": 0,
+            "violations": [],
+        }
+
+    cap = _resolve_enrichment_daily_cap_usd(conn, daily_cap_usd=daily_cap_usd)
+    violations: list[dict] = []
+
+    raw_rows = conn.execute(
+        "SELECT id, day, provider, endpoint, cost_usd FROM enrichment_ledger ORDER BY id ASC"
+    ).fetchall()
+    for r in raw_rows:
+        try:
+            cost_val = float(r["cost_usd"])
+        except (TypeError, ValueError):
+            cost_val = math.nan
+        if not math.isfinite(cost_val) or cost_val < 0.0:
+            violations.append(
+                {
+                    "kind": "invalid_enrichment_cost_usd",
+                    "id": int(r["id"]),
+                    "day": r["day"],
+                    "provider": r["provider"],
+                    "cost_usd": r["cost_usd"],
+                }
+            )
+
+    prov_rows = conn.execute(
+        """
+        SELECT day,
+               lower(trim(COALESCE(provider, ''))) AS provider,
+               COALESCE(SUM(cost_usd), 0.0) AS total_usd,
+               COUNT(*) AS calls
+        FROM enrichment_ledger
+        GROUP BY day, lower(trim(COALESCE(provider, '')))
+        ORDER BY day DESC, provider ASC
+        """
+    ).fetchall()
+    for pr in prov_rows:
+        prov_total = float(pr["total_usd"] or 0.0)
+        if not math.isfinite(prov_total) or prov_total > cap + 1e-6:
+            violations.append(
+                {
+                    "kind": "provider_daily_spend_exceeded",
+                    "day": pr["day"],
+                    "provider": pr["provider"],
+                    "total_usd": round(prov_total, 6),
+                    "daily_cap_usd": cap,
+                    "calls": int(pr["calls"] or 0),
+                }
+            )
+
+    day_rows = conn.execute(
+        """
+        SELECT day,
+               COALESCE(SUM(cost_usd), 0.0) AS total_usd,
+               COUNT(*) AS calls
+        FROM enrichment_ledger
+        GROUP BY day
+        ORDER BY day DESC
+        """
+    ).fetchall()
+    for dr in day_rows:
+        day_total = float(dr["total_usd"] or 0.0)
+        if not math.isfinite(day_total) or day_total > cap + 1e-6:
+            violations.append(
+                {
+                    "kind": "total_daily_spend_exceeded",
+                    "day": dr["day"],
+                    "total_usd": round(day_total, 6),
+                    "daily_cap_usd": cap,
+                    "calls": int(dr["calls"] or 0),
+                }
+            )
+
+    return {
+        "ok": len(violations) == 0,
+        "daily_cap_usd": cap,
+        "checked_days": len(day_rows),
+        "violation_count": len(violations),
+        "violations": violations[:20],
+    }
+
+
+def _collect_v2_audit_reports(conn: sqlite3.Connection) -> tuple[dict, dict, dict]:
+    return (
+        _audit_ru_expert_airtable_isolation(conn),
+        _audit_ru_language_campaigns(conn),
+        _audit_enrichment_ledger_bounds(conn),
+    )
+
+
 def _audit_local_db(
     db_path: Path,
     *,
@@ -949,6 +1452,7 @@ def _audit_local_db(
             healed_events = prune_redundant_airtable_synced_events(conn)
             healed_sessions = reconcile_disk_sessions_with_db(conn)
             healed_links = _heal_lead_dialog_links(conn)
+            healed_ru_iso = _heal_ru_expert_airtable_isolation(conn)
             print(
                 "proactive_audit: healed "
                 + json.dumps(
@@ -959,6 +1463,7 @@ def _audit_local_db(
                         "airtable_events_pruned": healed_events,
                         "session_parity": healed_sessions,
                         "lead_dialog_links": healed_links,
+                        "ru_expert_isolation": healed_ru_iso,
                     },
                     ensure_ascii=False,
                 )
@@ -976,6 +1481,7 @@ def _audit_local_db(
                 conn, db_path=db_path, state_dir=leadgen_state_dir
             )
             proxy_report = _audit_proxy_modes(conn, strict_static_proxy=strict_static_proxy)
+            ru_iso_report, ru_lang_report, ledger_report = _collect_v2_audit_reports(conn)
             if check_readiness:
                 readiness_report = _audit_server_leadgen_readiness(
                     conn, enforce_vps_checks=True
@@ -1000,6 +1506,7 @@ def _audit_local_db(
                 conn, db_path=db_path, state_dir=leadgen_state_dir
             )
             proxy_report = _audit_proxy_modes(conn, strict_static_proxy=strict_static_proxy)
+            ru_iso_report, ru_lang_report, ledger_report = _collect_v2_audit_reports(conn)
             if check_readiness:
                 readiness_report = _audit_server_leadgen_readiness(
                     conn, enforce_vps_checks=True
@@ -1020,6 +1527,9 @@ def _audit_local_db(
             and bool(drift_report.get("ok"))
             and bool(leadgen_anomalies.get("ok"))
             and bool(proxy_report.get("ok"))
+            and bool(ru_iso_report.get("ok"))
+            and bool(ru_lang_report.get("ok"))
+            and bool(ledger_report.get("ok"))
         )
         if readiness_report is not None and not bool(readiness_report.get("ok")):
             overall_ok = False
@@ -1042,6 +1552,12 @@ def _audit_local_db(
     combined["leadgen_starvation_and_anomalies"] = leadgen_anomalies
     combined["proxy_modes_ok"] = bool(proxy_report.get("ok"))
     combined["proxy_modes"] = proxy_report
+    combined["ru_expert_isolation_ok"] = bool(ru_iso_report.get("ok"))
+    combined["ru_expert_isolation"] = ru_iso_report
+    combined["ru_language_campaigns_ok"] = bool(ru_lang_report.get("ok"))
+    combined["ru_language_campaigns"] = ru_lang_report
+    combined["enrichment_ledger_bounds_ok"] = bool(ledger_report.get("ok"))
+    combined["enrichment_ledger_bounds"] = ledger_report
     if readiness_report is not None:
         combined["leadgen_ready"] = bool(readiness_report.get("ok"))
         combined["leadgen_readiness"] = readiness_report
@@ -1094,6 +1610,22 @@ def _audit_local_db(
         if not proxy_report.get("ok"):
             reasons.append(
                 f"strict_static_proxy(rotating_accounts={proxy_report.get('rotating_proxy_count', 0)})"
+            )
+        if not ru_iso_report.get("ok"):
+            reasons.append(
+                "ru_expert_isolation("
+                f"leads={ru_iso_report.get('unisolated_ru_expert_lead_count', 0)}, "
+                f"campaigns={ru_iso_report.get('unisolated_ru_expert_campaign_count', 0)}, "
+                f"linked={ru_iso_report.get('unisolated_linked_lead_count', 0)})"
+            )
+        if not ru_lang_report.get("ok"):
+            reasons.append(
+                f"ru_language_campaigns(violations={ru_lang_report.get('violation_count', 0)})"
+            )
+        if not ledger_report.get("ok"):
+            reasons.append(
+                f"enrichment_ledger_bounds(violations={ledger_report.get('violation_count', 0)}, "
+                f"cap={ledger_report.get('daily_cap_usd')})"
             )
         if readiness_report is not None and not readiness_report.get("ok"):
             missing = readiness_report.get("missing_components") or []
@@ -1651,6 +2183,195 @@ def _run_self_test() -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+            # --- v2 checks (j) ru_expert isolation, (k) RU language templates/CreatorOS, (l) enrichment_ledger bounds ---
+            v2_db_path = tmp_root / "v2_selftest.db"
+            v2_state_dir = tmp_root / "v2_leadgen_state"
+            v2_state_dir.mkdir(parents=True, exist_ok=True)
+            v2_cfg_path = tmp_root / "v2_leadgen_config.json"
+            v2_cfg_path.write_text(
+                json.dumps({"enabled": True, "enrichment": {"daily_budget_cap_usd": 5.0}}),
+                encoding="utf-8",
+            )
+
+            def _run_v2_db_audit() -> tuple[int, str]:
+                v_out = io.StringIO()
+                v_err = io.StringIO()
+                with (
+                    patch.dict(os.environ, {"LEADGEN_CONFIG_PATH": str(v2_cfg_path)}),
+                    patch(__name__ + ".is_vps_runtime", return_value=False),
+                    contextlib.redirect_stdout(v_out),
+                    contextlib.redirect_stderr(v_err),
+                ):
+                    rc_v2 = _audit_local_db(
+                        v2_db_path,
+                        heal=False,
+                        since_hours=None,
+                        enforce_vps_readiness=False,
+                        leadgen_state_dir=v2_state_dir,
+                    )
+                return rc_v2, v_err.getvalue()
+
+            v2_conn = connect(v2_db_path)
+            try:
+                init_db(v2_conn)
+                ensure_funnel_columns(v2_conn)
+
+                # (j) ru_expert lead with exclude_from_airtable == 0 MUST fail exit != 0
+                ru_lead = create_lead(
+                    v2_conn,
+                    name="Иван Эксперт",
+                    company="Школа Эксперта",
+                    niche="Образование",
+                    lead_source="ru_experts",
+                    username="ivan_expert_ru",
+                    telegram_user_id=9101,
+                    status="new",
+                )
+                v2_conn.execute(
+                    "UPDATE leads SET segment = 'ru_expert', language = 'ru', exclude_from_airtable = 0 WHERE id = ?",
+                    (int(ru_lead["id"]),),
+                )
+                v2_conn.commit()
+                if _audit_ru_expert_airtable_isolation(v2_conn).get("ok") is not False:
+                    print("SELFTEST FAILED: _audit_ru_expert_airtable_isolation missed exclude_from_airtable=0", file=sys.stderr)
+                    return 1
+                rc_ru_bad, err_ru_bad = _run_v2_db_audit()
+                if rc_ru_bad == 0 or "ru_expert_isolation" not in err_ru_bad:
+                    print(f"SELFTEST FAILED: _audit_local_db missed ru_expert exclude_from_airtable=0: rc={rc_ru_bad} err={err_ru_bad!r}", file=sys.stderr)
+                    return 1
+                v2_conn.execute("UPDATE leads SET exclude_from_airtable = 1 WHERE id = ?", (int(ru_lead["id"]),))
+                v2_conn.commit()
+                if _audit_ru_expert_airtable_isolation(v2_conn).get("ok") is not True:
+                    print("SELFTEST FAILED: ru_expert isolation did not pass when exclude_from_airtable=1", file=sys.stderr)
+                    return 1
+
+                # (k) RU-language campaign with English-only Step 1 or CreatorOS MUST fail exit != 0
+                ru_camp_id = int(
+                    v2_conn.execute(
+                        """
+                        INSERT INTO campaigns (
+                            name, daily_limit, status, segment, language, copy_profile,
+                            exclude_from_airtable, created_at, updated_at
+                        ) VALUES ('Client Reels RU SelfTest', 20, 'draft', 'vacancy', 'ru', 'vacancy_ru', 0, ?, ?)
+                        """,
+                        (now, now),
+                    ).lastrowid
+                )
+                v2_conn.execute(
+                    "INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, created_at) "
+                    "VALUES (?, 1, 0, 'Hey, we scale your SaaS with short-form video reels', ?)",
+                    (ru_camp_id, now),
+                )
+                v2_conn.commit()
+                if _audit_ru_language_campaigns(v2_conn).get("ok") is not False:
+                    print("SELFTEST FAILED: _audit_ru_language_campaigns missed EN Step 1 in RU campaign", file=sys.stderr)
+                    return 1
+                rc_en_in_ru, err_en_in_ru = _run_v2_db_audit()
+                if rc_en_in_ru == 0 or "ru_language_campaigns" not in err_en_in_ru:
+                    print(f"SELFTEST FAILED: _audit_local_db missed EN Step 1 in RU campaign: rc={rc_en_in_ru} err={err_en_in_ru!r}", file=sys.stderr)
+                    return 1
+
+                v2_conn.execute(
+                    "UPDATE campaign_steps SET template_text = 'Привет! Поможем через CreatorOS вырастить канал' "
+                    "WHERE campaign_id = ? AND step_order = 1",
+                    (ru_camp_id,),
+                )
+                v2_conn.commit()
+                if _audit_ru_language_campaigns(v2_conn).get("ok") is not False:
+                    print("SELFTEST FAILED: _audit_ru_language_campaigns missed CreatorOS in RU campaign", file=sys.stderr)
+                    return 1
+                rc_cos_in_ru, err_cos_in_ru = _run_v2_db_audit()
+                if rc_cos_in_ru == 0 or "ru_language_campaigns" not in err_cos_in_ru:
+                    print(f"SELFTEST FAILED: _audit_local_db missed CreatorOS in RU campaign: rc={rc_cos_in_ru} err={err_cos_in_ru!r}", file=sys.stderr)
+                    return 1
+
+                v2_conn.execute(
+                    "UPDATE campaign_steps SET template_text = 'Добрый день! Выстраиваем систему лидгена через короткие ролики SoftUGC.' "
+                    "WHERE campaign_id = ? AND step_order = 1",
+                    (ru_camp_id,),
+                )
+                v2_conn.commit()
+                if _audit_ru_language_campaigns(v2_conn).get("ok") is not True:
+                    print("SELFTEST FAILED: valid RU Step 1 failed _audit_ru_language_campaigns", file=sys.stderr)
+                    return 1
+
+                # (k2) EN-language campaign with RU leak in steps/custom/recipients or CreatorOS MUST fail exit != 0
+                en_camp_id = int(
+                    v2_conn.execute(
+                        """
+                        INSERT INTO campaigns (
+                            name, daily_limit, status, segment, language, copy_profile,
+                            exclude_from_airtable, created_at, updated_at
+                        ) VALUES ('Whales EN SelfTest', 30, 'draft', 'whale', 'en', 'whale_mass', 0, ?, ?)
+                        """,
+                        (now, now),
+                    ).lastrowid
+                )
+                v2_conn.execute(
+                    "INSERT INTO campaign_steps (campaign_id, step_order, delay_hours, template_text, created_at) "
+                    "VALUES (?, 1, 0, 'Привет! Check out SoftUGC reels', ?)",
+                    (en_camp_id, now),
+                )
+                v2_conn.commit()
+                if _audit_ru_language_campaigns(v2_conn).get("ok") is not False:
+                    print("SELFTEST FAILED: _audit_ru_language_campaigns missed RU leak in EN campaign step", file=sys.stderr)
+                    return 1
+                rc_ru_in_en, err_ru_in_en = _run_v2_db_audit()
+                if rc_ru_in_en == 0 or "ru_language_campaigns" not in err_ru_in_en:
+                    print(f"SELFTEST FAILED: _audit_local_db missed RU leak in EN campaign: rc={rc_ru_in_en} err={err_ru_in_en!r}", file=sys.stderr)
+                    return 1
+
+                v2_conn.execute(
+                    "UPDATE campaign_steps SET template_text = 'Hey, saw your app. Want 3 demo reels for Acme?' "
+                    "WHERE campaign_id = ? AND step_order = 1",
+                    (en_camp_id,),
+                )
+                v2_conn.execute(
+                    "INSERT INTO campaign_recipients (campaign_id, telegram_user_id, username, name, step1_text, status, created_at, updated_at) "
+                    "VALUES (?, 9202, 'en_ru_leak', 'Acme', 'Привет! We scale your reels with SoftUGC', 'pending', ?, ?)",
+                    (en_camp_id, now, now),
+                )
+                v2_conn.commit()
+                if _audit_ru_language_campaigns(v2_conn).get("ok") is not False:
+                    print("SELFTEST FAILED: _audit_ru_language_campaigns missed RU greeting in EN recipient", file=sys.stderr)
+                    return 1
+                v2_conn.execute(
+                    "UPDATE campaign_recipients SET step1_text = 'Hey Иван, saw your app. Want 3 demo reels for Acme?' "
+                    "WHERE campaign_id = ? AND username = 'en_ru_leak'",
+                    (en_camp_id,),
+                )
+                v2_conn.commit()
+                if _audit_ru_language_campaigns(v2_conn).get("ok") is not True:
+                    print("SELFTEST FAILED: valid EN template/recipient failed _audit_ru_language_campaigns", file=sys.stderr)
+                    return 1
+
+                # (l) enrichment_ledger daily spend exceeding cap MUST fail exit != 0
+                v2_conn.execute(
+                    """
+                    INSERT INTO enrichment_ledger (day, provider, endpoint, lead_key, cost_usd, hit, created_at)
+                    VALUES ('2026-11-22', 'treg', '/people.phone.find', 'whale.io', 5.75, 1, ?)
+                    """,
+                    (now,),
+                )
+                v2_conn.commit()
+                with patch.dict(os.environ, {"LEADGEN_CONFIG_PATH": str(v2_cfg_path)}):
+                    if _audit_enrichment_ledger_bounds(v2_conn).get("ok") is not False:
+                        print("SELFTEST FAILED: _audit_enrichment_ledger_bounds missed over-cap spend", file=sys.stderr)
+                        return 1
+                rc_cap_bad, err_cap_bad = _run_v2_db_audit()
+                if rc_cap_bad == 0 or "enrichment_ledger_bounds" not in err_cap_bad:
+                    print(f"SELFTEST FAILED: _audit_local_db missed enrichment_ledger over-cap spend: rc={rc_cap_bad} err={err_cap_bad!r}", file=sys.stderr)
+                    return 1
+
+                v2_conn.execute("UPDATE enrichment_ledger SET cost_usd = 4.25 WHERE provider = 'treg'")
+                v2_conn.commit()
+                rc_v2_clean, err_v2_clean = _run_v2_db_audit()
+                if rc_v2_clean != 0:
+                    print(f"SELFTEST FAILED: clean v2 DB failed audit: rc={rc_v2_clean} err={err_v2_clean!r}", file=sys.stderr)
+                    return 1
+            finally:
+                v2_conn.close()
 
             print("proactive_audit --self-test: OK (negative violations failed as expected, healed clean)")
             return 0

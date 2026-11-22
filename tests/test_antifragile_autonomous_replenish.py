@@ -132,7 +132,7 @@ def test_defect1b_sync_and_save_config_protect_running_daily_limit_and_empty_wa_
 
     camp_running = create_campaign(
         conn,
-        name="SoftUGC — База Все2",
+        name="Whales EN — TG",
         daily_limit=140,
         status="running",
         steps=DEFAULT_B2B_STEPS,
@@ -152,20 +152,23 @@ def test_defect1b_sync_and_save_config_protect_running_daily_limit_and_empty_wa_
 
     # Sync campaigns without sync_campaign_limits=True:
     # must NOT overwrite running campaign daily_limit downward (140 -> 30)
-    # and must NOT create Leadgen Auto (WA) when 0 WA accounts & 0 WA leads exist.
+    # and must keep Whales EN — WA (and vacancies when disabled) disabled when 0 WA accounts & 0 WA leads exist.
     sync_res = sync_leadgen_campaigns(conn, saved_cfg)
     assert sync_res["ok"] is True
     assert get_campaign(conn, camp_running["id"])["daily_limit"] == 140
-    names_no_wa = {c["name"] for c in sync_res["campaigns"]}
-    assert "Leadgen Auto (WA)" not in names_no_wa
-    assert "TG Вакансии" not in names_no_wa
+    by_name_no_wa = {c["name"]: c for c in sync_res["campaigns"]}
+    assert "Leadgen Auto (WA)" not in by_name_no_wa
+    assert "TG Вакансии" not in by_name_no_wa
+    assert "Whales EN — WA" in by_name_no_wa
+    assert by_name_no_wa["Whales EN — WA"]["leadgen_enabled"] is False
+    assert by_name_no_wa["Client Reels & Вакансии RU — TG"]["leadgen_enabled"] is False
 
     # Explicit sync_campaign_limits=True allows updating daily_limit to 30
     sync_explicit = sync_leadgen_campaigns(conn, saved_cfg, sync_campaign_limits=True)
     assert sync_explicit["ok"] is True
     assert get_campaign(conn, camp_running["id"])["daily_limit"] == 30
 
-    # Adding a connected WhatsApp account unlocks Leadgen Auto (WA) creation on sync
+    # Adding a connected WhatsApp account enables Whales EN — WA on sync (while keeping vacancies disabled)
     wa_sess = tmp_path / "wa_79990001122.session"
     wa_sess.write_text("wa-stub", encoding="utf-8")
     conn.execute(
@@ -177,9 +180,11 @@ def test_defect1b_sync_and_save_config_protect_running_daily_limit_and_empty_wa_
     )
     conn.commit()
 
-    sync_with_wa = sync_leadgen_campaigns(conn, saved_cfg)
-    names_with_wa = {c["name"] for c in sync_with_wa["campaigns"]}
-    assert "Leadgen Auto (WA)" in names_with_wa
+    sync_with_wa = sync_leadgen_campaigns(conn, saved_cfg, sync_leadgen_enabled=True)
+    names_with_wa = {c["name"]: c for c in sync_with_wa["campaigns"]}
+    assert "Whales EN — WA" in names_with_wa
+    assert names_with_wa["Whales EN — WA"]["leadgen_enabled"] is True
+    assert names_with_wa["Client Reels & Вакансии RU — TG"]["leadgen_enabled"] is False
 
 
 def test_defect2_validate_isolated_scraper_session_blocks_live_outreach_sessions(
@@ -428,7 +433,7 @@ def test_defect3_autonomous_low_water_mark_replenish_quarantine_subtraction_and_
     assert "ai_jobs_clean" in eff_cfg["vacancies"]["extra_chats"]
 
     # Check Rule 5 preview ran cleanly and cloud_persistence_dirty_at was updated
-    assert res_with_tg["rule5_previews"]["SoftUGC — База Все2"]["ok"] is True
+    assert res_with_tg["rule5_previews"]["Whales EN — TG"]["ok"] is True
     dirty_row = conn.execute(
         "SELECT value FROM kv_settings WHERE key = 'cloud_persistence_dirty_at'"
     ).fetchone()
@@ -973,7 +978,13 @@ def test_skeptic5_sync_campaigns_never_mutates_existing_limits_or_enabled_and_ve
         name="TG Вакансии",
         daily_limit=100,
         status="paused",
-        steps=DEFAULT_B2B_STEPS,
+        steps=[
+            {
+                "step_order": 1,
+                "delay_hours": 0,
+                "template_text": "Добрый день! По вакансии: сделаем серию AI Reels под ключ.",
+            }
+        ],
         leadgen_enabled=False,
     )
 

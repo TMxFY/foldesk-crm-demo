@@ -10,11 +10,13 @@ contacts using:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import logging
 from pathlib import Path
 import re
 import sys
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
@@ -35,6 +37,12 @@ except ImportError:
     except ImportError:
         from scripts.treg_enrich import domain_of
 
+
+logger = logging.getLogger(__name__)
+
+COST_MONID_X_PROFILE_USD = 0.001
+COST_TREG_X_PROFILE_USD = 0.001
+COST_CRAWL4AI_SEARCH_USD = 0.00015
 
 _TG_NOISE = {
     "joinchat",
@@ -193,51 +201,230 @@ def _extract_tme_handles(text: str) -> list[str]:
     return found
 
 
-def _default_x_profile(handle: str) -> dict[str, Any] | None:
-    clean = str(handle or "").strip().lstrip("@")
-    if not clean:
-        return None
+def _call_with_supported_kwargs(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     try:
-        try:
-            from leadgen.monid_client import check_monid_ready, run_monid
-        except ImportError:
-            from monid_client import check_monid_ready, run_monid
-        if check_monid_ready():
-            res = run_monid(
-                "twitterdata.io",
-                "/users",
-                query={"username": clean},
-                wait_sec=15,
-                timeout=20,
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return fn(*args, **kwargs)
+        filtered = {k: v for k, v in kwargs.items() if k in params}
+        return fn(*args, **filtered)
+    except (TypeError, ValueError):
+        return fn(*args, **kwargs)
+
+
+def _check_bridge_budget_guard(
+    budget_guard_fn: Callable[..., Any] | None,
+    provider: str,
+    endpoint: str,
+    est_cost: float,
+) -> bool:
+    if budget_guard_fn is None:
+        return True
+    try:
+        sig = inspect.signature(budget_guard_fn)
+        params = list(sig.parameters.values())
+        pos_count = sum(
+            1 for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+        has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        if has_var_pos or pos_count >= 3:
+            res = budget_guard_fn(provider, endpoint, float(est_cost))
+        elif pos_count == 2:
+            res = budget_guard_fn(provider, float(est_cost))
+        else:
+            res = _call_with_supported_kwargs(
+                budget_guard_fn,
+                provider=provider,
+                endpoint=endpoint,
+                estimated_cost=float(est_cost),
             )
-            if isinstance(res, dict) and res:
-                return res
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("bridge budget_guard_fn failed: %s", exc)
+        return False
+    if isinstance(res, tuple):
+        return bool(res[0]) if res else False
+    return bool(res)
+
+
+def _record_bridge_cost(
+    cost_record_fn: Callable[..., Any] | None,
+    *,
+    provider: str,
+    endpoint: str,
+    lead_key: str,
+    cost_usd: float,
+    hit: bool,
+) -> None:
+    if cost_record_fn is None:
+        return
     try:
+        _call_with_supported_kwargs(
+            cost_record_fn,
+            provider=provider,
+            endpoint=endpoint,
+            lead_key=lead_key,
+            cost_usd=float(cost_usd),
+            hit=bool(hit),
+        )
+    except Exception as exc:
+        logger.debug("bridge cost_record_fn failed: %s", exc)
+
+
+def _extract_bridge_cost(payload: Any, default_cost: float) -> float:
+    if isinstance(payload, dict):
+        for meta_key in ("_treg", "_monid", "meta"):
+            meta = payload.get(meta_key)
+            if isinstance(meta, dict):
+                for ck in ("cost_usd", "cost"):
+                    val = meta.get(ck)
+                    if val is not None and val != "":
+                        try:
+                            num = float(val)
+                            if num > 0:
+                                return num
+                        except (TypeError, ValueError):
+                            continue
+        for ck in ("cost_usd", "cost"):
+            val = payload.get(ck)
+            if val is not None and val != "":
+                try:
+                    num = float(val)
+                    if num > 0:
+                        return num
+                except (TypeError, ValueError):
+                    continue
+    return default_cost
+
+
+def _default_x_profile(
+    handle: str,
+    *,
+    allow_paid: bool = True,
+    budget_guard_fn: Callable[..., Any] | None = None,
+    cost_record_fn: Callable[..., Any] | None = None,
+    treg_fn: Callable[..., Any] | None = None,
+    monid_fn: Callable[..., Any] | None = None,
+    lead_key: str = "",
+) -> dict[str, Any] | None:
+    clean = str(handle or "").strip().lstrip("@")
+    if not clean or not allow_paid:
+        return None
+    if _check_bridge_budget_guard(budget_guard_fn, "monid", "twitterdata.io:/users", COST_MONID_X_PROFILE_USD):
         try:
-            from leadgen.treg_client import call as treg_call, check_treg_ready
-        except ImportError:
-            from treg_client import call as treg_call, check_treg_ready
-        if check_treg_ready():
-            res = treg_call("scrapecreators.x.user.profile", query={"handle": clean}, timeout=20)
-            if isinstance(res, dict) and res:
-                return res
-    except Exception:
-        pass
+            try:
+                from leadgen.monid_client import check_monid_ready, run_monid
+            except ImportError:
+                from monid_client import check_monid_ready, run_monid
+            if monid_fn is not None or check_monid_ready():
+                res = (
+                    _call_with_supported_kwargs(
+                        monid_fn,
+                        "twitterdata.io",
+                        "/users",
+                        query={"username": clean},
+                        wait_sec=15,
+                        timeout=20,
+                    )
+                    if monid_fn is not None
+                    else run_monid(
+                        "twitterdata.io",
+                        "/users",
+                        query={"username": clean},
+                        wait_sec=15,
+                        timeout=20,
+                    )
+                )
+                is_hit = isinstance(res, dict) and bool(res)
+                cost = _extract_bridge_cost(res, COST_MONID_X_PROFILE_USD) if is_hit else 0.0
+                _record_bridge_cost(
+                    cost_record_fn,
+                    provider="monid",
+                    endpoint="twitterdata.io:/users",
+                    lead_key=lead_key or clean,
+                    cost_usd=cost,
+                    hit=is_hit,
+                )
+                if is_hit:
+                    return res
+        except Exception as exc:
+            logger.debug("monid x_profile lookup failed: %s", exc)
+    if _check_bridge_budget_guard(budget_guard_fn, "treg", "scrapecreators.x.user.profile", COST_TREG_X_PROFILE_USD):
+        try:
+            try:
+                from leadgen.treg_client import call as treg_call, check_treg_ready
+            except ImportError:
+                from treg_client import call as treg_call, check_treg_ready
+            if treg_fn is not None or check_treg_ready():
+                res = (
+                    _call_with_supported_kwargs(
+                        treg_fn,
+                        "scrapecreators.x.user.profile",
+                        query={"handle": clean},
+                        timeout=20,
+                    )
+                    if treg_fn is not None
+                    else treg_call("scrapecreators.x.user.profile", query={"handle": clean}, timeout=20)
+                )
+                is_hit = isinstance(res, dict) and bool(res)
+                cost = _extract_bridge_cost(res, COST_TREG_X_PROFILE_USD) if is_hit else 0.0
+                _record_bridge_cost(
+                    cost_record_fn,
+                    provider="treg",
+                    endpoint="scrapecreators.x.user.profile",
+                    lead_key=lead_key or clean,
+                    cost_usd=cost,
+                    hit=is_hit,
+                )
+                if is_hit:
+                    return res
+        except Exception as exc:
+            logger.debug("treg x_profile lookup failed: %s", exc)
     return None
 
 
-def _default_search(query: str) -> dict[str, Any] | None:
+def _default_search(
+    query: str,
+    *,
+    allow_paid: bool = True,
+    budget_guard_fn: Callable[..., Any] | None = None,
+    cost_record_fn: Callable[..., Any] | None = None,
+    treg_fn: Callable[..., Any] | None = None,
+    lead_key: str = "",
+) -> dict[str, Any] | None:
+    if not allow_paid:
+        return None
+    if not _check_bridge_budget_guard(budget_guard_fn, "treg", "crawl4ai.web.search", COST_CRAWL4AI_SEARCH_USD):
+        return None
     try:
         try:
             from leadgen.treg_client import call as treg_call, check_treg_ready
         except ImportError:
             from treg_client import call as treg_call, check_treg_ready
-        if check_treg_ready():
-            return treg_call("crawl4ai.web.search", query={"q": query}, timeout=25)
-    except Exception:
-        pass
+        if treg_fn is not None or check_treg_ready():
+            res = (
+                _call_with_supported_kwargs(
+                    treg_fn,
+                    "crawl4ai.web.search",
+                    query={"q": query},
+                    timeout=25,
+                )
+                if treg_fn is not None
+                else treg_call("crawl4ai.web.search", query={"q": query}, timeout=25)
+            )
+            is_hit = isinstance(res, dict) and bool(res)
+            cost = _extract_bridge_cost(res, COST_CRAWL4AI_SEARCH_USD) if isinstance(res, dict) else 0.0
+            _record_bridge_cost(
+                cost_record_fn,
+                provider="treg",
+                endpoint="crawl4ai.web.search",
+                lead_key=lead_key or query,
+                cost_usd=cost,
+                hit=is_hit,
+            )
+            return res
+    except Exception as exc:
+        logger.debug("treg search failed: %s", exc)
     return None
 
 
@@ -478,6 +665,11 @@ def bridge_lead_to_telegram(
     search_fn=None,
     tme_fetch_fn=None,
     fetch_site_fn=None,
+    allow_paid: bool = True,
+    budget_guard_fn: Callable[[str, str, float], bool] | None = None,
+    cost_record_fn: Callable[..., Any] | None = None,
+    treg_fn: Callable[..., Any] | None = None,
+    monid_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Attempt to resolve a verified personal Telegram handle for a non-TG lead."""
     out = dict(row)
@@ -485,8 +677,37 @@ def bridge_lead_to_telegram(
     if _is_valid_personal_tg_handle(existing_tg):
         return out
 
-    get_x = _default_x_profile if x_profile_fn is None else x_profile_fn
-    do_search = _default_search if search_fn is None else search_fn
+    raw_site = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
+    domain = domain_of(raw_site)
+    brand = str(out.get("company") or out.get("project") or "").strip()
+    if not brand:
+        brand = str(out.get("name") or "").strip()
+    x_handle = _extract_x_handle(out)
+    lead_key = str(out.get("id") or domain or brand or x_handle or "lead").strip()
+
+    def _guarded_x_profile(handle: str) -> dict[str, Any] | None:
+        return _default_x_profile(
+            handle,
+            allow_paid=allow_paid,
+            budget_guard_fn=budget_guard_fn,
+            cost_record_fn=cost_record_fn,
+            treg_fn=treg_fn,
+            monid_fn=monid_fn,
+            lead_key=lead_key,
+        )
+
+    def _guarded_search(query: str) -> dict[str, Any] | None:
+        return _default_search(
+            query,
+            allow_paid=allow_paid,
+            budget_guard_fn=budget_guard_fn,
+            cost_record_fn=cost_record_fn,
+            treg_fn=treg_fn,
+            lead_key=lead_key,
+        )
+
+    get_x = _guarded_x_profile if x_profile_fn is None else x_profile_fn
+    do_search = _guarded_search if search_fn is None else search_fn
     fetch_tme = _default_tme_fetch if tme_fetch_fn is None else tme_fetch_fn
     do_site_fetch = (
         fetch_site_fn
@@ -497,13 +718,6 @@ def bridge_lead_to_telegram(
             else None
         )
     )
-
-    raw_site = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
-    domain = domain_of(raw_site)
-    brand = str(out.get("company") or out.get("project") or "").strip()
-    if not brand:
-        brand = str(out.get("name") or "").strip()
-    x_handle = _extract_x_handle(out)
 
     seen_cands: set[str] = set()
 
@@ -667,6 +881,11 @@ def enrich_rows_with_telegram_bridge(
     search_fn=None,
     tme_fetch_fn=None,
     fetch_site_fn=None,
+    allow_paid: bool = True,
+    budget_guard_fn: Callable[[str, str, float], bool] | None = None,
+    cost_record_fn: Callable[..., Any] | None = None,
+    treg_fn: Callable[..., Any] | None = None,
+    monid_fn: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Run Telegram bridge on up to max_rows non-TG leads in batch."""
     out: list[dict[str, Any]] = []
@@ -689,6 +908,11 @@ def enrich_rows_with_telegram_bridge(
                 search_fn=search_fn,
                 tme_fetch_fn=tme_fetch_fn,
                 fetch_site_fn=fetch_site_fn,
+                allow_paid=allow_paid,
+                budget_guard_fn=budget_guard_fn,
+                cost_record_fn=cost_record_fn,
+                treg_fn=treg_fn,
+                monid_fn=monid_fn,
             )
         )
     return out

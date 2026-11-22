@@ -28,14 +28,14 @@ try:
     from treg_client import call as treg_call, check_treg_ready
     from treg_enrich import domain_of, find_company_decision_maker
     from meta_ad_leads import APP_STORE_HOSTS, _scrape_site_contacts
-    from supply_side import is_supply_side, sniper_reject_reason
+    from supply_side import is_supply_side, sniper_reject_reason, whale_icp_reject_reason
     from tg_to_gsheet import email_of_text, linkedin_in_url, whatsapp_url, whatsapp_urls, x_profile_url
 except ImportError:
     from leadgen.monid_client import check_monid_ready, is_megacorp_app, resolve_app_store_developer, run_monid
     from leadgen.treg_client import call as treg_call, check_treg_ready
     from leadgen.treg_enrich import domain_of, find_company_decision_maker
     from leadgen.meta_ad_leads import APP_STORE_HOSTS, _scrape_site_contacts
-    from leadgen.supply_side import is_supply_side, sniper_reject_reason
+    from leadgen.supply_side import is_supply_side, sniper_reject_reason, whale_icp_reject_reason
     from leadgen.tg_to_gsheet import email_of_text, linkedin_in_url, whatsapp_url, whatsapp_urls, x_profile_url
 
 
@@ -52,7 +52,7 @@ TIKTOK_AD_QUERIES = (
     "astrology app",
     "calorie tracker",
     "prop trading",
-    "roblox game",
+    "language learning app",
     "supplement gummies",
     "skincare serum",
 )
@@ -356,6 +356,34 @@ def _clean_whop_brand(raw_title: str) -> str:
     return t[:80]
 
 
+def _extract_whop_pool_usd(text: str) -> int | None:
+    """Parse USD campaign pool/budget from a Whop search title or snippet."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return None
+    patterns = (
+        r"budget\s*[:=]?\s*\$([\d,]+(?:\.\d+)?)([kKmM]?)",
+        r"\$([\d,]+(?:\.\d+)?)([kKmM]?)\s*(?:budget|allocated|pool|prize|rewards?)",
+    )
+    for pat in patterns:
+        m = re.search(pat, raw, re.I)
+        if not m:
+            continue
+        num_str = m.group(1).replace(",", "")
+        suffix = (m.group(2) or "").lower()
+        try:
+            val = float(num_str)
+        except ValueError:
+            continue
+        if suffix == "k":
+            val *= 1_000.0
+        elif suffix == "m":
+            val *= 1_000_000.0
+        if val > 0:
+            return int(round(val))
+    return None
+
+
 def _extract_whop_budget_signal(blob: str, snippet: str = "") -> str:
     text = " ".join(str(blob or "").split())
     budget_m = re.search(r"budget\s*[:=]?\s*(\$[\d,]+(?:\.\d+)?[kKmM]?)", text, re.I)
@@ -393,6 +421,121 @@ def _extract_inline_contacts(text: str) -> dict[str, str]:
             found["username"] = u
             break
     return found
+
+
+_TG_COMMUNITY_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/"
+    r"(\+[A-Za-z0-9_-]{6,}|joinchat/[A-Za-z0-9_-]{6,}|s/[A-Za-z][A-Za-z0-9_]{2,31}|[A-Za-z][A-Za-z0-9_]{2,31})",
+    re.I,
+)
+
+
+def _normalize_tg_community_url(raw: str) -> str:
+    s = str(raw or "").strip().strip("<>\"'()[].,;")
+    if not s:
+        return ""
+    if s.startswith("@"):
+        handle = s[1:]
+        if (
+            re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,31}", handle)
+            and handle.casefold() not in _TG_NOISE
+            and not handle.lower().endswith("bot")
+        ):
+            return f"https://t.me/{handle}"
+        return ""
+    m = _TG_COMMUNITY_URL_RE.match(s)
+    if not m:
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,31}", s):
+            if s.casefold() not in _TG_NOISE and not s.lower().endswith("bot"):
+                return f"https://t.me/{s}"
+        return ""
+    tail = m.group(1)
+    if tail.startswith("+"):
+        return f"https://t.me/{tail}"
+    low_tail = tail.lower()
+    if low_tail.startswith("joinchat/"):
+        invite_hash = tail.split("/", 1)[1]
+        return f"https://t.me/joinchat/{invite_hash}"
+    if low_tail.startswith("s/"):
+        handle = tail.split("/", 1)[1]
+    else:
+        handle = tail
+    if handle.casefold() in _TG_NOISE or handle.lower().endswith("bot"):
+        return ""
+    return f"https://t.me/{handle}"
+
+
+def _extract_tg_community_links(*sources: Any) -> list[str]:
+    """Preserve unique t.me community/group/channel links from strings, lists, or dicts."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(url: str) -> None:
+        if not url:
+            return
+        k = url.casefold()
+        if k not in seen:
+            seen.add(k)
+            found.append(url)
+
+    def _scan(val: Any, *, allow_bare: bool = False) -> None:
+        if not val:
+            return
+        if isinstance(val, str):
+            for m in _TG_COMMUNITY_URL_RE.finditer(val):
+                _add(_normalize_tg_community_url(m.group(0)))
+            if allow_bare:
+                _add(_normalize_tg_community_url(val))
+        elif isinstance(val, dict):
+            for k in ("telegram_group", "community_url", "tg_group"):
+                _scan(val.get(k), allow_bare=True)
+            for k in ("links", "telegram", "telegram_url", "url", "href"):
+                _scan(val.get(k), allow_bare=False)
+        elif isinstance(val, (list, tuple, set)):
+            for item in val:
+                _scan(item, allow_bare=allow_bare)
+
+    for src in sources:
+        _scan(src)
+    return found
+
+
+def _finalize_whale_row(
+    row: dict[str, Any],
+    *,
+    tg_links: list[str] | tuple[str, ...] = (),
+    explicit_tg_group: str = "",
+) -> dict[str, Any] | None:
+    """Enforce Whale ICP hard rejection and stamp segment='whale', language='en', and TG links."""
+    if whale_icp_reject_reason(row) or sniper_reject_reason(row):
+        return None
+    out = dict(row)
+    out["segment"] = "whale"
+    out["language"] = "en"
+
+    personal_u = str(out.get("username") or out.get("telegram_username") or "").strip().lstrip("@").lower()
+    merged_links: list[str] = []
+    seen_links: set[str] = set()
+    for raw_u in list(out.get("links") or []) + list(tg_links or []):
+        s = str(raw_u or "").strip()
+        if not s:
+            continue
+        k = s.casefold()
+        if k not in seen_links:
+            seen_links.add(k)
+            merged_links.append(s)
+    out["links"] = merged_links
+
+    norm_explicit = _normalize_tg_community_url(explicit_tg_group)
+    if norm_explicit:
+        out["telegram_group"] = norm_explicit
+    elif not out.get("telegram_group"):
+        for cand in _extract_tg_community_links(tg_links, merged_links):
+            cand_tail = cand.rsplit("/", 1)[-1].lower()
+            if cand_tail.startswith("+") or "/joinchat/" in cand.lower() or cand_tail != personal_u:
+                out["telegram_group"] = cand
+                break
+    return out
 
 
 def _is_whop_doc_or_feed_url(url: str) -> bool:
@@ -433,7 +576,7 @@ def _merge_enriched_contacts(
     enrich_fn,
     site_scrape_fn,
     budget: list[int],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     inline = _extract_inline_contacts(extra_text)
     dm: dict[str, Any] = {}
     if budget[0] > 0 and (brand or domain):
@@ -445,7 +588,7 @@ def _merge_enriched_contacts(
 
     resolved_url = project_url or str(dm.get("project_url") or "").strip()
     resolved_domain = domain or domain_of(resolved_url)
-    site_contacts: dict[str, str] = {}
+    site_contacts: dict[str, Any] = {}
     if resolved_domain and resolved_url:
         try:
             site_contacts = site_scrape_fn(resolved_url) or {}
@@ -458,6 +601,12 @@ def _merge_enriched_contacts(
     founder_x = str(site_contacts.get("founder_x") or inline.get("founder_x") or "").strip()
     if founder_x:
         founder_x = x_profile_url({"founder_x": founder_x}) or founder_x
+    explicit_tg_group = ""
+    for g_key in ("telegram_group", "community_url", "tg_group"):
+        if site_contacts.get(g_key):
+            explicit_tg_group = str(site_contacts.get(g_key) or "").strip()
+            break
+    tg_links = _extract_tg_community_links(extra_text, site_contacts, dm.get("links"))
     return {
         "project_url": resolved_url,
         "domain": resolved_domain,
@@ -465,6 +614,8 @@ def _merge_enriched_contacts(
         "work_email": work_email,
         "username": username,
         "founder_x": founder_x,
+        "telegram_group": explicit_tg_group,
+        "tg_links": tg_links,
     }
 
 
@@ -473,6 +624,7 @@ def collect_whop_content_rewards(
     limit: int = 6,
     day: date | None = None,
     seen: dict[str, str] | None = None,
+    min_pool_usd: int = 0,
     search_fn=None,
     store_resolver_fn=None,
     enrich_fn=None,
@@ -482,6 +634,7 @@ def collect_whop_content_rewards(
     today = day or date.today()
     current = fresh_seen(seen or {}, today)
     stamp = today.isoformat()
+    eff_min_pool = max(0, int(min_pool_usd or 0))
     search = _default_web_search if search_fn is None else search_fn
     resolve_store = resolve_app_store_developer if store_resolver_fn is None else store_resolver_fn
     enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
@@ -511,7 +664,15 @@ def collect_whop_content_rewards(
             if not brand:
                 continue
             blob = f"{title} {brand} {snippet}"
-            if is_megacorp_app(brand, title) or is_supply_side(blob) or sniper_reject_reason(blob):
+            pool_usd = _extract_whop_pool_usd(f"{title} {snippet}")
+            if eff_min_pool > 0 and pool_usd is not None and pool_usd < eff_min_pool:
+                continue
+            if (
+                is_megacorp_app(brand, title)
+                or is_supply_side(blob)
+                or sniper_reject_reason(blob)
+                or whale_icp_reject_reason({"name": brand, "company": brand, "bio": snippet, "source_url": url})
+            ):
                 continue
 
             seen_key = f"whop:{_slugify(brand)}"
@@ -561,29 +722,38 @@ def collect_whop_content_rewards(
                 )
                 if u
             ]
-            row = {
-                "id": seen_key,
-                "name": brand,
-                "username": contacts["username"],
-                "telegram_username": contacts["username"],
-                "bio": what_they_do,
-                "links": list(dict.fromkeys(links)),
-                "source": "whop_content_rewards",
-                "source_url": url,
-                "role": "Founder",
-                "roles": ["Founder"],
-                "category": "SaaS / AI app",
-                "project": brand,
-                "company": brand,
-                "project_url": contacts["project_url"],
-                "what_they_do": what_they_do,
-                "founder_linkedin": contacts["founder_linkedin"],
-                "founder_x": contacts["founder_x"],
-                "work_email": contacts["work_email"],
-                "has_monetization_signal": True,
-                "icp_match": True,
-                "lead_tier": "A",
-            }
+            row = _finalize_whale_row(
+                {
+                    "id": seen_key,
+                    "name": brand,
+                    "username": contacts["username"],
+                    "telegram_username": contacts["username"],
+                    "bio": what_they_do,
+                    "links": list(dict.fromkeys(links)),
+                    "source": "whop_content_rewards",
+                    "source_url": url,
+                    "role": "Founder",
+                    "roles": ["Founder"],
+                    "category": "SaaS / AI app",
+                    "project": brand,
+                    "company": brand,
+                    "project_url": contacts["project_url"],
+                    "what_they_do": what_they_do,
+                    "founder_linkedin": contacts["founder_linkedin"],
+                    "founder_x": contacts["founder_x"],
+                    "work_email": contacts["work_email"],
+                    "pool_usd": pool_usd,
+                    "has_monetization_signal": True,
+                    "icp_match": True,
+                    "lead_tier": "A",
+                },
+                tg_links=_extract_tg_community_links(
+                    url, snippet, title, land_extra, contacts.get("tg_links")
+                ),
+                explicit_tg_group=str(contacts.get("telegram_group") or ""),
+            )
+            if not row:
+                continue
             rows.append(row)
             current[seen_key] = stamp
 
@@ -700,7 +870,19 @@ def collect_tiktok_creative_ads(
             if not brand_name or _is_noise_brand(brand_name):
                 continue
             blob = f"{brand_name} {ad_title}"
-            if is_megacorp_app(brand_name, ad_title) or is_supply_side(blob) or sniper_reject_reason(blob):
+            if (
+                is_megacorp_app(brand_name, ad_title)
+                or is_supply_side(blob)
+                or sniper_reject_reason(blob)
+                or whale_icp_reject_reason(
+                    {
+                        "name": brand_name,
+                        "company": brand_name,
+                        "bio": ad_title,
+                        "category": str(item.get("industry") or item.get("category") or ""),
+                    }
+                )
+            ):
                 continue
 
             landing_raw = str(
@@ -793,28 +975,39 @@ def collect_tiktok_creative_ads(
                 )
                 if u
             ]
-            row = {
-                "id": f"tiktok_ads:{_slugify(final_domain or brand_name)}",
-                "name": brand_name,
-                "username": contacts["username"],
-                "telegram_username": contacts["username"],
-                "bio": what_they_do,
-                "links": list(dict.fromkeys(links)),
-                "source": "tiktok_ads",
-                "role": "Marketing",
-                "roles": ["Marketing"],
-                "category": "SaaS / AI app",
-                "project": brand_name,
-                "company": brand_name,
-                "project_url": final_url,
-                "what_they_do": what_they_do,
-                "founder_linkedin": contacts["founder_linkedin"],
-                "founder_x": contacts["founder_x"],
-                "work_email": contacts["work_email"],
-                "has_monetization_signal": True,
-                "icp_match": True,
-                "lead_tier": "A",
-            }
+            row = _finalize_whale_row(
+                {
+                    "id": f"tiktok_ads:{_slugify(final_domain or brand_name)}",
+                    "name": brand_name,
+                    "username": contacts["username"],
+                    "telegram_username": contacts["username"],
+                    "bio": what_they_do,
+                    "links": list(dict.fromkeys(links)),
+                    "source": "tiktok_ads",
+                    "role": "Marketing",
+                    "roles": ["Marketing"],
+                    "category": str(store_info.get("category") or item.get("category") or "SaaS / AI app"),
+                    "project": brand_name,
+                    "company": brand_name,
+                    "project_url": final_url,
+                    "what_they_do": f"{what_they_do} {store_info.get('description') or ''}".strip()[:200],
+                    "founder_linkedin": contacts["founder_linkedin"],
+                    "founder_x": contacts["founder_x"],
+                    "work_email": contacts["work_email"],
+                    "has_monetization_signal": True,
+                    "icp_match": True,
+                    "lead_tier": "A",
+                },
+                tg_links=_extract_tg_community_links(
+                    ad_title, landing_raw, extra_links, item, store_info, contacts.get("tg_links")
+                ),
+                explicit_tg_group=str(contacts.get("telegram_group") or ""),
+            )
+            if not row:
+                continue
+            row["what_they_do"] = what_they_do
+            if not store_info.get("category") and not item.get("category"):
+                row["category"] = "SaaS / AI app"
             rows.append(row)
             current[seen_key] = stamp
 
@@ -931,7 +1124,12 @@ def collect_tiktok_shop_brands(
             if not brand or _is_noise_brand(brand):
                 continue
             blob = f"{brand} {title}"
-            if is_megacorp_app(brand, title) or is_supply_side(blob) or sniper_reject_reason(blob):
+            if (
+                is_megacorp_app(brand, title)
+                or is_supply_side(blob)
+                or sniper_reject_reason(blob)
+                or whale_icp_reject_reason({"name": brand, "company": brand, "bio": title, "category": str(item.get("category") or "")})
+            ):
                 continue
 
             seen_key = f"ttshop:{_slugify(brand)}"
@@ -989,28 +1187,38 @@ def collect_tiktok_shop_brands(
                 )
                 if u
             ]
-            row = {
-                "id": seen_key,
-                "name": brand,
-                "username": contacts["username"],
-                "telegram_username": contacts["username"],
-                "bio": what_they_do,
-                "links": list(dict.fromkeys(links)),
-                "source": "tiktok_shop",
-                "role": "Founder",
-                "roles": ["Founder"],
-                "category": "SaaS / AI app",
-                "project": brand,
-                "company": brand,
-                "project_url": contacts["project_url"],
-                "what_they_do": what_they_do,
-                "founder_linkedin": contacts["founder_linkedin"],
-                "founder_x": contacts["founder_x"],
-                "work_email": contacts["work_email"],
-                "has_monetization_signal": True,
-                "icp_match": True,
-                "lead_tier": "A",
-            }
+            row = _finalize_whale_row(
+                {
+                    "id": seen_key,
+                    "name": brand,
+                    "username": contacts["username"],
+                    "telegram_username": contacts["username"],
+                    "bio": what_they_do,
+                    "links": list(dict.fromkeys(links)),
+                    "source": "tiktok_shop",
+                    "role": "Founder",
+                    "roles": ["Founder"],
+                    "category": str(item.get("category") or "SaaS / AI app"),
+                    "project": brand,
+                    "company": brand,
+                    "project_url": contacts["project_url"],
+                    "what_they_do": what_they_do,
+                    "founder_linkedin": contacts["founder_linkedin"],
+                    "founder_x": contacts["founder_x"],
+                    "work_email": contacts["work_email"],
+                    "has_monetization_signal": True,
+                    "icp_match": True,
+                    "lead_tier": "A",
+                },
+                tg_links=_extract_tg_community_links(
+                    title, site_raw, shop_extra, item, shop_store, contacts.get("tg_links")
+                ),
+                explicit_tg_group=str(contacts.get("telegram_group") or ""),
+            )
+            if not row:
+                continue
+            if not item.get("category"):
+                row["category"] = "SaaS / AI app"
             rows.append(row)
             current[seen_key] = stamp
 
@@ -1414,6 +1622,7 @@ def collect_d2c_whatsapp_brands(
                 _D2C_NOISE_RE.search(text_for_gates)
                 or is_supply_side(text_for_gates)
                 or sniper_reject_reason(text_for_gates)
+                or whale_icp_reject_reason({"name": hit_title, "company": domain, "bio": text_for_gates, "project_url": f"https://{domain}", "source_url": hit_url})
                 or is_megacorp_app(hit_title, domain)
             ):
                 continue
@@ -1448,7 +1657,7 @@ def collect_d2c_whatsapp_brands(
                 f"D2C Shopify brand ({sample_prod or 'skincare/supplements'}): {clean_snip or brand}"
             )[:180]
 
-            rows.append(
+            row = _finalize_whale_row(
                 {
                     "id": seen_key,
                     "name": brand,
@@ -1479,8 +1688,12 @@ def collect_d2c_whatsapp_brands(
                     "icp_match": True,
                     "icp_score": 88,
                     "lead_tier": "A",
-                }
+                },
+                tg_links=_extract_tg_community_links(full_blob, hit_url, hit_snip),
             )
+            if not row:
+                continue
+            rows.append(row)
             current[seen_key] = stamp
 
     return rows, current
@@ -1634,7 +1847,21 @@ def collect_scaling_store_apps(
             if st.get("is_megacorp") or is_megacorp_app(dev, app_name, dom, rcount):
                 continue
             blob = f"{app_name} {dev} {st.get('description') or ''}"
-            if is_supply_side(blob) or sniper_reject_reason(blob):
+            store_cat = str(st.get("category") or st.get("genre") or "")
+            if (
+                is_supply_side(blob)
+                or sniper_reject_reason(blob, category=store_cat or None)
+                or whale_icp_reject_reason(
+                    {
+                        "name": app_name,
+                        "company": dev,
+                        "bio": blob,
+                        "category": store_cat,
+                        "project_url": website,
+                        "source_url": s_url,
+                    }
+                )
+            ):
                 continue
             seen_key = f"appstore:{_slugify(dom or app_name or s_url)}"
             if seen_key in current or seen_key in local_keys:
@@ -1668,7 +1895,7 @@ def collect_scaling_store_apps(
                 )
                 if u
             ]
-            rows.append(
+            row = _finalize_whale_row(
                 {
                     "id": seen_key,
                     "name": dev or project_name,
@@ -1680,11 +1907,11 @@ def collect_scaling_store_apps(
                     "source_url": s_url,
                     "role": "Founder",
                     "roles": ["Founder"],
-                    "category": "SaaS / AI app",
+                    "category": store_cat or "SaaS / AI app",
                     "project": project_name,
                     "company": dev or project_name,
                     "project_url": contacts["project_url"],
-                    "what_they_do": what_they_do,
+                    "what_they_do": f"{what_they_do} {st.get('description') or ''}".strip()[:200],
                     "founder_linkedin": contacts["founder_linkedin"],
                     "founder_x": contacts["founder_x"],
                     "work_email": contacts["work_email"],
@@ -1692,8 +1919,18 @@ def collect_scaling_store_apps(
                     "has_monetization_signal": True,
                     "icp_match": True,
                     "lead_tier": "A",
-                }
+                },
+                tg_links=_extract_tg_community_links(
+                    st.get("description"), st, contacts.get("tg_links")
+                ),
+                explicit_tg_group=str(contacts.get("telegram_group") or ""),
             )
+            if not row:
+                continue
+            row["what_they_do"] = what_they_do
+            if not store_cat:
+                row["category"] = "SaaS / AI app"
+            rows.append(row)
             current[seen_key] = stamp
 
     return rows, current
@@ -1810,7 +2047,23 @@ def collect_ats_ugc_hiring(
 
         brand = re.sub(r"[-_]+", " ", slug).strip().title()
         jtitle = str(matched_job.get("title") or "").strip()
-        if is_megacorp_app(brand, title_hint) or is_supply_side(f"{brand} {jtitle}"):
+        job_desc = str(matched_job.get("descriptionPlain") or matched_job.get("description") or "").strip()
+        job_cat = str(matched_job.get("department") or matched_job.get("team") or "").strip()
+        job_blob = f"{brand} {title_hint} {jtitle} {job_desc[:500]}"
+        if (
+            is_megacorp_app(brand, title_hint)
+            or is_supply_side(job_blob)
+            or sniper_reject_reason(job_blob, category=job_cat or None)
+            or whale_icp_reject_reason(
+                {
+                    "name": brand,
+                    "company": brand,
+                    "bio": job_blob,
+                    "category": job_cat,
+                    "source_url": str(matched_job.get("absolute_url") or matched_job.get("jobUrl") or ""),
+                }
+            )
+        ):
             continue
         seen_key = f"ats:{ats_kind}:{slug.lower()}"
         if seen_key in current or seen_key in local_keys:
@@ -1855,7 +2108,7 @@ def collect_ats_ugc_hiring(
             )
             if u
         ]
-        rows.append(
+        row = _finalize_whale_row(
             {
                 "id": seen_key,
                 "name": brand,
@@ -1871,15 +2124,23 @@ def collect_ats_ugc_hiring(
                 "project": brand,
                 "company": brand,
                 "project_url": contacts["project_url"],
-                "what_they_do": what_they_do,
+                "what_they_do": f"{what_they_do} {job_desc[:200]}".strip()[:200],
                 "founder_linkedin": contacts["founder_linkedin"],
                 "founder_x": contacts["founder_x"],
                 "work_email": contacts["work_email"],
                 "has_monetization_signal": True,
                 "icp_match": True,
                 "lead_tier": "A",
-            }
+            },
+            tg_links=_extract_tg_community_links(
+                job_url, job_desc, land_extra, contacts.get("tg_links")
+            ),
+            explicit_tg_group=str(contacts.get("telegram_group") or ""),
         )
+        if not row:
+            continue
+        row["what_they_do"] = what_they_do
+        rows.append(row)
         current[seen_key] = stamp
 
     return rows, current
@@ -1952,7 +2213,21 @@ def collect_producthunt_detailed(
         if not name or _is_noise_brand(name):
             continue
         blob = f"{name} {tagline} {item.get('pricing') or ''} {item.get('category') or ''}"
-        if is_megacorp_app(name, tagline) or is_supply_side(blob) or sniper_reject_reason(blob):
+        if (
+            is_megacorp_app(name, tagline)
+            or is_supply_side(blob)
+            or sniper_reject_reason(blob, category=str(item.get("category") or "") or None)
+            or whale_icp_reject_reason(
+                {
+                    "name": name,
+                    "company": name,
+                    "bio": blob,
+                    "category": str(item.get("category") or ""),
+                    "project_url": str(item.get("website") or item.get("product_url") or ""),
+                    "source_url": str(item.get("ph_url") or item.get("url") or ""),
+                }
+            )
+        ):
             continue
 
         site_raw = str(item.get("website") or item.get("product_url") or item.get("url") or "").strip()
@@ -2002,7 +2277,7 @@ def collect_producthunt_detailed(
             )
             if u
         ]
-        rows.append(
+        row = _finalize_whale_row(
             {
                 "id": seen_key,
                 "name": name,
@@ -2025,8 +2300,15 @@ def collect_producthunt_detailed(
                 "has_monetization_signal": True,
                 "icp_match": True,
                 "lead_tier": "A",
-            }
+            },
+            tg_links=_extract_tg_community_links(
+                tagline, makers_txt, item, contacts.get("tg_links")
+            ),
+            explicit_tg_group=str(contacts.get("telegram_group") or ""),
         )
+        if not row:
+            continue
+        rows.append(row)
         current[seen_key] = stamp
 
     return rows, current
@@ -2063,6 +2345,7 @@ def collect_all_veins(
     veins: tuple[str, ...] = ("whop", "tiktok_ads", "tiktok_shop"),
     cursor: int = 0,
     max_runtime_sec: float = 180.0,
+    whop_min_pool_usd: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     global _ACTIVE_RUN_CURSOR
     today = day or date.today()
@@ -2082,7 +2365,11 @@ def collect_all_veins(
             limit=rem, day=today, seen=cur_seen, call_budget=[8]
         ),
         "whop": lambda rem, cur_seen: collect_whop_content_rewards(
-            limit=rem, day=today, seen=cur_seen, call_budget=[8]
+            limit=rem,
+            day=today,
+            seen=cur_seen,
+            min_pool_usd=max(0, int(whop_min_pool_usd or 0)),
+            call_budget=[8],
         ),
         "tiktok_ads": lambda rem, cur_seen: collect_tiktok_creative_ads(
             limit=rem, day=today, seen=cur_seen, call_budget=[8]
@@ -2132,6 +2419,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop,app_stores,ats_hiring,ph_detailed,d2c_whatsapp")
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
     parser.add_argument("--max-runtime-sec", type=float, default=180.0)
+    parser.add_argument("--whop-min-pool-usd", type=int, default=5000)
     args = parser.parse_args(argv)
 
     day = date.fromisoformat(args.day) if args.day else date.today()
@@ -2147,6 +2435,7 @@ def main(argv: list[str] | None = None) -> None:
             veins=veins,
             cursor=cursor,
             max_runtime_sec=float(args.max_runtime_sec),
+            whop_min_pool_usd=max(0, int(args.whop_min_pool_usd)),
         )
     except Exception:
         rows, updated = [], before

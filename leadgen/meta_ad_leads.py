@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Active Meta Ad Library video advertisers enriched with decision-maker contacts.
 
-Scrapes active US video ads via scrapecreators.x.v1-facebook-adlibrary-search-ads,
-deduplicates advertisers over a 90-day window, and enriches decision-maker
-LinkedIn /in/ and work email via find_company_decision_maker.
+Scrapes active multi-GEO video ads via scrapecreators.x.v1-facebook-adlibrary-search-ads,
+extracts Click-to-WhatsApp CTAs and FB/IG metadata, deduplicates advertisers over a
+90-day window, and enriches decision-maker contacts via find_company_decision_maker.
 """
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Sequence
+import inspect
 import json
 import os
 import re
 from datetime import date, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     from treg_client import call
@@ -41,12 +44,7 @@ except ImportError:
 
 ENDPOINT = "scrapecreators.x.v1-facebook-adlibrary-search-ads"
 SEARCH_QUERIES = (
-    # Cluster 1: Gaming / Roblox / Fortnite / FiveM
-    "roblox game",
-    "fortnite map code",
-    "mobile RPG game",
-    "fivem roleplay server",
-    # Cluster 2: Consumer AI subscription apps (astrology, coaching, language, fitness, video)
+    # Cluster 1: Subscription consumer / AI apps (high-LTV $50-$100+/yr)
     "AI coaching app",
     "AI astrology app",
     "AI language learning",
@@ -54,16 +52,54 @@ SEARCH_QUERIES = (
     "calorie tracker AI",
     "AI note taker",
     "AI video editor",
-    # Cluster 3: E-com / Shopify D2C (cosmetics/skincare, supplements, household cleaning)
-    "skincare routine serum",
-    "daily supplement gummies",
-    "eco household detergent",
-    "shopify beauty brand",
-    # Cluster 4: Crypto B2C wallets, trackers & prop trading
+    "AI therapy app",
+    "AI trading assistant",
+    "sleep tracker subscription",
+    "AI productivity workspace",
+    "AI tutor app",
+    # Cluster 2: Crypto / Fintech / Prop-trading
     "crypto wallet app",
     "crypto portfolio tracker",
     "prop trading challenge",
     "funded trader challenge",
+    "forex prop firm",
+    "crypto exchange app",
+    "options trading app",
+    "wealth management app",
+    "copy trading platform",
+    # Cluster 3: Large Shopify / D2C brands (high-AOV / subscription LTV $50-$100+)
+    "skincare routine serum",
+    "daily supplement gummies",
+    "eco household detergent",
+    "shopify beauty brand",
+    "longevity supplement subscription",
+    "peptide skincare serum",
+    "hair growth serum subscription",
+    "protein greens subscription",
+    "red light therapy device",
+    "smart sleep mattress",
+    # Cluster 4: High-ticket infobiz / coaching & mentorship
+    "executive coaching program",
+    "business mastermind cohort",
+    "high ticket coaching",
+    "real estate investing mentorship",
+    "trading mentorship program",
+    "fitness coaching transformation",
+    "wealth building workshop",
+)
+TARGET_COUNTRIES = (
+    "US",
+    "GB",
+    "AE",
+    "SA",
+    "DE",
+    "FR",
+    "NL",
+    "ES",
+    "IT",
+    "SE",
+    "CA",
+    "AU",
 )
 CAP = int(os.getenv("META_ADS_CAP", "15"))
 SEEN_DAYS = 90
@@ -88,6 +124,68 @@ APP_STORE_HOSTS = {
     "itunes.apple.com",
     "play.google.com",
 }
+_NON_PROJECT_HOSTS = {
+    "wa.me",
+    "api.whatsapp.com",
+    "whatsapp.com",
+    "wa.link",
+    "fb.com",
+    "fb.me",
+    "m.me",
+    "facebook.com",
+    "l.facebook.com",
+    "lm.facebook.com",
+    "instagram.com",
+    "l.instagram.com",
+    "t.me",
+    "telegram.me",
+    "telegram.dog",
+    "linktr.ee",
+    "beacons.ai",
+    "bit.ly",
+    "tinyurl.com",
+}
+_IG_RESERVED_HANDLES = frozenset(
+    {
+        "p",
+        "reel",
+        "reels",
+        "stories",
+        "explore",
+        "accounts",
+        "direct",
+        "tv",
+        "ar",
+        "about",
+        "legal",
+        "privacy",
+        "developer",
+        "oauth",
+        "share",
+    }
+)
+_IG_URL_RE = re.compile(
+    r"""(?:https?://)?(?:www\.|m\.)?instagram\.com/([A-Za-z0-9._]{1,30})(?=[/?#"'<>\s,;:\)]|$)""",
+    re.I,
+)
+_IG_HANDLE_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+_WA_ME_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?wa\.me/(?:c/)?([%\d+][%\d\s().\-]*)",
+    re.I,
+)
+_WA_API_RE = re.compile(
+    r"(?:(?:https?://)?(?:www\.)?(?:api\.whatsapp\.com|whatsapp\.com)/send(?:/)?\?|whatsapp://send\?)"
+    r"[^#\s\"'<>]*?\bphone=(\+?[%\d][%\d\s().\-]{6,})",
+    re.I,
+)
+_WA_LABEL_E164_RE = re.compile(
+    r"(?:whatsapp|wa)\s*(?:/\s*tel[^:\n]{0,18})?\s*[:\-–—]?\s*(\+\d[\d\s().\-]{6,17}\d)",
+    re.I,
+)
+_TEL_PHONE_RE = re.compile(r"\btel:\s*(\+?\d[\d\s().\-]{6,17}\d)", re.I)
+_E164_PHONE_RE = re.compile(r"(?<![\w+])(\+\d[\d\s().\-]{6,17}\d)(?!\s*%)")
+_BARE_PHONE_RE = re.compile(r"^\s*\+?(\d[\d\s().\-]{7,18}\d)\s*$")
+_TOLLFREE_WA_PREFIXES = ("1800", "1833", "1844", "1855", "1866", "1877", "1888", "44800", "44808")
 
 
 def queries_for_day(day: date, count: int = 3) -> list[str]:
@@ -96,6 +194,15 @@ def queries_for_day(day: date, count: int = 3) -> list[str]:
         return []
     start = (day.toordinal() * count) % total
     return [SEARCH_QUERIES[(start + i) % total] for i in range(min(count, total))]
+
+
+def countries_for_day(day: date, count: int = 3) -> list[str]:
+    """Return a deterministic daily slice of TARGET_COUNTRIES for multi-GEO rotation."""
+    total = len(TARGET_COUNTRIES)
+    if not total or count <= 0:
+        return []
+    start = (day.toordinal() * count) % total
+    return [TARGET_COUNTRIES[(start + i) % total] for i in range(min(count, total))]
 
 
 def fresh_seen(seen: dict[str, str], day: date, keep_days: int = SEEN_DAYS) -> dict[str, str]:
@@ -132,19 +239,339 @@ def _is_giant_brand(page_name: str, domain: str = "") -> bool:
     return False
 
 
+def _unwrap_fb_redirect(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"https://{text}")
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host in {"l.facebook.com", "lm.facebook.com"} and parsed.path.rstrip("/") == "/l.php":
+        u_vals = parse_qs(parsed.query).get("u") or []
+        if u_vals:
+            return unquote(u_vals[0]).strip()
+    return text
+
+
+def _is_non_project_host(host: str) -> bool:
+    clean = (host or "").lower().removeprefix("www.").strip(".")
+    if not clean:
+        return True
+    return any(clean == skip or clean.endswith("." + skip) for skip in _NON_PROJECT_HOSTS)
+
+
+def _snapshot_cards(snapshot: dict) -> list[dict]:
+    cards = snapshot.get("cards")
+    if not isinstance(cards, list):
+        return []
+    return [c for c in cards if isinstance(c, dict)]
+
+
+def _snapshot_body_text(snapshot: dict) -> str:
+    body_obj = snapshot.get("body")
+    body_text = ""
+    if isinstance(body_obj, dict):
+        body_text = str(body_obj.get("text") or "").strip()
+    elif isinstance(body_obj, str):
+        body_text = body_obj.strip()
+    if not body_text:
+        body_text = str(snapshot.get("title") or snapshot.get("link_description") or "").strip()
+    if not body_text:
+        for card in _snapshot_cards(snapshot):
+            c_body = card.get("body")
+            if isinstance(c_body, dict):
+                body_text = str(c_body.get("text") or "").strip()
+            elif isinstance(c_body, str):
+                body_text = c_body.strip()
+            if not body_text:
+                body_text = str(card.get("title") or card.get("link_description") or "").strip()
+            if body_text:
+                break
+    return re.sub(r"\s+", " ", body_text).strip()
+
+
 def _extract_project_url_and_domain(snapshot: dict) -> tuple[str, str]:
-    for raw in (snapshot.get("link_url"), snapshot.get("caption"), snapshot.get("website")):
-        text = str(raw or "").strip()
+    cards = _snapshot_cards(snapshot)
+    raw_fields: list[Any] = [
+        snapshot.get("link_url"),
+        snapshot.get("caption"),
+        snapshot.get("website"),
+    ]
+    for card in cards:
+        raw_fields.extend((card.get("link_url"), card.get("caption"), card.get("website")))
+
+    for raw in raw_fields:
+        text = _unwrap_fb_redirect(str(raw or "").strip())
         if not text:
             continue
-        url = text if "://" in text else f"https://{text}"
-        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
-        if host in APP_STORE_HOSTS:
-            return (text if "://" in text else f"https://{text}"), ""
-        dom = domain_of(text)
-        if dom:
-            return f"https://{dom}", dom
+        low = text.lower()
+        if low.startswith(("tel:", "mailto:", "whatsapp:")):
+            continue
+        candidates: list[str] = []
+        if re.search(r"\s", text):
+            candidates.extend(m.group(0).rstrip(".,;:)") for m in re.finditer(r"https?://[^\s<>\]\)\"']+", text))
+        else:
+            candidates.append(text)
+        for cand in candidates:
+            url = cand if "://" in cand else f"https://{cand}"
+            host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+            if host in APP_STORE_HOSTS:
+                return url, ""
+            if _is_non_project_host(host):
+                continue
+            dom = domain_of(url)
+            if dom and not _is_non_project_host(dom):
+                return f"https://{dom}", dom
     return "", ""
+
+
+def _digits(value: Any) -> str:
+    return re.sub(r"\D", "", unquote(str(value or "")))
+
+
+def _is_plausible_wa_digits(digits: str) -> bool:
+    if not (8 <= len(digits) <= 15):
+        return False
+    if len(set(digits)) == 1 or digits.startswith("1234567") or digits.startswith(_TOLLFREE_WA_PREFIXES):
+        return False
+    return True
+
+
+def extract_whatsapp_from_snapshot(snapshot: dict) -> tuple[str, str, str]:
+    """Extract Click-to-WhatsApp URL, E.164 phone, and cta_type from an ad snapshot."""
+    if not isinstance(snapshot, dict):
+        return "", "", ""
+    cards = _snapshot_cards(snapshot)
+    cta_type = str(snapshot.get("cta_type") or "").strip().upper()
+    if not cta_type:
+        for card in cards:
+            c_type = str(card.get("cta_type") or "").strip().upper()
+            if c_type:
+                cta_type = c_type
+                break
+    cta_text = str(snapshot.get("cta_text") or "").strip()
+    if not cta_text:
+        for card in cards:
+            c_txt = str(card.get("cta_text") or "").strip()
+            if c_txt:
+                cta_text = c_txt
+                break
+
+    primary_raw: list[str] = [
+        str(snapshot.get("link_url") or ""),
+        str(snapshot.get("caption") or ""),
+        str(snapshot.get("website") or ""),
+    ]
+    for card in cards:
+        primary_raw.extend((
+            str(card.get("link_url") or ""),
+            str(card.get("caption") or ""),
+            str(card.get("website") or ""),
+        ))
+
+    secondary_raw: list[str] = [
+        str(snapshot.get("link_description") or ""),
+        str(snapshot.get("title") or ""),
+        _snapshot_body_text(snapshot),
+    ]
+    for card in cards:
+        c_body = card.get("body")
+        c_body_str = str(c_body.get("text") or "") if isinstance(c_body, dict) else str(c_body or "")
+        secondary_raw.extend((
+            str(card.get("link_description") or ""),
+            str(card.get("title") or ""),
+            c_body_str,
+        ))
+
+    def _expand_variants(values: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in values:
+            s = raw.strip()
+            if not s:
+                continue
+            out.append(s)
+            unwrapped = _unwrap_fb_redirect(s)
+            if unwrapped and unwrapped != s:
+                out.append(unwrapped)
+        return out
+
+    primary = _expand_variants(primary_raw)
+    secondary = _expand_variants(secondary_raw)
+    all_texts = primary + secondary
+
+    for text in all_texts:
+        for regex in (_WA_ME_RE, _WA_API_RE):
+            for m in regex.finditer(text):
+                digits = _digits(m.group(1))
+                if _is_plausible_wa_digits(digits):
+                    return f"https://wa.me/{digits}", f"+{digits}", cta_type
+
+    for text in all_texts:
+        for m in _WA_LABEL_E164_RE.finditer(text):
+            digits = _digits(m.group(1))
+            if _is_plausible_wa_digits(digits):
+                return f"https://wa.me/{digits}", f"+{digits}", cta_type
+
+    for text in primary:
+        for regex in (_TEL_PHONE_RE, _E164_PHONE_RE):
+            for m in regex.finditer(text):
+                digits = _digits(m.group(1))
+                if _is_plausible_wa_digits(digits):
+                    return f"https://wa.me/{digits}", f"+{digits}", cta_type
+
+    is_wa_cta = cta_type == "WHATSAPP_MESSAGE" or "whatsapp" in cta_text.casefold()
+    if is_wa_cta:
+        for text in secondary:
+            for regex in (_TEL_PHONE_RE, _E164_PHONE_RE):
+                for m in regex.finditer(text):
+                    digits = _digits(m.group(1))
+                    if _is_plausible_wa_digits(digits):
+                        return f"https://wa.me/{digits}", f"+{digits}", cta_type
+        for text in primary:
+            if "://" in text and not text.lower().startswith("tel:"):
+                continue
+            m = _BARE_PHONE_RE.match(text)
+            if m:
+                digits = _digits(m.group(1))
+                if _is_plausible_wa_digits(digits):
+                    return f"https://wa.me/{digits}", f"+{digits}", cta_type
+
+    return "", "", cta_type
+
+
+def _normalize_fb_page_url(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    url = text if "://" in text else f"https://{text}"
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host not in {"facebook.com", "m.facebook.com", "mbasic.facebook.com", "fb.com"}:
+        return ""
+    path_low = (parsed.path or "").lower()
+    if any(seg in path_low for seg in ("/ads/library", "/l.php", "/groups/", "/events/", "/sharer")):
+        return ""
+    clean_path = parsed.path or "/"
+    if clean_path == "/profile.php":
+        id_vals = parse_qs(parsed.query).get("id") or []
+        if id_vals and id_vals[0].strip().isdigit():
+            return f"https://www.facebook.com/profile.php?id={id_vals[0].strip()}"
+        return ""
+    if clean_path == "/":
+        return ""
+    return f"https://www.facebook.com{clean_path.rstrip('/')}"
+
+
+def _clean_ig_handle(raw: str) -> str:
+    candidate = str(raw or "").strip().lstrip("@")
+    if not candidate or not _IG_HANDLE_RE.fullmatch(candidate):
+        return ""
+    if candidate.casefold() in _IG_RESERVED_HANDLES or not any(c.isalnum() for c in candidate):
+        return ""
+    return candidate
+
+
+def extract_social_metadata(item: dict, snapshot: dict) -> dict[str, str]:
+    """Extract Facebook Page ID/URL and Instagram handle/URL from an ad item/snapshot."""
+    item = item if isinstance(item, dict) else {}
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+
+    fb_page_id = ""
+    for raw_id in (
+        snapshot.get("page_id"),
+        snapshot.get("pageId"),
+        item.get("page_id"),
+        item.get("pageId"),
+    ):
+        val = str(raw_id or "").strip()
+        if val:
+            fb_page_id = val
+            break
+
+    fb_page_url = ""
+    fb_url_candidates = [
+        snapshot.get("page_profile_uri"),
+        snapshot.get("page_profile_url"),
+        snapshot.get("page_url"),
+        snapshot.get("fb_page_url"),
+        item.get("page_profile_uri"),
+        item.get("page_profile_url"),
+        item.get("page_url"),
+        item.get("fb_page_url"),
+        snapshot.get("link_url"),
+    ]
+    for raw_fb in fb_url_candidates:
+        norm_fb = _normalize_fb_page_url(str(raw_fb or ""))
+        if norm_fb:
+            fb_page_url = norm_fb
+            break
+
+    if not fb_page_id and fb_page_url:
+        m_id = re.search(r"(?:\?id=|facebook\.com/)(\d{5,})(?:$|[/?#])", fb_page_url)
+        if m_id:
+            fb_page_id = m_id.group(1)
+
+    if not fb_page_url and fb_page_id:
+        fb_page_url = f"https://www.facebook.com/{fb_page_id}"
+
+    ig_handle = ""
+    for raw_ig_url in (
+        snapshot.get("instagram_profile_uri"),
+        snapshot.get("instagram_url"),
+        snapshot.get("ig_url"),
+        item.get("instagram_profile_uri"),
+        item.get("instagram_url"),
+        item.get("ig_url"),
+    ):
+        m_ig = _IG_URL_RE.search(str(raw_ig_url or ""))
+        if m_ig:
+            cand_h = _clean_ig_handle(m_ig.group(1))
+            if cand_h:
+                ig_handle = cand_h
+                break
+
+    if not ig_handle:
+        for raw_ig_h in (
+            snapshot.get("instagram_handle"),
+            snapshot.get("instagram_username"),
+            snapshot.get("ig_handle"),
+            snapshot.get("ig_username"),
+            snapshot.get("instagram_actor_name"),
+            item.get("instagram_handle"),
+            item.get("instagram_username"),
+            item.get("ig_handle"),
+            item.get("ig_username"),
+            item.get("instagram_actor_name"),
+        ):
+            cand_h = _clean_ig_handle(str(raw_ig_h or ""))
+            if cand_h:
+                ig_handle = cand_h
+                break
+
+    if not ig_handle:
+        fallback_texts = [
+            str(snapshot.get("link_url") or ""),
+            str(snapshot.get("caption") or ""),
+            str(snapshot.get("website") or ""),
+            _snapshot_body_text(snapshot),
+        ]
+        for card in _snapshot_cards(snapshot):
+            fallback_texts.extend((str(card.get("link_url") or ""), str(card.get("caption") or "")))
+        for raw_txt in fallback_texts:
+            unwrapped = _unwrap_fb_redirect(raw_txt)
+            m_ig = _IG_URL_RE.search(unwrapped)
+            if m_ig:
+                cand_h = _clean_ig_handle(m_ig.group(1))
+                if cand_h:
+                    ig_handle = cand_h
+                    break
+
+    ig_url = f"https://instagram.com/{ig_handle}" if ig_handle else ""
+    return {
+        "fb_page_id": fb_page_id,
+        "fb_page_url": fb_page_url,
+        "instagram_handle": ig_handle,
+        "instagram_url": ig_url,
+    }
 
 
 def _is_video_ad(item: dict) -> bool:
@@ -155,10 +582,15 @@ def _is_video_ad(item: dict) -> bool:
         return False
     fmt = str(snapshot.get("display_format") or "").upper()
     videos = snapshot.get("videos")
-    return fmt == "VIDEO" or (isinstance(videos, list) and len(videos) > 0)
+    if fmt == "VIDEO" or (isinstance(videos, list) and len(videos) > 0):
+        return True
+    for card in _snapshot_cards(snapshot):
+        if card.get("video_hd_url") or card.get("video_sd_url") or card.get("watermarked_video_sd_url"):
+            return True
+    return False
 
 
-def parse_ad_candidates(payload: dict | None) -> list[dict]:
+def parse_ad_candidates(payload: dict | None, *, country_code: str = "") -> list[dict]:
     if not isinstance(payload, dict):
         return []
     output = payload.get("output") if isinstance(payload.get("output"), dict) else payload
@@ -171,6 +603,7 @@ def parse_ad_candidates(payload: dict | None) -> list[dict]:
     )
     if not isinstance(items, list):
         return []
+    default_cc = str(country_code or "").strip().upper() or "US"
     candidates: list[dict] = []
     for item in items:
         if not isinstance(item, dict) or not _is_video_ad(item):
@@ -179,21 +612,22 @@ def parse_ad_candidates(payload: dict | None) -> list[dict]:
         page_name = str(snapshot.get("page_name") or item.get("page_name") or "").strip()
         if not page_name:
             continue
-        body_obj = snapshot.get("body")
-        body_text = ""
-        if isinstance(body_obj, dict):
-            body_text = str(body_obj.get("text") or "").strip()
-        elif isinstance(body_obj, str):
-            body_text = body_obj.strip()
-        if not body_text:
-            body_text = str(snapshot.get("title") or snapshot.get("link_description") or "").strip()
-        body_text = re.sub(r"\s+", " ", body_text).strip()
+        body_text = _snapshot_body_text(snapshot)
         project_url, domain = _extract_project_url_and_domain(snapshot)
         if _is_giant_brand(page_name, domain):
             continue
         ad_blob = f"{page_name} {body_text}"
         if is_supply_side(ad_blob) or sniper_reject_reason(ad_blob):
             continue
+        wa_url, wa_phone, cta_type = extract_whatsapp_from_snapshot(snapshot)
+        social = extract_social_metadata(item, snapshot)
+        item_cc = str(
+            country_code
+            or item.get("country_code")
+            or item.get("country")
+            or snapshot.get("country_code")
+            or default_cc
+        ).strip().upper() or "US"
         cta_text = str(snapshot.get("cta_text") or "Video Ad").strip() or "Video Ad"
         if body_text:
             what_they_do = f"Active Meta video ads ({cta_text}): {body_text}"[:200]
@@ -204,22 +638,51 @@ def parse_ad_candidates(payload: dict | None) -> list[dict]:
             "domain": domain,
             "project_url": project_url,
             "what_they_do": what_they_do,
+            "whatsapp": wa_url,
+            "phone": wa_phone,
+            "cta_type": cta_type,
+            "fb_page_id": social["fb_page_id"],
+            "fb_page_url": social["fb_page_url"],
+            "instagram_handle": social["instagram_handle"],
+            "instagram_url": social["instagram_url"],
+            "country_code": item_cc,
         })
     return candidates
 
 
-def _default_search(query: str) -> dict | None:
+def _default_search(query: str, country: str = "US") -> dict | None:
+    cc = str(country or "US").strip().upper() or "US"
     return call(
         ENDPOINT,
         query={
             "query": query,
             "trim": "true",
             "status": "ACTIVE",
-            "country": "US",
+            "country": cc,
             "media_type": "VIDEO",
         },
         timeout=60,
     )
+
+
+def _call_search(search_fn: Callable[..., Any], query: str, country: str) -> dict | None:
+    try:
+        sig = inspect.signature(search_fn)
+    except (TypeError, ValueError):
+        return search_fn(query)
+    params = list(sig.parameters.values())
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+    has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+    if "country" in sig.parameters or has_var_kw:
+        return search_fn(query, country=country)
+    positional = [
+        p
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional) >= 2 or has_var_pos:
+        return search_fn(query, country)
+    return search_fn(query)
 
 
 def _scrape_site_contacts(project_url: str) -> dict[str, str]:
@@ -413,6 +876,7 @@ def collect(
     day: date | None = None,
     seen: dict[str, str] | None = None,
     cap: int = CAP,
+    countries: Sequence[str] | None = None,
     search_fn=None,
     enrich_fn=None,
     store_resolver_fn=None,
@@ -428,14 +892,28 @@ def collect(
     rows: list[dict] = []
     local_keys: set[str] = set()
 
-    for query in queries_for_day(today):
+    selected_queries = queries_for_day(today)
+    if countries is not None:
+        selected_countries = [str(c).strip().upper() for c in countries if str(c).strip()]
+    else:
+        selected_countries = countries_for_day(today, count=len(selected_queries) or 3)
+    if not selected_countries:
+        selected_countries = ["US"]
+
+    total_steps = max(len(selected_queries), len(selected_countries)) if selected_queries else 0
+    search_plan = [
+        (selected_queries[i % len(selected_queries)], selected_countries[i % len(selected_countries)])
+        for i in range(total_steps)
+    ]
+
+    for query, country in search_plan:
         if len(rows) >= cap:
             break
         try:
-            payload = caller(query)
+            payload = _call_search(caller, query, country)
         except Exception:
             payload = None
-        for cand in parse_ad_candidates(payload):
+        for cand in parse_ad_candidates(payload, country_code=country):
             if len(rows) >= cap:
                 break
             page_name = cand["page_name"]
@@ -448,9 +926,12 @@ def collect(
 
             name_key = f"name:{page_name.casefold()}"
             dom_key = f"domain:{domain.casefold()}" if domain else ""
+            fb_key = f"fb:{cand['fb_page_id']}" if cand["fb_page_id"] else ""
             if name_key in current or name_key in local_keys:
                 continue
             if dom_key and (dom_key in current or dom_key in local_keys):
+                continue
+            if fb_key and (fb_key in current or fb_key in local_keys):
                 continue
 
             store_info: dict = {}
@@ -478,6 +959,8 @@ def collect(
             local_keys.add(name_key)
             if dom_key:
                 local_keys.add(dom_key)
+            if fb_key:
+                local_keys.add(fb_key)
             if resolved_domain:
                 local_keys.add(f"domain:{resolved_domain.casefold()}")
 
@@ -508,18 +991,54 @@ def collect(
             username = site_contacts.get("username", "")
             founder_x = site_contacts.get("founder_x", "")
 
-            if not (founder_linkedin or work_email or resolved_domain or project_url):
+            wa_url = cand["whatsapp"]
+            wa_phone = cand["phone"]
+            fb_page_id = cand["fb_page_id"]
+            fb_page_url = cand["fb_page_url"]
+            ig_handle = cand["instagram_handle"]
+            ig_url = cand["instagram_url"]
+
+            if not (
+                founder_linkedin
+                or work_email
+                or resolved_domain
+                or project_url
+                or wa_url
+                or wa_phone
+                or ig_url
+                or fb_page_url
+            ):
                 continue
 
             slug = _slugify(resolved_domain or page_name)
-            links = list(dict.fromkeys(u for u in (project_url, store_url, founder_linkedin, founder_x) if u))
+            links = list(
+                dict.fromkeys(
+                    u
+                    for u in (
+                        project_url,
+                        store_url,
+                        wa_url,
+                        founder_linkedin,
+                        founder_x,
+                        ig_url,
+                        fb_page_url,
+                    )
+                    if u
+                )
+            )
+            provider = "telegram" if username else ("whatsapp" if wa_url else "")
             row = {
                 "id": f"meta_ads:{slug}",
                 "name": page_name,
                 "username": username,
+                "whatsapp": wa_url,
+                "phone": wa_phone,
+                "provider": provider,
+                "cta_type": cand["cta_type"],
                 "bio": cand["what_they_do"],
                 "links": links,
                 "source": "meta_ads",
+                "segment": "whale",
                 "role": "Marketing",
                 "roles": ["Marketing"],
                 "category": "SaaS / AI app",
@@ -529,6 +1048,11 @@ def collect(
                 "founder_linkedin": founder_linkedin,
                 "founder_x": founder_x,
                 "work_email": work_email,
+                "fb_page_id": fb_page_id,
+                "fb_page_url": fb_page_url,
+                "instagram_handle": ig_handle,
+                "instagram_url": ig_url,
+                "country_code": cand["country_code"],
                 "has_monetization_signal": True,
                 "monetization": "subscription",
                 "icp_match": True,
@@ -540,6 +1064,8 @@ def collect(
                 current[dom_key] = stamp
             elif resolved_domain:
                 current[f"domain:{resolved_domain.casefold()}"] = stamp
+            if fb_key:
+                current[fb_key] = stamp
 
     return rows, current
 
@@ -571,13 +1097,19 @@ def main() -> None:
     parser.add_argument("--seen", default=".tg_pipeline/meta_ads_seen.json")
     parser.add_argument("--limit", type=int, default=CAP)
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
+    parser.add_argument("--country", default="", help="Comma-separated 2-letter GEO codes (optional)")
     args = parser.parse_args()
 
     day = date.fromisoformat(args.day) if args.day else date.today()
+    countries = (
+        [c.strip().upper() for c in args.country.split(",") if c.strip()]
+        if args.country.strip()
+        else None
+    )
     seen_path = Path(args.seen)
     before = _load_seen(seen_path)
     try:
-        rows, updated = collect(day=day, seen=before, cap=max(0, args.limit))
+        rows, updated = collect(day=day, seen=before, cap=max(0, args.limit), countries=countries)
     except Exception:
         rows, updated = [], before
     _save_seen(seen_path, updated)

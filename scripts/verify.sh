@@ -1018,6 +1018,380 @@ if acc_py_u.is_file() and fe_thread_pane.is_file():
     if m_apply and '"offline"' not in m_apply.group(0):
         errors.append("Gate U violation in app/accounts.py: _apply_result() must include 'offline' in replaceable health statuses")
 
+# Gate V: Outreach v2 Spec-9 Static Regression Gates
+# V1. Ban roblox / fortnite / fivem inside leadgen/meta_ad_leads.py SEARCH_QUERIES
+#     and leadgen/tg_llm_qualify.py Golden ICP clusters (while allowing them in REJECT sections)
+meta_ads_v_file = root / "leadgen" / "meta_ad_leads.py"
+if meta_ads_v_file.is_file():
+    ma_tree = ast.parse(meta_ads_v_file.read_text(encoding="utf-8"), filename=str(meta_ads_v_file))
+    sq_val = None
+    for nd in ma_tree.body:
+        if isinstance(nd, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "SEARCH_QUERIES" for t in nd.targets):
+            sq_val = nd.value
+            break
+        if isinstance(nd, ast.AnnAssign) and isinstance(nd.target, ast.Name) and nd.target.id == "SEARCH_QUERIES":
+            sq_val = nd.value
+            break
+    if sq_val is None:
+        errors.append("Gate V violation in leadgen/meta_ad_leads.py: missing SEARCH_QUERIES literal")
+    else:
+        sq_strings = [
+            sub.value
+            for sub in ast.walk(sq_val)
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+        ]
+        if not sq_strings:
+            errors.append("Gate V violation in leadgen/meta_ad_leads.py: empty SEARCH_QUERIES")
+        for q_str in sq_strings:
+            q_low = q_str.lower()
+            for banned_tok in ("roblox", "fortnite", "fivem"):
+                if banned_tok in q_low:
+                    errors.append(
+                        f"Gate V violation in leadgen/meta_ad_leads.py: banned gaming token '{banned_tok}' in SEARCH_QUERIES ({q_str!r})"
+                    )
+
+tg_qual_v_file = root / "leadgen" / "tg_llm_qualify.py"
+if tg_qual_v_file.is_file():
+    tq_tree = ast.parse(tg_qual_v_file.read_text(encoding="utf-8"), filename=str(tg_qual_v_file))
+    sp_val = None
+    for nd in tq_tree.body:
+        if isinstance(nd, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "SYSTEM_PROMPT" for t in nd.targets):
+            sp_val = nd.value
+            break
+        if isinstance(nd, ast.AnnAssign) and isinstance(nd.target, ast.Name) and nd.target.id == "SYSTEM_PROMPT":
+            sp_val = nd.value
+            break
+    if isinstance(sp_val, ast.Constant) and isinstance(sp_val.value, str):
+        sp_text = sp_val.value
+        if "Golden ICP clusters" not in sp_text or "REJECT" not in sp_text:
+            errors.append(
+                "Gate V violation in leadgen/tg_llm_qualify.py: SYSTEM_PROMPT must define 'Golden ICP clusters' and 'REJECT' sections"
+            )
+        else:
+            golden_section = sp_text.split("REJECT", 1)[0]
+            golden_low = golden_section.lower()
+            for banned_tok in ("roblox", "fortnite", "fivem"):
+                if banned_tok in golden_low:
+                    errors.append(
+                        f"Gate V violation in leadgen/tg_llm_qualify.py: banned gaming token '{banned_tok}' in Golden ICP clusters section"
+                    )
+    else:
+        errors.append("Gate V violation in leadgen/tg_llm_qualify.py: missing string SYSTEM_PROMPT")
+
+# V2. Ban 'or has_x or has_personal_email' inside leadgen/contact_waterfall.py Tier 2 trigger
+cw_v_file = root / "leadgen" / "contact_waterfall.py"
+if cw_v_file.is_file():
+    cw_src_v = cw_v_file.read_text(encoding="utf-8")
+    if re.search(r"\bor\s+has_x\b|\bhas_x\s+or\b|not\s*\(\s*has_tg\s+or\s+has_wa\s+or\s+[^\n)]*(?:has_x|has_personal_email)", cw_src_v):
+        errors.append(
+            "Gate V violation in leadgen/contact_waterfall.py: Tier 2 trigger must not include has_x or has_personal_email"
+        )
+    cw_tree = ast.parse(cw_src_v, filename=str(cw_v_file))
+    enrich_fn = next(
+        (n for n in cw_tree.body if isinstance(n, ast.FunctionDef) and n.name == "enrich_lead_contacts"),
+        None,
+    )
+    if enrich_fn is None:
+        errors.append("Gate V violation in leadgen/contact_waterfall.py: missing enrich_lead_contacts")
+    else:
+        tier2_if_nodes = [
+            nd
+            for nd in ast.walk(enrich_fn)
+            if isinstance(nd, ast.If)
+            and any(isinstance(sub, ast.Name) and sub.id == "allow_paid_tier2" for sub in ast.walk(nd.test))
+        ]
+        if not tier2_if_nodes:
+            errors.append("Gate V violation in leadgen/contact_waterfall.py: missing allow_paid_tier2 Tier 2 trigger guard")
+        else:
+            for t_if in tier2_if_nodes:
+                test_names = {sub.id for sub in ast.walk(t_if.test) if isinstance(sub, ast.Name)}
+                if "has_x" in test_names or "has_personal_email" in test_names:
+                    errors.append(
+                        f"Gate V violation in leadgen/contact_waterfall.py:{t_if.lineno}: Tier 2 trigger condition must not block on has_x / has_personal_email"
+                    )
+                if "has_tg" not in test_names or "has_wa" not in test_names:
+                    errors.append(
+                        f"Gate V violation in leadgen/contact_waterfall.py:{t_if.lineno}: Tier 2 trigger condition must gate on has_tg and has_wa"
+                    )
+
+# V3. Verify exclude_from_airtable and ru_expert isolation guards exist in app/airtable_sync.py
+if at_file.is_file():
+    at_src_v = at_file.read_text(encoding="utf-8")
+    for req_at_tok in ("def is_lead_airtable_excluded(", "exclude_from_airtable", "ru_expert"):
+        if req_at_tok not in at_src_v:
+            errors.append(f"Gate V violation in app/airtable_sync.py: missing Airtable isolation guard '{req_at_tok}'")
+    at_tree_v = ast.parse(at_src_v, filename=str(at_file))
+    at_fns_v = {n.name: n for n in at_tree_v.body if isinstance(n, ast.FunctionDef)}
+    for req_fn_v in ("_select_airtable_push_candidates", "push_lead_to_airtable", "sync_airtable"):
+        if req_fn_v not in at_fns_v:
+            errors.append(f"Gate V violation in app/airtable_sync.py: missing {req_fn_v}")
+    cand_fn = at_fns_v.get("_select_airtable_push_candidates")
+    if cand_fn is not None:
+        cand_calls = {
+            (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
+            for n in ast.walk(cand_fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
+        }
+        if "_sql_lead_not_excluded_clause" not in cand_calls or "_is_db_lead_airtable_excluded" not in cand_calls:
+            errors.append(
+                "Gate V violation in app/airtable_sync.py: _select_airtable_push_candidates must call _sql_lead_not_excluded_clause and _is_db_lead_airtable_excluded"
+            )
+
+# V4. Verify REVSHARE_OFFER_TEXT is NOT used in whale_mass Step 1 (leadgen/outreach_copy.py)
+oc_v_file = root / "leadgen" / "outreach_copy.py"
+if oc_v_file.is_file():
+    oc_src_v = oc_v_file.read_text(encoding="utf-8")
+    oc_tree = ast.parse(oc_src_v, filename=str(oc_v_file))
+    oc_fns = {n.name: n for n in oc_tree.body if isinstance(n, ast.FunctionDef)}
+    whale_steps_fn = oc_fns.get("_build_whale_mass_steps")
+    if whale_steps_fn is None:
+        errors.append("Gate V violation in leadgen/outreach_copy.py: missing _build_whale_mass_steps")
+    else:
+        used_names = {n.id for n in ast.walk(whale_steps_fn) if isinstance(n, ast.Name)}
+        if "REVSHARE_OFFER_TEXT" in used_names:
+            errors.append("Gate V violation in leadgen/outreach_copy.py: _build_whale_mass_steps must NOT reference REVSHARE_OFFER_TEXT")
+        str_lits = " ".join(n.value.lower() for n in ast.walk(whale_steps_fn) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        if "revshare" in str_lits or "cpa" in str_lits:
+            errors.append("Gate V violation in leadgen/outreach_copy.py: _build_whale_mass_steps must NOT contain revshare/CPA copy")
+    for mod_assign in oc_tree.body:
+        if isinstance(mod_assign, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ("WHALE_OFFER_TEXT", "WHALE_PITCH_TEXT") for t in mod_assign.targets):
+            lit_txt = " ".join(n.value.lower() for n in ast.walk(mod_assign.value) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+            if "revshare" in lit_txt or "cpa" in lit_txt:
+                errors.append("Gate V violation in leadgen/outreach_copy.py: WHALE_OFFER_TEXT / WHALE_PITCH_TEXT must NOT mention revshare/CPA")
+    for fn_nm in ("_default_steps_for_profile", "upgrade_to_vlad_step1", "_validate_and_assemble_llm_step1"):
+        fn_nd = oc_fns.get(fn_nm)
+        if fn_nd is not None:
+            for if_nd in ast.walk(fn_nd):
+                if (
+                    isinstance(if_nd, ast.If)
+                    and isinstance(if_nd.test, ast.Compare)
+                    and len(if_nd.test.ops) == 1
+                    and isinstance(if_nd.test.ops[0], ast.Eq)
+                    and any(
+                        isinstance(c, ast.Constant) and c.value == "whale_mass"
+                        for c in (if_nd.test.left, *if_nd.test.comparators)
+                    )
+                ):
+                    for body_stmt in if_nd.body:
+                        if any(isinstance(nm, ast.Name) and nm.id == "REVSHARE_OFFER_TEXT" for nm in ast.walk(body_stmt)):
+                            errors.append(
+                                f"Gate V violation in leadgen/outreach_copy.py:{fn_nm}: whale_mass branch must NOT use REVSHARE_OFFER_TEXT"
+                            )
+
+# V5. Verify frozen-account no-spillover guard & language match guard exist in app/outreach.py and leadgen/language_router.py
+lr_v_file = root / "leadgen" / "language_router.py"
+if lr_v_file.is_file():
+    lr_src_v = lr_v_file.read_text(encoding="utf-8")
+    for req_lr in ("def assert_copy_matches_language(", "def detect_lead_language(", "def resolve_target_campaign("):
+        if req_lr not in lr_src_v:
+            errors.append(f"Gate V violation in leadgen/language_router.py: missing {req_lr}")
+
+if outreach_file.is_file():
+    outreach_src_v = outreach_file.read_text(encoding="utf-8")
+    for req_outreach_guard in (
+        "def is_account_eligible_for_outreach(",
+        "def assert_campaign_copy_language(",
+        "def get_account_global_sent_today(",
+        "BLOCKED_OUTREACH_HEALTHS",
+        "assert_copy_matches_language",
+    ):
+        if req_outreach_guard not in outreach_src_v:
+            errors.append(
+                f"Gate V violation in app/outreach.py: missing v2 guard '{req_outreach_guard}'"
+            )
+    if '"frozen"' not in outreach_src_v:
+        errors.append("Gate V violation in app/outreach.py: missing 'frozen' account isolation guard")
+    if outreach_src_v.count("assert_campaign_copy_language(") < 2:
+        errors.append("Gate V violation in app/outreach.py: assert_campaign_copy_language must be wired into campaign ingestion/sending")
+
+    outreach_tree_v = ast.parse(outreach_src_v, filename=str(outreach_file))
+    outreach_fns_v = {
+        nd.name: nd
+        for nd in ast.walk(outreach_tree_v)
+        if isinstance(nd, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def _fn_calls_v(fn_node: ast.AST) -> list[ast.Call]:
+        return [c for c in ast.walk(fn_node) if isinstance(c, ast.Call)]
+
+    def _call_name_v(call_node: ast.Call) -> str:
+        if isinstance(call_node.func, ast.Name):
+            return call_node.func.id
+        if isinstance(call_node.func, ast.Attribute):
+            return call_node.func.attr
+        return ""
+
+    def _has_call_v(fn_node: ast.AST, target: str, req_kw: str | None = None) -> bool:
+        for c in _fn_calls_v(fn_node):
+            if _call_name_v(c) == target:
+                if req_kw is None or any(kw.arg == req_kw for kw in c.keywords):
+                    return True
+        return False
+
+    v5_outreach_reqs = (
+        ("_validate_template_text_language", "assert_campaign_copy_language", None),
+        ("_normalize_steps", "_validate_template_text_language", None),
+        ("create_campaign", "_normalize_steps", "expected_language"),
+        ("create_campaign", "_normalize_custom_step_templates_json", "expected_language"),
+        ("update_campaign", "_normalize_steps", "expected_language"),
+        ("update_campaign", "_validate_template_text_language", None),
+        ("_validate_campaign_steps_for_preview", "_validate_template_text_language", None),
+        ("run_campaign_batch", "is_account_eligible_for_outreach", None),
+        ("run_campaign_batch", "get_account_global_sent_today", None),
+    )
+    for fn_name, req_callee, req_kw in v5_outreach_reqs:
+        fn_nd = outreach_fns_v.get(fn_name)
+        if fn_nd is not None and not _has_call_v(fn_nd, req_callee, req_kw=req_kw):
+            kw_desc = f"(..., {req_kw}=...)" if req_kw else "()"
+            errors.append(
+                f"Gate V violation in app/outreach.py:{fn_name}: must call {req_callee}{kw_desc}"
+            )
+
+main_v_file = root / "app" / "main.py"
+if main_v_file.is_file():
+    main_tree_v = ast.parse(main_v_file.read_text(encoding="utf-8"), filename=str(main_v_file))
+    main_fns_v = {
+        nd.name: nd
+        for nd in ast.walk(main_tree_v)
+        if isinstance(nd, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    sct_fn = main_fns_v.get("_save_campaign_templates")
+    if sct_fn is not None:
+        sct_calls = {
+            (c.func.id if isinstance(c.func, ast.Name) else c.func.attr if isinstance(c.func, ast.Attribute) else "")
+            for c in ast.walk(sct_fn)
+            if isinstance(c, ast.Call)
+        }
+        if "_validate_template_text_language" not in sct_calls:
+            errors.append(
+                "Gate V violation in app/main.py:_save_campaign_templates: must call _validate_template_text_language"
+            )
+
+pmr_v_file = root / "leadgen" / "phone_messenger_resolver.py"
+if pmr_v_file.is_file():
+    pmr_tree_v = ast.parse(pmr_v_file.read_text(encoding="utf-8"), filename=str(pmr_v_file))
+    pmr_fn = next(
+        (
+            nd for nd in ast.walk(pmr_tree_v)
+            if isinstance(nd, (ast.FunctionDef, ast.AsyncFunctionDef)) and nd.name == "resolve_phones_telegram"
+        ),
+        None,
+    )
+    if pmr_fn is None:
+        errors.append("Gate V violation in leadgen/phone_messenger_resolver.py: missing resolve_phones_telegram")
+    else:
+        kw_defaults = dict(zip([a.arg for a in pmr_fn.args.kwonlyargs], pmr_fn.args.kw_defaults))
+        pos_defaults = dict(
+            zip(
+                [a.arg for a in pmr_fn.args.args[-len(pmr_fn.args.defaults):]],
+                pmr_fn.args.defaults,
+            )
+        ) if pmr_fn.args.defaults else {}
+        chk_def = kw_defaults.get("is_checker_session") or pos_defaults.get("is_checker_session")
+        if not (isinstance(chk_def, ast.Constant) and chk_def.value is False):
+            errors.append(
+                "Gate V violation in leadgen/phone_messenger_resolver.py:resolve_phones_telegram must default is_checker_session=False"
+            )
+
+bg_v_file = root / "leadgen" / "budget_guard.py"
+if bg_v_file.is_file():
+    bg_tree_v = ast.parse(bg_v_file.read_text(encoding="utf-8"), filename=str(bg_v_file))
+    bg_fn = next(
+        (
+            nd for nd in ast.walk(bg_tree_v)
+            if isinstance(nd, ast.FunctionDef) and nd.name == "check_balances_and_alert"
+        ),
+        None,
+    )
+    if bg_fn is None:
+        errors.append("Gate V violation in leadgen/budget_guard.py: missing check_balances_and_alert")
+    else:
+        kw_defaults = dict(zip([a.arg for a in bg_fn.args.kwonlyargs], bg_fn.args.kw_defaults))
+        pos_defaults = dict(
+            zip(
+                [a.arg for a in bg_fn.args.args[-len(bg_fn.args.defaults):]],
+                bg_fn.args.defaults,
+            )
+        ) if bg_fn.args.defaults else {}
+        allow_def = kw_defaults.get("allow_unavailable") or pos_defaults.get("allow_unavailable")
+        if not (isinstance(allow_def, ast.Constant) and allow_def.value is False):
+            errors.append(
+                "Gate V violation in leadgen/budget_guard.py:check_balances_and_alert must default allow_unavailable=False"
+            )
+
+bridge_v_file = root / "leadgen" / "tg_identity_bridge.py"
+if bridge_v_file.is_file():
+    bridge_src_v = bridge_v_file.read_text(encoding="utf-8")
+    bridge_tree_v = ast.parse(bridge_src_v, filename=str(bridge_v_file))
+    bridge_fns = {nd.name: nd for nd in ast.walk(bridge_tree_v) if isinstance(nd, ast.FunctionDef)}
+    if bridge_fns or (root / "app" / "outreach.py").is_file():
+        for b_fn_name in ("bridge_lead_to_telegram", "enrich_rows_with_telegram_bridge", "_default_x_profile", "_default_search"):
+            b_fn = bridge_fns.get(b_fn_name)
+            if b_fn is None:
+                errors.append(f"Gate V violation in leadgen/tg_identity_bridge.py: missing {b_fn_name}")
+            else:
+                b_arg_names = {a.arg for a in (*b_fn.args.args, *b_fn.args.kwonlyargs)}
+                if "allow_paid" not in b_arg_names or "budget_guard_fn" not in b_arg_names:
+                    errors.append(
+                        f"Gate V violation in leadgen/tg_identity_bridge.py:{b_fn_name}: must accept allow_paid and budget_guard_fn"
+                    )
+                if b_fn_name in ("_default_x_profile", "_default_search"):
+                    b_calls = {
+                        (c.func.id if isinstance(c.func, ast.Name) else c.func.attr if isinstance(c.func, ast.Attribute) else "")
+                        for c in ast.walk(b_fn)
+                        if isinstance(c, ast.Call)
+                    }
+                    if "_check_bridge_budget_guard" not in b_calls:
+                        errors.append(
+                            f"Gate V violation in leadgen/tg_identity_bridge.py:{b_fn_name}: must enforce _check_bridge_budget_guard"
+                        )
+
+if cw_v_file.is_file():
+    cw_tree_v = ast.parse(cw_v_file.read_text(encoding="utf-8"), filename=str(cw_v_file))
+    cw_elc = next(
+        (nd for nd in ast.walk(cw_tree_v) if isinstance(nd, ast.FunctionDef) and nd.name == "enrich_lead_contacts"),
+        None,
+    )
+    if cw_elc is not None:
+        cw_args = {a.arg for a in (*cw_elc.args.args, *cw_elc.args.kwonlyargs)}
+        if "allow_paid_tier2" not in cw_args or "budget_guard_fn" not in cw_args:
+            errors.append(
+                "Gate V violation in leadgen/contact_waterfall.py:enrich_lead_contacts must accept allow_paid_tier2 and budget_guard_fn"
+            )
+        bridge_calls_in_cw = [
+            c for c in ast.walk(cw_elc)
+            if isinstance(c, ast.Call)
+            and ((isinstance(c.func, ast.Name) and c.func.id == "bridge_lead_to_telegram")
+                 or (isinstance(c.func, ast.Attribute) and c.func.attr == "bridge_lead_to_telegram"))
+        ]
+        if bridge_calls_in_cw and not all(
+            any(kw.arg == "allow_paid" for kw in c.keywords) and any(kw.arg == "budget_guard_fn" for kw in c.keywords)
+            for c in bridge_calls_in_cw
+        ):
+            errors.append(
+                "Gate V violation in leadgen/contact_waterfall.py:enrich_lead_contacts must pass allow_paid and budget_guard_fn to bridge_lead_to_telegram"
+            )
+
+hygiene_v_file = root / "app" / "hygiene.py"
+if hygiene_v_file.is_file():
+    hyg_src_v = hygiene_v_file.read_text(encoding="utf-8")
+    hyg_tree_v = ast.parse(hyg_src_v, filename=str(hygiene_v_file))
+    hyg_fn = next(
+        (nd for nd in ast.walk(hyg_tree_v) if isinstance(nd, ast.FunctionDef) and nd.name == "_collect_hygiene_findings"),
+        None,
+    )
+    if hyg_fn is not None or "_CONTACTLESS_EXEMPT_SEGMENTS" in hyg_src_v or (root / "app" / "outreach.py").is_file():
+        if "_CONTACTLESS_EXEMPT_SEGMENTS" not in hyg_src_v or '"social_manual"' not in hyg_src_v or '"vacancy_assisted"' not in hyg_src_v:
+            errors.append(
+                "Gate V violation in app/hygiene.py: must define _CONTACTLESS_EXEMPT_SEGMENTS with 'social_manual' and 'vacancy_assisted'"
+            )
+        if hyg_fn is not None:
+            hyg_names = {nm.id for nm in ast.walk(hyg_fn) if isinstance(nm, ast.Name)}
+            if "_CONTACTLESS_EXEMPT_SEGMENTS" not in hyg_names:
+                errors.append(
+                    "Gate V violation in app/hygiene.py:_collect_hygiene_findings must use _CONTACTLESS_EXEMPT_SEGMENTS"
+                )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

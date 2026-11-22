@@ -299,7 +299,9 @@ def test_tg_identity_bridge_website_linkedin_email_and_namesake_guard() -> None:
 
 
 def test_default_tg_groups_and_graph_seeds_expanded() -> None:
-    for grp in ("indiehackers", "founders_chat", "startupchat", "buildinpublic"):
+    for removed in ("solofounderschat", "indiehackers", "buildinpublic"):
+        assert removed not in DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]
+    for grp in ("saasfounders", "founders_chat", "startupchat", "appfounders"):
         assert grp in DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]
     for seed in ("ai_founders", "microconf", "startups"):
         assert seed in tg_channel_graph.DEFAULT_GRAPH_SEED_CHANNELS
@@ -392,7 +394,7 @@ def test_b2b_never_collides_with_ofm_on_default_target_and_quota(
     res_b2b = push_discovered_now(conn)
     assert res_b2b["ingested"] == 1
 
-    b2b_camp = conn.execute("SELECT * FROM campaigns WHERE name = 'Leadgen Auto (TG)'").fetchone()
+    b2b_camp = conn.execute("SELECT * FROM campaigns WHERE name = 'Whales EN — TG'").fetchone()
     assert b2b_camp is not None
     assert "ofm_groups" not in json.loads(b2b_camp["leadgen_sources_json"] or "[]")
     b2b_recs = [

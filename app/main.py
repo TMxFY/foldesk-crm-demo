@@ -5,10 +5,12 @@ import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 _runtime_logger = logging.getLogger("crmtg.runtime")
@@ -50,13 +52,16 @@ from app.db import (
     as_dict,
     connect,
     create_pipeline_stage,
+    ensure_enrichment_ledger_table,
     init_db,
     is_waiting_our_answer,
+    list_enrichment_spend_summary,
     list_pipeline_stages,
     locked_conn,
     sql_norm_tg_username_expr,
     update_pipeline_stage,
     utc_now,
+    utc_today,
 )
 from app.demo import seed_demo
 from app.funnel_analytics import (
@@ -456,6 +461,554 @@ class CampaignRunIn(BaseModel):
     max_send: int | None = None
     respect_delays: bool = False
     dry_run: bool = False
+
+
+class MarkManualSentIn(BaseModel):
+    status: str | None = None
+    note: str | None = None
+    last_contacted: str | None = None
+
+
+_LEGACY_CREATOROS_GUARD_RE = re.compile(r"\bCreator\s*OS\b|creatoros", re.IGNORECASE)
+_TEMPLATE_KEY_ALIASES: dict[str, str] = {
+    "step1": "step1",
+    "step1_text": "step1",
+    "step2": "step2",
+    "step2_text": "step2",
+    "step3": "step3",
+    "step3_text": "step3",
+    "system_prompt": "system_prompt",
+    "editable_prompt_override": "system_prompt",
+    "prompt_override": "system_prompt",
+    "showcase_url": "showcase_url",
+}
+
+
+def _parse_segment_filter(segment: str | None) -> set[str]:
+    items = {s.strip().lower() for s in str(segment or "").split(",") if s.strip()}
+    items.discard("all")
+    return items
+
+
+def _normalize_lead_v2_fields(lead: dict) -> dict:
+    lead["segment"] = str(lead.get("segment") or "b2b").strip().lower() or "b2b"
+    lead["language"] = str(lead.get("language") or "en").strip().lower() or "en"
+    raw_excl = lead.get("exclude_from_airtable")
+    try:
+        lead["exclude_from_airtable"] = int(raw_excl) if raw_excl is not None else 0
+    except (TypeError, ValueError):
+        lead["exclude_from_airtable"] = 0
+    raw_pool = lead.get("pool_usd")
+    if raw_pool is not None and raw_pool != "":
+        try:
+            lead["pool_usd"] = int(float(raw_pool))
+        except (TypeError, ValueError):
+            lead["pool_usd"] = None
+    else:
+        lead["pool_usd"] = None
+    lead["manual_action_url"] = lead.get("manual_action_url") or None
+    lead["manual_draft_text"] = lead.get("manual_draft_text") or None
+    return lead
+
+
+def _list_manual_queue_leads(
+    conn: sqlite3.Connection,
+    *,
+    segment: str,
+    language: str | None = None,
+    q: str = "",
+    limit: int = 200,
+) -> list[dict]:
+    clean_seg = str(segment or "").strip().lower()
+    clauses = [
+        "lower(trim(COALESCE(segment, ''))) = ?",
+        "lower(trim(COALESCE(status, 'new'))) IN ('new', 'pending', 'open')",
+        "(last_contacted IS NULL OR trim(last_contacted) = '')",
+    ]
+    params: list = [clean_seg]
+    clean_lang = str(language or "").strip().lower()
+    if clean_lang:
+        clauses.append("lower(trim(COALESCE(language, 'en'))) = ?")
+        params.append(clean_lang)
+
+    eff_limit = max(1, min(1000, int(limit or 200)))
+    sql = f"""
+        SELECT id, name, company, segment, language, company_domain, pool_usd,
+               manual_action_url, manual_draft_text, status, created_at,
+               updated_at, last_contacted, username, url, lead_source, niche,
+               exclude_from_airtable
+        FROM leads
+        WHERE {' AND '.join(clauses)}
+        ORDER BY COALESCE(pool_usd, 0) DESC, created_at DESC, id DESC
+        LIMIT ?
+    """
+    params.append(eff_limit)
+    rows = conn.execute(sql, params).fetchall()
+    items: list[dict] = []
+    needle = str(q or "").strip().lower()
+    for r in rows:
+        item = as_dict(r)
+        if not item:
+            continue
+        _normalize_lead_v2_fields(item)
+        if needle:
+            blob = " ".join(
+                str(item.get(k) or "")
+                for k in (
+                    "name",
+                    "company",
+                    "company_domain",
+                    "manual_action_url",
+                    "manual_draft_text",
+                    "lead_source",
+                    "niche",
+                    "username",
+                )
+            ).lower()
+            if needle not in blob:
+                continue
+        items.append(item)
+    return items
+
+
+def _mark_manual_sent_tx(
+    conn: sqlite3.Connection,
+    lead_id: int,
+    *,
+    requested_status: str | None = None,
+    note: str | None = None,
+    last_contacted: str | None = None,
+) -> dict:
+    from app.events import list_lead_events, record_lead_event
+
+    row = conn.execute(
+        "SELECT id, status, segment, manual_action_url FROM leads WHERE id = ?",
+        (int(lead_id),),
+    ).fetchone()
+    if row is None:
+        raise LookupError("lead")
+
+    current_status = str(row["status"] or "new").strip().lower()
+    segment = str(row["segment"] or "b2b").strip().lower() or "b2b"
+    clean_req_status = str(requested_status or "").strip()
+    if clean_req_status:
+        target_status = clean_req_status
+    elif current_status in ("new", "pending", "open", ""):
+        target_status = "waiting"
+    else:
+        target_status = current_status
+
+    contacted_at = str(last_contacted or "").strip() or utc_now()
+    patch_fields: dict[str, object] = {
+        "status": target_status,
+        "last_contacted": contacted_at,
+    }
+    if note is not None:
+        patch_fields["note"] = note
+
+    updated = update_lead(conn, int(lead_id), **patch_fields)
+    record_lead_event(
+        conn,
+        int(lead_id),
+        "manual_queue_sent",
+        f"Отправлено вручную ({segment})",
+        {
+            "segment": segment,
+            "status": updated.get("status"),
+            "last_contacted": updated.get("last_contacted"),
+            "manual_action_url": row["manual_action_url"],
+        },
+        created_at=contacted_at,
+        commit=True,
+    )
+    updated["events"] = list_lead_events(conn, int(lead_id))
+    return _normalize_lead_v2_fields(updated)
+
+
+def _enrich_and_filter_inbox_result(
+    conn: sqlite3.Connection,
+    result,
+    segment_filter: set[str],
+    *,
+    limit: int | None = None,
+):
+    dialogs = (
+        list(result.get("dialogs") or result.get("items") or [])
+        if isinstance(result, dict)
+        else list(result)
+    )
+    lead_ids = sorted(
+        {
+            int(d["lead_id"])
+            for d in dialogs
+            if isinstance(d, dict) and d.get("lead_id") is not None
+        }
+    )
+    lead_meta_by_id: dict[int, dict] = {}
+    if lead_ids:
+        with locked_conn(conn):
+            for start in range(0, len(lead_ids), 400):
+                chunk = lead_ids[start : start + 400]
+                ph = ",".join("?" for _ in chunk)
+                for lrow in conn.execute(
+                    f"""
+                    SELECT id, segment, language, exclude_from_airtable,
+                           pool_usd, manual_action_url, manual_draft_text
+                    FROM leads
+                    WHERE id IN ({ph})
+                    """,
+                    chunk,
+                ).fetchall():
+                    ld = as_dict(lrow)
+                    if ld:
+                        lead_meta_by_id[int(ld["id"])] = _normalize_lead_v2_fields(ld)
+
+    for dlg in dialogs:
+        if not isinstance(dlg, dict):
+            continue
+        lid = dlg.get("lead_id")
+        lmeta = lead_meta_by_id.get(int(lid)) if lid is not None else None
+        if lmeta is not None:
+            dlg["segment"] = lmeta["segment"]
+            dlg["language"] = lmeta["language"]
+            dlg["exclude_from_airtable"] = lmeta["exclude_from_airtable"]
+            dlg["pool_usd"] = lmeta["pool_usd"]
+            dlg["manual_action_url"] = lmeta["manual_action_url"]
+            dlg["manual_draft_text"] = lmeta["manual_draft_text"]
+        else:
+            dlg["segment"] = None
+            dlg["language"] = None
+            dlg["exclude_from_airtable"] = 0
+            dlg["pool_usd"] = None
+            dlg["manual_action_url"] = None
+            dlg["manual_draft_text"] = None
+
+    if segment_filter:
+        dialogs = [
+            d
+            for d in dialogs
+            if isinstance(d, dict)
+            and str(d.get("segment") or "").strip().lower() in segment_filter
+        ]
+        if limit is not None and int(limit) > 0:
+            dialogs = dialogs[: int(limit)]
+        if isinstance(result, dict):
+            result["dialogs"] = dialogs
+            result["items"] = dialogs
+            result["counts"] = {
+                "waiting": sum(
+                    1
+                    for d in dialogs
+                    if is_waiting_our_answer(
+                        d.get("last_from_peer"),
+                        d.get("lead_status"),
+                        d.get("lead_airtable_status"),
+                    )
+                ),
+                "our_turn": sum(
+                    1
+                    for d in dialogs
+                    if int(d.get("last_from_peer") or 0) == 0
+                    and not is_waiting_our_answer(
+                        d.get("last_from_peer"),
+                        d.get("lead_status"),
+                        d.get("lead_airtable_status"),
+                    )
+                ),
+                "unread": sum(1 for d in dialogs if int(d.get("unread_count") or 0) > 0),
+                "groups": sum(1 for d in dialogs if int(d.get("is_group") or 0) == 1),
+                "muted": sum(1 for d in dialogs if int(d.get("muted") or 0) == 1),
+            }
+            return result
+        return dialogs
+    return result
+
+
+def _parse_campaign_templates_json(raw: str | None) -> dict[str, str]:
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for raw_k, raw_v in parsed.items():
+        if not isinstance(raw_v, str) or not raw_v.strip():
+            continue
+        clean_k = str(raw_k).strip()
+        canon_k = _TEMPLATE_KEY_ALIASES.get(clean_k, clean_k)
+        out[canon_k] = raw_v.strip()
+    return out
+
+
+def _validate_and_normalize_campaign_templates(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        raise ValueError("Ожидается JSON-объект с шаблонами шагов")
+    raw_templates = (
+        payload["templates"]
+        if set(payload.keys()) == {"templates"} and isinstance(payload["templates"], dict)
+        else payload
+    )
+    normalized: dict[str, str] = {}
+    for raw_key, raw_val in raw_templates.items():
+        clean_key = str(raw_key or "").strip()
+        if _LEGACY_CREATOROS_GUARD_RE.search(clean_key):
+            raise ValueError("Запрещено использовать устаревший бренд CreatorOS в шаблоне")
+        canon_key = _TEMPLATE_KEY_ALIASES.get(clean_key)
+        if canon_key is None:
+            raise ValueError(f"Недопустимый ключ шаблона: {clean_key}")
+        if raw_val is None:
+            continue
+        if not isinstance(raw_val, str):
+            raise ValueError(f"Поле '{clean_key}' должно быть строкой")
+        if _LEGACY_CREATOROS_GUARD_RE.search(raw_val):
+            raise ValueError("Запрещено использовать устаревший бренд CreatorOS в шаблоне")
+        cleaned_val = raw_val.strip()
+        if canon_key == "showcase_url" and cleaned_val:
+            if any(ch.isspace() for ch in cleaned_val) or not cleaned_val.startswith(
+                ("http://", "https://")
+            ):
+                raise ValueError("showcase_url должен начинаться с http:// или https://")
+        if cleaned_val:
+            normalized[canon_key] = cleaned_val
+    return normalized
+
+
+def _read_campaign_templates(conn: sqlite3.Connection, campaign_id: int) -> dict:
+    row = conn.execute(
+        "SELECT id, custom_step_templates_json FROM campaigns WHERE id = ?",
+        (int(campaign_id),),
+    ).fetchone()
+    if row is None:
+        raise LookupError("campaign")
+    return {
+        "ok": True,
+        "campaign_id": int(campaign_id),
+        "templates": _parse_campaign_templates_json(row["custom_step_templates_json"]),
+    }
+
+
+def _save_campaign_templates(
+    conn: sqlite3.Connection, campaign_id: int, payload: object
+) -> dict:
+    row = conn.execute(
+        "SELECT id, language FROM campaigns WHERE id = ?", (int(campaign_id),)
+    ).fetchone()
+    if row is None:
+        raise LookupError("campaign")
+    templates_dict = _validate_and_normalize_campaign_templates(payload)
+    camp_lang = str(row["language"] or "").strip().lower()
+    if camp_lang in ("ru", "en"):
+        from app.outreach import _validate_template_text_language
+
+        for step_key in ("step1", "step2", "step3"):
+            if step_key in templates_dict:
+                lang_err = _validate_template_text_language(
+                    templates_dict[step_key], camp_lang, label=step_key
+                )
+                if lang_err:
+                    raise ValueError(lang_err)
+    serialized = json.dumps(templates_dict, ensure_ascii=False)
+    conn.execute(
+        "UPDATE campaigns SET custom_step_templates_json = ?, updated_at = ? WHERE id = ?",
+        (serialized, utc_now(), int(campaign_id)),
+    )
+    conn.commit()
+    return {
+        "ok": True,
+        "campaign_id": int(campaign_id),
+        "templates": templates_dict,
+    }
+
+
+def _parse_iso_utc_safe(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _coerce_finite_float(val: object, default: float | None = None) -> float | None:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return default
+    if num != num or num in (float("inf"), float("-inf")):
+        return default
+    return num
+
+
+def _load_enrichment_budget_db_snapshot(
+    conn: sqlite3.Connection, eff_day: str
+) -> dict:
+    from app.leadgen_settings import get_leadgen_config
+    from leadgen import budget_guard as budget_guard_mod
+
+    ensure_enrichment_ledger_table(conn)
+    summary = list_enrichment_spend_summary(conn, eff_day)
+    cfg = get_leadgen_config(conn)
+    enr = cfg.get("enrichment") if isinstance(cfg, dict) else {}
+    if not isinstance(enr, dict):
+        enr = {}
+
+    daily_cap = _coerce_finite_float(
+        enr.get("daily_budget_cap_usd"), budget_guard_mod.DEFAULT_DAILY_CAP_USD
+    )
+    if daily_cap is None or daily_cap < 0:
+        daily_cap = budget_guard_mod.DEFAULT_DAILY_CAP_USD
+    low_warn = _coerce_finite_float(
+        enr.get("low_balance_warn_usd"), budget_guard_mod.DEFAULT_LOW_BALANCE_WARN_USD
+    )
+    if low_warn is None or low_warn < 0:
+        low_warn = budget_guard_mod.DEFAULT_LOW_BALANCE_WARN_USD
+    low_stop = _coerce_finite_float(
+        enr.get("low_balance_stop_usd"), budget_guard_mod.DEFAULT_LOW_BALANCE_STOP_USD
+    )
+    if low_stop is None or low_stop < 0:
+        low_stop = budget_guard_mod.DEFAULT_LOW_BALANCE_STOP_USD
+
+    last_state_row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = 'budget_guard_last_state'"
+    ).fetchone()
+    last_state: dict = {}
+    if last_state_row and last_state_row["value"]:
+        try:
+            parsed_state = json.loads(str(last_state_row["value"]))
+            if isinstance(parsed_state, dict):
+                last_state = parsed_state
+        except (ValueError, TypeError):
+            last_state = {}
+
+    stop_key = f"budget_guard_low_balance_stop:{eff_day}"
+    stop_row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = ?", (stop_key,)
+    ).fetchone()
+    kv_stop_reason = (
+        str(stop_row["value"]).strip()
+        if stop_row and stop_row["value"] is not None
+        else ""
+    )
+
+    return {
+        "day": eff_day,
+        "summary": summary,
+        "daily_cap_usd": float(daily_cap),
+        "low_balance_warn_usd": float(low_warn),
+        "low_balance_stop_usd": float(low_stop),
+        "last_state": last_state,
+        "kv_stop_reason": kv_stop_reason,
+    }
+
+
+def _try_cached_enrichment_balances(
+    app_state,
+    snapshot: dict,
+    *,
+    refresh: bool = False,
+) -> tuple[float | None, float | None, bool]:
+    if refresh:
+        return None, None, False
+    mem_cache = getattr(app_state, "_enrichment_balance_cache", None)
+    if isinstance(mem_cache, dict):
+        ts = _coerce_finite_float(mem_cache.get("ts"))
+        if ts is not None and (time.monotonic() - ts) < 120.0:
+            treg_c = _coerce_finite_float(mem_cache.get("treg"))
+            monid_c = _coerce_finite_float(mem_cache.get("monid"))
+            if treg_c is not None or monid_c is not None:
+                return treg_c, monid_c, True
+
+    last_state = snapshot.get("last_state") or {}
+    if isinstance(last_state, dict) and last_state:
+        updated_dt = _parse_iso_utc_safe(last_state.get("updated_at"))
+        age_ok = (
+            updated_dt is not None
+            and (datetime.now(timezone.utc) - updated_dt).total_seconds() <= 300.0
+        )
+        treg_kv = _coerce_finite_float(last_state.get("treg_balance_usd"))
+        monid_kv = _coerce_finite_float(last_state.get("monid_balance_usd"))
+        if age_ok and (treg_kv is not None or monid_kv is not None):
+            return treg_kv, monid_kv, True
+
+    return None, None, False
+
+
+def _call_fetch_live_balances(fetch_fn) -> tuple[float | None, float | None]:
+    try:
+        sig = inspect.signature(fetch_fn)
+        has_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD or name == "timeout"
+            for name, p in sig.parameters.items()
+        )
+    except (TypeError, ValueError):
+        has_kw = False
+    raw = fetch_fn(timeout=5) if has_kw else fetch_fn()
+    if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+        return None, None
+    return _coerce_finite_float(raw[0]), _coerce_finite_float(raw[1])
+
+
+def _build_enrichment_budget_response(
+    snapshot: dict,
+    treg_bal: float | None,
+    monid_bal: float | None,
+    *,
+    cached: bool,
+) -> dict:
+    summary = snapshot["summary"]
+    spent_usd = float(summary.get("total_usd") or 0.0)
+    daily_cap = float(snapshot["daily_cap_usd"])
+    low_warn = float(snapshot["low_balance_warn_usd"])
+    low_stop = float(snapshot["low_balance_stop_usd"])
+    kv_stop_reason = str(snapshot.get("kv_stop_reason") or "").strip()
+
+    stop_reasons: list[str] = []
+    if treg_bal is not None and treg_bal < low_stop:
+        stop_reasons.append(f"treg=${treg_bal:.2f} < ${low_stop:.2f}")
+    if monid_bal is not None and monid_bal < low_stop:
+        stop_reasons.append(f"monid=${monid_bal:.2f} < ${low_stop:.2f}")
+    if treg_bal is None and monid_bal is None and kv_stop_reason:
+        stop_reasons.append(kv_stop_reason)
+    if daily_cap <= 0.0 or spent_usd >= daily_cap - 1e-9:
+        stop_reasons.append(f"daily_cap=${spent_usd:.2f}/${daily_cap:.2f}")
+
+    low_balance_warning = any(
+        bal is not None and low_stop <= bal < low_warn
+        for bal in (treg_bal, monid_bal)
+    )
+    return {
+        "ok": True,
+        "day": summary["day"],
+        "spent_usd": round(spent_usd, 6),
+        "total_usd": summary["total_usd"],
+        "calls": int(summary.get("calls") or 0),
+        "hits": int(summary.get("hits") or 0),
+        "by_provider": summary.get("by_provider") or {},
+        "summary": summary,
+        "daily_cap_usd": round(daily_cap, 4),
+        "remaining_usd": round(max(0.0, daily_cap - spent_usd), 6),
+        "low_balance_warn_usd": round(low_warn, 4),
+        "low_balance_stop_usd": round(low_stop, 4),
+        "treg_balance_usd": treg_bal,
+        "monid_balance_usd": monid_bal,
+        "paid_allowed": len(stop_reasons) == 0,
+        "low_balance_warning": low_balance_warning,
+        "stop_reason": "; ".join(stop_reasons),
+        "cached": cached,
+    }
 
 
 def _resolve_tg_creds(conn=None) -> tuple[str, str]:
@@ -2528,6 +3081,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         status: str = "",
         folder_id: int | None = None,
         provider: str = "",
+        segment: str = "",
     ):
         rows = _call(
             search_leads,
@@ -2537,15 +3091,71 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             folder_id,
             provider=provider or None,
         )
+        seg_filter = _parse_segment_filter(segment)
         if isinstance(rows, list):
+            normalized: list[dict] = []
             for ld in rows:
-                if isinstance(ld, dict):
-                    ld["is_waiting_our_answer"] = is_waiting_our_answer(
-                        ld.get("last_from_peer"),
-                        ld.get("status"),
-                        ld.get("airtable_status"),
-                    )
+                if not isinstance(ld, dict):
+                    continue
+                _normalize_lead_v2_fields(ld)
+                ld["is_waiting_our_answer"] = is_waiting_our_answer(
+                    ld.get("last_from_peer"),
+                    ld.get("status"),
+                    ld.get("airtable_status"),
+                )
+                if seg_filter and ld["segment"] not in seg_filter:
+                    continue
+                normalized.append(ld)
+            return normalized
         return rows
+
+    @app.get("/api/queues/manual-social")
+    def queues_manual_social_get(
+        request: Request,
+        language: str = "",
+        q: str = "",
+        limit: int = 200,
+    ):
+        items = _call(
+            _list_manual_queue_leads,
+            request.app.state.conn,
+            segment="social_manual",
+            language=language or None,
+            q=q,
+            limit=limit,
+        )
+        return {
+            "ok": True,
+            "segment": "social_manual",
+            "total": len(items),
+            "count": len(items),
+            "items": items,
+            "leads": items,
+        }
+
+    @app.get("/api/queues/assisted-jobs")
+    def queues_assisted_jobs_get(
+        request: Request,
+        language: str = "",
+        q: str = "",
+        limit: int = 200,
+    ):
+        items = _call(
+            _list_manual_queue_leads,
+            request.app.state.conn,
+            segment="vacancy_assisted",
+            language=language or None,
+            q=q,
+            limit=limit,
+        )
+        return {
+            "ok": True,
+            "segment": "vacancy_assisted",
+            "total": len(items),
+            "count": len(items),
+            "items": items,
+            "leads": items,
+        }
 
     class LeadBulkIn(BaseModel):
         lead_ids: list[int]
@@ -2661,11 +3271,33 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
     @app.get("/api/leads/{lead_id}")
     async def leads_get(lead_id: int, request: Request):
-        return _call(get_lead, request.app.state.conn, lead_id)
+        lead = _call(get_lead, request.app.state.conn, lead_id)
+        if isinstance(lead, dict):
+            _normalize_lead_v2_fields(lead)
+        return lead
 
     @app.get("/api/leads/{lead_id}/card")
     async def leads_card(lead_id: int, request: Request):
-        return _call(lead_card, request.app.state.conn, lead_id)
+        card = _call(lead_card, request.app.state.conn, lead_id)
+        if isinstance(card, dict):
+            _normalize_lead_v2_fields(card)
+        return card
+
+    @app.post("/api/leads/{lead_id}/mark-manual-sent")
+    def lead_mark_manual_sent(
+        lead_id: int, request: Request, body: MarkManualSentIn | None = None
+    ):
+        updated = _call(
+            _mark_manual_sent_tx,
+            request.app.state.conn,
+            lead_id,
+            requested_status=body.status if body is not None else None,
+            note=body.note if body is not None else None,
+            last_contacted=body.last_contacted if body is not None else None,
+        )
+        if isinstance(updated, dict) and updated.get("id"):
+            _schedule_airtable_push_lead(request.app, int(updated["id"]))
+        return updated
 
     async def _resolve_and_enrich_client_profile(
         request: Request,
@@ -3079,6 +3711,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         with_counts: bool = False,
         crm_only: bool = False,
         group_by_lead: bool = False,
+        segment: str = "",
     ):
         if account_id is None or account_id == 0:
             with locked_conn(request.app.state.conn):
@@ -3089,8 +3722,10 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 await ensure_private_inbox(request.app, int(r["id"]))
         else:
             await ensure_private_inbox(request.app, account_id)
+        seg_filter = _parse_segment_filter(segment)
+        fetch_limit = 2000 if seg_filter else None
         if group_by_lead:
-            return _call(
+            res = _call(
                 list_unified_inbox,
                 request.app.state.conn,
                 account_id,
@@ -3100,17 +3735,23 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 status,
                 with_counts,
                 crm_only=bool(crm_only),
+                limit=fetch_limit,
             )
-        return _call(
-            list_inbox,
-            request.app.state.conn,
-            account_id,
-            q,
-            chip,
-            provider,
-            status,
-            with_counts,
-            crm_only=bool(crm_only),
+        else:
+            res = _call(
+                list_inbox,
+                request.app.state.conn,
+                account_id,
+                q,
+                chip,
+                provider,
+                status,
+                with_counts,
+                crm_only=bool(crm_only),
+                limit=fetch_limit,
+            )
+        return _enrich_and_filter_inbox_result(
+            request.app.state.conn, res, seg_filter
         )
 
     @app.get("/api/inbox/unified")
@@ -3123,6 +3764,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         status: str | None = None,
         crm_only: bool = True,
         limit: int | None = None,
+        segment: str = "",
     ):
         if account_id is None or account_id == 0:
             with locked_conn(request.app.state.conn):
@@ -3133,7 +3775,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
                 await ensure_private_inbox(request.app, int(r["id"]))
         else:
             await ensure_private_inbox(request.app, account_id)
-        return _call(
+        seg_filter = _parse_segment_filter(segment)
+        fetch_limit = 2000 if seg_filter else limit
+        res = _call(
             list_unified_inbox,
             request.app.state.conn,
             account_id,
@@ -3143,7 +3787,10 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             status,
             True,
             crm_only=bool(crm_only),
-            limit=limit,
+            limit=fetch_limit,
+        )
+        return _enrich_and_filter_inbox_result(
+            request.app.state.conn, res, seg_filter, limit=limit
         )
 
     @app.get("/api/inbox/counts")
@@ -4171,7 +4818,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
     @app.get("/api/campaigns")
     def campaigns_list(request: Request):
-        return _call(list_campaigns, request.app.state.conn)
+        camps = _call(list_campaigns, request.app.state.conn)
+        if isinstance(camps, list):
+            for c in camps:
+                if isinstance(c, dict):
+                    c["custom_step_templates"] = _parse_campaign_templates_json(
+                        c.get("custom_step_templates_json")
+                    )
+        return camps
 
     @app.get("/api/campaigns/sample-csv")
     def campaigns_sample_csv():
@@ -4198,7 +4852,24 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
 
     @app.get("/api/campaigns/{campaign_id}")
     def campaigns_get(campaign_id: int, request: Request):
-        return _call(get_campaign, request.app.state.conn, campaign_id)
+        camp = _call(get_campaign, request.app.state.conn, campaign_id)
+        if isinstance(camp, dict):
+            camp["custom_step_templates"] = _parse_campaign_templates_json(
+                camp.get("custom_step_templates_json")
+            )
+        return camp
+
+    @app.get("/api/campaigns/{campaign_id}/templates")
+    def campaigns_templates_get(campaign_id: int, request: Request):
+        return _call(_read_campaign_templates, request.app.state.conn, campaign_id)
+
+    @app.put("/api/campaigns/{campaign_id}/templates")
+    async def campaigns_templates_put(campaign_id: int, request: Request):
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        return _call(_save_campaign_templates, request.app.state.conn, campaign_id, payload)
 
     @app.delete("/api/campaigns/{campaign_id}")
     def campaigns_delete(campaign_id: int, request: Request):
@@ -4940,6 +5611,44 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
         from app.hygiene import read_ofm_review_leads
 
         return read_ofm_review_leads(_resolve_state_dir(), limit=limit, query=query)
+
+    @app.get("/api/leadgen/enrichment-budget")
+    async def leadgen_enrichment_budget_get(
+        request: Request,
+        day: str | None = None,
+        refresh: bool = False,
+    ):
+        from leadgen import budget_guard as budget_guard_mod
+
+        raw_day = str(day or "").strip()
+        if raw_day and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_day):
+            raise HTTPException(
+                status_code=400, detail="day должен быть в формате YYYY-MM-DD"
+            )
+        eff_day = raw_day or utc_today()
+        snapshot = _call(
+            _load_enrichment_budget_db_snapshot, request.app.state.conn, eff_day
+        )
+        treg_bal, monid_bal, used_cache = _try_cached_enrichment_balances(
+            request.app.state, snapshot, refresh=bool(refresh)
+        )
+        if not used_cache:
+            try:
+                treg_bal, monid_bal = await asyncio.to_thread(
+                    _call_fetch_live_balances, budget_guard_mod.fetch_live_balances
+                )
+            except Exception as exc:
+                _runtime_logger.warning("Failed to fetch live balances: %s", exc)
+                treg_bal, monid_bal = None, None
+            if treg_bal is not None or monid_bal is not None:
+                request.app.state._enrichment_balance_cache = {
+                    "ts": time.monotonic(),
+                    "treg": treg_bal,
+                    "monid": monid_bal,
+                }
+        return _build_enrichment_budget_response(
+            snapshot, treg_bal, monid_bal, cached=used_cache
+        )
 
     @app.get("/api/leadgen/config")
     def leadgen_config_get(request: Request):

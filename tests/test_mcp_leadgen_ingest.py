@@ -340,3 +340,161 @@ def test_mcp_ingest_auto_sonnet_uses_crmtg_auto_sonnet_flag(db_conn, monkeypatch
     )
     assert res["ok"] is True
     assert calls == [1]
+
+
+def test_mcp_ingest_mixed_create_update_skip_lead_id_by_index_and_v2_upsert(db_conn):
+    first = _call_mcp(
+        db_conn,
+        "ingest_discovered_leads",
+        {
+            "leads": [
+                {
+                    "username": "@mix_alpha",
+                    "name": "Alex Mix",
+                    "company": "MixAlpha",
+                    "website": "https://mixalpha.ai",
+                    "category": "AI SaaS",
+                    "their_angle": "B2B video analytics for product growth",
+                    "source": "whop_content_rewards",
+                    "segment": "whale",
+                    "language": "en",
+                }
+            ],
+            "enroll_in_campaign": True,
+        },
+    )
+    assert first["ok"] is True
+    assert first["created_leads"] == 1
+    assert len(first["lead_id_by_index"]) == 1
+    alpha_id = first["lead_id_by_index"][0]
+    assert isinstance(alpha_id, int)
+    assert first["lead_results"] == [
+        {"index": 0, "lead_id": alpha_id, "status": "created", "reason": "created"}
+    ]
+
+    # Mixed batch: [0] skipped non-ICP, [1] duplicate/existing updated with new v2 metadata,
+    # [2] created social_manual (queue-only), [3] skipped competitor, [4] created ru_expert.
+    mixed = _call_mcp(
+        db_conn,
+        "ingest_discovered_leads",
+        {
+            "leads": [
+                {
+                    "username": "@low_score_skip",
+                    "name": "Skip Low",
+                    "company": "SkipCo",
+                    "website": "https://skipco.io",
+                    "category": "AI SaaS",
+                    "their_angle": "Builds SaaS app",
+                    "icp_score": 40,
+                },
+                {
+                    "username": "@mix_alpha",
+                    "name": "Alex Mix",
+                    "company": "MixAlpha",
+                    "website": "https://mixalpha.ai",
+                    "category": "AI SaaS",
+                    "their_angle": "B2B video analytics for product growth",
+                    "source": "whop_content_rewards",
+                    "segment": "whale",
+                    "language": "en",
+                    "pool_usd": 18000,
+                    "company_domain": "mixalpha.ai",
+                    "secondary_contact": {"role": "CMO", "username": "cmo_mix"},
+                    "manual_action_url": "https://x.com/mixalpha",
+                    "manual_draft_text": "Hey Alex, reaching out about MixAlpha Whop UGC.",
+                },
+                {
+                    "name": "Noah Manual",
+                    "company": "ScaleManual",
+                    "segment": "social_manual",
+                    "language": "en",
+                    "linkedin_url": "https://linkedin.com/in/noahmanual",
+                    "website": "https://scalemanual.io",
+                    "category": "AI SaaS",
+                    "their_angle": "Growing paid Reels acquisition on mobile apps",
+                    "source": "linkedin_sales",
+                },
+                {
+                    "username": "@competitor_skip",
+                    "name": "CRMChat Competitor",
+                    "company": "CRMChat",
+                    "website": "https://crmchat.ai",
+                    "category": "SaaS",
+                    "their_angle": "Outbound platform",
+                },
+                {
+                    "username": "@mix_gamma_ru",
+                    "name": "Ирина Громова",
+                    "company": "EdTech Lab",
+                    "segment": "ru_expert",
+                    "language": "ru",
+                    "source": "ru_experts",
+                    "their_angle": "Эксперт по запуску автоворонок и Telegram-контенту",
+                },
+            ],
+            "enroll_in_campaign": True,
+        },
+    )
+
+    assert mixed["ok"] is True
+    assert mixed["skipped_non_icp"] == 1
+    assert mixed["skipped_duplicates"] == 2  # [1] already in campaign + [3] competitor
+    assert mixed["created_leads"] == 2
+    assert mixed["updated_leads"] == 1
+    assert mixed["enrolled_in_campaign"] == 1  # only [4] ru_expert; [2] social_manual stays out!
+
+    idx_map = mixed["lead_id_by_index"]
+    results = mixed["lead_results"]
+    assert len(idx_map) == 5
+    assert len(results) == 5
+
+    assert idx_map[0] is None
+    assert results[0]["status"] == "skipped"
+
+    assert idx_map[1] == alpha_id
+    assert results[1]["lead_id"] == alpha_id
+    assert results[1]["status"] == "updated"
+    assert results[1]["reason"] == "already_in_campaign"
+
+    social_id = idx_map[2]
+    assert isinstance(social_id, int) and social_id != alpha_id
+    assert results[2] == {
+        "index": 2,
+        "lead_id": social_id,
+        "status": "created",
+        "reason": "manual_queue_only",
+    }
+
+    assert idx_map[3] is None
+    assert results[3]["status"] == "skipped"
+    assert results[3]["reason"] == "competitor_denylist"
+
+    gamma_id = idx_map[4]
+    assert isinstance(gamma_id, int) and gamma_id not in (alpha_id, social_id)
+    assert results[4] == {
+        "index": 4,
+        "lead_id": gamma_id,
+        "status": "created",
+        "reason": "created",
+    }
+
+    assert mixed["lead_ids"] == [alpha_id, social_id, gamma_id]
+
+    # Verify v2 metadata persisted onto already-enrolled duplicate lead [1] without corrupting [2] or [4]
+    alpha_row = db_conn.execute("SELECT * FROM leads WHERE id = ?", (alpha_id,)).fetchone()
+    assert alpha_row["segment"] == "whale"
+    assert alpha_row["company_domain"] == "mixalpha.ai"
+    assert int(alpha_row["pool_usd"]) == 18000
+    assert "cmo_mix" in (alpha_row["secondary_contact_json"] or "")
+    assert alpha_row["manual_action_url"] == "https://x.com/mixalpha"
+    assert alpha_row["manual_draft_text"] == "Hey Alex, reaching out about MixAlpha Whop UGC."
+
+    social_row = db_conn.execute("SELECT * FROM leads WHERE id = ?", (social_id,)).fetchone()
+    assert social_row["segment"] == "social_manual"
+    assert social_row["pool_usd"] is None
+    assert social_row["manual_action_url"] == "https://linkedin.com/in/noahmanual"
+
+    gamma_row = db_conn.execute("SELECT * FROM leads WHERE id = ?", (gamma_id,)).fetchone()
+    assert gamma_row["segment"] == "ru_expert"
+    assert int(gamma_row["exclude_from_airtable"]) == 1

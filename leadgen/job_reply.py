@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import concurrent.futures as futures
 import datetime as dt
 import glob
@@ -25,8 +26,9 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKTREE_ROOT) not in sys.path:
@@ -34,14 +36,15 @@ if str(WORKTREE_ROOT) not in sys.path:
 
 try:
     from leadgen.crm_mcp_push import _extract_contact_fields, push_leads_via_mcp
-    from leadgen.job_monitor import OUTDIR as STATE_DIR, ask_llm, load_env
+    from leadgen.job_monitor import OUTDIR as STATE_DIR, ask_llm, load_env, resolve_enabled_layers
 except ImportError:
     from crm_mcp_push import _extract_contact_fields, push_leads_via_mcp
-    from job_monitor import OUTDIR as STATE_DIR, ask_llm, load_env
+    from job_monitor import OUTDIR as STATE_DIR, ask_llm, load_env, resolve_enabled_layers
 
 VAULT = "/Users/timofei/obsidian/Second Brain"
 LOCAL_BANK = WORKTREE_ROOT / "leadgen" / "job_cases_bank.md"
 VAULT_BANK = Path(VAULT) / "!ПРОЕКТЫ" / "Кейсы — банк для откликов.md"
+DEFAULT_SHOWCASE_URL = "https://tmxfy.github.io/"
 
 
 def _load_vacancies_ui_config() -> dict[str, Any]:
@@ -122,10 +125,11 @@ EXAMPLES = """ПРИМЕР 1 — вакансия: реалистичный ИИ
 Фикс плюс бонус за результат — только так и работаю. Какой сейчас CPA на
 подписчика или лид?"""
 
-PROMPT = """Ты пишешь отклик и два коротких фоллоу-апа на вакансию ЗА ТИМА для рассылки в CRM.
+PROMPT = """Ты пишешь отклик и два коротких фоллоу-апа на вакансию ЗА ТИМА (бренд SoftUGC) для рассылки в CRM.
 
-Кто такой Тим: практик AI UGC. Делает контент нейросетями, строит органические
-воронки и контент-заводы. Он архитектор и владелец, руки делегирует своим людям.
+Кто такой Тим: практик AI UGC и основатель SoftUGC. Строит систему лидгена под ключ:
+AI-ролики и короткие вертикалки (Reels / Shorts / TikTok) + воронка в ManyChat / Telegram +
+аналитика конверсий. Он архитектор и владелец, руками работает его команда креаторов.
 Пришёл из разработки, 5+ лет программирования.
 
 ═══ БАНК КЕЙСОВ (единственный источник цифр — не выдумывай своих) ═══
@@ -144,33 +148,216 @@ PROMPT = """Ты пишешь отклик и два коротких фолло
 Текст объявления:
 {text}
 
-═══ ПРАВИЛА ДЛЯ ПЕРВОГО СООБЩЕНИЯ (text) ═══
+═══ ПРАВИЛА ДЛЯ ПЕРВОГО СООБЩЕНИЯ (text / Step 1) ═══
 СКЕЛЕТ:
 1. «Добрый день! По <конкретной вакансии>.» — назвать её словами заказчика
-2. Кто я и на чём работаю применительно к ЭТОЙ задаче: одно-два предложения, конкретика и стек
-3. «Что делал:» — от двух до четырёх пунктов с цифрами, ПОДОБРАННЫМИ ПОД ЭТУ вакансию
+2. Позиционирование «система лидгена»: одно-два предложения, что строим не просто разовые
+   ролики, а связку Reels/Shorts + воронка в ManyChat/TG + аналитика (AI UGC + своя команда)
+3. «Что делал:» — от двух до четырёх релевантных кейсов с цифрами ПОД ЭТУ вакансию
 4. Блок ссылок:
-   — всегда: Шоурил https://tmxfy.github.io/ и PDF кейсов https://drive.google.com/file/d/1Aet4uXbGJwtDeJoh1fep0xeSlMTAH65w/view
+   — всегда сайт-витрина: {showcase_url} и PDF кейсов https://drive.google.com/file/d/1Aet4uXbGJwtDeJoh1fep0xeSlMTAH65w/view
    — видео и креаторские вакансии, плюсом: папка с видео https://drive.google.com/drive/folders/1EhiDsB4E4AJ6sgpn5_TcXBk0ObHyw212
    — технические и воронковые, плюсом: Notion https://destiny-occupation-0eb.notion.site/2418af798589806abbccd94a57083c2f?v=2418af798589809389ed000c2f3f02ac
-5. Ровно один вопрос в конце по делу (объём, ниша, формат, метрика, ТЗ)
+5. Предложение тестового запуска/пилота под их задачу и ровно один вопрос по делу в конце (объём, ниша, формат, метрика, ТЗ)
 
 ЖЕЛЕЗНЫЕ ЗАПРЕТЫ:
-— Везде, где в задаче есть креаторы или UGC — сразу заходить с «предлагаю внедрить AI UGC» (ролики с реалистичными ИИ-креаторами), вторым слоем своя команда креаторов.
+— Везде, где в задаче есть креаторы или UGC — заходить с «система лидгена на AI UGC» (ролики + воронка ManyChat + аналитика), вторым слоем своя команда.
 — Экономику «минута AI UGC ≈ 0,5$ генераций» вставлять ТОЛЬКО если заказчик выбирает между живыми съёмками и AI в найме.
-— Не называть себестоимость (600 ₽ за ролик), «15 минут на ролик», прайс-вилки.
+— Не называть в холодном Step 1 себестоимость (600 ₽ за ролик), «15 минут на ролик» и цену тестовой серии $80–$100 (прайс теста и 10-сек фрагмент — только в Step 2!).
 — Без штампов ИИ («не просто X, а Y», «комплексный», «уникальный», «ключевой»), без эмодзи, без лести.
 
 ═══ ПРАВИЛА ДЛЯ ФОЛЛОУ-АПОВ (followup_1 и followup_2) ═══
-— followup_1 (через 24 часа, если не ответили): 1–2 коротких предложения в том же спокойном деловом тоне. Без «просто напоминаю о себе». Привяжи к сути задачи ({role}): например, предложи прислать референс/ТЗ, чтобы собрать тестовый фрагмент 10–15 сек (для видео/дизайна) или набросать схему реализации (для ботов/воронок).
-— followup_2 (через 72 часа, финальный пинг): 1–2 коротких предложения. Спокойно уточни, открыта ли ещё задача по {role} или уже взяли человека; если актуально — предложи быстрый созвон на 10 минут.
+— followup_1 (Step 2, через 24 часа, если не ответили): 1–2 коротких предложения в спокойном деловом тоне. Без «просто напоминаю о себе». Предложи начать с тестового фрагмента 10–15 секунд по их референсу/ТЗ или запустить тестовую серию ($80–$100), чтобы проверить качество и отклик в воронке до основного объёма.
+— followup_2 (Step 3, через 72 часа, финальный пинг): 1–2 коротких предложения. Спокойно уточни, открыта ли ещё задача по {role} или уже взяли исполнителя; если актуально — предложи быстрый созвон на 10 минут.
 
 Верни СТРОГО один JSON без пояснений:
 {{"text": "готовый текст первого отклика целиком, с переносами строк",
-  "followup_1": "короткий фоллоу-ап через 24ч (1–2 предложения)",
+  "followup_1": "короткий фоллоу-ап через 24ч с предложением 10-сек фрагмента или тестовой серии $80-$100",
   "followup_2": "короткий финальный фоллоу-ап через 72ч (1–2 предложения)",
   "cases": "какие цифры взял и почему именно они, одной строкой",
   "risk": "чем отклик может не зайти, одной строкой; нечем — пусто"}}"""
+
+
+def _sanitize_brand_copy(text: str) -> str:
+    return re.sub(r"\bCreator\s*OS\b|creatoros", "SoftUGC", str(text or ""), flags=re.IGNORECASE)
+
+
+def parse_custom_step_templates(raw: Any) -> dict[str, str]:
+    """Parse `custom_step_templates_json` (JSON string or mapping) into normalized override keys."""
+    if raw is None or raw == "":
+        return {}
+    data: Any = raw
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return {}
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(data, Mapping):
+        return {}
+
+    out: dict[str, str] = {}
+    for canonical, aliases in (
+        ("step1", ("step1_text", "step1", "text")),
+        ("step2", ("step2_text", "step2", "followup_1")),
+        ("step3", ("step3_text", "step3", "followup_2")),
+        ("editable_prompt_override", ("editable_prompt_override", "prompt_override", "system_prompt")),
+        ("showcase_url", ("showcase_url",)),
+    ):
+        for key in aliases:
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                out[canonical] = val.strip()
+                break
+    return out
+
+
+def load_campaign_copy_overrides(
+    conn_or_db_path: Any = None,
+    *,
+    campaign_id: int | None = None,
+    campaign_name: str | None = None,
+) -> dict[str, str]:
+    """Load `campaigns.custom_step_templates_json` from SQLite cleanly without failing on older schemas."""
+    if conn_or_db_path is None:
+        return {}
+
+    opened_conn: sqlite3.Connection | None = None
+    conn: sqlite3.Connection
+    if isinstance(conn_or_db_path, (str, Path)):
+        db_file = Path(conn_or_db_path)
+        if not db_file.exists():
+            return {}
+        try:
+            opened_conn = sqlite3.connect(str(db_file))
+            opened_conn.row_factory = sqlite3.Row
+            conn = opened_conn
+        except sqlite3.Error:
+            return {}
+    elif isinstance(conn_or_db_path, sqlite3.Connection):
+        conn = conn_or_db_path
+    else:
+        return {}
+
+    try:
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+        if "custom_step_templates_json" not in cols:
+            return {}
+        row = None
+        if campaign_id is not None:
+            row = conn.execute(
+                "SELECT custom_step_templates_json FROM campaigns WHERE id = ?",
+                (int(campaign_id),),
+            ).fetchone()
+        elif campaign_name:
+            row = conn.execute(
+                "SELECT custom_step_templates_json FROM campaigns WHERE lower(trim(name)) = lower(trim(?)) ORDER BY id ASC LIMIT 1",
+                (str(campaign_name),),
+            ).fetchone()
+        if row is None:
+            return {}
+        raw_val = row["custom_step_templates_json"] if isinstance(row, sqlite3.Row) else row[0]
+        return parse_custom_step_templates(raw_val)
+    except sqlite3.Error:
+        return {}
+    finally:
+        if opened_conn is not None:
+            opened_conn.close()
+
+
+def resolve_vacancy_copy_settings(
+    *,
+    vac_cfg: Mapping[str, Any] | None = None,
+    campaign_overrides: Any = None,
+    db_path: str | Path | None = None,
+    conn: Any = None,
+    campaign_id: int | None = None,
+    campaign_name: str | None = None,
+) -> dict[str, str]:
+    """Merge editable vacancy templates, prompt override, and showcase URL from config & campaign."""
+    cfg_vac: Mapping[str, Any] = vac_cfg if vac_cfg is not None else _load_vacancies_ui_config()
+    if isinstance(cfg_vac, Mapping) and isinstance(cfg_vac.get("vacancies"), Mapping):
+        cfg_vac = cfg_vac["vacancies"]
+
+    settings: dict[str, str] = {
+        "showcase_url": (os.environ.get("VACANCY_SHOWCASE_URL") or "").strip() or DEFAULT_SHOWCASE_URL,
+        "editable_prompt_override": "",
+        "step1_template": "",
+        "step2_template": "",
+        "step3_template": "",
+    }
+
+    def _apply_parsed(parsed: dict[str, str]) -> None:
+        if parsed.get("showcase_url"):
+            settings["showcase_url"] = parsed["showcase_url"]
+        if parsed.get("editable_prompt_override"):
+            settings["editable_prompt_override"] = parsed["editable_prompt_override"]
+        if parsed.get("step1"):
+            settings["step1_template"] = parsed["step1"]
+        if parsed.get("step2"):
+            settings["step2_template"] = parsed["step2"]
+        if parsed.get("step3"):
+            settings["step3_template"] = parsed["step3"]
+
+    # 1. Config-level overrides (`vacancies`)
+    if isinstance(cfg_vac, Mapping):
+        _apply_parsed(
+            parse_custom_step_templates(
+                cfg_vac.get("custom_step_templates_json") or cfg_vac.get("custom_step_templates")
+            )
+        )
+        cfg_showcase = str(cfg_vac.get("showcase_url") or "").strip()
+        if cfg_showcase:
+            settings["showcase_url"] = cfg_showcase
+        cfg_prompt = str(cfg_vac.get("editable_prompt_override") or "").strip()
+        if cfg_prompt:
+            settings["editable_prompt_override"] = cfg_prompt
+
+    # 2. Campaign DB row overrides (`campaigns.custom_step_templates_json`)
+    if conn is not None or db_path is not None:
+        _apply_parsed(
+            load_campaign_copy_overrides(
+                conn if conn is not None else db_path,
+                campaign_id=campaign_id,
+                campaign_name=campaign_name,
+            )
+        )
+
+    # 3. Direct caller overrides
+    if campaign_overrides is not None:
+        _apply_parsed(parse_custom_step_templates(campaign_overrides))
+
+    return settings
+
+
+def render_vacancy_template(
+    template_text: str,
+    item: Mapping[str, Any],
+    *,
+    showcase_url: str = DEFAULT_SHOWCASE_URL,
+) -> str:
+    """Safely render user-editable vacancy templates with item fields and showcase URL."""
+    role = str(item.get("role") or item.get("head") or "вакансии").strip().lstrip("🔥 ").strip()
+    values = {
+        "role": role,
+        "company": str(item.get("company") or role).strip(),
+        "why": str(item.get("why") or "").strip(),
+        "pay": str(item.get("pay") or "").strip(),
+        "contact": str(item.get("contact") or "").strip(),
+        "src": str(item.get("src") or "").strip(),
+        "url": str(item.get("url") or "").strip(),
+        "name": str(item.get("name") or "").strip(),
+        "showcase_url": (showcase_url or DEFAULT_SHOWCASE_URL).strip(),
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        return values[key] if key in values else match.group(0)
+
+    rendered = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, str(template_text or ""))
+    return _sanitize_brand_copy(rendered).strip()
 
 
 def load_bank() -> str:
@@ -197,10 +384,53 @@ def _json_block(res: str | None) -> dict[str, Any] | None:
         return None
 
 
-def build_default_followups(item: dict[str, Any]) -> tuple[str, str]:
+def build_default_step1(
+    item: Mapping[str, Any],
+    *,
+    showcase_url: str = DEFAULT_SHOWCASE_URL,
+    copy_settings: Mapping[str, Any] | None = None,
+) -> str:
+    """Deterministic RU Step 1 pitch: cases + showcase link + leadgen system positioning + test offer."""
+    settings = dict(copy_settings) if copy_settings is not None else resolve_vacancy_copy_settings()
+    effective_showcase = (showcase_url or settings.get("showcase_url") or DEFAULT_SHOWCASE_URL).strip()
+    if settings.get("step1_template"):
+        return render_vacancy_template(settings["step1_template"], item, showcase_url=effective_showcase)
+
+    role = str(item.get("role") or item.get("head") or "вакансии").strip().lstrip("🔥 ").strip()
+    text = (
+        f"Добрый день! По задаче «{role}».\n\n"
+        "В SoftUGC строим систему лидгена под ключ: AI UGC и короткие вертикальные ролики "
+        "(Reels / Shorts / TikTok) + воронка в ManyChat / Telegram + аналитика конверсий "
+        "(AI-продакшн + своя команда креаторов).\n\n"
+        "Что делал:\n"
+        "— Faceless-канал на AI-роликах: 183,5 млн просмотров за 90 дней, 241K подписчиков, 94,8% холодный охват\n"
+        "— Конвейер под ключ для клиентов: до 90 роликов/мес с ростом охватов ×2–×3\n\n"
+        f"Сайт-витрина и кейсы: {effective_showcase}\n\n"
+        "Можем начать с тестового запуска под ваш продукт, чтобы проверить метрики в деле. "
+        "Какой объём роликов в месяц планируете и какая сейчас цель по воронке?"
+    )
+    return _sanitize_brand_copy(text)
+
+
+def build_default_followups(
+    item: Mapping[str, Any],
+    *,
+    copy_settings: Mapping[str, Any] | None = None,
+    vac_cfg: Mapping[str, Any] | None = None,
+    campaign_overrides: Any = None,
+) -> tuple[str, str]:
+    settings = (
+        dict(copy_settings)
+        if copy_settings is not None
+        else resolve_vacancy_copy_settings(vac_cfg=vac_cfg, campaign_overrides=campaign_overrides)
+    )
+    showcase = settings.get("showcase_url") or DEFAULT_SHOWCASE_URL
     role = (item.get("role") or "вакансии").strip()
     layer = (item.get("layer") or "").strip().lower()
-    if "автоматиз" in layer or "бот" in role.lower():
+
+    if settings.get("step2_template"):
+        f1 = render_vacancy_template(settings["step2_template"], item, showcase_url=showcase)
+    elif "автоматиз" in layer or "бот" in role.lower():
         f1 = (
             f"Добрый день! Возвращаюсь по задаче ({role}). "
             "Если скинете короткое описание текущей воронки или ТЗ, сразу скажу по срокам и архитектуре."
@@ -208,31 +438,108 @@ def build_default_followups(item: dict[str, Any]) -> tuple[str, str]:
     else:
         f1 = (
             f"Добрый день! Возвращаюсь по задаче ({role}). "
-            "Если пришлёте 1–2 референса или ТЗ, соберу тестовый фрагмент 10–15 секунд под ваш формат, чтобы оценить качество в деле."
+            "Можем начать с тестового фрагмента 10–15 секунд по вашему референсу/ТЗ "
+            "или запустить тестовую серию ($80–$100), чтобы проверить качество и отклик в воронке до основного объёма."
         )
-    f2 = (
-        f"Подскажите, задача по «{role}» ещё открыта или уже нашли исполнителя? "
-        "Если актуально — можем созвониться на 10 минут и обсудить запуск."
-    )
-    return f1, f2
+
+    if settings.get("step3_template"):
+        f2 = render_vacancy_template(settings["step3_template"], item, showcase_url=showcase)
+    else:
+        f2 = (
+            f"Подскажите, задача по «{role}» ещё открыта или уже нашли исполнителя? "
+            "Если актуально — можем созвониться на 10 минут и обсудить запуск."
+        )
+    return _sanitize_brand_copy(f1), _sanitize_brand_copy(f2)
 
 
-def build_micro_ping(item: dict[str, Any]) -> str:
+def build_micro_ping(item: Mapping[str, Any]) -> str:
     role = (item.get("role") or "задаче").strip()
-    return f"Добрый день! Подскажите, ещё ищете исполнителя по задаче «{role}»? Могу скинуть релевантные кейсы и примеры."
-
-
-def draft(item: dict[str, Any], bank: str) -> dict[str, Any]:
-    prompt = PROMPT.format(
-        bank=bank,
-        examples=EXAMPLES,
-        role=item.get("role") or "не разобрано",
-        why=item.get("why") or "",
-        pay=item.get("pay") or "не названа",
-        contact=item.get("contact") or "нет",
-        mode=item.get("mode") or "не разобрано",
-        text=(item.get("text") or "")[:3500],
+    return _sanitize_brand_copy(
+        f"Добрый день! Подскажите, ещё ищете исполнителя по задаче «{role}»? Могу скинуть релевантные кейсы и примеры."
     )
+
+
+def build_reply_prompt(
+    item: Mapping[str, Any],
+    bank: str,
+    *,
+    copy_settings: Mapping[str, Any] | None = None,
+    vac_cfg: Mapping[str, Any] | None = None,
+    campaign_overrides: Any = None,
+) -> str:
+    """Build the vacancy reply prompt incorporating `showcase_url` and `editable_prompt_override`."""
+    settings = (
+        dict(copy_settings)
+        if copy_settings is not None
+        else resolve_vacancy_copy_settings(vac_cfg=vac_cfg, campaign_overrides=campaign_overrides)
+    )
+    showcase_url = settings.get("showcase_url") or DEFAULT_SHOWCASE_URL
+    override = (settings.get("editable_prompt_override") or "").strip()
+
+    ctx = {
+        "bank": bank,
+        "examples": EXAMPLES,
+        "role": item.get("role") or "не разобрано",
+        "why": item.get("why") or "",
+        "pay": item.get("pay") or "не названа",
+        "contact": item.get("contact") or "нет",
+        "mode": item.get("mode") or "не разобрано",
+        "text": (item.get("text") or "")[:3500],
+        "showcase_url": showcase_url,
+    }
+
+    if override and "{text}" in override:
+        rendered = re.sub(
+            r"\{([A-Za-z_][A-Za-z0-9_]*)\}",
+            lambda m: str(ctx[m.group(1)]) if m.group(1) in ctx else m.group(0),
+            override,
+        )
+        if "JSON" not in rendered:
+            rendered += (
+                '\n\nВерни СТРОГО один JSON: {"text": "...", "followup_1": "...", '
+                '"followup_2": "...", "cases": "...", "risk": "..."}'
+            )
+        return _sanitize_brand_copy(rendered)
+
+    base_prompt = PROMPT.format(**ctx)
+    if override:
+        base_prompt = base_prompt.replace(
+            "═══ ВАКАНСИЯ ═══",
+            f"═══ ПОЛЬЗОВАТЕЛЬСКИЕ ИНСТРУКЦИИ (ПРИОРИТЕТ) ═══\n{override}\n\n═══ ВАКАНСИЯ ═══",
+        )
+    return _sanitize_brand_copy(base_prompt)
+
+
+def draft(
+    item: dict[str, Any],
+    bank: str,
+    *,
+    vac_cfg: Mapping[str, Any] | None = None,
+    campaign_overrides: Any = None,
+    copy_settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = (
+        dict(copy_settings)
+        if copy_settings is not None
+        else resolve_vacancy_copy_settings(vac_cfg=vac_cfg, campaign_overrides=campaign_overrides)
+    )
+    f1_def, f2_def = build_default_followups(item, copy_settings=settings)
+    if settings.get("step1_template"):
+        text = render_vacancy_template(
+            settings["step1_template"],
+            item,
+            showcase_url=settings.get("showcase_url") or DEFAULT_SHOWCASE_URL,
+        )
+        return {
+            "text": text,
+            "followup_1": f1_def,
+            "followup_2": f2_def,
+            "cases": "custom_step_templates",
+            "risk": "",
+            "no_question": "?" not in text[-260:],
+        }
+
+    prompt = build_reply_prompt(item, bank, copy_settings=settings)
     try:
         res = ask_llm(prompt, timeout=360)
     except Exception as e:
@@ -241,11 +548,14 @@ def draft(item: dict[str, Any], bank: str) -> dict[str, Any]:
     if not isinstance(d, dict) or not (d.get("text") or "").strip():
         return {"error": "ответ без JSON"}
 
-    text = str(d["text"]).strip()
-    f1_def, f2_def = build_default_followups(item)
+    text = _sanitize_brand_copy(str(d["text"]).strip())
     d["text"] = text
-    d["followup_1"] = str(d.get("followup_1") or "").strip() or f1_def
-    d["followup_2"] = str(d.get("followup_2") or "").strip() or f2_def
+    d["followup_1"] = _sanitize_brand_copy(
+        f1_def if settings.get("step2_template") else (str(d.get("followup_1") or "").strip() or f1_def)
+    )
+    d["followup_2"] = _sanitize_brand_copy(
+        f2_def if settings.get("step3_template") else (str(d.get("followup_2") or "").strip() or f2_def)
+    )
     d["no_question"] = "?" not in text[-260:]
     return d
 
@@ -255,6 +565,9 @@ def build_vacancy_mcp_lead(
     draft_obj: dict[str, Any],
     *,
     touch_mode: str | None = None,
+    copy_settings: Mapping[str, Any] | None = None,
+    vac_cfg: Mapping[str, Any] | None = None,
+    campaign_overrides: Any = None,
 ) -> dict[str, Any] | None:
     """Преобразует вакансию и черновик отклика в формат MCP `ingest_discovered_leads`."""
     raw_contact = str(item.get("contact") or "").strip()
@@ -272,15 +585,37 @@ def build_vacancy_mcp_lead(
     src = str(item.get("src") or "TG").strip()
     url = str(item.get("url") or "").strip()
 
-    full_reply = str(draft_obj.get("text") or "").strip()
+    settings = (
+        dict(copy_settings)
+        if copy_settings is not None
+        else resolve_vacancy_copy_settings(vac_cfg=vac_cfg, campaign_overrides=campaign_overrides)
+    )
+    effective_showcase = settings.get("showcase_url") or DEFAULT_SHOWCASE_URL
+
+    if settings.get("step1_template"):
+        full_reply = render_vacancy_template(
+            settings["step1_template"],
+            item,
+            showcase_url=effective_showcase,
+        )
+    else:
+        full_reply = _sanitize_brand_copy(str(draft_obj.get("text") or "").strip())
+        if full_reply and effective_showcase != DEFAULT_SHOWCASE_URL and DEFAULT_SHOWCASE_URL in full_reply:
+            full_reply = full_reply.replace(DEFAULT_SHOWCASE_URL, effective_showcase)
     if not full_reply:
         return None
-    f1_def, f2_def = build_default_followups(item)
-    followup_1 = str(draft_obj.get("followup_1") or "").strip() or f1_def
-    followup_2 = str(draft_obj.get("followup_2") or "").strip() or f2_def
 
+    f1_def, f2_def = build_default_followups(item, copy_settings=settings)
+    followup_1 = _sanitize_brand_copy(
+        f1_def if settings.get("step2_template") else (str(draft_obj.get("followup_1") or "").strip() or f1_def)
+    )
+    followup_2 = _sanitize_brand_copy(
+        f2_def if settings.get("step3_template") else (str(draft_obj.get("followup_2") or "").strip() or f2_def)
+    )
+
+    ui_cfg = vac_cfg if vac_cfg is not None else _load_vacancies_ui_config()
     resolved_mode = touch_mode or os.environ.get("JOBS_TOUCH_MODE") or str(
-        _load_vacancies_ui_config().get("touch_mode") or "direct"
+        (ui_cfg or {}).get("touch_mode") or "direct"
     )
     mode = str(resolved_mode or "direct").strip().lower()
     if mode == "micro_ping":
@@ -295,7 +630,9 @@ def build_vacancy_mcp_lead(
     first_line = full_reply.splitlines()[0].strip() if full_reply else role
     their_angle_parts = [p for p in (why, f"Оплата: {pay}" if pay else "") if p]
     their_angle = " | ".join(their_angle_parts) or role
-    our_angle = str(draft_obj.get("cases") or f"Отклик на вакансию ({item.get('mode') or 'AI UGC'})").strip()
+    our_angle = _sanitize_brand_copy(
+        str(draft_obj.get("cases") or f"Отклик на вакансию ({item.get('mode') or 'AI UGC'})").strip()
+    )
 
     note_lines = []
     if why:
@@ -316,6 +653,9 @@ def build_vacancy_mcp_lead(
         "url": url or None,
         "category": layer or None,
         "niche": layer or None,
+        "segment": str(item.get("segment") or "vacancy"),
+        "language": str(item.get("language") or "ru"),
+        "source": str(item.get("source") or "tg_jobs"),
         "their_angle": their_angle,
         "our_angle": our_angle,
         "hook": first_line,
@@ -381,9 +721,20 @@ def main() -> int:
     if not path or not os.path.exists(path):
         sys.exit("данных монитора нет — сначала запустите job_monitor.py")
 
+    resolved_db: str | Path | None = a.db_path or None
+    if resolved_db is None and os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1" and PROD_LOCAL_DB.exists():
+        resolved_db = PROD_LOCAL_DB
+
+    copy_settings = resolve_vacancy_copy_settings(
+        vac_cfg=vac_cfg,
+        db_path=resolved_db,
+        campaign_id=a.campaign_id,
+        campaign_name=a.campaign_name,
+    )
+
     items = json.load(open(path, encoding="utf-8"))
-    enabled_layers = {k for k, v in (vac_cfg.get("layers") or {}).items() if v}
-    if enabled_layers:
+    enabled_layers = resolve_enabled_layers()
+    if enabled_layers and not (a.force and a.from_replies):
         items = [
             it
             for it in items
@@ -414,17 +765,33 @@ def main() -> int:
         key = it.get("hash") or (it.get("chat_id"), it.get("msg_id")) or it.get("contact")
         if key and key in existing_replies_by_key:
             cached = existing_replies_by_key[key]
-            f1_def, f2_def = build_default_followups(it)
-            text_val = str(cached.get("text") or "").strip()
+            f1_def, f2_def = build_default_followups(it, copy_settings=copy_settings)
+            text_val = _sanitize_brand_copy(str(cached.get("text") or "").strip())
+            if copy_settings.get("step1_template"):
+                text_val = render_vacancy_template(
+                    copy_settings["step1_template"],
+                    it,
+                    showcase_url=copy_settings.get("showcase_url") or DEFAULT_SHOWCASE_URL,
+                )
+            elif (
+                text_val
+                and copy_settings.get("showcase_url", DEFAULT_SHOWCASE_URL) != DEFAULT_SHOWCASE_URL
+                and DEFAULT_SHOWCASE_URL in text_val
+            ):
+                text_val = text_val.replace(DEFAULT_SHOWCASE_URL, copy_settings["showcase_url"])
             return it, {
                 "text": text_val,
-                "followup_1": str(cached.get("followup_1") or "").strip() or f1_def,
-                "followup_2": str(cached.get("followup_2") or "").strip() or f2_def,
+                "followup_1": _sanitize_brand_copy(
+                    f1_def if copy_settings.get("step2_template") else (str(cached.get("followup_1") or "").strip() or f1_def)
+                ),
+                "followup_2": _sanitize_brand_copy(
+                    f2_def if copy_settings.get("step3_template") else (str(cached.get("followup_2") or "").strip() or f2_def)
+                ),
                 "cases": str(cached.get("cases") or "").strip(),
                 "risk": str(cached.get("risk") or "").strip(),
                 "no_question": "?" not in text_val[-260:],
             }
-        return it, draft(it, bank)
+        return it, draft(it, bank, copy_settings=copy_settings)
 
     with futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for it, d in ex.map(_process_one, items):
@@ -446,7 +813,7 @@ def main() -> int:
     for r in rows:
         it = r["item"]
         d = r["draft"]
-        mcp_lead = build_vacancy_mcp_lead(it, d, touch_mode=a.touch_mode)
+        mcp_lead = build_vacancy_mcp_lead(it, d, touch_mode=a.touch_mode, copy_settings=copy_settings)
         if mcp_lead is not None:
             mcp_leads.append(mcp_lead)
         serialized_replies.append(
@@ -470,10 +837,6 @@ def main() -> int:
     print(f"\nчерновиков: {len(rows)}\nданные: {out}")
 
     if not a.no_crm and mcp_leads:
-        resolved_db: str | Path | None = a.db_path or None
-        if resolved_db is None and os.environ.get("CRMTG_EPHEMERAL_RUNTIME") != "1" and PROD_LOCAL_DB.exists():
-            resolved_db = PROD_LOCAL_DB
-
         res = push_leads_via_mcp(
             mcp_leads,
             enroll_in_campaign=not a.no_campaign,
@@ -493,7 +856,6 @@ def main() -> int:
 
         # Если писали напрямую в локальную SQLite БД (без HTTP MCP), синхронизируем R2 снэпшот только при активном lease
         if not a.mcp_url and resolved_db is not None:
-            from contextlib import closing
             from app.cloud_persistence import (
                 backup_to_cloud,
                 check_tg_runtime_lease_owned,

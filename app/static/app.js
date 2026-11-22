@@ -130,6 +130,15 @@ const state = {
   viewMode: initialViewMode,
   activeSheet: (workspaceMain && workspaceMain.dataset.activeSheet) || "leads",
   leadsSubView: "kanban",
+  leadsSegmentFilter: "",
+  inboxSegmentFilter: "",
+  manualSocialQueue: [],
+  assistedJobsQueue: [],
+  manualQueueSearch: "",
+  manualSocialLoaded: false,
+  assistedJobsLoaded: false,
+  enrichmentBudget: null,
+  inboxDialogSegmentMap: {},
   outreachSubView: "campaigns",
   loginId: null,
   reauthAccountId: null,
@@ -714,6 +723,7 @@ function syncSheetVisibility(opts = {}) {
   const outreachCampaignsPane = document.querySelector("#outreach-campaigns-pane");
   const outreachAccountsPane = document.querySelector("#outreach-accounts-pane");
   const leads = document.querySelector("#leads");
+  const manualQueuesSec = document.querySelector("#manual-queues-section");
   const digest = document.querySelector("#digest");
   const accounts = document.querySelector("#accounts");
   const crmProps = document.querySelector("#crm-properties");
@@ -722,7 +732,8 @@ function syncSheetVisibility(opts = {}) {
   const funnelSec = document.querySelector("#funnel");
 
   // Sync sub-view toggle buttons
-  const leadsSub = state.leadsSubView === "table" ? "table" : "kanban";
+  const validLeadsSubs = new Set(["kanban", "table", "social_manual", "vacancy_assisted"]);
+  const leadsSub = validLeadsSubs.has(state.leadsSubView) ? state.leadsSubView : "kanban";
   document.querySelectorAll("[data-leads-subview]").forEach((btn) => {
     const isAct = btn.dataset.leadsSubview === leadsSub;
     btn.className = `btn ${isAct ? "primary" : "ghost"} sm`;
@@ -757,6 +768,13 @@ function syncSheetVisibility(opts = {}) {
       leads.hidden = false;
       leads.removeAttribute("data-popup-only");
     }
+    if (manualQueuesSec) {
+      const showQueue = leadsSub === "social_manual" || leadsSub === "vacancy_assisted";
+      manualQueuesSec.hidden = !showQueue;
+      if (showQueue) {
+        if (typeof ensureManualQueueLoaded === "function") ensureManualQueueLoaded(leadsSub);
+      }
+    }
     if (digest) digest.hidden = true;
     if (accounts) accounts.hidden = false;
     if (calendarSec) calendarSec.hidden = active !== "calendar";
@@ -777,6 +795,7 @@ function syncSheetVisibility(opts = {}) {
   const cardPopupOpen = state.activePopup === "card" || active === "s09";
   const leadPopupOpen = state.activePopup === "lead";
   const showLeads = active === "leads";
+  const isManualQueueSub = leadsSub === "social_manual" || leadsSub === "vacancy_assisted";
 
   if (leadsViewBar) leadsViewBar.hidden = !showLeads;
   if (s07) s07.hidden = !(showLeads && leadsSub === "kanban");
@@ -810,6 +829,13 @@ function syncSheetVisibility(opts = {}) {
       leads.removeAttribute("data-popup-only");
     }
   }
+  if (manualQueuesSec) {
+    const showManualQueue = showLeads && isManualQueueSub;
+    manualQueuesSec.hidden = !showManualQueue;
+    if (showManualQueue && typeof ensureManualQueueLoaded === "function") {
+      ensureManualQueueLoaded(leadsSub);
+    }
+  }
 
   if (digest) digest.hidden = true;
   if (crmProps) crmProps.hidden = active !== "crm-properties";
@@ -838,7 +864,11 @@ function syncSheetVisibility(opts = {}) {
     loadLeadgenHealthSummary().catch(() => {});
   }
 
-  const activeNode = active === "inbox" ? messengerGrid : (showLeads && leadsSub === "kanban" ? s07 : document.querySelector(`#${active}`));
+  const activeNode = active === "inbox"
+    ? messengerGrid
+    : (showLeads && leadsSub === "kanban"
+      ? s07
+      : (showLeads && isManualQueueSub ? manualQueuesSec : document.querySelector(`#${active}`)));
   if (!opts || !opts.preserveScroll) {
     triggerSheetEntrance(activeNode);
     window.requestAnimationFrame(() => window.scrollTo(0, 0));
@@ -1047,6 +1077,46 @@ function channelBadgeEl(provider) {
     className: `channel-badge ${isWa ? "channel-wa" : "channel-tg"}`,
     title: isWa ? "WhatsApp" : "Telegram",
   }, [isWa ? "WA" : "TG"]);
+}
+
+const SEGMENT_META = {
+  whale: { label: "Whale", cls: "seg-whale" },
+  vacancy: { label: "Vacancy", cls: "seg-vacancy" },
+  client_reels: { label: "Client Reels", cls: "seg-client_reels" },
+  ru_expert: { label: "RU Expert", cls: "seg-ru_expert" },
+  social_manual: { label: "Social Queue", cls: "seg-social_manual" },
+  vacancy_assisted: { label: "Job Queue", cls: "seg-vacancy_assisted" },
+  ofm: { label: "OFM", cls: "seg-ofm" },
+};
+
+const SEGMENT_PILL_OPTIONS = [
+  ["", "Все"],
+  ["whale", "Whale"],
+  ["vacancy", "Vacancy"],
+  ["client_reels", "Client Reels"],
+  ["ru_expert", "RU Expert"],
+  ["social_manual", "Social Queue"],
+  ["vacancy_assisted", "Job Queue"],
+  ["ofm", "OFM"],
+];
+
+function normalizeLeadSegment(raw) {
+  return String(raw || "").trim().toLowerCase();
+}
+
+function segmentLabel(rawSeg) {
+  const seg = normalizeLeadSegment(rawSeg);
+  return (SEGMENT_META[seg] && SEGMENT_META[seg].label) || (seg ? seg.toUpperCase() : "");
+}
+
+function segmentBadgeEl(rawSeg) {
+  const seg = normalizeLeadSegment(rawSeg);
+  const meta = SEGMENT_META[seg];
+  if (!meta) return null;
+  return el("span", {
+    className: `badge seg-badge ${meta.cls}`,
+    "data-segment": seg,
+  }, [meta.label]);
 }
 
 function statusSelect(lead, className) {
@@ -3726,6 +3796,12 @@ function passChips(dialog) {
   if (state.inboxSessionFilter && state.inboxSessionFilter !== "all" && dialog.account_id) {
     if (String(dialog.account_id) !== String(state.inboxSessionFilter)) return false;
   }
+  const segFilter = normalizeLeadSegment(state.inboxSegmentFilter);
+  if (segFilter) {
+    const linked = leadForDialog(dialog);
+    const dSeg = normalizeLeadSegment(dialog.segment || (linked && linked.segment));
+    if (dSeg !== segFilter) return false;
+  }
   const isTelegramServerSearch = state.searchMode === "telegram" && Boolean(String(state.dialogQuery || "").trim());
   const searchRaw = isTelegramServerSearch ? "" : String(state.inboxSearchQuery || "").trim().toLowerCase();
   if (searchRaw && !state.crmSearchServerApplied) {
@@ -3815,7 +3891,8 @@ function renderDialogs() {
         (STATUSES.find(([v]) => v === dialogLead.status) || ["", "В CRM"])[1],
       ])
       : el("span", { className: "badge b-talk dialog-crm-badge" }, ["CRM"]);
-    const metaTags = [crmStageBadge, sessionTag, statusBadge].filter(Boolean);
+    const dialogSegBadge = segmentBadgeEl(dialog.segment || (dialogLead && dialogLead.segment));
+    const metaTags = [crmStageBadge, dialogSegBadge, sessionTag, statusBadge].filter(Boolean);
     const who = el("span", {}, [
       el("span", { className: "dialog-name-row" }, [
         channelBadgeEl(provider),
@@ -5487,10 +5564,12 @@ function renderBoard() {
     );
   }
 
+  const segFilter = normalizeLeadSegment(state.leadsSegmentFilter);
   STATUSES.forEach(([value, label]) => {
     const cards = state.leads.filter((lead) => {
       if (lead.status !== value) return false;
       if (stage && stage !== value) return false;
+      if (segFilter && normalizeLeadSegment(lead.segment) !== segFilter) return false;
       if (folderId && String(lead.folder_id || "") !== folderId) return false;
       if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
       if (!matchFollowupFilter(lead, followup)) return false;
@@ -5533,8 +5612,9 @@ function renderBoard() {
         const folderTitle = folderTitleById(lead.folder_id);
         const tagNodes = [
           channelBadgeEl(provider),
+          segmentBadgeEl(lead.segment),
           el("span", { className: "card-amount", "data-card-amount": String(amt) }, [amtText]),
-        ];
+        ].filter(Boolean);
         if (folderTitle) {
           tagNodes.push(el("span", { className: "card-pill" }, [folderTitle]));
         }
@@ -5738,6 +5818,8 @@ function reminderForm(lead) {
 
 function buildLeadCrmPills(lead) {
   const pills = [];
+  const segBadge = segmentBadgeEl(lead.segment);
+  if (segBadge) pills.push(segBadge);
   const amt = leadAmount(lead);
   if (amt > 0) {
     pills.push(el("span", { className: "crm-field-pill is-budget" }, [formatMoney(amt, lead.currency)]));
@@ -5757,13 +5839,15 @@ function buildLeadCrmPills(lead) {
   }
   const cachedCard = state.cards && state.cards[lead.id];
   const props = (cachedCard && cachedCard.properties) || lead.properties || [];
+  let customPropsAdded = 0;
   props.forEach((prop) => {
-    if (pills.length >= 3) return;
+    if (customPropsAdded >= 3) return;
     const val = String(propertyShown(prop) || "").trim();
     if (val && val !== "-" && val.length <= 28 && !val.startsWith("+ Позитив")) {
       pills.push(el("span", { className: "crm-field-pill is-custom", title: `${prop.name}: ${val}` }, [
         `${prop.name}: ${val}`,
       ]));
+      customPropsAdded += 1;
     }
   });
   const profileBtn = el("button", {
@@ -5794,10 +5878,12 @@ function renderLeadTable() {
   if (!body) return;
   body.replaceChildren();
   const { status, folderId, channel, followup } = pipelineFilters();
+  const segFilter = normalizeLeadSegment(state.leadsSegmentFilter);
   const quickSearchInput = document.querySelector("#leads-quick-search");
   const quickQ = quickSearchInput ? String(quickSearchInput.value || "").trim().toLowerCase() : "";
   const filteredLeads = state.leads.filter((lead) => {
     if (status && lead.status !== status) return false;
+    if (segFilter && normalizeLeadSegment(lead.segment) !== segFilter) return false;
     if (folderId && String(lead.folder_id || "") !== String(folderId)) return false;
     if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
     if (!matchFollowupFilter(lead, followup)) return false;
@@ -5940,10 +6026,13 @@ async function loadLeads(query = "", keepId = null, silent = false) {
   }
   const params = new URLSearchParams();
   if (state.leadQuery) params.set("q", state.leadQuery);
+  if (state.leadsSegmentFilter) params.set("segment", state.leadsSegmentFilter);
   const leads = await api(`/api/leads?${params.toString()}`);
   state.leads = leads;
   leads.forEach((lead) => { state.leadCache[lead.id] = lead; });
   syncInboxV2BootSlice("leads");
+  if (typeof updateManualQueueCountBadges === "function") updateManualQueueCountBadges();
+  if (typeof scheduleInboxV2SegmentDecorate === "function") scheduleInboxV2SegmentDecorate();
   if (keepId != null && state.leadCache[keepId]) {
     state.selectedLeadId = keepId;
   } else if (state.selectedLeadId && !leads.some((lead) => lead.id === state.selectedLeadId)) {
@@ -6501,6 +6590,7 @@ async function loadInbox(opts = {}) {
   const qs = new URLSearchParams({ account_id: String(targetAccountId), with_counts: "1", crm_only: "1" });
   if (activeChips) qs.set("chip", activeChips);
   if (effectiveQuery) qs.set("q", effectiveQuery);
+  if (state.inboxSegmentFilter) qs.set("segment", state.inboxSegmentFilter);
   const res = await api(`/api/inbox?${qs.toString()}`);
   if (listToken !== inboxListLoadToken) return;
   const dialogs = sortDialogsByRecency(
@@ -8479,7 +8569,8 @@ document.querySelector(".nav").addEventListener("click", (event) => {
 document.querySelector("#leads-view-toggle")?.addEventListener("click", (event) => {
   const btn = event.target.closest("[data-leads-subview]");
   if (!btn) return;
-  state.leadsSubView = btn.dataset.leadsSubview === "table" ? "table" : "kanban";
+  const nextSub = btn.dataset.leadsSubview || "kanban";
+  state.leadsSubView = ["table", "social_manual", "vacancy_assisted"].includes(nextSub) ? nextSub : "kanban";
   syncSheetVisibility();
 });
 
@@ -10887,8 +10978,10 @@ state.bulkHostTarget = "leads";
 
 function getFilteredLeadsForBulk() {
   const { status: stage, folderId, channel, followup } = pipelineFilters();
+  const segFilter = normalizeLeadSegment(state.leadsSegmentFilter);
   return (state.leads || []).filter((lead) => {
     if (stage && lead.status !== stage) return false;
+    if (segFilter && normalizeLeadSegment(lead.segment) !== segFilter) return false;
     if (folderId && String(lead.folder_id || "") !== String(folderId)) return false;
     if (channel && normalizeProvider(lead.provider || "telegram") !== channel) return false;
     if (!matchFollowupFilter(lead, followup)) return false;
@@ -12757,11 +12850,26 @@ function ensureLeadgenState() {
       enabled: true,
       auto_push_to_crm: true,
       total_daily_quota: 50,
+      enrichment: {
+        daily_budget_cap_usd: 5.0,
+        per_lead_cap_usd: 0.04,
+        super_whale_cap_usd: 0.15,
+        super_whale_icp_min: 92,
+        super_whale_pool_min_usd: 10000,
+        low_balance_warn_usd: 2.0,
+        low_balance_stop_usd: 0.50,
+      },
+      whales: {
+        tg_group_admins_enabled: true,
+        whop_min_pool_usd: 5000,
+        max_dms_per_company: 2,
+        secondary_dm_wait_days: 6,
+      },
       b2b: {
         enabled: true,
         touch_mode: "direct",
-        target_campaign_tg: "Leadgen Auto (TG)",
-        target_campaign_wa: "Leadgen Auto (WA)",
+        target_campaign_tg: "Whales EN — TG",
+        target_campaign_wa: "Whales EN — WA",
         campaign_daily_limit: 30,
         sources: {
           tg_groups: true,
@@ -12783,9 +12891,10 @@ function ensureLeadgenState() {
           buyer_catalogs: true,
           linkedin_jobs: true,
           tg_identity_bridge: true,
+          tg_group_admins: true,
         },
         tg_groups_old: ["producthunt_heroes", "id1613398776"],
-        tg_groups_new: ["productcircle_chat", "solofounderschat", "saasfounders"],
+        tg_groups_new: ["productcircle_chat", "saasfounders"],
         tg_comment_channels: [],
         ofm_tg_groups: ["FranceOFM", "ofmfrancenetwork", "networkOFM", "mofmnetwork", "RedditWorldOFM", "aimodelnetwork", "AdultDeskAI"],
         fb_group_urls: [
@@ -12800,26 +12909,49 @@ function ensureLeadgenState() {
           ph_limit: 0,
           msg_limit: 1800,
           lurker_limit: 1000,
-          external_limit: 20,
+          external_limit: 40,
         },
       },
       vacancies: {
         enabled: false,
         touch_mode: "direct",
-        campaign_name: "TG Вакансии",
+        campaign_name: "Client Reels & Вакансии RU — TG",
         daily_limit: 20,
         remote_only: true,
         hot_priority: true,
         layers: {
           "AI-контент": true,
-          "автоматизация": true,
+          "автоматизация": false,
           "трафик": true,
-          "AI-роль": true,
+          "AI-роль": false,
         },
+        sources: {
+          tg_chats: true,
+          hh_ru: true,
+          profi_ru: true,
+          kwork: true,
+          linkedin_jobs: true,
+          upwork: true,
+        },
+        showcase_url: "https://tmxfy.github.io/",
+        editable_prompt_override: "",
         source_words: "ваканс|vacanc|работ[аыу]|\\bjob|фриланс|freelance|биржа|удал[её]н|подработ|\\bhr\\b|hr'?tg|найм|hiring|карьер|career|заказ",
         source_stop: "kurilo|аренда|прокат|spam|premium bot|wallet",
         extra_chats: ["itconnectbelgrade"],
         pause_between_chats: 1.5,
+      },
+      ru_experts: {
+        enabled: false,
+        target_campaign: "РФ-Эксперты (Продюсирование) — TG",
+        exclude_from_airtable: true,
+        niches: [],
+        min_subs: 1000,
+        max_subs: 50000,
+        stop_words: [],
+        seed_channels: [],
+        seed_chats: [],
+        ig_to_tg_enabled: true,
+        daily_limit: 20,
       },
       cases_bank_md: "",
     };
@@ -13155,10 +13287,20 @@ function renderLeadgenHarvest() {
   }
 }
 
+function _splitListText(raw) {
+  return String(raw || "")
+    .split(/[\n,;]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
 function renderLeadgenConfig() {
   const cfg = ensureLeadgenState();
   const b2b = cfg.b2b || {};
   const vac = cfg.vacancies || {};
+  const enr = cfg.enrichment || {};
+  const whales = cfg.whales || {};
+  const ruExp = cfg.ru_experts || {};
   const status = state.leadgenStatus || {};
 
   const statsBadge = document.querySelector("#leadgen-stats-badge");
@@ -13170,7 +13312,7 @@ function renderLeadgenConfig() {
     const waInCrm = Number(status.whatsapp_leads_count ?? counts.whatsapp_leads_count) || 0;
     const dxInPool = Number(status.direct_x_leads_count ?? counts.direct_x_leads_count) || 0;
     const ofmInReview = Number(status.ofm_review_count ?? counts.ofm_review_count) || 0;
-    statsBadge.textContent = `В CRM: ${totalInCrm} (TG B2B: ${b2bInCrm} · WA: ${waInCrm} · Direct/X: ${dxInPool} · OFM ревью: ${ofmInReview} · Вакансии: ${vacInCrm})`;
+    statsBadge.textContent = `В CRM: ${totalInCrm} (TG: ${b2bInCrm} · WA: ${waInCrm} · Direct/X: ${dxInPool} · Вакансии: ${vacInCrm} · OFM: ${ofmInReview})`;
   }
 
   const setVal = (sel, val) => {
@@ -13186,10 +13328,14 @@ function renderLeadgenConfig() {
   setCheck("#leadgen-autopush-toggle", cfg.auto_push_to_crm !== false);
   setVal("#leadgen-total-quota", cfg.total_daily_quota ?? 50);
 
+  setVal("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 5.0);
+  setVal("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.04);
+  setVal("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15);
+
   setCheck("#leadgen-b2b-enabled", b2b.enabled !== false);
   setVal("#leadgen-b2b-touch-mode", b2b.touch_mode || "direct");
-  setVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Leadgen Auto (TG)");
-  setVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Leadgen Auto (WA)");
+  setVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Whales EN — TG");
+  setVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Whales EN — WA");
   setVal("#leadgen-b2b-daily-limit", b2b.campaign_daily_limit ?? 30);
 
   const b2bSources = b2b.sources || {};
@@ -13198,19 +13344,31 @@ function renderLeadgenConfig() {
     cb.checked = b2bSources[key] !== false;
   });
 
+  setCheck("#leadgen-src-tg-group-admins", whales.tg_group_admins_enabled !== false && b2bSources.tg_group_admins !== false);
+
+  const vacSources = vac.sources || {};
+  document.querySelectorAll("[data-vac-source]").forEach((cb) => {
+    const key = cb.getAttribute("data-vac-source");
+    if (key in vacSources) cb.checked = Boolean(vacSources[key]);
+    else if (key in b2bSources) cb.checked = Boolean(b2bSources[key]);
+    else cb.checked = true;
+  });
+
   const limits = b2b.limits || {};
   setVal("#leadgen-limit-yc", limits.yc_limit ?? 50);
   setVal("#leadgen-limit-ph", limits.ph_limit ?? 0);
   setVal("#leadgen-limit-msg", limits.msg_limit ?? 1800);
   setVal("#leadgen-limit-lurker", limits.lurker_limit ?? 1000);
-  setVal("#leadgen-limit-external", limits.external_limit ?? 20);
+  setVal("#leadgen-limit-external", limits.external_limit ?? 40);
 
   setCheck("#leadgen-vacancies-enabled", Boolean(vac.enabled));
   setCheck("#leadgen-vac-remote-only", vac.remote_only !== false);
   setCheck("#leadgen-vac-hot-priority", vac.hot_priority !== false);
   setVal("#leadgen-vac-touch-mode", vac.touch_mode || "direct");
-  setVal("#leadgen-vac-campaign", vac.campaign_name || "TG Вакансии");
+  setVal("#leadgen-vac-campaign", vac.campaign_name || "Client Reels & Вакансии RU — TG");
   setVal("#leadgen-vac-daily-limit", vac.daily_limit ?? 20);
+  setVal("#leadgen-vac-showcase-url", vac.showcase_url || "");
+  setVal("#leadgen-vac-prompt-override", vac.editable_prompt_override || "");
   setVal("#leadgen-vac-source-words", vac.source_words || "");
   setVal("#leadgen-vac-source-stop", vac.source_stop || "");
   setVal("#leadgen-cases-bank", cfg.cases_bank_md || "");
@@ -13218,8 +13376,21 @@ function renderLeadgenConfig() {
   const vacLayers = vac.layers || {};
   document.querySelectorAll("[data-vac-layer]").forEach((cb) => {
     const key = cb.getAttribute("data-vac-layer");
-    cb.checked = vacLayers[key] !== false;
+    if (key in vacLayers) cb.checked = Boolean(vacLayers[key]);
+    else cb.checked = key === "AI-контент" || key === "трафик";
   });
+
+  setCheck("#leadgen-ru-experts-enabled", Boolean(ruExp.enabled));
+  setCheck("#leadgen-src-ru-experts-shortcut", Boolean(ruExp.enabled));
+  setCheck("#leadgen-ru-experts-ig-tg", ruExp.ig_to_tg_enabled !== false);
+  setVal("#leadgen-ru-experts-campaign", ruExp.target_campaign || "РФ-Эксперты (Продюсирование) — TG");
+  setVal("#leadgen-ru-experts-daily-limit", ruExp.daily_limit ?? 20);
+  setVal("#leadgen-ru-experts-min-subs", ruExp.min_subs ?? 1000);
+  setVal("#leadgen-ru-experts-max-subs", ruExp.max_subs ?? 50000);
+  setVal("#leadgen-ru-experts-niches", Array.isArray(ruExp.niches) ? ruExp.niches.join(", ") : (ruExp.niches || ""));
+  setVal("#leadgen-ru-experts-stop-words", Array.isArray(ruExp.stop_words) ? ruExp.stop_words.join(", ") : (ruExp.stop_words || ""));
+  setVal("#leadgen-ru-experts-seed-channels", Array.isArray(ruExp.seed_channels) ? ruExp.seed_channels.join(", ") : (ruExp.seed_channels || ""));
+  setVal("#leadgen-ru-experts-seed-chats", Array.isArray(ruExp.seed_chats) ? ruExp.seed_chats.join(", ") : (ruExp.seed_chats || ""));
 
   renderLeadgenGroupChips();
   renderLeadgenHarvest();
@@ -13230,12 +13401,15 @@ function collectLeadgenFormPayload() {
   const cfg = ensureLeadgenState();
   const b2b = cfg.b2b || {};
   const vac = cfg.vacancies || {};
+  const enr = cfg.enrichment || {};
+  const whales = cfg.whales || {};
+  const ruExp = cfg.ru_experts || {};
 
   const getVal = (sel, fallback = "") => {
     const node = document.querySelector(sel);
     return node ? node.value.trim() : fallback;
   };
-  const getNum = (sel, fallback = 0, min = 0, max = 50000) => {
+  const getNum = (sel, fallback = 0, min = 0, max = 50000000) => {
     const node = document.querySelector(sel);
     const val = node ? Number(node.value) : fallback;
     if (!Number.isFinite(val)) return fallback;
@@ -13246,10 +13420,21 @@ function collectLeadgenFormPayload() {
     return node ? Boolean(node.checked) : fallback;
   };
 
-  const sources = {};
+  const sources = { ...(b2b.sources || {}) };
   document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
     const key = cb.getAttribute("data-b2b-source");
     if (key) sources[key] = Boolean(cb.checked);
+  });
+  const tgAdminsOn = getCheck("#leadgen-src-tg-group-admins", true);
+  sources.tg_group_admins = tgAdminsOn;
+
+  const vacSources = { ...(vac.sources || {}) };
+  document.querySelectorAll("[data-vac-source]").forEach((cb) => {
+    const key = cb.getAttribute("data-vac-source");
+    if (key) vacSources[key] = Boolean(cb.checked);
+  });
+  ["hh_ru", "profi_ru", "kwork", "upwork", "linkedin_jobs"].forEach((k) => {
+    if (k in vacSources) sources[k] = Boolean(vacSources[k]);
   });
 
   const layers = {};
@@ -13259,16 +13444,30 @@ function collectLeadgenFormPayload() {
   });
 
   const casesNode = document.querySelector("#leadgen-cases-bank");
+  const promptNode = document.querySelector("#leadgen-vac-prompt-override");
+  const ruEnabled = getCheck("#leadgen-ru-experts-enabled", false);
+  sources.ru_experts = ruEnabled;
+
   return {
     enabled: getCheck("#leadgen-enabled-toggle", true),
     auto_push_to_crm: getCheck("#leadgen-autopush-toggle", true),
     total_daily_quota: getNum("#leadgen-total-quota", 50, 0, 500),
+    enrichment: {
+      ...enr,
+      daily_budget_cap_usd: getNum("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 5.0, 0, 500),
+      per_lead_cap_usd: getNum("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.04, 0, 10),
+      super_whale_cap_usd: getNum("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15, 0, 10),
+    },
+    whales: {
+      ...whales,
+      tg_group_admins_enabled: tgAdminsOn,
+    },
     b2b: {
       enabled: getCheck("#leadgen-b2b-enabled", true),
-      touch_mode: getVal("#leadgen-b2b-touch-mode", "direct"),
-      target_campaign_tg: getVal("#leadgen-b2b-campaign-tg", "Leadgen Auto (TG)"),
-      target_campaign_wa: getVal("#leadgen-b2b-campaign-wa", "Leadgen Auto (WA)"),
-      campaign_daily_limit: getNum("#leadgen-b2b-daily-limit", 30, 1, 500),
+      touch_mode: getVal("#leadgen-b2b-touch-mode", b2b.touch_mode || "direct"),
+      target_campaign_tg: getVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Whales EN — TG"),
+      target_campaign_wa: getVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Whales EN — WA"),
+      campaign_daily_limit: getNum("#leadgen-b2b-daily-limit", 30, 0, 500),
       sources,
       tg_groups_old: Array.isArray(b2b.tg_groups_old) ? b2b.tg_groups_old : [],
       tg_groups_new: Array.isArray(b2b.tg_groups_new) ? b2b.tg_groups_new : [],
@@ -13280,21 +13479,38 @@ function collectLeadgenFormPayload() {
         ph_limit: getNum("#leadgen-limit-ph", 0, 0, 5000),
         msg_limit: getNum("#leadgen-limit-msg", 1800, 50, 20000),
         lurker_limit: getNum("#leadgen-limit-lurker", 1000, 0, 10000),
-        external_limit: getNum("#leadgen-limit-external", 20, 0, 1000),
+        external_limit: getNum("#leadgen-limit-external", 40, 0, 1000),
       },
     },
     vacancies: {
       enabled: getCheck("#leadgen-vacancies-enabled", false),
-      touch_mode: getVal("#leadgen-vac-touch-mode", "direct"),
-      campaign_name: getVal("#leadgen-vac-campaign", "TG Вакансии"),
+      touch_mode: getVal("#leadgen-vac-touch-mode", vac.touch_mode || "direct"),
+      campaign_name: getVal("#leadgen-vac-campaign", vac.campaign_name || "Client Reels & Вакансии RU — TG"),
       daily_limit: getNum("#leadgen-vac-daily-limit", 20, 0, 500),
       remote_only: getCheck("#leadgen-vac-remote-only", true),
       hot_priority: getCheck("#leadgen-vac-hot-priority", true),
       layers,
+      sources: vacSources,
+      showcase_url: getVal("#leadgen-vac-showcase-url", vac.showcase_url || ""),
+      editable_prompt_override: promptNode ? promptNode.value : (vac.editable_prompt_override || ""),
       source_words: getVal("#leadgen-vac-source-words", vac.source_words || ""),
       source_stop: getVal("#leadgen-vac-source-stop", vac.source_stop || ""),
       extra_chats: Array.isArray(vac.extra_chats) ? vac.extra_chats : [],
       pause_between_chats: Number(vac.pause_between_chats) || 1.5,
+    },
+    ru_experts: {
+      ...ruExp,
+      enabled: ruEnabled,
+      target_campaign: getVal("#leadgen-ru-experts-campaign", ruExp.target_campaign || "РФ-Эксперты (Продюсирование) — TG"),
+      exclude_from_airtable: true,
+      ig_to_tg_enabled: getCheck("#leadgen-ru-experts-ig-tg", true),
+      daily_limit: getNum("#leadgen-ru-experts-daily-limit", 20, 0, 500),
+      min_subs: getNum("#leadgen-ru-experts-min-subs", 1000, 0, 10000000),
+      max_subs: getNum("#leadgen-ru-experts-max-subs", 50000, 0, 10000000),
+      niches: _splitListText(getVal("#leadgen-ru-experts-niches", "")),
+      stop_words: _splitListText(getVal("#leadgen-ru-experts-stop-words", "")),
+      seed_channels: _splitListText(getVal("#leadgen-ru-experts-seed-channels", "")),
+      seed_chats: _splitListText(getVal("#leadgen-ru-experts-seed-chats", "")),
     },
     cases_bank_md: casesNode ? casesNode.value : (cfg.cases_bank_md || ""),
   };
@@ -13439,9 +13655,16 @@ function bindLeadgenEvents() {
     });
   }
 
-  const leadgenSec = document.querySelector("#leadgen");
+  const leadgenSec = document.querySelector("#leadgen-settings-modal");
   if (leadgenSec) {
     leadgenSec.addEventListener("change", (e) => {
+      if (e.target && e.target.id === "leadgen-src-ru-experts-shortcut") {
+        const mainCb = document.querySelector("#leadgen-ru-experts-enabled");
+        if (mainCb) mainCb.checked = Boolean(e.target.checked);
+      } else if (e.target && e.target.id === "leadgen-ru-experts-enabled") {
+        const shortCb = document.querySelector("#leadgen-src-ru-experts-shortcut");
+        if (shortCb) shortCb.checked = Boolean(e.target.checked);
+      }
       if (e.target && e.target.matches('input[type="checkbox"], #leadgen-total-quota')) {
         syncLeadgenSwitchBadges();
       }
@@ -14474,6 +14697,8 @@ function buildCampaignCellCard(campaign) {
       ]),
       el("div", { className: "campaign-cell-badges" }, [
         ...channelBadges,
+        segmentBadgeEl(campaign.segment),
+        campaign.language ? el("span", { className: "badge manual-queue-lang-badge" }, [String(campaign.language).toUpperCase()]) : null,
         el("span", { className: `badge ${st.badgeClass}` }, [st.badgeLabel]),
         leadgenCellBadge,
       ].filter(Boolean)),
@@ -14628,6 +14853,9 @@ function renderOutreachCampaigns() {
 
 function renderCampaigns() {
   renderLeadgenHealthStrip();
+  if (typeof populateCampaignTemplatesSelect === "function") {
+    populateCampaignTemplatesSelect();
+  }
   return renderOutreachCampaigns();
 }
 
@@ -15357,6 +15585,755 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+/* =========================================================================
+ * Outreach v2 UI: Segment Filters, Inbox v2 Bridge, Manual Queues,
+ * Enrichment Budget Card & Campaign Step Templates Editor
+ * ========================================================================= */
+function updateManualQueueCountBadges() {
+  const leads = Array.isArray(state.leads) ? state.leads : [];
+  const openSocial = state.manualSocialLoaded
+    ? (state.manualSocialQueue || []).length
+    : leads.filter((l) => normalizeLeadSegment(l.segment) === "social_manual" && !isLeadStatusClosed(l.status) && l.status !== "contacted").length;
+  const openJobs = state.assistedJobsLoaded
+    ? (state.assistedJobsQueue || []).length
+    : leads.filter((l) => normalizeLeadSegment(l.segment) === "vacancy_assisted" && !isLeadStatusClosed(l.status) && l.status !== "contacted").length;
+  const setBadge = (sel, val) => {
+    const node = document.querySelector(sel);
+    if (node) node.textContent = String(val);
+  };
+  setBadge("#manual-social-count-badge", openSocial);
+  setBadge("#assisted-jobs-count-badge", openJobs);
+  setBadge("#outreach-social-queue-count", openSocial);
+  setBadge("#outreach-job-queue-count", openJobs);
+}
+
+function _cacheDialogSegmentsFromList(rows) {
+  if (!Array.isArray(rows)) return;
+  if (!state.inboxDialogSegmentMap || typeof state.inboxDialogSegmentMap !== "object") {
+    state.inboxDialogSegmentMap = {};
+  }
+  rows.forEach((d) => {
+    if (!d || typeof d !== "object") return;
+    const seg = normalizeLeadSegment(d.segment);
+    if (!seg || !SEGMENT_META[seg]) return;
+    const uname = String(d.username || "").trim().replace(/^@+/, "").toLowerCase();
+    const nameKey = String(d.name || d.title || "").trim().toLowerCase();
+    if (uname) state.inboxDialogSegmentMap[`u:${uname}`] = seg;
+    if (nameKey) state.inboxDialogSegmentMap[`n:${nameKey}`] = seg;
+    if (d.id != null) state.inboxDialogSegmentMap[`id:${d.id}`] = seg;
+  });
+}
+
+function _resolveSegmentForRenderedDialog(nameText, previewText) {
+  const unameMatch = String(previewText || "").match(/^@([A-Za-z0-9_]+)/);
+  const uname = unameMatch ? unameMatch[1].toLowerCase() : "";
+  const cleanName = String(nameText || "").trim().toLowerCase();
+  const map = state.inboxDialogSegmentMap || {};
+  if (uname && map[`u:${uname}`]) return map[`u:${uname}`];
+  if (cleanName && map[`n:${cleanName}`]) return map[`n:${cleanName}`];
+  const leads = Array.isArray(state.leads) ? state.leads : [];
+  const lead = leads.find((l) => {
+    if (!l) return false;
+    const lu = String(l.username || "").trim().replace(/^@+/, "").toLowerCase();
+    if (uname && lu && lu === uname) return true;
+    const ln = String(l.name || "").trim().toLowerCase();
+    return Boolean(cleanName && ln && ln === cleanName);
+  });
+  const seg = normalizeLeadSegment(lead && lead.segment);
+  return SEGMENT_META[seg] ? seg : "";
+}
+
+let inboxV2DecorateRaf = 0;
+function decorateInboxV2DialogRows() {
+  const root = document.querySelector("#inbox-v2-root");
+  if (!root) return;
+  const rows = root.querySelectorAll("#dialog-results button.dialog");
+  rows.forEach((btn) => {
+    const metaRow = btn.querySelector(".dialog-meta-row");
+    if (!metaRow) return;
+    const nameNode = btn.querySelector(".dialog-name-row .name");
+    const previewNode = btn.querySelector(".preview");
+    const seg = _resolveSegmentForRenderedDialog(
+      nameNode ? nameNode.textContent : "",
+      previewNode ? previewNode.textContent : "",
+    );
+    if (seg) {
+      if (metaRow.getAttribute("data-lead-segment") !== seg) {
+        metaRow.setAttribute("data-lead-segment", seg);
+      }
+    } else if (metaRow.hasAttribute("data-lead-segment")) {
+      metaRow.removeAttribute("data-lead-segment");
+    }
+  });
+}
+
+function scheduleInboxV2SegmentDecorate() {
+  if (inboxV2DecorateRaf) return;
+  inboxV2DecorateRaf = window.requestAnimationFrame(() => {
+    inboxV2DecorateRaf = 0;
+    decorateInboxV2DialogRows();
+  });
+}
+
+function syncInboxSegmentPillStates() {
+  const activeSeg = normalizeLeadSegment(state.inboxSegmentFilter);
+  document.querySelectorAll("[data-inbox-segment], [data-inbox-v2-segment]").forEach((btn) => {
+    const seg = normalizeLeadSegment(btn.getAttribute("data-inbox-segment") ?? btn.getAttribute("data-inbox-v2-segment"));
+    const isAct = seg === activeSeg;
+    btn.classList.toggle("is-active", isAct);
+    btn.setAttribute("aria-pressed", isAct ? "true" : "false");
+  });
+}
+
+function applyInboxSegmentFilter(segKey) {
+  state.inboxSegmentFilter = normalizeLeadSegment(segKey);
+  syncInboxSegmentPillStates();
+  if (isInboxV2Active() && window.__INBOX_V2_BRIDGE__ && typeof window.__INBOX_V2_BRIDGE__.refresh === "function") {
+    window.__INBOX_V2_BRIDGE__.refresh();
+    return;
+  }
+  loadInbox({ query: state.inboxSearchQuery || "" }).catch((err) => toast(err.message, "error"));
+}
+
+function ensureInboxV2SegmentToolbar() {
+  const host = document.querySelector("#inbox-v2-host");
+  if (!host || host.dataset.inboxV2 !== "mounted") return;
+  if (document.querySelector("#inbox-v2-segment-toolbar")) return;
+  const root = document.querySelector("#inbox-v2-root");
+  const bar = el("div", {
+    id: "inbox-v2-segment-toolbar",
+    className: "inbox-v2-segment-toolbar",
+    role: "region",
+    "aria-label": "Сегменты входящих",
+  }, [
+    el("span", { className: "inbox-v2-segment-toolbar-label" }, ["Сегмент:"]),
+    el("div", { className: "segment-filter-bar", role: "group", "aria-label": "Фильтр входящих по сегменту" },
+      SEGMENT_PILL_OPTIONS.map(([segVal, segTitle]) => (
+        el("button", {
+          type: "button",
+          className: `chip seg-filter-pill${normalizeLeadSegment(state.inboxSegmentFilter) === segVal ? " is-active" : ""}`,
+          "data-inbox-v2-segment": segVal,
+          "aria-pressed": normalizeLeadSegment(state.inboxSegmentFilter) === segVal ? "true" : "false",
+          onclick: () => applyInboxSegmentFilter(segVal),
+        }, [segTitle])
+      )),
+    ),
+  ]);
+  if (root && root.parentElement === host) {
+    host.insertBefore(bar, root);
+  } else {
+    host.prepend(bar);
+  }
+}
+
+function installInboxSegmentFetchBridge() {
+  if (window.__INBOX_SEGMENT_FETCH_WRAPPED__ || typeof window.fetch !== "function") return;
+  window.__INBOX_SEGMENT_FETCH_WRAPPED__ = true;
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async function wrappedInboxSegmentFetch(input, init) {
+    let targetInput = input;
+    let isInboxCall = false;
+    try {
+      const rawUrl = typeof input === "string"
+        ? input
+        : (input && typeof input.url === "string" ? input.url : "");
+      if (rawUrl) {
+        const parsed = new URL(rawUrl, window.location.origin);
+        if (parsed.origin === window.location.origin && (parsed.pathname === "/api/inbox" || parsed.pathname === "/api/inbox/unified")) {
+          isInboxCall = true;
+          if (state.inboxSegmentFilter && !parsed.searchParams.has("segment")) {
+            parsed.searchParams.set("segment", state.inboxSegmentFilter);
+            const nextUrl = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+            targetInput = typeof input === "string" ? nextUrl : new Request(nextUrl, input);
+          }
+        }
+      }
+    } catch (_err) { /* pass through unmodified */ }
+    const response = await origFetch(targetInput, init);
+    if (isInboxCall && response && response.ok && typeof response.clone === "function") {
+      response.clone().json().then((payload) => {
+        const list = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.dialogs) ? payload.dialogs : []);
+        _cacheDialogSegmentsFromList(list);
+        scheduleInboxV2SegmentDecorate();
+      }).catch(() => {});
+    }
+    return response;
+  };
+}
+
+function setupInboxV2SegmentIntegration() {
+  const host = document.querySelector("#inbox-v2-host");
+  if (!host) return;
+  if (host.dataset.inboxV2 === "mounted") {
+    ensureInboxV2SegmentToolbar();
+    scheduleInboxV2SegmentDecorate();
+  }
+  const observer = new MutationObserver(() => {
+    if (host.dataset.inboxV2 === "mounted") {
+      ensureInboxV2SegmentToolbar();
+      scheduleInboxV2SegmentDecorate();
+    }
+  });
+  observer.observe(host, {
+    attributes: true,
+    attributeFilter: ["data-inbox-v2"],
+    childList: true,
+    subtree: true,
+  });
+}
+
+async function copyTextToClipboard(text) {
+  const val = String(text || "");
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(val);
+      return true;
+    } catch (_err) { /* fallback below */ }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = val;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.append(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_err) {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+function _inferManualPlatformLabel(item) {
+  const url = String(item.manual_action_url || "").toLowerCase();
+  if (url.includes("hh.ru")) return "hh.ru";
+  if (url.includes("profi.ru")) return "Profi.ru";
+  if (url.includes("kwork.ru")) return "Kwork";
+  if (url.includes("upwork.com")) return "Upwork";
+  if (url.includes("linkedin.com")) return "LinkedIn";
+  if (url.includes("instagram.com")) return "Instagram";
+  if (url.includes("x.com") || url.includes("twitter.com")) return "X";
+  return item.lead_source || "";
+}
+
+function renderManualQueueSection(queueType = state.leadsSubView) {
+  const isSocial = queueType === "social_manual";
+  const items = isSocial ? (state.manualSocialQueue || []) : (state.assistedJobsQueue || []);
+  const titleEl = document.querySelector("#manual-queues-title");
+  const subEl = document.querySelector("#manual-queue-subtitle");
+  const badgeEl = document.querySelector("#manual-queue-active-badge");
+  const emptyEl = document.querySelector("#manual-queue-empty-msg");
+  const gridEl = document.querySelector("#manual-queue-grid");
+  if (!gridEl) return;
+
+  if (titleEl) {
+    titleEl.textContent = isSocial ? "Manual Social Queue" : "Assisted Job Queue";
+  }
+  if (subEl) {
+    subEl.textContent = isSocial
+      ? "Крупные бренды без TG/WA (ICP ≥ 85): быстрый 1-строчный перевод из X / LinkedIn / Instagram в мессенджер."
+      : "Закрытые биржи и работные сайты (hh.ru / Profi.ru / Kwork / Upwork): готовый отклик в 1 клик.";
+  }
+
+  const q = String(state.manualQueueSearch || "").trim().toLowerCase();
+  const filtered = items.filter((item) => {
+    if (!q) return true;
+    const hay = [
+      item.company,
+      item.name,
+      item.manual_action_url,
+      item.manual_draft_text,
+      item.lead_source,
+      item.company_domain,
+    ].filter(Boolean).join(" ").toLowerCase();
+    return hay.includes(q);
+  });
+
+  if (badgeEl) badgeEl.textContent = `${filtered.length} карточек`;
+
+  if (!filtered.length) {
+    gridEl.replaceChildren();
+    if (emptyEl) {
+      emptyEl.textContent = q
+        ? "По запросу ничего не найдено"
+        : (isSocial ? "Очередь Manual Social Queue пока пуста" : "Очередь Assisted Job Queue пока пуста");
+    }
+    setView("#manual-queue-view", "empty");
+    return;
+  }
+
+  setView("#manual-queue-view", "filled");
+  gridEl.replaceChildren(
+    ...filtered.map((item) => {
+      const title = item.company || item.name || `Лид #${item.id}`;
+      const subParts = [];
+      if (item.name && item.name !== title) subParts.push(item.name);
+      const platformLabel = _inferManualPlatformLabel(item);
+      if (platformLabel) subParts.push(platformLabel);
+      if (item.company_domain) subParts.push(item.company_domain);
+      const poolVal = Number(item.pool_usd) || 0;
+      const lang = String(item.language || (isSocial ? "en" : "ru")).toUpperCase();
+      const actionHref = safeHref(item.manual_action_url || "");
+      const draftText = String(item.manual_draft_text || "").trim();
+
+      const copyBtn = el("button", {
+        type: "button",
+        className: "btn secondary sm",
+        "data-copy-manual-draft": String(item.id),
+        onclick: async () => {
+          if (!draftText) {
+            toast("Текст черновика пуст", "error");
+            return;
+          }
+          const ok = await copyTextToClipboard(draftText);
+          if (ok) {
+            const orig = copyBtn.textContent;
+            copyBtn.textContent = "✓ Скопировано";
+            toast("Текст отклика скопирован", "ok");
+            window.setTimeout(() => {
+              copyBtn.textContent = orig;
+            }, 1800);
+          } else {
+            toast("Не удалось скопировать в буфер обмена", "error");
+          }
+        },
+      }, ["Копировать текст"]);
+
+      const markSentBtn = el("button", {
+        type: "button",
+        className: "btn primary sm",
+        "data-mark-manual-sent": String(item.id),
+        onclick: async () => {
+          markSentBtn.disabled = true;
+          try {
+            await api(`/api/leads/${encodeURIComponent(String(item.id))}/mark-manual-sent`, {
+              method: "POST",
+              body: {},
+            });
+            if (isSocial) {
+              state.manualSocialQueue = (state.manualSocialQueue || []).filter((x) => Number(x.id) !== Number(item.id));
+            } else {
+              state.assistedJobsQueue = (state.assistedJobsQueue || []).filter((x) => Number(x.id) !== Number(item.id));
+            }
+            updateManualQueueCountBadges();
+            renderManualQueueSection(queueType);
+            loadLeads(state.leadQuery || "", state.selectedLeadId, true).catch(() => {});
+            toast("Отправлено вручную · лид переведён в ожидание", "ok");
+          } catch (error) {
+            markSentBtn.disabled = false;
+            toast(error.message || "Не удалось отметить отправку", "error");
+          }
+        },
+      }, ["Отправлено вручную"]);
+
+      return el("article", {
+        className: "manual-queue-card",
+        "data-queue-lead-id": String(item.id),
+      }, [
+        el("div", { className: "manual-queue-card-head" }, [
+          el("div", { className: "manual-queue-card-title" }, [
+            el("strong", {}, [title]),
+            subParts.length ? el("span", { className: "hint" }, [subParts.join(" · ")]) : null,
+          ].filter(Boolean)),
+          el("div", { className: "manual-queue-badges" }, [
+            segmentBadgeEl(item.segment || (isSocial ? "social_manual" : "vacancy_assisted")),
+            el("span", { className: "badge manual-queue-lang-badge" }, [lang]),
+            poolVal > 0 ? el("span", { className: "badge b-won" }, [`$${poolVal.toLocaleString("en-US")} pool`]) : null,
+          ].filter(Boolean)),
+        ]),
+        el("pre", { className: "manual-queue-draft" }, [draftText || "Текст отклика ещё не сгенерирован."]),
+        el("div", { className: "manual-queue-actions" }, [
+          actionHref
+            ? el("a", {
+              className: "btn secondary sm",
+              href: actionHref,
+              target: "_blank",
+              rel: "noopener",
+            }, ["Открыть ↗"])
+            : el("span", { className: "hint" }, ["Нет ссылки"]),
+          copyBtn,
+          markSentBtn,
+        ]),
+      ]);
+    }),
+  );
+}
+
+async function loadManualSocialQueue() {
+  setView("#manual-queue-view", "loading");
+  try {
+    const res = await api("/api/queues/manual-social");
+    const items = Array.isArray(res) ? res : (res && (res.items || res.leads) ? (res.items || res.leads) : []);
+    state.manualSocialQueue = items;
+    state.manualSocialLoaded = true;
+    updateManualQueueCountBadges();
+    if (state.leadsSubView === "social_manual") {
+      renderManualQueueSection("social_manual");
+    }
+  } catch (error) {
+    const errEl = document.querySelector("#manual-queue-error");
+    if (errEl) errEl.textContent = error.message || "Ошибка загрузки Manual Social Queue";
+    setView("#manual-queue-view", "error");
+  }
+}
+
+async function loadAssistedJobsQueue() {
+  setView("#manual-queue-view", "loading");
+  try {
+    const res = await api("/api/queues/assisted-jobs");
+    const items = Array.isArray(res) ? res : (res && (res.items || res.leads) ? (res.items || res.leads) : []);
+    state.assistedJobsQueue = items;
+    state.assistedJobsLoaded = true;
+    updateManualQueueCountBadges();
+    if (state.leadsSubView === "vacancy_assisted") {
+      renderManualQueueSection("vacancy_assisted");
+    }
+  } catch (error) {
+    const errEl = document.querySelector("#manual-queue-error");
+    if (errEl) errEl.textContent = error.message || "Ошибка загрузки Assisted Job Queue";
+    setView("#manual-queue-view", "error");
+  }
+}
+
+function ensureManualQueueLoaded(queueType) {
+  if (queueType === "social_manual") {
+    if (!state.manualSocialLoaded) {
+      loadManualSocialQueue();
+    } else {
+      renderManualQueueSection("social_manual");
+    }
+  } else if (queueType === "vacancy_assisted") {
+    if (!state.assistedJobsLoaded) {
+      loadAssistedJobsQueue();
+    } else {
+      renderManualQueueSection("vacancy_assisted");
+    }
+  }
+}
+
+function renderEnrichmentBudget(data) {
+  const b = data && typeof data === "object" ? data : {};
+  const spent = Number(b.spent_usd ?? b.total_usd ?? 0) || 0;
+  const cap = Number(b.daily_cap_usd ?? 5.0) || 5.0;
+  const tregBal = b.treg_balance_usd;
+  const monidBal = b.monid_balance_usd;
+  const paidAllowed = b.paid_allowed !== false;
+  const warnBal = Number(b.low_balance_warn_usd ?? 2.0) || 2.0;
+
+  const spentEl = document.querySelector("#leadgen-budget-spent-value");
+  if (spentEl) spentEl.textContent = `$${spent.toFixed(2)} / $${cap.toFixed(2)}`;
+
+  const fillEl = document.querySelector("#leadgen-budget-progress-fill");
+  if (fillEl) {
+    const pct = cap > 0 ? Math.min(100, Math.round((spent / cap) * 100)) : 0;
+    fillEl.style.width = `${pct}%`;
+    fillEl.className = `lg-budget-bar-fill${!paidAllowed || pct >= 100 ? " is-stop" : (pct >= 80 ? " is-warn" : "")}`;
+  }
+
+  const fmtBal = (val) => (val == null || Number.isNaN(Number(val)) ? "н/д" : `$${Number(val).toFixed(2)}`);
+  const tregEl = document.querySelector("#leadgen-treg-balance");
+  if (tregEl) {
+    tregEl.textContent = fmtBal(tregBal);
+    tregEl.style.color = (tregBal != null && Number(tregBal) < warnBal) ? "var(--warning)" : "";
+  }
+  const monidEl = document.querySelector("#leadgen-monid-balance");
+  if (monidEl) {
+    monidEl.textContent = fmtBal(monidBal);
+    monidEl.style.color = (monidBal != null && Number(monidBal) < warnBal) ? "var(--warning)" : "";
+  }
+
+  const hitsEl = document.querySelector("#leadgen-budget-hits");
+  if (hitsEl) {
+    const calls = Number(b.calls ?? 0) || 0;
+    const hits = Number(b.hits ?? 0) || 0;
+    hitsEl.textContent = `${hits} / ${calls}`;
+  }
+
+  const badge = document.querySelector("#leadgen-paid-layer-badge");
+  if (badge) {
+    if (!paidAllowed) {
+      badge.className = "badge b-bad";
+      badge.textContent = b.stop_reason ? `Платный слой: Пауза (${b.stop_reason})` : "Платный слой: Пауза";
+    } else if (b.low_balance_warning) {
+      badge.className = "badge b-wait";
+      badge.textContent = "Платный слой: Активен (низкий баланс)";
+    } else {
+      badge.className = "badge b-ok";
+      badge.textContent = "Платный слой: Активен";
+    }
+  }
+}
+
+async function loadEnrichmentBudget({ refresh = false } = {}) {
+  try {
+    const res = await api(`/api/leadgen/enrichment-budget${refresh ? "?refresh=1" : ""}`);
+    state.enrichmentBudget = res;
+    renderEnrichmentBudget(res);
+    return res;
+  } catch (error) {
+    const badge = document.querySelector("#leadgen-paid-layer-badge");
+    if (badge) {
+      badge.className = "badge b-off";
+      badge.textContent = error.message || "Бюджет недоступен";
+    }
+    return null;
+  }
+}
+
+function _parseCampaignTemplates(campaign) {
+  let raw = campaign && (campaign.custom_step_templates || campaign.custom_step_templates_json);
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch (_err) {
+      raw = null;
+    }
+  }
+  const obj = raw && typeof raw === "object" ? raw : {};
+  const steps = Array.isArray(campaign && campaign.steps) ? campaign.steps : [];
+  const stepText = (order) => {
+    const found = steps.find((s) => Number(s.step_order) === order) || steps[order - 1];
+    return found ? String(found.template_text || "") : "";
+  };
+  return {
+    step1: String(obj.step1 ?? stepText(1) ?? ""),
+    step2: String(obj.step2 ?? stepText(2) ?? ""),
+    step3: String(obj.step3 ?? stepText(3) ?? ""),
+    system_prompt: String(obj.system_prompt ?? ""),
+    showcase_url: String(obj.showcase_url ?? ""),
+  };
+}
+
+function loadSelectedCampaignTemplatesIntoForm() {
+  const select = document.querySelector("#campaign-tpl-select");
+  const metaHost = document.querySelector("#campaign-tpl-meta");
+  const statusEl = document.querySelector("#campaign-tpl-status");
+  if (!select) return;
+  if (statusEl) {
+    statusEl.hidden = true;
+    statusEl.textContent = "";
+  }
+  const cid = Number(select.value);
+  const camp = (state.campaigns || []).find((c) => Number(c.id) === cid) || null;
+  if (metaHost) {
+    metaHost.replaceChildren();
+    if (camp) {
+      const segBadge = segmentBadgeEl(camp.segment);
+      if (segBadge) metaHost.append(segBadge);
+      if (camp.language) {
+        metaHost.append(el("span", { className: "badge manual-queue-lang-badge" }, [String(camp.language).toUpperCase()]));
+      }
+      if (Number(camp.exclude_from_airtable || 0) === 1 || normalizeLeadSegment(camp.segment) === "ru_expert") {
+        metaHost.append(el("span", { className: "badge b-won" }, ["Без Airtable"]));
+      }
+      metaHost.append(el("span", { className: "badge b-new" }, [camp.status || "draft"]));
+    }
+  }
+  const tpl = camp ? _parseCampaignTemplates(camp) : { step1: "", step2: "", step3: "", system_prompt: "", showcase_url: "" };
+  const setVal = (sel, v) => {
+    const node = document.querySelector(sel);
+    if (node) node.value = v;
+  };
+  setVal("#campaign-tpl-step1", tpl.step1);
+  setVal("#campaign-tpl-step2", tpl.step2);
+  setVal("#campaign-tpl-step3", tpl.step3);
+  setVal("#campaign-tpl-system-prompt", tpl.system_prompt);
+  setVal("#campaign-tpl-showcase-url", tpl.showcase_url);
+}
+
+function populateCampaignTemplatesSelect() {
+  const select = document.querySelector("#campaign-tpl-select");
+  if (!select) return;
+  const prevVal = select.value;
+  const camps = Array.isArray(state.campaigns) ? state.campaigns : [];
+  select.replaceChildren();
+  if (!camps.length) {
+    select.append(el("option", { value: "" }, ["Нет кампаний"]));
+    loadSelectedCampaignTemplatesIntoForm();
+    return;
+  }
+  camps.forEach((c) => {
+    const segTxt = segmentLabel(c.segment);
+    const langTxt = c.language ? String(c.language).toUpperCase() : "";
+    const meta = [segTxt, langTxt].filter(Boolean).join(" · ");
+    select.append(
+      el("option", { value: String(c.id) }, [meta ? `${c.name} [${meta}]` : c.name]),
+    );
+  });
+  if (prevVal && camps.some((c) => String(c.id) === String(prevVal))) {
+    select.value = prevVal;
+  } else {
+    select.value = String(camps[0].id);
+  }
+  loadSelectedCampaignTemplatesIntoForm();
+}
+
+async function saveCampaignTemplates(button) {
+  const select = document.querySelector("#campaign-tpl-select");
+  const statusEl = document.querySelector("#campaign-tpl-status");
+  const campaignId = select ? Number(select.value) : 0;
+  if (!campaignId) {
+    toast("Выберите кампанию", "error");
+    return;
+  }
+  const getVal = (sel) => {
+    const node = document.querySelector(sel);
+    return node ? node.value : "";
+  };
+  const payload = {
+    step1: getVal("#campaign-tpl-step1"),
+    step2: getVal("#campaign-tpl-step2"),
+    step3: getVal("#campaign-tpl-step3"),
+    system_prompt: getVal("#campaign-tpl-system-prompt"),
+    showcase_url: getVal("#campaign-tpl-showcase-url").trim(),
+  };
+  if (button) button.disabled = true;
+  if (statusEl) {
+    statusEl.hidden = true;
+    statusEl.textContent = "";
+  }
+  try {
+    const res = await api(`/api/campaigns/${encodeURIComponent(String(campaignId))}/templates`, {
+      method: "PUT",
+      body: payload,
+    });
+    const camp = (state.campaigns || []).find((c) => Number(c.id) === campaignId);
+    if (camp && res && res.templates) {
+      camp.custom_step_templates = res.templates;
+      camp.custom_step_templates_json = JSON.stringify(res.templates);
+    }
+    if (statusEl) {
+      statusEl.className = "msg";
+      statusEl.textContent = "Шаблоны кампании сохранены";
+      statusEl.hidden = false;
+    }
+    toast("Шаблоны кампании сохранены", "ok");
+  } catch (error) {
+    if (statusEl) {
+      statusEl.className = "msg";
+      statusEl.textContent = error.message || "Ошибка сохранения шаблонов";
+      statusEl.hidden = false;
+    }
+    toast(error.message || "Ошибка сохранения шаблонов", "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function switchLeadgenModalTab(tabKey = "budget") {
+  document.querySelectorAll("[data-lg-tab]").forEach((btn) => {
+    const isAct = btn.getAttribute("data-lg-tab") === tabKey;
+    btn.setAttribute("aria-selected", isAct ? "true" : "false");
+  });
+  const panes = {
+    budget: document.querySelector("#lg-pane-budget"),
+    vacancies: document.querySelector("#lg-pane-vacancies"),
+    ru_experts: document.querySelector("#lg-pane-ru-experts"),
+    templates: document.querySelector("#lg-pane-templates"),
+  };
+  Object.entries(panes).forEach(([k, pane]) => {
+    if (pane) pane.hidden = k !== tabKey;
+  });
+}
+
+function closeLeadgenSettingsModal() {
+  const modal = document.querySelector("#leadgen-settings-modal");
+  if (!modal) return;
+  if (typeof modal.close === "function" && modal.open) {
+    modal.close();
+  } else {
+    modal.removeAttribute("open");
+    modal.hidden = true;
+  }
+}
+
+async function openLeadgenSettingsModal(defaultTab = "budget") {
+  const modal = document.querySelector("#leadgen-settings-modal");
+  if (!modal) return;
+  switchLeadgenModalTab(defaultTab);
+  modal.hidden = false;
+  if (typeof modal.showModal === "function") {
+    if (!modal.open) modal.showModal();
+  } else {
+    modal.setAttribute("open", "");
+  }
+  await Promise.all([
+    loadLeadgenConfig(),
+    loadEnrichmentBudget(),
+    (!state.campaigns || !state.campaigns.length) ? loadCampaigns().catch(() => {}) : Promise.resolve(),
+  ]);
+  populateCampaignTemplatesSelect();
+}
+
+function bindOutreachV2Events() {
+  document.querySelector("#leads-segment-pills")?.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-leads-segment]");
+    if (!btn) return;
+    const seg = normalizeLeadSegment(btn.getAttribute("data-leads-segment"));
+    state.leadsSegmentFilter = seg;
+    document.querySelectorAll("#leads-segment-pills [data-leads-segment]").forEach((b) => {
+      const act = normalizeLeadSegment(b.getAttribute("data-leads-segment")) === seg;
+      b.classList.toggle("is-active", act);
+      b.setAttribute("aria-pressed", act ? "true" : "false");
+    });
+    if (state.leadsSubView === "social_manual" || state.leadsSubView === "vacancy_assisted") {
+      state.leadsSubView = "kanban";
+      syncSheetVisibility({ preserveScroll: true });
+    }
+    loadLeads(state.leadQuery || "", state.selectedLeadId).catch((err) => toast(err.message, "error"));
+  });
+
+  document.querySelector("#inbox-segment-pills")?.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-inbox-segment]");
+    if (!btn) return;
+    applyInboxSegmentFilter(btn.getAttribute("data-inbox-segment") || "");
+  });
+
+  document.querySelector("#manual-queue-refresh-btn")?.addEventListener("click", () => {
+    if (state.leadsSubView === "social_manual") loadManualSocialQueue();
+    else if (state.leadsSubView === "vacancy_assisted") loadAssistedJobsQueue();
+  });
+
+  document.querySelector("#manual-queue-search")?.addEventListener("input", (event) => {
+    state.manualQueueSearch = event.target.value || "";
+    renderManualQueueSection(state.leadsSubView);
+  });
+
+  document.querySelector("#outreach-open-social-queue-btn")?.addEventListener("click", () => {
+    state.leadsSubView = "social_manual";
+    activateSheet("leads", state.viewMode === "sheet");
+  });
+
+  document.querySelector("#outreach-open-job-queue-btn")?.addEventListener("click", () => {
+    state.leadsSubView = "vacancy_assisted";
+    activateSheet("leads", state.viewMode === "sheet");
+  });
+
+  document.querySelector("#open-leadgen-settings-btn")?.addEventListener("click", () => {
+    openLeadgenSettingsModal("budget");
+  });
+
+  document.querySelector("#leadgen-settings-close-btn")?.addEventListener("click", closeLeadgenSettingsModal);
+  document.querySelector("#leadgen-budget-refresh-btn")?.addEventListener("click", () => {
+    loadEnrichmentBudget({ refresh: true }).then(() => toast("Балансы обновлены", "ok"));
+  });
+
+  document.querySelectorAll("[data-lg-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      switchLeadgenModalTab(btn.getAttribute("data-lg-tab") || "budget");
+    });
+  });
+
+  document.querySelector("#campaign-tpl-select")?.addEventListener("change", loadSelectedCampaignTemplatesIntoForm);
+  document.querySelector("#campaign-tpl-save-btn")?.addEventListener("click", (e) => saveCampaignTemplates(e.currentTarget));
+}
+
+installInboxSegmentFetchBridge();
+setupInboxV2SegmentIntegration();
+bindOutreachV2Events();
 bindV5Events();
 bindLeadgenEvents();
 bindFunnelEvents();

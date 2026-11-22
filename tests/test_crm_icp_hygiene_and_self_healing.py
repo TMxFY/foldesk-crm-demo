@@ -361,7 +361,7 @@ def test_mcp_ingest_gate_direct_x_leads_and_outreach_step1_step2_barriers(
     # Check DEFAULT_LEADGEN_CONFIG defaults
     assert "shopifyeasy" not in DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_new"]
     assert "solofounders" not in DEFAULT_LEADGEN_CONFIG["b2b"]["tg_groups_old"]
-    assert DEFAULT_LEADGEN_CONFIG["b2b"]["limits"]["external_limit"] == 0
+    assert DEFAULT_LEADGEN_CONFIG["b2b"]["limits"]["external_limit"] == 40
 
     conn = connect(tmp_path / "mcp_outreach_gate.db")
     init_db(conn)

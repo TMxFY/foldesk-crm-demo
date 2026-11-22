@@ -6,6 +6,62 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+WHALE_SEGMENT = "whale"
+NON_WHALE_SEGMENTS = frozenset(
+    {
+        "vacancy",
+        "client_reels",
+        "ru_expert",
+        "ofm",
+        "vacancy_assisted",
+        "social_manual",
+    }
+)
+
+HARD_PLATFORM_GAMING_CATEGORIES = frozenset(
+    {
+        "gaming / roblox",
+        "gaming / fortnite",
+        "gaming / fivem",
+        "roblox",
+        "fortnite",
+        "fivem",
+        "uefn",
+    }
+)
+
+WHALE_REJECTED_CATEGORIES = frozenset(
+    {
+        "gaming",
+        "gamedev",
+        "gamefi",
+        "p2e",
+        "game studio",
+        "gaming studio",
+        "low-cpm gaming",
+        "mobile games",
+        "pc games",
+        "геймдев",
+        "игровая студия",
+        "игры / геймдев",
+        "solopreneur",
+        "solopreneurs",
+        "indie hacker",
+        "indie hackers",
+        "hobby / indie",
+        "hobby project",
+        "micro-arbitrage",
+        "micro arbitrage",
+        "low-margin e-com",
+        "cheap e-com",
+        "cheap goods",
+        "dropshipping",
+        "дропшиппинг",
+        "мелкий арбитраж",
+    }
+    | HARD_PLATFORM_GAMING_CATEGORIES
+)
+
 REJECTED_BUYER_CATEGORIES = frozenset(
     {
         "агентство",
@@ -16,6 +72,7 @@ REJECTED_BUYER_CATEGORIES = frozenset(
         "инфра",
         "инфраструктура / dev",
     }
+    | HARD_PLATFORM_GAMING_CATEGORIES
 )
 
 NON_BUYER_ROLES = frozenset(
@@ -147,7 +204,7 @@ PLATFORM_GARBAGE_COMPANY_NAMES = frozenset(
 
 # Unconditional vendor / agency / freelancer / spammer / dev-only / forum-collab signals.
 # These ALWAYS win, even if the bio also says "Founder", "CEO", "hiring", or "my community".
-_UNCONDITIONAL_SUPPLY_OR_AGENCY = re.compile(
+_EXPLICIT_AGENCY_OR_FOR_HIRE_PATTERNS = (
     r"got accepted into.{0,40}content rewards|my (?:last|next) payout|"
     r"getting paid for (?:my|our) content|revenue sharing program|"
     r"original content rewards|clipster withdrawal|x pays creators|@xcreators|"
@@ -171,14 +228,6 @@ _UNCONDITIONAL_SUPPLY_OR_AGENCY = re.compile(
     r"разрабатываем\s+ии-агентов|создаю\s+автономных\s+ии-агентов|"
     r"сервис\s+информационной\s+безопасности|разработк\w*\s+(?:ботов|телеграм-ботов|tg-ботов|сайтов)|"
     r"seo-аудит,\s*продвижение\s+и\s+создание\s+сайтов|"
-    r"free,?\s+open[- ]source|\bopen[- ]source\s+(?:mac\s+app|app|cli|tool|library|framework|engine|слой)\b|"
-    r"\bmit\s+licens\w*\b|\bapache[\s-]+2\.0\b|\bclaude\s+skills?\b|\bvibecoded\b|"
-    r"\bngrok\s+alternative\b|\bcontainer\s+runtime\b|\bcodebase\s+knowledge\s+graph\b|"
-    r"движок\s+графов\s+знаний(?:\s+кодовой\s+базы)?|"
-    r"синхронизирует\s+ai[- ]кодинг[- ]агентов|\bкодинг[- ]агентов\b|"
-    r"\baccount\s+recovery\s+apis?\b|\bethical\s+hacking\b|\bbacklink\s+indexing\b|"
-    r"\btelegram\s+bot\s+setup\b|"
-    r"\bjava\s+build\s+tool\b|\bold\s+css\s+hack\b|"
     r"\[open\]|\[(?:builder|modeler|scripter|animator)s?\s+needed\]|"
     r"looking\s+for\s+(?:a\s+|an\s+)?(?:new\s+)?(?:experienced\s+)?(?:3d\s+modeler|modeler|builder|scripter)\b|"
     r"design\s+an\s+asym\s+map|"
@@ -186,13 +235,36 @@ _UNCONDITIONAL_SUPPLY_OR_AGENCY = re.compile(
     r"\$\s*\d+\s*(?:per|/)\s*(?:clip|video|gig)\b|\bper\s+gig\b|"
     r"\[for\s*hire\]|\bfor\s+hire\b|\bopen\s+to\s+work\b|"
     r"looking\s+for\s+(?:a\s+)?job|looking\s+for\s+work|ищу\s+работу|ищу\s+заказы|"
-    r"партн[её]р,\s*не\s*ца|сервис\s*/\s*агентство",
+    r"партн[её]р,\s*не\s*ца|сервис\s*/\s*агентство"
+)
+_OSS_OR_DEVTOOL_SUPPLY_PATTERNS = (
+    r"free,?\s+open[- ]source|\bopen[- ]source\s+(?:mac\s+app|app|cli|tool|library|framework|engine|sdk|слой)\b|"
+    r"\bmit\s+licens\w*\b|\bapache[\s-]+2\.0\b|\bclaude\s+skills?\b|\bvibecoded\b|"
+    r"\bngrok\s+alternative\b|\bcontainer\s+runtime\b|\bcodebase\s+knowledge\s+graph\b|"
+    r"движок\s+графов\s+знаний(?:\s+кодовой\s+базы)?|"
+    r"синхронизирует\s+ai[- ]кодинг[- ]агентов|\bкодинг[- ]агентов\b|"
+    r"\baccount\s+recovery\s+apis?\b|\bethical\s+hacking\b|\bbacklink\s+indexing\b|"
+    r"\btelegram\s+bot\s+setup\b|"
+    r"\bjava\s+build\s+tool\b|\bold\s+css\s+hack\b"
+)
+_EXPLICIT_AGENCY_OR_FOR_HIRE_RE = re.compile(_EXPLICIT_AGENCY_OR_FOR_HIRE_PATTERNS, re.I)
+_UNCONDITIONAL_SUPPLY_OR_AGENCY = re.compile(
+    f"{_EXPLICIT_AGENCY_OR_FOR_HIRE_PATTERNS}|{_OSS_OR_DEVTOOL_SUPPLY_PATTERNS}",
+    re.I,
+)
+_VACANCY_FOR_HIRE_SPAM_RE = re.compile(
+    r"\[for\s*hire\]|\bfor\s+hire\b|\bopen\s+to\s+work\b|"
+    r"looking\s+for\s+(?:a\s+)?job|looking\s+for\s+work|ищу\s+работу|ищу\s+заказы",
     re.I,
 )
 
 _UGC_CREATOR_RE = re.compile(r"\bugc\s+creator\b", re.I)
 _BUYING_UGC_CREATOR_RE = re.compile(
-    r"\b(?:looking\s+for|hiring|need|seeking|hire|find)\s+(?:a\s+|an\s+|some\s+)?ugc\s+creators?\b",
+    r"(?:"
+    r"\b(?:looking\s+for|hiring|need|seeking|hire|find)\s+(?:a\s+|an\s+|some\s+)?ugc\s+creators?\b"
+    r"|(?:\b(?:ищем|ищу|нужен|нужна|нужны|нужно|требуется|требуются|найти|найд[её]м|подбор|поиск|вакансия|заказ\s+на|заказать)\b"
+    r"(?:\s+(?!работ\w*\b|заказ\w*\b)[а-яёa-z0-9\-]+){0,3}\s+ugc(?:\s*[-—]?\s*creators?)?)"
+    r")",
     re.I,
 )
 
@@ -242,6 +314,7 @@ def is_supply_side(text: str) -> bool:
 
 
 def is_rejected_buyer_category(category: str | None) -> bool:
+    """True for non-ICP/agency/dev and hard platform-gaming (Roblox/Fortnite/FiveM/UEFN) categories."""
     cat = " ".join(str(category or "").strip().lower().split())
     if not cat:
         return False
@@ -255,8 +328,50 @@ def is_rejected_buyer_category(category: str | None) -> bool:
             "партнер, не ца",
             "низкий приоритет",
             "инфраструктура / dev",
+            "roblox",
+            "fortnite",
+            "fivem",
+            "uefn",
         )
     )
+
+
+def is_whale_rejected_category(category: str | None) -> bool:
+    """True for categories rejected under the Whale ICP gate (generic gaming, solo, cheap e-com, etc.)."""
+    if is_rejected_buyer_category(category):
+        return True
+    cat = " ".join(str(category or "").strip().lower().split())
+    if not cat or cat == "gaming / ai":
+        return False
+    if cat in WHALE_REJECTED_CATEGORIES:
+        return True
+    if any(
+        tok in cat
+        for tok in (
+            "game studio",
+            "gaming studio",
+            "low-cpm",
+            "mobile game",
+            "pc game",
+            "gamedev",
+            "gamefi",
+            "геймдев",
+            "игровая студия",
+            "solopreneur",
+            "indie hacker",
+            "hobby project",
+            "micro-arbitrage",
+            "micro arbitrage",
+            "low-margin",
+            "cheap e-com",
+            "cheap goods",
+            "dropship",
+            "дропшиппинг",
+            "мелкий арбитраж",
+        )
+    ):
+        return True
+    return bool(re.search(r"\bgaming\b", cat))
 
 
 def is_raw_cohort_tag(value: str | None) -> bool:
@@ -415,54 +530,319 @@ _COMMON_PERSON_LAST_NAMES = frozenset(
 )
 
 
+_WHALE_HIGH_SCALE_REV_RE = re.compile(
+    r"(?:\$\s*(?:[2-9]\d\s*k|\d{3,}\s*k|[1-9](?:\.\d+)?\s*m|[2-9]\d,\d{3}|\d{3,},\d{3})\b|"
+    r"\b(?:series\s+[a-d]|arr\s*\$?\s*[1-9]\d*m|\d+\+?\s*(?:employees|team\s+members))\b)",
+    re.I,
+)
+_WHALE_ZERO_OR_NO_REV_RE = re.compile(
+    r"(?:"
+    r"\b(?:no\s+revenue|without\s+revenue|zero\s+revenue|0\s+revenue|pre[- ]?revenue|"
+    r"unmonetized|no\s+paying\s+(?:users|customers)|no\s+marketing\s+budget|zero\s+budget)\b"
+    r"|\$\s*0(?:\.0+)?\s*(?:mrr|arr|revenue|rev|sales)\b"
+    r"|без\s+выручки|нет\s+выручки|нулев\w+\s+выручк\w*|без\s+монетизации|без\s+бюджета"
+    r")",
+    re.I,
+)
+_HARD_PLATFORM_GAMING_BAN_RE = re.compile(
+    r"(?:"
+    r"\broblox\b|\brobux\b|\bdevforum\.roblox\b|\bbloxburg\b|\bobby\s+game\b"
+    r"|\bfortnite\b|\buefn\b|\bfortnite\s+creative\b|\bmap\s+code\b"
+    r"|\bfivem\b|\bcfx\.re\b|\bgta\s*(?:rp|roleplay|5|v|6)\b|\broleplay\s+server\b|\bgame\s+server\b"
+    r"|\bminecraft\s+(?:server|mod|mods|plugin|plugins|smp|realm)\b"
+    r"|роблокс\w*|фортнайт\w*|файвм\w*|игровой\s+сервер\w*|рп[- ]сервер\w*"
+    r")",
+    re.I,
+)
+_HARD_PLATFORM_GAMING_URL_RE = re.compile(
+    r"(?:roblox\.com|devforum\.roblox\.com|fivem\.net|fivem-server\.org|cfx\.re|"
+    r"fortnite\.com|epicgames\.com/fn)",
+    re.I,
+)
+_WHALE_GENERIC_GAMING_BAN_RE = re.compile(
+    r"(?:"
+    r"\blow[- ]?cpm(?:\s+(?:gam\w*|studio\w*|niche\w*|traffic))?\b"
+    r"|\b(?:mobile|pc|console|indie|hyper[- ]?casual|casual|free|browser|web3|p2e|play[- ]?to[- ]?earn|rpg|arcade|puzzle|shooter)\s+(?:[\w\.]+\s+){0,3}gam(?:e|es|ing)\b"
+    r"|\b(?:space\s+shooter|multiplayer\s+shooter|browser\s+game|\.io\s+game)\b"
+    r"|\b(?:gam(?:e|ing)|gamedev|game[- ]?dev)\s+(?:studio|studios|publisher|company|developer)s?\b"
+    r"|\b(?:gamefi|play[- ]?to[- ]?earn|mmorpg|roguelike)\b"
+    r"|игров\w*\s+студи\w*|геймдев\w*(?:\s+студи\w*)?"
+    r"|мобильн\w*\s+игр\w*|пк[- ]игр\w*|инди[- ]игр\w*"
+    r")",
+    re.I,
+)
+_WHALE_GAMING_URL_RE = re.compile(
+    r"(?:roblox\.com|devforum\.roblox\.com|fivem\.net|fivem-server\.org|cfx\.re|"
+    r"store\.steampowered\.com|fortnite\.com|epicgames\.com/fn)",
+    re.I,
+)
+_WHALE_SOLOPRENEUR_BAN_RE = re.compile(
+    r"(?:"
+    r"\bsolopreneurs?\b|солопрен[её]р\w*|соло[- ]?предпринимател\w*"
+    r"|\b(?:hobby|weekend|pet)\s+(?:project|app|saas|tool|site|product|indie|startup)s?\b"
+    r"|\bhobby\s+indie\b|\bindie\s+hobby\b|\bhobbyist\b"
+    r"|хобби[- ]?проект\w*|пет[- ]?проект\w*"
+    r")",
+    re.I,
+)
+_WHALE_INDIE_UNSCALED_RE = re.compile(
+    r"(?:"
+    r"\bindie\s*hackers?\b|\bindie\s+(?:maker|dev|developer|builder)s?\b"
+    r"|\bsolo\s+(?:founder|dev|developer|maker|builder)s?\b"
+    r"|\bbuild(?:ing)?\s+in\s+public\b|#buildinpublic\b|\bside\s+projects?\b"
+    r"|инди[- ]?хакер\w*|инди[- ]?разработчик\w*|соло[- ]?фаундер\w*"
+    r")",
+    re.I,
+)
+_WHALE_LOW_MARGIN_OR_ARBITRAGE_RE = re.compile(
+    r"(?:"
+    r"\bmicro[- ]?arbitrage\b|\btraffic\s+arbitrage\b|\bad\s+arbitrage\b"
+    r"|мелк\w*\s+арбитраж\w*|арбитраж\s+трафик\w*|\bp2p\s+арбитраж\w*"
+    r"|\blow[- ]?margin\s+(?:e-?com\w*|dtc|d2c|goods|products?|store|shop|brand|retail|merch|gadgets?|items?)\b"
+    r"|\bcheap\s+(?:e-?com\w*|goods|products?|merch|gadgets?|dropship\w*|trinkets|accessories|items?|stuff|phone\s+cases?)\b"
+    r"|\b(?:dropship|dropshipping|dropshipper|ali-?express\s+(?:store|shop|resell\w*|gadgets?)|temu\s+(?:resell\w*|store|goods))\b"
+    r"|\b(?:one[- ]?product|1[- ]?product|single[- ]?product)\s+(?:store|shop|shopify|dropship\w*)\b"
+    r"|\b(?:low[- ]?ltv|ltv\s*(?:under|below|<|<=)\s*\$?\s*(?:[1-4]?\d)\b|aov\s*(?:under|below|<|<=)\s*\$?\s*(?:1\d|[1-9])\b)"
+    r"|\$\s*[1-9](?:\.\d{1,2})?\s+(?:gadgets?|phone\s+cases?|keychains?|stickers?|trinkets?|accessories|socks)\b"
+    r"|деш[её]в\w*\s+(?:товар\w*|еком|e-?com|дропшип\w*|безделушк\w*|гаджет\w*)"
+    r"|низкомаржинальн\w*|дропшиппинг\w*|товарка\s+с\s+(?:садовода|али|1688|таобао)"
+    r")",
+    re.I,
+)
+
+_ROW_TEXT_KEYS = (
+    "name",
+    "username",
+    "company",
+    "project",
+    "bio",
+    "sample",
+    "text",
+    "title",
+    "excerpt",
+    "description",
+    "note",
+    "ad_title",
+    "ad_text",
+    "what_they_do",
+    "their_angle",
+    "our_angle",
+)
+
+
+def _extract_row_blob_and_category(
+    text_or_row: str | Mapping[str, Any] | None,
+    *,
+    category: str | None = None,
+) -> tuple[str, str, Mapping[str, Any] | None]:
+    if isinstance(text_or_row, Mapping):
+        cat = category if category is not None else str(
+            text_or_row.get("category") or text_or_row.get("niche") or ""
+        )
+        parts = [
+            val.strip()
+            for key in _ROW_TEXT_KEYS
+            for val in (text_or_row.get(key),)
+            if isinstance(val, str) and val.strip()
+        ]
+        return "\n".join(parts), cat, text_or_row
+    return str(text_or_row or ""), str(category or ""), None
+
+
+def _hard_platform_gaming_reject_reason(
+    blob: str,
+    cat: str,
+    row: Mapping[str, Any] | None,
+) -> str:
+    if row is not None:
+        for url_key in ("project_url", "website", "site", "url", "source_url"):
+            u_val = str(row.get(url_key) or "").strip()
+            if u_val:
+                um = _HARD_PLATFORM_GAMING_URL_RE.search(u_val)
+                if um:
+                    return f"hard_gaming_url:{um.group(0)}"
+    if is_rejected_buyer_category(cat):
+        return f"rejected_category:{cat}"
+    hm = _HARD_PLATFORM_GAMING_BAN_RE.search(blob)
+    if hm:
+        return f"hard_gaming:{hm.group(0)}"
+    return ""
+
+
+def whale_icp_reject_reason(
+    text_or_row: str | Mapping[str, Any] | None,
+    *,
+    category: str | None = None,
+) -> str:
+    """Return a non-empty reject reason when a lead violates Whale ICP exclusions."""
+    blob, cat, row = _extract_row_blob_and_category(text_or_row, category=category)
+    if row is not None:
+        seg = str(row.get("segment") or "").strip().lower()
+        if seg in NON_WHALE_SEGMENTS:
+            return ""
+        raw_ltv = row.get("ltv_usd")
+        if raw_ltv is not None and str(raw_ltv).strip() != "":
+            try:
+                ltv_val: float | None = float(raw_ltv)
+            except (TypeError, ValueError):
+                ltv_val = None
+            if ltv_val is not None and 0 < ltv_val < 50:
+                return f"whale_reject:low_ltv_usd:{ltv_val:g}"
+        for url_key in ("project_url", "website", "site", "url", "source_url"):
+            u_val = str(row.get(url_key) or "").strip()
+            if u_val:
+                um = _WHALE_GAMING_URL_RE.search(u_val)
+                if um:
+                    return f"whale_reject:gaming_url:{um.group(0)}"
+
+    if is_whale_rejected_category(cat):
+        return f"whale_reject:category:{cat}"
+
+    cat_low = " ".join(cat.strip().lower().split())
+    mon_low = str((row or {}).get("monetization") or "").strip().lower()
+    blob_no_legacy_cat = re.sub(r"\bgaming\s*/\s*ai\b", " ", blob, flags=re.I)
+    if cat_low == "gaming / ai" and (
+        mon_low == "iap" or re.search(r"\b(?:game|games|gaming)\b", blob_no_legacy_cat, re.I)
+    ):
+        return "whale_reject:gaming_category:Gaming / AI"
+
+    hm = _HARD_PLATFORM_GAMING_BAN_RE.search(blob)
+    if hm:
+        return f"whale_reject:gaming:{hm.group(0)}"
+
+    gm = _WHALE_GENERIC_GAMING_BAN_RE.search(blob)
+    if gm:
+        return f"whale_reject:gaming:{gm.group(0)}"
+
+    zrev = _WHALE_ZERO_OR_NO_REV_RE.search(blob)
+    if zrev:
+        return f"whale_reject:no_revenue:{zrev.group(0)}"
+
+    sm = _WHALE_SOLOPRENEUR_BAN_RE.search(blob)
+    if sm:
+        return f"whale_reject:solopreneur:{sm.group(0)}"
+
+    im = _WHALE_INDIE_UNSCALED_RE.search(blob)
+    if im and not _WHALE_HIGH_SCALE_REV_RE.search(blob):
+        return f"whale_reject:unscaled_indie:{im.group(0)}"
+
+    lm = _WHALE_LOW_MARGIN_OR_ARBITRAGE_RE.search(blob)
+    if lm:
+        return f"whale_reject:low_margin_or_arbitrage:{lm.group(0)}"
+
+    return ""
+
+
 def sniper_reject_reason(
     text_or_row: str | Mapping[str, Any] | None,
     *,
     category: str | None = None,
 ) -> str:
-    """Return a non-empty reject reason for agencies, PR, dev-only OSS, hosting, or modeler threads."""
-    if isinstance(text_or_row, Mapping):
-        cat = category if category is not None else str(
-            text_or_row.get("category") or text_or_row.get("niche") or ""
-        )
+    """Return a non-empty reject reason for agencies, PR, dev-only OSS, hosting, or hard gaming bans.
+
+    Generic gaming/solo/low-margin Whale exclusions live in ``whale_icp_reject_reason`` so
+    legacy manual CSV campaigns (e.g. ``category="Gaming"``) are not blocked by generic checks.
+    Vacancy and ``social_manual`` segments relax benign phrasing (e.g. ``freelancer``,
+    ``portfolio``, ``marketing agency``, ``open-source``, Russian ``Ищем UGC creator``)
+    while still blocking job-seeker spam and hard platform gaming bans.
+    """
+    blob, cat, row = _extract_row_blob_and_category(text_or_row, category=category)
+    seg_norm = str(row.get("segment") or "").strip().lower() if row is not None else ""
+
+    if seg_norm in ("vacancy", "vacancy_assisted", "client_reels"):
         if is_rejected_buyer_category(cat):
             return f"rejected_category:{cat}"
-        role_val = str(text_or_row.get("role") or "").strip()
+        for_hire_m = _VACANCY_FOR_HIRE_SPAM_RE.search(blob)
+        if for_hire_m:
+            return for_hire_m.group(0)
+        hr = _hard_platform_gaming_reject_reason(blob, cat, row)
+        if hr:
+            return hr
+        return ""
+
+    if row is not None:
+        if is_rejected_buyer_category(cat):
+            return f"rejected_category:{cat}"
+        role_val = str(row.get("role") or "").strip()
         if role_val and role_val in NON_BUYER_ROLES:
             return f"non_buyer_role:{role_val}"
-        raw_roles = text_or_row.get("roles")
+        raw_roles = row.get("roles")
         if isinstance(raw_roles, (list, tuple, set)):
             roles_set = {str(x).strip() for x in raw_roles if str(x or "").strip()}
             if roles_set and not (roles_set & {"Founder", "Marketing"}) and (roles_set & NON_BUYER_ROLES):
                 return f"non_buyer_role:{sorted(roles_set & NON_BUYER_ROLES)[0]}"
-        parts: list[str] = []
-        for key in (
-            "name",
-            "username",
-            "company",
-            "project",
-            "bio",
-            "sample",
-            "text",
-            "title",
-            "excerpt",
-            "what_they_do",
-            "their_angle",
-            "our_angle",
-        ):
-            val = text_or_row.get(key)
-            if isinstance(val, str) and val.strip():
-                parts.append(val.strip())
-        blob = "\n".join(parts)
-    else:
-        if category is not None and is_rejected_buyer_category(category):
-            return f"rejected_category:{category}"
-        blob = str(text_or_row or "")
+    elif category is not None and is_rejected_buyer_category(category):
+        return f"rejected_category:{category}"
+
+    if seg_norm == "social_manual":
+        explicit_m = _EXPLICIT_AGENCY_OR_FOR_HIRE_RE.search(blob)
+        if explicit_m:
+            return explicit_m.group(0)
+        ugc_m = _UGC_CREATOR_RE.search(blob)
+        if ugc_m and not _BUYING_UGC_CREATOR_RE.search(blob):
+            return ugc_m.group(0)
+        hr = _hard_platform_gaming_reject_reason(blob, cat, row)
+        if hr:
+            return hr
+        return ""
 
     sr = supply_reason(blob)
     if sr:
         return sr
+    hr = _hard_platform_gaming_reject_reason(blob, cat, row)
+    if hr:
+        return hr
     return ""
+
+
+def classify_whale_segment(
+    row: Mapping[str, Any],
+    *,
+    min_icp_score: int = 80,
+    require_qualified: bool = False,
+) -> str:
+    """Return 'whale' when row passes Whale ICP gates, preserving explicit non-whale segments."""
+    if not isinstance(row, Mapping):
+        return ""
+    existing = str(row.get("segment") or "").strip().lower()
+    if existing in NON_WHALE_SEGMENTS:
+        return existing
+    if require_qualified and row.get("qualified") is not True:
+        return ""
+    if row.get("qualified") is False:
+        return ""
+    mon = str(row.get("monetization") or "").strip().lower()
+    if mon == "none":
+        return ""
+    raw_score = row.get("icp_score")
+    if raw_score is not None:
+        try:
+            score = int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            return ""
+        if score < min_icp_score:
+            return ""
+    if sniper_reject_reason(row) or whale_icp_reject_reason(row):
+        return ""
+    return WHALE_SEGMENT
+
+
+def tag_whale_lead(
+    row: Mapping[str, Any],
+    *,
+    min_icp_score: int = 80,
+    require_qualified: bool = False,
+) -> dict[str, Any]:
+    """Return a copy of row annotated with segment='whale' when eligible."""
+    out = dict(row)
+    seg = classify_whale_segment(
+        out,
+        min_icp_score=min_icp_score,
+        require_qualified=require_qualified,
+    )
+    if seg:
+        out["segment"] = seg
+    return out
 
 
 def _is_human_person_name(value: str, *, person_hint: str = "") -> bool:

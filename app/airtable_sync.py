@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -29,9 +30,11 @@ from app.db import (
     KEY_TO_AIRTABLE_STATUS,
     ROOT,
     as_dict,
+    clean_tg_username_lookup,
     ensure_airtable_pipeline_stages,
     list_pipeline_stages,
     normalize_status,
+    sql_norm_tg_username_expr,
     status_to_airtable,
     utc_now,
 )
@@ -80,6 +83,251 @@ COMPUTED_READONLY_FIELDS = frozenset(
         "Margin",
     }
 )
+
+_EXCLUDED_SEGMENTS = frozenset({"ru_expert"})
+
+
+def _coerce_row_mapping(row: Any) -> dict[str, Any]:
+    """Convert sqlite3.Row, Mapping, or row-like objects safely into a plain dict."""
+    if row is None:
+        return {}
+    if isinstance(row, sqlite3.Row):
+        return {key: row[key] for key in row.keys()}
+    if isinstance(row, Mapping):
+        return dict(row)
+    keys_fn = getattr(row, "keys", None)
+    if callable(keys_fn):
+        return {key: row[key] for key in keys_fn()}
+    return {}
+
+
+def _is_truthy_flag(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    s = str(value).strip().lower()
+    if s in ("", "0", "false", "no", "off", "null", "none"):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return int(float(s)) != 0
+    except ValueError:
+        return False
+
+
+def is_lead_airtable_excluded(
+    lead_row: Mapping[str, Any] | sqlite3.Row | None,
+    campaign_row: Mapping[str, Any] | sqlite3.Row | None = None,
+) -> bool:
+    """Return True when a lead or its linked campaign must be isolated from Airtable."""
+    lead = _coerce_row_mapping(lead_row)
+    if _is_truthy_flag(lead.get("exclude_from_airtable")):
+        return True
+    if str(lead.get("segment") or "").strip().lower() in _EXCLUDED_SEGMENTS:
+        return True
+
+    if campaign_row is not None:
+        campaign = _coerce_row_mapping(campaign_row)
+        if _is_truthy_flag(campaign.get("exclude_from_airtable")):
+            return True
+        if str(campaign.get("segment") or "").strip().lower() in _EXCLUDED_SEGMENTS:
+            return True
+
+    return False
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row[1]) for row in rows if len(row) > 1}
+
+
+def _sql_lead_not_excluded_clause(
+    conn: sqlite3.Connection,
+    *,
+    alias: str = "leads",
+) -> str:
+    """Build a schema-safe SQL predicate excluding isolated leads and campaign members."""
+    lead_cols = _table_columns(conn, "leads")
+    camp_cols = _table_columns(conn, "campaigns")
+    rec_cols = _table_columns(conn, "campaign_recipients")
+
+    clauses: list[str] = []
+    if "exclude_from_airtable" in lead_cols:
+        clauses.append(f"COALESCE({alias}.exclude_from_airtable, 0) = 0")
+    if "segment" in lead_cols:
+        clauses.append(f"lower(trim(COALESCE({alias}.segment, ''))) != 'ru_expert'")
+
+    camp_excl_parts: list[str] = []
+    if "exclude_from_airtable" in camp_cols:
+        camp_excl_parts.append("COALESCE(c.exclude_from_airtable, 0) = 1")
+    if "segment" in camp_cols:
+        camp_excl_parts.append("lower(trim(COALESCE(c.segment, ''))) = 'ru_expert'")
+
+    if camp_excl_parts and "campaign_id" in rec_cols and "id" in camp_cols:
+        link_parts: list[str] = []
+        if "lead_id" in rec_cols and "id" in lead_cols:
+            link_parts.append(f"cr.lead_id = {alias}.id")
+
+        unlinked_parts: list[str] = []
+        if "telegram_user_id" in rec_cols and "telegram_user_id" in lead_cols:
+            unlinked_parts.append(
+                f"({alias}.telegram_user_id IS NOT NULL AND cr.telegram_user_id = {alias}.telegram_user_id)"
+            )
+        if "username" in rec_cols and "username" in lead_cols:
+            norm_cr = sql_norm_tg_username_expr("cr.username")
+            norm_lead = sql_norm_tg_username_expr(f"{alias}.username")
+            unlinked_parts.append(
+                f"({alias}.username IS NOT NULL AND trim({alias}.username) != '' "
+                f"AND cr.username IS NOT NULL AND trim(cr.username) != '' "
+                f"AND {norm_cr} = {norm_lead})"
+            )
+        if "phone" in rec_cols and "phone" in lead_cols:
+            unlinked_parts.append(
+                f"({alias}.phone IS NOT NULL AND trim({alias}.phone) != '' "
+                f"AND cr.phone IS NOT NULL AND trim(cr.phone) != '' "
+                f"AND cr.phone = {alias}.phone)"
+            )
+
+        if unlinked_parts:
+            unlinked_sql = " OR ".join(unlinked_parts)
+            if "lead_id" in rec_cols:
+                link_parts.append(f"(cr.lead_id IS NULL AND ({unlinked_sql}))")
+            else:
+                link_parts.append(f"({unlinked_sql})")
+
+        if link_parts:
+            camp_excl_sql = " OR ".join(camp_excl_parts)
+            link_sql = " OR ".join(link_parts)
+            clauses.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM campaign_recipients cr "
+                "JOIN campaigns c ON c.id = cr.campaign_id "
+                f"WHERE ({camp_excl_sql}) AND ({link_sql})"
+                ")"
+            )
+
+    return " AND ".join(clauses) if clauses else "1=1"
+
+
+def _get_linked_campaigns_for_lead(
+    conn: sqlite3.Connection,
+    lead: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    camp_cols = _table_columns(conn, "campaigns")
+    rec_cols = _table_columns(conn, "campaign_recipients")
+    if not camp_cols or not rec_cols or "campaign_id" not in rec_cols or "id" not in camp_cols:
+        return []
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    lead_id = lead.get("id")
+    has_lead_id_col = "lead_id" in rec_cols
+
+    if lead_id is not None and has_lead_id_col:
+        clauses.append("cr.lead_id = ?")
+        params.append(int(lead_id))
+
+    unlinked_prefix = "cr.lead_id IS NULL AND " if has_lead_id_col else ""
+    tg_uid = lead.get("telegram_user_id")
+    if tg_uid is not None and "telegram_user_id" in rec_cols:
+        clauses.append(f"({unlinked_prefix}cr.telegram_user_id = ?)")
+        params.append(int(tg_uid))
+
+    norm_uname = clean_tg_username_lookup(lead.get("username"))
+    if norm_uname and "username" in rec_cols:
+        norm_expr = sql_norm_tg_username_expr("cr.username")
+        clauses.append(f"({unlinked_prefix}cr.username IS NOT NULL AND {norm_expr} = ?)")
+        params.append(norm_uname)
+
+    raw_phone = str(lead.get("phone") or "").strip()
+    if raw_phone and "phone" in rec_cols:
+        clauses.append(f"({unlinked_prefix}cr.phone = ?)")
+        params.append(raw_phone)
+
+    campaigns: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    if clauses:
+        sql = (
+            "SELECT DISTINCT c.* "
+            "FROM campaign_recipients cr "
+            "JOIN campaigns c ON c.id = cr.campaign_id "
+            f"WHERE {' OR '.join(clauses)} "
+            "ORDER BY c.id ASC"
+        )
+        for row in conn.execute(sql, params).fetchall():
+            camp = _coerce_row_mapping(row)
+            cid = int(camp["id"])
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                campaigns.append(camp)
+
+    phone_digits = re.sub(r"\D", "", raw_phone)[-15:] if raw_phone else ""
+    if len(phone_digits) >= 7 and "phone" in rec_cols:
+        unlinked_cond = "cr.lead_id IS NULL AND " if has_lead_id_col else ""
+        phone_rows = conn.execute(
+            f"SELECT cr.phone AS cr_phone, c.* "
+            f"FROM campaign_recipients cr "
+            f"JOIN campaigns c ON c.id = cr.campaign_id "
+            f"WHERE {unlinked_cond}cr.phone IS NOT NULL AND trim(cr.phone) != ''"
+        ).fetchall()
+        for row in phone_rows:
+            rd = _coerce_row_mapping(row)
+            cr_digits = re.sub(r"\D", "", str(rd.pop("cr_phone", "") or ""))[-15:]
+            if cr_digits == phone_digits:
+                cid = int(rd["id"])
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    campaigns.append(rd)
+
+    return campaigns
+
+
+def _is_db_lead_airtable_excluded(
+    conn: sqlite3.Connection,
+    lead: Mapping[str, Any] | sqlite3.Row | None,
+) -> bool:
+    lead_dict = _coerce_row_mapping(lead)
+    if is_lead_airtable_excluded(lead_dict):
+        return True
+    for camp in _get_linked_campaigns_for_lead(conn, lead_dict):
+        if is_lead_airtable_excluded(lead_dict, camp):
+            return True
+    return False
+
+
+def _select_airtable_push_candidates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    lead_cols = _table_columns(conn, "leads")
+    excl_sql = _sql_lead_not_excluded_clause(conn, alias="l")
+    folder_guard = "AND l.folder_id IS NULL" if "folder_id" in lead_cols else ""
+    rows = conn.execute(
+        f"""
+        SELECT l.* FROM leads l
+        WHERE (
+            (
+                (l.airtable_record_id IS NULL OR trim(l.airtable_record_id) = '')
+                {folder_guard}
+            )
+            OR (
+                l.airtable_record_id IS NOT NULL
+                AND trim(l.airtable_record_id) != ''
+                AND l.updated_at > COALESCE(l.airtable_synced_at, '')
+            )
+        )
+          AND ({excl_sql})
+        ORDER BY l.id ASC
+        """
+    ).fetchall()
+    return [
+        lead
+        for r in rows
+        for lead in (_coerce_row_mapping(r),)
+        if not _is_db_lead_airtable_excluded(conn, lead)
+    ]
 
 
 def _read_dotenv_values() -> dict[str, str]:
@@ -961,12 +1209,13 @@ def _resolve_related_lead_id(
         rec_ids = [str(x).strip() for x in related_lead_field if str(x).strip()]
     elif isinstance(related_lead_field, str):
         rec_ids = [related_lead_field.strip()]
+    excl_sql = _sql_lead_not_excluded_clause(conn, alias="l")
     for rec_id in rec_ids:
         row = conn.execute(
-            "SELECT id FROM leads WHERE airtable_record_id = ? LIMIT 1",
+            f"SELECT l.* FROM leads l WHERE l.airtable_record_id = ? AND ({excl_sql}) LIMIT 1",
             (rec_id,),
         ).fetchone()
-        if row is not None:
+        if row is not None and not _is_db_lead_airtable_excluded(conn, row):
             return int(row["id"])
     return None
 
@@ -1143,6 +1392,8 @@ def pull_from_airtable(
         existing = _find_matching_crm_lead(conn, mapped)
 
         if existing is not None:
+            if _is_db_lead_airtable_excluded(conn, existing):
+                continue
             lead_id = int(existing["id"])
             is_dirty = bool(
                 (
@@ -1317,15 +1568,19 @@ def pull_from_airtable(
         if isinstance(r, dict) and str(r.get("id") or "").strip()
     }
     if isinstance(records, list) and remote_rec_ids:
+        excl_sql = _sql_lead_not_excluded_clause(conn, alias="l")
         linked_rows = conn.execute(
-            """
-            SELECT id, airtable_record_id, updated_at, airtable_synced_at
-            FROM leads
-            WHERE airtable_record_id IS NOT NULL AND trim(airtable_record_id) != ''
+            f"""
+            SELECT l.*
+            FROM leads l
+            WHERE l.airtable_record_id IS NOT NULL AND trim(l.airtable_record_id) != ''
+              AND ({excl_sql})
             """
         ).fetchall()
         stale_ids = []
         for lrow in linked_rows:
+            if _is_db_lead_airtable_excluded(conn, lrow):
+                continue
             lid = int(lrow["id"])
             rec_id = str(lrow["airtable_record_id"] or "").strip()
             if not rec_id or rec_id in remote_rec_ids:
@@ -1419,6 +1674,10 @@ def _find_remote_airtable_record(
     conn: sqlite3.Connection | None = None,
     remote_index: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if is_lead_airtable_excluded(lead) or (
+        conn is not None and _is_db_lead_airtable_excluded(conn, lead)
+    ):
+        return None
     target_username = _clean_username(lead.get("username"))
     raw_phone = str(lead.get("phone") or "").strip()
     target_digits = re.sub(r"\D", "", raw_phone)[-15:] if raw_phone else ""
@@ -1472,6 +1731,16 @@ def push_lead_to_airtable(
     if row is None:
         raise LookupError("lead")
     lead = as_dict(row)
+    if _is_db_lead_airtable_excluded(conn, lead):
+        return {
+            "ok": True,
+            "action": "skipped_excluded",
+            "excluded": True,
+            "skipped": True,
+            "reason": "excluded_from_airtable",
+            "lead_id": int(lead_id),
+            "airtable_record_id": None,
+        }
     composed_note = compose_lead_notes_text(conn, lead)
     if composed_note:
         lead["note"] = composed_note
@@ -1616,7 +1885,7 @@ def push_calendar_date_to_airtable(
         )
         rec_id = (lead.get("airtable_record_id") or "").strip() or None
         pushed = False
-        if rec_id:
+        if rec_id and not _is_db_lead_airtable_excluded(conn, lead):
             if client is None:
                 client = AirtableRestClient()
             table_name = getattr(client, "table_name", None) or DEFAULT_TABLE_NAME
@@ -1728,21 +1997,7 @@ def sync_airtable(
     table_name_for_sync = getattr(client, "table_name", None) or DEFAULT_TABLE_NAME
     preloaded_records: list[dict[str, Any]] | None = None
     if norm_dir in ("both", "push"):
-        dirty_rows = conn.execute(
-            """
-            SELECT id, airtable_record_id FROM leads
-            WHERE (
-                (airtable_record_id IS NULL OR trim(airtable_record_id) = '')
-                AND folder_id IS NULL
-            )
-               OR (
-                airtable_record_id IS NOT NULL
-                AND trim(airtable_record_id) != ''
-                AND updated_at > COALESCE(airtable_synced_at, '')
-            )
-            ORDER BY id ASC
-            """
-        ).fetchall()
+        dirty_rows = _select_airtable_push_candidates(conn)
         remote_index: dict[str, Any] | None = None
         remote_by_id: dict[str, dict[str, Any]] = {}
         if dirty_rows or norm_dir == "both":
@@ -1756,12 +2011,12 @@ def sync_airtable(
             for r_obj in preloaded_records:
                 if isinstance(r_obj, dict) and str(r_obj.get("id") or "").strip():
                     remote_by_id[str(r_obj["id"]).strip()] = r_obj
-            if any(not str(r["airtable_record_id"] or "").strip() for r in dirty_rows):
+            if any(not str(r.get("airtable_record_id") or "").strip() for r in dirty_rows):
                 remote_index = _build_remote_airtable_index(conn, preloaded_records)
-        elif any(not str(r["airtable_record_id"] or "").strip() for r in dirty_rows):
+        elif any(not str(r.get("airtable_record_id") or "").strip() for r in dirty_rows):
             remote_index = _build_remote_airtable_index(conn, [])
         for r in dirty_rows:
-            r_id = str(r["airtable_record_id"] or "").strip()
+            r_id = str(r.get("airtable_record_id") or "").strip()
             push_res = push_lead_to_airtable(
                 conn,
                 int(r["id"]),
@@ -1769,7 +2024,7 @@ def sync_airtable(
                 remote_index=remote_index,
                 remote_record=remote_by_id.get(r_id) if r_id else None,
             )
-            if push_res.get("action") != "unchanged":
+            if push_res.get("action") in ("created", "updated"):
                 pushed_to_airtable += 1
 
     if norm_dir in ("both", "pull"):

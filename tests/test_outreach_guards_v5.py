@@ -751,8 +751,8 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
     init_db(conn)
     _seed_two_accounts(conn)
 
-    # Clean DB fallback (before SoftUGC campaign exists): keeps 'Leadgen Auto (TG)' for legacy unit tests
-    assert resolve_target_b2b_tg_campaign_name(conn, "") == "Leadgen Auto (TG)"
+    # Clean DB fallback (when legacy Все2 is unlinked): routes to 'Whales EN — TG'
+    assert resolve_target_b2b_tg_campaign_name(conn, "") == "Whales EN — TG"
 
     # Create SoftUGC — База Все2 (paused, leadgen_enabled=0) and Leadgen Auto (TG)
     camp_auto = create_campaign(
@@ -833,18 +833,27 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
     resp = handle_jsonrpc_message(conn, rpc_req)
     payload = json.loads(resp["result"]["content"][0]["text"])
     assert payload["enrolled_in_campaign"] == 2
-    # B2B lead landed in SoftUGC — База Все2 (#5), NOT in Leadgen Auto (TG) (#4)!
+    # Whale/B2B lead landed in Whales EN — TG, NOT in Leadgen Auto (TG) or legacy SoftUGC — База Все2!
+    whales_camp = conn.execute(
+        "SELECT id FROM campaigns WHERE name = 'Whales EN — TG'"
+    ).fetchone()
+    assert whales_camp is not None
+    whales_camp_id = int(whales_camp["id"])
     vse2_rec = conn.execute(
         "SELECT campaign_id, step1_text, step2_text, step3_text, extra_json FROM campaign_recipients WHERE username = 'pixelquest_founder'"
     ).fetchone()
     assert vse2_rec is not None
-    assert vse2_rec["campaign_id"] == camp_vse2["id"]
-    assert "Custom Sonnet pain paragraph for PixelQuest" in vse2_rec["step1_text"]
+    assert vse2_rec["campaign_id"] == whales_camp_id
+    assert vse2_rec["campaign_id"] != camp_vse2["id"]
+    assert vse2_rec["campaign_id"] != camp_auto["id"]
+    assert "PixelQuest" in vse2_rec["step1_text"]
+    assert "Want to see 3 demo reels for PixelQuest?" in vse2_rec["step1_text"]
+    assert REVSHARE_OFFER_TEXT not in vse2_rec["step1_text"]
     assert "(which equals highly qualified players)" in vse2_rec["step2_text"]
     assert vse2_rec["step3_text"] == VLAD_STEP3_TEXT
     assert json.loads(vse2_rec["extra_json"])["audience"] == "players"
 
-    # Vacancy lead landed in 'TG Вакансии', NOT in SoftUGC — База Все2!
+    # Vacancy lead landed in 'Client Reels & Вакансии RU — TG', NOT in SoftUGC — База Все2!
     vac_rec = conn.execute(
         """
         SELECT cr.step1_text, c.name AS camp_name
@@ -854,12 +863,12 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
         """
     ).fetchone()
     assert vac_rec is not None
-    assert vac_rec["camp_name"] == "TG Вакансии"
+    assert vac_rec["camp_name"] == "Client Reels & Вакансии RU — TG"
     assert vac_rec["step1_text"] == "Привет! Пишу по вакансии рилсмейкера."
 
     # SoftUGC — База Все2 stayed paused with leadgen_enabled=0 even after get_leadgen_config / sync_leadgen_campaigns
     cfg = get_leadgen_config(conn)
-    assert cfg["b2b"]["target_campaign_tg"].startswith("SoftUGC — База Все2")
+    assert cfg["b2b"]["target_campaign_tg"] == "Whales EN — TG"
     sync_leadgen_campaigns(conn, cfg)
     vse2_camp_row = conn.execute(
         "SELECT status, leadgen_enabled FROM campaigns WHERE id = ?", (camp_vse2["id"],)
@@ -868,7 +877,7 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
     assert int(vse2_camp_row["leadgen_enabled"]) == 0
     conn.close()
 
-    # B) crm_mcp_push direct DB mode also routes default 'Leadgen Autopilot' to SoftUGC — База Все2 + claude-sonnet-5
+    # B) crm_mcp_push direct DB mode also routes default 'Leadgen Autopilot' to Whales EN — TG + claude-sonnet-5
     push_items = [
         {
             "username": "directpush_saas",
@@ -885,7 +894,7 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
         campaign_name="Leadgen Autopilot",
         db_path=str(db_path),
     )
-    assert push_res["campaign_id"] == camp_vse2["id"]
+    assert push_res["campaign_id"] == whales_camp_id
     assert "Custom Sonnet pain paragraph for FlowDesk" in push_items[0]["step1_text"]
 
     # C) tg_enrich_leads and tg_curate also invoke claude-sonnet-5 and populate followup_1 / followup_2
@@ -899,7 +908,7 @@ def test_v5_guard5_mcp_and_leadgen_route_b2b_to_softugc_vse2_vacancies_separate_
     assert "Custom Sonnet pain paragraph for ClipRadar" in curated[0]["first_touch"]
     assert curated[0]["followup_2"] == VLAD_STEP3_TEXT
 
-    assert len(sonnet_calls) >= 4
+    assert len(sonnet_calls) >= 3
     assert all(c["model"] == "claude-sonnet-5" for c in sonnet_calls)
 
 

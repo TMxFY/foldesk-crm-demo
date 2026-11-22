@@ -9,6 +9,7 @@ if _WORKTREE_ROOT not in sys.path:
     sys.path.insert(0, _WORKTREE_ROOT)
 
 from app.db import connect, init_db
+from app.leadgen_settings import sync_leadgen_campaigns
 from app.main import create_app
 from app.outreach import get_campaign
 from leadgen.crm_mcp_push import build_lead_payload_from_dict
@@ -90,7 +91,8 @@ def test_get_and_put_leadgen_config_persists_to_db_and_json(test_env):
     assert saved["b2b"]["sources"]["meta_ads"] is False
     assert saved["b2b"]["sources"]["linkedin_jobs"] is False
     assert saved["b2b"]["sources"]["tg_groups"] is True
-    assert saved["b2b"]["tg_groups_new"] == ["solofounderschat", "saas_builders"]
+    assert "solofounderschat" not in saved["b2b"]["tg_groups_new"]
+    assert saved["b2b"]["tg_groups_new"] == ["saas_builders"]
     assert saved["b2b"]["limits"]["yc_limit"] == 80
     assert saved["b2b"]["limits"]["msg_limit"] == 1200
     assert saved["vacancies"]["touch_mode"] == "micro_ping"
@@ -103,7 +105,7 @@ def test_get_and_put_leadgen_config_persists_to_db_and_json(test_env):
     assert cfg_file.exists()
     disk_cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
     assert disk_cfg["total_daily_quota"] == 75
-    assert disk_cfg["b2b"]["tg_groups_new"] == ["solofounderschat", "saas_builders"]
+    assert disk_cfg["b2b"]["tg_groups_new"] == ["saas_builders"]
 
 
 def test_sync_leadgen_campaigns_and_push_now(test_env):
@@ -111,17 +113,23 @@ def test_sync_leadgen_campaigns_and_push_now(test_env):
     conn = test_env["conn"]
     state_dir = test_env["state_dir"]
 
-    # By default vacancies.enabled is False and no WhatsApp accounts exist -> only Leadgen Auto (TG) is created
+    # sync_leadgen_campaigns idempotently provisions the 6 canonical draft segment campaigns
     res_sync = client.post("/api/leadgen/sync-campaigns")
     assert res_sync.status_code == 200
     sync_data = res_sync.json()
     assert sync_data["ok"] is True
-    assert sync_data["synced_count"] == 1
+    assert sync_data["synced_count"] == 6
     names = {c["name"]: c for c in sync_data["campaigns"]}
-    assert "Leadgen Auto (TG)" in names
-    assert "Leadgen Auto (WA)" not in names
+    assert "Whales EN — TG" in names
+    assert "Whales EN — WA" in names
+    assert "Client Reels & Вакансии RU — TG" in names
+    assert "Client Reels & Вакансии RU — WA" in names
+    assert "Client Reels & Вакансии EN — TG" in names
+    assert "РФ-Эксперты (Продюсирование) — TG" in names
     assert "TG Вакансии" not in names
-    tg_camp = names["Leadgen Auto (TG)"]
+
+    tg_camp = names["Whales EN — TG"]
+    assert tg_camp["status"] == "draft"
     assert tg_camp["leadgen_enabled"] is True
     assert tg_camp["daily_limit"] == 30
     assert tg_camp["leadgen_daily_quota"] == 30
@@ -131,9 +139,12 @@ def test_sync_leadgen_campaigns_and_push_now(test_env):
     assert "{audience}" in tg_camp["steps"][1]["template_text"]
     assert tg_camp["steps"][2]["template_text"] == "You’re doing me dirty mate... :((("
     assert tg_camp["steps"][2]["image_url"] == "/media/outreach/4fa85f083f9e2911.jpg"
-    assert [s["delay_hours"] for s in tg_camp["steps"]] == [0, 24, 24]
+    assert [s["delay_hours"] for s in tg_camp["steps"]] == [0, 48, 96]
 
-    # Explicit opt-in to vacancies + connected WhatsApp account creates both Leadgen Auto (WA) and TG Вакансии
+    assert names["Whales EN — WA"]["leadgen_enabled"] is False
+    assert names["Client Reels & Вакансии RU — TG"]["leadgen_enabled"] is False
+
+    # Explicit opt-in to vacancies + connected WhatsApp account enables Whales EN — WA and Client Reels & Вакансии RU — TG
     client.put("/api/leadgen/config", json={"vacancies": {"enabled": True}})
     conn.execute(
         """
@@ -145,13 +156,24 @@ def test_sync_leadgen_campaigns_and_push_now(test_env):
     res_sync_wa = client.post("/api/leadgen/sync-campaigns")
     assert res_sync_wa.status_code == 200
     sync_wa_data = res_sync_wa.json()
-    assert sync_wa_data["synced_count"] == 3
+    assert sync_wa_data["synced_count"] == 6
     names_wa = {c["name"]: c for c in sync_wa_data["campaigns"]}
-    assert "Leadgen Auto (WA)" in names_wa
-    assert len(names_wa["Leadgen Auto (WA)"]["steps"]) == 3
-    assert "TG Вакансии" in names_wa
-    vac_camp = names_wa["TG Вакансии"]
+    assert "Whales EN — WA" in names_wa
+    # Plain POST /api/leadgen/sync-campaigns preserves existing leadgen_enabled flags while updating quotas/steps
+    assert names_wa["Whales EN — WA"]["leadgen_enabled"] is False
+    assert len(names_wa["Whales EN — WA"]["steps"]) == 3
+    assert names_wa["Whales EN — WA"]["steps"][2]["image_url"] is None
+    assert "Client Reels & Вакансии RU — TG" in names_wa
+    vac_camp = names_wa["Client Reels & Вакансии RU — TG"]
+    assert vac_camp["leadgen_enabled"] is False
+    assert vac_camp["leadgen_daily_quota"] == 20
     assert [s["template_text"] for s in vac_camp["steps"]] == ["{first_touch}", "{followup_1}", "{followup_2}"]
+
+    # Explicit sync_leadgen_enabled=True enables Whales EN — WA and Client Reels & Вакансии RU — TG once opted in
+    sync_wa_enabled = sync_leadgen_campaigns(conn, sync_leadgen_enabled=True)
+    names_wa_on = {c["name"]: c for c in sync_wa_enabled["campaigns"]}
+    assert names_wa_on["Whales EN — WA"]["leadgen_enabled"] is True
+    assert names_wa_on["Client Reels & Вакансии RU — TG"]["leadgen_enabled"] is True
 
     # Write local ready vacancy monitor & replies to state_dir and test push-now without LLM
     mon_path = state_dir / "job_monitor_2026-11-06.json"

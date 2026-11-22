@@ -192,13 +192,36 @@ _VACANCY_SOURCE_OR_CAT_RE = re.compile(
     r"(?:ваканс|vacanc|job_monitor|tg[\s_\-]*jobs?\b)",
     re.IGNORECASE,
 )
+_EXPLICIT_JOB_SEEKER_OR_FOR_HIRE_RE = re.compile(
+    r"(?:"
+    r"\[\s*for\s*hire\s*\]|\bfor\s+hire\b|\bopen\s+to\s+work\b"
+    r"|\blooking\s+for\s+(?:a\s+)?(?:job|work)\b"
+    r"|ищу\s+(?:работу|заказы)"
+    r")",
+    re.IGNORECASE,
+)
+_HARD_GAMING_NICHE_RE = re.compile(
+    r"(?:"
+    r"\broblox\b|\brobux\b|\bdevforum\.roblox\b|\bbloxburg\b|\bobby\s+game\b"
+    r"|\bfortnite\b|\buefn\b|\bfortnite\s+creative\b"
+    r"|\bfivem\b|\bcfx\.re\b|\bgta\s*(?:rp|roleplay|5|v|6)\b"
+    r"|roblox\.com|fivem\.net|fivem-server\.org"
+    r")",
+    re.IGNORECASE,
+)
+_BANNED_CASINO_OR_SPAM_RE = re.compile(
+    r"\b(?:matrixreach|matrixreach_bot|firsay|1win(?:\s+partners)?|1xbet|mostbet)\b",
+    re.IGNORECASE,
+)
 _WARM_MANUAL_SOURCE_RE = re.compile(
     r"(?:\breferral\b|реферал|\binbound\b|входящ|рекомендац|\bmanual\b|ручн|\bother\b|\bairtable\b|\bpartner\b|партн[её]р)",
     re.IGNORECASE,
 )
 _COLD_OUTREACH_OR_LEADGEN_SOURCE_RE = re.compile(
     r"(?:cold\s+outreach|leadgen|google\s+sheet|product\s+hunt|\byc\b|hacker\s+news|\bhn\b|"
-    r"meta|ad\s+spy|\btg\b|channel|social|reddit|whop|tiktok|app_store|app_stores|ats_hiring|ph_detailed|"
+    r"meta|ad\s+spy|\btg\b|tg[\s_\-]*jobs?|vacanc\w*|job_monitor|hh_ru|kwork|profi_ru|upwork|"
+    r"ru_experts?|tg_group_admins|buyer_public|"
+    r"channel|social|reddit|whop|tiktok|app_store|app_stores|ats_hiring|ph_detailed|"
     r"d2c_whatsapp|fb_groups|facebook_groups|catalog|linkedin|rea[\s_\-]*video|direct|scrape|github)",
     re.IGNORECASE,
 )
@@ -350,9 +373,11 @@ def _call_external_sniper_reject(
     url: str,
     lead_source: str,
     vacancies_enabled: bool,
+    segment: str = "",
 ) -> str:
     if _external_sniper_reject_reason is None:
         return ""
+    seg_norm = str(segment or "").strip().lower()
     row_payload = {
         "name": name,
         "company": company,
@@ -367,6 +392,8 @@ def _call_external_sniper_reject(
         "source": lead_source,
         "text": blob,
     }
+    if seg_norm:
+        row_payload["segment"] = seg_norm
     res = _external_sniper_reject_reason(row_payload, category=niche or None)
     return str(res or "").strip()
 
@@ -392,6 +419,10 @@ def is_ofm_campaign_name(
     return False
 
 
+_NON_B2B_BUYER_SEGMENTS = frozenset({"vacancy", "vacancy_assisted", "client_reels", "social_manual"})
+_CONTACTLESS_EXEMPT_SEGMENTS = frozenset({"social_manual", "vacancy_assisted", "ru_expert"})
+
+
 def sniper_lead_violation_reason(
     *,
     name: str = "",
@@ -403,7 +434,12 @@ def sniper_lead_violation_reason(
     lead_source: str = "",
     vacancies_enabled: bool = False,
     ofm_enabled: bool = False,
+    segment: str = "",
 ) -> str:
+    seg_norm = str(segment or "").strip().lower()
+    if seg_norm == "ru_expert":
+        return ""
+
     name_s = _fix_mojibake(name).strip()
     company_s = _fix_mojibake(company).strip()
     niche_s = _fix_mojibake(niche).strip()
@@ -417,11 +453,7 @@ def sniper_lead_violation_reason(
         return ""
 
     if ofm_enabled:
-        if re.search(
-            r"\b(?:matrixreach|matrixreach_bot|firsay|1win(?:\s+partners)?|1xbet|mostbet)\b",
-            blob,
-            re.IGNORECASE,
-        ):
+        if _BANNED_CASINO_OR_SPAM_RE.search(blob):
             return "запрещённый спам/казино паттерн в OFM-кампании"
         return ""
 
@@ -444,21 +476,33 @@ def sniper_lead_violation_reason(
         url=url_s,
         lead_source=src_s,
         vacancies_enabled=vacancies_enabled,
+        segment=seg_norm,
     )
     if ext_reason:
         return ext_reason
 
-    m_agency = _FALLBACK_SUPPLY_OR_AGENCY_RE.search(blob)
-    if m_agency:
-        return f"агентство / сервисный подрядчик ({m_agency.group(0).strip()})"
+    if seg_norm in _NON_B2B_BUYER_SEGMENTS:
+        m_job_seeker = _EXPLICIT_JOB_SEEKER_OR_FOR_HIRE_RE.search(blob)
+        if m_job_seeker:
+            return f"соискатель / self-promo ({m_job_seeker.group(0).strip()})"
+        m_hard_game = _HARD_GAMING_NICHE_RE.search(blob)
+        if m_hard_game:
+            return f"запрещённая игровая платформа ({m_hard_game.group(0).strip()})"
+        m_spam = _BANNED_CASINO_OR_SPAM_RE.search(blob)
+        if m_spam:
+            return f"запрещённый спам/казино паттерн ({m_spam.group(0).strip()})"
+    else:
+        m_agency = _FALLBACK_SUPPLY_OR_AGENCY_RE.search(blob)
+        if m_agency:
+            return f"агентство / сервисный подрядчик ({m_agency.group(0).strip()})"
 
-    m_oss = _SNIPER_OSS_OR_DEVTOOL_RE.search(blob)
-    if m_oss:
-        return f"open-source / dev-only утилита ({m_oss.group(0).strip()})"
+        m_oss = _SNIPER_OSS_OR_DEVTOOL_RE.search(blob)
+        if m_oss:
+            return f"open-source / dev-only утилита ({m_oss.group(0).strip()})"
 
-    sup_reason = _ss_supply_reason(blob) if _ss_is_supply_side(blob) else ""
-    if sup_reason:
-        return f"supply-side сервис ({sup_reason.strip()})"
+        sup_reason = _ss_supply_reason(blob) if _ss_is_supply_side(blob) else ""
+        if sup_reason:
+            return f"supply-side сервис ({sup_reason.strip()})"
 
     if not vacancies_enabled:
         m_vac = _SNIPER_MICRO_VACANCY_RE.search(blob)
@@ -659,6 +703,15 @@ def _is_vacancy_or_qa_campaign(camp_name: str | None, leadgen_sources_json: str 
     return False
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    """Return existing column names for a SQLite table without failing on legacy schemas."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row[1]) for row in rows if len(row) > 1}
+
+
 def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
     active_junk_recipients: list[tuple[int, str, dict[str, Any]]] = []
     contactless_leads: list[tuple[int, str, dict[str, Any]]] = []
@@ -709,6 +762,11 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
         status_low = str(ld.get("status") or "").strip().lower()
         lead_source = str(ld.get("lead_source") or "").strip()
         niche_low = str(ld.get("niche") or "").strip().lower()
+        segment = str(ld.get("segment") or "").strip().lower()
+        is_manual_queue_lead = segment in ("social_manual", "vacancy_assisted")
+        is_contactless_exempt = segment in _CONTACTLESS_EXEMPT_SEGMENTS or is_manual_queue_lead
+        is_ru_expert_lead = segment == "ru_expert"
+        vacancies_enabled_for_lead = segment in _NON_B2B_BUYER_SEGMENTS
         uname_ld = _clean_username_token(ld.get("username")).lower()
         is_fb_ofm_lead = (
             lead_source.lower() == "fb_groups"
@@ -739,24 +797,26 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
                 telegram_user_id=ld.get("telegram_user_id"),
             )
             has_dialog = ld.get("dialog_id") is not None and int(ld.get("dialog_id") or 0) > 0
-            if not has_contact and not has_dialog:
+            if not has_contact and not has_dialog and not is_contactless_exempt:
                 contactless_leads.append(
                     (lid, "нет контакта (username/phone/telegram_user_id/dialog_id)", ld)
                 )
 
-            reason = sniper_lead_violation_reason(
-                name=str(ld.get("name") or ""),
-                company=str(ld.get("company") or ""),
-                niche=str(ld.get("niche") or ""),
-                note=str(ld.get("note") or ""),
-                description=str(ld.get("description") or ""),
-                url=str(ld.get("url") or ""),
-                lead_source=lead_source,
-                vacancies_enabled=False,
-                ofm_enabled=is_ofm_lead,
-            )
-            if reason:
-                active_junk_leads.append((lid, reason, ld))
+            if not is_ru_expert_lead:
+                reason = sniper_lead_violation_reason(
+                    name=str(ld.get("name") or ""),
+                    company=str(ld.get("company") or ""),
+                    niche=str(ld.get("niche") or ""),
+                    note=str(ld.get("note") or ""),
+                    description=str(ld.get("description") or ""),
+                    url=str(ld.get("url") or ""),
+                    lead_source=lead_source,
+                    vacancies_enabled=vacancies_enabled_for_lead,
+                    ofm_enabled=is_ofm_lead,
+                    segment=segment,
+                )
+                if reason:
+                    active_junk_leads.append((lid, reason, ld))
 
         if status_low != "won" and is_cold_src and not is_ofm_lead:
             cur_name = str(ld.get("name") or "")
@@ -766,9 +826,16 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
             if new_name != cur_name or new_comp != cur_comp:
                 dirty_title_leads.append((lid, new_name, new_comp, ld))
 
+    camp_cols = _table_columns(conn, "campaigns")
+    camp_seg_expr = (
+        "COALESCE(c.segment, 'b2b') AS camp_segment"
+        if "segment" in camp_cols
+        else "'b2b' AS camp_segment"
+    )
     rec_rows = conn.execute(
-        """
-        SELECT cr.*, c.name AS camp_name, c.leadgen_sources_json AS camp_sources_json
+        f"""
+        SELECT cr.*, c.name AS camp_name, c.leadgen_sources_json AS camp_sources_json,
+               {camp_seg_expr}
         FROM campaign_recipients cr
         JOIN campaigns c ON c.id = cr.campaign_id
         WHERE cr.status IN ('pending', 'in_progress')
@@ -778,9 +845,10 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
     for rr in rec_rows:
         rd = as_dict(rr)
         rid = int(rd["id"])
+        camp_segment = str(rd.get("camp_segment") or "b2b").strip().lower()
         if _is_vacancy_or_qa_campaign(rd.get("camp_name"), rd.get("camp_sources_json")):
             continue
-        is_ofm_rec = is_ofm_campaign_name(rd.get("camp_name"), rd.get("camp_sources_json"))
+        is_ofm_rec = is_ofm_campaign_name(rd.get("camp_name"), rd.get("camp_sources_json")) or camp_segment == "ofm"
         linked_lead = leads_by_id.get(int(rd["lead_id"])) if rd.get("lead_id") is not None else None
         if linked_lead is not None and is_protected_crm_deal(linked_lead):
             continue
@@ -796,6 +864,16 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
             )
             continue
 
+        linked_segment = str((linked_lead or {}).get("segment") or "").strip().lower()
+        if camp_segment == "ru_expert" or linked_segment == "ru_expert":
+            continue
+
+        rec_vacancies_enabled = camp_segment in ("vacancy", "client_reels") or linked_segment in (
+            "vacancy",
+            "vacancy_assisted",
+            "client_reels",
+        )
+        eff_rec_segment = camp_segment if camp_segment and camp_segment != "b2b" else linked_segment
         rec_reason = sniper_lead_violation_reason(
             name=str(rd.get("name") or ""),
             company=str(rd.get("company") or ""),
@@ -804,8 +882,9 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
             description=str((linked_lead or {}).get("description") or ""),
             url=str(rd.get("website") or (linked_lead or {}).get("url") or ""),
             lead_source=str((linked_lead or {}).get("lead_source") or ""),
-            vacancies_enabled=False,
+            vacancies_enabled=rec_vacancies_enabled,
             ofm_enabled=is_ofm_rec,
+            segment=eff_rec_segment,
         )
         if rec_reason:
             active_junk_recipients.append((rid, rec_reason, rd))
