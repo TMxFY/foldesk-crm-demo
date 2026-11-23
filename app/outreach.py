@@ -6772,7 +6772,14 @@ async def run_campaign_batch(
                     and not _is_same_tg_identity(st["raw"], clean_rec_uname, real_rec_peer_id)
                 ]
                 if not available:
-                    if step_idx == 0 and recipient_excluded_accounts:
+                    capped_only_candidates = [
+                        st
+                        for st in globally_available
+                        if st["id"] in phone_direct_capped_accounts
+                        and st["id"] not in recipient_excluded_accounts
+                        and not _is_same_tg_identity(st["raw"], clean_rec_uname, real_rec_peer_id)
+                    ]
+                    if step_idx == 0 and recipient_excluded_accounts and not capped_only_candidates:
                         conn.execute(
                             """
                             UPDATE campaign_recipients

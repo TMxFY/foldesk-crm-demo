@@ -772,3 +772,548 @@ def test_gate_y_blocks_wave_a_regressions(tmp_path: Path) -> None:
     assert "min(12, yc_limit)" in bad.stderr
     assert "enrich_whales_with_tg_group_admins after run_contact_waterfall_with_budget" in bad.stderr
     assert "00,03,06,09,12,15,18,21:15:00 UTC" in bad.stderr
+
+
+def test_icp_score_73_reaches_crm_end_to_end_while_65_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.leadgen_settings import push_discovered_now
+    from app.mcp_server import _handle_ingest_discovered_leads
+
+    conn, state_dir = _setup_env(tmp_path, monkeypatch)
+    cid = int(_seed_running_whales_campaign(conn)["id"])
+    _configure_b2b_for_fast_mock(conn)
+
+    final_jsonl = state_dir / "raw_score73.final.jsonl"
+    dx_jsonl = state_dir / "direct_x_leads.jsonl"
+    final_jsonl.write_text(
+        json.dumps({
+            "username": "score73_ceo",
+            "name": "Sam Founder",
+            "company": "MidScoreCo",
+            "project": "MidScoreCo",
+            "project_url": "https://midscore.io",
+            "category": "SaaS",
+            "their_angle": "Subscription editing workflow",
+            "icp_score": 73,
+            "source": "yc_ph",
+            "segment": "whale",
+            "step1_text": "Saw MidScoreCo. Paid acquisition gets expensive fast.",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    sp = repl.split_tg_and_direct_x_leads(final_jsonl, dx_jsonl)
+    assert sp["tg_wa_kept"] == 1
+    p_res = push_discovered_now(conn)
+    assert p_res["ingested"] == 1
+    assert conn.execute("SELECT id, username FROM leads WHERE username = 'score73_ceo'").fetchone() is not None
+
+    mcp_res = _handle_ingest_discovered_leads(
+        conn,
+        {
+            "campaign_id": cid,
+            "enroll_in_campaign": True,
+            "leads": [
+                {
+                    "username": "mcp_score74",
+                    "name": "Alex Growth",
+                    "company": "App74",
+                    "website": "https://app74.io",
+                    "category": "SaaS",
+                    "their_angle": "Mobile video SaaS",
+                    "icp_score": 74,
+                    "source": "meta_ads",
+                    "segment": "whale",
+                },
+                {
+                    "username": "mcp_score65",
+                    "name": "Low Score",
+                    "company": "Low65",
+                    "website": "https://low65.io",
+                    "category": "SaaS",
+                    "their_angle": "Tiny app",
+                    "icp_score": 65,
+                    "source": "meta_ads",
+                    "segment": "whale",
+                },
+            ],
+        },
+    )
+    assert mcp_res["created_leads"] == 1
+    assert mcp_res["quarantined"] == 1
+    assert conn.execute("SELECT 1 FROM leads WHERE username = 'mcp_score74'").fetchone() is not None
+    assert conn.execute("SELECT 1 FROM leads WHERE username = 'mcp_score65'").fetchone() is None
+    conn.close()
+
+
+def test_web_first_ad_spy_and_channel_graph_emit_none_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from leadgen import crm_mcp_push, tg_ad_spy, tg_channel_graph
+
+    monkeypatch.setattr(
+        tg_ad_spy,
+        "_resolve_tg_target",
+        lambda *_a, **_kw: asyncio.sleep(0, result={
+            "id": 0,
+            "username": "ad_web_ceo",
+            "name": "Ad Web CEO",
+            "company": "AdWebApp",
+            "bio": "Founder of AdWebApp.io",
+            "site": "https://adwebapp.io",
+        }),
+    )
+    ad_rows = asyncio.run(
+        tg_ad_spy.scan_ad_channels(
+            client=None,
+            channels=["hostadchan"],
+            seen_path=str(tmp_path / "ad_seen.json"),
+            output_path=str(tmp_path / "ad_out.jsonl"),
+            delay=0.0,
+            public_posts_fn=lambda _ch, _lim: (
+                {"title": "Host Ad", "about": ""},
+                ["Sponsored: try https://adwebapp.io reach @ad_web_ceo for creators"],
+            ),
+        )
+    )
+    assert len(ad_rows) == 1
+    assert ad_rows[0]["id"] is None
+    assert ad_rows[0]["dedup_id"] > 0
+
+    graph_rows = asyncio.run(
+        tg_channel_graph.crawl_channel_graph(
+            client=None,
+            seeds=["growth_seed_chan"],
+            depth=1,
+            limit=5,
+            state_path=str(tmp_path / "graph_seen.json"),
+            output_path=str(tmp_path / "graph_out.jsonl"),
+            delay=0.0,
+            web_posts_fn=lambda ch, _lim: (
+                {"title": "GrowthSeed", "about": "Founder @graph_web_ceo https://growthseed.io", "subscribers": 2500},
+                [],
+            ),
+            probe_fn=lambda u: {"kind": "user", "title": "Graph CEO", "bio": "SaaS founder"},
+        )
+    )
+    assert len(graph_rows) == 1
+    assert graph_rows[0]["id"] is None
+    assert graph_rows[0]["dedup_id"] > 0
+
+    built = crm_mcp_push.build_lead_payload_from_dict(graph_rows[0])
+    assert built["telegram_user_id"] is None
+
+
+def test_pending_tg_verify_queue_round_trip_excludes_master_and_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, state_dir = _setup_env(tmp_path, monkeypatch)
+    _seed_running_whales_campaign(conn)
+    _configure_b2b_for_fast_mock(
+        conn,
+        limits={"external_limit": 0},
+        sources_override={"yc_ph": False, "buyer_catalogs": True, "tg_groups": False, "tg_identity_bridge": True},
+    )
+    scraper_dir = tmp_path / "scraper_sessions"
+    scraper_dir.mkdir(parents=True, exist_ok=True)
+    ro_sess = scraper_dir / "signals_ro_1.session"
+    ro_sess.write_text("ro", encoding="utf-8")
+    monkeypatch.setenv("SCRAPER_TG_SESSION", str(ro_sess))
+    monkeypatch.setenv("SCRAPER_SESSIONS_DIR", str(scraper_dir))
+
+    # Avoid real network in web probe during verify_personal_tg_handles_live
+    monkeypatch.setattr(repl, "tg_web_client", None)
+
+    class FloodWaitError(Exception):
+        pass
+
+    flood_mode = {"flood": True}
+
+    class _FloodToggleClient:
+        async def get_entity(self, handle: str):
+            if flood_mode["flood"]:
+                raise FloodWaitError("Wait 60s")
+            return SimpleNamespace(id=777001122, bot=False, deleted=False, scam=False, fake=False)
+
+    tg_client_toggle = _FloodToggleClient()
+
+    def wave1_runner(cmd, **kwargs):
+        clist = [str(x) for x in cmd]
+        cstr = " ".join(clist)
+        if "buyer_catalogs.py" in cstr:
+            Path(clist[clist.index("--output") + 1]).write_text(
+                json.dumps({"company": "RetryCo", "project": "RetryCo", "project_url": "https://retryco.io", "work_email": "ceo@retryco.io"}) + "\n",
+                encoding="utf-8",
+            )
+        elif "tg_enrich_leads.py" in cstr:
+            in_p = Path(clist[clist.index("--input") + 1])
+            Path(clist[clist.index("--output") + 1]).write_text(
+                in_p.read_text(encoding="utf-8") if in_p.is_file() else "",
+                encoding="utf-8",
+            )
+        elif "tg_llm_qualify.py" in cstr:
+            in_p = Path(clist[clist.index("--input") + 1])
+            lines = [json.loads(ln) for ln in (in_p.read_text(encoding="utf-8") if in_p.is_file() else "").splitlines() if ln.strip()]
+            if not lines:
+                lines = [{"company": "RetryCo", "project": "RetryCo", "project_url": "https://retryco.io"}]
+            for r in lines:
+                r.update({"icp_match": True, "icp_score": 88})
+            Path(clist[clist.index("--output") + 1]).write_text(
+                "\n".join(json.dumps(r) for r in lines) + "\n", encoding="utf-8"
+            )
+        elif "tg_curate.py" in cstr:
+            Path(clist[clist.index("--output") + 1]).write_text(
+                json.dumps({
+                    "name": "Retry CEO",
+                    "company": "RetryCo",
+                    "project": "RetryCo",
+                    "project_url": "https://retryco.io",
+                    "category": "SaaS",
+                    "their_angle": "UGC subscription app",
+                    "icp_score": 88,
+                    "source": "buyer_catalogs",
+                    "step1_text": "Saw RetryCo scaling paid social.",
+                }) + "\n",
+                encoding="utf-8",
+            )
+        elif "tg_identity_bridge.py" in cstr:
+            r = json.loads(Path(clist[clist.index("--input") + 1]).read_text(encoding="utf-8").strip())
+            r["username"] = "wait_ceo"
+            r["tg_handle_is_guessed"] = True
+            Path(clist[clist.index("--output") + 1]).write_text(json.dumps(r) + "\n", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    res1 = repl.run_autonomous_replenish(
+        conn,
+        runner=wave1_runner,
+        scraper_session=ro_sess,
+        scraper_sessions_dir=scraper_dir,
+        tg_client=tg_client_toggle,
+        max_waves=1,
+    )
+    assert res1["ok"] is True
+    assert res1["tg_handle_verification"]["pending_verify_deferred"] == 1
+    queue_file = state_dir / "pending_tg_verify_queue.jsonl"
+    assert queue_file.is_file()
+    master_file = state_dir / "master_ids.jsonl"
+    master_text = master_file.read_text(encoding="utf-8") if master_file.is_file() else ""
+    assert "retryco.io" not in master_text
+    assert conn.execute("SELECT 1 FROM leads WHERE username = 'wait_ceo'").fetchone() is None
+
+    # Next tick: FloodWait clears -> _retry_pending_tg_verify_queue promotes into CRM and drains queue
+    flood_mode["flood"] = False
+    res2 = repl.run_autonomous_replenish(
+        conn,
+        runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        scraper_session=ro_sess,
+        scraper_sessions_dir=scraper_dir,
+        tg_client=tg_client_toggle,
+        max_waves=1,
+    )
+    assert res2["ok"] is True
+    assert "retry_pending_tg_verify_queue" in res2["stages_run"]
+    assert not queue_file.exists()
+    lead_row = conn.execute("SELECT username, telegram_user_id FROM leads WHERE username = 'wait_ceo'").fetchone()
+    assert lead_row is not None and lead_row["telegram_user_id"] == 777001122
+    conn.close()
+
+
+def test_tg_phone_direct_ignores_leftover_whatsapp_and_followup_skips_5day_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from app.leadgen_settings import push_discovered_now
+    from app.outreach import (
+        MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY,
+        get_tg_phone_direct_sent_today,
+        run_campaign_batch,
+    )
+    from app.telegram_gateway import FakeGateway
+    from leadgen import crm_mcp_push, phone_messenger_resolver as pmr
+
+    routed = pmr.route_resolved_lead(
+        {"phone": "+14155550999", "whatsapp": "https://wa.me/14155550999", "icp_score": 88},
+        {"+14155550999": pmr.ResolvedMessenger(phone_e164="+14155550999", tg_check_status="found", telegram_user_id=777902001)},
+    )
+    assert routed["provider"] == "telegram"
+    assert routed["tg_phone_direct"] is True
+    assert "whatsapp" not in routed
+
+    built = crm_mcp_push.build_lead_payload_from_dict({
+        "name": "Direct Co",
+        "company": "DirectCo",
+        "phone": "+14155550999",
+        "whatsapp": "https://wa.me/14155550999",
+        "provider": "telegram",
+        "telegram_user_id": 777902001,
+        "tg_phone_direct": True,
+        "website": "https://directco.io",
+        "category": "SaaS",
+        "their_angle": "UGC subscription reels",
+    })
+    assert built["provider"] == "telegram"
+    assert built["tg_phone_direct"] is True
+
+    conn, state_dir = _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("CRMTG_FORCE_NO_JITTER", "1")
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO accounts (
+            id, phone, session_path, status, health, provider,
+            telegram_user_id, telegram_username, daily_limit, sent_today, created_at, updated_at
+        ) VALUES (1, '+15550009999', ?, 'connected', 'active', 'telegram', 990011, 'sender_acc1', 20, 0, ?, ?)
+        """,
+        (str(tmp_path / "acc1.session"), now, now),
+    )
+    camp = create_campaign(
+        conn,
+        name="Whales EN — TG",
+        account_id=1,
+        account_ids=[1],
+        daily_limit=20,
+        status="running",
+        steps=[
+            {"step_order": 1, "delay_hours": 0, "template_text": "Step 1 hello {company}"},
+            {"step_order": 2, "delay_hours": 0, "template_text": "Followup 1 {company}"},
+        ],
+        leadgen_enabled=True,
+    )
+    conn.execute("UPDATE campaigns SET segment = 'whale', language = 'en' WHERE id = ?", (int(camp["id"]),))
+    conn.commit()
+    _configure_b2b_for_fast_mock(conn)
+
+    final_jsonl = state_dir / "raw_pd.final.jsonl"
+    final_jsonl.write_text(
+        json.dumps({
+            "name": "Direct Founder",
+            "company": "DirectFollowCo",
+            "project": "DirectFollowCo",
+            "project_url": "https://directfollow.io",
+            "phone": "+14155550999",
+            "whatsapp": "https://wa.me/14155550999",
+            "provider": "telegram",
+            "telegram_user_id": 777902001,
+            "tg_phone_direct": True,
+            "category": "SaaS",
+            "their_angle": "Video analytics SaaS",
+            "icp_score": 78,
+            "source": "meta_ads",
+            "segment": "whale",
+            "step1_text": "Saw DirectFollowCo scaling paid social.",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    repl.split_tg_and_direct_x_leads(final_jsonl, state_dir / "direct_x_leads.jsonl")
+    push_res = push_discovered_now(conn)
+    assert push_res["ingested"] == 1
+
+    class _TrackingFakeGateway(FakeGateway):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.by_phone_calls = 0
+            self.by_peer_calls = 0
+
+        async def send_message_by_phone(self, *args, **kwargs):
+            self.by_phone_calls += 1
+            return await super().send_message_by_phone(*args, **kwargs)
+
+        async def send_message(self, *args, **kwargs):
+            self.by_peer_calls += 1
+            return await super().send_message(*args, **kwargs)
+
+    # First contact discovers username -> follow-up routes via @username without consuming 5/day phone-direct cap
+    gw = _TrackingFakeGateway(
+        phone_contacts={"+14155550999": {"telegram_user_id": 777902001, "username": "resolved_direct_u"}}
+    )
+    b1 = asyncio.run(run_campaign_batch(conn, int(camp["id"]), gateway=gw, max_send=10))
+    assert b1["sent"] == 1
+    assert gw.by_phone_calls == 1
+    assert get_tg_phone_direct_sent_today(conn, 1) == 1
+
+    # Saturate cold 5/day cap and trigger follow-up immediately -> step 2 sends via discovered @username!
+    conn.execute("UPDATE campaign_recipients SET last_sent_at = '2020-01-01T00:00:00' WHERE campaign_id = ?", (int(camp["id"]),))
+    conn.commit()
+    from app.outreach import _increment_tg_phone_direct_sent_today
+
+    for _ in range(MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY - 1):
+        _increment_tg_phone_direct_sent_today(conn, 1)
+    assert get_tg_phone_direct_sent_today(conn, 1) == MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY
+
+    b2 = asyncio.run(run_campaign_batch(conn, int(camp["id"]), gateway=gw, max_send=10))
+    assert b2["sent"] == 1
+    assert gw.by_phone_calls == 1
+    assert gw.by_peer_calls == 1
+    assert get_tg_phone_direct_sent_today(conn, 1) == MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY
+    conn.close()
+
+
+def test_phone_direct_mixed_decline_and_cap_keeps_recipient_pending_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from app.outreach import (
+        MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY,
+        _increment_tg_phone_direct_sent_today,
+        run_campaign_batch,
+    )
+    from app.telegram_gateway import FakeGateway, GatewayError
+    from app.mcp_server import _handle_ingest_discovered_leads
+
+    conn, _state_dir = _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("CRMTG_FORCE_NO_JITTER", "1")
+    now = utc_now()
+    for acc_id in (1, 2):
+        conn.execute(
+            """
+            INSERT INTO accounts (
+                id, phone, session_path, status, health, provider,
+                telegram_user_id, telegram_username, daily_limit, sent_today, created_at, updated_at
+            ) VALUES (?, ?, ?, 'connected', 'active', 'telegram', ?, ?, 20, 0, ?, ?)
+            """,
+            (acc_id, f"+1555000880{acc_id}", str(tmp_path / f"acc{acc_id}.session"), 990020 + acc_id, f"acc_{acc_id}", now, now),
+        )
+    conn.commit()
+    camp = create_campaign(
+        conn,
+        name="Whales EN — TG",
+        account_id=1,
+        account_ids=[1, 2],
+        daily_limit=20,
+        status="running",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+        leadgen_enabled=True,
+    )
+    conn.execute(
+        "UPDATE campaigns SET segment = 'whale', language = 'en', copy_profile = 'whale_mass' WHERE id = ?",
+        (int(camp["id"]),),
+    )
+    conn.commit()
+    ing = _handle_ingest_discovered_leads(
+        conn,
+        {
+            "campaign_id": int(camp["id"]),
+            "enroll_in_campaign": True,
+            "leads": [
+                {
+                    "name": "CapVictim",
+                    "company": "CapCo",
+                    "phone": "+14155550777",
+                    "provider": "telegram",
+                    "tg_phone_direct": True,
+                    "website": "https://capco.io",
+                    "category": "AI SaaS",
+                    "their_angle": "Scaling consumer creator AI app with UGC",
+                    "source": "meta_ads",
+                    "segment": "whale",
+                    "language": "en",
+                    "icp_score": 82,
+                    "step1_text": "Hey CapVictim, quick SoftUGC demo reels idea for CapCo.",
+                }
+            ],
+        },
+    )
+    assert ing["enrolled_in_campaign"] == 1
+    # acc1 assigned, acc2 already at 5/5 cold cap
+    conn.execute("UPDATE campaign_recipients SET assigned_account_id = 1 WHERE campaign_id = ?", (int(camp["id"]),))
+    conn.commit()
+    for _ in range(MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY):
+        _increment_tg_phone_direct_sent_today(conn, 2)
+
+    class _Acc1DeclinesGw(FakeGateway):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.phone_calls: list[str] = []
+
+        async def probe_spambot(self, session_path: str, *, now_utc=None):
+            return {"ok": True, "limited": False}
+
+        async def send_message_by_phone(self, session_path: str, phone: str, text: str, **kwargs):
+            self.phone_calls.append(str(session_path))
+            if "acc1.session" in str(session_path):
+                raise GatewayError("PEER_FLOOD")
+            return await super().send_message_by_phone(session_path, phone, text, **kwargs)
+
+    gw = _Acc1DeclinesGw(phone_contacts={"+14155550777": {"telegram_user_id": 777007777, "username": None}})
+    asyncio.run(run_campaign_batch(conn, int(camp["id"]), gateway=gw, max_send=5))
+    assert any("acc1.session" in c for c in gw.phone_calls), gw.phone_calls
+    rec_row = conn.execute("SELECT status, error_text FROM campaign_recipients WHERE campaign_id = ?", (int(camp["id"]),)).fetchone()
+    assert rec_row["status"] == "pending", dict(rec_row)
+    conn.close()
+
+
+def test_tg_web_client_budget_env_and_tikhub_info_unwrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from leadgen import tg_web_client
+
+    monkeypatch.setenv("BUDGET_PAID_ALLOWED", "0")
+    assert tg_web_client._check_budget(None, "tikhub", "ep", 0.01) is False
+    monkeypatch.setenv("BUDGET_PAID_ALLOWED", "1")
+    assert tg_web_client._check_budget(None, "tikhub", "ep", 0.01) is True
+
+    unwrapped = tg_web_client._extract_batch_channel_map({
+        "data": {
+            "results": [
+                {
+                    "channel": "foochan",
+                    "info": {
+                        "title": "FooTitle",
+                        "about": "Founder @foo_ceo https://fooapp.io",
+                        "subscribers": 3200,
+                    },
+                }
+            ]
+        }
+    })
+    assert unwrapped["foochan"]["title"] == "FooTitle"
+    assert unwrapped["foochan"]["subscribers"] == 3200
+
+
+def test_validate_isolated_scraper_skips_phone_checker_and_ro_pool_rejects_pc1(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    scraper_dir = tmp_path / "scraper_sessions"
+    scraper_dir.mkdir(parents=True, exist_ok=True)
+    pc1 = scraper_dir / "phone_checker_1.session"
+    sig1 = scraper_dir / "signals_ro_1.session"
+    pc1.write_text("pc1", encoding="utf-8")
+    sig1.write_text("sig1", encoding="utf-8")
+
+    picked = repl.validate_isolated_scraper_session(conn, None, scraper_sessions_dir=scraper_dir)
+    assert picked is not None and picked.name == "signals_ro_1.session"
+
+    pool = repl.find_ro_scraper_sessions(conn, sessions_dir=scraper_dir, primary_session=pc1)
+    assert [p.name for p in pool] == ["signals_ro_1.session"]
+    conn.close()
+
+
+def test_contact_waterfall_preserves_3rd_dm_in_alternates() -> None:
+    from leadgen import contact_waterfall as cw
+
+    def fake_treg(ep: str, **kwargs):
+        if ep == "limadata.people.employees.search":
+            return {
+                "results": [
+                    {"full_name": "Alice Founder", "title": "CEO & Founder", "linkedin_url": "https://linkedin.com/in/alice-dm"},
+                    {"full_name": "Bob Growth", "title": "CMO / Head of Growth", "linkedin_url": "https://linkedin.com/in/bob-dm"},
+                    {"full_name": "Cara Paid", "title": "Co-founder & Paid Social", "linkedin_url": "https://linkedin.com/in/cara-dm"},
+                ]
+            }
+        return {}
+
+    out = cw.enrich_lead_contacts(
+        {
+            "company": "TriCo",
+            "project": "TriCo",
+            "project_url": "https://trico.io",
+            "icp_score": 85,
+            "founder_linkedin": "https://linkedin.com/in/alice-dm",
+        },
+        http_get_fn=lambda _u: "",
+        treg_fn=fake_treg,
+        allow_paid_tier2=True,
+    )
+    sec = json.loads(out["secondary_contact_json"])
+    secondary_and_alts = {sec["name"]} | {a["name"] for a in sec["alternates"]}
+    assert secondary_and_alts == {"Bob Growth", "Cara Paid"}
+    assert len(sec["alternates"]) == 1

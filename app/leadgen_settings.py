@@ -2165,7 +2165,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 raw_score = cand.get("icp_score")
                 if raw_score is not None and str(raw_score).strip() != "":
                     try:
-                        if float(raw_score) < 80:
+                        if float(raw_score) < 70:
                             continue
                     except (TypeError, ValueError):
                         continue
@@ -2251,6 +2251,7 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     "manual_draft_text",
                     "icp_score",
                     "source",
+                    "tg_phone_direct",
                 ):
                     if cand.get(v2_key) is not None and v2_key not in built:
                         built[v2_key] = cand[v2_key]

@@ -634,6 +634,8 @@ def route_resolved_lead(
         out["phone"] = resolved.phone_e164 or normalize_e164(str(out.get("phone") or ""))
         out["tg_phone_direct"] = True
         out["wa_check_pending"] = False
+        out.pop("whatsapp", None)
+        out.pop("whatsapp_url", None)
         return out
 
     if resolved and resolved.whatsapp_exists:

@@ -1772,7 +1772,7 @@ def _auto_enrich_b2b_items_with_sonnet(
         raw_icp = it.get("icp_score")
         if raw_icp is not None and str(raw_icp).strip() != "":
             try:
-                if float(raw_icp) < 80:
+                if float(raw_icp) < 70:
                     continue
             except (TypeError, ValueError):
                 continue
@@ -2606,7 +2606,7 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             raw_icp_score = item.get("icp_score")
             if raw_icp_score is not None and str(raw_icp_score).strip() != "":
                 try:
-                    if float(raw_icp_score) < 80:
+                    if float(raw_icp_score) < 70:
                         skipped_non_icp += 1
                         quarantined += 1
                         _record_skip(item_idx, "low_icp_score")

@@ -574,10 +574,14 @@ def _check_budget(
             )
             return bool(allowed)
         except ImportError:
+            if str(os.environ.get("BUDGET_PAID_ALLOWED") or "").strip().lower() in ("0", "false", "no"):
+                return False
             return True
         except Exception as exc:
             logger.warning("tg_web_client budget DB check failed (%s): %s", endpoint, exc)
             return False
+    if str(os.environ.get("BUDGET_PAID_ALLOWED") or "").strip().lower() in ("0", "false", "no"):
+        return False
     return True
 
 
@@ -648,6 +652,8 @@ def _invoke_treg(
 
 
 def _normalize_channel_info_dict(raw: Mapping[str, Any], fallback_handle: str = "") -> dict[str, Any] | None:
+    if isinstance(raw.get("info"), Mapping):
+        raw = {**raw, **raw["info"]}
     uname = _normalize_handle(
         str(raw.get("username") or raw.get("channel") or raw.get("handle") or fallback_handle)
     )

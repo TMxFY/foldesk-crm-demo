@@ -892,7 +892,8 @@ async def crawl_channel_graph(
                                     links.insert(0, site)
                                 fallback_eid = int.from_bytes(ch_key.encode("utf-8")[:8].ljust(8, b"\0"), "little") & 0x7FFFFFFF or 1
                                 row = {
-                                    "id": uinfo.get("id") or getattr(entity, "id", 0) or fallback_eid,
+                                    "id": uinfo.get("id") or None,
+                                    "dedup_id": fallback_eid,
                                     "username": founder_uname,
                                     "name": uinfo.get("name") or ch_title,
                                     "bio": combined_bio,

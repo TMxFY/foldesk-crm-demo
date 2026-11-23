@@ -985,7 +985,8 @@ async def scan_ad_channels(
                         & 0x7FFFFFFF
                     ) or 1
                     row: dict = {
-                        "id": resolved_id or fallback_id,
+                        "id": resolved_id if resolved_id else None,
+                        "dedup_id": fallback_id,
                         "username": resolved_username,
                         "telegram_username": resolved_username,
                         "name": resolved_name or resolved_company or resolved_username,

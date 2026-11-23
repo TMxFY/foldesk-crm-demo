@@ -2003,8 +2003,12 @@ def _call_treg_with_cap(
     return active_treg(endpoint, **filtered_kw)
 
 
-def _build_secondary_contact_json(dm: Mapping[str, Any]) -> str:
-    payload = {
+def _build_secondary_contact_json(
+    dm: Mapping[str, Any],
+    *,
+    extra_candidates: list[Mapping[str, Any]] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
         "name": str(dm.get("founder_name") or dm.get("name") or "").strip(),
         "role": str(dm.get("role") or dm.get("role_title") or dm.get("title") or "").strip(),
         "founder_linkedin": str(dm.get("founder_linkedin") or "").strip(),
@@ -2013,6 +2017,21 @@ def _build_secondary_contact_json(dm: Mapping[str, Any]) -> str:
         "whatsapp": str(dm.get("whatsapp") or "").strip(),
         "fallback_after_days": SECONDARY_DM_FALLBACK_DAYS,
     }
+    if extra_candidates:
+        alternates: list[dict[str, Any]] = []
+        for extra in extra_candidates:
+            if not isinstance(extra, Mapping):
+                continue
+            alternates.append({
+                "name": str(extra.get("founder_name") or extra.get("name") or "").strip(),
+                "role": str(extra.get("role") or extra.get("role_title") or extra.get("title") or "").strip(),
+                "founder_linkedin": str(extra.get("founder_linkedin") or "").strip(),
+                "phone": str(extra.get("phone") or "").strip(),
+                "telegram_username": str(extra.get("telegram_username") or extra.get("username") or "").strip().lstrip("@"),
+                "whatsapp": str(extra.get("whatsapp") or "").strip(),
+            })
+        if alternates:
+            payload["alternates"] = alternates
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -3156,10 +3175,13 @@ def enrich_lead_contacts(
 
                 _rebalance_dm_candidates()
 
-    # Persist 2nd DM into secondary_contact_json when present
+    # Persist 2nd DM into secondary_contact_json (+ 3rd+ DM alternates when present)
     if len(dm_candidates) >= 2:
         _rebalance_dm_candidates()
-        out["secondary_contact_json"] = _build_secondary_contact_json(dm_candidates[1])
+        out["secondary_contact_json"] = _build_secondary_contact_json(
+            dm_candidates[1],
+            extra_candidates=dm_candidates[2:MAX_DM_CANDIDATES],
+        )
 
     actual_spent = round(lead_cost, 6)
     if budget_usd is not None and len(budget_usd) > 0 and actual_spent > 0:

@@ -6,7 +6,7 @@ import base64
 from collections.abc import Mapping
 import concurrent.futures
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import inspect
@@ -795,8 +795,11 @@ def validate_isolated_scraper_session(
         ).expanduser()
         if sess_dir.is_dir():
             found = sorted(sess_dir.glob("*.session"))
-            if found:
-                candidate_raw = str(found[0])
+            non_checker = [p for p in found if not p.name.startswith("phone_checker_")]
+            signals_first = [p for p in non_checker if p.name.startswith("signals_ro")]
+            chosen_list = signals_first or non_checker
+            if chosen_list:
+                candidate_raw = str(chosen_list[0])
 
     if not candidate_raw:
         return None
@@ -1053,6 +1056,7 @@ _PROTECTED_JSONL_NAMES = frozenset(
         "ofm_review_leads.jsonl",
         "quarantined_unqualified.jsonl",
         "pending_qualify_queue.jsonl",
+        "pending_tg_verify_queue.jsonl",
         "leadgen_run_history.jsonl",
     }
 )
@@ -2053,7 +2057,11 @@ def find_ro_scraper_sessions(
             primary_session,
             scraper_sessions_dir=sessions_dir,
         )
-        if validated_prim is not None and validated_prim.is_file():
+        if (
+            validated_prim is not None
+            and validated_prim.is_file()
+            and validated_prim.name != "phone_checker_1.session"
+        ):
             _add_candidate(validated_prim)
 
     raw_dir = str(
@@ -2283,6 +2291,149 @@ def _pick_comment_channels_batch(
     )
     tmp_cur.replace(cursor_path)
     return selected
+
+
+def _retry_pending_tg_verify_queue(
+    conn: sqlite3.Connection,
+    *,
+    state_dir: Path,
+    cfg: Mapping[str, Any],
+    ro_sessions: list[Path],
+    primary_ro_session: Path | None,
+    use_web_first: bool,
+    is_real_subprocess_runner: bool,
+    tg_client: Any = None,
+    tg_entity_resolver_fn: Callable[..., Any] | None = None,
+    tg_admin_extractor_fn: Callable[..., Any] | None = None,
+    run_l2_phone_resolver: bool = False,
+    wa_gateway: Any = None,
+    tg_checker_client: Any = None,
+    scraper_sessions_dir: Path | str | None = None,
+    tg_verify_stats: dict[str, int] | None = None,
+    tg_admin_stats: dict[str, int] | None = None,
+    max_age_days: int = 14,
+) -> dict[str, int]:
+    """Re-verify guessed TG handles deferred by FloodWait and promote resolved leads into CRM."""
+    res_stats = {"retried": 0, "verified": 0, "remaining": 0, "ingested": 0, "direct_x_routed": 0}
+    queue_path = state_dir / "pending_tg_verify_queue.jsonl"
+    if not queue_path.is_file() or queue_path.stat().st_size == 0:
+        return res_stats
+    can_verify = bool(ro_sessions or use_web_first or tg_client is not None or tg_entity_resolver_fn is not None)
+    if not can_verify:
+        return res_stats
+
+    queued_rows = _read_jsonl_dicts(queue_path)
+    if not queued_rows:
+        queue_path.unlink(missing_ok=True)
+        return res_stats
+
+    now_dt = datetime.now(timezone.utc)
+    cutoff_dt = now_dt - timedelta(days=max(1, int(max_age_days)))
+    retry_candidates: list[dict[str, Any]] = []
+    for raw_item in queued_rows:
+        item = dict(raw_item)
+        def_at = _parse_iso_utc(str(item.get("tg_verify_deferred_at") or ""))
+        if def_at is not None and def_at < cutoff_dt:
+            continue
+        deferred_handle = str(item.get("deferred_tg_handle") or "").strip().lstrip("@")
+        if deferred_handle and not str(item.get("username") or "").strip():
+            item["username"] = deferred_handle
+            item["telegram_username"] = deferred_handle
+        item.pop("tg_verify_deferred", None)
+        retry_candidates.append(item)
+
+    if not retry_candidates:
+        queue_path.unlink(missing_ok=True)
+        return res_stats
+
+    res_stats["retried"] = len(retry_candidates)
+    verified_rows, v_st = verify_personal_tg_handles_live(
+        retry_candidates,
+        client=tg_client,
+        scraper_session=primary_ro_session,
+        scraper_sessions=ro_sessions if (is_real_subprocess_runner and tg_client is None and tg_entity_resolver_fn is None) else None,
+        entity_resolver_fn=tg_entity_resolver_fn,
+        use_web_first=use_web_first,
+        tme_cache_path=state_dir / "tme_probe_cache.json",
+        pending_verify_queue_path=None,
+    )
+    if tg_verify_stats is not None:
+        for k, val in v_st.items():
+            tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+
+    if tg_client is not None or tg_admin_extractor_fn is not None or ro_sessions:
+        need_admin = any(
+            not _is_real_personal_tg_handle(r.get("username") or r.get("telegram_username"))
+            and extract_tg_group_handles_from_row(r)
+            for r in verified_rows
+            if not r.get("tg_verify_deferred")
+        )
+        if need_admin:
+            verified_rows, a_st = enrich_whales_with_tg_group_admins(
+                verified_rows,
+                client=tg_client,
+                scraper_session=primary_ro_session,
+                scraper_sessions=ro_sessions if (is_real_subprocess_runner and tg_client is None and tg_admin_extractor_fn is None) else None,
+                admin_extractor_fn=tg_admin_extractor_fn,
+            )
+            if tg_admin_stats is not None:
+                for k, val in a_st.items():
+                    tg_admin_stats[k] = tg_admin_stats.get(k, 0) + int(val)
+
+    still_deferred: list[dict[str, Any]] = []
+    ready_for_pipeline: list[dict[str, Any]] = []
+    for row in verified_rows:
+        if row.get("tg_verify_deferred"):
+            row_copy = dict(row)
+            if not row_copy.get("deferred_tg_handle"):
+                h = str(row_copy.get("username") or row_copy.get("telegram_username") or "").strip().lstrip("@")
+                if h:
+                    row_copy["deferred_tg_handle"] = h
+            still_deferred.append(row_copy)
+            continue
+        if _is_real_personal_tg_handle(row.get("username") or row.get("telegram_username") or row.get("tg_username")):
+            res_stats["verified"] += 1
+        ready_for_pipeline.append(row)
+
+    res_stats["remaining"] = len(still_deferred)
+    if still_deferred:
+        tmp_q = queue_path.with_name(f".{queue_path.name}.tmp.{os.getpid()}")
+        tmp_q.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in still_deferred) + "\n",
+            encoding="utf-8",
+        )
+        tmp_q.replace(queue_path)
+    else:
+        queue_path.unlink(missing_ok=True)
+
+    if ready_for_pipeline:
+        if run_l2_phone_resolver:
+            ready_for_pipeline, _ = resolve_and_route_phone_leads(
+                conn,
+                ready_for_pipeline,
+                cfg=cfg,
+                wa_gateway=wa_gateway,
+                tg_checker_client=tg_checker_client,
+                scraper_sessions_dir=scraper_sessions_dir,
+            )
+        ts_retry = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        retry_final = state_dir / f"raw_{ts_retry}_verify_retry.final.jsonl"
+        retry_final.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in ready_for_pipeline) + "\n",
+            encoding="utf-8",
+        )
+        sp = split_tg_and_direct_x_leads(retry_final, state_dir / "direct_x_leads.jsonl")
+        res_stats["direct_x_routed"] += int(sp.get("direct_x_added") or 0)
+        if retry_final.is_file() and retry_final.stat().st_size > 0:
+            stamp_rows = _read_jsonl_dicts(retry_final)
+            p_res = push_discovered_now(conn)
+            res_stats["ingested"] += int(p_res.get("ingested") or 0)
+            if stamp_rows:
+                _stamp_new_lead_v2_fields(conn, stamp_rows)
+        else:
+            retry_final.unlink(missing_ok=True)
+
+    return res_stats
 
 
 def emit_leadgen_daily_digest(
@@ -4354,6 +4505,33 @@ def _run_autonomous_replenish_locked(
                     ingested_total += int(dx_retro["whales_ingested"])
                     social_manual_ingested += int(dx_retro["social_manual_ingested"])
 
+                verify_retry_res = _retry_pending_tg_verify_queue(
+                    conn,
+                    state_dir=state_dir,
+                    cfg=eff_cfg,
+                    ro_sessions=ro_sessions,
+                    primary_ro_session=primary_ro_session,
+                    use_web_first=is_real_subprocess_runner,
+                    is_real_subprocess_runner=is_real_subprocess_runner,
+                    tg_client=tg_client,
+                    tg_entity_resolver_fn=tg_entity_resolver_fn,
+                    tg_admin_extractor_fn=tg_admin_extractor_fn,
+                    run_l2_phone_resolver=is_real_subprocess_runner or any(
+                        x is not None
+                        for x in (wa_gateway, tg_checker_client, scraper_sessions_dir)
+                    ),
+                    wa_gateway=wa_gateway,
+                    tg_checker_client=tg_checker_client,
+                    scraper_sessions_dir=scraper_sessions_dir,
+                    tg_verify_stats=tg_verify_stats,
+                    tg_admin_stats=tg_admin_stats,
+                )
+                if verify_retry_res["retried"] > 0:
+                    with stage_lock:
+                        stages_run.append("retry_pending_tg_verify_queue")
+                    ingested_total += int(verify_retry_res["ingested"])
+                    direct_x_routed += int(verify_retry_res["direct_x_routed"])
+
                 effective_max_waves = (
                     max(1, min(3, int(max_waves)))
                     if max_waves is not None
@@ -4898,6 +5076,7 @@ def _run_autonomous_replenish_locked(
                     wave_dx_routed = 0
                     wave_ms_ingested = 0
                     wave_stamp_rows: list[dict[str, Any]] = []
+                    wave_deferred_rows: list[dict[str, Any]] = []
                     if has_new_rows or not is_real_subprocess_runner:
                         enriched_jsonl = state_dir / f"raw_{wave_ts}.enriched.jsonl"
                         enrich_ok = _exec_stage(
@@ -4984,6 +5163,9 @@ def _run_autonomous_replenish_locked(
                                                 )
                                                 for k, val in v_st_pre.items():
                                                     tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+                                                wave_deferred_rows.extend(
+                                                    r for r in v_rows_pre if r.get("tg_verify_deferred")
+                                                )
                                                 curated_jsonl.write_text(
                                                     "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_pre)
                                                     + ("\n" if v_rows_pre else ""),
@@ -5144,6 +5326,9 @@ def _run_autonomous_replenish_locked(
                                                 )
                                                 for k, val in v_st_post.items():
                                                     tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+                                                wave_deferred_rows.extend(
+                                                    r for r in v_rows_post if r.get("tg_verify_deferred")
+                                                )
                                                 curated_jsonl.write_text(
                                                     "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_post)
                                                     + ("\n" if v_rows_post else ""),
@@ -5261,15 +5446,17 @@ def _run_autonomous_replenish_locked(
                             if pipeline_ok:
                                 failed_rows = _read_jsonl_dicts(llm_failed_file) if has_llm_key else []
                                 llm_failed_file.unlink(missing_ok=True)
-                                if failed_rows and raw_jsonl.is_file():
-                                    failed_key_set: set[str] = set()
-                                    for fr in failed_rows:
-                                        failed_key_set.update(_lead_retry_keys(fr))
+                                exclude_key_set: set[str] = set()
+                                for fr in failed_rows:
+                                    exclude_key_set.update(_lead_retry_keys(fr))
+                                for dr in wave_deferred_rows:
+                                    exclude_key_set.update(_lead_retry_keys(dr))
+                                if exclude_key_set and raw_jsonl.is_file():
                                     raw_commit_tmp = state_dir / f"raw_{wave_ts}.commit_tmp.jsonl"
                                     kept_raw = [
                                         r
                                         for r in _read_jsonl_dicts(raw_jsonl)
-                                        if not (_lead_retry_keys(r) & failed_key_set)
+                                        if not (_lead_retry_keys(r) & exclude_key_set)
                                     ]
                                     raw_commit_tmp.write_text(
                                         "\n".join(json.dumps(r, ensure_ascii=False) for r in kept_raw)
@@ -5283,7 +5470,10 @@ def _run_autonomous_replenish_locked(
                                     finally:
                                         raw_commit_tmp.unlink(missing_ok=True)
                                         Path(f"{raw_commit_tmp}.new").unlink(missing_ok=True)
-                                    _write_pending_qualify_queue(pending_qualify_queue, failed_rows)
+                                    if failed_rows:
+                                        _write_pending_qualify_queue(pending_qualify_queue, failed_rows)
+                                    else:
+                                        pending_qualify_queue.unlink(missing_ok=True)
                                 else:
                                     if raw_jsonl.is_file():
                                         apply_master_merge(

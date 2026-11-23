@@ -1583,6 +1583,27 @@ if timer_file_y.is_file():
     if "00,03,06,09,12,15,18,21:15:00 UTC" not in timer_src_y:
         errors.append("Gate Y violation in deploy/systemd/crmtg-leadgen.timer: must use 3h schedule 00,03,06,09,12,15,18,21:15:00 UTC")
 
+mcp_file_y = root / "app" / "mcp_server.py"
+if mcp_file_y.is_file():
+    mcp_src_y = mcp_file_y.read_text(encoding="utf-8")
+    if "low_icp_score" in mcp_src_y and ("float(raw_icp_score) < 80" in mcp_src_y or "float(raw_icp) < 80" in mcp_src_y):
+        errors.append("Gate Y violation in app/mcp_server.py: stale ICP threshold < 80 blocks 70..79 Wave A leads")
+
+ls_file_y = root / "app" / "leadgen_settings.py"
+if ls_file_y.is_file():
+    ls_src_y = ls_file_y.read_text(encoding="utf-8")
+    if "def push_discovered_now(" in ls_src_y and "float(raw_score) < 80" in ls_src_y:
+        errors.append("Gate Y violation in app/leadgen_settings.py: push_discovered_now stale score < 80 blocks 70..79 Wave A leads")
+
+if tg_web_client_file.is_file():
+    twc_src_y = tg_web_client_file.read_text(encoding="utf-8")
+    if "def _check_budget(" in twc_src_y and "BUDGET_PAID_ALLOWED" not in twc_src_y:
+        errors.append("Gate Y violation in leadgen/tg_web_client.py: _check_budget must enforce BUDGET_PAID_ALLOWED")
+
+if repl_file_y.is_file() and "def _run_autonomous_replenish_locked(" in repl_src_y:
+    if "def _retry_pending_tg_verify_queue(" not in repl_src_y or '"pending_tg_verify_queue.jsonl"' not in repl_src_y:
+        errors.append("Gate Y violation in leadgen/vps_autonomous_replenish.py: pending_tg_verify_queue.jsonl must be protected and drained")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

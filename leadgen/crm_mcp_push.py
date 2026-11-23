@@ -577,13 +577,24 @@ def build_lead_payload_from_dict(
     if raw_plain_phone.lower().startswith(("http://", "https://")) or "wa.me/" in raw_plain_phone.lower():
         raw_plain_phone = ""
     phone = norm_wa_phone or raw_plain_phone or str(contact_info["phone"] or "").strip()
-    has_wa_signal = bool(
-        norm_wa_phone
-        and (
-            record.get("whatsapp")
-            or str(record.get("provider") or "").strip().lower() == "whatsapp"
-            or str(source).strip().lower() == "d2c_whatsapp"
-            or contact_info["provider"] == "whatsapp"
+    raw_tg_uid = record.get("telegram_user_id") or record.get("user_id") or record.get("id") or None
+    is_tg_phone_direct = bool(record.get("tg_phone_direct")) or (
+        str(record.get("provider") or "").strip().lower() == "telegram"
+        and not contact_info["username"]
+        and bool(phone)
+        and raw_tg_uid is not None
+    )
+    has_wa_signal = (
+        False
+        if is_tg_phone_direct
+        else bool(
+            norm_wa_phone
+            and (
+                record.get("whatsapp")
+                or str(record.get("provider") or "").strip().lower() == "whatsapp"
+                or str(source).strip().lower() == "d2c_whatsapp"
+                or contact_info["provider"] == "whatsapp"
+            )
         )
     )
 
@@ -663,7 +674,7 @@ def build_lead_payload_from_dict(
         hook = raw_hook or ping_text
         our_angle = raw_our_angle or full_pitch
 
-    return {
+    payload_out = {
         "username": contact_info["username"] or None,
         "name": raw_name or clean_comp or raw_company or contact_info["username"] or None,
         "company": clean_comp or raw_company or None,
@@ -680,9 +691,12 @@ def build_lead_payload_from_dict(
         "step3_text": step3_text,
         "lead_source": source,
         "note": str(record.get("note") or "").strip() or None,
-        "telegram_user_id": record.get("telegram_user_id") or record.get("user_id") or record.get("id"),
-        "provider": "telegram" if contact_info["username"] else ("whatsapp" if has_wa_signal else (str(record.get("provider") or "").strip().lower() if str(record.get("provider") or "").strip().lower() in ("telegram", "whatsapp") else (contact_info["provider"] or "telegram"))),
+        "telegram_user_id": raw_tg_uid,
+        "provider": "telegram" if (contact_info["username"] or is_tg_phone_direct) else ("whatsapp" if has_wa_signal else (str(record.get("provider") or "").strip().lower() if str(record.get("provider") or "").strip().lower() in ("telegram", "whatsapp") else (contact_info["provider"] or "telegram"))),
     }
+    if is_tg_phone_direct:
+        payload_out["tg_phone_direct"] = True
+    return payload_out
 
 
 def _passes_sheet_buyer_gate(row: list[Any]) -> bool:
