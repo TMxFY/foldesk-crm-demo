@@ -750,10 +750,33 @@ async def extract_brand_tg_admins(
             UsernameNotOccupiedError,
         )
         from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
-        from telethon.tl.types import ChannelParticipantsAdmins
+        from telethon.tl.types import ChannelParticipantsAdmins, PeerChannel
     except ImportError as exc:
         logger.debug("Telethon unavailable in extract_brand_tg_admins: %s", exc)
         return []
+
+    def _parse_participants_response(resp: Any, group_label: str) -> list[GroupAdminContact]:
+        raw_users = getattr(resp, "users", None)
+        if raw_users is not None:
+            raw_parts = getattr(resp, "participants", None) or []
+            parts_by_uid: dict[int, Any] = {}
+            for part in raw_parts:
+                uid = getattr(part, "user_id", None)
+                if uid is not None:
+                    parts_by_uid[int(uid)] = part
+
+            paired: list[Any] = []
+            for user in raw_users:
+                uid = getattr(user, "id", None)
+                if uid is not None and int(uid) in parts_by_uid:
+                    paired.append((user, parts_by_uid[int(uid)]))
+                else:
+                    paired.append(user)
+        elif isinstance(resp, Iterable) and not isinstance(resp, (str, bytes, Mapping)):
+            paired = list(resp)
+        else:
+            paired = []
+        return filter_and_rank_admins(paired, group_label, max_results=max_results)
 
     async def _extract_from_full_about(entity: Any) -> list[GroupAdminContact]:
         try:
@@ -773,68 +796,111 @@ async def extract_brand_tg_admins(
             return []
 
         about = str(getattr(getattr(full, "full_chat", None), "about", None) or getattr(full, "about", None) or "").strip()
-        if not about:
-            return []
-
-        candidates: list[str] = []
-        seen_cands: set[str] = {target.lower()}
-        for m in _TG_URL_RE.finditer(about):
-            seg = m.group(1).split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].lstrip("@")
-            if _ADMIN_USERNAME_RE.fullmatch(seg) and seg.lower() not in seen_cands:
-                seen_cands.add(seg.lower())
-                candidates.append(seg)
-        for cand in re.findall(r"(?<![A-Za-z0-9._])@([A-Za-z][A-Za-z0-9_]{3,31})", about):
-            if cand.lower() not in seen_cands:
-                seen_cands.add(cand.lower())
-                candidates.append(cand)
-
         about_contacts: list[GroupAdminContact] = []
-        resolved_users: set[str] = set()
-        for cand in candidates[: min(6, max(1, int(max_admins)))]:
-            if cand.lower() in _TG_URL_NOISE or cand.lower().endswith(("bot", "_bot")):
-                continue
-            if _is_noisy_support_or_mod(cand, "", "", ""):
-                continue
+        if about:
+            candidates: list[str] = []
+            seen_cands: set[str] = {target.lower()}
+            for m in _TG_URL_RE.finditer(about):
+                seg = m.group(1).split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].lstrip("@")
+                if _ADMIN_USERNAME_RE.fullmatch(seg) and seg.lower() not in seen_cands:
+                    seen_cands.add(seg.lower())
+                    candidates.append(seg)
+            for cand in re.findall(r"(?<![A-Za-z0-9._])@([A-Za-z][A-Za-z0-9_]{3,31})", about):
+                if cand.lower() not in seen_cands:
+                    seen_cands.add(cand.lower())
+                    candidates.append(cand)
+
+            resolved_users: set[str] = set()
+            for cand in candidates[: min(6, max(1, int(max_admins)))]:
+                if cand.lower() in _TG_URL_NOISE or cand.lower().endswith(("bot", "_bot")):
+                    continue
+                if _is_noisy_support_or_mod(cand, "", "", ""):
+                    continue
+                try:
+                    ent = await client.get_entity(cand)
+                except (
+                    FloodWaitError,
+                ):
+                    break
+                except (
+                    ChannelPrivateError,
+                    UsernameInvalidError,
+                    UsernameNotOccupiedError,
+                    RPCError,
+                    ValueError,
+                    TypeError,
+                ):
+                    continue
+                if ent is None or type(ent).__name__ != "User":
+                    continue
+                if getattr(ent, "bot", False) or getattr(ent, "deleted", False) or getattr(ent, "scam", False) or getattr(ent, "fake", False):
+                    continue
+                resolved_u = str(getattr(ent, "username", None) or cand).strip().lstrip("@")
+                if not resolved_u or _is_noisy_support_or_mod(resolved_u, "", "", ""):
+                    continue
+                low_u = resolved_u.lower()
+                if low_u in resolved_users:
+                    continue
+                resolved_users.add(low_u)
+                about_contacts.append(
+                    GroupAdminContact(
+                        username=resolved_u,
+                        user_id=int(ent.id) if getattr(ent, "id", None) is not None else None,
+                        first_name=str(getattr(ent, "first_name", "") or "").strip(),
+                        last_name=str(getattr(ent, "last_name", "") or "").strip(),
+                        admin_rank="Channel About",
+                        role_guess="Channel Contact",
+                        group_handle=target,
+                    )
+                )
+                if len(about_contacts) >= max_results:
+                    break
+
+        linked_contacts: list[GroupAdminContact] = []
+        raw_linked_id = getattr(getattr(full, "full_chat", None), "linked_chat_id", None)
+        try:
+            linked_chat_id = int(raw_linked_id) if raw_linked_id else 0
+        except (TypeError, ValueError):
+            linked_chat_id = 0
+        if linked_chat_id > 0:
             try:
-                ent = await client.get_entity(cand)
+                linked_entity = await client.get_entity(PeerChannel(linked_chat_id))
+                if linked_entity is not None:
+                    linked_req = GetParticipantsRequest(
+                        channel=linked_entity,
+                        filter=ChannelParticipantsAdmins(),
+                        offset=0,
+                        limit=max(1, int(max_admins)),
+                        hash=0,
+                    )
+                    linked_resp = await client(linked_req)
+                    linked_label = str(getattr(linked_entity, "username", None) or target).strip().lstrip("@")
+                    linked_contacts = _parse_participants_response(linked_resp, linked_label)
             except (
-                FloodWaitError,
-            ):
-                break
-            except (
+                ChatAdminRequiredError,
                 ChannelPrivateError,
                 UsernameInvalidError,
                 UsernameNotOccupiedError,
+                FloodWaitError,
                 RPCError,
                 ValueError,
                 TypeError,
-            ):
+            ) as exc:
+                logger.debug("linked_chat_id(%s) admins unavailable: %s", linked_chat_id, exc)
+
+        if not linked_contacts:
+            return about_contacts[:max_results]
+        merged: list[GroupAdminContact] = []
+        seen_merged: set[str] = set()
+        for contact in (*linked_contacts, *about_contacts):
+            key = contact.username.lower()
+            if key in seen_merged:
                 continue
-            if ent is None or type(ent).__name__ != "User":
-                continue
-            if getattr(ent, "bot", False) or getattr(ent, "deleted", False) or getattr(ent, "scam", False) or getattr(ent, "fake", False):
-                continue
-            resolved_u = str(getattr(ent, "username", None) or cand).strip().lstrip("@")
-            if not resolved_u or _is_noisy_support_or_mod(resolved_u, "", "", ""):
-                continue
-            low_u = resolved_u.lower()
-            if low_u in resolved_users:
-                continue
-            resolved_users.add(low_u)
-            about_contacts.append(
-                GroupAdminContact(
-                    username=resolved_u,
-                    user_id=int(ent.id) if getattr(ent, "id", None) is not None else None,
-                    first_name=str(getattr(ent, "first_name", "") or "").strip(),
-                    last_name=str(getattr(ent, "last_name", "") or "").strip(),
-                    admin_rank="Channel About",
-                    role_guess="Channel Contact",
-                    group_handle=target,
-                )
-            )
-            if len(about_contacts) >= max_results:
+            seen_merged.add(key)
+            merged.append(contact)
+            if len(merged) >= max_results:
                 break
-        return about_contacts
+        return merged
 
     try:
         entity = await client.get_entity(target)
@@ -867,28 +933,10 @@ async def extract_brand_tg_admins(
         logger.debug("extract_brand_tg_admins(%s) unavailable: %s", target, exc)
         return []
 
-    raw_users = getattr(response, "users", None)
-    if raw_users is not None:
-        raw_parts = getattr(response, "participants", None) or []
-        parts_by_uid: dict[int, Any] = {}
-        for part in raw_parts:
-            uid = getattr(part, "user_id", None)
-            if uid is not None:
-                parts_by_uid[int(uid)] = part
-
-        paired: list[Any] = []
-        for user in raw_users:
-            uid = getattr(user, "id", None)
-            if uid is not None and int(uid) in parts_by_uid:
-                paired.append((user, parts_by_uid[int(uid)]))
-            else:
-                paired.append(user)
-    elif isinstance(response, Iterable) and not isinstance(response, (str, bytes, Mapping)):
-        paired = list(response)
-    else:
-        paired = []
-
-    return filter_and_rank_admins(paired, target, max_results=max_results)
+    contacts = _parse_participants_response(response, target)
+    if not contacts and (getattr(entity, "broadcast", False) or not getattr(entity, "megagroup", False)):
+        return await _extract_from_full_about(entity)
+    return contacts
 
 
 __all__ = [

@@ -49,6 +49,7 @@ PROFILE_CACHE_PATH = os.environ.get(
 CURSOR_PATH = os.environ.get(
     "TG_CURSOR_PATH", os.path.join(_DEFAULT_STATE_DIR, "group_cursors.json")
 )
+HYBRID_MEMBERS_COOLDOWN_SEC = 7 * 86400
 
 
 def load_json_state(path):
@@ -239,11 +240,17 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
     sample_by_sender = {}
     failed_message_ids = set()
 
+    participants = []
+    messages = []
+    messages_read_failed = False
+    previous_cursor = int(cursors.get(group, 0) or 0)
+    pending_cursor = previous_cursor
+
     # Participant enumeration is the primary source.  Some broadcast/super
-    # groups hide members; callers can use --mode posters as a fallback.
+    # groups hide members; callers can use --mode posters as a fallback, or
+    # --mode hybrid for 7-day-cooldown bounded members + incremental posters.
     if mode == "members":
         try:
-            participants = []
             async for user in client.iter_participants(entity, limit=member_limit):
                 participants.append(user)
             if not participants:
@@ -254,8 +261,25 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
         except Exception as e:
             print(f"# {group}: participant list unavailable ({e}); trying message authors", file=sys.stderr)
             mode = "posters"
-    if mode == "posters":
-        previous_cursor = int(cursors.get(group, 0) or 0)
+    elif mode == "hybrid":
+        members_ts_key = f"{group}__members_ts"
+        try:
+            last_members_ts = float(cursors.get(members_ts_key) or 0)
+        except (TypeError, ValueError):
+            last_members_ts = 0.0
+        if (time.time() - last_members_ts) >= HYBRID_MEMBERS_COOLDOWN_SEC:
+            try:
+                async for user in client.iter_participants(entity, limit=member_limit or 300):
+                    participants.append(user)
+                cursors[members_ts_key] = time.time()
+                if not participants:
+                    print(f"# {group}: hybrid returned no visible participants; continuing to posters", file=sys.stderr)
+            except FloodWaitError as fw:
+                print(f"# {group}: hybrid participant FloodWait {fw.seconds}s -> continuing to posters", file=sys.stderr)
+            except Exception as e:
+                print(f"# {group}: hybrid participant list unavailable ({e}); continuing to posters", file=sys.stderr)
+
+    if mode in ("posters", "hybrid"):
         try:
             if previous_cursor:
                 messages = [m async for m in client.iter_messages(
@@ -280,23 +304,36 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
                 print(f"# {group}: cached entity failed ({e}); re-resolving", file=sys.stderr)
                 entity = await resolve_entity(client, group, entity_cache)
                 if entity is None:
-                    return []
-                try:
-                    if previous_cursor:
-                        messages = [m async for m in client.iter_messages(
-                            entity,
-                            min_id=previous_cursor,
-                            limit=msg_limit,
-                            reverse=True,
-                        )]
+                    if mode == "hybrid" and participants:
+                        messages = []
+                        messages_read_failed = True
                     else:
-                        messages = await client.get_messages(entity, limit=msg_limit)
-                except Exception as e2:
-                    print(f"# {group}: message read failed after re-resolve: {e2}", file=sys.stderr)
-                    return []
+                        return []
+                else:
+                    try:
+                        if previous_cursor:
+                            messages = [m async for m in client.iter_messages(
+                                entity,
+                                min_id=previous_cursor,
+                                limit=msg_limit,
+                                reverse=True,
+                            )]
+                        else:
+                            messages = await client.get_messages(entity, limit=msg_limit)
+                    except Exception as e2:
+                        print(f"# {group}: message read failed after re-resolve: {e2}", file=sys.stderr)
+                        if mode == "hybrid" and participants:
+                            messages = []
+                            messages_read_failed = True
+                        else:
+                            return []
             else:
                 print(f"# {group}: message read failed: {e}", file=sys.stderr)
-                return []
+                if mode == "hybrid" and participants:
+                    messages = []
+                    messages_read_failed = True
+                else:
+                    return []
         pending_cursor = max(
             [int(getattr(m, "id", 0) or 0) for m in messages] or
             [previous_cursor]
@@ -340,9 +377,41 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
     print(f"# {group}: excluding {len(exclude)} already-scraped ids", file=sys.stderr)
 
     if mode == "members":
-        sender_ids = [u.id for u in participants if getattr(u, "id", None) not in exclude]
-        user_by_id = {u.id: u for u in participants}
+        sender_ids = []
+        seen = set()
+        for u in participants:
+            uid = getattr(u, "id", None)
+            if uid is None or uid in seen or uid in exclude:
+                continue
+            seen.add(uid)
+            sender_ids.append(uid)
+        user_by_id = {u.id: u for u in participants if getattr(u, "id", None) is not None}
         print(f"# {group}: {len(sender_ids)} participants", file=sys.stderr)
+    elif mode == "hybrid":
+        sender_ids = []
+        seen = set()
+        user_by_id = {}
+        for u in participants:
+            uid = getattr(u, "id", None)
+            if uid is None:
+                continue
+            user_by_id[uid] = u
+            if uid not in seen and uid not in exclude:
+                seen.add(uid)
+                sender_ids.append(uid)
+        for m in messages:
+            sid = getattr(m, "sender_id", None)
+            if sid is None:
+                continue
+            if sid not in user_by_id and getattr(m, "sender", None) is not None:
+                user_by_id[sid] = getattr(m, "sender", None)
+            if sid not in seen and sid not in exclude:
+                seen.add(sid)
+                sender_ids.append(sid)
+        print(
+            f"# {group}: hybrid {len(participants)} participants + {len(messages)} msgs -> {len(sender_ids)} unique users",
+            file=sys.stderr,
+        )
     else:
         # unique sender ids, preserving order (most recent first), skip channel/anon posts
         sender_ids = []
@@ -421,7 +490,7 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
         username = profile.get("username")
         role = categorize(bio)
         sample = ""
-        if mode == "posters":
+        if mode in ("posters", "hybrid"):
             sample = sample_by_sender.get(sid, (0, ""))[1]
         if is_spam_shill({"name": name, "username": username, "bio": bio, "sample": sample}):
             continue
@@ -462,7 +531,7 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
     # Advance the cursor only after the whole group completed.  If Telegram
     # FloodWait or a transient profile failure interrupts the group, the next
     # run retries those messages instead of silently skipping them.
-    if mode == "posters":
+    if mode in ("posters", "hybrid") and not messages_read_failed:
         if failed_message_ids:
             safe_cursor = min(failed_message_ids) - 1
             cursors[group] = max(previous_cursor, safe_cursor)
@@ -506,8 +575,8 @@ async def main():
     p.add_argument("--session", required=True)
     p.add_argument("--groups", required=True)
     p.add_argument("--msg-limit", type=int, default=400)
-    p.add_argument("--mode", choices=("members", "posters"), default="posters",
-                   help="posters = message authors (default); members = participant list")
+    p.add_argument("--mode", choices=("members", "posters", "hybrid"), default="posters",
+                   help="posters = message authors (default); members = participant list; hybrid = 7d-cooldown members + incremental posters")
     p.add_argument("--member-limit", type=int, default=100)
     p.add_argument("--delay", type=float, default=2.0)
     p.add_argument("--output", required=True)

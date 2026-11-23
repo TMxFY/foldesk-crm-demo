@@ -43,6 +43,13 @@ except ImportError:
         parse_channel_founder_info,
     )
 
+try:
+    from leadgen import tg_web_client
+except ImportError:
+    import tg_web_client  # type: ignore
+
+_ORIG_TG_WEB_CLIENT = tg_web_client
+
 DEFAULT_SESSION = (
     os.environ.get("TG_SESSION")
     or os.environ.get("SCRAPER_TG_SESSION")
@@ -50,6 +57,7 @@ DEFAULT_SESSION = (
 )
 DEFAULT_SEEN_PATH = "leadgen_state/ad_spy_seen.json"
 DEFAULT_AD_SPY_CHANNELS: tuple[str, ...] = (
+    # Core existing channels
     "gonzo_ML",
     "ai_newz",
     "startupoftheday",
@@ -84,6 +92,107 @@ DEFAULT_AD_SPY_CHANNELS: tuple[str, ...] = (
     "ai_products",
     "indie_makers",
     "d2c_marketing",
+    # Consumer AI / Apps & ML (EN + CIS/Global)
+    "seeallochnaya",
+    "denissexy",
+    "ai_machinelearning_big_data",
+    "serge_ai",
+    "forklogAI",
+    "data_secrets",
+    "dl_stories",
+    "abstractDL",
+    "boris_again",
+    "deep_learning_school_news",
+    "ai_product",
+    "aioftheday",
+    "neuraldeep",
+    "gonzo_ML_podcasts",
+    "geosemanticaai",
+    "its_capitan",
+    "gpt_news",
+    "cyberyozh_official",
+    "huggingface",
+    "openai_news",
+    "bytebytego",
+    # SaaS / Product / Startups / Indie Makers / VC
+    "epicgrowth",
+    "gopractice",
+    "ProductMindset",
+    "productsense",
+    "ordinarypm",
+    "brainbox_vc",
+    "temno",
+    "Startup_Jedi_RU",
+    "DigitalStageXTech",
+    "saas_founders",
+    "mspodcast",
+    "godnolytika",
+    "leadsnotes",
+    "lomovx",
+    "mspiridonov",
+    "petrochenkow",
+    "ilya_krasinsky",
+    "oshestakovdigital",
+    "kgrbnv",
+    "solokumi",
+    "bulavkinaonduty",
+    "katyagrows",
+    "pplsense",
+    "fuckup_files",
+    "levelsio",
+    "producthunt",
+    "b2b_saas",
+    # Mobile UA & Subscription Apps / ASO / App Growth
+    "app_growth",
+    "aso_ru",
+    "asotrips",
+    "aso_pro",
+    "app2top",
+    "android_dev_ru",
+    # E-com / Shopify / D2C / Retail / SEO
+    "retail_ru",
+    "e_pepper",
+    "rushagency_ru",
+    "moremoney",
+    "ad_tech",
+    "shopify_plus",
+    "wb_sellers",
+    "oborot_ru",
+    "ozon_business",
+    # Crypto / Fintech / Prop Trading / Web3 Builders
+    "tondev_news",
+    "toncore",
+    "tontech",
+    "incrypted",
+    "frank_media",
+    "fm_invest",
+    "smartlabnews",
+    "markettwits",
+    "bitkogan",
+    "tradingview",
+    "ftmo_official",
+    "MyTonWalletEn",
+    "tonkeeper_ru",
+    "tinkoff_invest_official",
+    "SMLT_IR",
+    # Growth / Performance Marketing / Paid Traffic / Telegram Ads
+    "dnative",
+    "tkachuk_aliaksey",
+    "epicgrowth_marketing",
+    "pmm_1",
+    "pmmfaq",
+    "t_tutorial",
+    "tginfo",
+    "fb_killa",
+    "greed_traf",
+    "fromspytobuy",
+    "solobuyernotess",
+    "tyver_spy",
+    "cpa_lenta",
+    "partnerkin",
+    "protraffic",
+    "kiber_mastera",
+    "marketing_digest",
 )
 
 AD_MARKER_RE = re.compile(
@@ -267,9 +376,184 @@ def _save_seen(path: str, seen: set[str], *, cursor: int | None = None) -> None:
     os.replace(tmp, path)
 
 
-async def _resolve_tg_target(client, handle: str) -> dict:
-    """Resolve a mentioned @handle either as a personal user or as a channel with a founder in bio."""
+_JUNK_HOST_TOKENS = (
+    "fragment.com",
+    "fragment_monitor",
+    "tonviewer.com",
+    "tonviewer",
+    "getgems.io",
+    "getgems",
+    "ton.diamonds",
+)
+_JUNK_HANDLE_RE = re.compile(
+    r"(?:^|_)(?:fragment|fragment_monitor|tonviewer|getgems|casino|slots|betting|1win|1xbet|mostbet|giveaway|airdrop|rozygrysh)(?:$|_)",
+    re.IGNORECASE,
+)
+_JUNK_TEXT_RE = re.compile(
+    r"(?:fragment\.com|fragment_monitor|tonviewer(?:\.com)?|getgems(?:\.io)?|"
+    r"\b(?:username\s+auction|nft\s+auction|buy\s+usernames?|usernames?\s+for\s+sale|"
+    r"аукцион\w*\s+(?:юзернейм\w*|никнейм\w*|ников|номеров)|выкуп\w*\s+юзернейм\w*|купить\s+юзернейм\w*|номер\w*\s+\+888|"
+    r"casino|казино|slots|слоты|букмекер\w*|betting|sportsbook|ставки\s+на\s+спорт|1win|1xbet|mostbet|pin-?up|"
+    r"фриспин\w*|freespin\w*|лудоман\w*|онлайн[- ]?казино|рулетк\w*|"
+    r"giveaway\w*|розыгрыш\w*|гивэве\w*|airdrop\w*|аирдроп\w*|раздача\s+призов|конкурс\s+репостов|tap[- ]to[- ]earn|тапалк\w*)\b)",
+    re.IGNORECASE,
+)
+
+
+def is_ad_spy_junk_target(url: str = "", handle: str = "", text: str = "") -> bool:
+    """Filter Fragment/username auctions, TON explorers/NFT markets, casino/betting, giveaways, and bots."""
+    raw_url = (url or "").strip()
+    url_low = raw_url.lower()
+    raw_handle = (handle or "").strip().lstrip("@")
+    handle_low = raw_handle.lower()
+    body = (text or "").strip()
+
+    if raw_handle:
+        if is_bot_handle(handle_low) or _JUNK_HANDLE_RE.search(handle_low):
+            return True
+
+    if url_low:
+        if any(tok in url_low for tok in _JUNK_HOST_TOKENS):
+            return True
+        if re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/[a-z0-9_]+bot(?:[/?#]|$)", url_low):
+            return True
+        if "?start=" in url_low or "?startgroup=" in url_low or "&start=" in url_low:
+            return True
+
+    if body and _JUNK_TEXT_RE.search(body):
+        return True
+    return False
+
+
+def _should_use_web_first(client, *custom_fns) -> bool:
+    if any(fn is not None for fn in custom_fns):
+        return True
+    if client is None or isinstance(client, TelegramClient):
+        return True
+    if tg_web_client is not _ORIG_TG_WEB_CLIENT:
+        return True
+    if tg_web_client is not None and getattr(tg_web_client, "has_patched_io", lambda: False)():
+        return True
+    return False
+
+
+async def _resolve_tg_target(
+    client,
+    handle: str,
+    *,
+    probe_fn=None,
+    posts_fn=None,
+    http_get_fn=None,
+) -> dict:
+    """Resolve a mentioned @handle via Web-first (`tg_web_client`) and fall back to Telethon only on 'unknown'."""
     clean = handle.strip().lstrip("@")
+    empty_res = {"id": 0, "username": "", "name": "", "company": "", "bio": "", "site": ""}
+    if not clean or is_ad_spy_junk_target(handle=clean):
+        return empty_res
+
+    if _should_use_web_first(client, probe_fn, posts_fn, http_get_fn) and (
+        probe_fn is not None or tg_web_client is not None
+    ):
+        try:
+            probed = (
+                probe_fn(clean)
+                if probe_fn is not None
+                else tg_web_client.probe_tme_handle_web(clean, http_get_fn=http_get_fn)
+            )
+        except Exception:
+            probed = {"kind": "unknown"}
+        kind = str((probed or {}).get("kind") or "unknown").lower()
+        p_title = str((probed or {}).get("title") or "").strip()
+        p_bio = str((probed or {}).get("bio") or "").strip()
+        p_subs = int((probed or {}).get("subscribers") or 0)
+
+        if kind == "user":
+            return {
+                "id": 0,
+                "username": clean,
+                "name": p_title or clean,
+                "company": "",
+                "bio": p_bio,
+                "site": "",
+            }
+        if kind in ("bot", "missing"):
+            return empty_res
+        if kind == "channel":
+            post_texts: list[str] = []
+            info: dict = {}
+            try:
+                if posts_fn is not None:
+                    res = posts_fn(clean, 5)
+                    if isinstance(res, tuple) and len(res) == 2:
+                        info = dict(res[0] or {})
+                        post_texts = [str(p).strip() for p in (res[1] or []) if str(p or "").strip()]
+                    else:
+                        post_texts = [str(p).strip() for p in (res or []) if str(p or "").strip()]
+                elif tg_web_client is not None:
+                    info, post_texts = tg_web_client.fetch_channel_posts_web(
+                        clean,
+                        limit=5,
+                        http_get_fn=http_get_fn,
+                    )
+            except Exception:
+                info, post_texts = {}, []
+
+            about = str(info.get("about") or info.get("bio") or p_bio or "").strip()
+            title = str(info.get("title") or p_title or clean).strip()
+            subs = int(info.get("subscribers") or p_subs or 0)
+            parsed = parse_channel_founder_info(
+                about=about,
+                posts=post_texts,
+                channel_username=clean,
+                channel_title=title,
+                subscribers=subs,
+            )
+            owner_username = parsed["username"] if parsed else ""
+            site = parsed["site"] if parsed else extract_external_site([about] + post_texts)
+            if owner_username and not is_ad_spy_junk_target(handle=owner_username):
+                try:
+                    u_probe = (
+                        probe_fn(owner_username)
+                        if probe_fn is not None
+                        else tg_web_client.probe_tme_handle_web(owner_username, http_get_fn=http_get_fn)
+                    )
+                except Exception:
+                    u_probe = {"kind": "unknown"}
+                u_kind = str((u_probe or {}).get("kind") or "unknown").lower()
+                if u_kind == "user":
+                    return {
+                        "id": 0,
+                        "username": owner_username,
+                        "name": str(u_probe.get("title") or "").strip() or title,
+                        "company": title,
+                        "bio": about,
+                        "site": clean_product_url(site) or site,
+                    }
+                if u_kind == "unknown" and client is not None:
+                    u_res = await _resolve_personal_user(client, owner_username)
+                    return {
+                        "id": u_res.get("id") or 0,
+                        "username": owner_username,
+                        "name": u_res.get("name") or title,
+                        "company": title,
+                        "bio": about,
+                        "site": clean_product_url(site) or site,
+                    }
+            return {
+                "id": 0,
+                "username": "",
+                "name": title,
+                "company": title,
+                "bio": about,
+                "site": clean_product_url(site) or site,
+            }
+        # Only fall through to Telethon when Web returns "unknown" and client is not None.
+        if client is None:
+            return empty_res
+
+    if client is None:
+        return empty_res
+
     try:
         entity = await client.get_entity(clean)
     except Exception:
@@ -290,7 +574,7 @@ async def _resolve_tg_target(client, handle: str) -> dict:
             chat_obj = full.chats[0] if getattr(full, "chats", None) else entity
             title = getattr(chat_obj, "title", "") or clean
             subs = getattr(full.full_chat, "participants_count", None) or getattr(entity, "participants_count", 0) or 0
-            post_texts: list[str] = []
+            post_texts = []
             try:
                 msgs = await client.get_messages(entity, limit=3)
                 post_texts = [
@@ -577,6 +861,8 @@ async def scan_ad_channels(
                             if str(txt or "").strip()
                         ]
                 if messages is None:
+                    if client is None:
+                        continue
                     try:
                         entity = await client.get_entity(ch)
                         messages = await client.get_messages(entity, limit=msg_limit)
@@ -598,7 +884,15 @@ async def scan_ad_channels(
                         continue
 
                     site = sig["product_site"]
-                    tg_targets = sig["tg_targets"]
+                    tg_targets = [h for h in sig["tg_targets"] if not is_ad_spy_junk_target(handle=h)]
+                    if is_ad_spy_junk_target(
+                        url=site,
+                        handle=(tg_targets[0] if tg_targets else ""),
+                        text=text,
+                    ):
+                        continue
+                    if not site and not tg_targets:
+                        continue
 
                     resolved_username = ""
                     resolved_name = ""
@@ -616,6 +910,13 @@ async def scan_ad_channels(
                         resolved_id = target_info.get("id") or 0
                         if not site and target_info.get("site"):
                             site = target_info["site"]
+
+                    if is_ad_spy_junk_target(
+                        url=site,
+                        handle=resolved_username,
+                        text=resolved_bio,
+                    ):
+                        continue
 
                     if resolved_username and resolved_username.lower() == ch_low:
                         resolved_username = ""
