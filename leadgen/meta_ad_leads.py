@@ -13,6 +13,9 @@ import inspect
 import json
 import os
 import re
+import signal
+import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -897,6 +900,75 @@ def _default_store_resolver(store_url: str) -> dict:
     return _builtin_store_resolver(store_url)
 
 
+class _SigtermInterrupt(BaseException):
+    """Raised on SIGTERM so inner except-Exception handlers cannot swallow shutdown."""
+
+
+def _rotate_country_window(
+    countries: Sequence[str],
+    *,
+    cursor: int = 0,
+    max_countries: int = 3,
+) -> list[str]:
+    """Rotate a bounded GEO window using cursor when more than max_countries are supplied."""
+    cleaned = [str(c).strip().upper() for c in countries if str(c).strip()]
+    if not cleaned:
+        return ["US"]
+    window = max(1, int(max_countries))
+    if len(cleaned) <= window:
+        return cleaned
+    c_idx = max(0, int(cursor))
+    start = (c_idx * window) % len(cleaned)
+    return [cleaned[(start + i) % len(cleaned)] for i in range(window)]
+
+
+def _deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _record_row_seen(seen_map: dict[str, str], row: dict[str, Any], stamp: str) -> None:
+    pname = str(row.get("name") or "").strip()
+    if pname:
+        seen_map[f"name:{pname.casefold()}"] = stamp
+    pdom = domain_of(str(row.get("project_url") or ""))
+    if pdom:
+        seen_map[f"domain:{pdom.casefold()}"] = stamp
+    fb_id = str(row.get("fb_page_id") or "").strip()
+    if fb_id:
+        seen_map[f"fb:{fb_id}"] = stamp
+
+
+def _extract_tg_handles(
+    site_contacts: dict[str, Any],
+    dm: dict[str, Any],
+) -> tuple[str, str]:
+    """Split personal Telegram handle vs public channel/group t.me URL."""
+    site_tg = str(
+        site_contacts.get("username") or site_contacts.get("telegram_username") or ""
+    ).strip().lstrip("@")
+    dm_cands = (
+        str(dm.get("telegram_username") or "").strip().lstrip("@"),
+        str(dm.get("username") or "").strip().lstrip("@"),
+    )
+    username = ""
+    tg_group_url = ""
+    if site_tg:
+        if _is_personal_tg_username(site_tg):
+            username = site_tg
+        elif not site_tg.lower().endswith(("bot", "_bot")):
+            tg_group_url = f"https://t.me/{site_tg}"
+    for dm_tg in dm_cands:
+        if not dm_tg:
+            continue
+        if _is_personal_tg_username(dm_tg):
+            if not username:
+                username = dm_tg
+            break
+        if not tg_group_url and not dm_tg.lower().endswith(("bot", "_bot")):
+            tg_group_url = f"https://t.me/{dm_tg}"
+    return username, tg_group_url
+
+
 def collect(
     *,
     day: date | None = None,
@@ -905,6 +977,10 @@ def collect(
     countries: Sequence[str] | None = None,
     cursor: int = 0,
     query_count: int | None = None,
+    max_runtime_sec: float | None = None,
+    on_row: Callable[[dict], None] | None = None,
+    rotate_countries: bool = False,
+    max_countries: int | None = None,
     search_fn=None,
     enrich_fn=None,
     store_resolver_fn=None,
@@ -916,6 +992,11 @@ def collect(
     enricher = find_company_decision_maker if enrich_fn is None else enrich_fn
     resolve_store = _default_store_resolver if store_resolver_fn is None else store_resolver_fn
     allow_store_bridge = bool(store_resolver_fn is not None or enrich_fn is None)
+    deadline = (
+        (time.monotonic() + max(0.0, float(max_runtime_sec)))
+        if max_runtime_sec is not None
+        else None
+    )
 
     rows: list[dict] = []
     local_keys: set[str] = set()
@@ -924,6 +1005,13 @@ def collect(
     selected_queries = queries_for_day(today, count=q_count, cursor=cursor)
     if countries is not None:
         selected_countries = [str(c).strip().upper() for c in countries if str(c).strip()]
+        if rotate_countries or (max_countries is not None and int(max_countries) > 0):
+            window = int(max_countries) if (max_countries is not None and int(max_countries) > 0) else 3
+            selected_countries = _rotate_country_window(
+                selected_countries,
+                cursor=cursor,
+                max_countries=window,
+            )
     else:
         selected_countries = countries_for_day(today, count=len(selected_queries) or 6, cursor=cursor)
     if not selected_countries:
@@ -935,176 +1023,190 @@ def collect(
         for i in range(total_steps)
     ]
 
-    for query, country in search_plan:
-        if len(rows) >= cap:
-            break
-        try:
-            payload = _call_search(caller, query, country)
-        except Exception:
-            payload = None
-        for cand in parse_ad_candidates(payload, country_code=country):
-            if len(rows) >= cap:
+    stopped = False
+    try:
+        for query, country in search_plan:
+            if len(rows) >= cap or _deadline_expired(deadline):
                 break
-            page_name = cand["page_name"]
-            domain = cand["domain"]
-            orig_project_url = cand["project_url"]
-            orig_host = (
-                urlparse(orig_project_url if "://" in orig_project_url else f"https://{orig_project_url}").hostname or ""
-            ).lower().removeprefix("www.")
-            store_url = orig_project_url if orig_host in APP_STORE_HOSTS else ""
-
-            name_key = f"name:{page_name.casefold()}"
-            dom_key = f"domain:{domain.casefold()}" if domain else ""
-            fb_key = f"fb:{cand['fb_page_id']}" if cand["fb_page_id"] else ""
-            if name_key in current or name_key in local_keys:
-                continue
-            if dom_key and (dom_key in current or dom_key in local_keys):
-                continue
-            if fb_key and (fb_key in current or fb_key in local_keys):
-                continue
-
-            store_info: dict = {}
-            resolved_domain = domain
-            resolved_project_url = orig_project_url
-            if store_url and not domain and allow_store_bridge:
-                try:
-                    store_info = resolve_store(store_url) or {}
-                except Exception:
-                    store_info = {}
-                try:
-                    store_rating = int(store_info.get("rating_count") or 0)
-                except (TypeError, ValueError):
-                    store_rating = 0
-                if store_info.get("is_megacorp") or store_rating > 50000:
-                    continue
-                if store_info.get("website"):
-                    resolved_project_url = str(store_info["website"]).strip()
-                resolved_domain = str(store_info.get("domain") or domain_of(resolved_project_url)).strip()
-                if resolved_domain:
-                    res_dom_key = f"domain:{resolved_domain.casefold()}"
-                    if res_dom_key in current or res_dom_key in local_keys:
-                        continue
-
-            local_keys.add(name_key)
-            if dom_key:
-                local_keys.add(dom_key)
-            if fb_key:
-                local_keys.add(fb_key)
-            if resolved_domain:
-                local_keys.add(f"domain:{resolved_domain.casefold()}")
-
-            enrich_target = str(store_info.get("developer") or page_name).strip()
             try:
-                dm = enricher(enrich_target, resolved_domain) or {}
+                payload = _call_search(caller, query, country)
             except Exception:
-                dm = {}
+                payload = None
+            for cand in parse_ad_candidates(payload, country_code=country):
+                if len(rows) >= cap or _deadline_expired(deadline):
+                    stopped = True
+                    break
+                page_name = cand["page_name"]
+                domain = cand["domain"]
+                orig_project_url = cand["project_url"]
+                orig_host = (
+                    urlparse(orig_project_url if "://" in orig_project_url else f"https://{orig_project_url}").hostname or ""
+                ).lower().removeprefix("www.")
+                store_url = orig_project_url if orig_host in APP_STORE_HOSTS else ""
 
-            founder_linkedin = str(dm.get("founder_linkedin") or "").strip()
-            work_email = str(dm.get("work_email") or "").strip()
-            if resolved_project_url and resolved_project_url != store_url:
-                project_url = resolved_project_url
-            else:
-                project_url = str(dm.get("project_url") or "").strip() or orig_project_url
-            resolved_domain = resolved_domain or domain_of(project_url)
-            site_contacts = (
-                _scrape_site_contacts(project_url)
-                if (enrich_fn is None or store_resolver_fn is not None) and resolved_domain
-                else {}
-            )
-            if not founder_linkedin and site_contacts.get("founder_linkedin"):
-                founder_linkedin = site_contacts["founder_linkedin"]
-            if not work_email and site_contacts.get("work_email"):
-                work_email = site_contacts["work_email"]
-            if not work_email and store_info.get("email"):
-                work_email = str(store_info["email"]).strip()
-            raw_tg = str(site_contacts.get("username", "") or "").strip().lstrip("@")
-            tg_group_url = ""
-            if raw_tg and not _is_personal_tg_username(raw_tg):
-                username = ""
-                if not raw_tg.lower().endswith(("bot", "_bot")):
-                    tg_group_url = f"https://t.me/{raw_tg}"
-            else:
-                username = raw_tg
-            founder_x = site_contacts.get("founder_x", "")
+                name_key = f"name:{page_name.casefold()}"
+                dom_key = f"domain:{domain.casefold()}" if domain else ""
+                fb_key = f"fb:{cand['fb_page_id']}" if cand["fb_page_id"] else ""
+                if name_key in current or name_key in local_keys:
+                    continue
+                if dom_key and (dom_key in current or dom_key in local_keys):
+                    continue
+                if fb_key and (fb_key in current or fb_key in local_keys):
+                    continue
 
-            wa_url = cand["whatsapp"]
-            wa_phone = cand["phone"]
-            fb_page_id = cand["fb_page_id"]
-            fb_page_url = cand["fb_page_url"]
-            ig_handle = cand["instagram_handle"]
-            ig_url = cand["instagram_url"]
+                store_info: dict = {}
+                resolved_domain = domain
+                resolved_project_url = orig_project_url
+                if store_url and not domain and allow_store_bridge:
+                    try:
+                        store_info = resolve_store(store_url) or {}
+                    except Exception:
+                        store_info = {}
+                    try:
+                        store_rating = int(store_info.get("rating_count") or 0)
+                    except (TypeError, ValueError):
+                        store_rating = 0
+                    if store_info.get("is_megacorp") or store_rating > 50000:
+                        continue
+                    if store_info.get("website"):
+                        resolved_project_url = str(store_info["website"]).strip()
+                    resolved_domain = str(store_info.get("domain") or domain_of(resolved_project_url)).strip()
+                    if resolved_domain:
+                        res_dom_key = f"domain:{resolved_domain.casefold()}"
+                        if res_dom_key in current or res_dom_key in local_keys:
+                            continue
 
-            if not (
-                founder_linkedin
-                or work_email
-                or resolved_domain
-                or project_url
-                or wa_url
-                or wa_phone
-                or ig_url
-                or fb_page_url
-                or tg_group_url
-            ):
-                continue
+                if _deadline_expired(deadline):
+                    stopped = True
+                    break
 
-            slug = _slugify(resolved_domain or page_name)
-            links = list(
-                dict.fromkeys(
-                    u
-                    for u in (
-                        project_url,
-                        store_url,
-                        wa_url,
-                        tg_group_url,
-                        founder_linkedin,
-                        founder_x,
-                        ig_url,
-                        fb_page_url,
-                    )
-                    if u
+                local_keys.add(name_key)
+                if dom_key:
+                    local_keys.add(dom_key)
+                if fb_key:
+                    local_keys.add(fb_key)
+                if resolved_domain:
+                    local_keys.add(f"domain:{resolved_domain.casefold()}")
+
+                enrich_target = str(store_info.get("developer") or page_name).strip()
+                try:
+                    dm = enricher(enrich_target, resolved_domain) or {}
+                except Exception:
+                    dm = {}
+
+                founder_name = str(dm.get("founder_name") or "").strip()
+                founder_linkedin = str(dm.get("founder_linkedin") or "").strip()
+                work_email = str(dm.get("work_email") or "").strip()
+                if resolved_project_url and resolved_project_url != store_url:
+                    project_url = resolved_project_url
+                else:
+                    project_url = str(dm.get("project_url") or "").strip() or orig_project_url
+                resolved_domain = resolved_domain or domain_of(project_url)
+                site_contacts = (
+                    _scrape_site_contacts(project_url)
+                    if (enrich_fn is None or store_resolver_fn is not None) and resolved_domain
+                    else {}
                 )
-            )
-            provider = "telegram" if username else ("whatsapp" if wa_url else "")
-            row = {
-                "id": f"meta_ads:{slug}",
-                "name": page_name,
-                "username": username,
-                "telegram_group": tg_group_url,
-                "whatsapp": wa_url,
-                "phone": wa_phone,
-                "provider": provider,
-                "cta_type": cand["cta_type"],
-                "bio": cand["what_they_do"],
-                "links": links,
-                "source": "meta_ads",
-                "segment": "whale",
-                "role": "Marketing",
-                "roles": ["Marketing"],
-                "category": "SaaS / AI app",
-                "project": page_name,
-                "project_url": project_url,
-                "what_they_do": cand["what_they_do"],
-                "founder_linkedin": founder_linkedin,
-                "founder_x": founder_x,
-                "work_email": work_email,
-                "fb_page_id": fb_page_id,
-                "fb_page_url": fb_page_url,
-                "instagram_handle": ig_handle,
-                "instagram_url": ig_url,
-                "country_code": cand["country_code"],
-                "has_monetization_signal": True,
-                "monetization": "subscription",
-                "icp_match": True,
-                "lead_tier": "A",
-            }
-            rows.append(row)
-            current[name_key] = stamp
-            if dom_key:
-                current[dom_key] = stamp
-            elif resolved_domain:
-                current[f"domain:{resolved_domain.casefold()}"] = stamp
-            if fb_key:
-                current[fb_key] = stamp
+                if not founder_name and site_contacts.get("founder_name"):
+                    founder_name = str(site_contacts["founder_name"]).strip()
+                if not founder_linkedin and site_contacts.get("founder_linkedin"):
+                    founder_linkedin = site_contacts["founder_linkedin"]
+                if not work_email and site_contacts.get("work_email"):
+                    work_email = site_contacts["work_email"]
+                if not work_email and store_info.get("email"):
+                    work_email = str(store_info["email"]).strip()
+                username, tg_group_url = _extract_tg_handles(site_contacts, dm)
+                founder_x = str(site_contacts.get("founder_x") or dm.get("founder_x") or "").strip()
+
+                wa_url = cand["whatsapp"]
+                wa_phone = cand["phone"]
+                fb_page_id = cand["fb_page_id"]
+                fb_page_url = cand["fb_page_url"]
+                ig_handle = cand["instagram_handle"]
+                ig_url = cand["instagram_url"]
+
+                if not (
+                    founder_linkedin
+                    or work_email
+                    or resolved_domain
+                    or project_url
+                    or wa_url
+                    or wa_phone
+                    or ig_url
+                    or fb_page_url
+                    or tg_group_url
+                    or username
+                    or founder_x
+                ):
+                    continue
+
+                slug = _slugify(resolved_domain or page_name)
+                links = list(
+                    dict.fromkeys(
+                        u
+                        for u in (
+                            project_url,
+                            store_url,
+                            wa_url,
+                            f"https://t.me/{username}" if username else "",
+                            tg_group_url,
+                            founder_linkedin,
+                            founder_x,
+                            ig_url,
+                            fb_page_url,
+                        )
+                        if u
+                    )
+                )
+                provider = "telegram" if username else ("whatsapp" if wa_url else "")
+                row = {
+                    "id": f"meta_ads:{slug}",
+                    "name": page_name,
+                    "founder_name": founder_name,
+                    "username": username,
+                    "telegram_username": username,
+                    "telegram_group": tg_group_url,
+                    "whatsapp": wa_url,
+                    "phone": wa_phone,
+                    "provider": provider,
+                    "cta_type": cand["cta_type"],
+                    "bio": cand["what_they_do"],
+                    "links": links,
+                    "source": "meta_ads",
+                    "segment": "whale",
+                    "role": "Marketing",
+                    "roles": ["Marketing"],
+                    "category": "SaaS / AI app",
+                    "project": page_name,
+                    "project_url": project_url,
+                    "what_they_do": cand["what_they_do"],
+                    "founder_linkedin": founder_linkedin,
+                    "founder_x": founder_x,
+                    "work_email": work_email,
+                    "fb_page_id": fb_page_id,
+                    "fb_page_url": fb_page_url,
+                    "instagram_handle": ig_handle,
+                    "instagram_url": ig_url,
+                    "country_code": cand["country_code"],
+                    "has_monetization_signal": True,
+                    "monetization": "subscription",
+                    "icp_match": True,
+                    "lead_tier": "A",
+                }
+                rows.append(row)
+                current[name_key] = stamp
+                if dom_key:
+                    current[dom_key] = stamp
+                elif resolved_domain:
+                    current[f"domain:{resolved_domain.casefold()}"] = stamp
+                if fb_key:
+                    current[fb_key] = stamp
+                if on_row is not None:
+                    on_row(row)
+            if stopped:
+                break
+    except _SigtermInterrupt:
+        stopped = True
 
     return rows, current
 
@@ -1143,14 +1245,16 @@ def _save_seen(path: Path, seen: dict[str, str], *, cursor: int | None = None) -
         pass
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--seen", default=".tg_pipeline/meta_ads_seen.json")
     parser.add_argument("--limit", type=int, default=CAP)
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
     parser.add_argument("--country", default="", help="Comma-separated 2-letter GEO codes (optional)")
-    args = parser.parse_args()
+    parser.add_argument("--max-runtime-sec", type=float, default=210.0)
+    parser.add_argument("--max-countries", type=int, default=3)
+    args = parser.parse_args(argv)
 
     day = date.fromisoformat(args.day) if args.day else date.today()
     countries = (
@@ -1161,24 +1265,63 @@ def main() -> None:
     seen_path = Path(args.seen)
     before = _load_seen(seen_path)
     cursor = _load_cursor(seen_path)
-    try:
-        rows, updated = collect(
-            day=day,
-            seen=before,
-            cap=max(0, args.limit),
-            countries=countries,
-            cursor=cursor,
-            query_count=6,
-        )
-    except Exception:
-        rows, updated = [], before
-    _save_seen(seen_path, updated, cursor=cursor + 1)
+    updated = fresh_seen(before, day)
+    stamp = day.isoformat()
+
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"meta_ads: admitted={len(rows)}", flush=True)
+    admitted_count = 0
+    shutting_down = False
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        if not shutting_down:
+            raise _SigtermInterrupt("meta_ad_leads terminated by SIGTERM")
+
+    prev_sigterm = None
+    try:
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (ValueError, OSError):
+        prev_sigterm = None
+
+    max_rt = float(args.max_runtime_sec)
+    effective_runtime = max_rt if max_rt > 0 else None
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as handle:
+            def _emit_row(row: dict[str, Any]) -> None:
+                nonlocal admitted_count
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.flush()
+                admitted_count += 1
+                _record_row_seen(updated, row, stamp)
+
+            try:
+                _rows, returned_updated = collect(
+                    day=day,
+                    seen=before,
+                    cap=max(0, args.limit),
+                    countries=countries,
+                    cursor=cursor,
+                    query_count=6,
+                    max_runtime_sec=effective_runtime,
+                    on_row=_emit_row,
+                    rotate_countries=True,
+                    max_countries=max(1, int(args.max_countries)),
+                )
+                updated = returned_updated
+            except _SigtermInterrupt:
+                print("meta_ads: sigterm_graceful_stop", file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"meta_ads: collect_error={type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    finally:
+        shutting_down = True
+        if prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
+                pass
+        _save_seen(seen_path, updated, cursor=cursor + 1)
+    print(f"meta_ads: admitted={admitted_count}", flush=True)
 
 
 if __name__ == "__main__":
