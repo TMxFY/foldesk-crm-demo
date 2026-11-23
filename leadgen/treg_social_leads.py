@@ -54,17 +54,21 @@ REDDIT_ROTATION = (
     ("musicmarketing", "label"),
 )
 # No bare -clipper: "looking for clippers" is a buyer.
-_BUYER_CORE = (
-    '"looking for clippers" OR "hiring clippers" OR "need clippers" -portfolio -"no followers needed"',
-    '"content rewards" OR "paying clippers" OR "pay per view" (course OR students OR community OR skool OR whop)',
-    '"looking for" (UGC OR "short form" OR "video editor") (course OR students OR community OR saas OR "prop firm") -portfolio',
-    '("my students" OR "my cohort" OR "my community") ("short form" OR tiktok OR reels OR ugc) -portfolio',
-    '"looking for" "UGC creators" -portfolio -"open to work"',
-    '"hiring" "UGC creators" -portfolio -"open to work"',
-    '"need AI UGC" -portfolio -"open to work"',
-    '"scaling paid social" -portfolio -"open to work"',
-    '"need more creatives" -portfolio -"open to work"',
-    '"hiring content creator" -portfolio -"open to work"',
+_X_NOISE_EXCLUSIONS = '-"for hire" -"available for" -"dm for" -"airdrop" -"giveaway" -"jam track"'
+_BUYER_CORE = tuple(
+    f"{q} {_X_NOISE_EXCLUSIONS}"
+    for q in (
+        '"looking for clippers" OR "hiring clippers" OR "need clippers" -portfolio -"no followers needed"',
+        '"content rewards" OR "paying clippers" OR "pay per view" (course OR students OR community OR skool OR whop)',
+        '"looking for" (UGC OR "short form" OR "video editor") (course OR students OR community OR saas OR "prop firm") -portfolio',
+        '("my students" OR "my cohort" OR "my community") ("short form" OR tiktok OR reels OR ugc) -portfolio',
+        '"looking for" "UGC creators" -portfolio -"open to work"',
+        '"hiring" "UGC creators" -portfolio -"open to work"',
+        '"need AI UGC" -portfolio -"open to work"',
+        '"scaling paid social" -portfolio -"open to work"',
+        '"need more creatives" -portfolio -"open to work"',
+        '"hiring content creator" -portfolio -"open to work"',
+    )
 )
 
 _STRONG_DEMAND = re.compile(
@@ -97,13 +101,44 @@ _LARGE_CORE = (
     '("record label") ("looking for" OR hiring) ("short form" OR ugc OR editor) -portfolio',
     '(fivem OR "gta rp") (server) (tiktok OR trailer OR "short form") -portfolio',
 )
-_CLASSIC_CORE = (
-    '(supplement OR vitamin OR cosmetics OR skincare) (founder OR brand) (tiktok OR ugc) -portfolio',
-    '("fitness app" OR "health app" OR "productivity app") (founder OR launched) -portfolio',
-    '(astrology OR "fitness course") (ebook OR course OR guide) (tiktok OR ugc) -portfolio',
-    '("household" OR detergent OR "cleaning brand") (founder OR brand) (tiktok OR ugc) -portfolio',
-    '("make money" OR "side income") (course OR ebook OR guide) (tiktok OR founder) -portfolio -"open to work"',
+_CLASSIC_CORE = tuple(
+    f"{q} {_X_NOISE_EXCLUSIONS}"
+    for q in (
+        '(supplement OR vitamin OR cosmetics OR skincare) (founder OR brand) (tiktok OR ugc) -portfolio',
+        '("fitness app" OR "health app" OR "productivity app") (founder OR launched) -portfolio',
+        '(astrology OR "fitness course") (ebook OR course OR guide) (tiktok OR ugc) -portfolio',
+        '("household" OR detergent OR "cleaning brand") (founder OR brand) (tiktok OR ugc) -portfolio',
+        '("make money" OR "side income") (course OR ebook OR guide) (tiktok OR founder) -portfolio -"open to work"',
+    )
 )
+
+_SOCIAL_NOISE_RE = re.compile(
+    r"(?:"
+    r"\[for\s*hire\]|\bfor\s+hire\b|\bavailable\s+for\s+(?:hire|work|projects?|gigs?|editing|clipping|ugc|va)\b|"
+    r"\bopen\s+to\s+work\b|\bseeking\s+(?:a\s+)?(?:job|role|position|work|clients?|gigs?)\b|"
+    r"\blooking\s+for\s+(?:a\s+)?(?:job|work|remote\s+(?:job|work|role)|clients?|va\s+role)\b|"
+    r"\b(?:dm|message)\s+(?:me\s+)?for\s+(?:rates?|pricing|portfolio|promo|collabs?|work|services?|editing|ugc)\b|"
+    r"\bvirtual\s+assistant\s+(?:for\s+hire|available|looking\s+for|here)\b|\bhire\s+me\b|"
+    r"\b(?:i['’]?m|i\s+am)\s+(?:a\s+|an\s+)?(?:va|virtual\s+assistant|ugc\s+creator|video\s+editor|clipper)\b|"
+    r"\bjam\s+tracks?\b|\bfortnite\s+festival\b|\b(?:custom|ranked|arena)\s+(?:matchmaking|lobby|scrims?)\b|"
+    r"\blooking\s+for\s+(?:a\s+)?(?:duo|trio|squad|teammates?|4th|5th)\b|"
+    r"\bdrop\s+your\s+(?:epic|gamertag|psn|riot\s*id)\b|\b(?:v-?bucks|robux)\s+(?:giveaway|free|codes?)\b|"
+    r"\b(?:blox\s+fruits|adopt\s+me|minecraft\s+smp)\b|"
+    r"\b(?:giveaway|airdrop)s?\b|\bwl\s+giveaway\b|\bfree\s+mint\b|"
+    r"\b(?:like|rt|repost|retweet)\s*(?:&|and|\+)\s*(?:follow|rt|repost|comment|tag)\b|"
+    r"\btag\s+\d+\s+friends\b|\bdrop\s+your\s+(?:wallet|sol|eth|btc|ton|address)\b|"
+    r"\bclaim\s+your\s+(?:airdrop|prize|tokens?|usdt)\b"
+    r")",
+    re.I,
+)
+
+
+def is_social_noise_post(text: str, bio: str = "") -> bool:
+    """Drop obvious VA/job-seeker, gaming-match, and giveaway/airdrop spam before emitting JSONL rows."""
+    blob = f"{text or ''} {bio or ''}".strip()
+    if not blob:
+        return False
+    return _SOCIAL_NOISE_RE.search(blob) is not None
 _NICHE_OK = re.compile(
     r"\broblox\b|\bfortnite\b|\buefn\b|mobile game|creative producer",
     re.I,
@@ -400,6 +435,17 @@ def _author_name(post: dict, handle: str) -> str:
     return handle
 
 
+def _author_bio(post: dict) -> str:
+    for key in ("authorBio", "author_bio"):
+        val = str(post.get(key) or "").strip()
+        if val:
+            return val
+    author = post.get("author") or post.get("user") or {}
+    if isinstance(author, dict):
+        return str(author.get("description") or author.get("bio") or "").strip()
+    return ""
+
+
 def _text_of(post: dict) -> str:
     parts = []
     for key in ("title", "text", "full_text", "selftext", "body"):
@@ -495,9 +541,13 @@ def x_candidates(payload: dict | None) -> list[tuple[str, dict | None]]:
         if not handle:
             continue
         text = _text_of(post)
+        author_bio = _author_bio(post)
         urls = _urls(text, post.get("url"))
         site = next((_site(url) for url in urls if _site(url)), "")
         key = "x:" + handle.casefold()
+        if is_social_noise_post(text, author_bio):
+            out.append((key, None))
+            continue
         # Search posts only. A short post with no site is noise and stays seen.
         # Comment authors go through comment_candidates and are not burned here.
         if not site and len(_substance(text)) < 40:
@@ -524,6 +574,7 @@ def reddit_candidates(payload: dict | None, subreddit: str) -> list[tuple[str, d
         if not handle:
             continue
         text = _text_of(post)
+        author_bio = _author_bio(post)
         urls = _urls(text, post.get("url"), post.get("permalink"))
         site = next((_site(url) for url in urls if _site(url)), "")
         x_url = ""
@@ -533,6 +584,9 @@ def reddit_candidates(payload: dict | None, subreddit: str) -> list[tuple[str, d
                 x_url = f"https://x.com/{x_handle}"
                 break
         key = "reddit:" + handle.casefold()
+        if is_social_noise_post(text, author_bio):
+            out.append((key, None))
+            continue
         if not site and not x_url:
             out.append((key, None))
             continue
@@ -602,10 +656,11 @@ def comment_candidates(payload: dict | None) -> list[tuple[str, dict | None]]:
         if not handle or handle.casefold() in BRAND_HANDLES:
             continue
         text = _text_of(post)
+        author_bio = _author_bio(post)
         key = "x:" + handle.casefold()
         urls = _urls(text)
         site = next((_site(url) for url in urls if _site(url)), "")
-        if is_supply_side(text):
+        if is_supply_side(text) or is_social_noise_post(text, author_bio):
             out.append((key, None))
             continue
         # The 40-character seen mark belongs to search posts (x_candidates).
@@ -764,6 +819,10 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
         classic = any(core in query for core in _CLASSIC_CORE)
         for key, row in x_candidates(payload):
             if row is None:
+                filtered += 1
+                x_cands.append((key, None))
+                continue
+            if is_social_noise_post(str(row.get("sample") or row.get("bio") or ""), str(row.get("bio") or "")):
                 filtered += 1
                 x_cands.append((key, None))
                 continue

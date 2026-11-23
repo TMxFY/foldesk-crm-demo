@@ -246,7 +246,7 @@ def identity_filter(result: dict[str, Any] | None) -> str:
     return "uncertain"
 
 
-def creator_filter(result: dict[str, Any] | None) -> str:
+def creator_filter(result: dict[str, Any] | None, *, has_product_url: bool = False) -> str:
     """Return ``keep``, ``drop`` or ``uncertain`` for strict Product-Buyer routing."""
     if not result:
         return "uncertain"
@@ -254,10 +254,15 @@ def creator_filter(result: dict[str, Any] | None) -> str:
     if is_rejected_buyer_category(category):
         return "drop"
     fit = float(result.get("typesafe_fit", 0.5))
-    if fit <= float(os.getenv("TYPESAFE_CREATOR_DROP", "0.30")):
+    if has_product_url:
+        if fit <= 0.15:
+            return "drop"
+    elif fit <= float(os.getenv("TYPESAFE_CREATOR_DROP", "0.30")):
         return "drop"
     role = str(result.get("typesafe_role", ""))
     if role in {"Community", "Creator/KOL", "Dev", "Trader", "Other"}:
+        if has_product_url:
+            return "uncertain"
         return "drop" if fit < 0.45 else "uncertain"
     target_role = role in {"Founder", "Marketing"}
     if fit >= float(os.getenv("TYPESAFE_CREATOR_KEEP", "0.60")) and target_role:

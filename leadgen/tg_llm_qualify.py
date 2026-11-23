@@ -20,6 +20,7 @@ Env (.env in project root):
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import faulthandler
+import inspect
 import json
 import os
 import re
@@ -79,8 +80,10 @@ try:
         classify_whale_segment,
         has_insufficient_product_info,
         is_invalid_product_name,
+        is_platform_or_social_url,
         is_rejected_buyer_category,
         is_truncated_or_bad_pitch,
+        pick_best_product_url,
         sanitize_person_and_company,
         sniper_reject_reason,
         supply_reason,
@@ -94,8 +97,10 @@ except ImportError:
             classify_whale_segment,
             has_insufficient_product_info,
             is_invalid_product_name,
+            is_platform_or_social_url,
             is_rejected_buyer_category,
             is_truncated_or_bad_pitch,
+            pick_best_product_url,
             sanitize_person_and_company,
             sniper_reject_reason,
             supply_reason,
@@ -108,8 +113,10 @@ except ImportError:
             classify_whale_segment,
             has_insufficient_product_info,
             is_invalid_product_name,
+            is_platform_or_social_url,
             is_rejected_buyer_category,
             is_truncated_or_bad_pitch,
+            pick_best_product_url,
             sanitize_person_and_company,
             sniper_reject_reason,
             supply_reason,
@@ -142,23 +149,23 @@ CATEGORIES = ["SaaS / AI app", "E-com / D2C", "CEX / биржа", "Проп тр
               "Платёжки / финтех", "Web3 (общее)", "Сервис / агентство"]
 ROLES = ["Founder", "Marketing", "Community", "Creator/KOL", "Dev", "Trader", ""]
 VALID_MONETIZATIONS = ("subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none")
-MIN_ICP_SCORE = 80
+MIN_ICP_SCORE = 70
 
-SYSTEM_PROMPT = """You qualify Whale B2B/consumer product leads for SoftUGC (Sniper ICP Gate >= 80).
+SYSTEM_PROMPT = """You qualify Whale B2B/consumer product leads for SoftUGC (Sniper ICP Gate >= 70).
 
 SoftUGC sells high-volume organic short-form video user acquisition (AI UGC + owned-network clipping, 183.5M views in 90 days, 1,500+ reels/mo mass production) to founders, CEOs, CMOs, and marketing/growth leads who own a MONETIZED product (real paid monetization + budget evidence) and short-form viral potential.
 
-Golden ICP clusters (icp_score 80..100 when LTV $50-$100+ consumer/prosumer product + budget/scale evidence matches):
+Golden ICP clusters (icp_score 70..100 when LTV $50-$100+ consumer/prosumer product + budget/scale evidence matches):
 1. High-LTV Consumer / Prosumer SaaS & AI subscription apps (coaching, astrology, language learning, fitness, productivity, trading tools, video/creator tools) with paid subscriptions/trials and growth scale.
 2. E-com / Shopify / TikTok Shop D2C brands (cosmetics/skincare, supplements/vitamins, health/wellness, consumer household/beauty/fitness brands) with paid ads or shop volume.
 3. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, payment apps, and prop trading challenges / options & trading platforms with deposit/subscription/challenge monetization.
 4. High-ticket info-products, coaching programs, and education businesses with paid cohorts/ads.
 
 Paid Scale Evidence rule (CRITICAL):
-- Active paid video advertising (source in ["meta_ads", "tiktok_ads", "tiktok_shop", "whop_content_rewards", "d2c_whatsapp"]), proven store traction (source="app_stores" with rating_count >= 300), active hiring for UGC/Short-Form/Paid Social (source="ats_hiring"), or monetized YC/PH consumer/prosumer products (subscription, app IAP, paid product) ALREADY prove commercial budget and monetization. Do NOT lower icp_score below 80 solely because an ad snippet or short bio does not print explicit MRR or LTV dollar numbers.
-- Real consumer/prosumer/fintech/trading/AI/D2C advertisers running video ads with monetized plans/apps and short_form_fit=true should score icp_score 80..95 with is_lead=true.
+- Active paid video advertising (source in ["meta_ads", "tiktok_ads", "tiktok_shop", "whop_content_rewards", "d2c_whatsapp"]), proven store traction (source="app_stores" with rating_count >= 300), active hiring for UGC/Short-Form/Paid Social (source="ats_hiring"), or monetized YC/PH consumer/prosumer products (subscription, app IAP, paid product) ALREADY prove commercial budget and monetization. Do NOT lower icp_score below 70 solely because an ad snippet or short bio does not print explicit MRR or LTV dollar numbers.
+- Real consumer/prosumer/fintech/trading/AI/D2C advertisers running video ads with monetized plans/apps and short_form_fit=true should score icp_score 70..95 with is_lead=true.
 
-REJECT (is_lead=false, icp_score < 80, or monetization="none"):
+REJECT (is_lead=false, icp_score < 70, or monetization="none"):
 - Gaming / Roblox / Fortnite / FiveM / UEFN, mobile & PC games, low-CPM gaming studios, game servers, hobby browser games, and 3D modeler / Roblox builder recruitment threads.
 - Solopreneurs, indie hackers without revenue (no verified MRR/paying scale and no active paid video ads), hobby/weekend/side projects without budget (monetization="none"), micro-arbitrage, and cheap low-margin e-com (cheap dropshipping gadgets, low-AOV trinkets under $50 LTV).
 - Agencies, PR firms (e.g. FINPR, Marketacross), GTM/marketing/SEO/dev consultancies, outsource studios, recruiters, B2B sales agencies, targetologists, mentors, storymakers ("Сервис / агентство").
@@ -167,7 +174,7 @@ REJECT (is_lead=false, icp_score < 80, or monetization="none"):
 
 For EACH lead in the input array decide:
 - is_lead: true ONLY if Founder/CEO/CMO/Marketing/Growth/Advertiser of an own monetized product with short-form viral potential and commercial budget/ads/store evidence — NEVER Gaming/Roblox/Fortnite/FiveM, agencies, consultancies, pure B2D dev-only CLI/SDK/infra, robotics/hardware makers, universities, or free hobbies
-- icp_score: integer 0..100 (80..95 for verified monetized products with Paid Scale Evidence or clear monetization + short_form_fit; < 80 for unmonetized, pure enterprise B2B ERP/devops without short-form consumer angle, agencies, or weak fit)
+- icp_score: integer 0..100 (70..95 for verified monetized products with Paid Scale Evidence or clear monetization + short_form_fit; < 70 for unmonetized, pure enterprise B2B ERP/devops without short-form consumer angle, agencies, or weak fit)
 - monetization: one of ["subscription", "ecom", "iap", "cpa_deposit", "paid_product", "none"]
 - short_form_fit: bool (true if product can convert from TikTok/Reels/Shorts)
 - category: one of [SaaS / AI app, E-com / D2C, CEX / биржа, Проп трейдинг, DeFi / DEX, Медиа / контент, Токен / мемкоин, Платёжки / финтех, Web3 (общее), Сервис / агентство]
@@ -463,6 +470,44 @@ def _run_typesafe_safely(rows: list[dict]) -> list[dict | None]:
         return [None] * len(rows)
 
 
+_TYPESAFE_RESCUE_SOURCES = frozenset(
+    {
+        "tg_channel_graph",
+        "tg_groups",
+        "tg_ad_spy",
+        "yc",
+        "meta_ads",
+        "app_stores",
+        "high_yield_veins",
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+    }
+)
+
+
+def _row_has_real_product_url(row: dict[str, Any]) -> bool:
+    source = str(row.get("source") or row.get("lead_source") or "").strip().lower()
+    if source not in _TYPESAFE_RESCUE_SOURCES:
+        return False
+    best_url = pick_best_product_url(row)
+    return bool(best_url and not is_platform_or_social_url(best_url))
+
+
+def _call_creator_filter(ts: dict[str, Any] | None, *, has_product_url: bool) -> str:
+    if not creator_filter:
+        return "uncertain"
+    try:
+        params = inspect.signature(creator_filter).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "has_product_url" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        return creator_filter(ts, has_product_url=has_product_url)
+    return creator_filter(ts)
+
+
 def qualify_loaded(
     rows,
     *,
@@ -493,13 +538,27 @@ def qualify_loaded(
 
     routed = []
     for row, ts in zip(rows, ts_results or [None] * len(rows)):
-        route = creator_filter(ts) if creator_filter else "uncertain"
+        has_product_url = _row_has_real_product_url(row)
+        route = _call_creator_filter(ts, has_product_url=has_product_url)
+        ts_fit = float(ts.get("typesafe_fit") or 0.0) if isinstance(ts, dict) else 0.0
+        ts_cat = (
+            str(ts.get("typesafe_category") or row.get("category") or "")
+            if isinstance(ts, dict)
+            else str(row.get("category") or "")
+        )
+        if (
+            route == "drop"
+            and has_product_url
+            and isinstance(ts, dict)
+            and not is_rejected_buyer_category(ts_cat)
+            and ts_fit > 0.15
+        ):
+            route = "uncertain"
         if route == "drop":
             dropped += 1
             _quarantine_row(row, "typesafe_drop", quarantine)
             continue
         row = dict(row)
-        ts_fit = float(ts.get("typesafe_fit", 0.0)) if ts else 0.0
         if (
             ts
             and route == "keep"

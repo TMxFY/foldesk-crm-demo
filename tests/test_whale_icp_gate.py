@@ -240,13 +240,22 @@ def test_qualify_loaded_enforces_whale_gate_even_if_llm_accepts_and_tags_whale_s
             "project": "CaseTrend",
             "project_url": "https://casetrend.shop",
         },
-        # Vague bio passes pre-gate, LLM scores < 80 -> caught by MIN_ICP_SCORE
+        # Vague bio passes pre-gate, LLM scores < 70 -> caught by MIN_ICP_SCORE
         {
             "name": "Nina",
             "username": "nina_low",
             "bio": "Building consumer app https://ninalow.app",
             "project": "NinaLow",
             "project_url": "https://ninalow.app",
+        },
+        # Vague bio passes pre-gate, LLM scores == 70 -> accepted under Wave A MIN_ICP_SCORE=70
+        {
+            "name": "Maya",
+            "username": "maya_70",
+            "bio": "Founder @ PulseCal — daily meal tracker subscription ($9/mo) https://pulsecal.app",
+            "project": "PulseCal",
+            "project_url": "https://pulsecal.app",
+            "has_monetization_signal": True,
         },
         # Valid high-LTV Whale SaaS
         {
@@ -269,11 +278,12 @@ def test_qualify_loaded_enforces_whale_gate_even_if_llm_accepts_and_tags_whale_s
     ]
 
     def _mock_llm(batch: list[dict]) -> list[dict]:
-        # Only 5 rows reach LLM because jake_roblox is dropped in gate_before_model
+        # Only 6 rows reach LLM because jake_roblox is dropped in gate_before_model
         assert [r["username"] for r in batch] == [
             "ken_stealth",
             "sam_store",
             "nina_low",
+            "maya_70",
             "elena_astro",
             "liam_prop",
         ]
@@ -302,7 +312,7 @@ def test_qualify_loaded_enforces_whale_gate_even_if_llm_accepts_and_tags_whale_s
             },
             {
                 "is_lead": True,
-                "icp_score": 72,
+                "icp_score": 65,
                 "monetization": "subscription",
                 "short_form_fit": True,
                 "category": "SaaS / AI app",
@@ -310,6 +320,17 @@ def test_qualify_loaded_enforces_whale_gate_even_if_llm_accepts_and_tags_whale_s
                 "project": "NinaLow",
                 "project_url": "https://ninalow.app",
                 "what_they_do": "Small unscaled tracker app without growth budget",
+            },
+            {
+                "is_lead": True,
+                "icp_score": 70,
+                "monetization": "subscription",
+                "short_form_fit": True,
+                "category": "SaaS / AI app",
+                "role": "Founder",
+                "project": "PulseCal",
+                "project_url": "https://pulsecal.app",
+                "what_they_do": "Consumer nutrition subscription app ($9/mo)",
             },
             {
                 "is_lead": True,
@@ -339,7 +360,7 @@ def test_qualify_loaded_enforces_whale_gate_even_if_llm_accepts_and_tags_whale_s
     kept, dropped = tg_llm_qualify.qualify_loaded(candidates, batch_size=10)
 
     assert dropped == 4
-    assert [r["username"] for r in kept] == ["elena_astro", "liam_prop"]
+    assert [r["username"] for r in kept] == ["maya_70", "elena_astro", "liam_prop"]
     assert all(r["qualified"] is True and r["llm_qualified"] is True for r in kept)
     assert all(r["segment"] == "whale" for r in kept)
 
@@ -352,7 +373,7 @@ def test_qualify_loaded_enforces_whale_gate_even_if_llm_accepts_and_tags_whale_s
     assert q_by_user["jake_roblox"].startswith("pre_gate:")
     assert q_by_user["ken_stealth"].startswith("whale_reject:")
     assert q_by_user["sam_store"].startswith("whale_reject:")
-    assert q_by_user["nina_low"] == "low_icp_score:72"
+    assert q_by_user["nina_low"] == "low_icp_score:65"
 
 
 def test_whale_segment_helpers_preserve_non_whale_segments_and_typesafe_fast_path(
@@ -372,8 +393,20 @@ def test_whale_segment_helpers_preserve_non_whale_segments_and_typesafe_fast_pat
     )
     assert (
         supply_side.classify_whale_segment(
-            {"project": "LowScore", "icp_score": 79, "monetization": "subscription"}
+            {"project": "LowScore", "icp_score": 65, "monetization": "subscription"}
         )
+        == ""
+    )
+    assert (
+        tg_llm_qualify.annotate_whale_segment(
+            {"project": "Score70", "icp_score": 70, "monetization": "subscription"}
+        ).get("segment")
+        == "whale"
+    )
+    assert (
+        tg_llm_qualify.annotate_whale_segment(
+            {"project": "Score65", "icp_score": 65, "monetization": "subscription"}
+        ).get("segment", "")
         == ""
     )
     assert (
