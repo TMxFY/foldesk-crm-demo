@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Callable
 import urllib.parse
@@ -102,8 +103,44 @@ from leadgen.tg_to_gsheet import (
 from leadgen.monid_client import check_monid_ready as _client_check_monid_ready, monid_bin
 from leadgen.treg_client import check_treg_ready as _client_check_treg_ready, treg_bin
 
+try:
+    from leadgen import tg_web_client
+except ImportError:
+    tg_web_client = None  # type: ignore
+
+try:
+    from leadgen.tg_llm_qualify import MIN_ICP_SCORE
+except ImportError:
+    MIN_ICP_SCORE = 70
+
 DEFAULT_DB_PATH = "/opt/crmtg/data/crm.db"
 DEFAULT_SCRAPER_SESSIONS_DIR = "/opt/crmtg/data/scraper_sessions"
+COOLDOWN_ELIGIBLE_SOURCES = frozenset({"buyer_public", "facebook_groups"})
+COOLDOWN_ZERO_STREAK = 3
+COOLDOWN_TTL_SEC = 48 * 3600
+_GENERIC_PLATFORM_DOMAINS = frozenset({
+    "t.me",
+    "telegram.me",
+    "telegram.dog",
+    "x.com",
+    "twitter.com",
+    "linkedin.com",
+    "instagram.com",
+    "facebook.com",
+    "fb.com",
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "github.com",
+    "whop.com",
+    "producthunt.com",
+    "ycombinator.com",
+    "apps.apple.com",
+    "play.google.com",
+    "linktr.ee",
+    "beacons.ai",
+    "stan.store",
+})
 _NOISE_TG_HANDLES = frozenset({"joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "socks"})
 _NON_PERSONAL_TG_SUFFIXES = (
     "_official",
@@ -228,6 +265,20 @@ def _write_pending_qualify_queue(queue_path: Path, rows: list[dict[str, Any]]) -
     tmp.replace(queue_path)
 
 
+def _is_tg_phone_direct_row(row: Mapping[str, Any]) -> bool:
+    if bool(row.get("tg_phone_direct")):
+        return True
+    if str(row.get("provider") or "").strip().lower() != "telegram":
+        return False
+    phone = str(row.get("phone") or "").strip()
+    raw_uid = row.get("telegram_user_id")
+    try:
+        uid = int(raw_uid) if raw_uid is not None and str(raw_uid).strip() else 0
+    except (TypeError, ValueError):
+        uid = 0
+    return bool(phone and uid > 0)
+
+
 def _count_personal_tg_rows(jsonl_path: Path) -> int:
     if not jsonl_path.is_file():
         return 0
@@ -247,7 +298,7 @@ def _count_personal_tg_rows(jsonl_path: Path) -> int:
         if not isinstance(obj, dict):
             continue
         cand = obj.get("username") or obj.get("telegram_username") or obj.get("tg_username")
-        if _is_real_personal_tg_handle(cand):
+        if _is_real_personal_tg_handle(cand) or _is_tg_phone_direct_row(obj):
             cnt += 1
     return cnt
 
@@ -352,7 +403,7 @@ def split_tg_and_direct_x_leads(
             score = 85 if raw_score is None else int(round(float(raw_score)))
         except (TypeError, ValueError):
             score = 0
-        if score < 80 or str(row.get("monetization") or "").strip().lower() == "none":
+        if score < MIN_ICP_SCORE or str(row.get("monetization") or "").strip().lower() == "none":
             dropped += 1
             continue
         if sniper_reject_reason(row):
@@ -376,6 +427,7 @@ def split_tg_and_direct_x_leads(
 
         raw_tg = row.get("username") or row.get("telegram_username") or row.get("tg_username") or ""
         has_real_tg = _is_real_personal_tg_handle(raw_tg)
+        is_tg_direct = _is_tg_phone_direct_row(row)
         is_wa_pending = bool(row.get("wa_check_pending"))
         wa = (
             ""
@@ -389,10 +441,13 @@ def split_tg_and_direct_x_leads(
                 )
             )
         )
-        if has_real_tg or wa:
+        if has_real_tg or is_tg_direct or wa:
             if has_real_tg:
                 row["username"] = str(raw_tg).strip().lstrip("@")
                 row["provider"] = "telegram"
+            elif is_tg_direct:
+                row["provider"] = "telegram"
+                row["tg_phone_direct"] = True
             elif wa:
                 wa_digits = re.sub(r"\D", "", wa)
                 row["whatsapp"] = f"https://wa.me/{wa_digits}"
@@ -1483,20 +1538,69 @@ def run_contact_waterfall_with_budget(
     return out_rows, state
 
 
+def _is_guessed_tg_row(row: Mapping[str, Any]) -> bool:
+    if bool(row.get("tg_handle_is_guessed")):
+        return True
+    match_tag = str(row.get("tg_bridge_match") or "").strip().lower()
+    return match_tag.startswith(("guessed", "heuristic", "stage3b", "stage4"))
+
+
+def _append_pending_tg_verify_queue(queue_path: Path, deferred_rows: list[dict[str, Any]]) -> None:
+    if not deferred_rows:
+        return
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_jsonl_dicts(queue_path) if queue_path.is_file() else []
+    seen_keys: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for item in [*existing, *deferred_rows]:
+        if not isinstance(item, Mapping):
+            continue
+        item_dict = dict(item)
+        handle = str(
+            item_dict.get("username")
+            or item_dict.get("telegram_username")
+            or item_dict.get("tg_username")
+            or item_dict.get("deferred_tg_handle")
+            or ""
+        ).strip().lstrip("@").lower()
+        comp = str(item_dict.get("company") or item_dict.get("project") or item_dict.get("project_url") or "").strip().lower()
+        key = f"{handle}|{comp}" if handle or comp else json.dumps(item_dict, sort_keys=True, ensure_ascii=False)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        merged.append(item_dict)
+    tmp = queue_path.with_name(f".{queue_path.name}.tmp.{os.getpid()}")
+    tmp.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in merged) + ("\n" if merged else ""),
+        encoding="utf-8",
+    )
+    tmp.replace(queue_path)
+
+
 def verify_personal_tg_handles_live(
     rows: list[dict[str, Any]],
     *,
     client: Any = None,
     scraper_session: Path | None = None,
+    scraper_sessions: list[Path] | None = None,
     entity_resolver_fn: Callable[[Any, str], Any] | None = None,
+    web_probe_fn: Callable[[str], Mapping[str, Any] | None] | None = None,
+    web_batch_fn: Callable[[list[str]], Mapping[str, Any] | None] | None = None,
+    use_web_first: bool = False,
+    tme_cache_path: Path | None = None,
+    pending_verify_queue_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Strip channel/group/bot handles from personal username fields, resolving PeerType live."""
+    """Strip channel/group/bot handles from personal username fields, resolving PeerType live (Web-first + RO pool)."""
     stats = {
         "checked": 0,
         "verified_users": 0,
         "heuristic_stripped": 0,
         "channels_stripped": 0,
         "bots_or_invalid_stripped": 0,
+        "web_resolved": 0,
+        "flood_waits": 0,
+        "sessions_exhausted": 0,
+        "pending_verify_deferred": 0,
     }
     if not rows:
         return [], stats
@@ -1523,17 +1627,65 @@ def verify_personal_tg_handles_live(
             seen_handles.add(low)
             pending_handles.append(raw_h)
 
+    sessions_to_try: list[Path] = []
+    seen_sess_paths: set[str] = set()
+    for raw_s in [*(scraper_sessions or []), scraper_session]:
+        if raw_s is None:
+            continue
+        sp = Path(raw_s)
+        if not sp.is_file():
+            continue
+        try:
+            rkey = str(sp.resolve())
+        except OSError:
+            rkey = str(sp)
+        if rkey not in seen_sess_paths:
+            seen_sess_paths.add(rkey)
+            sessions_to_try.append(sp)
+
+    web_enabled = (
+        entity_resolver_fn is None
+        and client is None
+        and (
+            use_web_first
+            or web_probe_fn is not None
+            or web_batch_fn is not None
+        )
+        and (web_probe_fn is not None or web_batch_fn is not None or tg_web_client is not None)
+    )
     has_live_resolver = (
         entity_resolver_fn is not None
         or client is not None
-        or (scraper_session is not None and Path(scraper_session).is_file())
+        or bool(sessions_to_try)
+        or web_enabled
     )
     if not pending_handles or not has_live_resolver:
         return out_rows, stats
 
-    async def _resolve_all(active_client: Any) -> dict[str, tuple[str, int | None]]:
+    verdicts: dict[str, tuple[str, int | None]] = {}
+    saw_session_failure = False
+
+    def _map_web_kind(info: Mapping[str, Any] | None) -> tuple[str, int | None] | None:
+        if not isinstance(info, Mapping):
+            return None
+        kind = str(info.get("kind") or "").strip().lower()
+        if kind == "user":
+            raw_uid = info.get("user_id")
+            try:
+                uid = int(raw_uid) if raw_uid is not None else None
+            except (TypeError, ValueError):
+                uid = None
+            return ("user", uid)
+        if kind == "channel":
+            return ("channel", None)
+        if kind in {"bot", "missing", "invalid"}:
+            return ("drop", None)
+        return None
+
+    async def _resolve_all(active_client: Any, handles_batch: list[str]) -> tuple[dict[str, tuple[str, int | None]], bool]:
         cache: dict[str, tuple[str, int | None]] = {}
-        for handle in pending_handles:
+        hit_flood = False
+        for handle in handles_batch:
             stats["checked"] += 1
             try:
                 if entity_resolver_fn is not None:
@@ -1544,7 +1696,9 @@ def verify_personal_tg_handles_live(
             except Exception as exc:
                 cls_exc = exc.__class__.__name__
                 if cls_exc == "FloodWaitError":
-                    logger.warning("verify_personal_tg_handles_live hit FloodWaitError; pausing live checks")
+                    logger.warning("verify_personal_tg_handles_live hit FloodWaitError; pausing current session")
+                    stats["flood_waits"] += 1
+                    hit_flood = True
                     break
                 if cls_exc in {"UsernameNotOccupiedError", "UsernameInvalidError"} or isinstance(exc, ValueError):
                     cache[handle.lower()] = ("drop", None)
@@ -1574,17 +1728,75 @@ def verify_personal_tg_handles_live(
                 cache[handle.lower()] = ("user", int(raw_uid) if raw_uid is not None else None)
             else:
                 cache[handle.lower()] = ("drop", None)
-        return cache
+        return cache, hit_flood
 
-    verdicts: dict[str, tuple[str, int | None]] = {}
     if entity_resolver_fn is not None or client is not None:
-        verdicts = _run_coro_sync(_resolve_all(client)) or {}
-    elif scraper_session is not None and Path(scraper_session).is_file():
-        try:
-            verdicts = _with_isolated_tg_client(Path(scraper_session), _resolve_all) or {}
-        except Exception as exc:
-            logger.warning("verify_personal_tg_handles_live skipped live lookup (%s)", exc)
-            verdicts = {}
+        batch_verdicts, hit_flood = _run_coro_sync(_resolve_all(client, pending_handles)) or ({}, False)
+        verdicts.update(batch_verdicts)
+        if hit_flood:
+            saw_session_failure = True
+    else:
+        if web_enabled:
+            if web_batch_fn is not None:
+                try:
+                    batch_map = web_batch_fn(pending_handles) or {}
+                    if isinstance(batch_map, Mapping):
+                        for h in pending_handles:
+                            mapped = _map_web_kind(batch_map.get(h) or batch_map.get(h.lower()))
+                            if mapped is not None:
+                                verdicts[h.lower()] = mapped
+                                stats["web_resolved"] += 1
+                                stats["checked"] += 1
+                except Exception as exc:
+                    logger.debug("verify_personal_tg_handles_live web_batch_fn failed: %s", exc)
+            for h in pending_handles:
+                if h.lower() in verdicts:
+                    continue
+                try:
+                    if web_probe_fn is not None:
+                        info = web_probe_fn(h)
+                    elif tg_web_client is not None:
+                        info = _call_with_supported_kwargs(
+                            tg_web_client.probe_tme_handle_web,
+                            h,
+                            cache_path=tme_cache_path,
+                        )
+                    else:
+                        info = None
+                    mapped = _map_web_kind(info)
+                    if mapped is not None:
+                        verdicts[h.lower()] = mapped
+                        stats["web_resolved"] += 1
+                        stats["checked"] += 1
+                except Exception as exc:
+                    logger.debug("verify_personal_tg_handles_live web_probe(%s) warning: %s", h, exc)
+
+        rem_handles = [h for h in pending_handles if h.lower() not in verdicts]
+        if rem_handles and sessions_to_try:
+            for sess in sessions_to_try:
+                rem_handles = [h for h in pending_handles if h.lower() not in verdicts]
+                if not rem_handles:
+                    break
+                try:
+                    sess_res = _with_isolated_tg_client(
+                        sess,
+                        lambda active_client, rem=rem_handles: _resolve_all(active_client, rem),
+                    )
+                    if sess_res:
+                        batch_verdicts, hit_flood = sess_res
+                        verdicts.update(batch_verdicts)
+                        if hit_flood:
+                            saw_session_failure = True
+                except Exception as exc:
+                    logger.warning("verify_personal_tg_handles_live session %s failed (%s)", sess.name, exc)
+                    saw_session_failure = True
+
+        rem_after = [h for h in pending_handles if h.lower() not in verdicts]
+        if rem_after and saw_session_failure:
+            stats["sessions_exhausted"] += 1
+
+    deferred_rows: list[dict[str, Any]] = []
+    pending_handle_set = {h.lower() for h in pending_handles}
 
     for row in out_rows:
         raw_h = str(
@@ -1592,8 +1804,18 @@ def verify_personal_tg_handles_live(
         ).strip().lstrip("@")
         if not raw_h:
             continue
-        outcome = verdicts.get(raw_h.lower())
+        low_h = raw_h.lower()
+        outcome = verdicts.get(low_h)
         if outcome is None:
+            if low_h in pending_handle_set and _is_guessed_tg_row(row) and (saw_session_failure or (web_enabled and not sessions_to_try)):
+                deferred_copy = dict(row)
+                deferred_copy["deferred_tg_handle"] = raw_h
+                deferred_copy["tg_verify_deferred"] = True
+                deferred_copy["tg_verify_deferred_at"] = utc_now()
+                deferred_rows.append(deferred_copy)
+                _strip_tg_handle_from_row(row, raw_h, move_to_group=False)
+                row["tg_verify_deferred"] = True
+                stats["pending_verify_deferred"] += 1
             continue
         verdict, uid = outcome
         if verdict == "user":
@@ -1607,6 +1829,9 @@ def verify_personal_tg_handles_live(
             _strip_tg_handle_from_row(row, raw_h, move_to_group=False)
             stats["bots_or_invalid_stripped"] += 1
 
+    if deferred_rows and pending_verify_queue_path is not None:
+        _append_pending_tg_verify_queue(pending_verify_queue_path, deferred_rows)
+
     return out_rows, stats
 
 
@@ -1615,12 +1840,13 @@ def enrich_whales_with_tg_group_admins(
     *,
     client: Any = None,
     scraper_session: Path | None = None,
+    scraper_sessions: list[Path] | None = None,
     admin_extractor_fn: Callable[..., Any] | None = None,
     max_admins: int = 10,
     max_results: int = 2,
     max_groups: int = 25,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Layer 0 ($0): Resolve personal TG admins for whale rows linking TG communities."""
+    """Layer 0 ($0): Resolve personal TG admins for whale rows linking TG communities (with RO session pool)."""
     stats = {"groups_checked": 0, "admins_resolved": 0, "leads_promoted": 0}
     if not rows:
         return [], stats
@@ -1638,8 +1864,10 @@ def enrich_whales_with_tg_group_admins(
 
     out_rows = [dict(r) for r in rows]
 
-    async def _resolve_with_client(active_client: Any) -> dict[str, list[Any]]:
-        cache: dict[str, list[Any]] = {}
+    async def _resolve_with_client(
+        active_client: Any,
+        cache: dict[str, list[Any]],
+    ) -> dict[str, list[Any]]:
         for _idx, handles in targets:
             for handle in handles:
                 key = handle.lower()
@@ -1661,17 +1889,49 @@ def enrich_whales_with_tg_group_admins(
                         )
                     cache[key] = list(admins or [])
                 except Exception as exc:
+                    if exc.__class__.__name__ == "FloodWaitError":
+                        logger.warning("extract_brand_tg_admins hit FloodWaitError for %s; switching session", handle)
+                        return cache
                     logger.debug("extract_brand_tg_admins failed for %s: %s", handle, exc)
                     cache[key] = []
         return cache
 
     resolved_by_group: dict[str, list[Any]] = {}
     if admin_extractor_fn is not None or client is not None:
-        resolved_by_group = _run_coro_sync(_resolve_with_client(client)) or {}
-    elif scraper_session is not None and scraper_session.is_file():
-        resolved_by_group = (
-            _with_isolated_tg_client(scraper_session, _resolve_with_client) or {}
-        )
+        resolved_by_group = _run_coro_sync(_resolve_with_client(client, resolved_by_group)) or {}
+    else:
+        sessions_to_try: list[Path] = []
+        seen_sess_paths: set[str] = set()
+        for raw_s in [*(scraper_sessions or []), scraper_session]:
+            if raw_s is None:
+                continue
+            sp = Path(raw_s)
+            if not sp.is_file():
+                continue
+            try:
+                rkey = str(sp.resolve())
+            except OSError:
+                rkey = str(sp)
+            if rkey not in seen_sess_paths:
+                seen_sess_paths.add(rkey)
+                sessions_to_try.append(sp)
+        for sess in sessions_to_try:
+            if len(resolved_by_group) >= max_groups:
+                break
+            pending_any = any(
+                h.lower() not in resolved_by_group
+                for _idx, hs in targets
+                for h in hs
+            )
+            if not pending_any:
+                break
+            try:
+                _with_isolated_tg_client(
+                    sess,
+                    lambda active_client, cache=resolved_by_group: _resolve_with_client(active_client, cache),
+                )
+            except Exception as exc:
+                logger.warning("enrich_whales_with_tg_group_admins session %s failed (%s)", sess.name, exc)
 
     for idx, handles in targets:
         row = out_rows[idx]
@@ -1763,6 +2023,396 @@ def find_phone_checker_session(
     """Strictly locate the first dedicated isolated ``phone_checker_*.session`` file; never use outreach sessions."""
     sessions = find_phone_checker_sessions(conn, sessions_dir)
     return sessions[0] if sessions else None
+
+
+def find_ro_scraper_sessions(
+    conn: sqlite3.Connection,
+    sessions_dir: Path | str | None = None,
+    *,
+    primary_session: str | Path | None = None,
+    allow_phone_checker_ro_fallback: bool = True,
+) -> list[Path]:
+    """Return ordered RO Telegram scraper session pool (primary -> signals_ro*.session -> phone_checker_2+.session)."""
+    pool: list[Path] = []
+    seen_resolved: set[str] = set()
+
+    def _add_candidate(cand: Path | None) -> None:
+        if cand is None or not cand.is_file():
+            return
+        try:
+            key = str(cand.resolve())
+        except OSError:
+            key = str(cand)
+        if key not in seen_resolved:
+            seen_resolved.add(key)
+            pool.append(cand)
+
+    if primary_session is not None and str(primary_session).strip():
+        validated_prim = validate_isolated_scraper_session(
+            conn,
+            primary_session,
+            scraper_sessions_dir=sessions_dir,
+        )
+        if validated_prim is not None and validated_prim.is_file():
+            _add_candidate(validated_prim)
+
+    raw_dir = str(
+        sessions_dir
+        or os.environ.get("SCRAPER_SESSIONS_DIR")
+        or DEFAULT_SCRAPER_SESSIONS_DIR
+    ).strip()
+    base_dir = Path(os.path.expanduser(raw_dir))
+    if base_dir.is_dir():
+        for cand in sorted(base_dir.glob("signals_ro*.session")):
+            if not cand.is_file():
+                continue
+            try:
+                validated = validate_isolated_scraper_session(
+                    conn,
+                    cand,
+                    scraper_sessions_dir=base_dir,
+                )
+            except ValueError as exc:
+                logger.warning("Rejected non-isolated signals_ro session %s: %s", cand, exc)
+                continue
+            if validated is not None and validated.is_file():
+                _add_candidate(validated)
+
+    if allow_phone_checker_ro_fallback:
+        for checker_sess in find_phone_checker_sessions(conn, base_dir):
+            match_num = re.search(r"phone_checker_(\d+)\.session$", checker_sess.name)
+            if not match_num:
+                continue
+            if int(match_num.group(1)) >= 2:
+                _add_candidate(checker_sess)
+
+    return pool
+
+
+def _load_source_yield_state(state_dir: Path) -> dict[str, Any]:
+    path = state_dir / "source_yield_state.json"
+    if not path.is_file():
+        return {"sources": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("sources"), dict):
+            return data
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return {"sources": {}}
+
+
+def _save_source_yield_state(state_dir: Path, state: Mapping[str, Any]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "source_yield_state.json"
+    tmp = state_dir / f".source_yield_state.json.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _is_source_in_cooldown(
+    state: Mapping[str, Any],
+    source_name: str,
+    *,
+    now_ts: float | None = None,
+) -> bool:
+    sources = state.get("sources")
+    if not isinstance(sources, Mapping):
+        return False
+    entry = sources.get(source_name)
+    if not isinstance(entry, Mapping):
+        return False
+    try:
+        until = float(entry.get("cooldown_until") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    cur_ts = time.time() if now_ts is None else float(now_ts)
+    return until > cur_ts
+
+
+def _record_source_yield(
+    state: dict[str, Any],
+    source_name: str,
+    rows_count: int,
+    *,
+    now_ts: float | None = None,
+) -> bool:
+    """Update consecutive 0-yield streak and put empty eligible sources into 48h cooldown after 3 zeros."""
+    cur_ts = time.time() if now_ts is None else float(now_ts)
+    sources = state.setdefault("sources", {})
+    entry = dict(sources.get(source_name) or {})
+    cnt = max(0, int(rows_count or 0))
+    entered_cooldown = False
+    if cnt > 0:
+        entry["zero_streak"] = 0
+        entry["cooldown_until"] = 0.0
+        entry["last_nonzero_at"] = cur_ts
+        entry["last_yield"] = cnt
+    else:
+        streak = int(entry.get("zero_streak") or 0) + 1
+        entry["zero_streak"] = streak
+        entry["last_yield"] = 0
+        if source_name in COOLDOWN_ELIGIBLE_SOURCES and streak >= COOLDOWN_ZERO_STREAK:
+            entry["cooldown_until"] = cur_ts + COOLDOWN_TTL_SEC
+            entered_cooldown = True
+    entry["updated_at"] = cur_ts
+    sources[source_name] = entry
+    return entered_cooldown
+
+
+def _extract_root_domain(raw_val: Any) -> str:
+    s = str(raw_val or "").strip()
+    if not s:
+        return ""
+    if "://" not in s and "." not in s:
+        return ""
+    parsed = urllib.parse.urlparse(s if "://" in s else f"https://{s}")
+    host = (parsed.hostname or "").strip().lower().removeprefix("www.")
+    if not host or "." not in host:
+        return ""
+    return host
+
+
+def _normalize_phone_digits(raw_val: Any) -> str:
+    digits = re.sub(r"\D", "", str(raw_val or ""))
+    return digits if len(digits) >= 8 else ""
+
+
+def _filter_existing_crm_leads(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop rows whose username, non-platform root domain, or phone already exists in CRM leads before paid waterfall."""
+    if not rows:
+        return [], 0
+    existing_users: set[str] = set()
+    existing_domains: set[str] = set()
+    existing_phones: set[str] = set()
+    for db_row in conn.execute("SELECT username, url, company_domain, phone FROM leads").fetchall():
+        u = str(db_row["username"] or "").strip().lstrip("@").lower()
+        if u:
+            existing_users.add(u)
+        for dom_cand in (db_row["url"], db_row["company_domain"]):
+            dom = _extract_root_domain(dom_cand)
+            if dom and dom not in _GENERIC_PLATFORM_DOMAINS:
+                existing_domains.add(dom)
+        ph = _normalize_phone_digits(db_row["phone"])
+        if ph:
+            existing_phones.add(ph)
+
+    for rec_row in conn.execute("SELECT username, website FROM campaign_recipients").fetchall():
+        u = str(rec_row["username"] or "").strip().lstrip("@").lower()
+        if u:
+            existing_users.add(u)
+        dom = _extract_root_domain(rec_row["website"])
+        if dom and dom not in _GENERIC_PLATFORM_DOMAINS:
+            existing_domains.add(dom)
+
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = dict(row)
+        raw_u = str(
+            item.get("username") or item.get("telegram_username") or item.get("tg_username") or ""
+        ).strip().lstrip("@").lower()
+        has_real_u = bool(raw_u and _is_real_personal_tg_handle(raw_u))
+        if raw_u and raw_u in existing_users:
+            dropped += 1
+            continue
+        ph = _normalize_phone_digits(item.get("phone"))
+        if ph and ph in existing_phones:
+            dropped += 1
+            continue
+        dom = _extract_root_domain(
+            item.get("project_url") or item.get("website") or item.get("site") or item.get("domain")
+        )
+        if dom and dom not in _GENERIC_PLATFORM_DOMAINS and dom in existing_domains and not has_real_u:
+            dropped += 1
+            continue
+        kept.append(item)
+    return kept, dropped
+
+
+def _pick_comment_channels_batch(
+    state_dir: Path,
+    *,
+    excluded: set[str],
+    batch_size: int = 10,
+    include_repo_seed: bool = False,
+) -> list[str]:
+    state_file = state_dir / "discovered_comment_channels.txt"
+    repo_file = ROOT / "leadgen" / "discovered_comment_channels.txt"
+    src_file = state_file if state_file.is_file() else (repo_file if include_repo_seed and repo_file.is_file() else None)
+    if src_file is None:
+        return []
+    raw_tokens: list[str] = []
+    try:
+        for raw_ln in src_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            clean_ln = raw_ln.split("#", 1)[0].strip()
+            if clean_ln:
+                raw_tokens.append(clean_ln)
+    except OSError:
+        return []
+    candidates = [
+        ch
+        for ch in _clean_chat_list(raw_tokens)
+        if ch.lower() not in excluded
+    ]
+    if not candidates:
+        return []
+    cursor_path = state_dir / "comment_chats_cursor.json"
+    offset = 0
+    if cursor_path.is_file():
+        try:
+            cur_obj = json.loads(cursor_path.read_text(encoding="utf-8"))
+            if isinstance(cur_obj, dict):
+                offset = max(0, int(cur_obj.get("offset") or 0))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            offset = 0
+    take = min(max(1, int(batch_size)), len(candidates))
+    start = offset % len(candidates)
+    selected = [candidates[(start + idx) % len(candidates)] for idx in range(take)]
+    next_offset = (start + take) % len(candidates)
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_cur = cursor_path.with_name(f".{cursor_path.name}.tmp.{os.getpid()}")
+    tmp_cur.write_text(
+        json.dumps({"offset": next_offset, "total": len(candidates)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp_cur.replace(cursor_path)
+    return selected
+
+
+def emit_leadgen_daily_digest(
+    conn: sqlite3.Connection,
+    *,
+    summary: Mapping[str, Any],
+    digest_opener: Any = None,
+    now_dt: datetime | None = None,
+) -> dict[str, Any]:
+    """Send daily 4-line Wave A summary (1x/day UTC) + instant critical alert (6h dedup)."""
+    cur_dt = now_dt if now_dt is not None else datetime.now(timezone.utc)
+    if cur_dt.tzinfo is None:
+        cur_dt = cur_dt.replace(tzinfo=timezone.utc)
+    today_day = cur_dt.strftime("%Y-%m-%d")
+    now_iso = cur_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    result: dict[str, Any] = {
+        "daily_sent": False,
+        "daily_skipped": None,
+        "instant_alert_sent": False,
+        "instant_reasons": [],
+        "error": None,
+    }
+
+    try:
+        token, chat_id = app_digest._operator(conn)
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+    verify_stats = summary.get("tg_handle_verification") if isinstance(summary.get("tg_handle_verification"), Mapping) else {}
+    budget_info = summary.get("budget_state") if isinstance(summary.get("budget_state"), Mapping) else {}
+    sessions_exhausted = int(verify_stats.get("sessions_exhausted") or 0)
+    raw_treg_bal = budget_info.get("treg_balance_usd")
+    try:
+        treg_bal = float(raw_treg_bal) if raw_treg_bal is not None else None
+    except (TypeError, ValueError):
+        treg_bal = None
+
+    instant_reasons: list[str] = []
+    if sessions_exhausted > 0:
+        instant_reasons.append("все RO TG-сессии в FloodWait/недоступны")
+    if treg_bal is not None and treg_bal < 2.0:
+        instant_reasons.append(f"баланс treg ${treg_bal:.2f} < $2.00")
+    result["instant_reasons"] = list(instant_reasons)
+
+    if instant_reasons:
+        prev_inst_iso = ""
+        prev_row = conn.execute(
+            "SELECT value FROM kv_settings WHERE key = 'leadgen_instant_alert_last_at'"
+        ).fetchone()
+        if prev_row and prev_row["value"]:
+            prev_inst_iso = str(prev_row["value"]).strip()
+        prev_inst_dt = _parse_iso_utc(prev_inst_iso)
+        within_6h = prev_inst_dt is not None and (cur_dt - prev_inst_dt).total_seconds() < 6 * 3600
+        if not within_6h:
+            alert_text = (
+                "🚨 Leadgen Critical Alert\n"
+                f"Причина: {'; '.join(instant_reasons)}\n"
+                f"Pending B2B: {int(summary.get('pending_b2b') or 0)} | Волн: {int(summary.get('waves_executed') or 0)}"
+            )
+            try:
+                app_digest._post(
+                    app_digest.SEND_URL.format(token=token),
+                    {"chat_id": str(chat_id).strip(), "text": alert_text},
+                    digest_opener,
+                )
+                result["instant_alert_sent"] = True
+                conn.execute(
+                    """
+                    INSERT INTO kv_settings (key, value, updated_at)
+                    VALUES ('leadgen_instant_alert_last_at', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (now_iso, now_iso),
+                )
+                conn.commit()
+            except Exception as exc:
+                result["error"] = str(exc)
+
+    last_day_row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = 'leadgen_daily_digest_last_day'"
+    ).fetchone()
+    last_day = str(last_day_row["value"]).strip() if last_day_row and last_day_row["value"] else ""
+    if last_day == today_day:
+        result["daily_skipped"] = "already_sent_today"
+        return result
+
+    per_src = summary.get("per_source_counts") if isinstance(summary.get("per_source_counts"), Mapping) else {}
+    top_pairs = sorted(
+        ((str(k), int(v or 0)) for k, v in per_src.items() if int(v or 0) > 0),
+        key=lambda kv: (-kv[1], kv[0]),
+    )[:3]
+    top_str = ", ".join(f"{k}={v}" for k, v in top_pairs) if top_pairs else "нет новых"
+    spent = float(budget_info.get("spent_usd") or 0.0)
+    cap = float(budget_info.get("daily_cap_usd") or 0.0)
+    treg_str = f"${treg_bal:.2f}" if treg_bal is not None else "n/a"
+    raw_monid = budget_info.get("monid_balance_usd")
+    monid_str = f"${float(raw_monid):.2f}" if raw_monid is not None else "n/a"
+    deferred_cnt = int(verify_stats.get("pending_verify_deferred") or 0)
+    cd_sources = list(summary.get("cooldown_sources") or [])
+    cd_str = ",".join(str(x) for x in cd_sources) if cd_sources else "нет"
+    err_cnt = len(summary.get("stage_errors") or [])
+
+    digest_text = "\n".join([
+        f"📊 Leadgen ({today_day}): +{int(summary.get('ingested_total') or 0)} в CRM | pending B2B: {int(summary.get('pending_b2b') or 0)} | direct_x: {int(summary.get('direct_x_routed') or 0)} | волн: {int(summary.get('waves_executed') or 1)}",
+        f"🔎 Топ источники: {top_str}",
+        f"💰 Бюджет: ${spent:.2f}/${cap:.2f} | treg: {treg_str} | monid: {monid_str}",
+        f"🛡 Отложено verify: {deferred_cnt} | Cooldown: {cd_str} | Ошибки: {err_cnt}",
+    ])
+    try:
+        app_digest._post(
+            app_digest.SEND_URL.format(token=token),
+            {"chat_id": str(chat_id).strip(), "text": digest_text},
+            digest_opener,
+        )
+        result["daily_sent"] = True
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at)
+            VALUES ('leadgen_daily_digest_last_day', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (today_day, now_iso),
+        )
+        conn.commit()
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
 def _lookup_injected_checker_client(
@@ -3342,6 +3992,9 @@ def run_autonomous_replenish(
     freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
     linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
     ru_experts_fn: Callable[..., Any] | None = None,
+    max_waves: int | None = None,
+    max_wall_clock_sec: int = 1500,
+    web_discovery_workers: int | None = None,
 ) -> dict[str, Any]:
     try:
         lock_fh = _acquire_replenish_lock(lock_path)
@@ -3382,6 +4035,9 @@ def run_autonomous_replenish(
             freelance_monitor_fn=freelance_monitor_fn,
             linkedin_collector_fn=linkedin_collector_fn,
             ru_experts_fn=ru_experts_fn,
+            max_waves=max_waves,
+            max_wall_clock_sec=max_wall_clock_sec,
+            web_discovery_workers=web_discovery_workers,
         )
     finally:
         _release_replenish_lock(lock_fh)
@@ -3414,6 +4070,9 @@ def _run_autonomous_replenish_locked(
     freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
     linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
     ru_experts_fn: Callable[..., Any] | None = None,
+    max_waves: int | None = None,
+    max_wall_clock_sec: int = 1500,
+    web_discovery_workers: int | None = None,
 ) -> dict[str, Any]:
     is_real_subprocess_runner = runner is None or runner is subprocess.run
     active_runner = subprocess.run if runner is None else runner
@@ -3510,7 +4169,22 @@ def _run_autonomous_replenish_locked(
         "heuristic_stripped": 0,
         "channels_stripped": 0,
         "bots_or_invalid_stripped": 0,
+        "web_resolved": 0,
+        "flood_waits": 0,
+        "sessions_exhausted": 0,
+        "pending_verify_deferred": 0,
     }
+    waves_executed = 0
+    pre_waterfall_deduped = 0
+    cooldown_sources: list[str] = []
+    ro_sessions = find_ro_scraper_sessions(
+        conn,
+        sessions_dir=scraper_sessions_dir,
+        primary_session=isolated_session,
+        allow_phone_checker_ro_fallback=bool(whales_cfg.get("allow_phone_checker_ro_fallback", True)),
+    )
+    primary_ro_session = ro_sessions[0] if ro_sessions else isolated_session
+    run_started_mono = time.monotonic()
     phone_res_stats: dict[str, int] = {
         "phones_checked": 0,
         "wa_verified": 0,
@@ -3578,16 +4252,27 @@ def _run_autonomous_replenish_locked(
             sub_env["LEADGEN_STATE_DIR"] = str(state_dir)
             sub_env["LEADGEN_CONFIG_PATH"] = str(eff_cfg_path)
             sub_env["BUDGET_PAID_ALLOWED"] = "1" if budget_state.paid_allowed else "0"
-            if isolated_session is not None:
-                sub_env["TG_SESSION"] = str(isolated_session)
-                sub_env["TG_JOBS_SESSION"] = str(isolated_session)
+            if primary_ro_session is not None:
+                sub_env["TG_SESSION"] = str(primary_ro_session)
+                sub_env["TG_JOBS_SESSION"] = str(primary_ro_session)
 
-            def _exec_stage(stage_name: str, cmd: list[str]) -> bool:
-                stages_run.append(stage_name)
+            stage_lock = threading.Lock()
+
+            def _add_reason(tag: str) -> None:
+                with stage_lock:
+                    if tag not in replenish_reasons:
+                        replenish_reasons.append(tag)
+
+            def _exec_stage(stage_name: str, cmd: list[str], *, env_override: Mapping[str, str] | None = None) -> bool:
+                with stage_lock:
+                    stages_run.append(stage_name)
+                run_env = dict(sub_env)
+                if env_override:
+                    run_env.update(env_override)
                 try:
                     proc = active_runner(
                         cmd,
-                        env=sub_env,
+                        env=run_env,
                         timeout=stage_timeout,
                         cwd=str(ROOT),
                         check=False,
@@ -3597,42 +4282,45 @@ def _run_autonomous_replenish_locked(
                     rc = int(getattr(proc, "returncode", 0) or 0)
                     if rc != 0:
                         stderr_snip = str(getattr(proc, "stderr", "") or "").strip()[-500:]
-                        stage_errors.append(
-                            {
-                                "stage": stage_name,
-                                "returncode": rc,
-                                "error": stderr_snip or f"exit_code_{rc}",
-                                "at": utc_now(),
-                            }
-                        )
+                        with stage_lock:
+                            stage_errors.append(
+                                {
+                                    "stage": stage_name,
+                                    "returncode": rc,
+                                    "error": stderr_snip or f"exit_code_{rc}",
+                                    "at": utc_now(),
+                                }
+                            )
                         logger.error(
                             "Leadgen stage %s failed (rc=%d): %s", stage_name, rc, stderr_snip
                         )
                         return False
                     return True
                 except subprocess.TimeoutExpired as exc:
-                    stage_errors.append(
-                        {
-                            "stage": stage_name,
-                            "returncode": -1,
-                            "timeout": stage_timeout,
-                            "error": f"timeout_after_{stage_timeout}s: {exc}",
-                            "at": utc_now(),
-                        }
-                    )
+                    with stage_lock:
+                        stage_errors.append(
+                            {
+                                "stage": stage_name,
+                                "returncode": -1,
+                                "timeout": stage_timeout,
+                                "error": f"timeout_after_{stage_timeout}s: {exc}",
+                                "at": utc_now(),
+                            }
+                        )
                     logger.error(
                         "Leadgen stage %s timed out after %ds", stage_name, stage_timeout
                     )
                     return False
                 except Exception as exc:
-                    stage_errors.append(
-                        {
-                            "stage": stage_name,
-                            "returncode": -1,
-                            "error": str(exc),
-                            "at": utc_now(),
-                        }
-                    )
+                    with stage_lock:
+                        stage_errors.append(
+                            {
+                                "stage": stage_name,
+                                "returncode": -1,
+                                "error": str(exc),
+                                "at": utc_now(),
+                            }
+                        )
                     logger.error("Leadgen stage %s crashed: %s", stage_name, exc)
                     return False
 
@@ -3641,21 +4329,6 @@ def _run_autonomous_replenish_locked(
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
             if still_needs_b2b:
-                raw_jsonl = state_dir / f"raw_{ts}.jsonl"
-                master_jsonl = state_dir / "master_ids.jsonl"
-                buyer_public_out = state_dir / f"buyer_public_{ts}.jsonl"
-                catalogs_out = state_dir / f"buyer_catalogs_{ts}.jsonl"
-                high_yield_out = state_dir / f"high_yield_{ts}.jsonl"
-                meta_ads_out = state_dir / f"meta_ads_{ts}.jsonl"
-                social_out = state_dir / f"social_{ts}.jsonl"
-                channel_graph_out = state_dir / f"channel_graph_{ts}.jsonl"
-                ad_spy_out = state_dir / f"tg_ad_spy_{ts}.jsonl"
-                external_out = state_dir / f"external_{ts}.jsonl"
-                yc_ph_out = state_dir / f"yc_ph_{ts}.jsonl"
-                fb_groups_out = state_dir / f"fb_groups_{ts}.jsonl"
-                b2b_tg_groups_out = state_dir / f"b2b_tg_groups_{ts}.jsonl"
-                ofm_review_path = state_dir / "ofm_review_leads.jsonl"
-                pre_ofm_count = _count_jsonl_lines(ofm_review_path) if ofm_review_path.is_file() else 0
                 sources_cfg = b2b_cfg.get("sources") or {}
                 limits_cfg = b2b_cfg.get("limits") or {}
 
@@ -3665,7 +4338,7 @@ def _run_autonomous_replenish_locked(
                     cfg=eff_cfg,
                     budget_state=budget_state,
                     is_real_subprocess_runner=is_real_subprocess_runner,
-                    isolated_session=isolated_session,
+                    isolated_session=primary_ro_session,
                     tg_client=tg_client,
                     tg_entity_resolver_fn=tg_entity_resolver_fn,
                     waterfall_treg_fn=waterfall_treg_fn,
@@ -3675,74 +4348,116 @@ def _run_autonomous_replenish_locked(
                     max_rows=12,
                 )
                 if dx_retro["attempted"] > 0:
-                    stages_run.append("retro_bridge_direct_x")
+                    with stage_lock:
+                        stages_run.append("retro_bridge_direct_x")
                     tg_bridged_count += int(dx_retro["tg_bridged"])
                     ingested_total += int(dx_retro["whales_ingested"])
                     social_manual_ingested += int(dx_retro["social_manual_ingested"])
 
-                # Web / API discovery stages (no TG session needed)
-                paid_cli_discovery_allowed = (
-                    (not is_real_subprocess_runner)
-                    or budget_state is None
-                    or budget_state.paid_allowed
+                effective_max_waves = (
+                    max(1, min(3, int(max_waves)))
+                    if max_waves is not None
+                    else (3 if is_real_subprocess_runner else 1)
                 )
-                if sources_cfg.get("buyer_catalogs", True) and "buyer_catalogs" not in quarantined:
-                    if "buyer_public" not in quarantined:
-                        if paid_cli_discovery_allowed:
-                            _exec_stage(
-                                "buyer_public",
-                                [
+                yield_state = _load_source_yield_state(state_dir)
+
+                for wave_idx in range(1, effective_max_waves + 1):
+                    if not still_needs_b2b:
+                        break
+                    if wave_idx > 1 and (time.monotonic() - run_started_mono) >= float(max_wall_clock_sec):
+                        _add_reason("batch_loop_wall_clock_cap")
+                        break
+                    waves_executed += 1
+                    wave_ts = ts if wave_idx == 1 else f"{ts}_w{wave_idx}"
+                    raw_jsonl = state_dir / f"raw_{wave_ts}.jsonl"
+                    master_jsonl = state_dir / "master_ids.jsonl"
+                    buyer_public_out = state_dir / f"buyer_public_{wave_ts}.jsonl"
+                    catalogs_out = state_dir / f"buyer_catalogs_{wave_ts}.jsonl"
+                    high_yield_out = state_dir / f"high_yield_{wave_ts}.jsonl"
+                    meta_ads_out = state_dir / f"meta_ads_{wave_ts}.jsonl"
+                    social_out = state_dir / f"social_{wave_ts}.jsonl"
+                    channel_graph_out = state_dir / f"channel_graph_{wave_ts}.jsonl"
+                    ad_spy_out = state_dir / f"tg_ad_spy_{wave_ts}.jsonl"
+                    external_out = state_dir / f"external_{wave_ts}.jsonl"
+                    yc_ph_out = state_dir / f"yc_ph_{wave_ts}.jsonl"
+                    fb_groups_out = state_dir / f"fb_groups_{wave_ts}.jsonl"
+                    b2b_tg_groups_out = state_dir / f"b2b_tg_groups_{wave_ts}.jsonl"
+                    ofm_review_path = state_dir / "ofm_review_leads.jsonl"
+                    pre_ofm_count = _count_jsonl_lines(ofm_review_path) if ofm_review_path.is_file() else 0
+
+                    paid_cli_discovery_allowed = (
+                        (not is_real_subprocess_runner)
+                        or budget_state is None
+                        or budget_state.paid_allowed
+                    )
+                    enabled_veins: list[str] = []
+                    if (
+                        sources_cfg.get("whop_content_rewards", False)
+                        and "whop_content_rewards" not in quarantined
+                    ):
+                        enabled_veins.append("whop")
+                    if sources_cfg.get("tiktok_ads", False) and "tiktok_ads" not in quarantined:
+                        enabled_veins.append("tiktok_ads")
+                    if sources_cfg.get("tiktok_shop", False) and "tiktok_shop" not in quarantined:
+                        enabled_veins.append("tiktok_shop")
+                    if sources_cfg.get("app_stores", False) and "app_stores" not in quarantined:
+                        enabled_veins.append("app_stores")
+                    if sources_cfg.get("ats_hiring", False) and "ats_hiring" not in quarantined:
+                        enabled_veins.append("ats_hiring")
+                    if sources_cfg.get("ph_detailed", False) and "ph_detailed" not in quarantined:
+                        enabled_veins.append("ph_detailed")
+                    if sources_cfg.get("d2c_whatsapp", False) and "d2c_whatsapp" not in quarantined:
+                        enabled_veins.append("d2c_whatsapp")
+
+                    web_tasks: list[tuple[str, Callable[[], None]]] = []
+                    wave_ran_sources: set[str] = set()
+
+                    if sources_cfg.get("buyer_catalogs", True) and "buyer_catalogs" not in quarantined:
+                        if "buyer_public" not in quarantined:
+                            if _is_source_in_cooldown(yield_state, "buyer_public"):
+                                _add_reason("cooldown_48h:buyer_public")
+                                if "buyer_public" not in cooldown_sources:
+                                    cooldown_sources.append("buyer_public")
+                            elif paid_cli_discovery_allowed:
+                                wave_ran_sources.add("buyer_public")
+                                _bp_cmd = [
                                     py_bin,
                                     str(ROOT / "leadgen" / "buyer_public.py"),
                                     "--output",
                                     str(buyer_public_out),
-                                ],
-                            )
-                        elif "budget_guard_skipped:buyer_public" not in replenish_reasons:
-                            replenish_reasons.append("budget_guard_skipped:buyer_public")
-                    _exec_stage(
-                        "buyer_catalogs",
-                        [
+                                ]
+                                web_tasks.append((
+                                    "buyer_public",
+                                    lambda c=_bp_cmd: _exec_stage("buyer_public", c),
+                                ))
+                            else:
+                                _add_reason("budget_guard_skipped:buyer_public")
+                        wave_ran_sources.add("buyer_catalogs")
+                        _bc_cmd = [
                             py_bin,
                             str(ROOT / "leadgen" / "buyer_catalogs.py"),
                             "--output",
                             str(catalogs_out),
                             "--seen",
                             str(state_dir / "buyer_catalogs_seen.json"),
-                        ],
-                    )
+                        ]
+                        web_tasks.append((
+                            "buyer_catalogs",
+                            lambda c=_bc_cmd: _exec_stage("buyer_catalogs", c),
+                        ))
 
-                enabled_veins: list[str] = []
-                if (
-                    sources_cfg.get("whop_content_rewards", False)
-                    and "whop_content_rewards" not in quarantined
-                ):
-                    enabled_veins.append("whop")
-                if sources_cfg.get("tiktok_ads", False) and "tiktok_ads" not in quarantined:
-                    enabled_veins.append("tiktok_ads")
-                if sources_cfg.get("tiktok_shop", False) and "tiktok_shop" not in quarantined:
-                    enabled_veins.append("tiktok_shop")
-                if sources_cfg.get("app_stores", False) and "app_stores" not in quarantined:
-                    enabled_veins.append("app_stores")
-                if sources_cfg.get("ats_hiring", False) and "ats_hiring" not in quarantined:
-                    enabled_veins.append("ats_hiring")
-                if sources_cfg.get("ph_detailed", False) and "ph_detailed" not in quarantined:
-                    enabled_veins.append("ph_detailed")
-                if sources_cfg.get("d2c_whatsapp", False) and "d2c_whatsapp" not in quarantined:
-                    enabled_veins.append("d2c_whatsapp")
-                if enabled_veins and "high_yield_veins" not in quarantined:
-                    if not paid_cli_discovery_allowed:
-                        if "budget_guard_skipped:high_yield_veins" not in replenish_reasons:
-                            replenish_reasons.append("budget_guard_skipped:high_yield_veins")
-                    elif treg_ready or monid_ready or not is_real_subprocess_runner:
-                        whop_min_pool = int(
-                            whales_cfg.get("whop_min_pool_usd")
-                            if whales_cfg.get("whop_min_pool_usd") is not None
-                            else 5000
-                        )
-                        _exec_stage(
-                            "high_yield_veins",
-                            [
+                    if enabled_veins and "high_yield_veins" not in quarantined:
+                        if not paid_cli_discovery_allowed:
+                            _add_reason("budget_guard_skipped:high_yield_veins")
+                        elif treg_ready or monid_ready or not is_real_subprocess_runner:
+                            whop_min_pool = int(
+                                whales_cfg.get("whop_min_pool_usd")
+                                if whales_cfg.get("whop_min_pool_usd") is not None
+                                else 5000
+                            )
+                            hy_limit = min(200, max(20, int(limits_cfg.get("high_yield_limit") or 80)))
+                            wave_ran_sources.add("high_yield_veins")
+                            _hy_cmd = [
                                 py_bin,
                                 str(ROOT / "leadgen" / "high_yield_veins.py"),
                                 "--output",
@@ -3750,155 +4465,177 @@ def _run_autonomous_replenish_locked(
                                 "--seen",
                                 str(state_dir / "high_yield_seen.json"),
                                 "--limit",
-                                "48",
+                                str(hy_limit),
                                 "--veins",
                                 ",".join(enabled_veins),
                                 "--whop-min-pool-usd",
                                 str(max(0, whop_min_pool)),
                                 "--max-runtime-sec",
                                 str(min(220, max(60, int(stage_timeout) - 60))),
-                            ],
-                        )
-                    elif "missing_treg_cli" not in replenish_reasons:
-                        replenish_reasons.append("missing_treg_cli")
-
-                if (
-                    sources_cfg.get("facebook_groups", False)
-                    and "facebook_groups" not in quarantined
-                ):
-                    if not paid_cli_discovery_allowed:
-                        if "budget_guard_skipped:facebook_groups" not in replenish_reasons:
-                            replenish_reasons.append("budget_guard_skipped:facebook_groups")
-                    elif treg_ready or not is_real_subprocess_runner:
-                        fb_cmd = [
-                            py_bin,
-                            str(ROOT / "leadgen" / "ofm_and_groups.py"),
-                            "--mode",
-                            "fb_groups",
-                            "--output",
-                            str(fb_groups_out),
-                            "--ofm-out",
-                            str(ofm_review_path),
-                        ]
-                        fb_urls = [str(u).strip() for u in (b2b_cfg.get("fb_group_urls") or []) if str(u).strip()]
-                        if fb_urls:
-                            fb_cmd.extend(["--fb-urls", ",".join(fb_urls), "--max-groups", str(max(5, len(fb_urls)))])
-                        _exec_stage("facebook_groups", fb_cmd)
-                    elif "missing_treg_cli" not in replenish_reasons:
-                        replenish_reasons.append("missing_treg_cli")
-
-                if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
-                    if not paid_cli_discovery_allowed:
-                        if "budget_guard_skipped:meta_ad_leads" not in replenish_reasons:
-                            replenish_reasons.append("budget_guard_skipped:meta_ad_leads")
-                    elif treg_ready or not is_real_subprocess_runner:
-                        meta_seen_path = state_dir / "meta_ads_seen.json"
-                        meta_cmd = [
-                            py_bin,
-                            str(ROOT / "leadgen" / "meta_ad_leads.py"),
-                            "--output",
-                            str(meta_ads_out),
-                            "--seen",
-                            str(meta_seen_path),
-                            "--max-runtime-sec",
-                            str(min(210, max(60, int(stage_timeout) - 60))),
-                        ]
-                        whales_geos = [
-                            str(g).strip().upper()
-                            for g in (whales_cfg.get("geos") or ())
-                            if str(g or "").strip()
-                        ]
-                        if whales_geos:
-                            meta_cursor = 0
-                            if meta_seen_path.is_file():
-                                try:
-                                    seen_obj = json.loads(
-                                        meta_seen_path.read_text(encoding="utf-8")
-                                    )
-                                    if isinstance(seen_obj, dict):
-                                        meta_cursor = max(
-                                            0, int(seen_obj.get("cursor") or 0)
-                                        )
-                                except (OSError, json.JSONDecodeError, ValueError, TypeError):
-                                    meta_cursor = 0
-                            sliced_geos = [
-                                whales_geos[(meta_cursor * 3 + i) % len(whales_geos)]
-                                for i in range(min(3, len(whales_geos)))
                             ]
-                            meta_cmd.extend(["--country", ",".join(sliced_geos)])
-                        _exec_stage("meta_ad_leads", meta_cmd)
-                    elif "missing_treg_cli" not in replenish_reasons:
-                        replenish_reasons.append("missing_treg_cli")
-                if sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined:
-                    if not paid_cli_discovery_allowed:
-                        if "budget_guard_skipped:treg_social_leads" not in replenish_reasons:
-                            replenish_reasons.append("budget_guard_skipped:treg_social_leads")
-                    elif treg_ready:
-                        _exec_stage(
-                            "treg_social_leads",
-                            [
+                            web_tasks.append((
+                                "high_yield_veins",
+                                lambda c=_hy_cmd: _exec_stage("high_yield_veins", c),
+                            ))
+                        else:
+                            _add_reason("missing_treg_cli")
+
+                    if (
+                        sources_cfg.get("facebook_groups", False)
+                        and "facebook_groups" not in quarantined
+                    ):
+                        if _is_source_in_cooldown(yield_state, "facebook_groups"):
+                            _add_reason("cooldown_48h:facebook_groups")
+                            if "facebook_groups" not in cooldown_sources:
+                                cooldown_sources.append("facebook_groups")
+                        elif not paid_cli_discovery_allowed:
+                            _add_reason("budget_guard_skipped:facebook_groups")
+                        elif treg_ready or not is_real_subprocess_runner:
+                            fb_cmd = [
+                                py_bin,
+                                str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                                "--mode",
+                                "fb_groups",
+                                "--output",
+                                str(fb_groups_out),
+                                "--ofm-out",
+                                str(ofm_review_path),
+                            ]
+                            fb_urls = [str(u).strip() for u in (b2b_cfg.get("fb_group_urls") or []) if str(u).strip()]
+                            if fb_urls:
+                                fb_cmd.extend(["--fb-urls", ",".join(fb_urls), "--max-groups", str(max(5, len(fb_urls)))])
+                            wave_ran_sources.add("facebook_groups")
+                            web_tasks.append((
+                                "facebook_groups",
+                                lambda c=fb_cmd: _exec_stage("facebook_groups", c),
+                            ))
+                        else:
+                            _add_reason("missing_treg_cli")
+
+                    if sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined:
+                        if not paid_cli_discovery_allowed:
+                            _add_reason("budget_guard_skipped:meta_ad_leads")
+                        elif treg_ready or not is_real_subprocess_runner:
+                            meta_seen_path = state_dir / "meta_ads_seen.json"
+                            meta_cmd = [
+                                py_bin,
+                                str(ROOT / "leadgen" / "meta_ad_leads.py"),
+                                "--output",
+                                str(meta_ads_out),
+                                "--seen",
+                                str(meta_seen_path),
+                                "--max-runtime-sec",
+                                str(min(210, max(60, int(stage_timeout) - 60))),
+                            ]
+                            whales_geos = [
+                                str(g).strip().upper()
+                                for g in (whales_cfg.get("geos") or ())
+                                if str(g or "").strip()
+                            ]
+                            if whales_geos:
+                                meta_cursor = 0
+                                if meta_seen_path.is_file():
+                                    try:
+                                        seen_obj = json.loads(
+                                            meta_seen_path.read_text(encoding="utf-8")
+                                        )
+                                        if isinstance(seen_obj, dict):
+                                            meta_cursor = max(
+                                                0, int(seen_obj.get("cursor") or 0)
+                                            )
+                                    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                                        meta_cursor = 0
+                                sliced_geos = [
+                                    whales_geos[(meta_cursor * 3 + i) % len(whales_geos)]
+                                    for i in range(min(3, len(whales_geos)))
+                                ]
+                                meta_cmd.extend(["--country", ",".join(sliced_geos)])
+                            wave_ran_sources.add("meta_ads")
+                            web_tasks.append((
+                                "meta_ad_leads",
+                                lambda c=meta_cmd: _exec_stage("meta_ad_leads", c),
+                            ))
+                        else:
+                            _add_reason("missing_treg_cli")
+
+                    if sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined:
+                        if not paid_cli_discovery_allowed:
+                            _add_reason("budget_guard_skipped:treg_social_leads")
+                        elif treg_ready:
+                            wave_ran_sources.add("social_x_reddit")
+                            _soc_cmd = [
                                 py_bin,
                                 str(ROOT / "leadgen" / "treg_social_leads.py"),
                                 "--output",
                                 str(social_out),
                                 "--seen",
                                 str(state_dir / "treg_social_seen.json"),
-                            ],
-                        )
-                    elif is_real_subprocess_runner and "missing_treg_cli" not in replenish_reasons:
-                        replenish_reasons.append("missing_treg_cli")
-                if (
-                    is_real_subprocess_runner
-                    and not treg_ready
-                    and "missing_treg_cli" not in replenish_reasons
-                    and (
-                        (sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined)
-                        or (sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined)
-                        or (sources_cfg.get("facebook_groups", False) and "facebook_groups" not in quarantined)
-                        or (enabled_veins and "high_yield_veins" not in quarantined)
-                    )
-                ):
-                    replenish_reasons.append("missing_treg_cli")
-                if (
-                    sources_cfg.get("yc_ph", True)
-                    and "yc_ph" not in quarantined
-                    and "yc_ph_leads" not in quarantined
-                ):
-                    yc_lim = max(1, min(12, int(limits_cfg.get("yc_limit") or 12)))
-                    ph_lim = max(0, min(10, int(limits_cfg.get("ph_limit") or 0)))
-                    yc_cmd = [
-                        py_bin,
-                        str(ROOT / "leadgen" / "yc_ph_leads.py"),
-                        "--yc-limit",
-                        str(yc_lim),
-                        "--ph-limit",
-                        str(ph_lim),
-                        "--betalist-limit",
-                        "5",
-                        "--microlaunch-limit",
-                        "5",
-                        "--uneed-limit",
-                        "5",
-                        "--indiehackers-limit",
-                        "5",
-                        "--no-llm",
-                        "--no-sheet",
-                        "--persist-seen",
-                    ]
-                    if isolated_session is None:
-                        yc_cmd.append("--no-tg")
-                    tmp_yc = Path("/tmp/yc_ph_leads.jsonl")
-                    prev_yc_mtime = tmp_yc.stat().st_mtime_ns if tmp_yc.is_file() else -1
-                    if _exec_stage("yc_ph_leads", yc_cmd) and tmp_yc.is_file():
-                        cur_yc_st = tmp_yc.stat()
-                        if cur_yc_st.st_size > 0 and cur_yc_st.st_mtime_ns != prev_yc_mtime:
-                            yc_ph_out.write_bytes(tmp_yc.read_bytes())
+                            ]
+                            web_tasks.append((
+                                "treg_social_leads",
+                                lambda c=_soc_cmd: _exec_stage("treg_social_leads", c),
+                            ))
+                        elif is_real_subprocess_runner:
+                            _add_reason("missing_treg_cli")
 
-                ext_limit = min(10, max(0, int(limits_cfg.get("external_limit") or 10)))
-                if ext_limit > 0 and "creator_external_leads" not in quarantined:
-                    _exec_stage(
-                        "creator_external_leads",
-                        [
+                    if (
+                        is_real_subprocess_runner
+                        and not treg_ready
+                        and (
+                            (sources_cfg.get("meta_ads", True) and "meta_ads" not in quarantined)
+                            or (sources_cfg.get("social_x_reddit", True) and "social_x_reddit" not in quarantined)
+                            or (sources_cfg.get("facebook_groups", False) and "facebook_groups" not in quarantined)
+                            or (enabled_veins and "high_yield_veins" not in quarantined)
+                        )
+                    ):
+                        _add_reason("missing_treg_cli")
+
+                    if (
+                        sources_cfg.get("yc_ph", True)
+                        and "yc_ph" not in quarantined
+                        and "yc_ph_leads" not in quarantined
+                    ):
+                        yc_lim = max(1, min(200, int(limits_cfg.get("yc_limit") or 80)))
+                        raw_ph_lim = limits_cfg.get("ph_limit")
+                        ph_lim = max(0, min(50, int(0 if raw_ph_lim is None else raw_ph_lim)))
+                        yc_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "yc_ph_leads.py"),
+                            "--yc-limit",
+                            str(yc_lim),
+                            "--ph-limit",
+                            str(ph_lim),
+                            "--betalist-limit",
+                            "5",
+                            "--microlaunch-limit",
+                            "5",
+                            "--uneed-limit",
+                            "5",
+                            "--indiehackers-limit",
+                            "5",
+                            "--no-llm",
+                            "--no-sheet",
+                            "--persist-seen",
+                        ]
+                        if primary_ro_session is None or len(web_tasks) > 0:
+                            yc_cmd.append("--no-tg")
+                        wave_ran_sources.add("yc_ph")
+
+                        def _run_yc_ph_stage(cmd_arg: list[str] = yc_cmd, out_path: Path = yc_ph_out) -> None:
+                            tmp_yc = Path("/tmp/yc_ph_leads.jsonl")
+                            prev_yc_mtime = tmp_yc.stat().st_mtime_ns if tmp_yc.is_file() else -1
+                            if _exec_stage("yc_ph_leads", cmd_arg) and tmp_yc.is_file():
+                                cur_yc_st = tmp_yc.stat()
+                                if cur_yc_st.st_size > 0 and cur_yc_st.st_mtime_ns != prev_yc_mtime:
+                                    out_path.write_bytes(tmp_yc.read_bytes())
+
+                        web_tasks.append(("yc_ph_leads", _run_yc_ph_stage))
+
+                    raw_ext_lim = limits_cfg.get("external_limit")
+                    ext_limit = min(200, max(0, int(40 if raw_ext_lim is None else raw_ext_lim)))
+                    if ext_limit > 0 and "creator_external_leads" not in quarantined:
+                        wave_ran_sources.add("external")
+                        _ext_cmd = [
                             py_bin,
                             str(ROOT / "leadgen" / "creator_external_leads.py"),
                             "--output",
@@ -3909,553 +4646,678 @@ def _run_autonomous_replenish_locked(
                             str(state_dir / "creator_external_seen.json"),
                             "--verify-telegram",
                             "--no-qualify",
-                        ],
-                    )
+                        ]
+                        web_tasks.append((
+                            "creator_external_leads",
+                            lambda c=_ext_cmd: _exec_stage("creator_external_leads", c),
+                        ))
 
-                # TG scrapers ONLY if valid isolated SCRAPER_TG_SESSION is available
-                effective_groups: list[str] = []
-                for g in [*(b2b_cfg.get("tg_groups_new") or []), *(b2b_cfg.get("tg_groups_old") or [])]:
-                    if g not in effective_groups:
-                        effective_groups.append(g)
+                    if web_tasks:
+                        eff_web_workers = (
+                            max(1, min(5, int(web_discovery_workers)))
+                            if web_discovery_workers is not None
+                            else (5 if is_real_subprocess_runner else 1)
+                        )
+                        if eff_web_workers <= 1 or len(web_tasks) <= 1:
+                            for _label, fn in web_tasks:
+                                fn()
+                        else:
+                            pool = concurrent.futures.ThreadPoolExecutor(
+                                max_workers=min(eff_web_workers, len(web_tasks))
+                            )
+                            try:
+                                futs = [pool.submit(fn) for _label, fn in web_tasks]
+                                for fut in concurrent.futures.as_completed(futs):
+                                    fut.result()
+                            finally:
+                                pool.shutdown(wait=False, cancel_futures=True)
 
-                if (
-                    isolated_session is not None
-                    and sources_cfg.get("tg_groups", True)
-                    and effective_groups
-                ):
-                    scrape_cmd = [
-                        py_bin,
-                        str(ROOT / "leadgen" / "tg_scrape_posters.py"),
-                        "--session",
-                        str(isolated_session),
-                        "--groups",
-                        ",".join(effective_groups),
-                        "--mode",
-                        "posters",
-                        "--msg-limit",
-                        str(min(400, max(50, int(limits_cfg.get("msg_limit") or 400)))),
-                        "--delay",
-                        "0.8",
-                        "--max-runtime-sec",
-                        "180",
-                        "--output",
-                        str(raw_jsonl),
-                        "--append",
-                    ]
-                    if master_jsonl.is_file():
-                        scrape_cmd.extend(["--exclude", str(master_jsonl)])
-                    _exec_stage("tg_scrape_posters", scrape_cmd)
+                    # Native TG scrapers (RO pool, non-overlapping SQLite session locking)
+                    effective_groups: list[str] = []
+                    for g in [*(b2b_cfg.get("tg_groups_new") or []), *(b2b_cfg.get("tg_groups_old") or [])]:
+                        if g not in effective_groups:
+                            effective_groups.append(g)
 
-                    raw_b2b_new = b2b_cfg.get("tg_groups_new")
-                    b2b_group_list = _clean_chat_list(
-                        ["productcircle_chat", "solofounderschat", "saasfounders"]
-                        if raw_b2b_new is None
-                        else raw_b2b_new
-                    )
-                    if b2b_group_list:
+                    if (
+                        primary_ro_session is not None
+                        and sources_cfg.get("tg_groups", True)
+                        and effective_groups
+                    ):
+                        scrape_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "tg_scrape_posters.py"),
+                            "--session",
+                            str(primary_ro_session),
+                            "--groups",
+                            ",".join(effective_groups),
+                            "--mode",
+                            "hybrid",
+                            "--msg-limit",
+                            str(min(400, max(50, int(limits_cfg.get("msg_limit") or 400)))),
+                            "--delay",
+                            "0.8",
+                            "--max-runtime-sec",
+                            "180",
+                            "--output",
+                            str(raw_jsonl),
+                            "--append",
+                        ]
+                        if master_jsonl.is_file():
+                            scrape_cmd.extend(["--exclude", str(master_jsonl)])
+                        _exec_stage("tg_scrape_posters", scrape_cmd)
+
+                        comment_excluded = set(quarantined) | {str(g).strip().lstrip("@").lower() for g in effective_groups}
+                        comment_batch = _pick_comment_channels_batch(
+                            state_dir,
+                            excluded=comment_excluded,
+                            batch_size=10,
+                            include_repo_seed=is_real_subprocess_runner,
+                        )
+                        if comment_batch:
+                            comment_sess = (
+                                ro_sessions[1 % len(ro_sessions)]
+                                if ro_sessions
+                                else primary_ro_session
+                            )
+                            comment_cmd = [
+                                py_bin,
+                                str(ROOT / "leadgen" / "tg_scrape_posters.py"),
+                                "--session",
+                                str(comment_sess),
+                                "--groups",
+                                ",".join(comment_batch),
+                                "--mode",
+                                "hybrid",
+                                "--msg-limit",
+                                str(min(400, max(50, int(limits_cfg.get("msg_limit") or 400)))),
+                                "--delay",
+                                "0.8",
+                                "--max-runtime-sec",
+                                "150",
+                                "--output",
+                                str(raw_jsonl),
+                                "--append",
+                            ]
+                            if master_jsonl.is_file():
+                                comment_cmd.extend(["--exclude", str(master_jsonl)])
+                            _exec_stage("tg_scrape_comment_channels", comment_cmd)
+
+                        raw_b2b_new = b2b_cfg.get("tg_groups_new")
+                        b2b_group_list = _clean_chat_list(
+                            ["productcircle_chat", "solofounderschat", "saasfounders"]
+                            if raw_b2b_new is None
+                            else raw_b2b_new
+                        )
+                        if b2b_group_list:
+                            _exec_stage(
+                                "b2b_tg_groups",
+                                [
+                                    py_bin,
+                                    str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                                    "--mode",
+                                    "b2b_tg",
+                                    "--session",
+                                    str(primary_ro_session),
+                                    "--groups",
+                                    ",".join(b2b_group_list),
+                                    "--output",
+                                    str(b2b_tg_groups_out),
+                                    "--seen",
+                                    str(state_dir / "b2b_tg_groups_seen.json"),
+                                ],
+                            )
+
+                    if (
+                        primary_ro_session is not None
+                        and sources_cfg.get("ofm_groups", False)
+                        and "ofm_groups" not in quarantined
+                    ):
+                        ofm_group_list = _clean_chat_list(b2b_cfg.get("ofm_tg_groups") or [])
+                        ofm_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "ofm_and_groups.py"),
+                            "--mode",
+                            "ofm_tg",
+                            "--session",
+                            str(primary_ro_session),
+                            "--ofm-out",
+                            str(ofm_review_path),
+                            "--seen",
+                            str(state_dir / "ofm_seen.json"),
+                        ]
+                        if ofm_group_list:
+                            ofm_cmd.extend(["--groups", ",".join(ofm_group_list)])
+                        _exec_stage("ofm_groups", ofm_cmd)
+
+                    if (
+                        primary_ro_session is not None
+                        and sources_cfg.get("channel_graph", True)
+                        and "channel_graph" not in quarantined
+                    ):
+                        graph_sess = ro_sessions[1 % len(ro_sessions)] if ro_sessions else primary_ro_session
                         _exec_stage(
-                            "b2b_tg_groups",
+                            "tg_channel_graph",
                             [
                                 py_bin,
-                                str(ROOT / "leadgen" / "ofm_and_groups.py"),
-                                "--mode",
-                                "b2b_tg",
+                                str(ROOT / "leadgen" / "tg_channel_graph.py"),
                                 "--session",
-                                str(isolated_session),
-                                "--groups",
-                                ",".join(b2b_group_list),
+                                str(graph_sess),
                                 "--output",
-                                str(b2b_tg_groups_out),
-                                "--seen",
-                                str(state_dir / "b2b_tg_groups_seen.json"),
+                                str(channel_graph_out),
+                                "--state",
+                                str(state_dir / "tg_channel_graph_seen.json"),
+                                "--max-runtime-sec",
+                                str(min(180, max(60, int(stage_timeout) - 60))),
                             ],
                         )
 
-                if (
-                    isolated_session is not None
-                    and sources_cfg.get("ofm_groups", False)
-                    and "ofm_groups" not in quarantined
-                ):
-                    ofm_group_list = _clean_chat_list(b2b_cfg.get("ofm_tg_groups") or [])
-                    ofm_cmd = [
-                        py_bin,
-                        str(ROOT / "leadgen" / "ofm_and_groups.py"),
-                        "--mode",
-                        "ofm_tg",
-                        "--session",
-                        str(isolated_session),
-                        "--ofm-out",
-                        str(ofm_review_path),
-                        "--seen",
-                        str(state_dir / "ofm_seen.json"),
-                    ]
-                    if ofm_group_list:
-                        ofm_cmd.extend(["--groups", ",".join(ofm_group_list)])
-                    _exec_stage("ofm_groups", ofm_cmd)
-
-                if (
-                    isolated_session is not None
-                    and sources_cfg.get("channel_graph", True)
-                    and "channel_graph" not in quarantined
-                ):
-                    _exec_stage(
-                        "tg_channel_graph",
-                        [
-                            py_bin,
-                            str(ROOT / "leadgen" / "tg_channel_graph.py"),
-                            "--session",
-                            str(isolated_session),
-                            "--output",
-                            str(channel_graph_out),
-                            "--state",
-                            str(state_dir / "tg_channel_graph_seen.json"),
-                            "--max-runtime-sec",
-                            str(min(180, max(60, int(stage_timeout) - 60))),
-                        ],
-                    )
-
-                if (
-                    isolated_session is not None
-                    and sources_cfg.get("tg_ad_spy", True)
-                    and "tg_ad_spy" not in quarantined
-                ):
-                    _exec_stage(
-                        "tg_ad_spy",
-                        [
-                            py_bin,
-                            str(ROOT / "leadgen" / "tg_ad_spy.py"),
-                            "--session",
-                            str(isolated_session),
-                            "--output",
-                            str(ad_spy_out),
-                            "--seen",
-                            str(state_dir / "tg_ad_spy_seen.json"),
-                            "--max-runtime-sec",
-                            str(min(180, max(60, int(stage_timeout) - 60))),
-                        ],
-                    )
-
-                per_source_counts["tg_groups"] = _count_jsonl_lines(raw_jsonl) + _count_jsonl_lines(b2b_tg_groups_out)
-                per_source_counts["ofm_groups"] = max(
-                    0, _count_jsonl_lines(ofm_review_path) - pre_ofm_count
-                )
-                for src_label, src_path in (
-                    ("buyer_public", buyer_public_out),
-                    ("buyer_catalogs", catalogs_out),
-                    ("high_yield_veins", high_yield_out),
-                    ("facebook_groups", fb_groups_out),
-                    ("meta_ads", meta_ads_out),
-                    ("social_x_reddit", social_out),
-                    ("external", external_out),
-                    ("yc_ph", yc_ph_out),
-                    ("channel_graph", channel_graph_out),
-                    ("tg_ad_spy", ad_spy_out),
-                ):
-                    per_source_counts[src_label] = _count_jsonl_lines(src_path)
-                    if src_path.is_file() and src_path.stat().st_size > 0:
-                        try:
-                            source_hashes[src_label] = _file_sha256(src_path)
-                        except OSError:
-                            pass
-
-                pending_qualify_queue = state_dir / "pending_qualify_queue.jsonl"
-                llm_failed_file = state_dir / "llm_failed_batches.jsonl"
-                _merge_discovered_jsonl_into_raw(
-                    [
-                        pending_qualify_queue,
-                        buyer_public_out,
-                        catalogs_out,
-                        high_yield_out,
-                        fb_groups_out,
-                        b2b_tg_groups_out,
-                        meta_ads_out,
-                        social_out,
-                        external_out,
-                        yc_ph_out,
-                        channel_graph_out,
-                        ad_spy_out,
-                    ],
-                    raw_jsonl,
-                )
-                apply_master_merge(str(raw_jsonl), str(master_jsonl), commit_master=False)
-                new_jsonl = Path(f"{raw_jsonl}.new")
-                if not new_jsonl.exists():
-                    new_jsonl.write_text("", encoding="utf-8")
-
-                has_new_rows = new_jsonl.stat().st_size > 0
-                enrich_ok = False
-                qual_ok = False
-                curate_ok = True
-                if has_new_rows or not is_real_subprocess_runner:
-                    enriched_jsonl = state_dir / f"raw_{ts}.enriched.jsonl"
-                    enrich_ok = _exec_stage(
-                        "tg_enrich_leads",
-                        [
-                            py_bin,
-                            str(ROOT / "leadgen" / "tg_enrich_leads.py"),
-                            "--input",
-                            str(new_jsonl),
-                            "--output",
-                            str(enriched_jsonl),
-                            "--fetch",
-                            "--skip-copy",
-                        ],
-                    )
-                    if not enrich_ok:
-                        if has_new_rows:
-                            _write_pending_qualify_queue(
-                                pending_qualify_queue,
-                                _read_jsonl_dicts(new_jsonl),
-                            )
-                    else:
-                        enrich_src = (
-                            enriched_jsonl
-                            if enriched_jsonl.is_file() and enriched_jsonl.stat().st_size > 0
-                            else new_jsonl
+                    if (
+                        primary_ro_session is not None
+                        and sources_cfg.get("tg_ad_spy", True)
+                        and "tg_ad_spy" not in quarantined
+                    ):
+                        ad_sess = ro_sessions[2 % len(ro_sessions)] if ro_sessions else primary_ro_session
+                        _exec_stage(
+                            "tg_ad_spy",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "tg_ad_spy.py"),
+                                "--session",
+                                str(ad_sess),
+                                "--output",
+                                str(ad_spy_out),
+                                "--seen",
+                                str(state_dir / "tg_ad_spy_seen.json"),
+                                "--max-runtime-sec",
+                                str(min(180, max(60, int(stage_timeout) - 60))),
+                            ],
                         )
-                        if has_llm_key:
-                            llm_failed_file.unlink(missing_ok=True)
-                            qualified_jsonl = state_dir / f"raw_{ts}.qualified.jsonl"
-                            curated_jsonl = state_dir / f"raw_{ts}.curated_tmp.jsonl"
-                            final_jsonl = state_dir / f"raw_{ts}.final.jsonl"
-                            qual_ok = _exec_stage(
-                                "tg_llm_qualify",
-                                [
-                                    py_bin,
-                                    str(ROOT / "leadgen" / "tg_llm_qualify.py"),
-                                    "--input",
-                                    str(enrich_src),
-                                    "--output",
-                                    str(qualified_jsonl),
-                                ],
+
+                    wave_tg_groups_cnt = _count_jsonl_lines(raw_jsonl) + _count_jsonl_lines(b2b_tg_groups_out)
+                    per_source_counts["tg_groups"] = per_source_counts.get("tg_groups", 0) + wave_tg_groups_cnt
+                    wave_ofm_cnt = max(0, _count_jsonl_lines(ofm_review_path) - pre_ofm_count)
+                    per_source_counts["ofm_groups"] = per_source_counts.get("ofm_groups", 0) + wave_ofm_cnt
+                    wave_source_counts: dict[str, int] = {}
+                    for src_label, src_path in (
+                        ("buyer_public", buyer_public_out),
+                        ("buyer_catalogs", catalogs_out),
+                        ("high_yield_veins", high_yield_out),
+                        ("facebook_groups", fb_groups_out),
+                        ("meta_ads", meta_ads_out),
+                        ("social_x_reddit", social_out),
+                        ("external", external_out),
+                        ("yc_ph", yc_ph_out),
+                        ("channel_graph", channel_graph_out),
+                        ("tg_ad_spy", ad_spy_out),
+                    ):
+                        cnt_now = _count_jsonl_lines(src_path)
+                        wave_source_counts[src_label] = cnt_now
+                        per_source_counts[src_label] = per_source_counts.get(src_label, 0) + cnt_now
+                        if src_path.is_file() and src_path.stat().st_size > 0:
+                            try:
+                                source_hashes[src_label] = _file_sha256(src_path)
+                            except OSError:
+                                pass
+
+                    for cd_src in COOLDOWN_ELIGIBLE_SOURCES & wave_ran_sources:
+                        if _record_source_yield(yield_state, cd_src, wave_source_counts.get(cd_src, 0)):
+                            _add_reason(f"cooldown_48h_triggered:{cd_src}")
+                            if cd_src not in cooldown_sources:
+                                cooldown_sources.append(cd_src)
+                    _save_source_yield_state(state_dir, yield_state)
+
+                    pending_qualify_queue = state_dir / "pending_qualify_queue.jsonl"
+                    llm_failed_file = state_dir / "llm_failed_batches.jsonl"
+                    _merge_discovered_jsonl_into_raw(
+                        [
+                            pending_qualify_queue,
+                            buyer_public_out,
+                            catalogs_out,
+                            high_yield_out,
+                            fb_groups_out,
+                            b2b_tg_groups_out,
+                            meta_ads_out,
+                            social_out,
+                            external_out,
+                            yc_ph_out,
+                            channel_graph_out,
+                            ad_spy_out,
+                        ],
+                        raw_jsonl,
+                    )
+                    apply_master_merge(str(raw_jsonl), str(master_jsonl), commit_master=False)
+                    new_jsonl = Path(f"{raw_jsonl}.new")
+                    if not new_jsonl.exists():
+                        new_jsonl.write_text("", encoding="utf-8")
+
+                    has_new_rows = new_jsonl.stat().st_size > 0
+                    wave_new_count = _count_jsonl_lines(new_jsonl)
+                    enrich_ok = False
+                    qual_ok = False
+                    curate_ok = True
+                    wave_dx_routed = 0
+                    wave_ms_ingested = 0
+                    wave_stamp_rows: list[dict[str, Any]] = []
+                    if has_new_rows or not is_real_subprocess_runner:
+                        enriched_jsonl = state_dir / f"raw_{wave_ts}.enriched.jsonl"
+                        enrich_ok = _exec_stage(
+                            "tg_enrich_leads",
+                            [
+                                py_bin,
+                                str(ROOT / "leadgen" / "tg_enrich_leads.py"),
+                                "--input",
+                                str(new_jsonl),
+                                "--output",
+                                str(enriched_jsonl),
+                                "--fetch",
+                                "--skip-copy",
+                            ],
+                        )
+                        if not enrich_ok:
+                            if has_new_rows:
+                                _write_pending_qualify_queue(
+                                    pending_qualify_queue,
+                                    _read_jsonl_dicts(new_jsonl),
+                                )
+                        else:
+                            enrich_src = (
+                                enriched_jsonl
+                                if enriched_jsonl.is_file() and enriched_jsonl.stat().st_size > 0
+                                else new_jsonl
                             )
-                            # Fail-Closed: if tg_llm_qualify failed or produced 0 qualified leads,
-                            # NEVER fall back to enrich_src — 0 leads advance to tg_curate / CRM!
-                            if (
-                                qual_ok
-                                and qualified_jsonl.is_file()
-                                and qualified_jsonl.stat().st_size > 0
-                            ):
-                                curate_ok = _exec_stage(
-                                    "tg_curate",
+                            if has_llm_key:
+                                llm_failed_file.unlink(missing_ok=True)
+                                qualified_jsonl = state_dir / f"raw_{wave_ts}.qualified.jsonl"
+                                curated_jsonl = state_dir / f"raw_{wave_ts}.curated_tmp.jsonl"
+                                final_jsonl = state_dir / f"raw_{wave_ts}.final.jsonl"
+                                qual_ok = _exec_stage(
+                                    "tg_llm_qualify",
                                     [
                                         py_bin,
-                                        str(ROOT / "leadgen" / "tg_curate.py"),
+                                        str(ROOT / "leadgen" / "tg_llm_qualify.py"),
                                         "--input",
-                                        str(qualified_jsonl),
+                                        str(enrich_src),
                                         "--output",
-                                        str(curated_jsonl),
+                                        str(qualified_jsonl),
                                     ],
                                 )
-                                if curate_ok:
-                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
-                                        v_rows_pre = _read_jsonl_dicts(curated_jsonl)
-                                        if v_rows_pre:
-                                            live_sess_pre = (
-                                                isolated_session
-                                                if (
-                                                    is_real_subprocess_runner
-                                                    or tg_client is not None
-                                                    or tg_entity_resolver_fn is not None
-                                                )
-                                                else None
-                                            )
-                                            v_rows_pre, v_st_pre = verify_personal_tg_handles_live(
-                                                v_rows_pre,
-                                                client=tg_client,
-                                                scraper_session=live_sess_pre,
-                                                entity_resolver_fn=tg_entity_resolver_fn,
-                                            )
-                                            for k, val in v_st_pre.items():
-                                                tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
-                                            curated_jsonl.write_text(
-                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_pre)
-                                                + ("\n" if v_rows_pre else ""),
-                                                encoding="utf-8",
-                                            )
-                                    pre_wf_tg_cnt = (
-                                        _count_personal_tg_rows(curated_jsonl)
-                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0
-                                        else 0
+                                # Fail-Closed: if tg_llm_qualify failed or produced 0 qualified leads,
+                                # NEVER fall back to enrich_src — 0 leads advance to tg_curate / CRM!
+                                if (
+                                    qual_ok
+                                    and qualified_jsonl.is_file()
+                                    and qualified_jsonl.stat().st_size > 0
+                                ):
+                                    curate_ok = _exec_stage(
+                                        "tg_curate",
+                                        [
+                                            py_bin,
+                                            str(ROOT / "leadgen" / "tg_curate.py"),
+                                            "--input",
+                                            str(qualified_jsonl),
+                                            "--output",
+                                            str(curated_jsonl),
+                                        ],
                                     )
-                                    # Layer 0 ($0): TG Group Admins for whale leads with TG communities
-                                    if (
-                                        whales_cfg.get("tg_group_admins_enabled", True)
-                                        and curated_jsonl.is_file()
-                                        and curated_jsonl.stat().st_size > 0
-                                        and (
-                                            is_real_subprocess_runner
-                                            or tg_client is not None
-                                            or tg_admin_extractor_fn is not None
+                                    if curate_ok:
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                            v_rows_pre = _read_jsonl_dicts(curated_jsonl)
+                                            if v_rows_pre:
+                                                live_sess_pre = (
+                                                    primary_ro_session
+                                                    if (
+                                                        is_real_subprocess_runner
+                                                        or tg_client is not None
+                                                        or tg_entity_resolver_fn is not None
+                                                    )
+                                                    else None
+                                                )
+                                                v_rows_pre, v_st_pre = verify_personal_tg_handles_live(
+                                                    v_rows_pre,
+                                                    client=tg_client,
+                                                    scraper_session=live_sess_pre,
+                                                    scraper_sessions=ro_sessions if (is_real_subprocess_runner and tg_client is None and tg_entity_resolver_fn is None) else None,
+                                                    entity_resolver_fn=tg_entity_resolver_fn,
+                                                    use_web_first=is_real_subprocess_runner,
+                                                    tme_cache_path=state_dir / "tme_probe_cache.json",
+                                                    pending_verify_queue_path=state_dir / "pending_tg_verify_queue.jsonl",
+                                                )
+                                                for k, val in v_st_pre.items():
+                                                    tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+                                                curated_jsonl.write_text(
+                                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_pre)
+                                                    + ("\n" if v_rows_pre else ""),
+                                                    encoding="utf-8",
+                                                )
+                                        # Pre-Waterfall CRM DB Dedup (0 paid spend on already ingested companies/handles)
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                            dd_rows = _read_jsonl_dicts(curated_jsonl)
+                                            if dd_rows:
+                                                kept_dd, dropped_dd = _filter_existing_crm_leads(conn, dd_rows)
+                                                pre_waterfall_deduped += dropped_dd
+                                                if dropped_dd:
+                                                    curated_jsonl.write_text(
+                                                        "\n".join(json.dumps(r, ensure_ascii=False) for r in kept_dd)
+                                                        + ("\n" if kept_dd else ""),
+                                                        encoding="utf-8",
+                                                    )
+                                        pre_wf_tg_cnt = (
+                                            _count_personal_tg_rows(curated_jsonl)
+                                            if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0
+                                            else 0
                                         )
-                                    ):
-                                        cur_rows = _read_jsonl_dicts(curated_jsonl)
-                                        if cur_rows:
-                                            cur_rows, tg_admin_stats = enrich_whales_with_tg_group_admins(
-                                                cur_rows,
-                                                client=tg_client,
-                                                scraper_session=isolated_session,
-                                                admin_extractor_fn=tg_admin_extractor_fn,
-                                            )
-                                            curated_jsonl.write_text(
-                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in cur_rows)
-                                                + ("\n" if cur_rows else ""),
-                                                encoding="utf-8",
-                                            )
-                                    # Paid Tier 1.5 treg_enrich (only when Budget Guard allows paid calls)
-                                    if (
-                                        treg_ready
-                                        and (budget_state is None or budget_state.paid_allowed)
-                                        and curated_jsonl.is_file()
-                                        and curated_jsonl.stat().st_size > 0
-                                    ):
-                                        treg_tmp_jsonl = state_dir / f"raw_{ts}.treg_tmp.jsonl"
-                                        treg_ok = _exec_stage(
-                                            "treg_enrich",
-                                            [
-                                                py_bin,
-                                                str(ROOT / "leadgen" / "treg_enrich.py"),
-                                                "--input",
-                                                str(curated_jsonl),
-                                                "--output",
-                                                str(treg_tmp_jsonl),
-                                                "--cache",
-                                                str(state_dir / "treg_market.json"),
-                                            ],
-                                        )
+                                        # Paid Tier 1.5 treg_enrich (only when Budget Guard allows paid calls)
                                         if (
-                                            treg_ok
-                                            and treg_tmp_jsonl.is_file()
-                                            and treg_tmp_jsonl.stat().st_size > 0
+                                            treg_ready
+                                            and (budget_state is None or budget_state.paid_allowed)
+                                            and curated_jsonl.is_file()
+                                            and curated_jsonl.stat().st_size > 0
                                         ):
-                                            treg_tmp_jsonl.replace(curated_jsonl)
-                                        elif treg_tmp_jsonl.is_file():
-                                            treg_tmp_jsonl.unlink(missing_ok=True)
-                                    # Tier 1 + Budget-guarded Paid Tier 2 contact_waterfall
-                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
-                                        use_inprocess_wf = is_real_subprocess_runner or any(
-                                            fn is not None
-                                            for fn in (
+                                            treg_tmp_jsonl = state_dir / f"raw_{wave_ts}.treg_tmp.jsonl"
+                                            treg_ok = _exec_stage(
+                                                "treg_enrich",
+                                                [
+                                                    py_bin,
+                                                    str(ROOT / "leadgen" / "treg_enrich.py"),
+                                                    "--input",
+                                                    str(curated_jsonl),
+                                                    "--output",
+                                                    str(treg_tmp_jsonl),
+                                                    "--cache",
+                                                    str(state_dir / "treg_market.json"),
+                                                ],
+                                            )
+                                            if (
+                                                treg_ok
+                                                and treg_tmp_jsonl.is_file()
+                                                and treg_tmp_jsonl.stat().st_size > 0
+                                            ):
+                                                treg_tmp_jsonl.replace(curated_jsonl)
+                                            elif treg_tmp_jsonl.is_file():
+                                                treg_tmp_jsonl.unlink(missing_ok=True)
+                                        # Tier 1 + Budget-guarded Paid Tier 2 contact_waterfall
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                            use_inprocess_wf = is_real_subprocess_runner or any(
+                                                fn is not None
+                                                for fn in (
+                                                    waterfall_enrich_fn,
+                                                    waterfall_http_get_fn,
+                                                    waterfall_treg_fn,
+                                                    waterfall_monid_fn,
+                                                    budget_treg_balance_fn,
+                                                    budget_monid_balance_fn,
+                                                )
+                                            )
+                                            if use_inprocess_wf:
+                                                with stage_lock:
+                                                    stages_run.append("contact_waterfall")
+                                                wf_input_rows = _read_jsonl_dicts(curated_jsonl)
+                                                wf_out_rows, budget_state = run_contact_waterfall_with_budget(
+                                                    conn,
+                                                    wf_input_rows,
+                                                    cfg=eff_cfg,
+                                                    budget_state=budget_state,
+                                                    enrich_fn=waterfall_enrich_fn,
+                                                    http_get_fn=waterfall_http_get_fn,
+                                                    treg_fn=waterfall_treg_fn,
+                                                    monid_fn=waterfall_monid_fn,
+                                                )
+                                                curated_jsonl.write_text(
+                                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in wf_out_rows)
+                                                    + ("\n" if wf_out_rows else ""),
+                                                    encoding="utf-8",
+                                                )
+                                            else:
+                                                wf_tmp_jsonl = state_dir / f"raw_{wave_ts}.waterfall_tmp.jsonl"
+                                                wf_cmd = [
+                                                    py_bin,
+                                                    str(ROOT / "leadgen" / "contact_waterfall.py"),
+                                                    "--input",
+                                                    str(curated_jsonl),
+                                                    "--output",
+                                                    str(wf_tmp_jsonl),
+                                                    "--max-budget-usd",
+                                                    "0"
+                                                    if (budget_state is not None and not budget_state.paid_allowed)
+                                                    else "0.08",
+                                                ]
+                                                if budget_state is not None and not budget_state.paid_allowed:
+                                                    wf_cmd.append("--no-paid-tier2")
+                                                wf_ok = _exec_stage("contact_waterfall", wf_cmd)
+                                                if (
+                                                    wf_ok
+                                                    and wf_tmp_jsonl.is_file()
+                                                    and wf_tmp_jsonl.stat().st_size > 0
+                                                ):
+                                                    wf_tmp_jsonl.replace(curated_jsonl)
+                                                elif wf_tmp_jsonl.is_file():
+                                                    wf_tmp_jsonl.unlink(missing_ok=True)
+                                        if (
+                                            (treg_ready or monid_ready or not is_real_subprocess_runner)
+                                            and (budget_state is None or budget_state.paid_allowed or not is_real_subprocess_runner)
+                                            and sources_cfg.get("tg_identity_bridge", True)
+                                            and "tg_identity_bridge" not in quarantined
+                                            and curated_jsonl.is_file()
+                                            and curated_jsonl.stat().st_size > 0
+                                        ):
+                                            bridge_tmp_jsonl = state_dir / f"raw_{wave_ts}.bridge_tmp.jsonl"
+                                            bridge_ok = _exec_stage(
+                                                "tg_identity_bridge",
+                                                [
+                                                    py_bin,
+                                                    str(ROOT / "leadgen" / "tg_identity_bridge.py"),
+                                                    "--input",
+                                                    str(curated_jsonl),
+                                                    "--output",
+                                                    str(bridge_tmp_jsonl),
+                                                ],
+                                            )
+                                            if (
+                                                bridge_ok
+                                                and bridge_tmp_jsonl.is_file()
+                                                and bridge_tmp_jsonl.stat().st_size > 0
+                                            ):
+                                                bridge_tmp_jsonl.replace(curated_jsonl)
+                                            elif bridge_tmp_jsonl.is_file():
+                                                bridge_tmp_jsonl.unlink(missing_ok=True)
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                            v_rows_post = _read_jsonl_dicts(curated_jsonl)
+                                            if v_rows_post:
+                                                live_sess_post = (
+                                                    primary_ro_session
+                                                    if (
+                                                        is_real_subprocess_runner
+                                                        or tg_client is not None
+                                                        or tg_entity_resolver_fn is not None
+                                                    )
+                                                    else None
+                                                )
+                                                v_rows_post, v_st_post = verify_personal_tg_handles_live(
+                                                    v_rows_post,
+                                                    client=tg_client,
+                                                    scraper_session=live_sess_post,
+                                                    scraper_sessions=ro_sessions if (is_real_subprocess_runner and tg_client is None and tg_entity_resolver_fn is None) else None,
+                                                    entity_resolver_fn=tg_entity_resolver_fn,
+                                                    use_web_first=is_real_subprocess_runner,
+                                                    tme_cache_path=state_dir / "tme_probe_cache.json",
+                                                    pending_verify_queue_path=state_dir / "pending_tg_verify_queue.jsonl",
+                                                )
+                                                for k, val in v_st_post.items():
+                                                    tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+                                                curated_jsonl.write_text(
+                                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_post)
+                                                    + ("\n" if v_rows_post else ""),
+                                                    encoding="utf-8",
+                                                )
+                                        # Layer 0 ($0): TG Group Admins AFTER waterfall/bridge/verify (handles moved to telegram_group!)
+                                        if (
+                                            whales_cfg.get("tg_group_admins_enabled", True)
+                                            and curated_jsonl.is_file()
+                                            and curated_jsonl.stat().st_size > 0
+                                            and (
+                                                is_real_subprocess_runner
+                                                or tg_client is not None
+                                                or tg_admin_extractor_fn is not None
+                                            )
+                                        ):
+                                            cur_rows = _read_jsonl_dicts(curated_jsonl)
+                                            if cur_rows:
+                                                cur_rows, w_admin_stats = enrich_whales_with_tg_group_admins(
+                                                    cur_rows,
+                                                    client=tg_client,
+                                                    scraper_session=primary_ro_session,
+                                                    scraper_sessions=ro_sessions if (is_real_subprocess_runner and tg_client is None and tg_admin_extractor_fn is None) else None,
+                                                    admin_extractor_fn=tg_admin_extractor_fn,
+                                                )
+                                                for k, val in w_admin_stats.items():
+                                                    tg_admin_stats[k] = tg_admin_stats.get(k, 0) + int(val)
+                                                curated_jsonl.write_text(
+                                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in cur_rows)
+                                                    + ("\n" if cur_rows else ""),
+                                                    encoding="utf-8",
+                                                )
+                                        # Layer 2 ($0): Phone -> WA + dedicated TG checker + Manual Social Queue routing
+                                        run_l2_phone_resolver = is_real_subprocess_runner or any(
+                                            x is not None
+                                            for x in (
+                                                wa_gateway,
+                                                tg_checker_client,
+                                                scraper_sessions_dir,
                                                 waterfall_enrich_fn,
-                                                waterfall_http_get_fn,
-                                                waterfall_treg_fn,
-                                                waterfall_monid_fn,
                                                 budget_treg_balance_fn,
                                                 budget_monid_balance_fn,
                                             )
                                         )
-                                        if use_inprocess_wf:
-                                            stages_run.append("contact_waterfall")
-                                            wf_input_rows = _read_jsonl_dicts(curated_jsonl)
-                                            wf_out_rows, budget_state = run_contact_waterfall_with_budget(
-                                                conn,
-                                                wf_input_rows,
-                                                cfg=eff_cfg,
-                                                budget_state=budget_state,
-                                                enrich_fn=waterfall_enrich_fn,
-                                                http_get_fn=waterfall_http_get_fn,
-                                                treg_fn=waterfall_treg_fn,
-                                                monid_fn=waterfall_monid_fn,
-                                            )
-                                            curated_jsonl.write_text(
-                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in wf_out_rows)
-                                                + ("\n" if wf_out_rows else ""),
-                                                encoding="utf-8",
-                                            )
-                                        else:
-                                            wf_tmp_jsonl = state_dir / f"raw_{ts}.waterfall_tmp.jsonl"
-                                            wf_cmd = [
-                                                py_bin,
-                                                str(ROOT / "leadgen" / "contact_waterfall.py"),
-                                                "--input",
-                                                str(curated_jsonl),
-                                                "--output",
-                                                str(wf_tmp_jsonl),
-                                                "--max-budget-usd",
-                                                "0"
-                                                if (budget_state is not None and not budget_state.paid_allowed)
-                                                else "0.08",
-                                            ]
-                                            if budget_state is not None and not budget_state.paid_allowed:
-                                                wf_cmd.append("--no-paid-tier2")
-                                            wf_ok = _exec_stage("contact_waterfall", wf_cmd)
-                                            if (
-                                                wf_ok
-                                                and wf_tmp_jsonl.is_file()
-                                                and wf_tmp_jsonl.stat().st_size > 0
-                                            ):
-                                                wf_tmp_jsonl.replace(curated_jsonl)
-                                            elif wf_tmp_jsonl.is_file():
-                                                wf_tmp_jsonl.unlink(missing_ok=True)
-                                    if (
-                                        (treg_ready or monid_ready or not is_real_subprocess_runner)
-                                        and (budget_state is None or budget_state.paid_allowed or not is_real_subprocess_runner)
-                                        and sources_cfg.get("tg_identity_bridge", True)
-                                        and "tg_identity_bridge" not in quarantined
-                                        and curated_jsonl.is_file()
-                                        and curated_jsonl.stat().st_size > 0
-                                    ):
-                                        bridge_tmp_jsonl = state_dir / f"raw_{ts}.bridge_tmp.jsonl"
-                                        bridge_ok = _exec_stage(
-                                            "tg_identity_bridge",
-                                            [
-                                                py_bin,
-                                                str(ROOT / "leadgen" / "tg_identity_bridge.py"),
-                                                "--input",
-                                                str(curated_jsonl),
-                                                "--output",
-                                                str(bridge_tmp_jsonl),
-                                            ],
-                                        )
+                                        manual_social_jsonl = state_dir / f"manual_social_{wave_ts}.jsonl"
                                         if (
-                                            bridge_ok
-                                            and bridge_tmp_jsonl.is_file()
-                                            and bridge_tmp_jsonl.stat().st_size > 0
+                                            run_l2_phone_resolver
+                                            and curated_jsonl.is_file()
+                                            and curated_jsonl.stat().st_size > 0
                                         ):
-                                            bridge_tmp_jsonl.replace(curated_jsonl)
-                                        elif bridge_tmp_jsonl.is_file():
-                                            bridge_tmp_jsonl.unlink(missing_ok=True)
-                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
-                                        v_rows_post = _read_jsonl_dicts(curated_jsonl)
-                                        if v_rows_post:
-                                            live_sess_post = (
-                                                isolated_session
-                                                if (
-                                                    is_real_subprocess_runner
-                                                    or tg_client is not None
-                                                    or tg_entity_resolver_fn is not None
+                                            l2_rows = _read_jsonl_dicts(curated_jsonl)
+                                            if l2_rows:
+                                                routed_l2, w_phone_stats = resolve_and_route_phone_leads(
+                                                    conn,
+                                                    l2_rows,
+                                                    cfg=eff_cfg,
+                                                    wa_gateway=wa_gateway,
+                                                    tg_checker_client=tg_checker_client,
+                                                    scraper_sessions_dir=scraper_sessions_dir,
                                                 )
-                                                else None
+                                                for k, val in w_phone_stats.items():
+                                                    phone_res_stats[k] = phone_res_stats.get(k, 0) + int(val)
+                                                curated_jsonl.write_text(
+                                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in routed_l2)
+                                                    + ("\n" if routed_l2 else ""),
+                                                    encoding="utf-8",
+                                                )
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                            post_tg_cnt = _count_personal_tg_rows(curated_jsonl)
+                                            curated_snapshot = _read_jsonl_dicts(curated_jsonl)
+                                            bridged_tag_cnt = sum(
+                                                1
+                                                for r in curated_snapshot
+                                                if str(r.get("tg_bridge_match") or "").strip()
                                             )
-                                            v_rows_post, v_st_post = verify_personal_tg_handles_live(
-                                                v_rows_post,
-                                                client=tg_client,
-                                                scraper_session=live_sess_post,
-                                                entity_resolver_fn=tg_entity_resolver_fn,
+                                            tg_bridged_count += max(
+                                                0, post_tg_cnt - pre_wf_tg_cnt, bridged_tag_cnt
                                             )
-                                            for k, val in v_st_post.items():
-                                                tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
-                                            curated_jsonl.write_text(
-                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in v_rows_post)
-                                                + ("\n" if v_rows_post else ""),
-                                                encoding="utf-8",
+                                            split_res = split_tg_and_direct_x_leads(
+                                                curated_jsonl,
+                                                state_dir / "direct_x_leads.jsonl",
+                                                manual_social_jsonl=(
+                                                    manual_social_jsonl if run_l2_phone_resolver else None
+                                                ),
                                             )
-                                    # Layer 2 ($0): Phone -> WA + dedicated TG checker + Manual Social Queue routing
-                                    run_l2_phone_resolver = is_real_subprocess_runner or any(
-                                        x is not None
-                                        for x in (
-                                            wa_gateway,
-                                            tg_checker_client,
-                                            scraper_sessions_dir,
-                                            waterfall_enrich_fn,
-                                            budget_treg_balance_fn,
-                                            budget_monid_balance_fn,
-                                        )
-                                    )
-                                    manual_social_jsonl = state_dir / f"manual_social_{ts}.jsonl"
-                                    if (
-                                        run_l2_phone_resolver
-                                        and curated_jsonl.is_file()
-                                        and curated_jsonl.stat().st_size > 0
-                                    ):
-                                        l2_rows = _read_jsonl_dicts(curated_jsonl)
-                                        if l2_rows:
-                                            routed_l2, phone_res_stats = resolve_and_route_phone_leads(
-                                                conn,
-                                                l2_rows,
-                                                cfg=eff_cfg,
-                                                wa_gateway=wa_gateway,
-                                                tg_checker_client=tg_checker_client,
-                                                scraper_sessions_dir=scraper_sessions_dir,
-                                            )
-                                            curated_jsonl.write_text(
-                                                "\n".join(json.dumps(r, ensure_ascii=False) for r in routed_l2)
-                                                + ("\n" if routed_l2 else ""),
-                                                encoding="utf-8",
-                                            )
-                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
-                                        post_tg_cnt = _count_personal_tg_rows(curated_jsonl)
-                                        curated_snapshot = _read_jsonl_dicts(curated_jsonl)
-                                        bridged_tag_cnt = sum(
-                                            1
-                                            for r in curated_snapshot
-                                            if str(r.get("tg_bridge_match") or "").strip()
-                                        )
-                                        tg_bridged_count += max(
-                                            0, post_tg_cnt - pre_wf_tg_cnt, bridged_tag_cnt
-                                        )
-                                        split_res = split_tg_and_direct_x_leads(
-                                            curated_jsonl,
-                                            state_dir / "direct_x_leads.jsonl",
-                                            manual_social_jsonl=(
-                                                manual_social_jsonl if run_l2_phone_resolver else None
-                                            ),
-                                        )
-                                        direct_x_routed += int(split_res.get("direct_x_added") or 0)
-                                        if manual_social_jsonl.is_file() and manual_social_jsonl.stat().st_size > 0:
-                                            ms_rows = _read_jsonl_dicts(manual_social_jsonl)
-                                            ms_ingest = ingest_v2_routed_leads(
-                                                conn,
-                                                ms_rows,
-                                                cfg=eff_cfg,
-                                                auto_push=bool(eff_cfg.get("auto_push_to_crm", True)),
-                                            )
-                                            social_manual_ingested += int(ms_ingest.get("social_manual_ingested") or 0)
-                                            manual_social_jsonl.unlink(missing_ok=True)
-                                        curated_v2_stamp_rows.extend(_read_jsonl_dicts(curated_jsonl))
-                                    if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
-                                        curated_jsonl.replace(final_jsonl)
+                                            wave_dx_routed = int(split_res.get("direct_x_added") or 0)
+                                            direct_x_routed += wave_dx_routed
+                                            if manual_social_jsonl.is_file() and manual_social_jsonl.stat().st_size > 0:
+                                                ms_rows = _read_jsonl_dicts(manual_social_jsonl)
+                                                ms_ingest = ingest_v2_routed_leads(
+                                                    conn,
+                                                    ms_rows,
+                                                    cfg=eff_cfg,
+                                                    auto_push=bool(eff_cfg.get("auto_push_to_crm", True)),
+                                                )
+                                                wave_ms_ingested = int(ms_ingest.get("social_manual_ingested") or 0)
+                                                social_manual_ingested += wave_ms_ingested
+                                                manual_social_jsonl.unlink(missing_ok=True)
+                                            wave_stamp_rows = _read_jsonl_dicts(curated_jsonl)
+                                            curated_v2_stamp_rows.extend(wave_stamp_rows)
+                                        if curated_jsonl.is_file() and curated_jsonl.stat().st_size > 0:
+                                            curated_jsonl.replace(final_jsonl)
+                                        else:
+                                            curated_jsonl.unlink(missing_ok=True)
+                                            if final_jsonl.is_file():
+                                                final_jsonl.unlink(missing_ok=True)
                                     else:
                                         curated_jsonl.unlink(missing_ok=True)
                                         if final_jsonl.is_file():
                                             final_jsonl.unlink(missing_ok=True)
-                                else:
-                                    curated_jsonl.unlink(missing_ok=True)
-                                    if final_jsonl.is_file():
-                                        final_jsonl.unlink(missing_ok=True)
-                            elif final_jsonl.is_file():
-                                final_jsonl.unlink(missing_ok=True)
+                                elif final_jsonl.is_file():
+                                    final_jsonl.unlink(missing_ok=True)
 
-                        pipeline_ok = has_llm_key and enrich_ok and qual_ok and curate_ok
-                        if pipeline_ok:
-                            failed_rows = _read_jsonl_dicts(llm_failed_file) if has_llm_key else []
-                            llm_failed_file.unlink(missing_ok=True)
-                            if failed_rows and raw_jsonl.is_file():
-                                failed_key_set: set[str] = set()
-                                for fr in failed_rows:
-                                    failed_key_set.update(_lead_retry_keys(fr))
-                                raw_commit_tmp = state_dir / f"raw_{ts}.commit_tmp.jsonl"
-                                kept_raw = [
-                                    r
-                                    for r in _read_jsonl_dicts(raw_jsonl)
-                                    if not (_lead_retry_keys(r) & failed_key_set)
-                                ]
-                                raw_commit_tmp.write_text(
-                                    "\n".join(json.dumps(r, ensure_ascii=False) for r in kept_raw)
-                                    + ("\n" if kept_raw else ""),
-                                    encoding="utf-8",
+                            pipeline_ok = has_llm_key and enrich_ok and qual_ok and curate_ok
+                            if pipeline_ok:
+                                failed_rows = _read_jsonl_dicts(llm_failed_file) if has_llm_key else []
+                                llm_failed_file.unlink(missing_ok=True)
+                                if failed_rows and raw_jsonl.is_file():
+                                    failed_key_set: set[str] = set()
+                                    for fr in failed_rows:
+                                        failed_key_set.update(_lead_retry_keys(fr))
+                                    raw_commit_tmp = state_dir / f"raw_{wave_ts}.commit_tmp.jsonl"
+                                    kept_raw = [
+                                        r
+                                        for r in _read_jsonl_dicts(raw_jsonl)
+                                        if not (_lead_retry_keys(r) & failed_key_set)
+                                    ]
+                                    raw_commit_tmp.write_text(
+                                        "\n".join(json.dumps(r, ensure_ascii=False) for r in kept_raw)
+                                        + ("\n" if kept_raw else ""),
+                                        encoding="utf-8",
+                                    )
+                                    try:
+                                        apply_master_merge(
+                                            str(raw_commit_tmp), str(master_jsonl), commit_master=True
+                                        )
+                                    finally:
+                                        raw_commit_tmp.unlink(missing_ok=True)
+                                        Path(f"{raw_commit_tmp}.new").unlink(missing_ok=True)
+                                    _write_pending_qualify_queue(pending_qualify_queue, failed_rows)
+                                else:
+                                    if raw_jsonl.is_file():
+                                        apply_master_merge(
+                                            str(raw_jsonl), str(master_jsonl), commit_master=True
+                                        )
+                                    pending_qualify_queue.unlink(missing_ok=True)
+                            elif has_new_rows:
+                                _write_pending_qualify_queue(
+                                    pending_qualify_queue,
+                                    _read_jsonl_dicts(new_jsonl),
                                 )
-                                try:
-                                    apply_master_merge(
-                                        str(raw_commit_tmp), str(master_jsonl), commit_master=True
-                                    )
-                                finally:
-                                    raw_commit_tmp.unlink(missing_ok=True)
-                                    Path(f"{raw_commit_tmp}.new").unlink(missing_ok=True)
-                                _write_pending_qualify_queue(pending_qualify_queue, failed_rows)
-                            else:
-                                if raw_jsonl.is_file():
-                                    apply_master_merge(
-                                        str(raw_jsonl), str(master_jsonl), commit_master=True
-                                    )
-                                pending_qualify_queue.unlink(missing_ok=True)
-                        elif has_new_rows:
-                            _write_pending_qualify_queue(
-                                pending_qualify_queue,
-                                _read_jsonl_dicts(new_jsonl),
-                            )
-                else:
-                    pending_qualify_queue.unlink(missing_ok=True)
+                    else:
+                        pending_qualify_queue.unlink(missing_ok=True)
+
+                    wave_push = push_discovered_now(conn)
+                    wave_ingested_now = int(wave_push.get("ingested") or 0)
+                    ingested_total += wave_ingested_now
+                    if wave_stamp_rows:
+                        _stamp_new_lead_v2_fields(conn, wave_stamp_rows)
+                    b2b_camp = _find_campaign_by_name(conn, b2b_name) or _resolve_active_b2b_camp_fallback(conn)
+                    pending_b2b = _count_pending(conn, b2b_camp["id"] if b2b_camp else None)
+                    still_needs_b2b = b2b_active and pending_b2b < int(low_water_mark)
+                    if not still_needs_b2b:
+                        break
+                    if (
+                        wave_new_count == 0
+                        and wave_ingested_now == 0
+                        and wave_dx_routed == 0
+                        and wave_ms_ingested == 0
+                    ):
+                        break
+                    if (time.monotonic() - run_started_mono) >= float(max_wall_clock_sec):
+                        _add_reason("batch_loop_wall_clock_cap")
+                        break
 
             # Wave 2 Vacancy pipeline (TG job_monitor + hh.ru + Profi/Kwork/Upwork + LinkedIn Jobs)
             if still_needs_vac:
@@ -4703,7 +5565,30 @@ def _run_autonomous_replenish_locked(
         "wave2_vacancies": wave2_stats,
         "wave3_ru_experts": wave3_stats,
         "whales_ready": whales_ready,
+        "waves_executed": waves_executed,
+        "pre_waterfall_deduped": pre_waterfall_deduped,
+        "cooldown_sources": cooldown_sources,
+        "ro_sessions_count": len(ro_sessions),
     }
+    daily_digest_res: dict[str, Any] | None = None
+    should_emit_digest = (
+        is_real_subprocess_runner
+        or digest_opener is not None
+        or int(tg_verify_stats.get("sessions_exhausted") or 0) > 0
+        or (
+            budget_summary is not None
+            and budget_summary.get("treg_balance_usd") is not None
+            and float(budget_summary["treg_balance_usd"]) < 2.0
+        )
+    )
+    if should_emit_digest:
+        daily_digest_res = emit_leadgen_daily_digest(
+            conn,
+            summary=result_payload,
+            digest_opener=digest_opener,
+        )
+    result_payload["daily_digest"] = daily_digest_res
+
     if (
         stages_run
         or ingested_total > 0
@@ -4744,6 +5629,11 @@ def _run_autonomous_replenish_locked(
                         "phone_resolution": phone_res_stats,
                         "wave2_vacancies": wave2_stats,
                         "wave3_ru_experts": wave3_stats,
+                        "waves_executed": waves_executed,
+                        "pre_waterfall_deduped": pre_waterfall_deduped,
+                        "cooldown_sources": cooldown_sources,
+                        "ro_sessions_count": len(ro_sessions),
+                        "daily_digest": daily_digest_res,
                     },
                     ensure_ascii=False,
                     indent=2,

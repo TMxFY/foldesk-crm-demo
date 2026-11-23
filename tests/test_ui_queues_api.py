@@ -517,8 +517,8 @@ def test_enrichment_budget_endpoint_spend_cache_and_cli_fallback(
             assert d1["day"] == today
             assert d1["spent_usd"] == 1.6
             assert d1["total_usd"] == 1.6
-            assert d1["daily_cap_usd"] == 5.0
-            assert d1["remaining_usd"] == 3.4
+            assert d1["daily_cap_usd"] == 10.0
+            assert d1["remaining_usd"] == 8.4
             assert d1["treg_balance_usd"] is None
             assert d1["monid_balance_usd"] is None
             assert d1["paid_allowed"] is True
@@ -557,21 +557,21 @@ def test_enrichment_budget_endpoint_spend_cache_and_cli_fallback(
             assert d3["paid_allowed"] is False
             assert "monid=" in d3["stop_reason"]
 
-            # 4. Daily cap reached ($5.00) -> paid_allowed=False even with healthy balances
+            # 4. Daily cap reached ($10.00) -> paid_allowed=False even with healthy balances
             record_enrichment_ledger_entry(
                 conn,
                 day=today,
                 provider="treg",
                 endpoint="people.phone.find",
                 lead_key="whale2.io",
-                cost_usd=3.40,
+                cost_usd=8.40,
                 hit=1,
             )
             monkeypatch.setattr(bg, "fetch_live_balances", lambda: (25.0, 25.0))
             r4 = client.get("/api/leadgen/enrichment-budget?refresh=1")
             assert r4.status_code == 200
             d4 = r4.json()
-            assert d4["spent_usd"] == 5.0
+            assert d4["spent_usd"] == 10.0
             assert d4["remaining_usd"] == 0.0
             assert d4["paid_allowed"] is False
             assert "daily_cap=" in d4["stop_reason"]

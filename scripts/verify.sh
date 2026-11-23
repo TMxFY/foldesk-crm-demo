@@ -1509,6 +1509,80 @@ if sec_py_file.is_file() and main_py_file.is_file():
             if "_mask_account_payload_for_caller" not in call_names:
                 errors.append(f"Gate X violation in app/main.py:{acc_fn_name} must wrap payload in _mask_account_payload_for_caller")
 
+# Gate Y: Wave A Telegram Leadgen Scale-Up Invariants
+tg_web_client_file = root / "leadgen" / "tg_web_client.py"
+if (root / "leadgen" / "tg_ad_spy.py").is_file() and (root / "leadgen" / "tg_channel_graph.py").is_file():
+    if not tg_web_client_file.is_file():
+        errors.append("Gate Y violation: missing leadgen/tg_web_client.py")
+
+tg_ad_spy_file = root / "leadgen" / "tg_ad_spy.py"
+if tg_ad_spy_file.is_file():
+    tg_ad_src = tg_ad_spy_file.read_text(encoding="utf-8")
+    if "def scan_ad_channels(" in tg_ad_src and "tg_web_client" not in tg_ad_src:
+        errors.append("Gate Y violation in leadgen/tg_ad_spy.py: must import/use tg_web_client")
+
+tg_graph_file = root / "leadgen" / "tg_channel_graph.py"
+if tg_graph_file.is_file():
+    tg_graph_src = tg_graph_file.read_text(encoding="utf-8")
+    if "def crawl_channel_graph(" in tg_graph_src and "tg_web_client" not in tg_graph_src:
+        errors.append("Gate Y violation in leadgen/tg_channel_graph.py: must import/use tg_web_client")
+
+llm_qual_file = root / "leadgen" / "tg_llm_qualify.py"
+if llm_qual_file.is_file():
+    llm_qual_tree = ast.parse(llm_qual_file.read_text(encoding="utf-8"), filename=str(llm_qual_file))
+    icp_score_val = None
+    for node in ast.walk(llm_qual_tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "MIN_ICP_SCORE" and isinstance(node.value, ast.Constant):
+                    icp_score_val = node.value.value
+    if icp_score_val is not None and icp_score_val != 70:
+        errors.append(f"Gate Y violation in leadgen/tg_llm_qualify.py: MIN_ICP_SCORE must be 70, got {icp_score_val!r}")
+
+repl_file_y = root / "leadgen" / "vps_autonomous_replenish.py"
+if repl_file_y.is_file():
+    repl_src_y = repl_file_y.read_text(encoding="utf-8")
+    if "def _run_autonomous_replenish_locked(" in repl_src_y:
+        if "def find_ro_scraper_sessions(" not in repl_src_y:
+            errors.append("Gate Y violation in leadgen/vps_autonomous_replenish.py: missing find_ro_scraper_sessions")
+        if "def emit_leadgen_daily_digest(" not in repl_src_y:
+            errors.append("Gate Y violation in leadgen/vps_autonomous_replenish.py: missing emit_leadgen_daily_digest")
+        if re.search(r"min\s*\(\s*12\s*,[^\n]*yc_limit", repl_src_y):
+            errors.append("Gate Y violation in leadgen/vps_autonomous_replenish.py: hardcoded min(12, yc_limit) cap remains")
+        if re.search(r"min\s*\(\s*10\s*,[^\n]*external_limit", repl_src_y):
+            errors.append("Gate Y violation in leadgen/vps_autonomous_replenish.py: hardcoded min(10, external_limit) cap remains")
+        repl_tree_y = ast.parse(repl_src_y, filename=str(repl_file_y))
+        locked_fn_y = next(
+            (n for n in ast.walk(repl_tree_y) if isinstance(n, ast.FunctionDef) and n.name == "_run_autonomous_replenish_locked"),
+            None,
+        )
+        if locked_fn_y is not None:
+            wf_lines_y: list[int] = []
+            admin_lines_y: list[int] = []
+            for node in ast.walk(locked_fn_y):
+                if isinstance(node, ast.Call):
+                    callee_name = node.func.id if isinstance(node.func, ast.Name) else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
+                    if callee_name == "run_contact_waterfall_with_budget":
+                        wf_lines_y.append(int(node.lineno))
+                    elif callee_name == "enrich_whales_with_tg_group_admins":
+                        admin_lines_y.append(int(node.lineno))
+            if not wf_lines_y or not admin_lines_y or min(admin_lines_y) <= min(wf_lines_y):
+                errors.append(
+                    f"Gate Y violation in leadgen/vps_autonomous_replenish.py:_run_autonomous_replenish_locked must call enrich_whales_with_tg_group_admins after run_contact_waterfall_with_budget (wf={wf_lines_y}, admins={admin_lines_y})"
+                )
+
+gw_file_y = root / "app" / "telegram_gateway.py"
+if gw_file_y.is_file():
+    gw_src_y = gw_file_y.read_text(encoding="utf-8")
+    if "class TelegramGateway" in gw_src_y and ("def send_message_by_phone(" not in gw_src_y or "DeleteContactsRequest" not in gw_src_y):
+        errors.append("Gate Y violation in app/telegram_gateway.py: must implement send_message_by_phone with DeleteContactsRequest cleanup")
+
+timer_file_y = root / "deploy" / "systemd" / "crmtg-leadgen.timer"
+if timer_file_y.is_file():
+    timer_src_y = timer_file_y.read_text(encoding="utf-8")
+    if "00,03,06,09,12,15,18,21:15:00 UTC" not in timer_src_y:
+        errors.append("Gate Y violation in deploy/systemd/crmtg-leadgen.timer: must use 3h schedule 00,03,06,09,12,15,18,21:15:00 UTC")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
