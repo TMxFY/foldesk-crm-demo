@@ -142,6 +142,83 @@ def load_env():
 
 # ---------------- YC ----------------
 
+_YC_NON_CONSUMER_TAGS_OR_INDUSTRIES = frozenset(
+    {
+        "biotech",
+        "therapeutics",
+        "synthetic biology",
+        "genomics",
+        "drug discovery",
+        "medical devices",
+        "aerospace",
+        "aviation and space",
+        "defense",
+        "defence",
+        "drones",
+        "robotics",
+        "manufacturing and robotics",
+        "semiconductors",
+        "hard tech",
+        "climate",
+        "energy",
+        "devops",
+        "developer tools",
+        "infrastructure",
+        "open source",
+        "cloud computing",
+        "cybersecurity",
+        "data engineering",
+    }
+)
+
+_YC_NON_CONSUMER_TEXT_RE = re.compile(
+    r"(?:"
+    r"\bbiotech\w*\b|\btherapeutics?\b|\bsynthetic\s+biology\b|\bgenomics?\b|\bgene\s+therapy\b|\bcell\s+therapy\b|"
+    r"\bdrug\s+discovery\b|\bclinical\s+trials?\b|\bbiopharma\w*\b|\bpharmaceutical\w*\b|\boncology\b|\bcrispr\b|"
+    r"\bprotein\s+engineering\b|\bwet\s+lab\b|\bmedical\s+devices?\b|\bsurgical\s+robots?\b|"
+    r"\baerospace\b|\bdefense\s+tech\b|\bdefence\b|\bmilitary\b|\b(?:autonomous|defense|military|combat)\s+drones?\b|"
+    r"\bsatellites?\b|\borbital\b|\bspacecraft\b|\bpropulsion\b|\bavionics\b|\bmunitions\b|\buav\b|"
+    r"\brobotics?\b|\bhumanoid\s+robots?\b|\bcobots?\b|\bindustrial\s+(?:manufacturing|automation|robotics?)\b|"
+    r"\bfactory\s+automation\b|\bcnc\s+machining\b|\badditive\s+manufacturing\b|\bautonomous\s+vehicles?\b|"
+    r"\bsemiconductors?\b|\bchip\s+design\b|\b(?:asic|fpga)\s+(?:design|chips?|verification)\b|\bwafer\b|\blithography\b|\bphotonics\b|"
+    r"\bclimate\s+hardware\b|\bcarbon\s+capture\b|\bdirect\s+air\s+capture\b|\bbattery\s+chemistry\b|"
+    r"\bnuclear\s+(?:reactor|fusion|fission|power)\b|\belectrolyzer\b|\bdesalination\b|"
+    r"\bkubernetes\b|\bk8s\b|\bdevops\b|\bobservability\b|\bopentelemetry\b|\bci/cd\b|\bcicd\b|\bterraform\b|"
+    r"\bservice\s+mesh\b|\bebpf\b|\bcontainer\s+runtime\b|\bcloud\s+infrastructure\b|"
+    r"\bdeveloper[\s-]+infra(?:structure)?\b|\bdev[\s-]+infra\b|\bdeveloper\s+tools?\b|\bdevtools\b|"
+    r"\bapi\s+gateway\b|\blog\s+management\b|\bincident\s+response\b|\bdatabase\s+engine\b|\bquery\s+engine\b|"
+    r"\bmlops\b|\bllmops\b|\bgpu\s+cluster\b|\binference\s+engine\b|\bcode\s+review\s+(?:bot|tool|agent)\b|"
+    r"\b(?:developer|infra|observability|telemetry|logging|tracing|monitoring|python|typescript|rust|go)\s+sdks?\b"
+    r")",
+    re.I,
+)
+
+
+def is_non_consumer_yc_company(company) -> bool:
+    """Return True for non-consumer/hard-tech/dev-infra YC companies before emitting YC rows."""
+    if isinstance(company, str):
+        return _YC_NON_CONSUMER_TEXT_RE.search(company) is not None
+    if not isinstance(company, dict):
+        return False
+    tag_tokens: list[str] = []
+    for key in ("industries", "industry", "subindustry", "tags"):
+        val = company.get(key)
+        if isinstance(val, (list, tuple, set)):
+            tag_tokens.extend(str(x).strip().lower() for x in val if str(x).strip())
+        elif isinstance(val, str) and val.strip():
+            tag_tokens.extend(part.strip().lower() for part in re.split(r"[,/|]+", val) if part.strip())
+    if any(tok in _YC_NON_CONSUMER_TAGS_OR_INDUSTRIES for tok in tag_tokens):
+        return True
+    blob = " ".join(
+        str(company.get(k) or "").strip()
+        for k in ("name", "one_liner", "long_description", "description", "what_they_do", "bio", "category")
+        if company.get(k)
+    )
+    if not blob:
+        return False
+    return _YC_NON_CONSUMER_TEXT_RE.search(blob) is not None
+
+
 def yc_algolia_key():
     """Fetch public Algolia app/key embedded in the YC directory page.
 
@@ -197,6 +274,9 @@ def yc_company_details(slug):
         "one_liner": co.get("one_liner") or "",
         "website": co.get("website") or "",
         "batch": co.get("batch") or "",
+        "industries": co.get("industries") or [],
+        "tags": co.get("tags") or [],
+        "long_description": co.get("long_description") or "",
     }
     site_tg = extract_tg_from_html(html)
     if site_tg:
@@ -213,7 +293,7 @@ def _social_user(url, host_pat):
 def scrape_yc(limit, seen_keys=None, *, cursor: int = 0):
     app, key = yc_algolia_key()
     leads = []
-    fetch_limit = max(limit * 3, 100) if seen_keys is not None else max(1, limit // 2)
+    fetch_limit = max(limit * 4, 100) if seen_keys is not None else max(limit * 3, 60)
     batches = list(YC_BATCHES)
     if batches and cursor > 0:
         shift = cursor % len(batches)
@@ -236,6 +316,8 @@ def scrape_yc(limit, seen_keys=None, *, cursor: int = 0):
             slug = h.get("slug")
             if not slug:
                 continue
+            if is_non_consumer_yc_company(h):
+                continue
             if seen_keys:
                 h_name = (h.get("name") or "").strip().lower()
                 h_site = norm_site(h.get("website"))
@@ -247,6 +329,12 @@ def scrape_yc(limit, seen_keys=None, *, cursor: int = 0):
             except Exception as e:
                 log(f"  YC {slug}: {e}")
             time.sleep(1.2)
+            merged_company = dict(h)
+            for k, v in det.items():
+                if v:
+                    merged_company[k] = v
+            if is_non_consumer_yc_company(merged_company):
+                continue
             founders = det.get("founders") or []
             f0 = founders[0] if founders else {}
             lead_item = {
@@ -1626,6 +1714,8 @@ def main():
 
     fresh = []
     for l in leads:
+        if (l.get("source") or "") == "yc" and is_non_consumer_yc_company(l):
+            continue
         key = norm_site(l.get("site")) or (l.get("name") or "").strip().lower()
         name_l = (l.get("name") or "").strip().lower()
         if not key:

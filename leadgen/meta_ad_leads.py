@@ -104,7 +104,7 @@ TARGET_COUNTRIES = (
     "CA",
     "AU",
 )
-CAP = int(os.getenv("META_ADS_CAP", "35"))
+CAP = int(os.getenv("META_ADS_CAP", "80"))
 SEEN_DAYS = 90
 _NON_PERSONAL_TG_SUFFIXES = (
     "_official",
@@ -225,7 +225,7 @@ def queries_for_day(day: date, count: int = 3, cursor: int = 0) -> list[str]:
     return [SEARCH_QUERIES[(start + i) % total] for i in range(min(count, total))]
 
 
-def countries_for_day(day: date, count: int = 3, cursor: int = 0) -> list[str]:
+def countries_for_day(day: date, count: int = 6, cursor: int = 0) -> list[str]:
     """Return a deterministic daily slice of TARGET_COUNTRIES for multi-GEO rotation."""
     total = len(TARGET_COUNTRIES)
     if not total or count <= 0:
@@ -1302,7 +1302,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     cap=max(0, args.limit),
                     countries=countries,
                     cursor=cursor,
-                    query_count=6,
+                    query_count=12,
                     max_runtime_sec=effective_runtime,
                     on_row=_emit_row,
                     rotate_countries=True,

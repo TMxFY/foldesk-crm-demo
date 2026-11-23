@@ -11,6 +11,14 @@ import os
 import re
 import sys
 
+try:
+    from tg_llm_qualify import MIN_ICP_SCORE
+except ImportError:
+    try:
+        from leadgen.tg_llm_qualify import MIN_ICP_SCORE
+    except ImportError:
+        MIN_ICP_SCORE = 70
+
 # key: username.lower() or "id:<id>"
 # value: (category, project, project_url, what_they_do_ru)
 OVERRIDES = {
@@ -279,7 +287,7 @@ def curate_rows(rows: list[dict]) -> list[dict]:
             score = 85 if raw_score is None else int(round(float(raw_score)))
         except (TypeError, ValueError):
             score = 0
-        if score < 80:
+        if score < MIN_ICP_SCORE:
             continue
         if r.get("has_agency_signal") and not r.get("has_monetization_signal"):
             continue

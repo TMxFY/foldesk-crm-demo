@@ -336,7 +336,7 @@ def test_tg_enrich_leads_parallel_threadpool_5s_timeout_and_monetization_xray(mo
     assert indirect_row["has_monetization_signal"] is True
 
 
-def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeypatch, tmp_path):
+def test_tg_llm_qualify_and_curate_icp_score_70_gate_and_quarantine_file(monkeypatch, tmp_path):
     monkeypatch.setenv("TYPESAFE_ENABLED", "0")
     monkeypatch.setenv("LEADGEN_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("RELAYFAST_API_KEY", "test-fake-key")
@@ -384,6 +384,15 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
             "has_monetization_signal": False,
         },
         {
+            "name": "Borderline Buyer",
+            "username": "borderline_70",
+            "bio": "Founder @ HabitLoop — habit tracker app ($9/mo) https://habitloop.app",
+            "project": "HabitLoop",
+            "project_url": "https://habitloop.app",
+            "has_monetization_signal": True,
+            "has_agency_signal": False,
+        },
+        {
             "name": "Sniper Winner",
             "username": "sniper_winner",
             "bio": "Founder @ AstroCoach — AI astrology subscription app ($14.99/mo) https://astrocoach.app",
@@ -394,13 +403,13 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
         },
     ]
 
-    # Note: candidate[0] (FINPR) is caught in gate_before_model, so batch has 4 items
+    # Note: candidate[0] (FINPR) is caught in gate_before_model, so batch has 5 items
     def _mock_llm(batch):
-        assert len(batch) == 4
+        assert len(batch) == 5
         return [
             {
                 "is_lead": True,
-                "icp_score": 74,
+                "icp_score": 65,
                 "monetization": "subscription",
                 "short_form_fit": True,
                 "category": "SaaS / AI app",
@@ -433,6 +442,17 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
             },
             {
                 "is_lead": True,
+                "icp_score": 70,
+                "monetization": "subscription",
+                "short_form_fit": True,
+                "category": "SaaS / AI app",
+                "role": "Founder",
+                "project": "HabitLoop",
+                "project_url": "https://habitloop.app",
+                "what_they_do": "Consumer habit tracker subscription app ($9/mo)",
+            },
+            {
+                "is_lead": True,
                 "icp_score": 92,
                 "monetization": "subscription",
                 "short_form_fit": True,
@@ -447,9 +467,10 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
     monkeypatch.setattr(tg_llm_qualify, "call_llm_retry", _mock_llm)
     kept, dropped = tg_llm_qualify.qualify_loaded(candidates, batch_size=10)
     assert dropped == 4
-    assert [r["username"] for r in kept] == ["sniper_winner"]
-    assert kept[0]["icp_score"] == 92
-    assert kept[0]["monetization"] == "subscription"
+    assert [r["username"] for r in kept] == ["borderline_70", "sniper_winner"]
+    assert kept[0]["icp_score"] == 70
+    assert kept[1]["icp_score"] == 92
+    assert kept[1]["monetization"] == "subscription"
 
     q_file = tmp_path / "quarantined_unqualified.jsonl"
     assert q_file.is_file()
@@ -457,11 +478,11 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
     assert len(q_rows) == 4
     q_by_user = {r["username"]: r["quarantine_reason"] for r in q_rows}
     assert "pre_gate" in q_by_user["finpr_ceo"]
-    assert "74" in q_by_user["mid_saas"] or "icp_score" in q_by_user["mid_saas"]
+    assert "65" in q_by_user["mid_saas"] or "icp_score" in q_by_user["mid_saas"]
     assert "monetization" in q_by_user["free_dev"]
     assert "agency" in q_by_user["agency_site_guy"]
 
-    # Curate re-checks icp_score >= 80, sniper_reject_reason, and sanitize_person_and_company
+    # Curate re-checks icp_score >= MIN_ICP_SCORE (70), sniper_reject_reason, and sanitize_person_and_company
     monkeypatch.delenv("RELAYFAST_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     curated = tg_curate.curate_rows(
@@ -473,7 +494,7 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
                 "project_url": "https://lowapp.io",
                 "category": "SaaS / AI app",
                 "role": "Founder",
-                "icp_score": 79,
+                "icp_score": 65,
                 "what_they_do": "Subscription tool",
             },
             {
@@ -485,6 +506,17 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
                 "role": "Founder",
                 "icp_score": 90,
                 "what_they_do": "Telegram bot hosting 24/7",
+            },
+            {
+                "username": "threshold_70",
+                "name": "Sara",
+                "project": "FocusTimer",
+                "project_url": "https://focustimer.app",
+                "category": "SaaS / AI app",
+                "role": "Founder",
+                "icp_score": 70,
+                "monetization": "subscription",
+                "what_they_do": "Consumer focus & productivity subscription app",
             },
             {
                 "username": "monetor_ceo",
@@ -499,9 +531,9 @@ def test_tg_llm_qualify_and_curate_icp_score_80_gate_and_quarantine_file(monkeyp
             },
         ]
     )
-    assert [r["username"] for r in curated] == ["monetor_ceo"]
-    assert curated[0]["name"] == "Олег"
-    assert curated[0]["project"] == "Monetor"
+    assert [r["username"] for r in curated] == ["threshold_70", "monetor_ceo"]
+    assert curated[1]["name"] == "Олег"
+    assert curated[1]["project"] == "Monetor"
 
 
 def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_split(
@@ -700,7 +732,7 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
                     "icp_score": 86,
                     "monetization": "ecom",
                 },
-                # Below icp_score 80 -> dropped from both!
+                # Below icp_score threshold -> dropped from both!
                 {
                     "username": "",
                     "name": "LowScoreCo",
@@ -711,7 +743,7 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
                     "work_email": "ceo@lowscore.io",
                     "category": "SaaS / AI app",
                     "what_they_do": "Unclear enterprise tool",
-                    "icp_score": 72,
+                    "icp_score": 65,
                     "monetization": "paid_product",
                 },
             ]
@@ -762,7 +794,7 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
 
 
 def test_tg_llm_qualify_lead_view_and_paid_scale_evidence_prompt() -> None:
-    assert tg_llm_qualify.MIN_ICP_SCORE == 80
+    assert tg_llm_qualify.MIN_ICP_SCORE == 70
     assert "Paid Scale Evidence rule" in tg_llm_qualify.SYSTEM_PROMPT
     assert "Roblox" in tg_llm_qualify.SYSTEM_PROMPT
 

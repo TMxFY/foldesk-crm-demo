@@ -10,6 +10,7 @@ hard API call budget cap <= 25 calls per run):
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, timedelta
 import html as html_mod
 import ipaddress
@@ -19,6 +20,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -2414,7 +2416,7 @@ def collect_all_veins(
     *,
     day: date | None = None,
     seen: dict[str, str] | None = None,
-    limit: int = 48,
+    limit: int = 80,
     veins: tuple[str, ...] = ("whop", "tiktok_ads", "tiktok_shop"),
     cursor: int = 0,
     max_runtime_sec: float = 180.0,
@@ -2423,6 +2425,8 @@ def collect_all_veins(
     global _ACTIVE_RUN_CURSOR
     today = day or date.today()
     merged_seen = fresh_seen(seen or {}, today)
+    if limit <= 0:
+        return [], merged_seen
     all_rows: list[dict[str, Any]] = []
 
     ordered_veins = [v.strip().lower() for v in veins if v.strip()]
@@ -2430,56 +2434,102 @@ def collect_all_veins(
         shift = int(cursor) % len(ordered_veins)
         ordered_veins = ordered_veins[shift:] + ordered_veins[:shift]
 
-    per_vein_cap = max(4, min(10, limit // max(1, len(ordered_veins)) + 2))
+    per_vein_cap = max(4, min(limit, limit // max(1, len(ordered_veins)) + 4))
     deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
+    if deadline is not None and time.monotonic() >= deadline:
+        return [], merged_seen
 
     vein_runners: dict[str, Any] = {
         "d2c_whatsapp": lambda rem, cur_seen: collect_d2c_whatsapp_brands(
-            limit=rem, day=today, seen=cur_seen, call_budget=[18]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20]
         ),
         "whop": lambda rem, cur_seen: collect_whop_content_rewards(
             limit=rem,
             day=today,
             seen=cur_seen,
             min_pool_usd=max(0, int(whop_min_pool_usd or 0)),
-            call_budget=[18],
+            call_budget=[20],
         ),
         "tiktok_ads": lambda rem, cur_seen: collect_tiktok_creative_ads(
-            limit=rem, day=today, seen=cur_seen, call_budget=[18]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20]
         ),
         "tiktok_shop": lambda rem, cur_seen: collect_tiktok_shop_brands(
-            limit=rem, day=today, seen=cur_seen, call_budget=[18]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20]
         ),
         "app_stores": lambda rem, cur_seen: collect_scaling_store_apps(
-            limit=rem, day=today, seen=cur_seen, call_budget=[18]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20]
         ),
         "ats_hiring": lambda rem, cur_seen: collect_ats_ugc_hiring(
-            limit=rem, day=today, seen=cur_seen, call_budget=[18]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20]
         ),
         "ph_detailed": lambda rem, cur_seen: collect_producthunt_detailed(
-            limit=rem, day=today, seen=cur_seen, call_budget=[10]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20]
         ),
     }
 
+    active_veins = [v for v in ordered_veins if v in vein_runners]
+    if not active_veins:
+        return [], merged_seen
+
+    seen_lock = threading.Lock()
     per_vein_counts: dict[str, int] = {}
+    vein_results: dict[str, list[dict[str, Any]]] = {}
     prev_cursor = _ACTIVE_RUN_CURSOR
     _ACTIVE_RUN_CURSOR = max(0, int(cursor))
     try:
-        for v_name in ordered_veins:
+        def _run_vein(v_name: str) -> tuple[str, list[dict[str, Any]], dict[str, str]]:
+            if deadline is not None and time.monotonic() >= deadline:
+                return v_name, [], {}
+            fn = vein_runners[v_name]
+            with seen_lock:
+                seen_snap = dict(merged_seen)
+            v_rows, v_seen = fn(per_vein_cap, seen_snap)
+            if isinstance(v_seen, dict):
+                with seen_lock:
+                    merged_seen.update(v_seen)
+            return v_name, list(v_rows or []), dict(v_seen or {})
+
+        max_workers = min(4, max(1, len(ordered_veins)))
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        not_done_set: set[Any] = set()
+        try:
+            futs = [(v_name, pool.submit(_run_vein, v_name)) for v_name in active_veins]
+            if deadline is not None:
+                wait_timeout = max(0.01, deadline - time.monotonic())
+                done_set, not_done_set = wait([f for _, f in futs], timeout=wait_timeout)
+                for f in not_done_set:
+                    f.cancel()
+            else:
+                wait([f for _, f in futs])
+                done_set = {f for _, f in futs}
+
+            for v_name, fut in futs:
+                if fut not in done_set:
+                    per_vein_counts[v_name] = 0
+                    vein_results[v_name] = []
+                    continue
+                try:
+                    _, v_rows, _ = fut.result()
+                except Exception:
+                    v_rows = []
+                vein_results[v_name] = v_rows
+                per_vein_counts[v_name] = len(v_rows)
+        finally:
+            pool.shutdown(wait=(deadline is None or not not_done_set), cancel_futures=True)
+
+        seen_row_ids: set[str] = set()
+        for v_name in active_veins:
+            for row in vein_results.get(v_name, []):
+                if len(all_rows) >= limit:
+                    break
+                row_id = str(row.get("id") or "").strip()
+                if row_id and row_id in seen_row_ids:
+                    continue
+                if row_id:
+                    seen_row_ids.add(row_id)
+                all_rows.append(row)
             if len(all_rows) >= limit:
                 break
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            fn = vein_runners.get(v_name)
-            if fn is None:
-                continue
-            rem = min(per_vein_cap, limit - len(all_rows))
-            try:
-                v_rows, merged_seen = fn(rem, merged_seen)
-            except Exception:
-                v_rows = []
-            per_vein_counts[v_name] = len(v_rows)
-            all_rows.extend(v_rows)
     finally:
         _ACTIVE_RUN_CURSOR = prev_cursor
 
@@ -2495,7 +2545,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Collect SoftUGC high-yield veins")
     parser.add_argument("--output", required=True)
     parser.add_argument("--seen", default="data/leadgen_state/high_yield_seen.json")
-    parser.add_argument("--limit", type=int, default=48)
+    parser.add_argument("--limit", type=int, default=80)
     parser.add_argument("--veins", default="whop,tiktok_ads,tiktok_shop,app_stores,ats_hiring,ph_detailed,d2c_whatsapp")
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
     parser.add_argument("--max-runtime-sec", type=float, default=180.0)
