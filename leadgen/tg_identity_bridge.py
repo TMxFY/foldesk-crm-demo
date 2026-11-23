@@ -10,12 +10,17 @@ contacts using:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import html as html_mod
 import inspect
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sys
+import threading
+import time
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
@@ -43,6 +48,21 @@ logger = logging.getLogger(__name__)
 COST_MONID_X_PROFILE_USD = 0.001
 COST_TREG_X_PROFILE_USD = 0.001
 COST_CRAWL4AI_SEARCH_USD = 0.00015
+TME_CACHE_TTL_SEC = 7 * 86400
+TME_FETCH_TIMEOUT_S = 5.0
+_TME_CACHE_LOCK = threading.Lock()
+_EXPLICIT_TG_MATCH_KINDS = frozenset(
+    {"links_explicit", "x_bio_explicit", "website_direct", "domain_search_explicit"}
+)
+_GUESSED_TG_MATCH_KINDS = frozenset(
+    {
+        "founder_handle_confirmed",
+        "linkedin_handle_confirmed",
+        "x_founder_handle",
+        "email_handle_confirmed",
+        "instagram_handle_confirmed",
+    }
+)
 
 _TG_NOISE = {
     "joinchat",
@@ -117,6 +137,44 @@ _GENERIC_BRAND_WORDS = frozenset(
         "sync",
         "plus",
         "pro",
+        "the",
+        "daily",
+        "insider",
+        "weekly",
+        "monthly",
+        "news",
+        "reviews",
+        "review",
+        "guide",
+        "guides",
+        "journal",
+        "digest",
+        "chronicle",
+        "times",
+        "post",
+        "wellness",
+        "health",
+        "beauty",
+        "skincare",
+        "supplements",
+        "talks",
+        "explained",
+        "hub",
+        "world",
+        "life",
+        "care",
+        "med",
+        "clinic",
+        "brand",
+        "brands",
+        "solutions",
+        "ventures",
+        "capital",
+        "partners",
+        "academy",
+        "institute",
+        "foundation",
+        "collective",
     }
 )
 _SUPPORT_TG_HANDLE_RE = re.compile(
@@ -428,19 +486,165 @@ def _default_search(
     return None
 
 
-def _default_tme_fetch(nick: str) -> Any:
+def _resolve_tme_cache_path(cache_path: Path | None = None) -> Path:
+    if cache_path is not None:
+        return Path(cache_path)
+    state_dir = (
+        os.environ.get("LEADGEN_STATE_DIR")
+        or os.environ.get("CRMTG_LEADGEN_STATE_DIR")
+        or ""
+    ).strip()
+    if state_dir:
+        return Path(state_dir) / "tme_probe_cache.json"
+    return Path(__file__).resolve().parents[1] / "data" / "leadgen_state" / "tme_probe_cache.json"
+
+
+def _load_tme_cache_unlocked(path: Path, now_ts: float) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    fresh: dict[str, dict[str, Any]] = {}
+    for k, val in raw.items():
+        if not isinstance(val, dict):
+            continue
+        try:
+            ts = float(val.get("ts") or val.get("cached_at") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts > 0.0 and (now_ts - ts) < TME_CACHE_TTL_SEC:
+            fresh[str(k).lower()] = val
+    return fresh
+
+
+def _save_tme_cache_entry(
+    path: Path,
+    key: str,
+    entry: dict[str, Any],
+    now_ts: float,
+) -> None:
+    with _TME_CACHE_LOCK:
+        cache = _load_tme_cache_unlocked(path, now_ts)
+        cache[key] = entry
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.debug("tme_probe_cache write failed: %s", exc)
+
+
+def _cached_entry_to_tme_response(clean: str, entry: dict[str, Any]) -> str:
+    kind = str(entry.get("kind") or "").strip().lower()
+    if kind != "user":
+        return ""
+    title_txt = str(entry.get("title") or clean).strip() or clean
+    bio_txt = str(entry.get("bio") or "").strip()
+    title_esc = html_mod.escape(title_txt, quote=True)
+    bio_esc = html_mod.escape(bio_txt, quote=True)
+    desc_html = f'<div class="tgme_page_description">{bio_esc}</div>' if bio_esc else ""
+    return (
+        "<html><body>"
+        f'<div class="tgme_page_title"><span>{title_esc}</span></div>'
+        f'<div class="tgme_page_extra">@{html_mod.escape(clean, quote=True)}</div>'
+        f"{desc_html}"
+        '<div class="tgme_page_action"><a class="tgme_action_button_new" href="tg://resolve">Send Message</a></div>'
+        "</body></html>"
+    )
+
+
+def _classify_non_user_tme_kind(resp: Any) -> str:
+    status = int(getattr(resp, "status_code", 200) or 0)
+    is_redir = (
+        bool(getattr(resp, "is_redirect", False))
+        or (300 <= status < 400)
+        or bool((getattr(resp, "headers", {}) or {}).get("Location"))
+    )
+    if status == 404 or is_redir:
+        return "missing"
+    if status != 200:
+        return "unknown"
+    low = str(getattr(resp, "text", "") or "").lower()
+    if "start bot" in low or "monthly user" in low:
+        return "bot"
+    if any(tok in low for tok in ("subscriber", "подписчик", "member", "участник", "online")):
+        return "channel"
+    return "missing"
+
+
+def _default_tme_fetch(
+    nick: str,
+    *,
+    cache_path: Path | None = None,
+    timeout: float = TME_FETCH_TIMEOUT_S,
+) -> Any:
     clean = str(nick or "").strip().lstrip("@")
     if not clean:
         return ""
+    resolved_cache = _resolve_tme_cache_path(cache_path)
+    key = clean.lower()
+    now_ts = time.time()
+    with _TME_CACHE_LOCK:
+        cache = _load_tme_cache_unlocked(resolved_cache, now_ts)
+        cached = cache.get(key)
+    if isinstance(cached, dict) and str(cached.get("kind") or "").lower() in {"user", "channel", "bot", "missing"}:
+        return _cached_entry_to_tme_response(clean, cached)
+
+    eff_timeout = min(max(0.1, float(timeout or TME_FETCH_TIMEOUT_S)), TME_FETCH_TIMEOUT_S)
     try:
-        return requests.get(
+        resp = requests.get(
             f"https://t.me/{clean}",
             headers={"User-Agent": "Mozilla/5.0 (compatible; SoftUGC/1.0)"},
-            timeout=4,
+            timeout=eff_timeout,
             allow_redirects=False,
         )
     except requests.RequestException:
         return ""
+
+    status = int(getattr(resp, "status_code", 200) or 0)
+    is_redir = (
+        bool(getattr(resp, "is_redirect", False))
+        or (300 <= status < 400)
+        or bool((getattr(resp, "headers", {}) or {}).get("Location"))
+    )
+    if status == 200 and not is_redir:
+        ok, title, bio = _parse_tme_response(resp, clean)
+        if ok:
+            _save_tme_cache_entry(
+                resolved_cache,
+                key,
+                {
+                    "handle": clean,
+                    "kind": "user",
+                    "title": title,
+                    "bio": bio,
+                    "subscribers": 0,
+                    "ts": now_ts,
+                },
+                now_ts,
+            )
+            return resp
+    kind = _classify_non_user_tme_kind(resp)
+    if kind in {"channel", "bot", "missing"}:
+        _save_tme_cache_entry(
+            resolved_cache,
+            key,
+            {
+                "handle": clean,
+                "kind": kind,
+                "title": "",
+                "bio": "",
+                "subscribers": 0,
+                "ts": now_ts,
+            },
+            now_ts,
+        )
+    return resp
 
 
 def _default_site_fetch(domain: str) -> str:
@@ -489,6 +693,23 @@ _SLUG_GENERIC_TOKENS = frozenset(
         "owner",
     }
 )
+_LEADING_NON_PERSON_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "my",
+        "our",
+        "your",
+        "get",
+        "try",
+        "use",
+        "buy",
+        "best",
+        "top",
+        "all",
+    }
+)
 _NON_PERSON_ROW_NAME_WORDS = frozenset(
     {
         "role",
@@ -528,8 +749,57 @@ _NON_PERSON_ROW_NAME_WORDS = frozenset(
         "ltd",
         "corp",
         "gmbh",
+        "the",
+        "daily",
+        "insider",
+        "weekly",
+        "monthly",
+        "news",
+        "reviews",
+        "review",
+        "guide",
+        "guides",
+        "journal",
+        "digest",
+        "chronicle",
+        "times",
+        "post",
+        "wellness",
+        "health",
+        "beauty",
+        "skincare",
+        "supplements",
+        "talks",
+        "explained",
+        "club",
+        "hub",
+        "world",
+        "life",
+        "care",
+        "med",
+        "clinic",
+        "brand",
+        "brands",
+        "media",
+        "network",
+        "ventures",
+        "capital",
+        "partners",
+        "digital",
+        "academy",
+        "institute",
+        "foundation",
+        "collective",
     }
 )
+
+
+def _is_rejected_person_name_words(words: list[str]) -> bool:
+    if not words:
+        return True
+    if words[0].casefold() in _LEADING_NON_PERSON_WORDS:
+        return True
+    return any(w.casefold() in _NON_PERSON_ROW_NAME_WORDS for w in words)
 
 
 def _linkedin_urls_from_row(row: dict[str, Any]) -> list[str]:
@@ -591,8 +861,9 @@ def _infer_founder_name_from_row(row: dict[str, Any], brand: str = "") -> str:
         and raw_fn.casefold() not in comp_variants
         and not re.search(r"https?://|t\.me/|@|\d|[:/|]", raw_fn)
     ):
-        fn_words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", raw_fn)]
-        if len(fn_words) >= 2:
+        all_fn_words = re.findall(r"[A-Za-zА-Яа-яЁё]+", raw_fn)
+        fn_words = [w for w in all_fn_words if len(w) >= 2]
+        if len(fn_words) >= 2 and not _is_rejected_person_name_words(all_fn_words):
             return raw_fn
 
     # 2) Multi-word person `name` distinct from brand
@@ -602,11 +873,12 @@ def _infer_founder_name_from_row(row: dict[str, Any], brand: str = "") -> str:
         and raw_nm.casefold() not in comp_variants
         and not re.search(r"https?://|t\.me/|@|\d|[:/|–—]", raw_nm)
     ):
-        nm_words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", raw_nm)]
+        all_nm_words = re.findall(r"[A-Za-zА-Яа-яЁё]+", raw_nm)
+        nm_words = [w for w in all_nm_words if len(w) >= 2]
         if 2 <= len(nm_words) <= 4:
             lows = {w.casefold() for w in nm_words}
             if (
-                not (lows & _NON_PERSON_ROW_NAME_WORDS)
+                not _is_rejected_person_name_words(all_nm_words)
                 and not (lows <= _GENERIC_BRAND_WORDS)
                 and not (lows & brand_tokens)
             ):
@@ -615,12 +887,13 @@ def _infer_founder_name_from_row(row: dict[str, Any], brand: str = "") -> str:
     # 3) Parse founder_linkedin / linkedin_url /in/<slug>
     for lk in _linkedin_urls_from_row(row):
         _, parts = _clean_linkedin_slug_parts(lk)
-        alpha = [
+        all_alpha = [
             p
             for p in parts
             if p.lower() not in _SLUG_GENERIC_TOKENS
-            and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{2,}", p)
+            and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]+", p)
         ]
+        alpha = [p for p in all_alpha if len(p) >= 2]
         if not (2 <= len(alpha) <= 4):
             continue
         low_alpha = {w.casefold() for w in alpha}
@@ -628,7 +901,7 @@ def _infer_founder_name_from_row(row: dict[str, Any], brand: str = "") -> str:
         if (
             joined_cf in comp_variants
             or joined_cf.replace(" ", "") in comp_compact
-            or (low_alpha & _NON_PERSON_ROW_NAME_WORDS)
+            or _is_rejected_person_name_words(all_alpha)
             or (low_alpha <= _GENERIC_BRAND_WORDS)
             or (low_alpha & brand_tokens)
         ):
@@ -659,13 +932,16 @@ def _extract_social_or_email_candidates(row: dict[str, Any]) -> list[tuple[str, 
         slug, parts = _clean_linkedin_slug_parts(lk)
         if not slug:
             continue
-        _add(slug.replace("-", "_"), "linkedin_handle_confirmed")
-        _add(slug.replace("-", ""), "linkedin_handle_confirmed")
-        alpha_parts = [
+        raw_slug_alpha = [
             p.lower()
             for p in parts
-            if p.lower() not in _SLUG_GENERIC_TOKENS and re.fullmatch(r"[A-Za-z]{2,}", p)
+            if p.lower() not in _SLUG_GENERIC_TOKENS and re.fullmatch(r"[A-Za-z]+", p)
         ]
+        if raw_slug_alpha and _is_rejected_person_name_words(raw_slug_alpha):
+            continue
+        _add(slug.replace("-", "_"), "linkedin_handle_confirmed")
+        _add(slug.replace("-", ""), "linkedin_handle_confirmed")
+        alpha_parts = [p for p in raw_slug_alpha if len(p) >= 2]
         if len(alpha_parts) >= 3:
             _add(f"{alpha_parts[0]}_{alpha_parts[-1]}", "linkedin_handle_confirmed")
             _add(f"{alpha_parts[0]}{alpha_parts[-1]}", "linkedin_handle_confirmed")
@@ -786,8 +1062,13 @@ def _extract_x_founder_name(profile: dict[str, Any] | None, brand: str) -> str:
     for cand in candidates:
         if cand.casefold() == brand_cf:
             continue
-        words = re.findall(r"[A-Za-z]{2,18}", cand)
-        if 2 <= len(words) <= 3 and not any(w.lower() in _GENERIC_BRAND_WORDS for w in words):
+        all_words = re.findall(r"[A-Za-z]+", cand)
+        words = [w for w in all_words if 2 <= len(w) <= 18]
+        if (
+            2 <= len(words) <= 3
+            and not _is_rejected_person_name_words(all_words)
+            and not any(w.lower() in _GENERIC_BRAND_WORDS for w in words)
+        ):
             return " ".join(words)
     return ""
 
@@ -917,8 +1198,16 @@ def bridge_lead_to_telegram(
 
     seen_cands: set[str] = set()
 
-    def _try_candidates(stage_cands: list[tuple[str, str, bool]]) -> dict[str, Any] | None:
-        for nick, match_kind, require_confirm in stage_cands:
+    def _try_candidates(stage_cands: list[tuple[str, str, bool] | tuple[str, str, bool, bool]]) -> dict[str, Any] | None:
+        for item in stage_cands:
+            if len(item) == 4:
+                nick, match_kind, require_confirm, explicit_guessed = item
+            else:
+                nick, match_kind, require_confirm = item
+                explicit_guessed = (
+                    match_kind in _GUESSED_TG_MATCH_KINDS
+                    and match_kind not in _EXPLICIT_TG_MATCH_KINDS
+                )
             if not _is_valid_personal_tg_handle(nick):
                 continue
             low = nick.lower()
@@ -941,6 +1230,12 @@ def bridge_lead_to_telegram(
             out["tg_username"] = nick
             out["telegram_url"] = tg_url
             out["tg_bridge_match"] = match_kind
+            if match_kind in _EXPLICIT_TG_MATCH_KINDS:
+                out["tg_handle_is_guessed"] = False
+            elif match_kind in _GUESSED_TG_MATCH_KINDS:
+                out["tg_handle_is_guessed"] = True
+            else:
+                out["tg_handle_is_guessed"] = bool(explicit_guessed)
             out["provider"] = "telegram"
             channels = [str(c) for c in (out.get("contact_channels") or []) if str(c).strip()]
             if "telegram" not in channels:
@@ -959,7 +1254,7 @@ def bridge_lead_to_telegram(
         p for p in (links_blob, out.get("bio") or "", out.get("sample") or "", out.get("what_they_do") or "") if p
     )
     stage0 = [
-        (nick, "links_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)))
+        (nick, "links_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)), False)
         for nick in _extract_tme_handles(stage0_blob)
     ]
     if hit := _try_candidates(stage0):
@@ -978,12 +1273,13 @@ def bridge_lead_to_telegram(
             out["founder_name"] = x_founder_name
         resolved_x_founder = x_founder_name or _infer_founder_name_from_row(out, brand)
         if resolved_x_founder:
+            all_xf_words = re.findall(r"[A-Za-zА-Яа-яЁё]+", resolved_x_founder)
             fw = [w.lower() for w in re.findall(r"[A-Za-z]{2,}", resolved_x_founder)]
-            if len(fw) >= 2:
+            if len(fw) >= 2 and not _is_rejected_person_name_words(all_xf_words):
                 x_founder_cands.append((f"{fw[0]}_{fw[-1]}", "x_founder_handle"))
                 x_founder_cands.append((f"{fw[0]}{fw[-1]}", "x_founder_handle"))
         stage1 = [
-            (nick, "x_bio_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)))
+            (nick, "x_bio_explicit", bool(_SUPPORT_TG_HANDLE_RE.search(nick)), False)
             for nick in _extract_tme_handles(bio_blob)
         ]
         if hit := _try_candidates(stage1):
@@ -1002,7 +1298,7 @@ def bridge_lead_to_telegram(
         site_nicks = _extract_tme_handles(site_html)
         multi_site = len(site_nicks) > 1
         stage2 = [
-            (nick, "website_direct", bool(multi_site or _SUPPORT_TG_HANDLE_RE.search(nick)))
+            (nick, "website_direct", bool(multi_site or _SUPPORT_TG_HANDLE_RE.search(nick)), False)
             for nick in site_nicks
         ]
         if hit := _try_candidates(stage2):
@@ -1016,7 +1312,7 @@ def bridge_lead_to_telegram(
             s_payload = do_search(query)
         except Exception:
             s_payload = None
-        stage3a: list[tuple[str, str, bool]] = []
+        stage3a: list[tuple[str, str, bool, bool]] = []
         for search_hit in _unwrap_search_hits(s_payload):
             hit_url = str(search_hit.get("url") or "").strip()
             hit_title = str(search_hit.get("title") or "").strip()
@@ -1029,6 +1325,7 @@ def bridge_lead_to_telegram(
                         nick,
                         "domain_search_explicit" if has_exact_domain else "x_handle_verified",
                         bool((not has_exact_domain) or _SUPPORT_TG_HANDLE_RE.search(nick)),
+                        False,
                     )
                 )
         if hit := _try_candidates(stage3a):
@@ -1046,39 +1343,59 @@ def bridge_lead_to_telegram(
                 s_payload_2 = do_search(f_query)
             except Exception:
                 s_payload_2 = None
-            stage3b: list[tuple[str, str, bool]] = []
+            stage3b: list[tuple[str, str, bool, bool]] = []
             for search_hit in _unwrap_search_hits(s_payload_2):
                 hit_blob = " ".join(
                     str(search_hit.get(k) or "").strip() for k in ("url", "title", "snippet", "description")
                 )
                 for nick in _extract_tme_handles(hit_blob):
-                    stage3b.append((nick, "founder_search_verified", True))
+                    stage3b.append((nick, "founder_search_verified", True, False))
             if hit := _try_candidates(stage3b):
                 return hit
 
     # 4) Same-handle / social / personal email / founder-name candidates (strict anti-namesake confirmation required)
-    stage4: list[tuple[str, str, bool]] = []
+    stage4: list[tuple[str, str, bool, bool]] = []
     if x_handle:
-        stage4.append((x_handle, "x_handle_verified", True))
+        stage4.append((x_handle, "x_handle_verified", True, True))
     for fn_nick, fn_kind in x_founder_cands:
-        stage4.append((fn_nick, fn_kind, True))
+        stage4.append((fn_nick, fn_kind, True, True))
     for social_nick, social_kind in _extract_social_or_email_candidates(out):
-        stage4.append((social_nick, social_kind, True))
+        stage4.append((social_nick, social_kind, True, True))
     if founder_raw:
+        all_fr_words = re.findall(r"[A-Za-zА-Яа-яЁё]+", founder_raw)
         fw_ascii = [w.lower() for w in re.findall(r"[A-Za-z]{2,}", founder_raw)]
-        if len(fw_ascii) >= 2:
-            stage4.append((f"{fw_ascii[0]}_{fw_ascii[-1]}", "founder_handle_confirmed", True))
-            stage4.append((f"{fw_ascii[0]}{fw_ascii[-1]}", "founder_handle_confirmed", True))
+        if len(fw_ascii) >= 2 and not _is_rejected_person_name_words(all_fr_words):
+            stage4.append((f"{fw_ascii[0]}_{fw_ascii[-1]}", "founder_handle_confirmed", True, True))
+            stage4.append((f"{fw_ascii[0]}{fw_ascii[-1]}", "founder_handle_confirmed", True, True))
     if hit := _try_candidates(stage4):
         return hit
 
     return out
 
 
+def _write_bridge_checkpoint_atomic(
+    checkpoint_path: Path,
+    results: list[dict[str, Any] | None],
+) -> None:
+    completed = [r for r in results if r is not None]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = checkpoint_path.with_name(
+        f".{checkpoint_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    if checkpoint_path.suffix.lower() == ".json":
+        payload = json.dumps(completed, ensure_ascii=False, indent=2)
+    else:
+        payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in completed)
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, checkpoint_path)
+
+
 def enrich_rows_with_telegram_bridge(
     rows: list[dict[str, Any]],
     *,
     max_rows: int = 20,
+    max_workers: int = 8,
+    checkpoint_path: Path | None = None,
     x_profile_fn=None,
     search_fn=None,
     tme_fetch_fn=None,
@@ -1089,35 +1406,82 @@ def enrich_rows_with_telegram_bridge(
     treg_fn: Callable[..., Any] | None = None,
     monid_fn: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run Telegram bridge on up to max_rows non-TG leads in batch."""
-    out: list[dict[str, Any]] = []
-    attempted = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
+    """Run Telegram bridge on up to max_rows non-TG leads in parallel while preserving order."""
+    dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
+    if not dict_rows:
+        return []
+
+    results: list[dict[str, Any] | None] = [None] * len(dict_rows)
+    to_bridge: list[int] = []
+    limit = max(0, int(max_rows))
+
+    for idx, row in enumerate(dict_rows):
         existing_tg = row.get("username") or row.get("telegram_username") or row.get("tg_username")
-        if _is_valid_personal_tg_handle(existing_tg):
-            out.append(dict(row))
-            continue
-        if attempted >= max(0, int(max_rows)):
-            out.append(dict(row))
-            continue
-        attempted += 1
-        out.append(
-            bridge_lead_to_telegram(
-                row,
-                x_profile_fn=x_profile_fn,
-                search_fn=search_fn,
-                tme_fetch_fn=tme_fetch_fn,
-                fetch_site_fn=fetch_site_fn,
-                allow_paid=allow_paid,
-                budget_guard_fn=budget_guard_fn,
-                cost_record_fn=cost_record_fn,
-                treg_fn=treg_fn,
-                monid_fn=monid_fn,
-            )
+        if _is_valid_personal_tg_handle(existing_tg) or len(to_bridge) >= limit:
+            results[idx] = row
+        else:
+            to_bridge.append(idx)
+
+    if not to_bridge:
+        out_ready = [r for r in results if r is not None]
+        if checkpoint_path is not None:
+            _write_bridge_checkpoint_atomic(Path(checkpoint_path), results)
+        return out_ready
+
+    cb_lock = threading.Lock()
+    ckpt_lock = threading.Lock()
+
+    safe_guard_fn = None
+    if budget_guard_fn is not None:
+
+        def _locked_guard(*args: Any, **kwargs: Any) -> Any:
+            with cb_lock:
+                return budget_guard_fn(*args, **kwargs)
+
+        safe_guard_fn = _locked_guard
+
+    safe_cost_fn = None
+    if cost_record_fn is not None:
+
+        def _locked_cost(*args: Any, **kwargs: Any) -> Any:
+            with cb_lock:
+                return cost_record_fn(*args, **kwargs)
+
+        safe_cost_fn = _locked_cost
+
+    def _run_one(row_idx: int) -> tuple[int, dict[str, Any]]:
+        bridged = bridge_lead_to_telegram(
+            dict_rows[row_idx],
+            x_profile_fn=x_profile_fn,
+            search_fn=search_fn,
+            tme_fetch_fn=tme_fetch_fn,
+            fetch_site_fn=fetch_site_fn,
+            allow_paid=allow_paid,
+            budget_guard_fn=safe_guard_fn,
+            cost_record_fn=safe_cost_fn,
+            treg_fn=treg_fn,
+            monid_fn=monid_fn,
         )
-    return out
+        return row_idx, bridged
+
+    workers = max(1, min(int(max_workers or 1), len(to_bridge)))
+    ckpt_target = Path(checkpoint_path) if checkpoint_path is not None else None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {pool.submit(_run_one, idx): idx for idx in to_bridge}
+        for fut in as_completed(future_map):
+            orig_idx = future_map[fut]
+            try:
+                idx_done, bridged_row = fut.result()
+            except Exception as exc:
+                logger.debug("enrich_rows_with_telegram_bridge worker failed for row %s: %s", orig_idx, exc)
+                idx_done, bridged_row = orig_idx, dict_rows[orig_idx]
+            results[idx_done] = bridged_row
+            if ckpt_target is not None:
+                with ckpt_lock:
+                    _write_bridge_checkpoint_atomic(ckpt_target, results)
+
+    return [r for r in results if r is not None]
 
 
 def main(argv: list[str] | None = None) -> None:

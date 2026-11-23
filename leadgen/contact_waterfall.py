@@ -80,10 +80,11 @@ MAX_BIO_HUB_PAGES = 2
 PER_LEAD_CAP_USD = 0.05
 SUPER_WHALE_CAP_USD = 0.15
 CONTACTOUT_VERIFIED_PHONE_CAP_USD = 0.25
-CONTACTOUT_VERIFIED_MIN_ICP = 85
+CONTACTOUT_VERIFIED_MIN_ICP = 80
 SUPER_WHALE_ICP_MIN = 92
 SUPER_WHALE_POOL_MIN_USD = 10000
 SECONDARY_DM_FALLBACK_DAYS = 6
+MAX_DM_CANDIDATES = 3
 
 _GEO_CALLING_CODES: dict[str, str] = {
     "US": "1",
@@ -158,6 +159,7 @@ COST_CRAWL4AI_EMAIL_USD = 0.00095
 COST_CRAWL4AI_PHONE_USD = 0.00095
 COST_CRAWL4AI_SEARCH_USD = 0.00015
 COST_BLITZAPI_EMAIL_USD = 0.001
+COST_LIMADATA_EMP_USD = 0.002
 COST_LEADMAGIC_EMP_USD = 0.00375
 COST_TREG_PHONE_MIN_USD = 0.001
 COST_MONID_FB_CONTACT_USD = 0.0012
@@ -472,11 +474,15 @@ _FORM_FIELD_RE = re.compile(
 )
 _TITLE_OR_H1_RE = re.compile(r"<(?:title|h1)\b[^>]*>(.*?)</(?:title|h1)>", re.I | re.S)
 
-_DM_TIER2_RE = re.compile(
-    r"\b(?:co-?\s*founder|founder|ceo|chief executive|owner|cmo|chief marketing|growth|marketing|head)\b",
+_DM_TIER3_RE = re.compile(
+    r"\b(?:paid\s+social|performance|user\s+acquisition|ua|brand|partnerships?|director|head)\b",
     re.I,
 )
-_DM_TIER1_RE = re.compile(r"\b(?:co-?\s*founder|founder|ceo|chief executive|owner)\b", re.I)
+_DM_TIER2_RE = re.compile(
+    r"\b(?:cmo|chief\s+marketing|head\s+of\s+growth|vp\s+growth|head\s+of\s+marketing|vp\s+marketing|marketing\s+director|growth|marketing)\b",
+    re.I,
+)
+_DM_TIER1_RE = re.compile(r"\b(?:co-?\s*founder|founder|ceo|chief\s+executive|owner)\b", re.I)
 _GENERIC_PERSON_NAMES = frozenset(
     {
         "unknown",
@@ -1292,7 +1298,7 @@ def _extract_person_role(person: dict[str, Any]) -> str:
     return ""
 
 
-def _pick_decision_makers(payload: Any, *, limit: int = 2) -> list[dict[str, str]]:
+def _pick_decision_makers(payload: Any, *, limit: int = MAX_DM_CANDIDATES) -> list[dict[str, str]]:
     people = _unwrap_person_dicts(payload)
     if not people or limit <= 0:
         return []
@@ -1304,8 +1310,10 @@ def _pick_decision_makers(payload: Any, *, limit: int = 2) -> list[dict[str, str
             for k in ("title", "job_title", "role", "headline", "position", "occupation")
         ).strip()
         if _DM_TIER1_RE.search(title_blob):
-            tier = 2
+            tier = 3
         elif _DM_TIER2_RE.search(title_blob):
+            tier = 2
+        elif _DM_TIER3_RE.search(title_blob):
             tier = 1
         else:
             tier = 0
@@ -1329,6 +1337,11 @@ def _pick_decision_makers(payload: Any, *, limit: int = 2) -> list[dict[str, str
         person_nm = _extract_person_name(chosen)
         email = rank_and_pick_best_email(_extract_emails_from_treg_payload(chosen))
         role = _extract_person_role(chosen)
+        raw_tg = str(
+            chosen.get("telegram_username") or chosen.get("tg_username") or chosen.get("username") or ""
+        ).strip().lstrip("@")
+        tg_handle = raw_tg if _is_valid_tg_handle(raw_tg) else ""
+        raw_phone = _normalize_phone_e164(chosen.get("phone") or chosen.get("mobile_phone") or "")
 
         li_key = li_raw.casefold()
         nm_key = person_nm.casefold()
@@ -1336,7 +1349,7 @@ def _pick_decision_makers(payload: Any, *, limit: int = 2) -> list[dict[str, str
             continue
         if nm_key and nm_key in seen_names and not li_key:
             continue
-        if not (li_raw or person_nm or email):
+        if not (li_raw or person_nm or email or tg_handle or raw_phone):
             continue
 
         if li_key:
@@ -1353,6 +1366,10 @@ def _pick_decision_makers(payload: Any, *, limit: int = 2) -> list[dict[str, str
             entry["work_email"] = email
         if role:
             entry["role"] = role
+        if tg_handle:
+            entry["telegram_username"] = tg_handle
+        if raw_phone:
+            entry["phone"] = raw_phone
         picked.append(entry)
         if len(picked) >= limit:
             break
@@ -1390,6 +1407,12 @@ def _merge_bridge_result(out: dict[str, Any], bridged: Any) -> None:
         out["telegram_username"] = tg
         out["tg_username"] = tg
         out["telegram_url"] = bridged.get("telegram_url") or f"https://t.me/{tg}"
+        if "tg_handle_is_guessed" in bridged:
+            out["tg_handle_is_guessed"] = bool(bridged["tg_handle_is_guessed"])
+        if bridged.get("provider"):
+            out["provider"] = bridged["provider"]
+    if bridged.get("founder_name") and not str(out.get("founder_name") or "").strip():
+        out["founder_name"] = str(bridged["founder_name"]).strip()
     for key in ("tg_bridge_match", "contact_channels"):
         if bridged.get(key) and not out.get(key):
             out[key] = bridged[key]
@@ -2030,7 +2053,7 @@ def _add_dm_candidate(dm_candidates: list[dict[str, str]], cand: Mapping[str, An
                 existing["whatsapp"] = wa
             return
 
-    if len(dm_candidates) >= 2:
+    if len(dm_candidates) >= MAX_DM_CANDIDATES:
         return
 
     entry: dict[str, str] = {}
@@ -2498,7 +2521,7 @@ def enrich_lead_contacts(
                         tier2_unlocked_contact = True
                     break
 
-    # --- Tier 1 DM lookup (supports up to 2 decision makers) ---
+    # --- Tier 1 DM lookup (supports up to MAX_DM_CANDIDATES = 3 decision makers) ---
     dm_candidates: list[dict[str, str]] = []
     if linkedin_in_url(out.get("founder_linkedin") or "") or (
         str(out.get("founder_name") or "").strip()
@@ -2516,11 +2539,11 @@ def enrich_lead_contacts(
 
     need_dm_lookup = (
         (not linkedin_in_url(out.get("founder_linkedin") or ""))
-        or (dm_multi_finder_fn is not None and len(dm_candidates) < 2)
+        or (dm_multi_finder_fn is not None and len(dm_candidates) < MAX_DM_CANDIDATES)
         or (
             not custom_mode
             and not out.get("secondary_contact_json")
-            and len(dm_candidates) < 2
+            and len(dm_candidates) < MAX_DM_CANDIDATES
             and not (_has_personal_tg(out) or _extract_whatsapp_url(out.get("whatsapp") or ""))
         )
     )
@@ -2532,7 +2555,7 @@ def enrich_lead_contacts(
                 if "limit" in sig.parameters or any(
                     p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
                 ):
-                    res_multi = dm_multi_finder_fn(company, dom, limit=2)
+                    res_multi = dm_multi_finder_fn(company, dom, limit=MAX_DM_CANDIDATES)
                 else:
                     res_multi = dm_multi_finder_fn(company, dom)
                 if isinstance(res_multi, list):
@@ -2596,7 +2619,7 @@ def enrich_lead_contacts(
 
                     try:
                         sig = inspect.signature(multi_fn)
-                        kw: dict[str, Any] = {"limit": 2}
+                        kw: dict[str, Any] = {"limit": MAX_DM_CANDIDATES}
                         if "treg_fn" in sig.parameters or any(
                             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
                         ):
@@ -2627,7 +2650,7 @@ def enrich_lead_contacts(
                 except Exception:
                     dm_rows = []
 
-        for dm_found in dm_rows[:2]:
+        for dm_found in dm_rows[:MAX_DM_CANDIDATES]:
             _add_dm_candidate(dm_candidates, dm_found)
             dm_email = str(dm_found.get("work_email") or "").strip()
             if dm_email:
@@ -2644,6 +2667,14 @@ def enrich_lead_contacts(
                 out["founder_linkedin"] = primary_dm["founder_linkedin"]
             if primary_dm.get("founder_name") and not str(out.get("founder_name") or "").strip():
                 out["founder_name"] = primary_dm["founder_name"]
+            if primary_dm.get("telegram_username") and not _has_personal_tg(out):
+                dm_tg = _has_personal_tg({"username": primary_dm["telegram_username"]})
+                if dm_tg:
+                    out["username"] = dm_tg
+                    out["telegram_username"] = dm_tg
+                    out["tg_username"] = dm_tg
+                    out["telegram_url"] = f"https://t.me/{dm_tg}"
+                    out["provider"] = "telegram"
 
     best_tier1_email = rank_and_pick_best_email(email_pool, domain=dom)
     if best_tier1_email:
@@ -2705,8 +2736,114 @@ def enrich_lead_contacts(
     try:
         bridged = _run_bridge(out)
         _merge_bridge_result(out, bridged)
+        if dm_candidates and _has_personal_tg(out):
+            dm_candidates[0]["telegram_username"] = _has_personal_tg(out)
+            if out.get("tg_bridge_match"):
+                dm_candidates[0]["tg_bridge_match"] = str(out["tg_bridge_match"])
+            if "tg_handle_is_guessed" in out:
+                dm_candidates[0]["tg_handle_is_guessed"] = "1" if out["tg_handle_is_guessed"] else "0"
     except Exception as exc:
         logger.debug("tier1 tg_bridge failed: %s", exc)
+
+    def _build_dm_bridge_row(dm_item: Mapping[str, str]) -> dict[str, Any]:
+        dm_row = {
+            k: v
+            for k, v in out.items()
+            if k
+            not in {
+                "username",
+                "telegram_username",
+                "tg_username",
+                "telegram_url",
+                "tg_bridge_match",
+                "tg_handle_is_guessed",
+                "founder_x",
+                "founder_twitter",
+                "x_url",
+                "twitter_url",
+                "twitter",
+                "instagram_url",
+                "instagram_handle",
+                "instagram",
+                "founder_linkedin",
+                "linkedin_url",
+                "linkedin",
+                "founder_name",
+                "name",
+                "work_email",
+                "email",
+                "links",
+            }
+        }
+        if dm_item.get("founder_name"):
+            dm_row["founder_name"] = dm_item["founder_name"]
+            dm_row["name"] = dm_item["founder_name"]
+        if dm_item.get("founder_linkedin"):
+            dm_row["founder_linkedin"] = dm_item["founder_linkedin"]
+            dm_row["links"] = [dm_item["founder_linkedin"]]
+        if dm_item.get("work_email"):
+            dm_row["work_email"] = dm_item["work_email"]
+            dm_row["email"] = dm_item["work_email"]
+        if dm_item.get("role"):
+            dm_row["role"] = dm_item["role"]
+        return dm_row
+
+    def _apply_primary_dm_fields(primary_dm: Mapping[str, str]) -> None:
+        if primary_dm.get("founder_linkedin"):
+            out["founder_linkedin"] = primary_dm["founder_linkedin"]
+        if primary_dm.get("founder_name"):
+            out["founder_name"] = primary_dm["founder_name"]
+        if primary_dm.get("role"):
+            out["role"] = primary_dm["role"]
+        if primary_dm.get("work_email"):
+            email_pool.append(primary_dm["work_email"])
+        dm_tg = _has_personal_tg({"username": primary_dm.get("telegram_username") or ""})
+        if dm_tg:
+            out["username"] = dm_tg
+            out["telegram_username"] = dm_tg
+            out["tg_username"] = dm_tg
+            out["telegram_url"] = f"https://t.me/{dm_tg}"
+            out["provider"] = "telegram"
+            if primary_dm.get("tg_bridge_match"):
+                out["tg_bridge_match"] = primary_dm["tg_bridge_match"]
+            if "tg_handle_is_guessed" in primary_dm:
+                out["tg_handle_is_guessed"] = primary_dm["tg_handle_is_guessed"] in ("1", "true", True)
+        if primary_dm.get("phone"):
+            out["phone"] = primary_dm["phone"]
+            if primary_dm.get("phone_line_type"):
+                out["phone_line_type"] = primary_dm["phone_line_type"]
+
+    def _rebalance_dm_candidates() -> None:
+        if not dm_candidates:
+            return
+        best_idx = max(
+            range(len(dm_candidates)),
+            key=lambda idx: (
+                1 if _is_valid_tg_handle(dm_candidates[idx].get("telegram_username") or "") else 0,
+                1 if _extract_whatsapp_url(dm_candidates[idx].get("whatsapp") or "") else 0,
+                1 if str(dm_candidates[idx].get("phone") or "").strip() else 0,
+                -idx,
+            ),
+        )
+        if best_idx != 0:
+            chosen = dm_candidates.pop(best_idx)
+            dm_candidates.insert(0, chosen)
+            _apply_primary_dm_fields(dm_candidates[0])
+        elif dm_candidates[0].get("phone") and not str(out.get("phone") or "").strip():
+            out["phone"] = dm_candidates[0]["phone"]
+            if dm_candidates[0].get("phone_line_type"):
+                out["phone_line_type"] = dm_candidates[0]["phone_line_type"]
+        if len(dm_candidates) > 2:
+            tail = sorted(
+                dm_candidates[1:],
+                key=lambda item: (
+                    1 if _is_valid_tg_handle(item.get("telegram_username") or "") else 0,
+                    1 if _extract_whatsapp_url(item.get("whatsapp") or "") else 0,
+                    1 if str(item.get("phone") or "").strip() else 0,
+                ),
+                reverse=True,
+            )
+            dm_candidates[1:] = tail
 
     # --- Tier 2: paid treg email + phone waterfall + HLR filter ---
     has_tg = bool(_has_personal_tg(out))
@@ -2717,14 +2854,15 @@ def enrich_lead_contacts(
     if (
         allow_paid_tier2
         and budget_ok
-        and icp_score >= 80
+        and icp_score >= 70
         and not (has_tg or has_wa)
     ):
         if active_treg is not None:
             unlocked_identity = False
             li_url = linkedin_in_url(out.get("founder_linkedin") or "")
+            existing_dm_count = len(dm_candidates)
 
-            # Step 2A: Email & missing DM discovery (when no personal email or no LinkedIn)
+            # Step 2A: Email & missing DM discovery
             if li_url and not has_personal_email:
                 if _remaining() + 1e-9 >= COST_CRAWL4AI_EMAIL_USD and _check_budget_guard(
                     budget_guard_fn, "treg", COST_CRAWL4AI_EMAIL_USD, endpoint="crawl4ai.people.email.find"
@@ -2788,33 +2926,83 @@ def enrich_lead_contacts(
                             unlocked_identity = True
                             tier2_unlocked_contact = True
 
-            elif not li_url and dom and _remaining() + 1e-9 >= COST_LEADMAGIC_EMP_USD and _check_budget_guard(
-                budget_guard_fn, "treg", COST_LEADMAGIC_EMP_USD, endpoint="leadmagic.x.employee-finder"
+            # Multi-DM employee lookup (up to 3 roles: Founder/CEO, CMO/Growth, Paid Social/Performance)
+            # Runs whenever TG & WA are still missing and < 3 DMs found, EVEN if primary li_url is populated!
+            if (
+                not (_has_personal_tg(out) or _extract_whatsapp_url(out.get("whatsapp") or ""))
+                and len(dm_candidates) < MAX_DM_CANDIDATES
+                and dom
             ):
-                try:
-                    emp_payload = _call_treg_with_cap(
-                        active_treg,
-                        "leadmagic.x.employee-finder",
-                        max_cost=_remaining(),
-                        method="POST",
-                        data={"company_domain": dom, "limit": 5},
+                emp_dms: list[dict[str, str]] = []
+                if _remaining() + 1e-9 >= COST_LIMADATA_EMP_USD and _check_budget_guard(
+                    budget_guard_fn, "treg", COST_LIMADATA_EMP_USD, endpoint="limadata.people.employees.search"
+                ):
+                    try:
+                        lima_payload = _call_treg_with_cap(
+                            active_treg,
+                            "limadata.people.employees.search",
+                            max_cost=_remaining(),
+                            method="POST",
+                            data={"company_domains": [dom], "limit": 6},
+                        )
+                    except Exception:
+                        lima_payload = None
+                    emp_dms = _pick_decision_makers(lima_payload, limit=MAX_DM_CANDIDATES)
+                    lima_cost = (
+                        _extract_payload_cost(lima_payload, COST_LIMADATA_EMP_USD)
+                        if (emp_dms or _extract_payload_cost(lima_payload, 0.0) > 0)
+                        else 0.0
                     )
-                except Exception:
-                    emp_payload = None
-                emp_dms = _pick_decision_makers(emp_payload, limit=2)
-                emp_cost = _extract_payload_cost(emp_payload, COST_LEADMAGIC_EMP_USD) if (emp_dms or _extract_payload_cost(emp_payload, 0.0) > 0) else 0.0
-                if emp_cost > 0:
-                    lead_cost += emp_cost
-                    _record_cost_event(
-                        cost_record_fn,
-                        provider="treg",
-                        endpoint="leadmagic.x.employee-finder",
-                        lead_key=lead_key,
-                        cost_usd=emp_cost,
-                        hit=bool(emp_dms),
+                    if lima_cost > 0:
+                        lead_cost += lima_cost
+                        _record_cost_event(
+                            cost_record_fn,
+                            provider="treg",
+                            endpoint="limadata.people.employees.search",
+                            lead_key=lead_key,
+                            cost_usd=lima_cost,
+                            hit=bool(emp_dms),
+                        )
+
+                if (
+                    not emp_dms
+                    and _remaining() + 1e-9 >= COST_LEADMAGIC_EMP_USD
+                    and _check_budget_guard(
+                        budget_guard_fn, "treg", COST_LEADMAGIC_EMP_USD, endpoint="leadmagic.x.employee-finder"
                     )
+                ):
+                    try:
+                        emp_payload = _call_treg_with_cap(
+                            active_treg,
+                            "leadmagic.x.employee-finder",
+                            max_cost=_remaining(),
+                            method="POST",
+                            data={"company_domain": dom, "limit": 6},
+                        )
+                    except Exception:
+                        emp_payload = None
+                    emp_dms = _pick_decision_makers(emp_payload, limit=MAX_DM_CANDIDATES)
+                    emp_cost = (
+                        _extract_payload_cost(emp_payload, COST_LEADMAGIC_EMP_USD)
+                        if (emp_dms or _extract_payload_cost(emp_payload, 0.0) > 0)
+                        else 0.0
+                    )
+                    if emp_cost > 0:
+                        lead_cost += emp_cost
+                        _record_cost_event(
+                            cost_record_fn,
+                            provider="treg",
+                            endpoint="leadmagic.x.employee-finder",
+                            lead_key=lead_key,
+                            cost_usd=emp_cost,
+                            hit=bool(emp_dms),
+                        )
+
                 for dm_found in emp_dms:
                     _add_dm_candidate(dm_candidates, dm_found)
+                    dm_email = str(dm_found.get("work_email") or "").strip()
+                    if dm_email:
+                        email_pool.append(dm_email)
 
                 dm_info = emp_dms[0] if emp_dms else {}
                 if dm_info.get("founder_linkedin") and not linkedin_in_url(out.get("founder_linkedin") or ""):
@@ -2828,7 +3016,6 @@ def enrich_lead_contacts(
                     if _is_generic_or_empty_name(str(out.get("name") or ""), company, dom):
                         out["name"] = dm_info["founder_name"]
                 if dm_info.get("work_email"):
-                    email_pool.append(dm_info["work_email"])
                     unlocked_identity = True
                     tier2_unlocked_contact = True
 
@@ -2836,7 +3023,8 @@ def enrich_lead_contacts(
                 best_so_far = rank_and_pick_best_email(email_pool, domain=dom)
                 has_good_dm_email = bool(dm_info.get("work_email")) or is_personal_or_exec_email(best_so_far, dom)
                 if (
-                    not has_good_dm_email
+                    not li_url
+                    and not has_good_dm_email
                     and person_nm
                     and dom
                     and _remaining() + 1e-9 >= COST_CRAWL4AI_EMAIL_USD
@@ -2876,10 +3064,45 @@ def enrich_lead_contacts(
                     _merge_bridge_result(out, bridged2)
                     if _has_personal_tg(out):
                         tier2_unlocked_contact = True
+                        if dm_candidates:
+                            dm_candidates[0]["telegram_username"] = _has_personal_tg(out)
+                            if out.get("tg_bridge_match"):
+                                dm_candidates[0]["tg_bridge_match"] = str(out["tg_bridge_match"])
+                            if "tg_handle_is_guessed" in out:
+                                dm_candidates[0]["tg_handle_is_guessed"] = (
+                                    "1" if out["tg_handle_is_guessed"] else "0"
+                                )
                 except Exception as exc:
                     logger.debug("tier2 tg_bridge failed: %s", exc)
 
-            # Step 2B: Layer 1 Phone Waterfall + HLR Filter (for up to 2 DMs)
+        # Bridge newly discovered 2nd and 3rd DMs until TG is found (works even if active_treg is None)
+        if not _has_personal_tg(out) and len(dm_candidates) > 1:
+            for dm_item in dm_candidates[1:MAX_DM_CANDIDATES]:
+                if _is_valid_tg_handle(dm_item.get("telegram_username") or ""):
+                    tier2_unlocked_contact = True
+                    break
+                try:
+                    bridged_dm = _run_bridge(_build_dm_bridge_row(dm_item))
+                except Exception as exc:
+                    logger.debug("tier2 multi-dm tg_bridge failed: %s", exc)
+                    bridged_dm = None
+                if isinstance(bridged_dm, dict):
+                    dm_tg = _has_personal_tg(bridged_dm)
+                    if dm_tg:
+                        dm_item["telegram_username"] = dm_tg
+                        if bridged_dm.get("tg_bridge_match"):
+                            dm_item["tg_bridge_match"] = str(bridged_dm["tg_bridge_match"])
+                        if "tg_handle_is_guessed" in bridged_dm:
+                            dm_item["tg_handle_is_guessed"] = (
+                                "1" if bridged_dm["tg_handle_is_guessed"] else "0"
+                            )
+                        tier2_unlocked_contact = True
+                        break
+
+        _rebalance_dm_candidates()
+
+        if active_treg is not None:
+            # Step 2B: Layer 1 Phone Waterfall + HLR Filter (for up to MAX_DM_CANDIDATES = 3 DMs)
             # Only runs if TG, WA, and mobile phone are still missing.
             if not (
                 _has_personal_tg(out)
@@ -2901,7 +3124,7 @@ def enrich_lead_contacts(
                 raw_co_cap = enr_cfg.get("contactout_verified_cap_usd", CONTACTOUT_VERIFIED_PHONE_CAP_USD)
                 base_co_cap = CONTACTOUT_VERIFIED_PHONE_CAP_USD if raw_co_cap is None else max(0.0, float(raw_co_cap))
                 co_lead_budget = [base_co_cap]
-                for dm_item in dm_candidates[:2]:
+                for dm_item in dm_candidates[:MAX_DM_CANDIDATES]:
                     if dm_item.get("phone"):
                         continue
                     company_has_phone = any(bool(d.get("phone")) for d in dm_candidates)
@@ -2931,26 +3154,11 @@ def enrich_lead_contacts(
                         dm_item["phone_line_type"] = str(wf_res.get("line_type") or "UNKNOWN")
                         tier2_unlocked_contact = True
 
-                # Choose best DM as primary (prefer one with phone/TG/WA)
-                if dm_candidates:
-                    dm0 = dm_candidates[0]
-                    dm1 = dm_candidates[1] if len(dm_candidates) > 1 else None
-                    if not dm0.get("phone") and dm1 and dm1.get("phone"):
-                        dm_candidates[0], dm_candidates[1] = dm1, dm0
-                        primary_dm = dm_candidates[0]
-                        if primary_dm.get("founder_linkedin"):
-                            out["founder_linkedin"] = primary_dm["founder_linkedin"]
-                        if primary_dm.get("founder_name"):
-                            out["founder_name"] = primary_dm["founder_name"]
-                        if primary_dm.get("work_email"):
-                            email_pool.append(primary_dm["work_email"])
-                    if dm_candidates[0].get("phone"):
-                        out["phone"] = dm_candidates[0]["phone"]
-                        if dm_candidates[0].get("phone_line_type"):
-                            out["phone_line_type"] = dm_candidates[0]["phone_line_type"]
+                _rebalance_dm_candidates()
 
     # Persist 2nd DM into secondary_contact_json when present
     if len(dm_candidates) >= 2:
+        _rebalance_dm_candidates()
         out["secondary_contact_json"] = _build_secondary_contact_json(dm_candidates[1])
 
     actual_spent = round(lead_cost, 6)
