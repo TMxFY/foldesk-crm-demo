@@ -406,6 +406,17 @@ class TelegramGateway(ABC):
     async def send_message(self, session_path: str, peer_id: int, text: str, reply_to=None) -> dict:
         raise GatewayError("Отправка не подключена")
 
+    async def send_message_by_phone(
+        self,
+        session_path: str,
+        phone: str,
+        text: str,
+        *,
+        first_name: str = "",
+        image_path: str | None = None,
+    ) -> dict:
+        raise GatewayError("Отправка по телефону не подключена")
+
     async def edit_message(
         self, session_path: str, peer_id, telegram_message_id: int, text: str
     ) -> dict:
@@ -908,6 +919,33 @@ def write_sqlite_session_from_string(session_string: str, dest_path: Path) -> by
             raise
     except Exception:
         return None
+
+
+def _normalize_phone_e164(raw_phone: str | None) -> str:
+    text = str(raw_phone or "").strip()
+    if not text:
+        return ""
+    if text.startswith("00"):
+        digits = re.sub(r"\D", "", text[2:])
+    else:
+        digits = re.sub(r"\D", "", text)
+    if 7 <= len(digits) <= 15:
+        return f"+{digits}"
+    return ""
+
+
+def _validate_phone_send_inputs(
+    phone: str, text: str, *, first_name: str = "", image_path: str | None = None
+) -> tuple[str, str, str | None, str]:
+    body = (text or "").strip()
+    clean_img = (image_path or "").strip() or None
+    if not body and not clean_img:
+        raise GatewayError("Напишите сообщение")
+    e164 = _normalize_phone_e164(phone)
+    if not e164:
+        raise GatewayError("Некорректный номер телефона")
+    contact_first = (first_name or "").strip() or "Contact"
+    return body, e164, clean_img, contact_first
 
 
 def _person_name(user) -> str:
@@ -2799,6 +2837,122 @@ class TelethonGateway(TelegramGateway):
                 "direction": "out",
             }
 
+    async def send_message_by_phone(
+        self,
+        session_path: str,
+        phone: str,
+        text: str,
+        *,
+        first_name: str = "",
+        image_path: str | None = None,
+    ) -> dict:
+        body, e164, clean_img, contact_first = _validate_phone_send_inputs(
+            phone, text, first_name=first_name, image_path=image_path
+        )
+
+        from telethon.tl.functions.contacts import DeleteContactsRequest, ImportContactsRequest
+        from telethon.tl.types import Channel, Chat, InputPhoneContact
+
+        async with self._session_lock(session_path):
+            client, owned = await self._open(session_path)
+            try:
+                imported_users: list = []
+                try:
+                    res = await asyncio.wait_for(
+                        client(
+                            ImportContactsRequest(
+                                [
+                                    InputPhoneContact(
+                                        client_id=1,
+                                        phone=e164,
+                                        first_name=contact_first,
+                                        last_name="",
+                                    )
+                                ]
+                            )
+                        ),
+                        timeout=self._rpc_timeout,
+                    )
+                    imported_users = list(getattr(res, "users", None) or ())
+                    candidates = [
+                        u
+                        for u in imported_users
+                        if not isinstance(u, (Chat, Channel))
+                        and not getattr(u, "bot", False)
+                        and not getattr(u, "deleted", False)
+                        and not getattr(u, "is_self", False)
+                        and getattr(u, "id", None) is not None
+                    ]
+                    if not candidates:
+                        raise GatewayError(f"Номер {e164} не найден в Telegram")
+                    target_user = candidates[0]
+                    for imp in list(getattr(res, "imported", None) or ()):
+                        if int(getattr(imp, "client_id", 0) or 0) == 1:
+                            imp_uid = getattr(imp, "user_id", None)
+                            matched_u = next(
+                                (u for u in candidates if int(u.id) == int(imp_uid)),
+                                None,
+                            )
+                            if matched_u is not None:
+                                target_user = matched_u
+                                break
+
+                    if clean_img:
+                        from app.db import resolve_outreach_media
+
+                        media_target = resolve_outreach_media(clean_img)
+                        msg = await asyncio.wait_for(
+                            client.send_file(
+                                target_user,
+                                str(media_target),
+                                caption=body or None,
+                            ),
+                            timeout=self._rpc_timeout,
+                        )
+                    else:
+                        msg = await asyncio.wait_for(
+                            client.send_message(target_user, body),
+                            timeout=self._rpc_timeout,
+                        )
+                finally:
+                    if imported_users:
+                        try:
+                            await asyncio.wait_for(
+                                client(DeleteContactsRequest(id=imported_users)),
+                                timeout=min(5.0, self._rpc_timeout),
+                            )
+                        except Exception as del_exc:
+                            logger.warning("DeleteContactsRequest cleanup failed: %s", del_exc)
+            except GatewayError:
+                raise
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as exc:
+                await self._drop_zombie_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Таймаут отправки по телефону в Telegram") from exc
+            except Exception as exc:
+                if _classify_session_error(exc).get("health") in ("unauthorized", "banned", "frozen"):
+                    await self._evict_client_unlocked(session_path)
+                raise GatewayError(str(exc) or "Не удалось отправить по телефону") from exc
+            finally:
+                if owned:
+                    await self._close(session_path)
+
+            raw_uname = str(getattr(target_user, "username", "") or "").strip().lstrip("@")
+            if not raw_uname:
+                for extra in getattr(target_user, "usernames", None) or ():
+                    if getattr(extra, "active", True):
+                        handle = str(getattr(extra, "username", "") or "").strip().lstrip("@")
+                        if handle:
+                            raw_uname = handle
+                            break
+            return {
+                "telegram_message_id": int(msg.id),
+                "telegram_user_id": int(target_user.id),
+                "username": raw_uname or None,
+                "text": getattr(msg, "message", None) or body,
+                "sent_at": _stamp(getattr(msg, "date", None)),
+                "direction": "out",
+            }
+
     async def edit_message(
         self, session_path: str, peer_id, telegram_message_id: int, text: str
     ) -> dict:
@@ -3955,6 +4109,7 @@ class FakeGateway(TelegramGateway):
         health=None,
         folders=None,
         profiles=None,
+        phone_contacts=None,
     ):
         self.code = code
         self.password = password
@@ -3965,6 +4120,11 @@ class FakeGateway(TelegramGateway):
             raw_k = str(k).strip()
             norm_k = raw_k.lstrip("@").lower() if not raw_k.lstrip("-").isdigit() else raw_k
             self.profiles[norm_k] = dict(v)
+        self.phone_contacts = {}
+        for pk, pv in (phone_contacts or {}).items():
+            norm_pk = _normalize_phone_e164(pk) or str(pk).strip()
+            if norm_pk:
+                self.phone_contacts[norm_pk] = None if pv is None else dict(pv)
         self.dialogs = [dict(item) for item in (dialogs or [])]
         self.folders = []
         for item in folders or []:
@@ -4352,6 +4512,95 @@ class FakeGateway(TelegramGateway):
         }
         self.history.setdefault(peer_key, []).append(dict(record))
         return record
+
+    async def send_message_by_phone(
+        self,
+        session_path: str,
+        phone: str,
+        text: str,
+        *,
+        first_name: str = "",
+        image_path: str | None = None,
+    ) -> dict:
+        body, e164, clean_img, contact_first = _validate_phone_send_inputs(
+            phone, text, first_name=first_name, image_path=image_path
+        )
+
+        resolved_uid: int | None = None
+        resolved_username: str | None = None
+        if e164 in self.phone_contacts:
+            entry = self.phone_contacts[e164]
+            if (
+                entry is None
+                or entry.get("bot")
+                or entry.get("deleted")
+                or entry.get("found") is False
+            ):
+                raise GatewayError(f"Номер {e164} не найден в Telegram")
+            if entry.get("telegram_user_id") is not None:
+                resolved_uid = int(entry["telegram_user_id"])
+            raw_un = str(entry.get("username") or "").strip().lstrip("@")
+            resolved_username = raw_un or None
+        else:
+            for dlg in self.dialogs:
+                if _normalize_phone_e164(dlg.get("phone")) == e164:
+                    if dlg.get("telegram_user_id") is not None:
+                        resolved_uid = int(dlg["telegram_user_id"])
+                    raw_un = str(dlg.get("username") or "").strip().lstrip("@")
+                    resolved_username = raw_un or None
+                    break
+        if resolved_uid is None:
+            for k in (e164, e164.lstrip("+")):
+                if k in self.profiles:
+                    prof = self.profiles[k]
+                    if prof.get("telegram_user_id") is not None:
+                        resolved_uid = int(prof["telegram_user_id"])
+                    raw_un = str(prof.get("username") or "").strip().lstrip("@")
+                    resolved_username = raw_un or None
+                    break
+        if resolved_uid is None:
+            digits = re.sub(r"\D", "", e164)
+            resolved_uid = 1000000 + int(digits[-7:])
+
+        self._message_seq += 1
+        used = {
+            int(row.get("telegram_message_id") or 0)
+            for row in self.history.get(resolved_uid, [])
+        }
+        while self._message_seq in used:
+            self._message_seq += 1
+        sent_at = utc_now()
+        self.sent.append(
+            {
+                "peer_id": resolved_uid,
+                "telegram_user_id": resolved_uid,
+                "username": resolved_username,
+                "phone": e164,
+                "first_name": contact_first,
+                "text": body,
+                "image_url": clean_img,
+                "image_path": clean_img,
+                "session_path": session_path,
+                "via": "send_message_by_phone",
+            }
+        )
+        history_rec = {
+            "telegram_message_id": self._message_seq,
+            "text": body,
+            "image_url": clean_img,
+            "sent_at": sent_at,
+            "direction": "out",
+            "reply_to_telegram_message_id": None,
+        }
+        self.history.setdefault(resolved_uid, []).append(dict(history_rec))
+        return {
+            "telegram_message_id": self._message_seq,
+            "telegram_user_id": resolved_uid,
+            "username": resolved_username,
+            "text": body,
+            "sent_at": sent_at,
+            "direction": "out",
+        }
 
     async def edit_message(
         self, session_path: str, peer_id, telegram_message_id: int, text: str

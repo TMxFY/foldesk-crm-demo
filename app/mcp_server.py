@@ -2326,6 +2326,8 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         tg_id_raw = item.get("telegram_user_id")
         if raw_provider in ("telegram", "whatsapp"):
             provider = raw_provider
+        elif bool(item.get("tg_phone_direct")) and (tg_id_raw is not None or phone):
+            provider = "telegram"
         elif item.get("whatsapp") and not username and not tg_id_raw:
             provider = "whatsapp"
         else:
@@ -2879,6 +2881,13 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 upd_fields["phone"] = phone
             if username and not existing.get("username"):
                 upd_fields["username"] = username
+            if (
+                provider == "telegram"
+                and str(existing.get("provider") or "").strip().lower() != "telegram"
+                and not existing.get("dialog_id")
+                and (real_tg_id is not None or bool(item.get("tg_phone_direct")) or bool(username))
+            ):
+                upd_fields["provider"] = "telegram"
             if our_angle and not existing.get("offer_details"):
                 upd_fields["offer_details"] = our_angle
 
@@ -2897,7 +2906,12 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
             if upd_fields:
                 update_lead(conn, lid, **upd_fields)
             existing_tg_id = existing.get("telegram_user_id")
-            if existing_tg_id is None and has_direct_messenger_handle:
+            is_existing_synthetic = (
+                existing_tg_id is not None and 900000 <= int(existing_tg_id) <= 999999
+            )
+            if (existing_tg_id is None and has_direct_messenger_handle) or (
+                real_tg_id is not None and is_existing_synthetic
+            ):
                 existing_tg_id = real_tg_id if real_tg_id is not None else (900000 + lid)
                 try:
                     conn.execute(

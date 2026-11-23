@@ -602,7 +602,8 @@ def route_resolved_lead(
     """Route a lead record using resolved messenger verification outcomes.
 
     Priority order:
-      1. Telegram username found -> provider='telegram', username, telegram_user_id.
+      1. Telegram username or verified TG user ID found -> provider='telegram', telegram_user_id
+         (with tg_phone_direct=True when username is empty).
       2. WhatsApp verified -> provider='whatsapp', phone=<e164>, whatsapp='https://wa.me/<digits>'.
       3. WhatsApp check pending -> preserve phone, wa_check_pending=True (+ click-to-WA URL/draft).
       4. Neither TG nor WA, icp_score >= 85 ->
@@ -624,6 +625,14 @@ def route_resolved_lead(
             out["telegram_user_id"] = int(resolved.telegram_user_id)
         if resolved and resolved.phone_e164:
             out["phone"] = resolved.phone_e164
+        out["wa_check_pending"] = False
+        return out
+
+    if resolved and resolved.tg_check_status == "found" and resolved.telegram_user_id is not None:
+        out["provider"] = "telegram"
+        out["telegram_user_id"] = int(resolved.telegram_user_id)
+        out["phone"] = resolved.phone_e164 or normalize_e164(str(out.get("phone") or ""))
+        out["tg_phone_direct"] = True
         out["wa_check_pending"] = False
         return out
 

@@ -61,7 +61,7 @@ def test_default_leadgen_config_and_disk_json_v2_sections(
         # Enrichment budget & alert guardrails
         enr = cfg["enrichment"]
         assert enr == {
-            "daily_budget_cap_usd": 5.0,
+            "daily_budget_cap_usd": 10.0,
             "per_lead_cap_usd": 0.05,
             "super_whale_cap_usd": 0.15,
             "contactout_verified_cap_usd": 0.25,
@@ -76,11 +76,12 @@ def test_default_leadgen_config_and_disk_json_v2_sections(
         wh = cfg["whales"]
         assert wh["geos"] == ["US", "GB", "AE", "SA", "DE", "FR", "NL", "ES", "IT", "SE", "CA", "AU"]
         assert wh["whop_min_pool_usd"] == 5000
-        assert wh["max_dms_per_company"] == 2
+        assert wh["max_dms_per_company"] == 3
         assert wh["secondary_dm_wait_days"] == 6
         assert wh["tg_group_admins_enabled"] is True
-        assert wh["phone_tg_checker_daily_limit"] == 120
+        assert wh["phone_tg_checker_daily_limit"] == 200
         assert wh["phone_tg_checker_batch_size"] == 15
+        assert wh["allow_phone_checker_ro_fallback"] is True
 
         # Vacancies v2 section (Gate D requires default enabled == False)
         vac = cfg["vacancies"]
