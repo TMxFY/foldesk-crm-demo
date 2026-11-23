@@ -352,10 +352,12 @@ def _has_messenger_contact(
     username: Any = None,
     phone: Any = None,
     telegram_user_id: Any = None,
+    provider: Any = None,
 ) -> bool:
     if _clean_username_token(username):
         return True
-    if str(phone or "").strip():
+    phone_str = str(phone or "").strip()
+    if phone_str and phone_str.casefold() not in {"none", "null", "n/a", "na", "-", "—"}:
         return True
     if _has_real_tg_id(telegram_user_id):
         return True
@@ -795,6 +797,7 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
                 username=ld.get("username"),
                 phone=ld.get("phone"),
                 telegram_user_id=ld.get("telegram_user_id"),
+                provider=ld.get("provider"),
             )
             has_dialog = ld.get("dialog_id") is not None and int(ld.get("dialog_id") or 0) > 0
             if not has_contact and not has_dialog and not is_contactless_exempt:
@@ -857,6 +860,7 @@ def _collect_hygiene_findings(conn: sqlite3.Connection) -> dict[str, Any]:
             username=rd.get("username"),
             phone=rd.get("phone"),
             telegram_user_id=rd.get("telegram_user_id"),
+            provider=(linked_lead or {}).get("provider"),
         )
         if not has_contact:
             active_junk_recipients.append(

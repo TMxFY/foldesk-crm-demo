@@ -42,6 +42,7 @@ from app.db import (
 
 logger = logging.getLogger(__name__)
 PREWARM_STORIES_TIMEOUT_SEC: float = 8.0
+MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY: int = 5
 ICP_GUARD_ERROR = "Остановлено ICP-фильтром: нерелевантный профиль или пустой продукт"
 QUARANTINED_SOURCE_ERROR = "Источник поставлен на авто-карантин из-за жалоб/низкого качества"
 from app.inbox import (
@@ -50,7 +51,193 @@ from app.inbox import (
     _record_lead_event_safe,
     stop_outreach_on_reply,
 )
-from app.telegram_gateway import parse_spambot_details
+from app.telegram_gateway import _normalize_phone_e164, parse_spambot_details
+
+
+def _tg_phone_direct_kv_key(account_id: int, today_iso: str) -> str:
+    return f"tg_phone_direct_sent:{int(account_id)}:{today_iso}"
+
+
+def get_tg_phone_direct_sent_today(
+    conn,
+    account_id: int,
+    *,
+    today: str | None = None,
+) -> int:
+    """Return today's Telegram phone-direct sends count for one account from kv_settings."""
+    eff_today = (today or "").strip() or utc_today()
+    key = _tg_phone_direct_kv_key(int(account_id), eff_today)
+    row = conn.execute(
+        "SELECT value FROM kv_settings WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None or row["value"] is None:
+        return 0
+    try:
+        return max(0, int(str(row["value"]).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _increment_tg_phone_direct_sent_today(
+    conn,
+    account_id: int,
+    *,
+    today: str | None = None,
+) -> int:
+    eff_today = (today or "").strip() or utc_today()
+    key = _tg_phone_direct_kv_key(int(account_id), eff_today)
+    now_ts = utc_now()
+    with locked_conn(conn):
+        cur_val = get_tg_phone_direct_sent_today(conn, int(account_id), today=eff_today)
+        new_val = cur_val + 1
+        conn.execute(
+            """
+            INSERT INTO kv_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(new_val), now_ts),
+        )
+        conn.commit()
+        return new_val
+
+
+def _is_tg_entity_resolution_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    cause = getattr(exc, "__cause__", None)
+    blob = (
+        f"{exc.__class__.__name__} "
+        f"{cause.__class__.__name__ if cause is not None else ''} "
+        f"{cause or ''} {exc}"
+    ).casefold()
+    return any(
+        marker in blob
+        for marker in (
+            "could not find the input entity",
+            "peeruser",
+            "cannot find any entity corresponding to",
+            "no user has ",
+            "nobody is using this username",
+            "usernameinvalid",
+            "usernamenotoccupied",
+        )
+    )
+
+
+def _sync_tg_phone_direct_identity(
+    conn,
+    *,
+    account_id: int,
+    dialog: dict,
+    rec: dict,
+    sent_res: Mapping[str, Any],
+    now_ts: str,
+) -> dict:
+    """Sync real telegram_user_id and username returned by send_message_by_phone into dialogs/recipients/leads."""
+    ret_uid_raw = sent_res.get("telegram_user_id")
+    ret_uid: int | None = None
+    if ret_uid_raw is not None and not isinstance(ret_uid_raw, bool):
+        try:
+            cand_uid = int(ret_uid_raw)
+            if cand_uid > 0 and not _is_synthetic_peer_id(cand_uid):
+                ret_uid = cand_uid
+        except (TypeError, ValueError):
+            ret_uid = None
+    ret_uname = _clean_handle(sent_res.get("username"))
+
+    cur_dlg = dict(dialog)
+    dlg_id = safe_int(cur_dlg.get("id"))
+    if dlg_id is not None and ret_uid is not None:
+        cur_peer = safe_int(cur_dlg.get("peer_id"))
+        if cur_peer != ret_uid:
+            existing_real = conn.execute(
+                "SELECT * FROM dialogs WHERE account_id = ? AND peer_type = 'user' AND peer_id = ?",
+                (int(account_id), ret_uid),
+            ).fetchone()
+            if existing_real is not None and int(existing_real["id"]) != dlg_id:
+                real_dlg = as_dict(existing_real)
+                old_msg_cnt = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE dialog_id = ?",
+                        (dlg_id,),
+                    ).fetchone()[0]
+                    or 0
+                )
+                if old_msg_cnt == 0:
+                    conn.execute(
+                        "UPDATE leads SET dialog_id = ? WHERE dialog_id = ?",
+                        (real_dlg["id"], dlg_id),
+                    )
+                    conn.execute("DELETE FROM dialogs WHERE id = ?", (dlg_id,))
+                    cur_dlg = real_dlg
+                    dlg_id = int(real_dlg["id"])
+            else:
+                try:
+                    conn.execute(
+                        "UPDATE dialogs SET peer_id = ?, updated_at = ? WHERE id = ?",
+                        (ret_uid, now_ts, dlg_id),
+                    )
+                    cur_dlg["peer_id"] = ret_uid
+                except sqlite3.IntegrityError:
+                    pass
+
+    if dlg_id is not None and ret_uname:
+        conn.execute(
+            """
+            UPDATE dialogs
+            SET username = ?, updated_at = ?
+            WHERE id = ?
+              AND (username IS NULL OR trim(username) = '' OR lower(username) != lower(?))
+            """,
+            (ret_uname, now_ts, dlg_id, ret_uname),
+        )
+        cur_dlg["username"] = ret_uname
+
+    if ret_uid is not None and (
+        rec.get("telegram_user_id") is None
+        or _is_synthetic_peer_id(rec.get("telegram_user_id"))
+        or safe_int(rec.get("telegram_user_id")) != ret_uid
+    ):
+        conn.execute(
+            "UPDATE campaign_recipients SET telegram_user_id = ?, updated_at = ? WHERE id = ?",
+            (ret_uid, now_ts, rec["id"]),
+        )
+        rec["telegram_user_id"] = ret_uid
+
+    if ret_uname and (
+        not _clean_handle(rec.get("username"))
+        or (_clean_handle(rec.get("username")) or "").lower() != ret_uname.lower()
+    ):
+        conn.execute(
+            "UPDATE campaign_recipients SET username = ?, updated_at = ? WHERE id = ?",
+            (ret_uname, now_ts, rec["id"]),
+        )
+        rec["username"] = ret_uname
+
+    lead_id_val = safe_int(rec.get("lead_id"))
+    if lead_id_val is not None:
+        if ret_uid is not None:
+            try:
+                conn.execute(
+                    """
+                    UPDATE leads
+                    SET telegram_user_id = ?, updated_at = ?
+                    WHERE id = ?
+                      AND (telegram_user_id IS NULL OR (telegram_user_id BETWEEN 900000 AND 999999) OR telegram_user_id != ?)
+                    """,
+                    (ret_uid, now_ts, lead_id_val, ret_uid),
+                )
+            except sqlite3.IntegrityError:
+                pass
+        if ret_uname:
+            conn.execute(
+                "UPDATE leads SET username = ?, updated_at = ? WHERE id = ? AND (username IS NULL OR trim(username) = '' OR lower(username) != lower(?))",
+                (ret_uname, now_ts, lead_id_val, ret_uname),
+            )
+
+    return cur_dlg
 
 CAMPAIGN_STATUSES = ("draft", "running", "paused", "completed")
 RECIPIENT_STATUSES = ("pending", "in_progress", "completed", "replied", "failed")
@@ -2495,6 +2682,7 @@ def _is_invalid_recipient_error(exc: BaseException | None) -> bool:
             "chatwriteforbidden",
             "allow_payment_required",
             "payment_required",
+            "не найден в telegram",
             "не зарегистрирован в whatsapp",
             "некорректный номер получателя whatsapp",
         )
@@ -6540,7 +6728,9 @@ async def run_campaign_batch(
             replied_skipped = False
             rotated_after_failure = False
             recipient_excluded_accounts: set[int] = set()
+            phone_direct_capped_accounts: set[int] = set()
             spambot_retried_accounts: set[int] = set()
+            rec_e164 = _normalize_phone_e164(clean_rec_phone)
             effective_rendered_text = rendered_text
             effective_step_image_url = step_image_url
             while True:
@@ -6574,10 +6764,11 @@ async def run_campaign_batch(
                     if step_idx == 0:
                         no_new_lead_quota_left = True
                     break
+                excluded_for_rec = recipient_excluded_accounts | phone_direct_capped_accounts
                 available = [
                     st
                     for st in globally_available
-                    if st["id"] not in recipient_excluded_accounts
+                    if st["id"] not in excluded_for_rec
                     and not _is_same_tg_identity(st["raw"], clean_rec_uname, real_rec_peer_id)
                 ]
                 if not available:
@@ -6611,7 +6802,7 @@ async def run_campaign_batch(
                         elif (
                             not pinned_state.get("disabled")
                             and not pinned_state.get("dead")
-                            and pinned_state["id"] not in recipient_excluded_accounts
+                            and pinned_state["id"] not in excluded_for_rec
                             and pinned_state["sent_today"] < min(pinned_state["daily_limit"], pinned_state["paced_limit"])
                         ):
                             chosen_state = pinned_state
@@ -6623,7 +6814,7 @@ async def run_campaign_batch(
                         not pinned_state.get("disabled")
                         and not pinned_state.get("spambot_warm_only")
                         and not pinned_state.get("wa_cold_blocked")
-                        and pinned_state["id"] not in recipient_excluded_accounts
+                        and pinned_state["id"] not in excluded_for_rec
                         and pinned_state["sent_today"] < pinned_state["paced_limit"]
                         and (
                             pinned_state["daily_limit"]
@@ -6737,6 +6928,20 @@ async def run_campaign_batch(
                             chosen_state["wa_cold_blocked"] = True
                             continue
                 use_gateway = active_gw is not None and not is_demo_session
+                use_phone_direct_primary = (
+                    acc_provider == "telegram"
+                    and not clean_rec_uname
+                    and bool(rec_e164)
+                    and use_gateway
+                    and hasattr(active_gw, "send_message_by_phone")
+                )
+                if use_phone_direct_primary and step_idx == 0:
+                    pd_sent_today = get_tg_phone_direct_sent_today(
+                        conn, chosen_account_id, today=today_loop_iso
+                    )
+                    if pd_sent_today >= MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY:
+                        phone_direct_capped_accounts.add(chosen_account_id)
+                        continue
 
                 if not jitter_applied and jitter_range is not None and len(jitter_range) == 2:
                     jitter_applied = True
@@ -6900,6 +7105,15 @@ async def run_campaign_batch(
                             replied_skipped = True
                             break
 
+                    if use_phone_direct_primary and step_idx >= 1:
+                        pd_sent_today = get_tg_phone_direct_sent_today(
+                            conn, chosen_account_id, today=today_loop_iso
+                        )
+                        if pd_sent_today >= MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY:
+                            phone_direct_capped_accounts.add(chosen_account_id)
+                            _release_followup_reservation(int(rec["id"]))
+                            break
+
                     reserved_ok, res_acc, res_lim, res_sent = _reserve_account_send_slot(
                         conn,
                         chosen_account_id,
@@ -6946,55 +7160,114 @@ async def run_campaign_batch(
                     else:
                         next_step_order = step_idx + 1
                         if use_gateway:
-                            peer_target = (
-                                f"@{rec['username']}"
-                                if (_is_synthetic_peer_id(dialog["peer_id"]) and rec.get("username"))
-                                else dialog["peer_id"]
-                            )
-                            if next_step_order == 1:
-                                target_entity = peer_target
+                            used_phone_direct = False
+                            raw_contact_name = str(rec.get("first_name") or rec.get("name") or "").strip()
+                            contact_first_name = raw_contact_name.split()[0] if raw_contact_name else ""
+                            if use_phone_direct_primary:
+                                sent = await active_gw.send_message_by_phone(
+                                    session_path,
+                                    rec_e164,
+                                    effective_rendered_text,
+                                    first_name=contact_first_name,
+                                    image_path=effective_step_image_url,
+                                )
+                                used_phone_direct = True
+                            else:
+                                peer_target = (
+                                    f"@{rec['username']}"
+                                    if (_is_synthetic_peer_id(dialog["peer_id"]) and rec.get("username"))
+                                    else dialog["peer_id"]
+                                )
+                                if next_step_order == 1:
+                                    target_entity = peer_target
 
-                                async def _do_bounded_prewarm() -> None:
-                                    client = await _resolve_telethon_client_for_prewarm(
-                                        active_gw, session_path
-                                    )
-                                    if client is not None:
-                                        await prewarm_recipient_stories(client, target_entity)
+                                    async def _do_bounded_prewarm() -> None:
+                                        client = await _resolve_telethon_client_for_prewarm(
+                                            active_gw, session_path
+                                        )
+                                        if client is not None:
+                                            await prewarm_recipient_stories(client, target_entity)
 
-                                try:
-                                    lock_fn = getattr(active_gw, "_session_lock", None)
-                                    if callable(lock_fn):
-                                        async with lock_fn(session_path):
+                                    try:
+                                        lock_fn = getattr(active_gw, "_session_lock", None)
+                                        if callable(lock_fn):
+                                            async with lock_fn(session_path):
+                                                await asyncio.wait_for(
+                                                    _do_bounded_prewarm(),
+                                                    timeout=PREWARM_STORIES_TIMEOUT_SEC,
+                                                )
+                                        else:
                                             await asyncio.wait_for(
                                                 _do_bounded_prewarm(),
                                                 timeout=PREWARM_STORIES_TIMEOUT_SEC,
                                             )
-                                    else:
-                                        await asyncio.wait_for(
-                                            _do_bounded_prewarm(),
-                                            timeout=PREWARM_STORIES_TIMEOUT_SEC,
+                                    except (asyncio.TimeoutError, TimeoutError):
+                                        logger.warning(
+                                            "prewarm_recipient_stories timed out after %.2fs for %s on %s",
+                                            PREWARM_STORIES_TIMEOUT_SEC,
+                                            target_entity,
+                                            session_path,
                                         )
-                                except (asyncio.TimeoutError, TimeoutError):
-                                    logger.warning(
-                                        "prewarm_recipient_stories timed out after %.2fs for %s on %s",
-                                        PREWARM_STORIES_TIMEOUT_SEC,
-                                        target_entity,
+                                    except Exception as pre_exc:
+                                        logger.debug(
+                                            "prewarm_recipient_stories skipped for %s: %s",
+                                            target_entity,
+                                            pre_exc,
+                                        )
+                                try:
+                                    sent = await _tg_send_with_username_fallback(
+                                        active_gw,
                                         session_path,
+                                        peer_target,
+                                        effective_rendered_text,
+                                        effective_step_image_url,
+                                        rec.get("username"),
                                     )
-                                except Exception as pre_exc:
-                                    logger.debug(
-                                        "prewarm_recipient_stories skipped for %s: %s",
-                                        target_entity,
-                                        pre_exc,
-                                    )
-                            sent = await _tg_send_with_username_fallback(
-                                active_gw,
-                                session_path,
-                                peer_target,
-                                effective_rendered_text,
-                                effective_step_image_url,
-                                rec.get("username"),
-                            )
+                                except Exception as send_exc:
+                                    if (
+                                        rec_e164
+                                        and hasattr(active_gw, "send_message_by_phone")
+                                        and _is_tg_entity_resolution_error(send_exc)
+                                    ):
+                                        pd_sent_today = get_tg_phone_direct_sent_today(
+                                            conn, chosen_account_id, today=today_loop_iso
+                                        )
+                                        if pd_sent_today >= MAX_TG_PHONE_DIRECT_PER_ACCOUNT_DAY:
+                                            if slot_reserved:
+                                                _release_account_send_slot(
+                                                    conn,
+                                                    chosen_account_id,
+                                                    today_iso=today_loop_iso,
+                                                )
+                                                slot_reserved = False
+                                            _cleanup_empty_step0_dialog(conn, step_idx, dialog)
+                                            phone_direct_capped_accounts.add(chosen_account_id)
+                                            if step_idx >= 1:
+                                                _release_followup_reservation(int(rec["id"]))
+                                                break
+                                            continue
+                                        sent = await active_gw.send_message_by_phone(
+                                            session_path,
+                                            rec_e164,
+                                            effective_rendered_text,
+                                            first_name=contact_first_name,
+                                            image_path=effective_step_image_url,
+                                        )
+                                        used_phone_direct = True
+                                    else:
+                                        raise
+                            if used_phone_direct:
+                                _increment_tg_phone_direct_sent_today(
+                                    conn, chosen_account_id, today=today_loop_iso
+                                )
+                                dialog = _sync_tg_phone_direct_identity(
+                                    conn,
+                                    account_id=chosen_account_id,
+                                    dialog=dialog,
+                                    rec=rec,
+                                    sent_res=sent,
+                                    now_ts=now,
+                                )
                             tg_mid = int(sent["telegram_message_id"])
                             sent_at = str(sent.get("sent_at") or now)
                         else:
@@ -7124,7 +7397,7 @@ async def run_campaign_batch(
                         continue
 
                     is_unregistered_wa = "не зарегистрирован в whatsapp" in str(exc or "").casefold()
-                    if is_unregistered_wa:
+                    if is_unregistered_wa or (use_phone_direct_primary and _is_invalid_recipient_error(exc)):
                         _cleanup_empty_step0_dialog(conn, step_idx, dialog)
                     conn.execute(
                         """

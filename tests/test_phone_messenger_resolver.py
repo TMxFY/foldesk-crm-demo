@@ -400,6 +400,16 @@ def test_route_resolved_lead_priorities_and_social_manual() -> None:
                 whatsapp_exists=False,
                 wa_check_pending=False,
             ),
+            "+14155550105": ResolvedMessenger(
+                phone_e164="+14155550105",
+                whatsapp_exists=True,
+                whatsapp_jid="14155550105@s.whatsapp.net",
+            ),
+            "+14155550106": ResolvedMessenger(
+                phone_e164="+14155550106",
+                whatsapp_exists=True,
+                whatsapp_jid="14155550106@s.whatsapp.net",
+            ),
         },
         {
             "+14155550101": ResolvedMessenger(
@@ -408,11 +418,23 @@ def test_route_resolved_lead_priorities_and_social_manual() -> None:
                 telegram_user_id=9001,
                 tg_check_status="found",
             ),
-            # User on Telegram without username -> should fall through to WhatsApp!
+            # User on Telegram without username -> routes to TG phone-direct!
             "+14155550102": ResolvedMessenger(
                 phone_e164="+14155550102",
                 telegram_username="",
                 telegram_user_id=9002,
+                tg_check_status="found",
+            ),
+            "+14155550105": ResolvedMessenger(
+                phone_e164="+14155550105",
+                telegram_username="",
+                telegram_user_id=None,
+                tg_check_status="not_found",
+            ),
+            "+14155550106": ResolvedMessenger(
+                phone_e164="+14155550106",
+                telegram_username="",
+                telegram_user_id=None,
                 tg_check_status="found",
             ),
         },
@@ -426,12 +448,27 @@ def test_route_resolved_lead_priorities_and_social_manual() -> None:
     assert routed1["telegram_user_id"] == 9001
     assert routed1["phone"] == "+14155550101"
 
-    # Priority 2: WhatsApp
+    # Priority 1b: TG phone-direct (found + telegram_user_id without username) beats WhatsApp
     routed2 = route_resolved_lead({"phone": "14155550102", "icp_score": 90}, merged)
-    assert routed2["provider"] == "whatsapp"
+    assert routed2["provider"] == "telegram"
+    assert routed2["telegram_user_id"] == 9002
     assert routed2["phone"] == "+14155550102"
-    assert routed2["whatsapp"] == "https://wa.me/14155550102"
+    assert routed2["tg_phone_direct"] is True
     assert routed2["wa_check_pending"] is False
+    assert not routed2.get("username")
+
+    # Priority 2: WhatsApp fallback when TG not_found or telegram_user_id is None
+    routed_wa = route_resolved_lead({"phone": "14155550105", "icp_score": 90}, merged)
+    assert routed_wa["provider"] == "whatsapp"
+    assert routed_wa["phone"] == "+14155550105"
+    assert routed_wa["whatsapp"] == "https://wa.me/14155550105"
+    assert routed_wa["wa_check_pending"] is False
+
+    routed_wa_no_uid = route_resolved_lead({"phone": "+14155550106", "icp_score": 90}, merged)
+    assert routed_wa_no_uid["provider"] == "whatsapp"
+    assert routed_wa_no_uid["phone"] == "+14155550106"
+    assert routed_wa_no_uid["whatsapp"] == "https://wa.me/14155550106"
+    assert routed_wa_no_uid["wa_check_pending"] is False
 
     # Priority 3: WA check pending preserves phone and blocks premature social_manual fallback
     routed3 = route_resolved_lead(

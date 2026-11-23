@@ -172,7 +172,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         },
     },
     "enrichment": {
-        "daily_budget_cap_usd": 5.0,
+        "daily_budget_cap_usd": 10.0,
         "per_lead_cap_usd": 0.05,
         "super_whale_cap_usd": 0.15,
         "contactout_verified_cap_usd": 0.25,
@@ -185,11 +185,12 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
     "whales": {
         "geos": list(DEFAULT_WHALES_GEOS),
         "whop_min_pool_usd": 5000,
-        "max_dms_per_company": 2,
+        "max_dms_per_company": 3,
         "secondary_dm_wait_days": 6,
         "tg_group_admins_enabled": True,
-        "phone_tg_checker_daily_limit": 120,
+        "phone_tg_checker_daily_limit": 200,
         "phone_tg_checker_batch_size": 15,
+        "allow_phone_checker_ro_fallback": True,
     },
     "vacancies": {
         "enabled": False,
@@ -338,6 +339,24 @@ def _parse_int_range(raw: Any, default: int, lo: int, hi: int, label: str) -> in
     return val
 
 
+def _parse_bool_flag(raw: Any, default: bool, label: str) -> bool:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int):
+        if raw in (0, 1):
+            return bool(raw)
+        raise ValueError(f"{label} должно быть булевым значением")
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"{label} должно быть булевым значением")
+
+
 def _normalize_enrichment_config(raw: Any) -> dict[str, Any]:
     enr = dict(raw) if isinstance(raw, dict) else {}
     defaults = DEFAULT_LEADGEN_CONFIG["enrichment"]
@@ -407,6 +426,11 @@ def _normalize_whales_config(raw: Any) -> dict[str, Any]:
             1,
             100,
             "whales.phone_tg_checker_batch_size",
+        ),
+        "allow_phone_checker_ro_fallback": _parse_bool_flag(
+            wh.get("allow_phone_checker_ro_fallback"),
+            defaults["allow_phone_checker_ro_fallback"],
+            "whales.allow_phone_checker_ro_fallback",
         ),
     }
 
@@ -2058,9 +2082,15 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                 if phone_digits:
                     phone_val = f"+{phone_digits}"
                     cand["phone"] = phone_val
-                    if canon_wa or str(cand.get("provider") or "").strip().lower() == "whatsapp":
+                    if (
+                        str(cand.get("provider") or "").strip().lower() != "telegram"
+                        and (canon_wa or str(cand.get("provider") or "").strip().lower() == "whatsapp")
+                    ):
                         cand["whatsapp"] = f"https://wa.me/{phone_digits}"
-                if uname:
+                if uname or (
+                    str(cand.get("provider") or "").strip().lower() == "telegram"
+                    and (cand.get("telegram_user_id") is not None or bool(cand.get("tg_phone_direct")))
+                ):
                     cand["provider"] = "telegram"
                 elif cand.get("phone") and (canon_wa or str(cand.get("provider") or "").lower() == "whatsapp"):
                     cand["provider"] = "whatsapp"
@@ -2197,7 +2227,14 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                         },
                     )
                     continue
-                if not keep_for_sheet(cand):
+                is_tg_phone_direct = (
+                    str(cand.get("provider") or "").strip().lower() == "telegram"
+                    and not cand.get("username")
+                    and bool(cand.get("phone"))
+                    and (cand.get("telegram_user_id") is not None or bool(cand.get("tg_phone_direct")))
+                )
+                sheet_probe = {**cand, "whatsapp": cand["phone"]} if is_tg_phone_direct else cand
+                if not keep_for_sheet(sheet_probe):
                     continue
 
                 built = _crm_mcp_push.build_lead_payload_from_dict(cand, touch_mode=touch_mode_val)
