@@ -5,7 +5,7 @@ from app.db import connect, init_db
 from app.main import create_app
 
 
-def _make_secured_client(tmp_path, monkeypatch, gateway=None):
+def _make_secured_client(tmp_path, monkeypatch, gateway=None, wa_gateway=None):
     monkeypatch.setenv("CRM_REQUIRE_AUTH", "1")
     monkeypatch.setenv("MCP_API_KEY", "test-mcp-secret-999")
     monkeypatch.setenv("CRM_ADMIN_PASSWORD", "StrongTimPass#2026")
@@ -13,7 +13,7 @@ def _make_secured_client(tmp_path, monkeypatch, gateway=None):
     monkeypatch.setenv("CRM_OPERATOR_PASSWORD", "StrongOpPass#2026")
     conn = connect(tmp_path / "crm_sec.db")
     init_db(conn)
-    app = create_app(conn=conn, gateway=gateway)
+    app = create_app(conn=conn, gateway=gateway, wa_gateway=wa_gateway)
     return TestClient(app, follow_redirects=False), conn
 
 
@@ -153,8 +153,11 @@ def test_sales_role_rbac_prevents_login_loop_and_blocks_infra_endpoints(tmp_path
         headers=vlad_headers,
     )
     assert r_cloud.status_code == 403
-    assert client.delete("/api/accounts/1", headers=vlad_headers).status_code == 403
     assert client.post("/api/settings/tg-credentials", json={"api_id": 123, "api_hash": "abc"}, headers=vlad_headers).status_code == 403
+    assert client.post("/api/leadgen/config", json={"enabled": True}, headers=vlad_headers).status_code == 403
+    assert client.post("/api/proxy/nodemaven", json={}, headers=vlad_headers).status_code == 403
+    assert client.post("/api/outreach/autopilot", json={"enabled": False}, headers=vlad_headers).status_code == 403
+    assert client.post("/api/campaigns/1/run", headers=vlad_headers).status_code == 403
 
 
 def test_leaked_default_passwords_rejected_even_when_env_passwords_unset(tmp_path, monkeypatch):
@@ -294,7 +297,7 @@ def test_admin_register_preserves_admin_cookie_and_csrf_origin_check(tmp_path, m
     assert r_me.json()["user"]["username"] == "tim"
 
 
-def test_non_admin_roles_can_add_and_manage_accounts_without_delete_or_proxy_leak(tmp_path, monkeypatch):
+def test_non_admin_roles_can_add_manage_and_delete_accounts_without_proxy_leak(tmp_path, monkeypatch):
     from app.telegram_gateway import FakeGateway
 
     class _MultiAccountFakeGateway(FakeGateway):
@@ -306,8 +309,27 @@ def test_non_admin_roles_can_add_and_manage_accounts_without_delete_or_proxy_lea
                 res["telegram_username"] = f"user_{uid}"
             return res
 
+    class _FakeWaGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__(code="11111")
+            self.cleared_paths: list[str] = []
+
+        async def request_code(
+            self,
+            phone: str,
+            session_path: str,
+            proxy_url: str | None = None,
+            auth_mode: str = "code",
+            **_kw,
+        ) -> str:
+            return await super().request_code(phone, session_path)
+
+        def clear_session(self, session_path: str) -> None:
+            self.cleared_paths.append(str(session_path))
+
     gateway = _MultiAccountFakeGateway(code="11111")
-    client, _ = _make_secured_client(tmp_path, monkeypatch, gateway=gateway)
+    wa_gateway = _FakeWaGateway()
+    client, conn = _make_secured_client(tmp_path, monkeypatch, gateway=gateway, wa_gateway=wa_gateway)
     proxy_secret_url = "socks5://nmuser:supersecretpass@gate.nodemaven.com:1080"
 
     assert (
@@ -318,6 +340,8 @@ def test_non_admin_roles_can_add_and_manage_accounts_without_delete_or_proxy_lea
         ).status_code
         == 401
     )
+    assert client.delete("/api/accounts/1", headers={"User-Agent": "Mozilla/5.0"}).status_code == 401
+    assert client.post("/api/accounts/purge-dead", headers={"User-Agent": "Mozilla/5.0"}).status_code == 401
 
     created_ids: list[int] = []
     for username, password, phone in (
@@ -390,8 +414,95 @@ def test_non_admin_roles_can_add_and_manage_accounts_without_delete_or_proxy_lea
         for acc_row in r_check.json().get("accounts") or []:
             assert "supersecretpass" not in str(acc_row.get("proxy_url") or "")
 
-        assert client.post("/api/accounts/purge-dead", headers=hdrs).status_code == 403
-        assert client.delete(f"/api/accounts/{acc_id}", headers=hdrs).status_code == 403
+    # Non-admin (vlad) can delete a mistyped pending_code WhatsApp account and purge dead accounts safely without proxy leaks
+    vlad_login = client.post(
+        "/api/auth/login",
+        json={"username": "vlad", "password": "StrongVladPass#2026"},
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    assert vlad_login.status_code == 200
+    vlad_hdrs = {
+        "Authorization": f"Bearer {vlad_login.json()['token']}",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    wa_start_1 = client.post(
+        "/api/accounts/start",
+        json={"phone": "+7908819595", "provider": "whatsapp", "proxy_url": proxy_secret_url},
+        headers=vlad_hdrs,
+    )
+    assert wa_start_1.status_code == 200, wa_start_1.text
+    wa_id_1 = int(wa_start_1.json()["id"])
+    r_del_wa = client.delete(f"/api/accounts/{wa_id_1}", headers=vlad_hdrs)
+    assert r_del_wa.status_code == 200, r_del_wa.text
+    assert r_del_wa.json()["deleted"] is True
+    assert r_del_wa.json()["id"] == wa_id_1
+    assert any(f"wa_{wa_id_1}.session" in p for p in wa_gateway.cleared_paths)
+
+    wa_start_2 = client.post(
+        "/api/accounts/start",
+        json={"phone": "+7908819596", "provider": "whatsapp", "proxy_url": proxy_secret_url},
+        headers=vlad_hdrs,
+    )
+    assert wa_start_2.status_code == 200, wa_start_2.text
+    wa_id_2 = int(wa_start_2.json()["id"])
+    r_purge = client.post("/api/accounts/purge-dead", headers=vlad_hdrs)
+    assert r_purge.status_code == 200, r_purge.text
+    purge_data = r_purge.json()
+    assert wa_id_2 in purge_data.get("deleted_ids", [])
+    assert any(f"wa_{wa_id_2}.session" in p for p in wa_gateway.cleared_paths)
+    for acc_row in purge_data.get("accounts") or []:
+        assert "supersecretpass" not in str(acc_row.get("proxy_url") or "")
+        assert "***" in str(acc_row.get("proxy_url") or "")
+
+    # Operator can purge dead accounts (including raw colon proxy masking + cookie auth) and delete TG accounts safely
+    op_login = client.post(
+        "/api/auth/login",
+        json={"username": "operator", "password": "StrongOpPass#2026"},
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    assert op_login.status_code == 200
+    op_hdrs = {
+        "Authorization": f"Bearer {op_login.json()['token']}",
+        "User-Agent": "Mozilla/5.0",
+    }
+    from app.telegram_gateway import mask_proxy_url
+
+    assert mask_proxy_url("gate.nodemaven.com:1080:nmuser:supersecretpass") == "socks5://nmuser:***@gate.nodemaven.com:1080"
+    wa_start_op = client.post(
+        "/api/accounts/start",
+        json={"phone": "+7908819597", "provider": "telegram", "proxy_url": "gate.nodemaven.com:1080:nmuser:supersecretpass"},
+        headers=op_hdrs,
+    )
+    assert wa_start_op.status_code == 200, wa_start_op.text
+    op_wa_id = int(wa_start_op.json()["id"])
+    r_op_purge = client.post("/api/accounts/purge-dead", headers=op_hdrs)
+    assert r_op_purge.status_code == 200, r_op_purge.text
+    assert op_wa_id in r_op_purge.json().get("deleted_ids", [])
+    for acc_row in r_op_purge.json().get("accounts") or []:
+        assert "supersecretpass" not in str(acc_row.get("proxy_url") or "")
+        assert "***" in str(acc_row.get("proxy_url") or "")
+
+    # Cookie auth (as browser UI sends) works for DELETE too, and app.state.wa_gateway=None degrades safely without crash
+    wa_start_3 = client.post(
+        "/api/accounts/start",
+        json={"phone": "+7908819598", "provider": "whatsapp"},
+        headers=op_hdrs,
+    )
+    assert wa_start_3.status_code == 200, wa_start_3.text
+    wa_id_3 = int(wa_start_3.json()["id"])
+    app_no_wa = create_app(conn=conn, gateway=gateway, wa_gateway=None)
+    app_no_wa.state.wa_gateway = None
+    with TestClient(app_no_wa, follow_redirects=False) as client_no_wa:
+        r_cookie_login = client_no_wa.post(
+            "/api/auth/login",
+            json={"username": "operator", "password": "StrongOpPass#2026"},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        assert r_cookie_login.status_code == 200
+        assert client_no_wa.delete(f"/api/accounts/{wa_id_3}", headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
+
+    assert client.delete(f"/api/accounts/{created_ids[1]}", headers=op_hdrs).status_code == 200
 
     r_admin = client.post(
         "/api/auth/login",
@@ -406,7 +517,6 @@ def test_non_admin_roles_can_add_and_manage_accounts_without_delete_or_proxy_lea
     admin_accs = client.get("/api/accounts", headers=admin_hdrs)
     assert admin_accs.status_code == 200
     by_id = {int(item["id"]): item for item in admin_accs.json()}
-    for acc_id in created_ids:
-        assert by_id[acc_id]["proxy_url"] == proxy_secret_url
-        assert client.delete(f"/api/accounts/{acc_id}", headers=admin_hdrs).status_code == 200
+    assert by_id[created_ids[0]]["proxy_url"] == proxy_secret_url
+    assert client.delete(f"/api/accounts/{created_ids[0]}", headers=admin_hdrs).status_code == 200
 

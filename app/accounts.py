@@ -481,10 +481,10 @@ def _is_spambot_restriction_error(last_error: str | None) -> bool:
     return bool(details.get("limited") is True or details.get("is_expired_limit"))
 
 
-def purge_dead_accounts(conn, gateway=None) -> dict:
+def purge_dead_accounts(conn, gateway=None, wa_gateway=None) -> dict:
     rows = conn.execute(
         """
-        SELECT id, health, last_error FROM accounts
+        SELECT id, health, last_error, COALESCE(provider, 'telegram') AS provider FROM accounts
         WHERE status != 'connected'
            OR health IN ('unauthorized', 'banned', 'frozen')
         ORDER BY id ASC
@@ -497,8 +497,10 @@ def purge_dead_accounts(conn, gateway=None) -> dict:
         if health_val == "frozen" and _is_spambot_restriction_error(row[2]):
             continue
         aid = int(row[0])
+        provider = str(row[3] or "telegram").strip().lower()
+        gw = wa_gateway if provider == "whatsapp" else gateway
         try:
-            res = delete_account(conn, aid, gateway=gateway)
+            res = delete_account(conn, aid, gateway=gw)
             deleted_ids.append(aid)
             if res.get("session_path"):
                 deleted_paths.append(str(res["session_path"]))

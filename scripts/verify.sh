@@ -1464,6 +1464,51 @@ if proactive_audit_file.is_file():
             "Gate W violation in scripts/proactive_audit.py: must flag b2b_tg_campaign_not_running / whales_en_tg_starved"
         )
 
+# Gate X: AST invariant — non-admin CRM roles can delete & purge accounts with strict proxy masking
+sec_py_file = root / "app" / "security.py"
+main_py_file = root / "app" / "main.py"
+if sec_py_file.is_file() and main_py_file.is_file():
+    sec_src_x = sec_py_file.read_text(encoding="utf-8")
+    if "def _requires_admin_role(" in sec_src_x:
+        sec_tree_x = ast.parse(sec_src_x, filename=str(sec_py_file))
+        req_admin_fn = next(
+            (n for n in ast.walk(sec_tree_x) if isinstance(n, ast.FunctionDef) and n.name == "_requires_admin_role"),
+            None,
+        )
+        if req_admin_fn is not None:
+            admin_lits = {
+                n.value for n in ast.walk(req_admin_fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            }
+            if any("/api/accounts" in s or "purge-dead" in s for s in admin_lits):
+                errors.append(
+                    "Gate X violation in app/security.py: _requires_admin_role must not block /api/accounts DELETE or /api/accounts/purge-dead"
+                )
+            for req_admin_lit in ("/api/settings", "/api/leadgen", "/api/proxy/nodemaven", "/api/cloud"):
+                if req_admin_lit not in admin_lits:
+                    errors.append(
+                        f"Gate X violation in app/security.py: _requires_admin_role must keep {req_admin_lit} admin-only"
+                    )
+    main_src_x = main_py_file.read_text(encoding="utf-8")
+    if "async def accounts_purge_dead(" in main_src_x and "async def accounts_delete(" in main_src_x:
+        main_tree_x = ast.parse(main_src_x, filename=str(main_py_file))
+        main_fns_x = {
+            n.name: n for n in ast.walk(main_tree_x) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for acc_fn_name in ("accounts_delete", "accounts_purge_dead"):
+            fn_node = main_fns_x.get(acc_fn_name)
+            if fn_node is None:
+                errors.append(f"Gate X violation in app/main.py: missing {acc_fn_name}")
+                continue
+            call_names = {
+                (c.func.id if isinstance(c.func, ast.Name) else c.func.attr)
+                for c in ast.walk(fn_node)
+                if isinstance(c, ast.Call) and isinstance(c.func, (ast.Name, ast.Attribute))
+            }
+            if "_require_admin_or_mcp_auth" in call_names:
+                errors.append(f"Gate X violation in app/main.py:{acc_fn_name} must not call _require_admin_or_mcp_auth")
+            if "_mask_account_payload_for_caller" not in call_names:
+                errors.append(f"Gate X violation in app/main.py:{acc_fn_name} must wrap payload in _mask_account_payload_for_caller")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

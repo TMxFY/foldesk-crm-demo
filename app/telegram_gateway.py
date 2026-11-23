@@ -1425,19 +1425,18 @@ def mask_proxy_url(proxy_url: str | None) -> str | None:
     if not proxy_url:
         return None
     raw = str(proxy_url).strip()
-    if "://" not in raw:
-        return raw
+    candidate = _normalize_raw_proxy_url(raw) if "://" not in raw else raw
     try:
-        parsed = urlparse(raw)
+        parsed = urlparse(candidate)
         if not parsed.hostname:
-            return raw
+            return "***" if (":" in raw or "@" in raw) else raw
         auth = ""
         if parsed.username:
             auth = f"{unquote(parsed.username)}:***@" if parsed.password else f"{unquote(parsed.username)}@"
         port_part = f":{parsed.port}" if parsed.port else ""
         return f"{parsed.scheme}://{auth}{parsed.hostname}{port_part}"
     except Exception:
-        return raw
+        return "***"
 
 
 def _normalize_raw_proxy_url(raw: str) -> str:

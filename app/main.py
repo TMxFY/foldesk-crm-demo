@@ -2790,29 +2790,43 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     async def accounts_delete(account_id: int, request: Request):
         with locked_conn(request.app.state.conn):
             row = request.app.state.conn.execute(
-                "SELECT session_path FROM accounts WHERE id = ?", (account_id,)
+                "SELECT session_path, COALESCE(provider, 'telegram') AS provider FROM accounts WHERE id = ?",
+                (account_id,),
             ).fetchone()
         pre_path = row["session_path"] if row else None
+        provider = str((row["provider"] if row else "") or "telegram").strip().lower()
+        target_gw = (
+            getattr(request.app.state, "wa_gateway", None)
+            if provider == "whatsapp"
+            else request.app.state.gateway
+        )
         await _cleanup_deleted_account_runtime(request.app, account_id, pre_path)
         res = _call(
             delete_account,
             request.app.state.conn,
             account_id,
-            request.app.state.gateway,
+            target_gw,
         )
-        return res
+        return _mask_account_payload_for_caller(request, res)
 
     @app.post("/api/accounts/purge-dead")
     async def accounts_purge_dead(request: Request):
+        from app.accounts import _is_spambot_restriction_error
+
         with locked_conn(request.app.state.conn):
             dead_rows = request.app.state.conn.execute(
                 """
-                SELECT id, session_path FROM accounts
+                SELECT id, session_path, health, last_error FROM accounts
                 WHERE status != 'connected'
                    OR COALESCE(health, 'active') IN ('unauthorized', 'banned', 'frozen')
                 """
             ).fetchall()
         for r in dead_rows:
+            if (
+                str(r["health"] or "").strip().lower() == "frozen"
+                and _is_spambot_restriction_error(r["last_error"])
+            ):
+                continue
             await _cleanup_deleted_account_runtime(
                 request.app, int(r["id"]), r["session_path"]
             )
@@ -2820,8 +2834,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             purge_dead_accounts,
             request.app.state.conn,
             request.app.state.gateway,
+            getattr(request.app.state, "wa_gateway", None),
         )
-        return res
+        return _mask_account_payload_for_caller(request, res)
 
     @app.post("/api/accounts/check-all")
     async def accounts_check_all(request: Request):
