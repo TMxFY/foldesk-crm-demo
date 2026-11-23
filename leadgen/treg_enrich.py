@@ -319,9 +319,93 @@ _ROLE_PHRASE_RE = re.compile(
 _NON_PERSON_NAME_WORDS = frozenset({
     "founder", "cofounder", "co-founder", "ceo", "cmo", "cto", "coo", "cfo", "cgo",
     "owner", "vp", "director", "marketing", "growth", "president", "officer",
-    "linkedin", "official", "careers", "career", "jobs", "job", "team",
+    "linkedin", "telegram", "official", "careers", "career", "jobs", "job", "team",
     "inc", "llc", "ltd", "corp", "company", "studio", "studios", "labs", "advisor",
 })
+_TG_NOISE_HANDLES = frozenset({
+    "joinchat", "share", "addstickers", "proxy", "iv", "s", "c", "boost", "socks", "login", "contact",
+})
+_SUPPORT_TG_HANDLE_RE = re.compile(
+    r"(?:^|_)(?:support|help|admin|manager|sales|care|news|channel|chat|community|group)(?:$|_)",
+    re.I,
+)
+_TME_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,31})\b",
+    re.I,
+)
+_SLUG_GENERIC_TOKENS = frozenset({
+    "profile", "in", "www", "http", "https", "com", "linkedin", "official", "hq",
+    "ceo", "founder", "cofounder", "cmo", "cto", "coo", "cfo", "cgo", "owner",
+})
+_ROLE_EMAIL_PREFIXES = frozenset({
+    "info", "support", "hello", "hi", "hey", "contact", "sales", "team", "admin",
+    "office", "press", "help", "care", "marketing", "billing", "privacy", "legal",
+    "aso", "research", "jobs", "careers", "noreply", "no-reply", "founders", "founder",
+})
+
+
+def _is_valid_personal_tg_handle(raw: Any) -> bool:
+    u = str(raw or "").strip().lstrip("@")
+    if not u or len(u) < 4 or len(u) > 32:
+        return False
+    low = u.lower()
+    if low in _TG_NOISE_HANDLES or low.endswith("bot") or low.endswith("_bot"):
+        return False
+    if _SUPPORT_TG_HANDLE_RE.search(u):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", u))
+
+
+def _first_personal_tg_handle(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("telegram_username", "username", "tg_username"):
+            val = str(payload.get(key) or "").strip().lstrip("@")
+            if _is_valid_personal_tg_handle(val):
+                return val
+    for text in walk_strings(payload):
+        for match in _TME_LINK_RE.finditer(text or ""):
+            nick = match.group(1)
+            tail_after = (text or "")[match.end() : match.end() + 2]
+            if nick.lower() == "s" and tail_after.startswith("/"):
+                continue
+            if _is_valid_personal_tg_handle(nick):
+                return nick
+    return ""
+
+
+def _person_name_from_linkedin_slug(url: str, *, clean_company: str, tokens: list[str]) -> str:
+    norm = _normalize_linkedin_in_url(url)
+    if not norm:
+        return ""
+    slug = unquote(norm.rsplit("/in/", 1)[-1]).strip().strip("/")
+    parts = [p for p in re.split(r"[-_]+", slug) if p]
+    while parts:
+        last = parts[-1]
+        if re.fullmatch(r"\d+", last):
+            parts.pop()
+        elif len(parts) > 2 and re.fullmatch(r"[0-9a-f]{5,}", last, re.I):
+            parts.pop()
+        elif re.fullmatch(r"(?=.*\d)[0-9a-f]{5,}", last, re.I):
+            parts.pop()
+        else:
+            break
+    alpha = [
+        p for p in parts
+        if p.lower() not in _SLUG_GENERIC_TOKENS
+        and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ]{2,}", p)
+    ]
+    if not (2 <= len(alpha) <= 4):
+        return ""
+    token_set = {t.lower() for t in tokens if t}
+    if clean_company:
+        token_set.update(w.lower() for w in re.findall(r"[A-Za-z0-9]{2,}", clean_company))
+    low_alpha = [w.lower() for w in alpha]
+    if any(w in _NON_PERSON_NAME_WORDS or w in _GENERIC_BRAND_STOPWORDS or w in token_set for w in low_alpha):
+        return ""
+    joined = " ".join(w.capitalize() for w in alpha)
+    if _SLOT2_ROLE_RE.search(joined) or _NON_DM_ROLE_RE.search(joined):
+        return ""
+    return joined
 
 
 @dataclass
@@ -340,6 +424,7 @@ class _DecisionMakerCandidate:
     slot2_score: int
     exec_score: int
     order: int
+    telegram_username: str = ""
 
 
 def _normalize_linkedin_in_url(url: str) -> str:
@@ -476,22 +561,49 @@ def _parse_candidate_from_hit(
 ) -> _DecisionMakerCandidate | None:
     linkedin = _normalize_linkedin_in_url(_first_linkedin(hit))
     email = _first_email(hit)
+    tg_nick = _first_personal_tg_handle(hit)
 
     explicit_name = _clean_person_name_candidate(
         str(hit.get("founder_name") or hit.get("name") or ""),
         clean_company,
     )
     raw_title = str(hit.get("title") or "").strip()
-    stripped_title = re.sub(r"\s*(?:[|\-–—]\s*LinkedIn|on\s+LinkedIn)\s*$", "", raw_title, flags=re.I).strip()
-    segments = [s.strip() for s in re.split(r"\s+[-–—|·]\s+", stripped_title) if s.strip()]
+    stripped_title = re.sub(
+        r"\s*(?:[|\-–—]\s*(?:LinkedIn|Telegram)|on\s+(?:LinkedIn|Telegram))\s*$",
+        "",
+        raw_title,
+        flags=re.I,
+    ).strip()
+    segments = [s.strip() for s in re.split(r"\s*[|·]\s*|\s+[-–—]\s+", stripped_title) if s.strip()]
 
     parsed_name = explicit_name
     headline = ""
     if not parsed_name and segments:
         candidate_name = _clean_person_name_candidate(segments[0], clean_company)
+        rest_start = 1
+        if not candidate_name:
+            role_split = re.split(
+                r"[:,]\s+(?=(?:co[\s\-]?founder|founder|ceo|cmo|cgo|cto|coo|cfo|owner|vp|head|director|president|chief)\b)",
+                segments[0],
+                maxsplit=1,
+                flags=re.I,
+            )
+            if len(role_split) == 2:
+                candidate_name = _clean_person_name_candidate(role_split[0], clean_company)
+                if candidate_name:
+                    headline = " - ".join([role_split[1].strip(), *segments[1:]]).strip(" -")
+        if not candidate_name and len(segments) >= 2:
+            seg0_low = segments[0].lower()
+            if (clean_company and seg0_low == clean_company.lower()) or any(
+                re.search(rf"\b{re.escape(tok)}\b", seg0_low) for tok in tokens
+            ):
+                candidate_name = _clean_person_name_candidate(segments[1], clean_company)
+                if candidate_name:
+                    rest_start = 2
         if candidate_name:
             parsed_name = candidate_name
-            headline = " - ".join(segments[1:]).strip()
+            if not headline:
+                headline = " - ".join(segments[rest_start:]).strip()
         else:
             headline = " - ".join(segments).strip()
     elif segments:
@@ -500,11 +612,18 @@ def _parse_candidate_from_hit(
         else:
             headline = " - ".join(segments).strip()
 
+    if not parsed_name and linkedin:
+        parsed_name = _person_name_from_linkedin_slug(
+            linkedin,
+            clean_company=clean_company,
+            tokens=tokens,
+        )
+
     explicit_role = str(hit.get("role_title") or hit.get("role") or "").strip()
     if explicit_role:
         headline = explicit_role if not headline else f"{explicit_role} | {headline}"
 
-    if not linkedin and not parsed_name and not email:
+    if not linkedin and not parsed_name and not email and not tg_nick:
         return None
 
     snippet_blob = " ".join(str(hit.get(k) or "") for k in ("snippet", "description")).strip()
@@ -572,6 +691,7 @@ def _parse_candidate_from_hit(
         slot2_score=slot2_score,
         exec_score=15 + (20 if h_exec else 0) + (10 if brand_in_title else 0) if is_exec else 0,
         order=order,
+        telegram_username=tg_nick,
     )
 
 
@@ -586,6 +706,8 @@ def _merge_candidate(target: _DecisionMakerCandidate, incoming: _DecisionMakerCa
         target.project_url = incoming.project_url
     if not target.role_title and incoming.role_title:
         target.role_title = incoming.role_title
+    if not target.telegram_username and incoming.telegram_username:
+        target.telegram_username = incoming.telegram_username
     target.matches_slot1 = target.matches_slot1 or incoming.matches_slot1
     target.matches_slot2 = target.matches_slot2 or incoming.matches_slot2
     target.is_exec = target.is_exec or incoming.is_exec
@@ -600,18 +722,24 @@ def _deduplicate_candidates(candidates: list[_DecisionMakerCandidate]) -> list[_
     unique: list[_DecisionMakerCandidate] = []
     by_li: dict[str, int] = {}
     by_name: dict[str, int] = {}
+    by_tg: dict[str, int] = {}
     for cand in candidates:
         li_key = _linkedin_dedup_key(cand.founder_linkedin)
         name_key = _normalize_name_key(cand.founder_name)
+        tg_key = cand.telegram_username.strip().lower()
         existing_idx = by_li.get(li_key) if li_key else None
         if existing_idx is None and name_key:
             existing_idx = by_name.get(name_key)
+        if existing_idx is None and tg_key:
+            existing_idx = by_tg.get(tg_key)
         if existing_idx is not None:
             _merge_candidate(unique[existing_idx], cand)
             if li_key and li_key not in by_li:
                 by_li[li_key] = existing_idx
             if name_key and name_key not in by_name:
                 by_name[name_key] = existing_idx
+            if tg_key and tg_key not in by_tg:
+                by_tg[tg_key] = existing_idx
             continue
         idx = len(unique)
         unique.append(cand)
@@ -619,11 +747,13 @@ def _deduplicate_candidates(candidates: list[_DecisionMakerCandidate]) -> list[_
             by_li[li_key] = idx
         if name_key:
             by_name[name_key] = idx
+        if tg_key:
+            by_tg[tg_key] = idx
     return unique
 
 
 def _candidate_to_dict(cand: _DecisionMakerCandidate, role_bucket_override: str | None = None) -> dict[str, str]:
-    return {
+    out = {
         "founder_name": cand.founder_name,
         "founder_linkedin": cand.founder_linkedin,
         "work_email": cand.work_email,
@@ -631,6 +761,10 @@ def _candidate_to_dict(cand: _DecisionMakerCandidate, role_bucket_override: str 
         "role_title": cand.role_title,
         "role_bucket": role_bucket_override or cand.role_bucket,
     }
+    if cand.telegram_username:
+        out["telegram_username"] = cand.telegram_username
+        out["username"] = cand.telegram_username
+    return out
 
 
 def _select_prioritized_candidates(
@@ -650,6 +784,7 @@ def _select_prioritized_candidates(
                 c.slot2_score,
                 1 if c.is_exec else 0,
                 c.exec_score,
+                1 if c.telegram_username else 0,
                 1 if c.founder_linkedin else 0,
                 1 if c.work_email else 0,
                 -c.order,
@@ -664,7 +799,7 @@ def _select_prioritized_candidates(
     slot1_cands = [c for c in candidates if c.matches_slot1]
     slot2_cands = [c for c in candidates if c.matches_slot2]
 
-    best_pair: tuple[tuple[int, int, int, int], _DecisionMakerCandidate, _DecisionMakerCandidate] | None = None
+    best_pair: tuple[tuple[int, int, int, int, int], _DecisionMakerCandidate, _DecisionMakerCandidate] | None = None
     for c1 in slot1_cands:
         for c2 in slot2_cands:
             if c1 is c2:
@@ -672,6 +807,7 @@ def _select_prioritized_candidates(
             pair_key = (
                 c1.slot1_score + c2.slot2_score,
                 min(c1.slot1_score, c2.slot2_score),
+                (1 if c1.telegram_username else 0) + (1 if c2.telegram_username else 0),
                 (1 if c1.founder_linkedin else 0) + (1 if c2.founder_linkedin else 0),
                 -(c1.order + c2.order),
             )
@@ -688,7 +824,7 @@ def _select_prioritized_candidates(
         if slot1_cands:
             c1 = max(
                 slot1_cands,
-                key=lambda c: (c.slot1_score, 1 if c.founder_linkedin else 0, -c.order),
+                key=lambda c: (c.slot1_score, 1 if c.telegram_username else 0, 1 if c.founder_linkedin else 0, -c.order),
             )
             selected_entries.append((c1, "founder"))
             used_ids.add(id(c1))
@@ -697,7 +833,7 @@ def _select_prioritized_candidates(
             if rem_s2:
                 c2 = max(
                     rem_s2,
-                    key=lambda c: (c.slot2_score, 1 if c.founder_linkedin else 0, -c.order),
+                    key=lambda c: (c.slot2_score, 1 if c.telegram_username else 0, 1 if c.founder_linkedin else 0, -c.order),
                 )
                 selected_entries.append((c2, "marketing"))
                 used_ids.add(id(c2))
@@ -713,6 +849,7 @@ def _select_prioritized_candidates(
                 1 if c.matches_slot1 else 0,
                 1 if c.matches_slot2 else 0,
                 max(c.slot1_score, c.slot2_score, c.exec_score),
+                1 if c.telegram_username else 0,
                 1 if c.founder_linkedin else 0,
                 -c.order,
             ),
@@ -728,7 +865,7 @@ def _select_prioritized_candidates(
     if not selected_entries:
         fallback = max(
             candidates,
-            key=lambda c: (1 if c.founder_linkedin else 0, 1 if c.work_email else 0, -c.order),
+            key=lambda c: (1 if c.telegram_username else 0, 1 if c.founder_linkedin else 0, 1 if c.work_email else 0, -c.order),
         )
         selected_entries.append((fallback, fallback.role_bucket))
 
@@ -752,7 +889,19 @@ def _filter_brand_hits(hits: list[dict], clean_domain: str, tokens: list[str]) -
     for hit in hits:
         blob = " ".join(
             str(hit.get(k) or "")
-            for k in ("title", "snippet", "description", "url", "link", "founder_linkedin", "founder_name", "role_title", "work_email")
+            for k in (
+                "title",
+                "snippet",
+                "description",
+                "url",
+                "link",
+                "founder_linkedin",
+                "founder_name",
+                "role_title",
+                "work_email",
+                "telegram_username",
+                "username",
+            )
         ).lower()
         if not blob:
             continue
@@ -888,8 +1037,17 @@ def find_email(name: str, domain: str) -> dict:
     linkedin = _first_linkedin(payload)
     if linkedin:
         found["founder_linkedin"] = linkedin
+    tg_nick = _first_personal_tg_handle(payload)
+    if tg_nick:
+        found["telegram_username"] = tg_nick
+        found["username"] = tg_nick
     output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
-    if output.get("verified") is True and found.get("work_email"):
+    if isinstance(output, dict):
+        fn_raw = str(output.get("full_name") or output.get("founder_name") or "").strip()
+        clean_fn = _clean_person_name_candidate(fn_raw, "")
+        if clean_fn:
+            found["founder_name"] = clean_fn
+    if isinstance(output, dict) and output.get("verified") is True and found.get("work_email"):
         found["email_status"] = "valid"
     return {k: v for k, v in found.items() if v}
 
@@ -996,6 +1154,73 @@ def market_note(kind: str, cache_path: Path) -> dict:
     return fresh if isinstance(fresh, dict) else {}
 
 
+def _is_role_email(email: str) -> bool:
+    raw = str(email or "").strip()
+    if "@" not in raw:
+        return False
+    local = raw.split("@", 1)[0].strip().lower()
+    return local in _ROLE_EMAIL_PREFIXES
+
+
+def _merge_dm_into_row(row: dict[str, Any], found: dict[str, str]) -> None:
+    for k, v in found.items():
+        if not v:
+            continue
+        if k in ("username", "telegram_username", "tg_username"):
+            if _is_valid_personal_tg_handle(v) and not _is_valid_personal_tg_handle(row.get(k)):
+                row[k] = v
+        elif not row.get(k):
+            row[k] = v
+
+
+def _preserve_tg_and_founder_fields(
+    row: dict[str, Any],
+    *,
+    company: str,
+    domain: str,
+    person_nm: str,
+) -> None:
+    tg = ""
+    for k in ("username", "telegram_username", "tg_username"):
+        cand = str(row.get(k) or "").strip().lstrip("@")
+        if _is_valid_personal_tg_handle(cand):
+            tg = cand
+            break
+    if not tg:
+        tg = _first_personal_tg_handle(
+            {
+                "links": row.get("links") or [],
+                "bio": row.get("bio") or "",
+                "what_they_do": row.get("what_they_do") or "",
+                "about": row.get("about") or "",
+                "sample": row.get("sample") or "",
+            }
+        )
+    if tg:
+        tg_url = f"https://t.me/{tg}"
+        if not _is_valid_personal_tg_handle(row.get("username")):
+            row["username"] = tg
+        if not _is_valid_personal_tg_handle(row.get("telegram_username")):
+            row["telegram_username"] = tg
+        if not str(row.get("telegram_url") or "").strip():
+            row["telegram_url"] = tg_url
+        if not str(row.get("provider") or "").strip():
+            row["provider"] = "telegram"
+        if isinstance(row.get("links"), list) and tg_url not in row["links"]:
+            row["links"].append(tg_url)
+
+    if not str(row.get("founder_name") or "").strip():
+        inferred_fn = person_nm
+        if not inferred_fn and row.get("founder_linkedin"):
+            inferred_fn = _person_name_from_linkedin_slug(
+                str(row.get("founder_linkedin") or ""),
+                clean_company=company,
+                tokens=_brand_match_tokens(company, domain),
+            )
+        if inferred_fn:
+            row["founder_name"] = inferred_fn
+
+
 def enrich_creator_rows(rows: list[dict], cache_path: Path) -> list[dict]:
     try:
         from tg_to_gsheet import harvest_direct
@@ -1018,25 +1243,34 @@ def enrich_creator_rows(rows: list[dict], cache_path: Path) -> list[dict]:
             if inferred:
                 row["project_url"] = f"https://{inferred}"
         domain = domain_of(row.get("project_url") or "")
-        if row.get("source") == "linkedin_jobs":
-            if used < LEAD_CAP and not row.get("founder_linkedin") and not row.get("work_email"):
-                company = (row.get("project") or row.get("name") or "").strip()
-                if company or domain:
-                    found = find_company_decision_maker(company, domain)
-                    for k, v in found.items():
-                        if v and not row.get(k):
-                            row[k] = v
+        company = str(row.get("company") or row.get("project") or "").strip()
+        raw_name = str(row.get("name") or "").strip()
+        person_nm = _clean_person_name_candidate(str(row.get("founder_name") or ""), company)
+        if not person_nm and raw_name:
+            if not company or raw_name.casefold() != company.casefold():
+                person_nm = _clean_person_name_candidate(raw_name, company)
+
+        is_company_row = (row.get("source") == "linkedin_jobs") or (not person_nm and bool(company or domain))
+        if is_company_row:
+            has_usable_email = bool(row.get("work_email")) and not _is_role_email(str(row.get("work_email") or ""))
+            has_tg = _is_valid_personal_tg_handle(row.get("username") or row.get("telegram_username"))
+            if used < LEAD_CAP and not row.get("founder_linkedin") and not has_usable_email and not has_tg:
+                dm_company = (row.get("project") or company or raw_name).strip() if row.get("source") == "linkedin_jobs" else (company or raw_name).strip()
+                if dm_company or domain:
+                    found = find_company_decision_maker(dm_company, domain)
+                    _merge_dm_into_row(row, found)
                     used += 1
         else:
-            name = person_name(row.get("name") or "")
-            if used < LEAD_CAP and name and domain and not row.get("work_email"):
-                found = find_email(name, domain)
-                row.update(found)
+            if used < LEAD_CAP and person_nm and domain and not row.get("work_email"):
+                found = find_email(person_nm, domain)
+                _merge_dm_into_row(row, found)
                 if row.get("work_email") and not row.get("email_status"):
                     status = verify_email(row["work_email"])
                     if status:
                         row["email_status"] = status
                 used += 1
+
+        _preserve_tg_and_founder_fields(row, company=company or raw_name, domain=domain, person_nm=person_nm)
         out.append(row)
     return out
 

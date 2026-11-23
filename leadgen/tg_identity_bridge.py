@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
@@ -467,29 +467,218 @@ def _default_site_fetch(domain: str) -> str:
     return "\n".join(chunks)
 
 
+_SLUG_GENERIC_TOKENS = frozenset(
+    {
+        "profile",
+        "in",
+        "www",
+        "http",
+        "https",
+        "com",
+        "linkedin",
+        "official",
+        "hq",
+        "ceo",
+        "founder",
+        "cofounder",
+        "cmo",
+        "cto",
+        "coo",
+        "cfo",
+        "cgo",
+        "owner",
+    }
+)
+_NON_PERSON_ROW_NAME_WORDS = frozenset(
+    {
+        "role",
+        "hiring",
+        "job",
+        "jobs",
+        "manager",
+        "director",
+        "engineer",
+        "developer",
+        "strategist",
+        "intern",
+        "specialist",
+        "coordinator",
+        "agency",
+        "studio",
+        "studios",
+        "labs",
+        "official",
+        "app",
+        "apps",
+        "saas",
+        "shop",
+        "store",
+        "platform",
+        "software",
+        "solutions",
+        "services",
+        "editor",
+        "generator",
+        "tracker",
+        "planner",
+        "tutor",
+        "ecom",
+        "llc",
+        "inc",
+        "ltd",
+        "corp",
+        "gmbh",
+    }
+)
+
+
+def _linkedin_urls_from_row(row: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for lk_key in ("founder_linkedin", "linkedin_url", "linkedin"):
+        val = str(row.get(lk_key) or "").strip()
+        if val:
+            urls.append(val)
+    links = row.get("links")
+    if isinstance(links, list):
+        for item in links:
+            s = str(item or "").strip()
+            if s and "linkedin.com/in/" in s.lower() and s not in urls:
+                urls.append(s)
+    return urls
+
+
+def _clean_linkedin_slug_parts(lk_url: str) -> tuple[str, list[str]]:
+    m_li = re.search(r"linkedin\.com/in/([^/?#\s]+)", str(lk_url or ""), re.I)
+    if not m_li:
+        return "", []
+    raw_slug = unquote(m_li.group(1)).strip().strip("/")
+    tokens = [t for t in re.split(r"[-_]+", raw_slug) if t]
+    while tokens:
+        last = tokens[-1]
+        if re.fullmatch(r"\d+", last):
+            tokens.pop()
+        elif len(tokens) > 2 and re.fullmatch(r"[0-9a-f]{5,}", last, re.I):
+            tokens.pop()
+        elif re.fullmatch(r"(?=.*\d)[0-9a-f]{5,}", last, re.I):
+            tokens.pop()
+        else:
+            break
+    if not tokens:
+        return "", []
+    return "-".join(tokens), tokens
+
+
+def _infer_founder_name_from_row(row: dict[str, Any], brand: str = "") -> str:
+    if not isinstance(row, dict):
+        return ""
+    comp_variants = {
+        " ".join(str(b or "").split()).strip().casefold()
+        for b in (brand, row.get("company"), row.get("project"))
+        if str(b or "").strip()
+    }
+    comp_compact = {c.replace(" ", "") for c in comp_variants}
+    brand_tokens = {
+        w.casefold()
+        for comp in comp_variants
+        for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{3,}", comp)
+        if w.casefold() not in _GENERIC_BRAND_WORDS
+    }
+
+    # 1) Explicit founder_name
+    raw_fn = " ".join(str(row.get("founder_name") or "").split()).strip()
+    if (
+        raw_fn
+        and raw_fn.casefold() not in comp_variants
+        and not re.search(r"https?://|t\.me/|@|\d|[:/|]", raw_fn)
+    ):
+        fn_words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", raw_fn)]
+        if len(fn_words) >= 2:
+            return raw_fn
+
+    # 2) Multi-word person `name` distinct from brand
+    raw_nm = " ".join(str(row.get("name") or "").split()).strip()
+    if (
+        raw_nm
+        and raw_nm.casefold() not in comp_variants
+        and not re.search(r"https?://|t\.me/|@|\d|[:/|–—]", raw_nm)
+    ):
+        nm_words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", raw_nm)]
+        if 2 <= len(nm_words) <= 4:
+            lows = {w.casefold() for w in nm_words}
+            if (
+                not (lows & _NON_PERSON_ROW_NAME_WORDS)
+                and not (lows <= _GENERIC_BRAND_WORDS)
+                and not (lows & brand_tokens)
+            ):
+                return raw_nm
+
+    # 3) Parse founder_linkedin / linkedin_url /in/<slug>
+    for lk in _linkedin_urls_from_row(row):
+        _, parts = _clean_linkedin_slug_parts(lk)
+        alpha = [
+            p
+            for p in parts
+            if p.lower() not in _SLUG_GENERIC_TOKENS
+            and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{2,}", p)
+        ]
+        if not (2 <= len(alpha) <= 4):
+            continue
+        low_alpha = {w.casefold() for w in alpha}
+        joined_cf = " ".join(alpha).casefold()
+        if (
+            joined_cf in comp_variants
+            or joined_cf.replace(" ", "") in comp_compact
+            or (low_alpha & _NON_PERSON_ROW_NAME_WORDS)
+            or (low_alpha <= _GENERIC_BRAND_WORDS)
+            or (low_alpha & brand_tokens)
+        ):
+            continue
+        return " ".join(w.capitalize() for w in alpha)
+
+    return ""
+
+
 def _extract_social_or_email_candidates(row: dict[str, Any]) -> list[tuple[str, str]]:
     cands: list[tuple[str, str]] = []
+    seen_local: set[str] = set()
+
+    def _add(nick: str, kind: str) -> None:
+        clean = nick.strip().lower()
+        if clean and clean not in seen_local:
+            seen_local.add(clean)
+            cands.append((clean, kind))
+
     ig = str(row.get("instagram_url") or row.get("instagram") or "").strip()
     m_ig = re.search(r"instagram\.com/([A-Za-z0-9._]{3,32})", ig, re.I)
     if m_ig:
         h_ig = m_ig.group(1).strip(".").replace(".", "_")
         if h_ig.lower() not in {"p", "reel", "reels", "explore", "stories"}:
-            cands.append((h_ig, "instagram_handle_confirmed"))
-    for lk_key in ("founder_linkedin", "linkedin_url", "linkedin"):
-        lk = str(row.get(lk_key) or "").strip()
-        m_li = re.search(r"linkedin\.com/in/([A-Za-z0-9\-_%]+)", lk, re.I)
-        if m_li:
-            slug = re.sub(r"-[0-9a-f]{6,}$", "", m_li.group(1), flags=re.I)
-            slug = re.sub(r"-\d+$", "", slug)
-            for variant in (slug.replace("-", "_"), slug.replace("-", "")):
-                cands.append((variant, "linkedin_handle_confirmed"))
+            _add(h_ig, "instagram_handle_confirmed")
+
+    for lk in _linkedin_urls_from_row(row):
+        slug, parts = _clean_linkedin_slug_parts(lk)
+        if not slug:
+            continue
+        _add(slug.replace("-", "_"), "linkedin_handle_confirmed")
+        _add(slug.replace("-", ""), "linkedin_handle_confirmed")
+        alpha_parts = [
+            p.lower()
+            for p in parts
+            if p.lower() not in _SLUG_GENERIC_TOKENS and re.fullmatch(r"[A-Za-z]{2,}", p)
+        ]
+        if len(alpha_parts) >= 3:
+            _add(f"{alpha_parts[0]}_{alpha_parts[-1]}", "linkedin_handle_confirmed")
+            _add(f"{alpha_parts[0]}{alpha_parts[-1]}", "linkedin_handle_confirmed")
+        if len(alpha_parts) >= 2:
+            _add(f"{alpha_parts[0]}{alpha_parts[-1][0]}", "linkedin_handle_confirmed")
+
     for em_key in ("work_email", "email"):
         em = str(row.get(em_key) or "").strip()
         if "@" in em:
             local = em.split("@", 1)[0].strip().lower()
             if local and local not in _ROLE_EMAIL_PREFIXES:
-                for variant in (local.replace(".", "_"), local.replace(".", "")):
-                    cands.append((variant, "email_handle_confirmed"))
+                _add(re.sub(r"[.\-]+", "_", local), "email_handle_confirmed")
+                _add(re.sub(r"[.\-_]+", "", local), "email_handle_confirmed")
     return cands
 
 
@@ -628,12 +817,19 @@ def _identity_confirmed_on_tme(title: str, bio: str, row: dict[str, Any], domain
         elif re.search(rf"\b{re.escape(tok)}\b", tme_blob):
             return True
     # 2) Full founder name (2+ alphabetic words, each >= 2 chars)
-    raw_name = " ".join(str(row.get("founder_name") or row.get("name") or "").split()).strip()
-    comp_norm = " ".join(str(row.get("company") or row.get("project") or "").split()).strip()
-    if raw_name and raw_name.casefold() != comp_norm.casefold():
-        words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", raw_name)]
+    brand = str(row.get("company") or row.get("project") or "").strip()
+    if not brand:
+        brand = str(row.get("name") or "").strip()
+    inferred_name = _infer_founder_name_from_row(row, brand)
+    if inferred_name:
+        words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", inferred_name)]
         if len(words) >= 2:
             if all(re.search(rf"\b{re.escape(w.casefold())}\b", tme_blob) for w in words[:2]):
+                return True
+            if len(words) >= 3 and (
+                re.search(rf"\b{re.escape(words[0].casefold())}\b", tme_blob)
+                and re.search(rf"\b{re.escape(words[-1].casefold())}\b", tme_blob)
+            ):
                 return True
     return False
 
@@ -778,10 +974,11 @@ def bridge_lead_to_telegram(
             x_prof = None
         bio_blob = _extract_x_bio_blob(x_prof)
         x_founder_name = _extract_x_founder_name(x_prof, brand)
-        if x_founder_name:
-            if not str(out.get("founder_name") or "").strip():
-                out["founder_name"] = x_founder_name
-            fw = [w.lower() for w in x_founder_name.split()]
+        if x_founder_name and not str(out.get("founder_name") or "").strip():
+            out["founder_name"] = x_founder_name
+        resolved_x_founder = x_founder_name or _infer_founder_name_from_row(out, brand)
+        if resolved_x_founder:
+            fw = [w.lower() for w in re.findall(r"[A-Za-z]{2,}", resolved_x_founder)]
             if len(fw) >= 2:
                 x_founder_cands.append((f"{fw[0]}_{fw[-1]}", "x_founder_handle"))
                 x_founder_cands.append((f"{fw[0]}{fw[-1]}", "x_founder_handle"))
@@ -791,6 +988,10 @@ def bridge_lead_to_telegram(
         ]
         if hit := _try_candidates(stage1):
             return hit
+
+    founder_raw = _infer_founder_name_from_row(out, brand)
+    if founder_raw and not str(out.get("founder_name") or "").strip():
+        out["founder_name"] = founder_raw
 
     # 2) Direct product website HTML scan for explicit t.me handles
     if domain and do_site_fetch is not None:
@@ -809,7 +1010,6 @@ def bridge_lead_to_telegram(
 
     # 3) Web search `site:t.me "<domain>"` or `"<brand>"`
     search_target = f'"{domain}"' if domain else (f'"{brand}"' if len(brand) >= 4 else "")
-    found_domain_explicit = False
     if search_target:
         query = f"site:t.me {search_target}"
         try:
@@ -823,8 +1023,6 @@ def bridge_lead_to_telegram(
             hit_snip = str(search_hit.get("snippet") or search_hit.get("description") or "").strip()
             hit_blob = f"{hit_url} {hit_title} {hit_snip}"
             has_exact_domain = bool(domain and domain.lower() in hit_blob.lower())
-            if has_exact_domain:
-                found_domain_explicit = True
             for nick in _extract_tme_handles(hit_blob):
                 stage3a.append(
                     (
@@ -836,28 +1034,27 @@ def bridge_lead_to_telegram(
         if hit := _try_candidates(stage3a):
             return hit
 
-    # 3b) Secondary person-name + brand search when multi-word founder name is known
-    founder_raw = " ".join(str(out.get("founder_name") or out.get("name") or "").split()).strip()
+    # 3b) Secondary person-name + brand search (plus person-name fallback) when multi-word founder name is known
     founder_words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", founder_raw)]
-    if (
-        not found_domain_explicit
-        and len(founder_words) >= 2
-        and founder_raw.casefold() != brand.casefold()
-        and len(brand) >= 3
-    ):
-        try:
-            s_payload_2 = do_search(f'site:t.me "{founder_raw}" "{brand}"')
-        except Exception:
-            s_payload_2 = None
-        stage3b: list[tuple[str, str, bool]] = []
-        for search_hit in _unwrap_search_hits(s_payload_2):
-            hit_blob = " ".join(
-                str(search_hit.get(k) or "").strip() for k in ("url", "title", "snippet", "description")
-            )
-            for nick in _extract_tme_handles(hit_blob):
-                stage3b.append((nick, "founder_search_verified", True))
-        if hit := _try_candidates(stage3b):
-            return hit
+    if len(founder_words) >= 2:
+        founder_queries: list[str] = []
+        if len(brand) >= 3 and founder_raw.casefold() != brand.casefold():
+            founder_queries.append(f'site:t.me "{founder_raw}" "{brand}"')
+        founder_queries.append(f'site:t.me "{founder_raw}"')
+        for f_query in founder_queries:
+            try:
+                s_payload_2 = do_search(f_query)
+            except Exception:
+                s_payload_2 = None
+            stage3b: list[tuple[str, str, bool]] = []
+            for search_hit in _unwrap_search_hits(s_payload_2):
+                hit_blob = " ".join(
+                    str(search_hit.get(k) or "").strip() for k in ("url", "title", "snippet", "description")
+                )
+                for nick in _extract_tme_handles(hit_blob):
+                    stage3b.append((nick, "founder_search_verified", True))
+            if hit := _try_candidates(stage3b):
+                return hit
 
     # 4) Same-handle / social / personal email / founder-name candidates (strict anti-namesake confirmation required)
     stage4: list[tuple[str, str, bool]] = []
@@ -867,6 +1064,11 @@ def bridge_lead_to_telegram(
         stage4.append((fn_nick, fn_kind, True))
     for social_nick, social_kind in _extract_social_or_email_candidates(out):
         stage4.append((social_nick, social_kind, True))
+    if founder_raw:
+        fw_ascii = [w.lower() for w in re.findall(r"[A-Za-z]{2,}", founder_raw)]
+        if len(fw_ascii) >= 2:
+            stage4.append((f"{fw_ascii[0]}_{fw_ascii[-1]}", "founder_handle_confirmed", True))
+            stage4.append((f"{fw_ascii[0]}{fw_ascii[-1]}", "founder_handle_confirmed", True))
     if hit := _try_candidates(stage4):
         return hit
 
