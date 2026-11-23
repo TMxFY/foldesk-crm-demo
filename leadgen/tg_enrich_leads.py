@@ -6,11 +6,13 @@ Input: JSONL from tg_scrape_posters.py
 Output: enriched JSONL with extra fields.
 """
 import argparse
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
 import sys
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -21,6 +23,7 @@ try:
         PLATFORM_AGGREGATOR_HOSTS,
         PLATFORM_GARBAGE_COMPANY_NAMES,
         is_platform_or_social_url,
+        is_supply_side,
         sanitize_person_and_company,
     )
 except ImportError:
@@ -29,6 +32,7 @@ except ImportError:
             PLATFORM_AGGREGATOR_HOSTS,
             PLATFORM_GARBAGE_COMPANY_NAMES,
             is_platform_or_social_url,
+            is_supply_side,
             sanitize_person_and_company,
         )
     except ImportError:
@@ -36,6 +40,7 @@ except ImportError:
             PLATFORM_AGGREGATOR_HOSTS,
             PLATFORM_GARBAGE_COMPANY_NAMES,
             is_platform_or_social_url,
+            is_supply_side,
             sanitize_person_and_company,
         )
 
@@ -137,12 +142,99 @@ CATEGORIES = [
     ),
     ("CEX / биржа", r"\b(exchange|cex\b|бирж\w*|trading platform|broker)\b"),
     ("DeFi / DEX", r"\b(defi|dex\b|tvl|staking|yield|liquidity|lending|borrow|swap|amm|perp\w*|vault\w*)\b"),
-    ("Gaming / AI", r"\b(game\w*|gamefi|p2e|playto|ai[- ]?(agent|app|tool|video|startup)|\bai\b|agent\w*|ml\b|нейросет\w*|metaverse)\b"),
-    ("SaaS / AI app", r"\b(saas|b2b app|mobile app|ios app|android app|приложени\w*|app developer|indie\w*|micro[- ]?saas|product[- ]?hunt|software product|subscription app|ai app|ai tool|ai startup|gpt[- ]?app)\b"),
-    ("E-com / D2C", r"\b(shopify|e-?com(?:merce)?|d2c|dtc|skincare|cosmetics|supplements?|serum|gummies|collagen|haircare|fragrance|bodycare|online store|cosmetic brand|beauty brand)\b"),
+    ("Gaming / AI", r"\b(game\w*|gaming|gamefi|p2e|playto|metaverse|roblox|fortnite|fivem|uefn|геймдев\w*|игров\w*)\b"),
+    (
+        "SaaS / AI app",
+        r"\b(saas|micro[- ]?saas|b2b(?:\s+(?:app|saas|sales|tool|platform|software|startup|product|solution))?|b2c\s+(?:app|saas)|"
+        r"mobile\s+app|ios\s+app|android\s+app|web\s+app|app\s+store|play\s+store|google\s+play|chrome\s+extension|"
+        r"приложени\w*|app\s+developer|indie\w*|product[- ]?hunt|software(?:\s+product)?|subscription\s+app|"
+        r"ai[- ]?(?:agent|app|tool|video|startup|platform|saas|assistant|copilot|bot|crm|analytics|automation)|"
+        r"gpt[- ]?app|\bai\b|\bml\b|\bllm\b|нейросет\w*|ии[- ]?(?:сервис|агент|бот|платформ)\w*|"
+        r"google\s+ads|meta\s+ads|facebook\s+ads|tiktok\s+ads|adtech|martech|ads?\s+platform|"
+        r"(?:marketing|sales|growth|seo|email)\s+(?:platform|tool|software|saas|automation|stack|suite|engine)|"
+        r"sales\s+platform|crm|erp|analytics|аналитик\w*|automation|автоматизац\w*|workflow\w*|"
+        r"no[- ]?code|low[- ]?code|dashboard\w*|devtools?|api\s+platform|cloud\s+platform|edtech|healthtech|hrtech)\b",
+    ),
+    (
+        "E-com / D2C",
+        r"\b(shopify|woocommerce|magento|bigcommerce|e-?com(?:merce)?|d2c|dtc|"
+        r"online\s+store|web\s+store|storefront|retail\s+brand|consumer\s+brand|"
+        r"(?:online|web|ecom\w*|d2c|dtc|shopify|merch|retail|brand|clothing|fashion|jewelry|beauty|cosmetic|supplement|wellness|pet|my|our)\s+store|"
+        r"store\s+(?:owner|founder|brand)|"
+        r"skincare|cosmetics|supplements?|serum|gummies|collagen|haircare|fragrance|bodycare|"
+        r"cosmetic\s+brand|beauty\s+brand|apparel|fashion\s+brand|wellness\s+brand|nutrition|"
+        r"интернет[- ]?магазин\w*|товарн\w+\s+бренд\w*|маркетплейс\w*)\b",
+    ),
+    (
+        "SaaS / AI app",
+        r"(?:https?://[^\s/]+|[a-z0-9][a-z0-9-]{1,})\.(?:io|ai|app)(?=[/\s),.;:!?\"']|$)",
+    ),
     ("Медиа / контент", r"\b(podcast\w*|подкаст\w*|ama\b|media|медиа|newsletter|youtube|host\b|эфир\w*|content|show\b|канал)\b"),
 ]
 CAT_RE = [(name, re.compile(pat, re.IGNORECASE)) for name, pat in CATEGORIES]
+
+_SPAM_SHILL_RE = re.compile(
+    r"(?:qnation\s*tech|qnation\.tech|launch[\s_-]+q[\s_-]+credits)",
+    re.IGNORECASE,
+)
+
+TG_DISCOVERY_SOURCES = frozenset({"tg_groups", "tg_channel_graph", "tg_ad_spy", "b2b_tg"})
+_TG_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+_TG_NOISE_USERNAMES = frozenset(
+    {
+        "joinchat",
+        "addstickers",
+        "share",
+        "proxy",
+        "socks",
+        "iv",
+        "boost",
+        "s",
+        "c",
+        "grouphelp",
+        "rose",
+        "ghclone",
+        "shieldy",
+        "combot",
+        "admin",
+        "support",
+        "channel",
+        "telegram",
+    }
+)
+
+
+def is_spam_shill(text_or_row: Any) -> bool:
+    """Return True for known spam-shill rings (e.g., qnationtech / Launch Q Credits)."""
+    if isinstance(text_or_row, Mapping):
+        parts: list[str] = []
+        for key in (
+            "name",
+            "username",
+            "telegram_username",
+            "bio",
+            "sample",
+            "what_they_do",
+            "their_angle",
+            "project",
+            "company",
+            "project_url",
+            "website",
+            "site",
+            "url",
+            "text",
+        ):
+            val = text_or_row.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val.strip())
+        for list_key in ("links", "sample_messages"):
+            items = text_or_row.get(list_key)
+            if isinstance(items, (list, tuple)):
+                parts.extend(str(x).strip() for x in items if str(x or "").strip())
+        blob = "\n".join(parts)
+    else:
+        blob = str(text_or_row or "")
+    return bool(blob and _SPAM_SHILL_RE.search(blob))
 
 # Роль по био — продаём founders/growth/marketing/community. Порядок = приоритет.
 ROLES = [
@@ -370,6 +462,7 @@ def extract_social_contacts(links):
 
 
 _BUYER_ROLES = frozenset({"Founder", "Marketing"})
+_PLACEHOLDER_ROLES = frozenset({"Other", "Unknown", "Project/Web3"})
 
 
 def merge_roles(row, bio):
@@ -378,13 +471,20 @@ def merge_roles(row, bio):
     A row with no buyer roles yet gets classify_role(bio) normally.
     Pre-tagged Founder/Marketing roles are preserved when bio classifies empty or
     to a non-buyer role (e.g., Trader/Creator/KOL/Dev in ad/reward copy).
+    Placeholder tags (Other/Unknown/Project/Web3) are ignored so LLM decides.
     """
     classified = classify_role(bio)
     raw = row.get("roles") if isinstance(row, dict) else None
     existing = []
     if isinstance(raw, list):
-        existing = [str(item) for item in raw if str(item or "").strip()]
+        existing = [
+            str(item)
+            for item in raw
+            if str(item or "").strip() and str(item).strip() not in _PLACEHOLDER_ROLES
+        ]
     single_role = str(row.get("role") or "").strip() if isinstance(row, dict) else ""
+    if single_role in _PLACEHOLDER_ROLES:
+        single_role = ""
 
     if classified in _BUYER_ROLES:
         return classified, [classified]
@@ -606,8 +706,28 @@ def enrich_rows(
     }
     for r in rows:
         bio = r.get("bio") or ""
+        sample_msgs = [str(m) for m in (r.get("sample_messages") or []) if str(m or "").strip()]
+        fallback_text = (
+            str(r.get("sample") or "").strip()
+            or str(r.get("what_they_do") or "").strip()
+            or " ".join(sample_msgs[:2]).strip()
+        )
+        signal_text = bio if bio.strip() else fallback_text
         existing_cat = str(r.get("category") or "").strip()
         classified_cat = classify_cat(bio)
+        if classified_cat == "Web3 (общее)":
+            fallback_blob = " ".join(
+                str(x)
+                for x in (
+                    bio,
+                    fallback_text,
+                    r.get("project_url") or r.get("site") or "",
+                    " ".join(str(u) for u in (r.get("links") or [])),
+                )
+                if x
+            )
+            if fallback_blob.strip():
+                classified_cat = classify_cat(fallback_blob)
         src_val = str(r.get("source") or r.get("lead_source") or "").strip()
         if existing_cat == "E-com / D2C" or str(r.get("monetization") or "").strip().lower() == "ecom":
             cat = "E-com / D2C" if classified_cat in ("Web3 (общее)", "Медиа / контент", "E-com / D2C") else existing_cat or classified_cat
@@ -616,7 +736,7 @@ def enrich_rows(
             or (src_val in commercial_sources and classified_cat in ("Медиа / контент", "E-com / D2C"))
         ):
             cat = existing_cat
-        elif bio.strip():
+        elif signal_text.strip():
             cat = classified_cat
         else:
             cat = existing_cat or classified_cat
@@ -625,8 +745,8 @@ def enrich_rows(
         )
         norm_purl = norm_url(purl)
         existing_project = str(r.get("project") or r.get("company") or "").strip()
-        pname = existing_project or project_name_from(norm_purl, bio) or ""
-        prepared.append((r, bio, cat, norm_purl, pname))
+        pname = existing_project or project_name_from(norm_purl, signal_text) or ""
+        prepared.append((r, signal_text, cat, norm_purl, pname))
         if fetch and norm_purl and norm_purl not in seen_urls:
             seen_urls.add(norm_purl)
             urls_to_fetch.append(norm_purl)
@@ -705,6 +825,87 @@ def enrich_rows(
     return out
 
 
+def _is_valid_personal_tg_username(raw: Any) -> bool:
+    uname = str(raw or "").strip().lstrip("@")
+    if not uname or not _TG_USERNAME_RE.match(uname):
+        return False
+    low = uname.lower()
+    if low.endswith("bot") or low in _TG_NOISE_USERNAMES:
+        return False
+    return True
+
+
+def _row_has_product_link(row: Mapping[str, Any]) -> bool:
+    for key in ("project_url", "site", "website", "url"):
+        val = str(row.get(key) or "").strip()
+        if val and not is_social(val):
+            return True
+    if pick_project_url(row.get("links") or []):
+        return True
+    for text_key in ("bio", "sample", "what_they_do"):
+        txt = str(row.get(text_key) or "")
+        for m in re.finditer(r"(?:https?://[^\s<>()\[\]\"']+|www\.[^\s<>()\[\]\"']+)", txt, re.I):
+            cand = m.group(0).rstrip(".,;:!?)\"'>]")
+            if not is_social(cand):
+                return True
+    return False
+
+
+def should_admit_for_enrich(row: Any) -> bool:
+    """Admit non-spam, non-supply TG discovery candidates with personal username and signal."""
+    if not isinstance(row, Mapping):
+        return False
+    if row.get("bot") or row.get("deleted"):
+        return False
+    if is_spam_shill(row):
+        return False
+
+    raw_uname = str(row.get("username") or row.get("telegram_username") or "").strip().lstrip("@")
+    if raw_uname:
+        low_uname = raw_uname.lower()
+        if low_uname.endswith("bot") or low_uname in _TG_NOISE_USERNAMES:
+            return False
+
+    src = str(row.get("source") or row.get("lead_source") or "").strip().lower()
+    if src in TG_DISCOVERY_SOURCES:
+        sample_msgs = [str(m) for m in (row.get("sample_messages") or []) if str(m or "").strip()]
+        supply_blob = "\n".join(
+            str(x)
+            for x in (
+                row.get("name") or "",
+                row.get("project") or "",
+                row.get("company") or "",
+                row.get("bio") or "",
+                row.get("sample") or "",
+                row.get("what_they_do") or "",
+                row.get("their_angle") or "",
+                " ".join(sample_msgs),
+            )
+            if x
+        )
+        if supply_blob.strip() and is_supply_side(supply_blob):
+            return False
+        if row.get("icp_match"):
+            return True
+        if not _is_valid_personal_tg_username(raw_uname):
+            return False
+        text_evidence = " ".join(
+            " ".join(
+                str(x)
+                for x in (
+                    row.get("bio") or "",
+                    row.get("sample") or "",
+                    row.get("what_they_do") or "",
+                    " ".join(sample_msgs),
+                )
+                if str(x or "").strip()
+            ).split()
+        )
+        return len(text_evidence) >= 15 or _row_has_product_link(row)
+
+    return bool(row.get("icp_match"))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
@@ -715,7 +916,7 @@ def main():
     args = p.parse_args()
 
     rows = [json.loads(l) for l in open(args.input) if l.strip()]
-    rows = [r for r in rows if r.get("icp_match")]
+    rows = [r for r in rows if should_admit_for_enrich(r)]
     if args.limit:
         rows = rows[:args.limit]
 

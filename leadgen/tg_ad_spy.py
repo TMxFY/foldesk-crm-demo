@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import html
 import json
 import os
@@ -65,10 +66,31 @@ DEFAULT_AD_SPY_CHANNELS: tuple[str, ...] = (
     "indiehackers",
     "marketingmemes",
     "devtools_daily",
+    "ai_founders",
+    "microconf",
+    "startups",
+    "nocodefounders",
+    "producthunt_news",
+    "b2bsaas",
+    "bootstrapped",
+    "growthhacking",
+    "shopifyeasy",
+    "shopify_merchants",
+    "dtc_brands",
+    "ecommerce_news",
+    "mobileapps_dev",
+    "appgrowth",
+    "saas_insider",
+    "ai_products",
+    "indie_makers",
+    "d2c_marketing",
 )
 
 AD_MARKER_RE = re.compile(
-    r"(#реклама|#ad\b|#sponsored|\berid\s*[:=]?\s*[A-Za-z0-9\-]+|\bsponsored\b|"
+    r"(#реклама|#ad\b|#sponsored|#promo\b|#partner\b|#collab\b|\berid\s*[:=]?\s*[A-Za-z0-9\-]+|\bsponsored(?:\s+by)?\b|"
+    r"(?:today['’]s\s+)?sponsor\s*:|"
+    r"paid\s+partnership|brought\s+to\s+you\s+by|in\s+partnership\s+with|partnered\s+with|partner\s+post|"
+    r"promo\s*code|coupon\s*code|discount\s*code|use\s+code\s+[A-Z0-9_-]{3,}|\b\d{1,2}%\s+off\b|affiliate\b|"
     r"партнерский\s+материал|партнёрский\s+материал|промокод\w*|на\s+правах\s+рекламы)",
     re.IGNORECASE,
 )
@@ -76,7 +98,9 @@ AD_MARKER_RE = re.compile(
 CTA_RE = re.compile(
     r"(переход\w*|подпис\w*|читай\w*|забирай\w*|попробуй\w*|тестируй\w*|"
     r"запустил\w*|рекоменду\w*|совету\w*|по\s+ссылк\w*|бесплатн\w*|"
-    r"check\s+out|try\s+it|join\b|follow\b|sign\s+up|launch\w*)",
+    r"check\s+(?:out|this\s+out)|try\s+(?:it|for\s+free)|free\s+trial|start\s+(?:your\s+)?free|"
+    r"get\s+started|book\s+a\s+demo|request\s+(?:a\s+)?demo|learn\s+more|"
+    r"join\b|follow\b|sign\s+up|launch\w*|grab\b|claim\b|visit\b|download\b|dm\s+@|built\s+by|shipped\b)",
     re.IGNORECASE,
 )
 
@@ -257,21 +281,34 @@ async def _resolve_tg_target(client, handle: str) -> dict:
         or getattr(entity, "megagroup", False)
         or hasattr(entity, "participants_count")
     ):
+        about = ""
+        title = clean
+        site = ""
         try:
             full = await client(GetFullChannelRequest(channel=entity))
             about = getattr(full.full_chat, "about", "") or ""
             chat_obj = full.chats[0] if getattr(full, "chats", None) else entity
             title = getattr(chat_obj, "title", "") or clean
             subs = getattr(full.full_chat, "participants_count", None) or getattr(entity, "participants_count", 0) or 0
+            post_texts: list[str] = []
+            try:
+                msgs = await client.get_messages(entity, limit=3)
+                post_texts = [
+                    (getattr(m, "message", None) or "").strip()
+                    for m in (msgs or [])
+                    if (getattr(m, "message", None) or "").strip()
+                ]
+            except Exception:
+                post_texts = []
             parsed = parse_channel_founder_info(
                 about=about,
-                posts=[],
+                posts=post_texts,
                 channel_username=clean,
                 channel_title=title,
                 subscribers=subs,
             )
             owner_username = parsed["username"] if parsed else ""
-            site = parsed["site"] if parsed else extract_external_site([about])
+            site = parsed["site"] if parsed else extract_external_site([about] + post_texts)
             if owner_username:
                 u_res = await _resolve_personal_user(client, owner_username)
                 return {
@@ -284,6 +321,14 @@ async def _resolve_tg_target(client, handle: str) -> dict:
                 }
         except Exception:
             pass
+        return {
+            "id": getattr(entity, "id", 0) or 0,
+            "username": "",
+            "name": title,
+            "company": title,
+            "bio": about,
+            "site": clean_product_url(site) or site,
+        }
 
     u_res = await _resolve_personal_user(client, clean)
     return {
@@ -349,18 +394,39 @@ def _parse_tme_s_html(html_text: str, limit: int) -> list[str]:
     except ImportError:
         BeautifulSoup = None
 
+    def _extract_msg_text(node) -> str:
+        for a_tag in node.find_all("a", href=True):
+            href = html.unescape(str(a_tag.get("href") or "")).strip()
+            label = a_tag.get_text(" ", strip=True)
+            if href.startswith(("http://", "https://")) and href not in label:
+                a_tag.replace_with(f"{label} {href} ")
+        return " ".join(node.get_text(" ", strip=True).split())
+
     out: list[str] = []
     if BeautifulSoup is not None:
         soup = BeautifulSoup(html_text, "html.parser")
-        for node in soup.select(".tgme_widget_message_text"):
-            for a_tag in node.find_all("a", href=True):
-                href = html.unescape(str(a_tag.get("href") or "")).strip()
-                label = a_tag.get_text(" ", strip=True)
-                if href.startswith(("http://", "https://")) and href not in label:
-                    a_tag.replace_with(f"{label} {href} ")
-            txt = " ".join(node.get_text(" ", strip=True).split())
-            if txt:
-                out.append(txt)
+        wraps = soup.select(".tgme_widget_message_wrap")
+        if wraps:
+            for wrap in wraps:
+                node = wrap.select_one(".tgme_widget_message_text")
+                txt = _extract_msg_text(node) if node is not None else ""
+                extras: list[str] = []
+                for btn in wrap.select("a.tgme_widget_message_inline_button[href], a.tgme_widget_message_link_preview[href]"):
+                    href = html.unescape(str(btn.get("href") or "")).strip()
+                    if not href.startswith(("http://", "https://")):
+                        continue
+                    if re.match(r"^https?://(?:t\.me|telegram\.me)/[^/]+/\d+", href, re.I):
+                        continue
+                    if href not in txt and href not in extras:
+                        extras.append(href)
+                combined = " ".join([txt, *extras]).strip()
+                if combined:
+                    out.append(combined)
+        else:
+            for node in soup.select(".tgme_widget_message_text"):
+                txt = _extract_msg_text(node)
+                if txt:
+                    out.append(txt)
         return out[-limit:] if limit > 0 else []
 
     for m in re.finditer(r'class="[^"]*\btgme_widget_message_text\b[^"]*"[^>]*>(.*?)</div>', html_text, re.I | re.S):
@@ -478,12 +544,14 @@ async def scan_ad_channels(
     seen = _load_seen(seen_path)
     cursor = _load_spy_cursor(seen_path)
     ordered_channels = [c for c in channels if c and c.strip()]
+    host_channel_keys = {c.strip().lstrip("@").lower() for c in ordered_channels}
     if len(ordered_channels) > 1 and cursor > 0:
         shift = cursor % len(ordered_channels)
         ordered_channels = ordered_channels[shift:] + ordered_channels[:shift]
     deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered: list[dict] = []
+    channels_scanned = 0
 
     try:
         with open(output_path, "w", encoding="utf-8") as out_fh:
@@ -494,6 +562,8 @@ async def scan_ad_channels(
                 ch = raw_ch.strip().lstrip("@")
                 if not ch:
                     continue
+                ch_low = ch.lower()
+                channels_scanned += 1
                 messages = None
                 if public_posts_fn is not None:
                     try:
@@ -547,6 +617,9 @@ async def scan_ad_channels(
                         if not site and target_info.get("site"):
                             site = target_info["site"]
 
+                    if resolved_username and resolved_username.lower() == ch_low:
+                        resolved_username = ""
+
                     if site and (not resolved_username or not resolved_company):
                         html_text = ""
                         if fetch_html is not None:
@@ -557,7 +630,7 @@ async def scan_ad_channels(
                         meta = parse_site_html_contacts(html_text, fallback_domain=site)
                         if not resolved_company and meta["title"]:
                             resolved_company = meta["title"]
-                        if not resolved_username and meta["tg_username"]:
+                        if not resolved_username and meta["tg_username"] and meta["tg_username"].lower() != ch_low:
                             resolved_username = meta["tg_username"]
                         if meta["x_handle"]:
                             x_handle = meta["x_handle"]
@@ -569,14 +642,25 @@ async def scan_ad_channels(
                                 x_handle = cand
                                 break
 
+                    site_low = site.lower() if site else ""
+                    site_host = urlparse(site).netloc.removeprefix("www.").lower() if site else ""
+                    adv_keys = [
+                        k
+                        for k in (
+                            resolved_username.lower() if resolved_username else "",
+                            x_handle.lower() if x_handle else "",
+                            site_low,
+                            site_host,
+                        )
+                        if k and k not in host_channel_keys
+                    ]
                     dedup_key = (resolved_username or x_handle or site).lower()
-                    if not dedup_key or dedup_key in seen:
+                    if not dedup_key or not adv_keys:
                         continue
-                    if not (resolved_username or x_handle or site):
+                    if any(k in seen for k in adv_keys):
                         continue
-                    seen.add(dedup_key)
-                    if site:
-                        seen.add(site.lower())
+                    for k in adv_keys:
+                        seen.add(k)
 
                     contact_channels: list[str] = []
                     links: list[str] = []
@@ -595,8 +679,12 @@ async def scan_ad_channels(
                         host = urlparse(site).netloc.removeprefix("www.")
                         resolved_company = host.split(".")[0].capitalize()
 
+                    fallback_id = (
+                        int.from_bytes(hashlib.blake2b(dedup_key.encode("utf-8"), digest_size=4).digest(), "big")
+                        & 0x7FFFFFFF
+                    ) or 1
                     row: dict = {
-                        "id": resolved_id or hash(dedup_key) & 0x7FFFFFFF,
+                        "id": resolved_id or fallback_id,
                         "username": resolved_username,
                         "telegram_username": resolved_username,
                         "name": resolved_name or resolved_company or resolved_username,
@@ -622,7 +710,8 @@ async def scan_ad_channels(
                 if delay > 0:
                     await asyncio.sleep(delay)
     finally:
-        _save_seen(seen_path, seen, cursor=cursor + 1)
+        step = channels_scanned if 0 < channels_scanned < len(ordered_channels) else 1
+        _save_seen(seen_path, seen, cursor=cursor + step)
     return discovered
 
 

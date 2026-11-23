@@ -25,15 +25,18 @@ from telethon.tl.types import Channel, InputPeerChannel, PeerChannel
 try:
     from outreach_copy import dm_allowed
     from supply_side import is_platform_or_social_url, is_supply_side
+    from tg_enrich_leads import is_spam_shill
     from tg_to_gsheet import first_touch_for
 except ImportError:
     try:
         from leadgen.outreach_copy import dm_allowed
         from leadgen.supply_side import is_platform_or_social_url, is_supply_side
+        from leadgen.tg_enrich_leads import is_spam_shill
         from leadgen.tg_to_gsheet import first_touch_for
     except ImportError:
         from scripts.outreach_copy import dm_allowed
         from scripts.supply_side import is_platform_or_social_url, is_supply_side
+        from scripts.tg_enrich_leads import is_spam_shill
         from scripts.tg_to_gsheet import first_touch_for
 
 _DEFAULT_STATE_DIR = os.environ.get("LEADGEN_STATE_DIR") or os.path.join(
@@ -194,7 +197,7 @@ def is_match(bio, role, sample=""):
     text = (bio or "").strip()
     snippet = (sample or "").strip()
     combined = f"{text}\n{snippet}".strip()
-    if not combined or is_supply_side(combined):
+    if not combined or is_spam_shill(combined) or is_supply_side(combined):
         return False
     product_links = extract_product_links(text) or extract_product_links(snippet)
     has_signal = bool(PRODUCT_BUYER_SIGNAL_RE.search(combined))
@@ -420,6 +423,8 @@ async def scrape_group(client, group, msg_limit, delay, fh, exclude_paths,
         sample = ""
         if mode == "posters":
             sample = sample_by_sender.get(sid, (0, ""))[1]
+        if is_spam_shill({"name": name, "username": username, "bio": bio, "sample": sample}):
+            continue
         row = {
             "source": "tg_groups",
             "lead_source": "tg_groups",

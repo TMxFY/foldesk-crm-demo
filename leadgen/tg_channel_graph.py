@@ -25,6 +25,7 @@ from telethon.tl.functions.channels import (
     GetFullChannelRequest,
 )
 from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import PeerChannel
 
 try:
     from supply_side import PLATFORM_AGGREGATOR_HOSTS as _SS_PLATFORM_HOSTS
@@ -56,6 +57,19 @@ DEFAULT_GRAPH_SEED_CHANNELS: tuple[str, ...] = (
     "indiehackers",
     "nocodefounders",
     "producthunt_news",
+    "b2bsaas",
+    "bootstrapped",
+    "growthhacking",
+    "shopifyeasy",
+    "shopify_merchants",
+    "dtc_brands",
+    "ecommerce_news",
+    "mobileapps_dev",
+    "appgrowth",
+    "saas_insider",
+    "ai_products",
+    "indie_makers",
+    "d2c_marketing",
 )
 FALLBACK_EN_GRAPH_SEEDS: tuple[str, ...] = (
     "saasgrowth",
@@ -68,6 +82,16 @@ FALLBACK_EN_GRAPH_SEEDS: tuple[str, ...] = (
     "growthhacking",
     "b2bsaas",
     "bootstrapped",
+    "shopifyeasy",
+    "shopify_merchants",
+    "dtc_brands",
+    "ecommerce_news",
+    "mobileapps_dev",
+    "appgrowth",
+    "saas_insider",
+    "ai_products",
+    "indie_makers",
+    "d2c_marketing",
 )
 MAX_SUBSCRIBERS = 100_000
 
@@ -84,13 +108,14 @@ AD_LINE_RE = re.compile(
 )
 
 FOUNDER_HINT_RE = re.compile(
-    r"(основател\w*|соосновател\w*|автор\w*|фаундер\w*|founder|co[- ]?founder|"
+    r"(основател\w*|соосновател\w*|владел\w*|создател\w*|руководител\w*|"
+    r"автор\w*|фаундер\w*|founder|co[- ]?founder|"
     r"ceo|owner|creator|built\s+by|making|building|связь|лс|личк\w*|dm\b|contact)",
     re.IGNORECASE,
 )
 
 HANDLE_RE = re.compile(
-    r"(?:@|(?:https?://)?(?:t\.me|telegram\.me)/)([A-Za-z][A-Za-z0-9_]{3,31})\b",
+    r"(?:@|(?:https?://)?(?:t\.me|telegram\.me)/(?:s/)?)([A-Za-z][A-Za-z0-9_]{3,31})\b",
     re.IGNORECASE,
 )
 
@@ -323,6 +348,78 @@ async def _resolve_user_profile(client, username: str) -> dict:
         return {"id": None, "name": "", "user_bio": "", "bot": False}
 
 
+def _load_discovered_comment_channels(paths: list[str]) -> list[object]:
+    """Parse channel handles or id<digits> tokens from discovered_comment_channels.txt."""
+    out: list[object] = []
+    seen_tokens: set[str] = set()
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            tok = raw.strip()
+            if not tok or tok.startswith("#"):
+                continue
+            tok = re.sub(r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/(?:s/)?", "", tok, flags=re.I)
+            tok = tok.lstrip("@").split("/", 1)[0].split("?", 1)[0].strip()
+            if not tok:
+                continue
+            low = tok.lower()
+            if low in seen_tokens:
+                continue
+            if low.startswith("id") and low[2:].isdigit():
+                seen_tokens.add(low)
+                out.append(int(low[2:]))
+            elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", tok) and not is_bot_handle(tok):
+                seen_tokens.add(low)
+                out.append(tok)
+    return out
+
+
+def _extract_linked_channels_from_messages(msgs: list[object], host_key: str, *, skip_handles: set[str] | None = None) -> list[object]:
+    """Extract forwarded channel IDs and mentioned @handles / t.me links from channel posts."""
+    discovered: list[object] = []
+    local_seen: set[str] = set()
+    skip_low = {h.lower() for h in (skip_handles or set()) if h}
+    for m in msgs or []:
+        fwd = getattr(m, "fwd_from", None)
+        if fwd is not None:
+            from_id = getattr(fwd, "from_id", None)
+            fwd_ch_id = getattr(from_id, "channel_id", None)
+            if fwd_ch_id is None:
+                fwd_ch_id = getattr(fwd, "channel_id", None)
+            if isinstance(fwd_ch_id, int) and fwd_ch_id > 0:
+                key = f"id{fwd_ch_id}"
+                if key not in local_seen and key != host_key:
+                    local_seen.add(key)
+                    discovered.append(int(fwd_ch_id))
+        text = (getattr(m, "message", None) or getattr(m, "text", None) or "").strip()
+        if text:
+            for match in HANDLE_RE.finditer(text):
+                handle = match.group(1).strip()
+                low = handle.lower()
+                if not handle or low == host_key or low in skip_low or is_bot_handle(low):
+                    continue
+                if low not in local_seen:
+                    local_seen.add(low)
+                    discovered.append(handle)
+    return discovered
+
+
+def _is_channel_entity(entity: object) -> bool:
+    if entity is None:
+        return False
+    if hasattr(entity, "title") or getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False) or hasattr(entity, "participants_count"):
+        return True
+    if getattr(entity, "first_name", None) is not None and not hasattr(entity, "title"):
+        return False
+    return True
+
+
 async def crawl_channel_graph(
     client,
     seeds: list[str],
@@ -334,14 +431,16 @@ async def crawl_channel_graph(
     delay: float = 1.0,
     max_runtime_sec: float = 150.0,
 ) -> list[dict]:
+    state_dir = os.path.dirname(os.path.abspath(state_path))
+    state_discovered_path = os.path.join(state_dir, "discovered_comment_channels.txt")
     if not linked_chats_path:
-        state_dir = os.path.dirname(os.path.abspath(state_path))
-        linked_chats_path = os.path.join(state_dir, "discovered_comment_channels.txt")
+        linked_chats_path = state_discovered_path
 
     seen_channels, expanded_channels, saved_frontier = _load_graph_state(state_path)
     seen_founders: set[str] = set()
     queue: deque[tuple[object, int]] = deque()
     queued_keys: set[str] = set()
+    rescan_keys: set[str] = set()
     deferred_frontier: list[tuple[object, int]] = []
     deadline = (time.monotonic() + float(max_runtime_sec)) if max_runtime_sec and max_runtime_sec > 0 else None
 
@@ -376,20 +475,45 @@ async def crawl_channel_graph(
         queue.append((clean, 0))
         queued_keys.add(s_key)
 
-    # When saved frontier is empty and initial seeds are all exhausted, rotate through
-    # unseen EN seeds or least-recently-checked seen channels so graph never stalls at 0.
-    if not queue and seeds:
+    # When saved frontier is empty and initial seeds are all exhausted, replenish from:
+    # 1) discovered_comment_channels.txt in dirname(state_path)
+    # 2) unexpanded FALLBACK_EN_GRAPH_SEEDS / seen channels
+    # 3) re-scanning recent posts of seed channels for newly linked/forwarded channels
+    had_initial_work = bool(queue)
+    if not had_initial_work and seeds:
+        cand_paths = [state_discovered_path]
+        if linked_chats_path and os.path.abspath(linked_chats_path) != os.path.abspath(state_discovered_path):
+            cand_paths.append(linked_chats_path)
+        for disc_ref in _load_discovered_comment_channels(cand_paths):
+            disc_key = _target_key(disc_ref)
+            if disc_key and disc_key not in queued_keys and (
+                disc_key not in seen_channels or (depth > 0 and disc_key not in expanded_channels)
+            ):
+                queue.append((disc_ref, 0))
+                queued_keys.add(disc_key)
+
         for fb in FALLBACK_EN_GRAPH_SEEDS:
             fb_key = fb.strip().lstrip("@").lower()
-            if fb_key and fb_key not in queued_keys and fb_key not in seen_channels:
+            if fb_key and fb_key not in queued_keys and (
+                fb_key not in seen_channels or (depth > 0 and fb_key not in expanded_channels)
+            ):
                 queue.append((fb, 0))
                 queued_keys.add(fb_key)
-        if not queue:
+
+        if depth > 0:
             unexpanded_seen = [c for c in sorted(seen_channels) if c not in expanded_channels]
             for cand in unexpanded_seen[:12]:
                 if cand not in queued_keys:
                     queue.append((cand, 0))
                     queued_keys.add(cand)
+
+        for s in seeds:
+            clean = s.strip().lstrip("@")
+            s_key = clean.lower()
+            if clean and s_key in seen_channels and s_key not in queued_keys:
+                queue.append((clean, 0))
+                queued_keys.add(s_key)
+                rescan_keys.add(s_key)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     discovered_rows: list[dict] = []
@@ -404,20 +528,53 @@ async def crawl_channel_graph(
             target, cur_depth = queue.popleft()
             target_key = _target_key(target)
 
-            try:
-                entity = target if hasattr(target, "id") else await client.get_entity(target)
-            except FloodWaitError as fw:
-                deferred_frontier.append((target, cur_depth))
-                await asyncio.sleep(min(fw.seconds, 60))
-                continue
-            except Exception:
+            if hasattr(target, "id"):
+                entity = target
+            else:
+                try:
+                    entity = await client.get_entity(target)
+                except FloodWaitError as fw:
+                    deferred_frontier.append((target, cur_depth))
+                    await asyncio.sleep(min(fw.seconds, 60))
+                    continue
+                except Exception:
+                    if isinstance(target, int):
+                        try:
+                            entity = await client.get_entity(PeerChannel(target))
+                        except Exception:
+                            continue
+                    else:
+                        continue
+
+            if not _is_channel_entity(entity):
                 continue
 
             ch_username = (getattr(entity, "username", None) or target_key).lstrip("@")
             ch_key = ch_username.lower()
-            already_seen = ch_key in seen_channels
-            already_expanded = ch_key in expanded_channels
+            already_seen = ch_key in seen_channels or target_key in seen_channels
+            already_expanded = ch_key in expanded_channels or target_key in expanded_channels
             fetch_ok = already_seen
+
+            def _enqueue_linked_from_msgs(msgs_list: list[object], host_k: str, skip_u: set[str] | None = None) -> None:
+                next_d = min(cur_depth + 1, depth) if depth > 0 else 0
+                for cand in _extract_linked_channels_from_messages(msgs_list, host_k, skip_handles=skip_u):
+                    cand_key = _target_key(cand)
+                    if (
+                        cand_key
+                        and cand_key not in queued_keys
+                        and cand_key not in seen_channels
+                    ):
+                        queued_keys.add(cand_key)
+                        queue.append((cand, next_d))
+
+            if already_seen and (ch_key in rescan_keys or target_key in rescan_keys):
+                try:
+                    recent_msgs = await client.get_messages(entity, limit=10)
+                    _enqueue_linked_from_msgs(recent_msgs or [], ch_key)
+                except FloodWaitError as fw:
+                    await asyncio.sleep(min(fw.seconds, 60))
+                except Exception:
+                    pass
 
             if not already_seen:
                 try:
@@ -434,13 +591,15 @@ async def crawl_channel_graph(
                     )
                     linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
 
-                    msgs = await client.get_messages(entity, limit=3)
+                    msgs = await client.get_messages(entity, limit=5)
                     post_texts = [
                         (getattr(m, "message", None) or "").strip()
                         for m in (msgs or [])
                         if (getattr(m, "message", None) or "").strip()
                     ]
                     seen_channels.add(ch_key)
+                    if target_key:
+                        seen_channels.add(target_key)
                     fetch_ok = True
 
                     parsed = parse_channel_founder_info(
@@ -450,6 +609,9 @@ async def crawl_channel_graph(
                         channel_title=ch_title,
                         subscribers=subscribers,
                     )
+                    skip_linked = {parsed["username"]} if parsed else set()
+                    if cur_depth < depth:
+                        _enqueue_linked_from_msgs(msgs or [], ch_key, skip_u=skip_linked)
                     if parsed:
                         _append_linked_chat(linked_chats_path, linked_chat_id)
                         founder_uname = parsed["username"].lstrip("@")
@@ -504,6 +666,8 @@ async def crawl_channel_graph(
                     try:
                         recs = await client(GetChannelRecommendationsRequest(channel=entity))
                         expanded_channels.add(ch_key)
+                        if target_key:
+                            expanded_channels.add(target_key)
                         for rec_chat in getattr(recs, "chats", []) or []:
                             rec_uname = (
                                 getattr(rec_chat, "username", None)
@@ -550,6 +714,7 @@ async def crawl_channel_graph(
         if (
             q_key
             and q_key not in seen_frontier_keys
+            and q_key not in rescan_keys
             and (q_key not in seen_channels or (q_depth < depth and q_key not in expanded_channels))
         ):
             seen_frontier_keys.add(q_key)
