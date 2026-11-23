@@ -93,7 +93,7 @@ def test_tier2_skipped_when_tg_or_wa_present_or_icp_low() -> None:
             "project": "LowICP",
             "project_url": "https://lowicp.io",
             "founder_linkedin": "https://www.linkedin.com/in/low-icp",
-            "icp_score": 79,
+            "icp_score": 69,
         },
         http_get_fn=_empty_http,
         treg_fn=fake_treg,
@@ -105,6 +105,34 @@ def test_tier2_skipped_when_tg_or_wa_present_or_icp_low() -> None:
     assert out_tg["contact_waterfall_tier"] == "tier1"
     assert out_wa["contact_waterfall_tier"] == "tier1"
     assert out_low_icp["contact_waterfall_tier"] == "tier1"
+
+    # ICP == 70 triggers cheap Tier 2 phone lookup
+    mid_calls: list[str] = []
+
+    def fake_treg_70(ep: str, **kw: Any) -> dict[str, Any]:
+        mid_calls.append(ep)
+        if ep == "crawl4ai.people.phone.find":
+            return {"data": {"phone": {"value": "+14155550170"}}}
+        if ep == "hlrlookup.people.phone.validate":
+            return {"results": [{"telephone_number_type": "MOBILE"}]}
+        return {}
+
+    out_70 = contact_waterfall.enrich_lead_contacts(
+        {
+            "project": "MidICP70",
+            "project_url": "https://midicp70.io",
+            "founder_linkedin": "https://www.linkedin.com/in/mid-icp-70",
+            "work_email": "founder@midicp70.io",
+            "icp_score": 70,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=fake_treg_70,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+    )
+    assert "crawl4ai.people.phone.find" in mid_calls
+    assert out_70["phone"] == "+14155550170"
+    assert out_70["contact_waterfall_tier"] == "tier2"
 
 
 def test_per_lead_cap_and_super_whale_cap() -> None:
@@ -1060,7 +1088,7 @@ def test_contactout_company_hard_cap_max_one_hit_and_icp_gate() -> None:
     assert sec["phone"] == "+14155550192"
     assert not any(ep == "contactout.people.contact.phone" for ep, _ in dm1_phone_calls)
 
-    # 3) icp_score < 85 NEVER calls ContactOut $0.25 even if pool_usd >= 10000
+    # 3) icp_score < 80 NEVER calls ContactOut $0.25 even if pool_usd >= 10000; icp_score == 80 DOES call ContactOut
     low_icp_calls: list[str] = []
 
     def treg_low_icp_whale(ep: str, **kw: Any) -> dict[str, Any]:
@@ -1076,7 +1104,7 @@ def test_contactout_company_hard_cap_max_one_hit_and_icp_gate() -> None:
             "project_url": "https://poolonly.io",
             "work_email": "ceo@poolonly.io",
             "founder_linkedin": "https://www.linkedin.com/in/ceo-poolonly",
-            "icp_score": 82,
+            "icp_score": 79,
             "pool_usd": 15000,
         },
         http_get_fn=_empty_http,
@@ -1085,6 +1113,35 @@ def test_contactout_company_hard_cap_max_one_hit_and_icp_gate() -> None:
         tg_bridge_fn=lambda r: r,
     )
     assert "contactout.people.contact.phone" not in low_icp_calls
+
+    icp80_calls: list[str] = []
+
+    def treg_icp80_co(ep: str, **kw: Any) -> dict[str, Any]:
+        icp80_calls.append(ep)
+        if ep == "contactout.people.phone.available":
+            return {"status_code": 200, "profile": {"phone": True}}
+        if ep == "contactout.people.contact.phone":
+            return {"status_code": 200, "profile": {"phone": ["+14155550180"]}, "_treg": {"cost_usd": 0.25}}
+        if ep == "hlrlookup.people.phone.validate":
+            return {"results": [{"telephone_number_type": "MOBILE"}]}
+        return {}
+
+    out_co80 = contact_waterfall.enrich_lead_contacts(
+        {
+            "id": "co_icp_80",
+            "company": "EightyCo",
+            "project_url": "https://eightyco.io",
+            "work_email": "ceo@eightyco.io",
+            "founder_linkedin": "https://www.linkedin.com/in/ceo-eightyco",
+            "icp_score": 80,
+        },
+        http_get_fn=_empty_http,
+        treg_fn=treg_icp80_co,
+        dm_finder_fn=lambda c, d: {},
+        tg_bridge_fn=lambda r: r,
+    )
+    assert "contactout.people.contact.phone" in icp80_calls
+    assert out_co80["phone"] == "+14155550180"
 
 
 def test_free_tier1_contact_form_and_root_domain_fallback() -> None:
