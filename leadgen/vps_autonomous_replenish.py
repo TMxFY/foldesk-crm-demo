@@ -39,6 +39,7 @@ from app.db import ROOT, as_dict, connect, init_db, resolve_session, utc_now
 from app.leadgen_settings import (
     _clean_chat_list,
     _resolve_state_dir,
+    ensure_whales_tg_campaign_ready,
     find_existing_softugc_tg_campaign,
     get_leadgen_config,
     push_discovered_now,
@@ -74,6 +75,9 @@ from leadgen.linkedin_jobs import collect as collect_linkedin_jobs
 from leadgen.outreach_copy import build_outreach_sequence, resolve_copy_profile
 from leadgen.phone_messenger_resolver import (
     ResolvedMessenger,
+    _build_bridge_dm,
+    _normalize_social_url,
+    _parse_icp_score,
     build_fallback_contact_draft,
     merge_resolved_messengers,
     normalize_e164,
@@ -85,6 +89,8 @@ from leadgen.ru_experts import discover_ru_experts
 from leadgen.supply_side import sanitize_person_and_company, sniper_reject_reason, whale_icp_reject_reason
 from leadgen.tg_group_admins import extract_brand_tg_admins, extract_tg_group_handles_from_row
 from leadgen.tg_identity_bridge import bridge_lead_to_telegram
+
+_ORIG_BRIDGE_LEAD_TO_TELEGRAM = bridge_lead_to_telegram
 from leadgen.tg_to_gsheet import (
     admit_discovered_row,
     apply_master_merge,
@@ -1362,6 +1368,50 @@ def _with_isolated_tg_client(
     return _run_coro_sync(_runner())
 
 
+def _make_budget_callbacks(
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any] | None,
+    state: EnrichmentBudgetState | None,
+) -> tuple[Callable[..., bool], Callable[..., None]]:
+    """Build shared budget-reservation and spend-ledger callbacks."""
+
+    def _guard_fn(provider: str = "treg", *rest: Any, estimated_cost: float = 0.0, **kwargs: Any) -> bool:
+        if state is not None and not state.paid_allowed:
+            return False
+        if len(rest) == 1 and isinstance(rest[0], (int, float)):
+            est_cost = float(rest[0])
+        elif len(rest) >= 2 and isinstance(rest[1], (int, float)):
+            est_cost = float(rest[1])
+        else:
+            est_cost = float(estimated_cost or 0.0)
+        ok, _reason = check_and_reserve_budget(
+            conn,
+            provider=provider,
+            estimated_cost=est_cost,
+            cfg=cfg,
+        )
+        return ok
+
+    def _cost_fn(
+        *,
+        provider: str,
+        endpoint: str = "",
+        lead_key: str = "",
+        cost_usd: float = 0.0,
+        hit: bool = False,
+    ) -> None:
+        record_enrichment_spend(
+            conn,
+            provider=provider,
+            endpoint=endpoint,
+            lead_key=lead_key,
+            cost_usd=cost_usd,
+            hit=hit,
+        )
+
+    return _guard_fn, _cost_fn
+
+
 def run_contact_waterfall_with_budget(
     conn: sqlite3.Connection,
     rows: list[dict[str, Any]],
@@ -1394,39 +1444,7 @@ def run_contact_waterfall_with_budget(
     if not rows:
         return [], state
 
-    def _guard_fn(provider: str = "treg", *rest: Any, estimated_cost: float = 0.0, **kwargs: Any) -> bool:
-        if not state.paid_allowed:
-            return False
-        if len(rest) == 1 and isinstance(rest[0], (int, float)):
-            est_cost = float(rest[0])
-        elif len(rest) >= 2 and isinstance(rest[1], (int, float)):
-            est_cost = float(rest[1])
-        else:
-            est_cost = float(estimated_cost or 0.0)
-        ok, _reason = check_and_reserve_budget(
-            conn,
-            provider=provider,
-            estimated_cost=est_cost,
-            cfg=cfg,
-        )
-        return ok
-
-    def _cost_fn(
-        *,
-        provider: str,
-        endpoint: str = "",
-        lead_key: str = "",
-        cost_usd: float = 0.0,
-        hit: bool = False,
-    ) -> None:
-        record_enrichment_spend(
-            conn,
-            provider=provider,
-            endpoint=endpoint,
-            lead_key=lead_key,
-            cost_usd=cost_usd,
-            hit=hit,
-        )
+    _guard_fn, _cost_fn = _make_budget_callbacks(conn, cfg, state)
 
     active_enrich = enrich_lead_contacts if enrich_fn is None else enrich_fn
     eff_treg_fn = treg_fn if state.paid_allowed else (lambda *args, **kwargs: {})
@@ -2991,6 +3009,311 @@ def _collect_vacancy_campaigns_state(
     return True, needs, pending_total, non_completed_camps
 
 
+def _resolve_direct_x_social_manual_url_and_draft(
+    row: Mapping[str, Any], language: str
+) -> tuple[str, str]:
+    """Build (manual_action_url, manual_draft_text) for high-ICP Direct/X fallback rows."""
+    lang = "ru" if str(language or "").strip().lower() == "ru" else "en"
+    manual_url = ""
+    draft_kind = "social"
+
+    for key in ("founder_linkedin", "linkedin_url", "linkedin", "li_url"):
+        cand = _normalize_social_url(row.get(key), "linkedin")
+        if cand:
+            manual_url = cand
+            break
+    if not manual_url:
+        for key in ("founder_x", "x_url", "founder_twitter", "twitter", "twitter_url"):
+            cand = _normalize_social_url(row.get(key), "x")
+            if cand:
+                manual_url = cand
+                break
+    if not manual_url:
+        for key in ("instagram_url", "instagram_handle", "instagram", "ig_url", "ig_handle"):
+            cand = _normalize_social_url(row.get(key), "instagram")
+            if cand:
+                manual_url = cand
+                break
+    if not manual_url:
+        em = email_of_text(row.get("work_email") or row.get("email") or "")
+        if em:
+            manual_url = f"mailto:{em}"
+            draft_kind = "email"
+    if not manual_url:
+        e164 = normalize_e164(str(row.get("phone") or row.get("mobile_phone") or ""))
+        if e164:
+            manual_url = f"https://wa.me/{e164.lstrip('+')}"
+            draft_kind = "whatsapp_hlr"
+    if not manual_url:
+        raw_m = str(row.get("manual_action_url") or "").strip()
+        if raw_m.lower().startswith(("http://", "https://", "mailto:")):
+            manual_url = raw_m
+            if raw_m.lower().startswith("mailto:"):
+                draft_kind = "email"
+            elif raw_m.lower().startswith("https://wa.me/"):
+                draft_kind = "whatsapp_hlr"
+
+    if not manual_url:
+        return "", ""
+
+    draft = str(row.get("manual_draft_text") or "").strip()
+    if not draft:
+        if draft_kind in ("email", "whatsapp_hlr"):
+            draft = build_fallback_contact_draft(row, lang, draft_kind)
+        else:
+            draft = _build_bridge_dm(row, lang)
+    return manual_url, draft
+
+
+def _retro_bridge_direct_x_leads(
+    conn: sqlite3.Connection,
+    *,
+    state_dir: Path,
+    cfg: Mapping[str, Any],
+    budget_state: EnrichmentBudgetState | None,
+    is_real_subprocess_runner: bool,
+    isolated_session: Path | None,
+    tg_client: Any,
+    tg_entity_resolver_fn: Callable[..., Any] | None,
+    waterfall_treg_fn: Callable[..., Any] | None,
+    waterfall_monid_fn: Callable[..., Any] | None,
+    waterfall_http_get_fn: Callable[..., Any] | None,
+    tg_verify_stats: dict[str, int],
+    max_rows: int = 12,
+) -> dict[str, int]:
+    """Bounded retro-bridge (up to max_rows un-attempted rows) + high-ICP social_manual surfacing."""
+    stats = {
+        "attempted": 0,
+        "tg_bridged": 0,
+        "whales_ingested": 0,
+        "social_manual_ingested": 0,
+    }
+    direct_x_path = state_dir / "direct_x_leads.jsonl"
+    if not direct_x_path.is_file() or direct_x_path.stat().st_size == 0:
+        return stats
+
+    all_rows = _read_jsonl_dicts(direct_x_path)
+    if not all_rows:
+        return stats
+
+    batch_indices = [
+        idx
+        for idx, row in enumerate(all_rows)
+        if not str(row.get("tg_bridge_attempted_at") or "").strip()
+    ][: max(0, int(max_rows))]
+    if not batch_indices:
+        return stats
+
+    import leadgen.tg_identity_bridge as _tg_bridge_mod
+
+    active_bridge_fn = (
+        bridge_lead_to_telegram
+        if bridge_lead_to_telegram is not _ORIG_BRIDGE_LEAD_TO_TELEGRAM
+        else _tg_bridge_mod.bridge_lead_to_telegram
+    )
+    bridge_patched = active_bridge_fn is not _ORIG_BRIDGE_LEAD_TO_TELEGRAM
+    has_injected_io = any(
+        fn is not None
+        for fn in (waterfall_treg_fn, waterfall_monid_fn, waterfall_http_get_fn)
+    )
+    external_bridge_allowed = (
+        is_real_subprocess_runner or bridge_patched or has_injected_io
+    )
+    paid_allowed = bool(budget_state is None or budget_state.paid_allowed)
+    _guard_fn, _cost_fn = _make_budget_callbacks(conn, cfg, budget_state)
+
+    eff_treg_fn = waterfall_treg_fn if paid_allowed else (lambda *args, **kwargs: {})
+    eff_monid_fn = waterfall_monid_fn if paid_allowed else (lambda *args, **kwargs: {})
+
+    fetch_site_wrapper = None
+    if waterfall_http_get_fn is not None:
+
+        def _fetch_site_from_http(domain_arg: str) -> str:
+            clean_dom = str(domain_arg or "").strip().lower().removeprefix("www.").strip("/")
+            if not clean_dom:
+                return ""
+            try:
+                resp = waterfall_http_get_fn(f"https://{clean_dom}")
+                return str(getattr(resp, "text", resp) or "")
+            except Exception:
+                return ""
+
+        fetch_site_wrapper = _fetch_site_from_http
+
+    live_sess_dx = (
+        isolated_session
+        if (
+            is_real_subprocess_runner
+            or tg_client is not None
+            or tg_entity_resolver_fn is not None
+        )
+        else None
+    )
+
+    auto_push = bool(cfg.get("auto_push_to_crm", True))
+    bridged_for_whales: list[dict[str, Any]] = []
+    removed_indices: set[int] = set()
+    now_stamp = utc_now()
+
+    for idx in batch_indices:
+        stats["attempted"] += 1
+        row = dict(all_rows[idx])
+        if external_bridge_allowed:
+            bridged_raw = _call_with_supported_kwargs(
+                active_bridge_fn,
+                dict(row),
+                allow_paid=paid_allowed,
+                budget_guard_fn=_guard_fn,
+                cost_record_fn=_cost_fn,
+                treg_fn=eff_treg_fn,
+                monid_fn=eff_monid_fn,
+                fetch_site_fn=fetch_site_wrapper,
+            )
+        else:
+            bridged_raw = _call_with_supported_kwargs(
+                active_bridge_fn,
+                dict(row),
+                allow_paid=False,
+                x_profile_fn=lambda *_a, **_kw: None,
+                search_fn=lambda *_a, **_kw: None,
+                tme_fetch_fn=lambda *_a, **_kw: "",
+                fetch_site_fn=lambda *_a, **_kw: "",
+                treg_fn=lambda *_a, **_kw: {},
+                monid_fn=lambda *_a, **_kw: {},
+            )
+        candidate = dict(bridged_raw) if isinstance(bridged_raw, Mapping) else dict(row)
+
+        cand_u = (
+            str(
+                candidate.get("username")
+                or candidate.get("telegram_username")
+                or candidate.get("tg_username")
+                or ""
+            )
+            .strip()
+            .lstrip("@")
+        )
+        if cand_u:
+            verified_rows, v_stats = verify_personal_tg_handles_live(
+                [candidate],
+                client=tg_client,
+                scraper_session=live_sess_dx,
+                entity_resolver_fn=tg_entity_resolver_fn,
+            )
+            for k, val in v_stats.items():
+                tg_verify_stats[k] = tg_verify_stats.get(k, 0) + int(val)
+            candidate = verified_rows[0] if verified_rows else candidate
+
+        verified_u = (
+            str(
+                candidate.get("username")
+                or candidate.get("telegram_username")
+                or candidate.get("tg_username")
+                or ""
+            )
+            .strip()
+            .lstrip("@")
+        )
+        if _is_real_personal_tg_handle(verified_u):
+            candidate["username"] = verified_u
+            candidate["telegram_username"] = verified_u
+            candidate["provider"] = "telegram"
+            candidate["segment"] = "whale"
+            candidate["language"] = (
+                "ru"
+                if str(candidate.get("language") or "").strip().lower() == "ru"
+                else "en"
+            )
+            src_val = str(candidate.get("lead_source") or candidate.get("source") or "direct_x_bridge").strip()
+            candidate["source"] = src_val
+            candidate["lead_source"] = src_val
+            bridged_for_whales.append(candidate)
+            if auto_push:
+                removed_indices.add(idx)
+            else:
+                candidate["tg_bridge_attempted_at"] = now_stamp
+                all_rows[idx] = candidate
+            continue
+
+        row["tg_bridge_attempted_at"] = now_stamp
+        all_rows[idx] = row
+
+        if _parse_icp_score(row.get("icp_score")) >= 82 and not sniper_reject_reason(row):
+            has_direct_contact = any(
+                str(row.get(k) or "").strip()
+                for k in (
+                    "founder_linkedin",
+                    "linkedin_url",
+                    "linkedin",
+                    "li_url",
+                    "founder_x",
+                    "x_url",
+                    "founder_twitter",
+                    "twitter",
+                    "twitter_url",
+                    "instagram_url",
+                    "instagram_handle",
+                    "instagram",
+                    "ig_url",
+                    "ig_handle",
+                    "phone",
+                    "mobile_phone",
+                    "email",
+                    "work_email",
+                )
+            )
+            if has_direct_contact:
+                lang = detect_lead_language(row)
+                manual_url, manual_draft = _resolve_direct_x_social_manual_url_and_draft(
+                    row, lang
+                )
+                if manual_url:
+                    em_norm = email_of_text(row.get("work_email") or row.get("email") or "")
+                    dup_email = False
+                    if em_norm:
+                        dup_email = (
+                            conn.execute(
+                                "SELECT 1 FROM leads WHERE lower(COALESCE(email, '')) = lower(?) AND segment = 'social_manual' LIMIT 1",
+                                (em_norm,),
+                            ).fetchone()
+                            is not None
+                        )
+                    if not dup_email:
+                        manual_row = dict(row)
+                        manual_row["segment"] = "social_manual"
+                        manual_row["language"] = lang
+                        manual_row["manual_action_url"] = manual_url
+                        manual_row["manual_draft_text"] = manual_draft
+                        if not str(manual_row.get("lead_source") or "").strip():
+                            manual_row["lead_source"] = str(
+                                manual_row.get("source") or "direct_x"
+                            ).strip()
+                        inserted_id = _insert_manual_queue_lead(conn, manual_row)
+                        if inserted_id is not None:
+                            stats["social_manual_ingested"] += 1
+
+    if bridged_for_whales:
+        stats["tg_bridged"] = len(bridged_for_whales)
+        if auto_push:
+            ingest_res = ingest_v2_routed_leads(
+                conn,
+                bridged_for_whales,
+                cfg=cfg,
+                auto_push=True,
+            )
+            stats["whales_ingested"] += int(ingest_res.get("whales_ingested") or 0)
+
+    kept_rows = [row for idx, row in enumerate(all_rows) if idx not in removed_indices]
+    tmp_dx = direct_x_path.with_suffix(".jsonl.tmp")
+    tmp_dx.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in kept_rows)
+        + ("\n" if kept_rows else ""),
+        encoding="utf-8",
+    )
+    tmp_dx.replace(direct_x_path)
+    return stats
+
+
 def run_autonomous_replenish(
     conn: sqlite3.Connection,
     *,
@@ -3336,6 +3659,27 @@ def _run_autonomous_replenish_locked(
                 sources_cfg = b2b_cfg.get("sources") or {}
                 limits_cfg = b2b_cfg.get("limits") or {}
 
+                dx_retro = _retro_bridge_direct_x_leads(
+                    conn,
+                    state_dir=state_dir,
+                    cfg=eff_cfg,
+                    budget_state=budget_state,
+                    is_real_subprocess_runner=is_real_subprocess_runner,
+                    isolated_session=isolated_session,
+                    tg_client=tg_client,
+                    tg_entity_resolver_fn=tg_entity_resolver_fn,
+                    waterfall_treg_fn=waterfall_treg_fn,
+                    waterfall_monid_fn=waterfall_monid_fn,
+                    waterfall_http_get_fn=waterfall_http_get_fn,
+                    tg_verify_stats=tg_verify_stats,
+                    max_rows=12,
+                )
+                if dx_retro["attempted"] > 0:
+                    stages_run.append("retro_bridge_direct_x")
+                    tg_bridged_count += int(dx_retro["tg_bridged"])
+                    ingested_total += int(dx_retro["whales_ingested"])
+                    social_manual_ingested += int(dx_retro["social_manual_ingested"])
+
                 # Web / API discovery stages (no TG session needed)
                 paid_cli_discovery_allowed = (
                     (not is_real_subprocess_runner)
@@ -3448,13 +3792,16 @@ def _run_autonomous_replenish_locked(
                         if "budget_guard_skipped:meta_ad_leads" not in replenish_reasons:
                             replenish_reasons.append("budget_guard_skipped:meta_ad_leads")
                     elif treg_ready or not is_real_subprocess_runner:
+                        meta_seen_path = state_dir / "meta_ads_seen.json"
                         meta_cmd = [
                             py_bin,
                             str(ROOT / "leadgen" / "meta_ad_leads.py"),
                             "--output",
                             str(meta_ads_out),
                             "--seen",
-                            str(state_dir / "meta_ads_seen.json"),
+                            str(meta_seen_path),
+                            "--max-runtime-sec",
+                            str(min(210, max(60, int(stage_timeout) - 60))),
                         ]
                         whales_geos = [
                             str(g).strip().upper()
@@ -3462,7 +3809,23 @@ def _run_autonomous_replenish_locked(
                             if str(g or "").strip()
                         ]
                         if whales_geos:
-                            meta_cmd.extend(["--country", ",".join(whales_geos)])
+                            meta_cursor = 0
+                            if meta_seen_path.is_file():
+                                try:
+                                    seen_obj = json.loads(
+                                        meta_seen_path.read_text(encoding="utf-8")
+                                    )
+                                    if isinstance(seen_obj, dict):
+                                        meta_cursor = max(
+                                            0, int(seen_obj.get("cursor") or 0)
+                                        )
+                                except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                                    meta_cursor = 0
+                            sliced_geos = [
+                                whales_geos[(meta_cursor * 3 + i) % len(whales_geos)]
+                                for i in range(min(3, len(whales_geos)))
+                            ]
+                            meta_cmd.extend(["--country", ",".join(sliced_geos)])
                         _exec_stage("meta_ad_leads", meta_cmd)
                     elif "missing_treg_cli" not in replenish_reasons:
                         replenish_reasons.append("missing_treg_cli")
@@ -4018,7 +4381,7 @@ def _run_autonomous_replenish_locked(
                                             for r in curated_snapshot
                                             if str(r.get("tg_bridge_match") or "").strip()
                                         )
-                                        tg_bridged_count = max(
+                                        tg_bridged_count += max(
                                             0, post_tg_cnt - pre_wf_tg_cnt, bridged_tag_cnt
                                         )
                                         split_res = split_tg_and_direct_x_leads(
@@ -4227,6 +4590,15 @@ def _run_autonomous_replenish_locked(
             vac_low_water_mark=int(vac_low_water_mark),
         )
 
+    whales_ready = ensure_whales_tg_campaign_ready(conn, eff_cfg)
+    if whales_ready.get("campaign_id"):
+        refreshed_b2b = _find_campaign_by_name(
+            conn, str(whales_ready.get("campaign_name") or b2b_name)
+        )
+        if refreshed_b2b is not None:
+            b2b_camp = refreshed_b2b
+            pending_b2b = _count_pending(conn, b2b_camp["id"])
+
     # Persist stage_errors in kv_settings for observability
     now_err_stamp = utc_now()
     conn.execute(
@@ -4330,6 +4702,7 @@ def _run_autonomous_replenish_locked(
         "phone_resolution": phone_res_stats,
         "wave2_vacancies": wave2_stats,
         "wave3_ru_experts": wave3_stats,
+        "whales_ready": whales_ready,
     }
     if (
         stages_run

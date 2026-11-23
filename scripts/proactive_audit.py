@@ -523,14 +523,18 @@ def _audit_leadgen_starvation_and_anomalies(
     for c in campaigns:
         pending = int(c.get("pending") or 0)
         ingested_72h = int(c.get("ingested_72h") or 0)
-        is_starved = pending < int(critical_low_mark) or ingested_72h == 0
+        not_running_b2b = str(c.get("starvation_reason") or "") == "b2b_tg_campaign_not_running"
+        is_starved = not_running_b2b or pending < int(critical_low_mark) or ingested_72h == 0
         if is_starved:
             enriched = dict(c)
-            enriched["starvation_reason"] = (
-                "pending_below_mark_and_zero_72h"
-                if (pending < int(critical_low_mark) and ingested_72h == 0)
-                else ("pending_below_mark" if pending < int(critical_low_mark) else "zero_ingested_72h")
-            )
+            if not_running_b2b:
+                enriched["starvation_reason"] = "b2b_tg_campaign_not_running"
+            else:
+                enriched["starvation_reason"] = (
+                    "pending_below_mark_and_zero_72h"
+                    if (pending < int(critical_low_mark) and ingested_72h == 0)
+                    else ("pending_below_mark" if pending < int(critical_low_mark) else "zero_ingested_72h")
+                )
             campaigns_starved.append(enriched)
 
     anomalies = inspect_leadgen_run_anomalies(eff_state_dir)
@@ -576,6 +580,15 @@ def _audit_leadgen_starvation_and_anomalies(
             for c in campaigns_starved
         ]
         issues.append(f"leadgen_starvation={labels}")
+        for c in campaigns_starved:
+            if c.get("starvation_reason") == "b2b_tg_campaign_not_running":
+                if "b2b_tg_campaign_not_running" not in issues:
+                    issues.append("b2b_tg_campaign_not_running")
+                if (
+                    c.get("issue_code") == "whales_en_tg_starved"
+                    or "whales" in str(c.get("name") or "").lower()
+                ) and "whales_en_tg_starved" not in issues:
+                    issues.append("whales_en_tg_starved")
     if tg_bridged_zero_alert:
         issues.append(f"tg_bridged_zero_streak={anomalies.get('tg_bridged_zero_streak')}")
     if static_dump_alert:
@@ -2042,6 +2055,48 @@ def _run_self_test() -> int:
                 if lg_clean.get("ok") is not True:
                     print(f"SELFTEST FAILED: leadgen healthy failed: {lg_clean}", file=sys.stderr)
                     return 1
+
+                # Negative ratchet check: b2b.enabled=True & autopilot=1 with Whales EN — TG stuck in draft
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('leadgen_config', ?, ?)",
+                    (json.dumps({"enabled": True, "b2b": {"enabled": True}}), now),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_settings (key, value, updated_at) VALUES ('outreach_autopilot_enabled', '1', ?)",
+                    (now,),
+                )
+                conn.execute("UPDATE campaigns SET status = 'draft' WHERE id = ?", (b2b_camp_id,))
+                draft_whales_id = int(
+                    conn.execute(
+                        "INSERT INTO campaigns (name, account_id, account_ids_json, daily_limit, status, leadgen_enabled, created_at, updated_at) "
+                        "VALUES ('Whales EN — TG', NULL, '[]', 30, 'draft', 1, ?, ?)",
+                        (now, now),
+                    ).lastrowid
+                )
+                conn.commit()
+                draft_fail = _audit_leadgen_starvation_and_anomalies(
+                    conn, db_path=db_path, state_dir=state_dir
+                )
+                draft_starved_ids = {
+                    int(c["campaign_id"]) for c in (draft_fail.get("campaigns_starved") or [])
+                }
+                if (
+                    draft_fail.get("ok") is not False
+                    or draft_whales_id not in draft_starved_ids
+                    or not any(
+                        "b2b_tg_campaign_not_running" in iss or "whales_en_tg_starved" in iss
+                        for iss in (draft_fail.get("issues") or [])
+                    )
+                ):
+                    print(
+                        f"SELFTEST FAILED: draft Whales EN — TG missed: {draft_fail}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                conn.execute("DELETE FROM campaigns WHERE id = ?", (draft_whales_id,))
+                conn.execute("UPDATE campaigns SET status = 'running' WHERE id = ?", (b2b_camp_id,))
+                conn.execute("DELETE FROM kv_settings WHERE key IN ('leadgen_config', 'outreach_autopilot_enabled')")
+                conn.commit()
 
             # (f) Dialog last_from_peer vs latest messages.direction drift
             drift_dlg_id = int(

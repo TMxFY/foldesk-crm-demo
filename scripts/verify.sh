@@ -1392,6 +1392,78 @@ if hygiene_v_file.is_file():
                     "Gate V violation in app/hygiene.py:_collect_hygiene_findings must use _CONTACTLESS_EXEMPT_SEGMENTS"
                 )
 
+# Gate W: Whales EN — TG Autostart, Meta Ads Geo Slicing & Direct/X Retro-Bridge Gate
+if repl_file.is_file() and "def _run_autonomous_replenish_locked(" in repl_src:
+    repl_tree_w = ast.parse(repl_src, filename=str(repl_file))
+    repl_locked_fn = next(
+        (nd for nd in repl_tree_w.body if isinstance(nd, ast.FunctionDef) and nd.name == "_run_autonomous_replenish_locked"),
+        None,
+    )
+    if "--max-runtime-sec" not in repl_src or "meta_ads_seen.json" not in repl_src or "% len(whales_geos)" not in repl_src:
+        errors.append(
+            "Gate W violation in leadgen/vps_autonomous_replenish.py: meta_ad_leads must slice whales_geos via meta_ads_seen.json cursor and pass --max-runtime-sec"
+        )
+    if repl_locked_fn is None:
+        errors.append("Gate W violation in leadgen/vps_autonomous_replenish.py: missing _run_autonomous_replenish_locked")
+    else:
+        locked_calls = {
+            (c.func.id if isinstance(c.func, ast.Name) else c.func.attr)
+            for c in ast.walk(repl_locked_fn)
+            if isinstance(c, ast.Call) and isinstance(c.func, (ast.Name, ast.Attribute))
+        }
+        for req_call_w in ("ensure_whales_tg_campaign_ready", "_retro_bridge_direct_x_leads"):
+            if req_call_w not in locked_calls:
+                errors.append(
+                    f"Gate W violation in leadgen/vps_autonomous_replenish.py:_run_autonomous_replenish_locked must call {req_call_w}"
+                )
+
+if lg_settings_file.is_file():
+    lg_src_w = lg_settings_file.read_text(encoding="utf-8")
+    if "def sync_leadgen_campaigns(" in lg_src_w:
+        lg_tree_w = ast.parse(lg_src_w, filename=str(lg_settings_file))
+        lg_fns_w = {nd.name: nd for nd in lg_tree_w.body if isinstance(nd, ast.FunctionDef)}
+        ready_fn_w = lg_fns_w.get("ensure_whales_tg_campaign_ready")
+        sync_fn_w = lg_fns_w.get("sync_leadgen_campaigns")
+        if ready_fn_w is None:
+            errors.append("Gate W violation in app/leadgen_settings.py: missing ensure_whales_tg_campaign_ready")
+        else:
+            ready_calls_w = {
+                (c.func.id if isinstance(c.func, ast.Name) else c.func.attr)
+                for c in ast.walk(ready_fn_w)
+                if isinstance(c, ast.Call) and isinstance(c.func, (ast.Name, ast.Attribute))
+            }
+            for req_ready_call in ("is_autopilot_enabled", "preview_outreach_batch"):
+                if req_ready_call not in ready_calls_w:
+                    errors.append(
+                        f"Gate W violation in app/leadgen_settings.py:ensure_whales_tg_campaign_ready must call {req_ready_call}"
+                    )
+        if sync_fn_w is not None:
+            sync_calls_w = {
+                (c.func.id if isinstance(c.func, ast.Name) else c.func.attr)
+                for c in ast.walk(sync_fn_w)
+                if isinstance(c, ast.Call) and isinstance(c.func, (ast.Name, ast.Attribute))
+            }
+            if "ensure_whales_tg_campaign_ready" not in sync_calls_w:
+                errors.append(
+                    "Gate W violation in app/leadgen_settings.py:sync_leadgen_campaigns must call ensure_whales_tg_campaign_ready"
+                )
+
+if hygiene_py_file.is_file():
+    hyg_src_w = hygiene_py_file.read_text(encoding="utf-8")
+    if "def _audit_per_campaign_leadgen_status(" in hyg_src_w and "b2b_tg_campaign_not_running" not in hyg_src_w:
+        errors.append(
+            "Gate W violation in app/hygiene.py: _audit_per_campaign_leadgen_status must flag b2b_tg_campaign_not_running"
+        )
+
+if proactive_audit_file.is_file():
+    pa_src_w = proactive_audit_file.read_text(encoding="utf-8")
+    if "def _audit_leadgen_starvation_and_anomalies(" in pa_src_w and (
+        "b2b_tg_campaign_not_running" not in pa_src_w or "whales_en_tg_starved" not in pa_src_w
+    ):
+        errors.append(
+            "Gate W violation in scripts/proactive_audit.py: must flag b2b_tg_campaign_not_running / whales_en_tg_starved"
+        )
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)

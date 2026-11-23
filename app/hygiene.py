@@ -1294,6 +1294,23 @@ def inspect_leadgen_run_anomalies(state_dir: Path | None = None) -> dict[str, An
     }
 
 
+def _is_non_b2b_tg_campaign_row(cdict: Mapping[str, Any]) -> bool:
+    """Return True when campaign row is OFM, WhatsApp, vacancy, or RU-expert (not EN B2B/Whale TG)."""
+    cname = str(cdict.get("name") or "").strip()
+    cname_low = cname.lower()
+    ch = str(cdict.get("channel") or "").strip().lower()
+    if ch == "whatsapp" or "(wa)" in cname_low or "whatsapp" in cname_low or " — wa" in cname_low:
+        return True
+    if is_ofm_campaign_name(cname, cdict.get("leadgen_sources_json")):
+        return True
+    seg = str(cdict.get("segment") or "").strip().lower()
+    if seg in {"ofm", "ru_expert", "vacancy", "vacancy_assisted", "client_reels", "social_manual"}:
+        return True
+    if any(k in cname_low for k in ("ваканс", "vacanc", "job", "рф-эксперт", "ru_expert")):
+        return True
+    return False
+
+
 def _audit_per_campaign_leadgen_status(
     conn: sqlite3.Connection,
     *,
@@ -1308,11 +1325,13 @@ def _audit_per_campaign_leadgen_status(
     if "leadgen_enabled" not in cols:
         return []
 
-    sel_channel = ", channel" if "channel" in cols else ""
+    sel_extra = "".join(
+        f", {col}" for col in ("channel", "segment", "leadgen_sources_json") if col in cols
+    )
     try:
         camp_rows = conn.execute(
             f"""
-            SELECT id, name, status, leadgen_enabled{sel_channel}
+            SELECT id, name, status, leadgen_enabled{sel_extra}
             FROM campaigns
             WHERE lower(COALESCE(status, '')) = 'running'
               AND COALESCE(leadgen_enabled, 0) = 1
@@ -1332,6 +1351,40 @@ def _audit_per_campaign_leadgen_status(
     cutoff_72h = (now_dt - timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
     cutoff_24h_t = (now_dt - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
     cutoff_72h_t = (now_dt - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def _campaign_counts(target_cid: int) -> tuple[int, int, int]:
+        if target_cid <= 0:
+            return 0, 0, 0
+        p_cnt = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ? AND status = 'pending'",
+                (target_cid,),
+            ).fetchone()[0]
+            or 0
+        )
+        i24_cnt = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM campaign_recipients
+                WHERE campaign_id = ?
+                  AND replace(substr(created_at, 1, 19), 'T', ' ') >= ?
+                """,
+                (target_cid, min(cutoff_24h, cutoff_24h_t)),
+            ).fetchone()[0]
+            or 0
+        )
+        i72_cnt = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM campaign_recipients
+                WHERE campaign_id = ?
+                  AND replace(substr(created_at, 1, 19), 'T', ' ') >= ?
+                """,
+                (target_cid, min(cutoff_72h, cutoff_72h_t)),
+            ).fetchone()[0]
+            or 0
+        )
+        return p_cnt, i24_cnt, i72_cnt
 
     results: list[dict[str, Any]] = []
     for crow in camp_rows:
@@ -1355,35 +1408,7 @@ def _audit_per_campaign_leadgen_status(
                 ).fetchone()
                 raw_ch = "whatsapp" if wa_row is not None else "telegram"
 
-        pending = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = ? AND status = 'pending'",
-                (cid,),
-            ).fetchone()[0]
-            or 0
-        )
-        ingested_24h = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM campaign_recipients
-                WHERE campaign_id = ?
-                  AND replace(substr(created_at, 1, 19), 'T', ' ') >= ?
-                """,
-                (cid, min(cutoff_24h, cutoff_24h_t)),
-            ).fetchone()[0]
-            or 0
-        )
-        ingested_72h = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM campaign_recipients
-                WHERE campaign_id = ?
-                  AND replace(substr(created_at, 1, 19), 'T', ' ') >= ?
-                """,
-                (cid, min(cutoff_72h, cutoff_72h_t)),
-            ).fetchone()[0]
-            or 0
-        )
+        pending, ingested_24h, ingested_72h = _campaign_counts(cid)
 
         low_water = pending < int(critical_low_mark)
         explicit_exhausted = (
@@ -1398,7 +1423,10 @@ def _audit_per_campaign_leadgen_status(
             {
                 "campaign_id": cid,
                 "name": cname,
+                "status": str(cdict.get("status") or "running"),
                 "channel": raw_ch,
+                "segment": str(cdict.get("segment") or ""),
+                "leadgen_sources_json": cdict.get("leadgen_sources_json"),
                 "pending": pending,
                 "ingested_24h": ingested_24h,
                 "ingested_72h": ingested_72h,
@@ -1407,6 +1435,100 @@ def _audit_per_campaign_leadgen_status(
                 "low_water_alert": low_water,
             }
         )
+
+    # Ratchet: when B2B leadgen and Autopilot are active, 0 running non-OFM B2B/Whale TG campaigns
+    # (e.g., Whales EN — TG stuck in 'draft') must not be masked by OFM or empty running results.
+    from app.leadgen_settings import get_leadgen_config, resolve_target_b2b_tg_campaign_name
+    from app.outreach import is_autopilot_enabled
+
+    cfg = get_leadgen_config(conn)
+    b2b_enabled = bool((cfg.get("b2b") or {}).get("enabled", True))
+    leadgen_on = bool(cfg.get("enabled", True))
+    autopilot_on = is_autopilot_enabled(conn)
+
+    if leadgen_on and b2b_enabled and autopilot_on:
+        running_b2b_tg = [
+            r
+            for r in results
+            if r.get("channel") == "telegram" and not _is_non_b2b_tg_campaign_row(r)
+        ]
+        if not running_b2b_tg:
+            target_b2b_name = resolve_target_b2b_tg_campaign_name(
+                conn,
+                (cfg.get("b2b") or {}).get("target_campaign_tg"),
+                fallback_default="Whales EN — TG",
+            )
+            all_camps = [
+                as_dict(r)
+                for r in conn.execute(
+                    f"SELECT id, name, status, leadgen_enabled{sel_extra} FROM campaigns ORDER BY id ASC"
+                ).fetchall()
+            ]
+            target_row = next(
+                (
+                    c
+                    for c in all_camps
+                    if str(c.get("name") or "").strip().lower()
+                    in {target_b2b_name.strip().lower(), "whales en — tg"}
+                ),
+                None,
+            )
+            if target_row is None:
+                target_row = next(
+                    (
+                        c
+                        for c in all_camps
+                        if int(c.get("leadgen_enabled") or 0) == 1
+                        and str(c.get("status") or "").strip().lower() != "completed"
+                        and not _is_non_b2b_tg_campaign_row(c)
+                    ),
+                    None,
+                )
+
+            kv_keys: set[str] = set()
+            try:
+                kv_keys = {
+                    str(r["key"])
+                    for r in conn.execute(
+                        "SELECT key FROM kv_settings WHERE key IN ('leadgen_config', 'outreach_autopilot_enabled')"
+                    ).fetchall()
+                }
+            except sqlite3.Error:
+                kv_keys = set()
+
+            should_flag = bool(
+                target_row is not None
+                or results
+                or {"leadgen_config", "outreach_autopilot_enabled"}.issubset(kv_keys)
+            )
+            if should_flag:
+                t_cid = int(target_row["id"]) if target_row is not None else 0
+                t_name = str(target_row.get("name") or target_b2b_name) if target_row is not None else target_b2b_name
+                t_status = str(target_row.get("status") or "missing") if target_row is not None else "missing"
+                pending, ingested_24h, ingested_72h = _campaign_counts(t_cid)
+                issue_code = (
+                    "whales_en_tg_starved"
+                    if "whales" in t_name.lower()
+                    else "b2b_tg_campaign_not_running"
+                )
+                results.append(
+                    {
+                        "campaign_id": t_cid,
+                        "name": t_name,
+                        "status": t_status,
+                        "channel": "telegram",
+                        "segment": str(target_row.get("segment") or "whale") if target_row else "whale",
+                        "leadgen_sources_json": target_row.get("leadgen_sources_json") if target_row else None,
+                        "pending": pending,
+                        "ingested_24h": ingested_24h,
+                        "ingested_72h": ingested_72h,
+                        "critical_low_mark": int(critical_low_mark),
+                        "sources_exhausted": bool(ingested_24h == 0 and bool(summary)),
+                        "low_water_alert": True,
+                        "starvation_reason": "b2b_tg_campaign_not_running",
+                        "issue_code": issue_code,
+                    }
+                )
     return results
 
 

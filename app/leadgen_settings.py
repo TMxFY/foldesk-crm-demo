@@ -13,7 +13,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.db import CANONICAL_STEP3_IMAGE_URL, ROOT, as_dict, utc_now, utc_today
-from app.outreach import create_campaign, get_campaign, update_campaign
+from app.outreach import (
+    _parse_account_ids,
+    create_campaign,
+    get_account_cooldown_until,
+    get_campaign,
+    is_account_eligible_for_outreach,
+    is_autopilot_enabled,
+    is_vacancy_campaign,
+    preview_outreach_batch,
+    update_campaign,
+)
 from leadgen.language_router import (
     CAMPAIGN_OFM_TG,
     CAMPAIGN_RU_EXPERTS_TG,
@@ -1381,10 +1391,247 @@ def sync_leadgen_campaigns(
             )
             synced_campaigns.append(get_campaign(conn, cid))
 
+    whales_ready = ensure_whales_tg_campaign_ready(conn, cfg)
+    ready_cid = whales_ready.get("campaign_id")
+    if ready_cid is not None:
+        refreshed = get_campaign(conn, int(ready_cid))
+        synced_campaigns = [
+            refreshed if int(c["id"]) == int(ready_cid) else c
+            for c in synced_campaigns
+        ]
+
     return {
         "ok": True,
         "synced_count": len(synced_campaigns),
         "campaigns": synced_campaigns,
+        "whales_ready": whales_ready,
+    }
+
+
+def _find_campaign_by_name_ci(
+    conn: sqlite3.Connection, name: str
+) -> dict[str, Any] | None:
+    clean = str(name or "").strip().lower()
+    if not clean:
+        return None
+    row = conn.execute(
+        "SELECT * FROM campaigns WHERE lower(trim(COALESCE(name, ''))) = ? ORDER BY id ASC LIMIT 1",
+        (clean,),
+    ).fetchone()
+    return as_dict(row) if row is not None else None
+
+
+def _select_healthy_connected_tg_accounts_for_whales(
+    conn: sqlite3.Connection,
+    *,
+    exclude_campaign_id: int,
+) -> list[int]:
+    """Select healthy connected TG accounts, preferring completely unassigned accounts first."""
+    tg_rows = conn.execute(
+        """
+        SELECT * FROM accounts
+        WHERE lower(COALESCE(provider, 'telegram')) = 'telegram'
+          AND lower(COALESCE(status, '')) = 'connected'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    healthy_ids: list[int] = []
+    for raw_acc in tg_rows:
+        acc = as_dict(raw_acc)
+        acc_id = int(acc["id"])
+        eligible, _reason = is_account_eligible_for_outreach(acc, allow_spambot_warm=False)
+        if not eligible:
+            continue
+        health_low = str(acc.get("health") or "active").strip().lower()
+        if health_low in ("offline", "dead", "disconnected"):
+            continue
+        if get_account_cooldown_until(conn, acc_id) is not None:
+            continue
+        healthy_ids.append(acc_id)
+
+    if not healthy_ids:
+        return []
+
+    other_camps = conn.execute(
+        """
+        SELECT * FROM campaigns
+        WHERE id != ?
+          AND lower(COALESCE(status, '')) != 'completed'
+        """,
+        (int(exclude_campaign_id),),
+    ).fetchall()
+    used_any_ids: set[int] = set()
+    used_vacancy_ids: set[int] = set()
+    for raw_oc in other_camps:
+        oc = as_dict(raw_oc)
+        oc_ids = _parse_account_ids(oc.get("account_id"), oc.get("account_ids_json"))
+        used_any_ids.update(oc_ids)
+        if is_vacancy_campaign(oc):
+            used_vacancy_ids.update(oc_ids)
+
+    unassigned_ids = [aid for aid in healthy_ids if aid not in used_any_ids]
+    if unassigned_ids:
+        return unassigned_ids
+    non_vacancy_pool = [aid for aid in healthy_ids if aid not in used_vacancy_ids]
+    return non_vacancy_pool or healthy_ids
+
+
+def ensure_whales_tg_campaign_ready(
+    conn: sqlite3.Connection,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Ensure Whales EN — TG has healthy connected TG accounts and auto-promotes draft -> running when safe."""
+    eff_cfg = cfg if isinstance(cfg, dict) else get_leadgen_config(conn)
+    b2b_cfg = eff_cfg.get("b2b") if isinstance(eff_cfg.get("b2b"), dict) else {}
+    if (
+        not bool(eff_cfg.get("enabled", True))
+        or not bool(b2b_cfg.get("enabled", True))
+        or not bool(eff_cfg.get("auto_push_to_crm", True))
+    ):
+        return {
+            "ok": True,
+            "found": False,
+            "campaign_id": None,
+            "assigned_account_ids": [],
+            "accounts_assigned": False,
+            "promoted_to_running": False,
+            "skipped": "disabled_in_config",
+        }
+
+    target_name = resolve_target_b2b_tg_campaign_name(
+        conn,
+        b2b_cfg.get("target_campaign_tg"),
+        fallback_default=CAMPAIGN_WHALES_EN_TG,
+    )
+    camp = _find_campaign_by_name_ci(conn, target_name)
+    if camp is None and target_name.strip().lower() != CAMPAIGN_WHALES_EN_TG.lower():
+        camp = _find_campaign_by_name_ci(conn, CAMPAIGN_WHALES_EN_TG)
+    if camp is None:
+        return {
+            "ok": True,
+            "found": False,
+            "campaign_id": None,
+            "campaign_name": target_name,
+            "assigned_account_ids": [],
+            "accounts_assigned": False,
+            "promoted_to_running": False,
+        }
+
+    from app.hygiene import is_ofm_campaign_name
+
+    cname = str(camp.get("name") or target_name)
+    cname_low = cname.lower()
+    if is_ofm_campaign_name(cname, camp.get("leadgen_sources_json")) or "(wa)" in cname_low or "whatsapp" in cname_low:
+        return {
+            "ok": True,
+            "found": False,
+            "campaign_id": int(camp["id"]),
+            "campaign_name": cname,
+            "assigned_account_ids": [],
+            "accounts_assigned": False,
+            "promoted_to_running": False,
+            "skipped": "ineligible_campaign_type",
+        }
+
+    cid = int(camp["id"])
+    cur_status = str(camp.get("status") or "").strip().lower()
+    if cur_status in ("completed", "paused"):
+        return {
+            "ok": True,
+            "found": True,
+            "campaign_id": cid,
+            "campaign_name": cname,
+            "status": cur_status,
+            "assigned_account_ids": _parse_account_ids(
+                camp.get("account_id"), camp.get("account_ids_json")
+            ),
+            "accounts_assigned": False,
+            "promoted_to_running": False,
+            "skipped": f"status_{cur_status}",
+        }
+
+    assigned_ids = _parse_account_ids(camp.get("account_id"), camp.get("account_ids_json"))
+    accounts_assigned = False
+    if not assigned_ids:
+        cand_ids = _select_healthy_connected_tg_accounts_for_whales(
+            conn, exclude_campaign_id=cid
+        )
+        if cand_ids:
+            camp = update_campaign(
+                conn,
+                cid,
+                account_id=cand_ids[0],
+                account_ids=cand_ids,
+            )
+            assigned_ids = _parse_account_ids(
+                camp.get("account_id"), camp.get("account_ids_json")
+            )
+            accounts_assigned = bool(assigned_ids)
+
+    connected_tg_count = 0
+    if assigned_ids:
+        ph = ",".join("?" for _ in assigned_ids)
+        assigned_rows = conn.execute(
+            f"""
+            SELECT * FROM accounts
+            WHERE id IN ({ph})
+              AND lower(COALESCE(provider, 'telegram')) = 'telegram'
+              AND lower(COALESCE(status, '')) = 'connected'
+            """,
+            tuple(assigned_ids),
+        ).fetchall()
+        for raw_ar in assigned_rows:
+            acc_d = as_dict(raw_ar)
+            eligible, _ = is_account_eligible_for_outreach(acc_d, allow_spambot_warm=False)
+            health_low = str(acc_d.get("health") or "active").strip().lower()
+            if eligible and health_low not in ("offline", "dead", "disconnected"):
+                connected_tg_count += 1
+
+    pending_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM campaign_recipients
+            WHERE campaign_id = ?
+              AND COALESCE(current_step, 0) = 0
+              AND status = 'pending'
+            """,
+            (cid,),
+        ).fetchone()[0]
+        or 0
+    )
+
+    autopilot_on = is_autopilot_enabled(conn)
+    promoted_to_running = False
+    if (
+        cur_status == "draft"
+        and autopilot_on
+        and connected_tg_count >= 1
+        and pending_count > 0
+    ):
+        preview = preview_outreach_batch(conn, cid, sample_size=5, strict=False)
+        violations = list(preview.get("violations") or [])
+        ready_count = int(
+            preview.get("ready_count")
+            if preview.get("ready_count") is not None
+            else (preview.get("fresh_untouched_count") or 0)
+        )
+        if bool(preview.get("ok", True)) and not violations and ready_count > 0:
+            camp = update_campaign(conn, cid, status="running")
+            cur_status = str(camp.get("status") or "running")
+            promoted_to_running = True
+
+    return {
+        "ok": True,
+        "found": True,
+        "campaign_id": cid,
+        "campaign_name": cname,
+        "status": cur_status,
+        "assigned_account_ids": assigned_ids,
+        "accounts_assigned": accounts_assigned,
+        "connected_tg_accounts": connected_tg_count,
+        "pending_count": pending_count,
+        "autopilot_enabled": autopilot_on,
+        "promoted_to_running": promoted_to_running,
     }
 
 
