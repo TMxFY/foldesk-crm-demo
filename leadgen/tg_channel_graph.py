@@ -51,6 +51,8 @@ DEFAULT_SESSION = (
     or "/Users/timofei/.claude/skill-telegram/tim3.session"
 )
 DEFAULT_STATE_PATH = "leadgen_state/channel_graph_seen.json"
+MAX_DISCOVERED_GRAPH_SEEDS = 200
+_DISCOVERED_SEED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{2,31}$")
 DEFAULT_GRAPH_SEED_CHANNELS: tuple[str, ...] = (
     "startupoftheday",
     "productradar_official",
@@ -670,6 +672,14 @@ async def crawl_channel_graph(
                 queue.append((disc_ref, 0))
                 queued_keys.add(disc_key)
 
+        for extra_seed in _load_discovered_graph_seeds(state_dir=state_dir, state_path=state_path):
+            es_key = extra_seed.strip().lstrip("@").lower()
+            if es_key and es_key not in queued_keys and (
+                es_key not in seen_channels or (depth > 0 and es_key not in expanded_channels)
+            ):
+                queue.append((extra_seed, 0))
+                queued_keys.add(es_key)
+
         for fb in FALLBACK_EN_GRAPH_SEEDS:
             fb_key = fb.strip().lstrip("@").lower()
             if fb_key and fb_key not in queued_keys and (
@@ -999,11 +1009,102 @@ async def crawl_channel_graph(
     return discovered_rows
 
 
+def _normalize_discovered_seed(raw: str) -> str:
+    tok = str(raw or "").split("#", 1)[0].strip()
+    if not tok:
+        return ""
+    tok = re.sub(
+        r"^https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?",
+        "",
+        tok,
+        flags=re.IGNORECASE,
+    )
+    tok = tok.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].strip().lstrip("@")
+    if not tok or not _DISCOVERED_SEED_RE.fullmatch(tok) or is_bot_handle(tok):
+        return ""
+    return tok
+
+
+def _load_discovered_graph_seeds(
+    *,
+    state_dir: str | os.PathLike[str] | None = None,
+    state_path: str | os.PathLike[str] | None = None,
+    existing_keys: set[str] | None = None,
+    cap: int = MAX_DISCOVERED_GRAPH_SEEDS,
+) -> list[str]:
+    candidates: list[str] = []
+    explicit_dir = str(state_dir or "").strip()
+    if explicit_dir:
+        candidates.append(explicit_dir)
+    else:
+        raw_state_path = str(state_path or "").strip()
+        if raw_state_path and raw_state_path != DEFAULT_STATE_PATH:
+            candidates.append(os.path.dirname(os.path.abspath(raw_state_path)))
+        env_dir = (
+            os.environ.get("LEADGEN_STATE_DIR")
+            or os.environ.get("CRMTG_LEADGEN_STATE_DIR")
+            or ""
+        ).strip()
+        if env_dir:
+            candidates.append(env_dir)
+        if raw_state_path:
+            candidates.append(os.path.dirname(os.path.abspath(raw_state_path)))
+
+    target_file = ""
+    for cand_dir in candidates:
+        cand_path = os.path.join(cand_dir, "discovered_graph_seeds.txt")
+        if os.path.isfile(cand_path):
+            target_file = cand_path
+            break
+    if not target_file:
+        return []
+
+    try:
+        lines = open(target_file, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return []
+
+    seen_low = set(existing_keys or ())
+    extra: list[str] = []
+    for raw in lines:
+        clean = _normalize_discovered_seed(raw)
+        if not clean:
+            continue
+        low = clean.lower()
+        if low in seen_low:
+            continue
+        seen_low.add(low)
+        extra.append(clean)
+        if cap > 0 and len(extra) >= cap:
+            break
+    return extra
+
+
+def resolve_default_graph_seeds(
+    *,
+    state_dir: str | os.PathLike[str] | None = None,
+    state_path: str | os.PathLike[str] | None = None,
+    cap: int = MAX_DISCOVERED_GRAPH_SEEDS,
+) -> list[str]:
+    base = list(DEFAULT_GRAPH_SEED_CHANNELS)
+    existing = {s.strip().lstrip("@").lower() for s in base if s.strip()}
+    extra = _load_discovered_graph_seeds(
+        state_dir=state_dir,
+        state_path=state_path,
+        existing_keys=existing,
+        cap=cap,
+    )
+    return base + extra
+
+
 async def _async_main(args: argparse.Namespace) -> None:
     raw_seeds = args.seeds or os.getenv("TG_GRAPH_SEED_CHANNELS", "")
     seeds = [s.strip() for s in raw_seeds.split(",") if s.strip()]
     if not seeds and not getattr(args, "no_default_seeds", False):
-        seeds = list(DEFAULT_GRAPH_SEED_CHANNELS)
+        seeds = resolve_default_graph_seeds(
+            state_dir=getattr(args, "state_dir", ""),
+            state_path=getattr(args, "state", DEFAULT_STATE_PATH),
+        )
     if not seeds:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8"):
@@ -1043,6 +1144,7 @@ def main() -> None:
     ap.add_argument("--session", default=DEFAULT_SESSION)
     ap.add_argument("--seeds", default=os.getenv("TG_GRAPH_SEED_CHANNELS", ""))
     ap.add_argument("--no-default-seeds", action="store_true")
+    ap.add_argument("--state-dir", default="")
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--state", "--seen", dest="state", default=DEFAULT_STATE_PATH)
