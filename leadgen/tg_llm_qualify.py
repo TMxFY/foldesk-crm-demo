@@ -475,6 +475,7 @@ _TYPESAFE_RESCUE_SOURCES = frozenset(
         "tg_channel_graph",
         "tg_groups",
         "tg_ad_spy",
+        "tma_apps",
         "yc",
         "meta_ads",
         "app_stores",

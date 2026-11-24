@@ -637,7 +637,7 @@ def is_offline_non_icp_contact(
     their_angle: str | None = None,
 ) -> bool:
     uname = (username or "").strip().lstrip("@").lower()
-    if uname in _OFFLINE_JUNK_USERNAMES:
+    if uname in _OFFLINE_JUNK_USERNAMES or (uname and uname.endswith("bot")):
         return True
     angle_fixed = _fix_mojibake(their_angle)
     blob = " ".join(
@@ -1313,7 +1313,7 @@ def has_last_mile_icp_defect(
     camp: dict | None = None,
 ) -> bool:
     clean_uname = (_clean_handle(rec.get("username")) or "").lower()
-    if clean_uname and (clean_uname == "matrixreach_bot" or clean_uname.endswith("_bot")):
+    if clean_uname and (clean_uname == "matrixreach_bot" or clean_uname.endswith("bot")):
         return True
 
     is_vacancy_camp = is_vacancy_campaign(camp, name_override=campaign_name)

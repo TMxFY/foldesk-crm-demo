@@ -754,6 +754,7 @@ def _catalog_site_url(out):
         or source
         in (
             "meta_ads",
+            "tma_apps",
             "tg_ad_spy",
             "tg_channel_graph",
             "whop_content_rewards",

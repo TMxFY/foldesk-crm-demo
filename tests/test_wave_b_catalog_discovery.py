@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -666,4 +669,99 @@ def test_edge_cases_cli_tgstat_block_day_rollover_adspy_rotation_and_graph_reple
         )
     )
     assert "replenished_tma_seed" in visited_targets
+
+
+def test_skeptic_group_a_ro_isolation_concurrent_cap_and_nonempty_frontier(tmp_path: Path) -> None:
+    # 1) Relative data/sessions paths, sessions/vlad.session, data/sessions/signals_ro.session, and phone_checker_1 must be rejected
+    bad_sessions = [
+        "data/sessions/acc39.session",
+        "data/sessions/signals_ro.session",
+        "sessions/vlad.session",
+        "/opt/crmtg/data/scraper_sessions/phone_checker_1.session",
+        "outreach_helper.session",
+    ]
+    for bad in bad_sessions:
+        assert tg_catalog_discovery._is_isolated_ro_session_path(bad) is False
+        bad_client = SimpleNamespace(session=SimpleNamespace(filename=bad))
+        with pytest.raises(ValueError):
+            tg_catalog_discovery.safe_join_public_groups(
+                ["public_saas_chat"],
+                state_dir=tmp_path / "bad_sess_state",
+                client=bad_client,
+            )
+
+    # phone_checker_2 inside scraper_sessions/ and signals_ro* inside scraper_sessions/ pass isolation
+    assert tg_catalog_discovery._is_isolated_ro_session_path("/opt/crmtg/data/scraper_sessions/signals_ro.session") is True
+    assert tg_catalog_discovery._is_isolated_ro_session_path("/opt/crmtg/data/scraper_sessions/phone_checker_2.session") is True
+
+    # 2) Concurrent safe_join_public_groups calls cannot race past MAX_RO_JOINS_PER_DAY = 2
+    race_state = tmp_path / "race_join_state"
+    race_state.mkdir(parents=True)
+    calls_lock = threading.Lock()
+    actual_joins: list[str] = []
+
+    def slow_join_fn(handle: str) -> dict[str, Any]:
+        time.sleep(0.03)
+        with calls_lock:
+            actual_joins.append(handle)
+        return {"joined": True}
+
+    def _worker(idx: int) -> dict[str, Any]:
+        return tg_catalog_discovery.safe_join_public_groups(
+            [f"race_chat_{idx}_a", f"race_chat_{idx}_b", f"race_chat_{idx}_c"],
+            state_dir=race_state,
+            join_fn=slow_join_fn,
+            max_joins_per_day=2,
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_worker, range(4)))
+
+    assert len(actual_joins) == 2
+    assert sum(len(r["joined"]) for r in results) == 2
+    ledger = json.loads((race_state / "ro_join_ledger.json").read_text(encoding="utf-8"))
+    assert ledger["count"] == 2
+    assert len(ledger["handles"]) == 2
+
+    # 3) Captcha dict with ok=True without explicit joined=True defers WITHOUT burning quota
+    cap_state = tmp_path / "captcha_ok_state"
+    res_cap = tg_catalog_discovery.safe_join_public_groups(
+        ["captcha_ok_chat"],
+        state_dir=cap_state,
+        join_fn=lambda h: {"ok": True, "captcha": True, "reason": "Shieldy verify"},
+        max_joins_per_day=2,
+    )
+    assert res_cap["joined"] == []
+    assert res_cap["deferred"] == ["captcha_ok_chat"]
+    assert res_cap["used_after"] == 0
+
+    # 4) tg_channel_graph injects unseen discovered_graph_seeds.txt even when frontier is non-empty
+    nonempty_dir = tmp_path / "nonempty_frontier"
+    nonempty_dir.mkdir(parents=True)
+    nonempty_state = nonempty_dir / "tg_channel_graph_seen.json"
+    nonempty_state.write_text(
+        json.dumps({"seen": ["seed_old"], "expanded": [], "frontier": ["frontier_pending"]}),
+        encoding="utf-8",
+    )
+    (nonempty_dir / "discovered_graph_seeds.txt").write_text("fresh_auto_seed\n", encoding="utf-8")
+    visited_ne: list[str] = []
+
+    class FakeNonEmptyClient:
+        async def get_entity(self, target: Any) -> Any:
+            visited_ne.append(str(target))
+            raise ValueError("stop")
+
+    asyncio.run(
+        tg_channel_graph.crawl_channel_graph(
+            client=FakeNonEmptyClient(),
+            seeds=["seed_old"],
+            state_path=str(nonempty_state),
+            output_path=str(tmp_path / "ne_out.jsonl"),
+            delay=0.0,
+            max_runtime_sec=5.0,
+            web_posts_fn=lambda ch, lim: ({}, []),
+            probe_fn=lambda h: {"handle": h, "kind": "unknown"},
+        )
+    )
+    assert "fresh_auto_seed" in visited_ne
 

@@ -1157,6 +1157,16 @@ def _call_fetch_posts_web_safe(fetch_fn, channel: str, limit: int) -> tuple[dict
     return {}, []
 
 
+def _is_bot_lead_record(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    for key in ("username", "telegram_username", "tg_username"):
+        raw_val = str(row.get(key) or "").strip().lstrip("@").lower()
+        if raw_val and raw_val.endswith("bot"):
+            return True
+    return False
+
+
 def _call_probe_handle_web_safe(probe_fn, handle: str) -> dict:
     res = probe_fn(handle)
     return dict(res) if isinstance(res, dict) else {}
@@ -1251,7 +1261,7 @@ async def _collect_hybrid_batch_leads(
     conn: sqlite3.Connection,
     targets: list[str],
     limit: int,
-) -> tuple[list[dict], str]:
+) -> tuple[list[dict], str, str]:
     from leadgen.vps_autonomous_replenish import find_ro_scraper_sessions
 
     with locked_conn(conn):
@@ -1264,25 +1274,35 @@ async def _collect_hybrid_batch_leads(
     ro_sess = ro_sessions[0]
     leads = await asyncio.to_thread(_collect_web_batch_leads_sync, targets, limit)
     seen_users = {str(r.get("username") or "").strip().lower() for r in leads if r.get("username")}
+    mode_used = "web_only_fallback"
 
     api_id_raw, api_hash = _resolve_tg_creds(conn)
     if api_id_raw.isdigit() and int(api_id_raw) > 0 and api_hash and len(leads) < limit:
         from telethon import TelegramClient
         from leadgen.tg_scrape_posters import (
-            CURSOR_PATH,
-            PROFILE_CACHE_PATH,
-            load_entity_cache,
             load_json_state,
             save_json_state,
             scrape_group,
         )
 
+        runtime_state_dir = Path(
+            os.environ.get("LEADGEN_STATE_DIR") or (ROOT / "data" / "leadgen_state")
+        )
+        entity_cache_path = str(runtime_state_dir / "entity_cache.json")
+        profile_cache_path = str(runtime_state_dir / "profile_cache.json")
+        cursor_path = str(runtime_state_dir / "group_cursors.json")
+
         client = TelegramClient(str(ro_sess), int(api_id_raw), api_hash)
-        entity_cache = load_entity_cache()
-        profile_cache = load_json_state(PROFILE_CACHE_PATH)
-        cursors = load_json_state(CURSOR_PATH)
+        entity_cache = load_json_state(entity_cache_path)
+        profile_cache = load_json_state(profile_cache_path)
+        cursors = load_json_state(cursor_path)
         try:
-            await client.start()
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError(
+                    f"Изолированная RO-сессия {ro_sess.name} не авторизована; MTProto hybrid пропущен."
+                )
+            mode_used = "hybrid_mtproto"
             with open(os.devnull, "w", encoding="utf-8") as null_fh:
                 for ch in targets:
                     if len(leads) >= limit:
@@ -1305,6 +1325,8 @@ async def _collect_hybrid_batch_leads(
                     for row in rows:
                         if len(leads) >= limit:
                             break
+                        if _is_bot_lead_record(row):
+                            continue
                         uname = str(row.get("username") or "").strip().lstrip("@")
                         if not uname or uname.lower().endswith("bot") or uname.lower() in seen_users:
                             continue
@@ -1323,11 +1345,12 @@ async def _collect_hybrid_batch_leads(
                             )
                         )
         finally:
-            save_json_state(PROFILE_CACHE_PATH, profile_cache)
-            save_json_state(CURSOR_PATH, cursors)
+            save_json_state(entity_cache_path, entity_cache)
+            save_json_state(profile_cache_path, profile_cache)
+            save_json_state(cursor_path, cursors)
             await client.disconnect()
 
-    return leads[:limit], ro_sess.name
+    return leads[:limit], ro_sess.name, mode_used
 
 
 def _auto_ingest_batch_leads_with_rule5(
@@ -1338,9 +1361,13 @@ def _auto_ingest_batch_leads_with_rule5(
     from leadgen.vps_autonomous_replenish import ingest_v2_routed_leads
 
     if not leads:
-        return 0, {}, {"forbidden_pattern_count": 0, "campaigns": [], "ok": True}
+        return 0, {}, {"forbidden_pattern_count": 0, "rolled_back_count": 0, "campaigns": [], "ok": True}
 
+    rolled_back_count = 0
     with locked_conn(conn):
+        pre_existing_ids = {
+            int(r[0]) for r in conn.execute("SELECT id FROM campaign_recipients").fetchall()
+        }
         cfg = get_leadgen_config(conn)
         ingest_stats = ingest_v2_routed_leads(conn, leads, cfg=cfg, auto_push=True)
         rule5_campaigns: list[dict] = []
@@ -1360,15 +1387,35 @@ def _auto_ingest_batch_leads_with_rule5(
                     "ok": bool(prev.get("ok", True)) and forb == 0,
                 }
             )
+        if forbidden_total > 0:
+            after_ids = {
+                int(r[0]) for r in conn.execute("SELECT id FROM campaign_recipients").fetchall()
+            }
+            new_ids = sorted(after_ids - pre_existing_ids)
+            if new_ids:
+                for start in range(0, len(new_ids), 200):
+                    chunk = new_ids[start : start + 200]
+                    placeholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        f"DELETE FROM campaign_recipients WHERE id IN ({placeholders})",
+                        tuple(chunk),
+                    )
+                conn.commit()
+                rolled_back_count = len(new_ids)
     ingested_count = (
-        int(ingest_stats.get("whales_ingested") or 0)
-        + int(ingest_stats.get("ru_experts_ingested") or 0)
-        + int(ingest_stats.get("vacancy_ingested") or 0)
-        + int(ingest_stats.get("social_manual_ingested") or 0)
-        + int(ingest_stats.get("vacancy_assisted_ingested") or 0)
+        0
+        if forbidden_total > 0
+        else (
+            int(ingest_stats.get("whales_ingested") or 0)
+            + int(ingest_stats.get("ru_experts_ingested") or 0)
+            + int(ingest_stats.get("vacancy_ingested") or 0)
+            + int(ingest_stats.get("social_manual_ingested") or 0)
+            + int(ingest_stats.get("vacancy_assisted_ingested") or 0)
+        )
     )
     rule5_summary = {
         "forbidden_pattern_count": forbidden_total,
+        "rolled_back_count": rolled_back_count,
         "campaigns": rule5_campaigns,
         "ok": forbidden_total == 0,
     }
@@ -1420,17 +1467,20 @@ async def _execute_batch_scrape_job(app_obj: FastAPI, job: dict) -> None:
         if custom_runner is not None:
             res = await _invoke_batch_scrape_runner(custom_runner, app_obj, job)
             if isinstance(res, list):
-                job["leads"] = [dict(r) for r in res if isinstance(r, dict) and not str(r.get("username") or "").lower().endswith("bot")]
+                job["leads"] = [dict(r) for r in res if isinstance(r, dict) and not _is_bot_lead_record(r)]
                 job["leads_found"] = len(job["leads"])
             elif isinstance(res, dict):
-                if "leads" in res and isinstance(res["leads"], list):
+                has_leads_list = "leads" in res and isinstance(res["leads"], list)
+                if has_leads_list:
                     job["leads"] = [
                         dict(r)
                         for r in res["leads"]
-                        if isinstance(r, dict) and not str(r.get("username") or "").lower().endswith("bot")
+                        if isinstance(r, dict) and not _is_bot_lead_record(r)
                     ]
                     job["leads_found"] = len(job["leads"])
-                for key in ("leads_found", "ingested_count", "ingest_stats", "rule5_preview", "ro_session", "error"):
+                for key in ("leads_found", "ingested_count", "ingest_stats", "rule5_preview", "ro_session", "mode_used", "error"):
+                    if key == "leads_found" and has_leads_list:
+                        continue
                     if key in res and res[key] is not None:
                         job[key] = res[key]
             if job.get("auto_ingest") and job.get("leads") and job.get("rule5_preview") is None:
@@ -1442,30 +1492,36 @@ async def _execute_batch_scrape_job(app_obj: FastAPI, job: dict) -> None:
                 job["ingested_count"] = ing_cnt
                 job["ingest_stats"] = ing_stats
                 job["rule5_preview"] = r5
-            if job.get("error"):
+            r5_prev = job.get("rule5_preview")
+            if isinstance(r5_prev, dict) and int(r5_prev.get("forbidden_pattern_count") or 0) > 0:
+                job["status"] = "failed"
+                job["error"] = job.get("error") or "Rule 5 violation: forbidden_pattern_count > 0"
+            elif job.get("error"):
                 job["status"] = "failed"
             else:
                 job["status"] = "completed"
             return
 
         if job["mode"] == "hybrid":
-            leads, ro_name = await _collect_hybrid_batch_leads(
+            leads, ro_name, mode_used = await _collect_hybrid_batch_leads(
                 app_obj.state.conn,
                 list(job["targets"]),
                 int(job["limit"]),
             )
             job["ro_session"] = ro_name
+            job["mode_used"] = mode_used
         else:
             leads = await asyncio.to_thread(
                 _collect_web_batch_leads_sync,
                 list(job["targets"]),
                 int(job["limit"]),
             )
+            job["mode_used"] = "web"
 
         clean_leads = [
             r
             for r in leads
-            if not str(r.get("username") or "").strip().lower().endswith("bot")
+            if not _is_bot_lead_record(r)
         ]
         job["leads"] = clean_leads
         job["leads_found"] = len(clean_leads)
@@ -6187,6 +6243,7 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             "status": "queued",
             "targets": targets,
             "mode": mode,
+            "mode_used": mode,
             "limit": limit,
             "auto_ingest": auto_ingest,
             "created_at": utc_now(),

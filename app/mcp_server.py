@@ -2301,7 +2301,9 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
         if not isinstance(item, dict):
             _record_skip(item_idx, "invalid_item")
             continue
-        username = _clean_handle(item.get("username"))
+        raw_uname = _clean_handle(item.get("username"))
+        had_bot_username = bool(raw_uname and raw_uname.lower().endswith("bot"))
+        username = None if had_bot_username else raw_uname
         raw_company = _clean_company_title(item.get("company"))
         explicit_name = (str(item.get("name") or "").strip()) or None
         phone = (str(item.get("phone") or item.get("whatsapp") or "").strip()) or None
@@ -2341,6 +2343,16 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                 tg_id = None
         real_tg_id = tg_id if (tg_id is not None and tg_id > 0 and not (900000 <= tg_id <= 999999)) else None
         has_direct_messenger_handle = bool(username or phone or real_tg_id is not None)
+        if (
+            had_bot_username
+            and not has_direct_messenger_handle
+            and not any((email, x_url, linkedin_url, instagram_url, website))
+            and not _is_qa_campaign_name(campaign_name)
+        ):
+            skipped_non_icp += 1
+            quarantined += 1
+            _record_skip(item_idx, "bot_username_blocked")
+            continue
 
         pool_usd = parse_pool_usd_value(item.get("pool_usd"))
         company_domain = _extract_company_domain(item, website_raw, url_val)
@@ -3165,7 +3177,14 @@ def _handle_ingest_discovered_leads(conn: sqlite3.Connection, args: dict) -> dic
                     custom_step_templates=custom_tpls,
                     showcase_url=showcase_url,
                 )
-                if raw_s1 is not None and str(raw_s1).strip():
+                raw_s1_str = str(raw_s1 or "").strip()
+                whale_legacy_offer_re = re.compile(r"\b(?:rev[\s\-]?share|cpa|creatoros)\b", re.I)
+                whale_revshare_leak = (
+                    resolved_profile == "whale_mass"
+                    and bool(raw_s1_str)
+                    and bool(whale_legacy_offer_re.search(raw_s1_str))
+                )
+                if raw_s1 is not None and raw_s1_str and not whale_revshare_leak:
                     step1_text, error_reason = _clean_step1_text(raw_s1, company, is_b2b=False)
                     if not error_reason and step1_text and not is_qa_camp and expected_copy_lang in ("ru", "en"):
                         lang_ok, lang_reason = check_copy_language(step1_text, expected_copy_lang)  # type: ignore[arg-type]

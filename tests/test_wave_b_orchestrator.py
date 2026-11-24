@@ -299,3 +299,94 @@ def test_verify_sh_gate_z_fails_on_unsafe_ro_joins(tmp_path: Path) -> None:
     )
     assert proc.returncode == 1
     assert "Gate Z violation" in proc.stderr
+
+
+def test_skeptic_tma_unresolved_pipe_and_mcp_guards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.mcp_server import handle_jsonrpc_message
+    from leadgen import tg_to_gsheet
+
+    # 1) tma_apps row WITHOUT personal username (only tma_bot_handle + project_url) MUST survive _merge_discovered_jsonl_into_raw
+    tma_in = tmp_path / "tma_apps_raw.jsonl"
+    merged_out = tmp_path / "merged_raw.jsonl"
+    tma_in.write_text(
+        json.dumps(
+            {
+                "id": "tma:focusvpn",
+                "name": "FocusVPN Bot",
+                "project": "FocusVPN",
+                "company": "FocusVPN",
+                "project_url": "https://focusvpn.example",
+                "website": "https://focusvpn.example",
+                "tma_bot_handle": "focusvpn_bot",
+                "username": "",
+                "bio": "Paid Telegram Mini App VPN on Telegram Stars",
+                "what_they_do": "Subscription VPN Mini App for privacy",
+                "source": "tma_apps",
+                "lead_source": "tma_apps",
+                "category": "tma",
+                "segment": "whale",
+                "icp_score": 82,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    admitted = tg_to_gsheet.admit_discovered_row(json.loads(tma_in.read_text(encoding="utf-8").strip()))
+    assert admitted is not None
+    assert admitted["contact_url"] == "https://focusvpn.example"
+    merged_cnt = repl._merge_discovered_jsonl_into_raw([tma_in], merged_out)
+    assert merged_cnt == 1
+
+    # 2) ingest_discovered_leads strips *bot username & scrubs revshare/CPA on Whales EN — TG (whale_mass)
+    conn, state_dir = _setup_env(tmp_path, monkeypatch)
+    _seed_whales_campaign(conn)
+    mcp_resp = handle_jsonrpc_message(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ingest_discovered_leads",
+                "arguments": {
+                    "enroll_in_campaign": True,
+                    "leads": [
+                        {
+                            "username": "pure_bot",
+                            "company": "BotOnlyCo",
+                            "name": "Bot Only",
+                            "their_angle": "Subscription AI studio SaaS",
+                            "icp_score": 85,
+                            "segment": "whale",
+                        },
+                        {
+                            "username": "real_tma_founder",
+                            "company": "StarsFlow",
+                            "name": "Leo Founder",
+                            "website": "https://starsflow.app",
+                            "their_angle": "Telegram Mini App SaaS on Stars",
+                            "source": "tma_apps",
+                            "segment": "whale",
+                            "step1_text": (
+                                "Hey,\n\nSaw StarsFlow.\n\nWe run SoftUGC.\n\n"
+                                "We work on revshare or CPA — want 3 demo reels?"
+                            ),
+                            "icp_score": 88,
+                        },
+                    ],
+                },
+            },
+        },
+    )
+    res_obj = mcp_resp["result"]["structuredContent"]
+    assert res_obj["enrolled_in_campaign"] == 1
+    assert res_obj["skipped_non_icp"] >= 1
+    assert conn.execute("SELECT COUNT(*) FROM leads WHERE LOWER(username) LIKE '%bot'").fetchone()[0] == 0
+    rec = conn.execute(
+        "SELECT username, step1_text FROM campaign_recipients WHERE username = 'real_tma_founder'"
+    ).fetchone()
+    assert rec is not None
+    assert "revshare" not in (rec["step1_text"] or "").lower()
+    assert "cpa" not in (rec["step1_text"] or "").lower()
+    assert "1 500+ reels/mo" in (rec["step1_text"] or "")
+    conn.close()

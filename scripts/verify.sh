@@ -1645,6 +1645,20 @@ if cat_file_z.is_file():
                 break
         if not isinstance(max_joins_val, int) or not (1 <= max_joins_val <= 2):
             errors.append(f"Gate Z violation in leadgen/tg_catalog_discovery.py: MAX_RO_JOINS_PER_DAY must be 1..2, got {max_joins_val!r}")
+    if "fcntl.flock" not in cat_src_z or "def _try_reserve_join_slot(" not in cat_src_z or "phone_checker_1" not in cat_src_z:
+        errors.append("Gate Z violation in leadgen/tg_catalog_discovery.py: must use fcntl.flock, _try_reserve_join_slot, and phone_checker_1 guard")
+
+gsheet_file_z = root / "leadgen" / "tg_to_gsheet.py"
+if gsheet_file_z.is_file():
+    gsheet_src_z = gsheet_file_z.read_text(encoding="utf-8")
+    if "def _catalog_site_url(" in gsheet_src_z and '"tma_apps"' not in gsheet_src_z:
+        errors.append("Gate Z violation in leadgen/tg_to_gsheet.py: _catalog_site_url must admit tma_apps")
+
+qual_file_z = root / "leadgen" / "tg_llm_qualify.py"
+if qual_file_z.is_file():
+    qual_src_z = qual_file_z.read_text(encoding="utf-8")
+    if "_TYPESAFE_RESCUE_SOURCES" in qual_src_z and '"tma_apps"' not in qual_src_z:
+        errors.append("Gate Z violation in leadgen/tg_llm_qualify.py: _TYPESAFE_RESCUE_SOURCES must include tma_apps")
 
 oc_file_z = root / "leadgen" / "outreach_copy.py"
 if oc_file_z.is_file():
@@ -1661,6 +1675,13 @@ if main_file_z.is_file() and "def register_routes(" in main_file_z.read_text(enc
     main_src_z = main_file_z.read_text(encoding="utf-8")
     if "/api/leadgen/batch-scrape" not in main_src_z:
         errors.append("Gate Z violation in app/main.py: missing /api/leadgen/batch-scrape endpoint")
+    m_hyb_z = re.search(r"async def _collect_hybrid_batch_leads\(.*?(?=\ndef |\nasync def |\Z)", main_src_z, flags=re.S)
+    if m_hyb_z is not None:
+        hyb_src_z = m_hyb_z.group(0)
+        if "client.start(" in hyb_src_z or "is_user_authorized" not in hyb_src_z:
+            errors.append("Gate Z violation in app/main.py: _collect_hybrid_batch_leads must use connect()+is_user_authorized(), never client.start()")
+    if "_is_bot_lead_record" not in main_src_z or "DELETE FROM campaign_recipients" not in main_src_z:
+        errors.append("Gate Z violation in app/main.py: batch-scrape must filter bot aliases and roll back Rule 5 violations")
 
 if repl_file_y.is_file() and tma_file_z.is_file() and cat_file_z.is_file():
     repl_src_z = repl_file_y.read_text(encoding="utf-8")

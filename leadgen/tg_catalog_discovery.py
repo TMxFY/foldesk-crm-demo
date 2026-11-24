@@ -20,13 +20,16 @@ import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import inspect
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -907,83 +910,204 @@ def _append_manual_join_queue(
         return True
 
 
-def _read_join_ledger(ledger_path: Path, utc_day: str) -> tuple[dict[str, Any], int, set[str]]:
+@contextmanager
+def _ro_join_process_lock(state_path: Path):
+    """Serialize ro_join_ledger.json check/reserve/update across threads AND OS processes."""
+    lock_path = state_path / ".ro_join_ledger.lock"
+    state_path.mkdir(parents=True, exist_ok=True)
     with _STATE_LOCK:
-        data = _read_json_safe(ledger_path, {})
-        if not isinstance(data, dict):
-            data = {}
-        days = data.get("days") if isinstance(data.get("days"), dict) else {}
-        day_entry = days.get(utc_day) if isinstance(days.get(utc_day), dict) else None
-        if day_entry is None and str(data.get("date") or "") == utc_day:
-            day_entry = {
-                "count": int(data.get("count") or 0),
-                "handles": list(data.get("handles") or []),
-            }
-        if day_entry is None:
-            return data, 0, set()
-        raw_handles = [
-            _normalize_tg_handle(str(h)).lower()
-            for h in (day_entry.get("handles") or [])
-        ]
-        joined_set = {h for h in raw_handles if h}
-        count = max(len(joined_set), int(day_entry.get("count") or 0))
+        with lock_path.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def _read_join_ledger_unlocked(ledger_path: Path, utc_day: str) -> tuple[dict[str, Any], int, set[str], set[str]]:
+    data = _read_json_safe(ledger_path, {})
+    if not isinstance(data, dict):
+        data = {}
+    days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    day_entry = days.get(utc_day) if isinstance(days.get(utc_day), dict) else None
+    if day_entry is None and str(data.get("date") or "") == utc_day:
+        day_entry = {
+            "count": int(data.get("count") or 0),
+            "handles": list(data.get("handles") or []),
+            "in_flight": list(data.get("in_flight") or []),
+        }
+    if day_entry is None:
+        return data, 0, set(), set()
+    joined_set = {
+        h
+        for h in (_normalize_tg_handle(str(x)).lower() for x in (day_entry.get("handles") or []))
+        if h
+    }
+    in_flight_set = {
+        h
+        for h in (_normalize_tg_handle(str(x)).lower() for x in (day_entry.get("in_flight") or []))
+        if h and h not in joined_set
+    }
+    count = max(len(joined_set), int(day_entry.get("count") or 0)) + len(in_flight_set)
+    return data, count, joined_set, in_flight_set
+
+
+def _read_join_ledger(ledger_path: Path, utc_day: str) -> tuple[dict[str, Any], int, set[str]]:
+    with _ro_join_process_lock(ledger_path.parent):
+        data, count, joined_set, _in_flight = _read_join_ledger_unlocked(ledger_path, utc_day)
         return data, count, joined_set
+
+
+def _write_join_ledger_unlocked(
+    ledger_path: Path,
+    utc_day: str,
+    data: dict[str, Any],
+    joined_set: set[str],
+    in_flight_set: set[str],
+) -> int:
+    days = dict(data.get("days") or {}) if isinstance(data.get("days"), dict) else {}
+    ordered = sorted(joined_set)
+    in_flight_ordered = sorted(h for h in in_flight_set if h not in joined_set)
+    new_count = len(ordered)
+    days[utc_day] = {
+        "count": new_count,
+        "handles": ordered,
+        "in_flight": in_flight_ordered,
+        "updated_at": _utc_now_iso(),
+    }
+    recent_days = dict(sorted(days.items())[-14:])
+    payload = {
+        "date": utc_day,
+        "count": new_count,
+        "handles": ordered,
+        "days": recent_days,
+    }
+    _atomic_write_json(ledger_path, payload)
+    return new_count + len(in_flight_ordered)
 
 
 def _record_join_ledger(ledger_path: Path, utc_day: str, handle: str) -> int:
     clean = _normalize_tg_handle(handle).lower()
-    with _STATE_LOCK:
-        data, _, joined_set = _read_join_ledger(ledger_path, utc_day)
-        days = dict(data.get("days") or {}) if isinstance(data.get("days"), dict) else {}
+    with _ro_join_process_lock(ledger_path.parent):
+        data, _, joined_set, in_flight_set = _read_join_ledger_unlocked(ledger_path, utc_day)
         if clean:
             joined_set.add(clean)
-        ordered = sorted(joined_set)
-        new_count = len(ordered)
-        days[utc_day] = {
-            "count": new_count,
-            "handles": ordered,
-            "updated_at": _utc_now_iso(),
-        }
-        # Keep recent 14 days so ledger never grows unboundedly
-        recent_days = dict(sorted(days.items())[-14:])
-        payload = {
-            "date": utc_day,
-            "count": new_count,
-            "handles": ordered,
-            "days": recent_days,
-        }
-        _atomic_write_json(ledger_path, payload)
-        return new_count
+            in_flight_set.discard(clean)
+        _write_join_ledger_unlocked(ledger_path, utc_day, data, joined_set, in_flight_set)
+        return len(joined_set) + len(in_flight_set)
 
 
-def _assert_isolated_client(client: Any) -> None:
-    if client is None:
-        return
-    sess = getattr(client, "session", None)
-    filename = str(getattr(sess, "filename", "") or "").strip()
-    if not filename:
-        return
-    norm = filename.replace("\\", "/").lower()
-    if "/scraper_sessions/" in norm:
-        return
-    base = os.path.basename(norm)
-    if base.startswith(("signals_ro", "phone_checker_")):
-        return
-    if "/data/sessions/" in norm or "outreach" in norm or base in {"tim2.session", "tim3.session"}:
-        raise ValueError(
-            f"Refusing to join groups with live outreach session '{filename}'. Pass an isolated RO session."
-        )
+def _try_reserve_join_slot(
+    ledger_path: Path,
+    utc_day: str,
+    handle: str,
+    effective_cap: int,
+) -> tuple[bool, int, str]:
+    clean = _normalize_tg_handle(handle).lower()
+    with _ro_join_process_lock(ledger_path.parent):
+        data, used_total, joined_set, in_flight_set = _read_join_ledger_unlocked(ledger_path, utc_day)
+        if clean in joined_set:
+            return False, used_total, "already_joined_today"
+        if clean in in_flight_set:
+            return False, used_total, "already_in_flight"
+        if used_total >= effective_cap:
+            return False, used_total, "daily_cap_reached"
+        in_flight_set.add(clean)
+        reserved_total = _write_join_ledger_unlocked(ledger_path, utc_day, data, joined_set, in_flight_set)
+        return True, reserved_total, "reserved"
+
+
+def _release_reserved_join_slot(ledger_path: Path, utc_day: str, handle: str) -> int:
+    clean = _normalize_tg_handle(handle).lower()
+    with _ro_join_process_lock(ledger_path.parent):
+        data, _, joined_set, in_flight_set = _read_join_ledger_unlocked(ledger_path, utc_day)
+        if clean in in_flight_set:
+            in_flight_set.discard(clean)
+            return _write_join_ledger_unlocked(ledger_path, utc_day, data, joined_set, in_flight_set)
+        return len(joined_set) + len(in_flight_set)
+
+
+_DISALLOWED_SESSION_PATH_RE = re.compile(r"(?:^|/)(?:data/sessions|sessions)(?:/|$)")
+_OUTREACH_BASENAME_RE = re.compile(r"^(?:acc_?\d+|tim\d+|phone_checker_1)(?:\.session)?$")
 
 
 def _is_isolated_ro_session_path(session_path: str | Path) -> bool:
     raw = str(session_path or "").strip()
     if not raw:
         return False
-    norm = raw.replace("\\", "/").lower()
-    base = os.path.basename(norm)
-    if "/data/sessions/" in norm or "outreach" in norm:
-        return False
-    return base.startswith(("signals_ro", "phone_checker_")) or "/scraper_sessions/" in norm
+    candidates = [raw]
+    try:
+        expanded = str(Path(raw).expanduser())
+        candidates.append(expanded)
+        if Path(expanded).exists():
+            candidates.append(os.path.realpath(expanded))
+    except OSError:
+        pass
+    for cand in candidates:
+        norm = cand.replace("\\", "/").lower()
+        if "outreach" in norm:
+            return False
+        if "/scraper_sessions/" not in norm:
+            if _DISALLOWED_SESSION_PATH_RE.search(norm):
+                return False
+        base = os.path.basename(norm)
+        if _OUTREACH_BASENAME_RE.match(base):
+            return False
+    norm0 = os.path.realpath(str(Path(raw).expanduser())).replace("\\", "/").lower() if Path(raw).expanduser().exists() else raw.replace("\\", "/").lower()
+    base0 = os.path.basename(norm0)
+    return "/scraper_sessions/" in norm0 or base0.startswith("signals_ro")
+
+
+def _assert_isolated_client(client: Any, *, conn: sqlite3.Connection | None = None) -> None:
+    if client is None:
+        return
+    sess = getattr(client, "session", None)
+    filename = str(getattr(sess, "filename", "") or "").strip()
+    if not filename:
+        return
+    if not _is_isolated_ro_session_path(filename):
+        raise ValueError(
+            f"Refusing to join groups with non-isolated or outreach session '{filename}'. Pass an isolated RO session."
+        )
+    cand_path = Path(filename).expanduser()
+    if cand_path.is_file():
+        try:
+            from leadgen import vps_autonomous_replenish as _repl
+
+            sha = _repl._extract_sqlite_auth_key_sha256(cand_path)
+        except Exception:
+            sha = None
+        if sha:
+            live_dirs = [Path(__file__).resolve().parent.parent / "data" / "sessions"]
+            if conn is not None:
+                try:
+                    live_dirs = _repl._collect_outreach_session_dirs(conn)
+                    for row in conn.execute("SELECT session_blob, session_string, session_path FROM accounts").fetchall():
+                        for cand_sha in (
+                            _repl._extract_blob_auth_key_sha256(row[0]),
+                            _repl._extract_string_session_auth_key_sha256(row[1]),
+                        ):
+                            if cand_sha and cand_sha == sha:
+                                raise ValueError(
+                                    f"Refusing to join groups: session '{filename}' shares auth_key with outreach account."
+                                )
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
+            for sdir in live_dirs:
+                if not sdir.is_dir():
+                    continue
+                for disk_sess in sdir.glob("*.session"):
+                    try:
+                        if _repl._extract_sqlite_auth_key_sha256(disk_sess) == sha:
+                            raise ValueError(
+                                f"Refusing to join groups: session '{filename}' shares auth_key with '{disk_sess}'."
+                            )
+                    except ValueError:
+                        raise
+                    except Exception:
+                        continue
 
 
 def _run_coro(coro: Any) -> Any:
@@ -1022,8 +1146,11 @@ def _inspect_join_result_for_captcha(res: Any) -> tuple[bool, bool, str, str]:
     if res is False:
         return False, False, "join_returned_false", ""
     if isinstance(res, Mapping):
-        joined_occurred = bool(res.get("joined") or res.get("ok"))
-        if res.get("deferred") or res.get("requires_approval") or res.get("captcha") or res.get("captcha_detected"):
+        deferred_flag = bool(
+            res.get("deferred") or res.get("requires_approval") or res.get("captcha") or res.get("captcha_detected")
+        )
+        joined_occurred = bool(res.get("joined")) if deferred_flag else bool(res.get("joined") or res.get("ok"))
+        if deferred_flag:
             sig = _detect_captcha_signature(
                 " ".join(
                     str(res.get(k) or "")
@@ -1033,7 +1160,7 @@ def _inspect_join_result_for_captcha(res: Any) -> tuple[bool, bool, str, str]:
             return True, joined_occurred, str(res.get("reason") or "captcha_or_approval"), sig or "captcha"
         status = str(res.get("status") or "").strip().lower()
         if status in {"deferred", "captcha", "manual", "approval_required"}:
-            return True, joined_occurred, f"status:{status}", status
+            return True, bool(res.get("joined")), f"status:{status}", status
         text_blob = " ".join(
             str(res.get(k) or "")
             for k in ("reason", "error", "signature", "bot", "bots", "messages", "recent_messages", "text")
@@ -1162,6 +1289,13 @@ def safe_join_public_groups(
                     _defer(clean, f"precheck_messages:{pre_msg_sig}", pre_msg_sig)
                     continue
 
+            reserved, used_now, reserve_reason = _try_reserve_join_slot(
+                ledger_path, utc_day, clean, effective_cap
+            )
+            if not reserved:
+                _skip(clean, reserve_reason)
+                continue
+
             try:
                 if join_fn is not None:
                     raw_res = join_fn(clean)
@@ -1172,6 +1306,8 @@ def safe_join_public_groups(
                         used_now = _record_join_ledger(ledger_path, utc_day, clean)
                         joined_today.add(low)
                         joined.append(clean)
+                    else:
+                        used_now = _release_reserved_join_slot(ledger_path, utc_day, clean)
                     if is_def:
                         _defer(clean, def_reason, def_sig)
                     elif not did_join:
@@ -1180,6 +1316,7 @@ def safe_join_public_groups(
 
                 # Telethon client path
                 if JoinChannelRequest is None:
+                    _release_reserved_join_slot(ledger_path, utc_day, clean)
                     raise RuntimeError("Telethon JoinChannelRequest is unavailable")
                 await client(JoinChannelRequest(clean))
                 used_now = _record_join_ledger(ledger_path, utc_day, clean)
@@ -1190,6 +1327,7 @@ def safe_join_public_groups(
                 if post_sig:
                     _defer(clean, f"postjoin_captcha:{post_sig}", post_sig)
             except BaseException as exc:
+                used_now = _release_reserved_join_slot(ledger_path, utc_day, clean)
                 is_def, def_reason, def_sig = _is_deferred_join_exception(exc)
                 if is_def:
                     _defer(clean, def_reason, def_sig)
@@ -1202,7 +1340,8 @@ def safe_join_public_groups(
                     _skip(clean, f"error:{type(exc).__name__}")
         return used_now
 
-    used_after = _run_coro(_run_joins_async())
+    _run_coro(_run_joins_async())
+    _, used_after, _ = _read_join_ledger(ledger_path, utc_day)
     return {
         "state_dir": str(state_path),
         "utc_day": utc_day,

@@ -646,6 +646,14 @@ async def crawl_channel_graph(
             queue.append((clean, 0))
             queued_keys.add(s_key)
 
+    # Always inject newly discovered unseen seeds even before the saved frontier drains
+    for extra_seed in _load_discovered_graph_seeds(state_dir=state_dir, state_path=state_path):
+        clean_es = extra_seed.strip().lstrip("@")
+        es_key = clean_es.lower()
+        if clean_es and es_key not in queued_keys and es_key not in seen_channels:
+            queue.append((clean_es, 0))
+            queued_keys.add(es_key)
+
     if depth > 0:
         unexpanded_seen = [
             c for c in sorted(seen_channels)

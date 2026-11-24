@@ -554,6 +554,18 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
         )
     allow_sonnet = bool(api_key) and sonnet_runtime_ok
 
+    whale_sources = {
+        "tma_apps",
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+        "app_stores",
+        "app_store",
+        "ats_hiring",
+        "ph_detailed",
+        "d2c_whatsapp",
+    }
+
     need_idx: list[int] = []
     need_payloads: list[dict] = []
     for idx, r in enumerate(rows):
@@ -561,15 +573,30 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
         src_low = str(r.get("lead_source") or r.get("source") or "").lower()
         if any(k in cat_low or k in src_low for k in ("ваканс", "vacanc", "job_monitor")):
             continue
-        raw_ft = str(r.get("first_touch") or r.get("step1_text") or "").strip()
-        already_canonical = (
-            bool(raw_ft)
-            and "SoftUGC" in raw_ft
-            and REVSHARE_OFFER_TEXT in raw_ft
-            and "creatoros" not in raw_ft.lower()
-            and "if your user growth has hit a ceiling" not in raw_ft.lower()
-            and "plug-and-play" not in raw_ft.lower()
+        is_whale_row = (
+            str(r.get("segment") or "").strip().lower() == "whale"
+            or src_low in whale_sources
         )
+        raw_ft = str(r.get("first_touch") or r.get("step1_text") or "").strip()
+        if is_whale_row:
+            already_canonical = (
+                bool(raw_ft)
+                and "SoftUGC" in raw_ft
+                and "revshare" not in raw_ft.lower()
+                and "cpa" not in raw_ft.lower()
+                and "creatoros" not in raw_ft.lower()
+                and "if your user growth has hit a ceiling" not in raw_ft.lower()
+                and "plug-and-play" not in raw_ft.lower()
+            )
+        else:
+            already_canonical = (
+                bool(raw_ft)
+                and "SoftUGC" in raw_ft
+                and REVSHARE_OFFER_TEXT in raw_ft
+                and "creatoros" not in raw_ft.lower()
+                and "if your user growth has hit a ceiling" not in raw_ft.lower()
+                and "plug-and-play" not in raw_ft.lower()
+            )
         if already_canonical:
             aud = str(r.get("audience") or "").strip().lower() or infer_lead_audience(
                 category=str(r.get("category") or ""),
@@ -654,15 +681,35 @@ def apply_vlad_sonnet_or_fallback(rows: list[dict]) -> list[dict]:
     for idx, r in enumerate(rows):
         if idx in sonnet_done:
             continue
+        src_val = str(r.get("lead_source") or r.get("source") or "").strip()
+        is_whale_row = (
+            str(r.get("segment") or "").strip().lower() == "whale"
+            or src_val.lower() in whale_sources
+        )
         raw_ft = str(r.get("first_touch") or r.get("step1_text") or "").strip()
-        if raw_ft and "SoftUGC" in raw_ft and REVSHARE_OFFER_TEXT in raw_ft:
-            continue
+        if raw_ft and "SoftUGC" in raw_ft:
+            if is_whale_row and "revshare" not in raw_ft.lower() and "cpa" not in raw_ft.lower():
+                continue
+            if not is_whale_row and REVSHARE_OFFER_TEXT in raw_ft:
+                continue
         pname = str(r.get("project") or "")
         what = str(r.get("what_they_do") or "")
         cat = str(r.get("category") or "")
         purl = str(r.get("project_url") or "")
         aud = infer_lead_audience(category=cat, company=pname, their_angle=what, site=purl)
-        ft = _vlad_first_touch(pname, what, russian=False, category=cat, site=purl)
+        if is_whale_row:
+            ft = _vlad_first_touch(
+                pname,
+                what,
+                russian=False,
+                category=cat,
+                site=purl,
+                source=src_val,
+                segment="whale",
+                copy_profile="whale_mass",
+            )
+        else:
+            ft = _vlad_first_touch(pname, what, russian=False, category=cat, site=purl, source=src_val)
         r["first_touch"] = ft
         r["step1_text"] = ft
         r["hook"] = ft
@@ -692,8 +739,11 @@ def enrich_rows(
         "DeFi / DEX",
         "Gaming / AI",
         "Платёжки / финтех",
+        "tma",
+        "Telegram Mini App",
     }
     commercial_sources = {
+        "tma_apps",
         "whop_content_rewards",
         "tiktok_ads",
         "tiktok_shop",

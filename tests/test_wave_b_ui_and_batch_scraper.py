@@ -724,3 +724,127 @@ const {{ chromium }} = require('playwright');
             server.wait(timeout=5)
         except subprocess.TimeoutExpired:
             server.kill()
+
+
+def test_skeptic_batch_scrape_connect_auth_rule5_rollback_and_bot_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+    import app.main as app_main
+
+    monkeypatch.setenv("CRMTG_SKIP_DOTENV", "1")
+    monkeypatch.setenv("DISABLE_BOT_ALERTS", "1")
+    state_dir = tmp_path / "leadgen_state"
+    state_dir.mkdir(parents=True)
+    sessions_dir = tmp_path / "scraper_sessions"
+    sessions_dir.mkdir(parents=True)
+    ro_sess = sessions_dir / "signals_ro_batch.session"
+    ro_sess.write_bytes(b"SQLite format 3\x00" + b"0" * 32)
+    monkeypatch.setenv("LEADGEN_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("LEADGEN_CONFIG_PATH", str(tmp_path / "leadgen_config.json"))
+    monkeypatch.setenv("SCRAPER_SESSIONS_DIR", str(sessions_dir))
+    monkeypatch.setenv("SCRAPER_TG_SESSION", str(ro_sess))
+    monkeypatch.setenv("TG_API_ID", "123456")
+    monkeypatch.setenv("TG_API_HASH", "fakehash123")
+
+    conn = connect(tmp_path / "crm.db")
+    init_db(conn)
+    create_campaign(
+        conn,
+        name="Whales EN — TG",
+        daily_limit=50,
+        status="running",
+        segment="whale",
+        language="en",
+        copy_profile="whale_mass",
+        steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
+        leadgen_enabled=True,
+    )
+
+    # 1) Unauthorized RO session uses connect() + is_user_authorized(), NEVER client.start()
+    import telethon
+
+    client_events: list[str] = []
+
+    class FakeUnauthClient:
+        def __init__(self, *_a: object, **_kw: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            client_events.append("start_called")
+            raise AssertionError("client.start() MUST NOT be called in batch-scrape event loop")
+
+        async def connect(self) -> None:
+            client_events.append("connect")
+
+        async def is_user_authorized(self) -> bool:
+            client_events.append("is_user_authorized")
+            return False
+
+        async def disconnect(self) -> None:
+            client_events.append("disconnect")
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeUnauthClient)
+    monkeypatch.setattr(
+        "leadgen.tg_web_client.fetch_channel_posts_web",
+        lambda ch, limit=20: ({"title": "Test", "about": ""}, []),
+    )
+    with pytest.raises(RuntimeError, match="не авторизована"):
+        asyncio.run(app_main._collect_hybrid_batch_leads(conn, ["saas_founders"], 10))
+    assert client_events == ["connect", "is_user_authorized", "disconnect"]
+
+    # 2) Rule 5 violation rolls back newly created campaign_recipients
+    from app import main as main_mod
+
+    monkeypatch.setattr(
+        main_mod,
+        "preview_outreach_batch",
+        lambda *_a, **_kw: {"ok": False, "sample_count": 1, "forbidden_pattern_count": 1},
+    )
+    ing_cnt, _stats, r5_summary = app_main._auto_ingest_batch_leads_with_rule5(
+        conn,
+        [
+            {
+                "name": "Alice Whale",
+                "username": "alice_whale_ok",
+                "company": "AliceApp",
+                "website": "https://aliceapp.io",
+                "their_angle": "Subscription AI video studio",
+                "source": "batch_scrape",
+                "segment": "whale",
+                "icp_score": 88,
+            }
+        ],
+    )
+    assert ing_cnt == 0
+    assert r5_summary["forbidden_pattern_count"] == 1
+    assert r5_summary["rolled_back_count"] >= 1
+    assert conn.execute("SELECT COUNT(*) FROM campaign_recipients WHERE username = 'alice_whale_ok'").fetchone()[0] == 0
+
+    # 3) _execute_batch_scrape_job filters *bot via telegram_username/tg_username aliases & fails custom_runner on Rule 5 > 0
+    app = create_app(conn=conn)
+    app.state._batch_scrape_runner = lambda _job: {
+        "leads": [
+            {"username": "", "telegram_username": "alias_bot", "name": "Alias Bot"},
+            {"username": "human_founder", "tg_username": "human_founder", "name": "Human"},
+        ],
+        "leads_found": 99,  # stale count must NOT override post-filter len(leads)
+        "rule5_preview": {"forbidden_pattern_count": 1, "ok": False},
+    }
+    job: dict[str, object] = {
+        "job_id": "jtest1",
+        "targets": ["saas_founders"],
+        "mode": "web",
+        "limit": 10,
+        "auto_ingest": False,
+        "leads": [],
+        "leads_found": 0,
+        "error": None,
+    }
+    asyncio.run(app_main._execute_batch_scrape_job(app, job))
+    assert job["leads_found"] == 1
+    assert [r["username"] for r in job["leads"]] == ["human_founder"]
+    assert job["status"] == "failed"
+    assert "Rule 5" in str(job["error"])
+    conn.close()

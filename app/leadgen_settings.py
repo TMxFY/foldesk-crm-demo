@@ -799,6 +799,7 @@ def save_leadgen_config(
         isinstance(inner_sources, dict)
         and inner_sources.get("meta_ads") is False
         and inner_sources.get("social_x_reddit") is False
+        and not any(inner_sources.get(k) is True for k in new_vein_keys)
     ):
         for new_k in new_vein_keys:
             if new_k not in inner_sources:
@@ -2283,7 +2284,10 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                     built["segment"] = cand_seg
                 if not built.get("language"):
                     built["language"] = cand_lang
-                if cand_seg == "whale" and not cand.get("step1_text") and not cand.get("first_touch"):
+                cand_s1_txt = str(cand.get("step1_text") or cand.get("first_touch") or "")
+                legacy_offer_re = re.compile(r"\b(?:rev[\s\-]?share|cpa|creatoros)\b", re.I)
+                has_legacy_offer_leak = bool(cand_s1_txt and legacy_offer_re.search(cand_s1_txt))
+                if cand_seg == "whale" and ((not cand.get("step1_text") and not cand.get("first_touch")) or has_legacy_offer_leak):
                     for _k in ("first_touch", "step1_text", "followup_1", "step2_text", "followup_2", "step3_text"):
                         built.pop(_k, None)
                 c_name, c_comp = clean_crm_lead_names(

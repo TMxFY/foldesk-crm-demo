@@ -269,6 +269,9 @@ def _extract_contact_fields(contact_str: str, tg_col: str = "", email_col: str =
             out["username"] = candidate
             break
 
+    if out["username"] and out["username"].strip().lstrip("@").lower().endswith("bot"):
+        out["username"] = ""
+
     norm_wa = _normalize_e164_wa_phone(raw_contact)
     if norm_wa:
         out["phone"] = norm_wa
@@ -390,8 +393,10 @@ def _ensure_full_case_pitch(
     category: str,
     their_angle: str,
     source: str = "",
+    segment: str = "",
+    copy_profile: str = "",
 ) -> str:
-    """Guarantee Vlad's canonical 3-paragraph SoftUGC pitch (183.5M views / 90 days / 13-40x + revshare/CPA CTA)."""
+    """Guarantee Vlad's canonical 3-paragraph SoftUGC pitch (whale_mass or legacy offer)."""
     return upgrade_to_vlad_step1(
         raw_first_touch,
         company=company,
@@ -400,6 +405,8 @@ def _ensure_full_case_pitch(
         category=category,
         their_angle=their_angle,
         source=source,
+        segment=segment,
+        copy_profile=copy_profile,
     )
 
 
@@ -636,6 +643,16 @@ def build_lead_payload_from_dict(
             record["followup_2"] = VLAD_STEP3_TEXT
             record["step3_text"] = VLAD_STEP3_TEXT
 
+    rec_seg = str(record.get("segment") or "").strip().lower()
+    src_low_push = str(source or "").strip().lower()
+    is_whale_pitch = rec_seg == "whale" or src_low_push in {
+        "tma_apps",
+        "whop_content_rewards",
+        "tiktok_ads",
+        "tiktok_shop",
+        "app_stores",
+        "d2c_whatsapp",
+    }
     full_pitch = _ensure_full_case_pitch(
         raw_first_touch,
         company=clean_comp or raw_company,
@@ -644,6 +661,8 @@ def build_lead_payload_from_dict(
         category=category,
         their_angle=their_angle,
         source=source,
+        segment="whale" if is_whale_pitch else rec_seg,
+        copy_profile="whale_mass" if is_whale_pitch else str(record.get("copy_profile") or "").strip(),
     )
     f1_default = followup_one(clean_comp or raw_company, their_angle, audience=audience, category=category, site=site)
     f2_default = followup_two(clean_comp or raw_company)
