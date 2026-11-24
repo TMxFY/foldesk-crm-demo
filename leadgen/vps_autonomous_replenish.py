@@ -73,7 +73,7 @@ from leadgen.language_router import (
     route_lead,
 )
 from leadgen.linkedin_jobs import collect as collect_linkedin_jobs
-from leadgen.outreach_copy import build_outreach_sequence, resolve_copy_profile
+from leadgen.outreach_copy import build_outreach_sequence, build_reverse_bridge_draft, resolve_copy_profile
 from leadgen.phone_messenger_resolver import (
     ResolvedMessenger,
     _build_bridge_dm,
@@ -359,6 +359,8 @@ def split_tg_and_direct_x_leads(
     final_jsonl: Path,
     direct_x_jsonl: Path,
     manual_social_jsonl: Path | None = None,
+    *,
+    reverse_bridge_tg_handle: str = "",
 ) -> dict[str, int]:
     """Keep TG/WA leads (icp_score >= 80) in final_jsonl; preserve manual social & Direct/X queues."""
     if not final_jsonl.is_file() or final_jsonl.stat().st_size == 0:
@@ -519,6 +521,20 @@ def split_tg_and_direct_x_leads(
                 row["linkedin_url"] = fli
             if cform:
                 row["contact_form_url"] = cform
+            has_wa_or_phone = bool(
+                whatsapp_url(row.get("whatsapp") or "")
+                or normalize_e164(str(row.get("phone") or row.get("mobile_phone") or ""))
+            )
+            if em or has_wa_or_phone:
+                rb_draft = build_reverse_bridge_draft(row, tg_handle=reverse_bridge_tg_handle)
+                if rb_draft.get("whatsapp_draft"):
+                    row.setdefault("reverse_bridge_wa_draft", rb_draft["whatsapp_draft"])
+                if rb_draft.get("email_subject"):
+                    row.setdefault("reverse_bridge_email_subject", rb_draft["email_subject"])
+                if rb_draft.get("email_body"):
+                    row.setdefault("reverse_bridge_email_body", rb_draft["email_body"])
+                if rb_draft.get("tg_link"):
+                    row.setdefault("reverse_bridge_tg_link", rb_draft["tg_link"])
             row["route_channel"] = "x" if (fx and not em and not fli and not cform) else "direct"
             d_keys = _direct_x_dedup_keys(row)
             if d_keys and any(k in existing_dx_keys for k in d_keys):
@@ -2422,7 +2438,12 @@ def _retry_pending_tg_verify_queue(
             "\n".join(json.dumps(r, ensure_ascii=False) for r in ready_for_pipeline) + "\n",
             encoding="utf-8",
         )
-        sp = split_tg_and_direct_x_leads(retry_final, state_dir / "direct_x_leads.jsonl")
+        rb_handle_retry = str(((cfg or {}).get("b2b") or {}).get("reverse_bridge_tg_handle") or "").strip()
+        sp = split_tg_and_direct_x_leads(
+            retry_final,
+            state_dir / "direct_x_leads.jsonl",
+            reverse_bridge_tg_handle=rb_handle_retry,
+        )
         res_stats["direct_x_routed"] += int(sp.get("direct_x_added") or 0)
         if retry_final.is_file() and retry_final.stat().st_size > 0:
             stamp_rows = _read_jsonl_dicts(retry_final)
@@ -4143,6 +4164,7 @@ def run_autonomous_replenish(
     freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
     linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
     ru_experts_fn: Callable[..., Any] | None = None,
+    catalog_discovery_fn: Callable[..., Any] | None = None,
     max_waves: int | None = None,
     max_wall_clock_sec: int = 1500,
     web_discovery_workers: int | None = None,
@@ -4186,12 +4208,31 @@ def run_autonomous_replenish(
             freelance_monitor_fn=freelance_monitor_fn,
             linkedin_collector_fn=linkedin_collector_fn,
             ru_experts_fn=ru_experts_fn,
+            catalog_discovery_fn=catalog_discovery_fn,
             max_waves=max_waves,
             max_wall_clock_sec=max_wall_clock_sec,
             web_discovery_workers=web_discovery_workers,
         )
     finally:
         _release_replenish_lock(lock_fh)
+
+
+def _is_catalog_refresh_due(state_dir: Path, max_age_hours: float = 24.0) -> bool:
+    """Return True when tg_catalog_state.json is absent or older than max_age_hours."""
+    state_path = state_dir / "tg_catalog_state.json"
+    if not state_path.is_file() or state_path.stat().st_size == 0:
+        return True
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    if not isinstance(payload, Mapping):
+        return True
+    last_at = _parse_iso_utc(str(payload.get("last_run_at") or ""))
+    if last_at is None:
+        return True
+    age_sec = (datetime.now(timezone.utc) - last_at).total_seconds()
+    return age_sec >= max(0.0, float(max_age_hours)) * 3600.0
 
 
 def _run_autonomous_replenish_locked(
@@ -4221,6 +4262,7 @@ def _run_autonomous_replenish_locked(
     freelance_monitor_fn: Callable[..., dict[str, Any]] | None = None,
     linkedin_collector_fn: Callable[..., list[dict[str, Any]]] | None = None,
     ru_experts_fn: Callable[..., Any] | None = None,
+    catalog_discovery_fn: Callable[..., Any] | None = None,
     max_waves: int | None = None,
     max_wall_clock_sec: int = 1500,
     web_discovery_workers: int | None = None,
@@ -4539,6 +4581,46 @@ def _run_autonomous_replenish_locked(
                 )
                 yield_state = _load_source_yield_state(state_dir)
 
+                # Wave B: 24h auto-replenishment of ad_spy, channel_graph, and comment channel catalogs
+                if (
+                    still_needs_b2b
+                    and sources_cfg.get("tg_catalog_discovery", True)
+                    and "tg_catalog_discovery" not in quarantined
+                    and _is_catalog_refresh_due(state_dir, max_age_hours=24.0)
+                ):
+                    cat_paid_allowed = budget_state is None or bool(budget_state.paid_allowed)
+                    if catalog_discovery_fn is not None:
+                        with stage_lock:
+                            stages_run.append("tg_catalog_discovery")
+                        try:
+                            _call_with_supported_kwargs(
+                                catalog_discovery_fn,
+                                state_dir,
+                                allow_paid=cat_paid_allowed,
+                            )
+                        except Exception as exc:
+                            with stage_lock:
+                                stage_errors.append(
+                                    {
+                                        "stage": "tg_catalog_discovery",
+                                        "returncode": -1,
+                                        "error": f"{type(exc).__name__}: {exc}",
+                                        "at": utc_now(),
+                                    }
+                                )
+                    else:
+                        cat_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "tg_catalog_discovery.py"),
+                            "--state-dir",
+                            str(state_dir),
+                            "--limit",
+                            "40",
+                        ]
+                        if not cat_paid_allowed:
+                            cat_cmd.append("--no-paid")
+                        _exec_stage("tg_catalog_discovery", cat_cmd)
+
                 for wave_idx in range(1, effective_max_waves + 1):
                     if not still_needs_b2b:
                         break
@@ -4558,6 +4640,7 @@ def _run_autonomous_replenish_locked(
                     ad_spy_out = state_dir / f"tg_ad_spy_{wave_ts}.jsonl"
                     external_out = state_dir / f"external_{wave_ts}.jsonl"
                     yc_ph_out = state_dir / f"yc_ph_{wave_ts}.jsonl"
+                    tma_apps_out = state_dir / f"tma_apps_{wave_ts}.jsonl"
                     fb_groups_out = state_dir / f"fb_groups_{wave_ts}.jsonl"
                     b2b_tg_groups_out = state_dir / f"b2b_tg_groups_{wave_ts}.jsonl"
                     ofm_review_path = state_dir / "ofm_review_leads.jsonl"
@@ -4830,6 +4913,27 @@ def _run_autonomous_replenish_locked(
                             lambda c=_ext_cmd: _exec_stage("creator_external_leads", c),
                         ))
 
+                    if sources_cfg.get("tma_apps", True) and "tma_apps" not in quarantined:
+                        wave_ran_sources.add("tma_apps")
+                        tma_lim = min(100, max(10, int(limits_cfg.get("tma_limit") or 40)))
+                        _tma_cmd = [
+                            py_bin,
+                            str(ROOT / "leadgen" / "tma_apps.py"),
+                            "--output",
+                            str(tma_apps_out),
+                            "--seen",
+                            str(state_dir / "tma_apps_seen.json"),
+                            "--limit",
+                            str(tma_lim),
+                        ]
+                        tma_paid_allowed = budget_state is None or bool(budget_state.paid_allowed)
+                        if not tma_paid_allowed:
+                            _tma_cmd.append("--no-paid")
+                        web_tasks.append((
+                            "tma_apps",
+                            lambda c=_tma_cmd: _exec_stage("tma_apps", c),
+                        ))
+
                     if web_tasks:
                         eff_web_workers = (
                             max(1, min(5, int(web_discovery_workers)))
@@ -4980,6 +5084,8 @@ def _run_autonomous_replenish_locked(
                                 str(ROOT / "leadgen" / "tg_channel_graph.py"),
                                 "--session",
                                 str(graph_sess),
+                                "--state-dir",
+                                str(state_dir),
                                 "--output",
                                 str(channel_graph_out),
                                 "--state",
@@ -5002,6 +5108,8 @@ def _run_autonomous_replenish_locked(
                                 str(ROOT / "leadgen" / "tg_ad_spy.py"),
                                 "--session",
                                 str(ad_sess),
+                                "--state-dir",
+                                str(state_dir),
                                 "--output",
                                 str(ad_spy_out),
                                 "--seen",
@@ -5025,6 +5133,7 @@ def _run_autonomous_replenish_locked(
                         ("social_x_reddit", social_out),
                         ("external", external_out),
                         ("yc_ph", yc_ph_out),
+                        ("tma_apps", tma_apps_out),
                         ("channel_graph", channel_graph_out),
                         ("tg_ad_spy", ad_spy_out),
                     ):
@@ -5058,6 +5167,7 @@ def _run_autonomous_replenish_locked(
                             social_out,
                             external_out,
                             yc_ph_out,
+                            tma_apps_out,
                             channel_graph_out,
                             ad_spy_out,
                         ],
@@ -5413,6 +5523,9 @@ def _run_autonomous_replenish_locked(
                                                 manual_social_jsonl=(
                                                     manual_social_jsonl if run_l2_phone_resolver else None
                                                 ),
+                                                reverse_bridge_tg_handle=str(
+                                                    b2b_cfg.get("reverse_bridge_tg_handle") or ""
+                                                ).strip(),
                                             )
                                             wave_dx_routed = int(split_res.get("direct_x_added") or 0)
                                             direct_x_routed += wave_dx_routed

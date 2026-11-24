@@ -1604,6 +1604,71 @@ if repl_file_y.is_file() and "def _run_autonomous_replenish_locked(" in repl_src
     if "def _retry_pending_tg_verify_queue(" not in repl_src_y or '"pending_tg_verify_queue.jsonl"' not in repl_src_y:
         errors.append("Gate Y violation in leadgen/vps_autonomous_replenish.py: pending_tg_verify_queue.jsonl must be protected and drained")
 
+# Gate Z: Wave B Telegram Mini Apps, Auto-Catalogs, Segment Copy & UI Invariants
+tma_file_z = root / "leadgen" / "tma_apps.py"
+if tma_file_z.is_file():
+    tma_src_z = tma_file_z.read_text(encoding="utf-8")
+    if "def is_rejected_tma_app(" not in tma_src_z or "def collect_tma_leads(" not in tma_src_z or "tma_bot_handle" not in tma_src_z:
+        errors.append("Gate Z violation in leadgen/tma_apps.py: must reject tap-to-earn/gambling and isolate bot handles to tma_bot_handle")
+
+cat_file_z = root / "leadgen" / "tg_catalog_discovery.py"
+if cat_file_z.is_file():
+    cat_src_z = cat_file_z.read_text(encoding="utf-8")
+    if (
+        "def discover_and_replenish_catalogs(" not in cat_src_z
+        or "def safe_join_public_groups(" not in cat_src_z
+        or "MAX_RO_JOINS_PER_DAY" not in cat_src_z
+    ):
+        errors.append("Gate Z violation in leadgen/tg_catalog_discovery.py: missing required catalog/safe-join contracts")
+    else:
+        cat_tree_z = ast.parse(cat_src_z, filename=str(cat_file_z))
+        max_joins_val = None
+        for stmt in cat_tree_z.body:
+            val_node = None
+            if (
+                isinstance(stmt, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "MAX_RO_JOINS_PER_DAY" for t in stmt.targets)
+            ):
+                val_node = stmt.value
+            elif (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == "MAX_RO_JOINS_PER_DAY"
+                and stmt.value is not None
+            ):
+                val_node = stmt.value
+            if val_node is not None:
+                try:
+                    max_joins_val = ast.literal_eval(val_node)
+                except Exception:
+                    max_joins_val = None
+                break
+        if not isinstance(max_joins_val, int) or not (1 <= max_joins_val <= 2):
+            errors.append(f"Gate Z violation in leadgen/tg_catalog_discovery.py: MAX_RO_JOINS_PER_DAY must be 1..2, got {max_joins_val!r}")
+
+oc_file_z = root / "leadgen" / "outreach_copy.py"
+if oc_file_z.is_file():
+    oc_src_z = oc_file_z.read_text(encoding="utf-8")
+    if "def _infer_subniche_pain(" in oc_src_z:
+        if "def build_reverse_bridge_draft(" not in oc_src_z:
+            errors.append("Gate Z violation in leadgen/outreach_copy.py: missing build_reverse_bridge_draft")
+        for seg_tok in ("tma_apps", "tg_ad_spy", "app_stores", "tiktok_shop"):
+            if seg_tok not in oc_src_z:
+                errors.append(f"Gate Z violation in leadgen/outreach_copy.py: missing Wave B hook for {seg_tok}")
+
+main_file_z = root / "app" / "main.py"
+if main_file_z.is_file() and "def register_routes(" in main_file_z.read_text(encoding="utf-8"):
+    main_src_z = main_file_z.read_text(encoding="utf-8")
+    if "/api/leadgen/batch-scrape" not in main_src_z:
+        errors.append("Gate Z violation in app/main.py: missing /api/leadgen/batch-scrape endpoint")
+
+if repl_file_y.is_file() and tma_file_z.is_file() and cat_file_z.is_file():
+    repl_src_z = repl_file_y.read_text(encoding="utf-8")
+    if "def _run_autonomous_replenish_locked(" in repl_src_z:
+        for req_wire_z in ("tg_catalog_discovery", "tma_apps", "build_reverse_bridge_draft"):
+            if req_wire_z not in repl_src_z:
+                errors.append(f"Gate Z violation in leadgen/vps_autonomous_replenish.py: missing Wave B wiring for {req_wire_z}")
+
 if errors:
     for err in errors:
         print("FAIL:", err, file=sys.stderr)
