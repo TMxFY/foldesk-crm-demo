@@ -42,6 +42,7 @@ from leadgen.outreach_copy import (
     DEFAULT_VACANCY_SHOWCASE_URL,
     VLAD_STEP2_TEMPLATE,
     VLAD_STEP3_TEXT,
+    normalize_tg_handle,
     sanitize_copy_text,
 )
 from leadgen.tg_to_gsheet import whatsapp_url
@@ -109,12 +110,15 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "ofm_outreach_enabled": False,
         "ofm_daily_limit": 25,
         "campaign_daily_limit": 30,
+        "reverse_bridge_tg_handle": "",
         "sources": {
             "tg_groups": True,
             "tg_comments": True,
             "channel_graph": True,
             "tg_ad_spy": True,
             "tg_group_admins": True,
+            "tma_apps": True,
+            "tg_catalog_discovery": True,
             "whop_content_rewards": True,
             "tiktok_ads": True,
             "tiktok_shop": True,
@@ -522,10 +526,15 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if not (0 <= b2b_limit <= 500):
         raise ValueError("b2b.campaign_daily_limit должен быть от 0 до 500")
     b2b["campaign_daily_limit"] = b2b_limit
+    b2b["reverse_bridge_tg_handle"] = normalize_tg_handle(
+        b2b.get("reverse_bridge_tg_handle"), strict=True
+    )
 
     raw_sources = b2b.get("sources") or {}
     caller_sources = ((cfg or {}).get("b2b") or {}).get("sources")
     new_vein_keys = {
+        "tma_apps",
+        "tg_catalog_discovery",
         "whop_content_rewards",
         "tiktok_ads",
         "tiktok_shop",
@@ -773,6 +782,8 @@ def save_leadgen_config(
     merged = _deep_merge(current, inner)
     inner_sources = (inner.get("b2b") or {}).get("sources")
     new_vein_keys = (
+        "tma_apps",
+        "tg_catalog_discovery",
         "whop_content_rewards",
         "tiktok_ads",
         "tiktok_shop",
@@ -962,6 +973,7 @@ def get_leadgen_status(conn: sqlite3.Connection | None = None) -> dict[str, Any]
                 "social",
                 "reddit",
                 "whop",
+                "tma_apps",
                 "catalog",
                 "linkedin",
                 "app_store",
@@ -1331,6 +1343,7 @@ def sync_leadgen_campaigns(
     targets = build_segment_campaign_targets(cfg, wa_ready=wa_ready)
 
     synced_campaigns: list[dict[str, Any]] = []
+    newly_created_ids: set[int] = set()
     for spec in targets:
         spec_name_low = str(spec["name"] or "").strip().lower()
         if is_legacy_baza_vse2_name(spec_name_low):
@@ -1405,6 +1418,7 @@ def sync_leadgen_campaigns(
                 leadgen_sources=spec["leadgen_sources"],
             )
             cid = int(created["id"])
+            newly_created_ids.add(cid)
             _apply_campaign_v2_metadata(
                 conn,
                 cid,
@@ -1418,6 +1432,12 @@ def sync_leadgen_campaigns(
     whales_ready = ensure_whales_tg_campaign_ready(conn, cfg)
     ready_cid = whales_ready.get("campaign_id")
     if ready_cid is not None:
+        if int(ready_cid) in newly_created_ids:
+            cur_ready = get_campaign(conn, int(ready_cid))
+            if cur_ready and str(cur_ready.get("status") or "").strip().lower() != "draft":
+                update_campaign(conn, int(ready_cid), status="draft")
+                whales_ready["status"] = "draft"
+                whales_ready["promoted_to_running"] = False
         refreshed = get_campaign(conn, int(ready_cid))
         synced_campaigns = [
             refreshed if int(c["id"]) == int(ready_cid) else c
@@ -2211,21 +2231,25 @@ def push_discovered_now(conn: sqlite3.Connection) -> dict[str, Any]:
                         cand["language"] = cand_lang
                         leads.append(cand)
                         continue
-                    append_direct_x_lead(
-                        state_dir,
-                        {
-                            "name": cand.get("name") or cand.get("company") or cand.get("project"),
-                            "company": cand.get("company") or cand.get("project"),
-                            "email": cand.get("email") or cand.get("work_email"),
-                            "x_url": cand.get("x_url") or cand.get("founder_x") or cand.get("founder_twitter") or cand.get("twitter"),
-                            "linkedin_url": cand.get("linkedin_url") or cand.get("founder_linkedin"),
-                            "url": site_s,
-                            "category": cand.get("category") or cand.get("niche"),
-                            "their_angle": angle_s,
-                            "lead_source": cand.get("lead_source") or cand.get("source"),
-                            "icp_score": cand.get("icp_score"),
-                        },
-                    )
+                    dx_payload: dict[str, Any] = {
+                        "name": cand.get("name") or cand.get("company") or cand.get("project"),
+                        "company": cand.get("company") or cand.get("project"),
+                        "email": cand.get("email") or cand.get("work_email"),
+                        "x_url": cand.get("x_url") or cand.get("founder_x") or cand.get("founder_twitter") or cand.get("twitter"),
+                        "linkedin_url": cand.get("linkedin_url") or cand.get("founder_linkedin"),
+                        "url": site_s,
+                        "category": cand.get("category") or cand.get("niche"),
+                        "their_angle": angle_s,
+                        "lead_source": cand.get("lead_source") or cand.get("source"),
+                        "icp_score": cand.get("icp_score"),
+                    }
+                    if cand.get("contact_form_url"):
+                        dx_payload["contact_form_url"] = cand.get("contact_form_url")
+                    if cand.get("source") or cand.get("lead_source"):
+                        dx_payload["source"] = cand.get("source") or cand.get("lead_source")
+                    if cand.get("tma_bot_handle"):
+                        dx_payload["tma_bot_handle"] = cand.get("tma_bot_handle")
+                    append_direct_x_lead(state_dir, dx_payload)
                     continue
                 is_tg_phone_direct = (
                     str(cand.get("provider") or "").strip().lower() == "telegram"

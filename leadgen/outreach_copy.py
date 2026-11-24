@@ -504,6 +504,14 @@ def infer_lead_audience(
     return "users"
 
 
+def _d2c_pain(opener: str) -> str:
+    return (
+        f"{opener} You're probably running into the same thing most consumer brands hit: "
+        "ad CPMs keep climbing, and product seeding delays from shipping physical samples to creators "
+        "take weeks just to find one winning reel, while zero-shoot daily AI UGC output lets you test fresh angles every day."
+    )
+
+
 def _infer_subniche_pain(
     brand: str,
     category: str = "",
@@ -529,6 +537,47 @@ def _infer_subniche_pain(
             f"Saw {subject} is running video ads right now. Paid social works until creative fatigue "
             "kicks in and CAC creeps up faster than your team can ship fresh variations."
         )
+    if (
+        src in ("tma_apps", "tma", "telegram_mini_apps", "mini_apps")
+        or src.startswith("tma_")
+        or re.search(
+            r"(?:\btma_apps\b|\btma\b|\btelegram\s+mini[\s-]?apps?\b|\btg\s+mini[\s-]?apps?\b|"
+            r"\bmini[\s-]?apps?\b|\btelegram\s+stars\b|\btapps\.center\b|\bfindmini\b)",
+            blob,
+        )
+    ):
+        return (
+            f"{opener} You're probably running into the same thing most Telegram Mini App teams hit: "
+            "Telegram Ads and catalog traffic burn out fast as CPMs keep rising, leaving growth stuck inside the same bubble. "
+            "External AI short-form distribution sends fresh organic users directly into the Mini App every day."
+        )
+    if (
+        src in ("tg_ad_spy", "tg_adspy", "telegram_ads", "tg_ads")
+        or src.startswith("tg_ad_spy")
+        or re.search(r"(?:\btg_ad_spy\b|\btelegram\s+ads?\b|\btg\s+ads?\b|\bpaid\s+channel\s+seeding\b)", blob)
+    ):
+        return (
+            f"{opener} Paid channel seeding and Telegram Ads usually give you a one-day spike while CPM keeps rising, "
+            "so acquisition drops back down as soon as you pause spend. "
+            "External AI reels compound daily user acquisition without paying per post every week."
+        )
+    if (
+        src in ("app_stores", "app_store", "mobile_ua", "ios_app", "android_app", "play_store")
+        or src.startswith(("app_store", "mobile_ua"))
+        or re.search(
+            r"(?:\bapp_stores?\b|\bmobile_ua\b|\bmobile\s+ua\b|\bmobile\s+app\w*\b|"
+            r"\b(?:ios|android)(?:\s*(?:/|&|and)\s*(?:ios|android))?\s+app\w*\b|"
+            r"\bapp\s+store\b|\bgoogle\s+play\b|\bsubscription\s+app\w*\b)",
+            blob,
+        )
+    ):
+        return (
+            f"{opener} You're probably running into the same thing most mobile apps hit: "
+            "mobile UA creative fatigue sets in every 5-7 days and drives up CPI and CAC faster than teams can test new hooks. "
+            "Mass AI UGC variations keep creatives fresh daily and drop install costs."
+        )
+    if src in ("d2c", "tiktok_shop", "d2c_whatsapp", "ecom", "e-com", "shopify") or src.startswith(("d2c", "tiktok_shop")):
+        return _d2c_pain(opener)
     if re.search(r"(?:агентств|agency|agencies|\bbd\b|advisory|consulting|venture\s+studio|kol\s+marketing|pr\s+agency|marketing\s+partner)", blob):
         return (
             f"{opener} You're probably running into the same thing most agencies hit: "
@@ -560,11 +609,11 @@ def _infer_subniche_pain(
             f"{opener} You're probably running into the same thing most education brands hit: "
             "ad and webinar CPLs keep climbing, while organic short-form takes too much founder time to produce at volume."
         )
-    if _AUD_ECOM_DESC_RE.search(blob) or re.search(r"(?:\be-?com\b|\bd2c\b|\bdtc\b|shopify|physical\s+product)", blob):
-        return (
-            f"{opener} You're probably running into the same thing most consumer brands hit: "
-            "ad CPMs keep climbing, and shipping product out to dozens of creators takes weeks just to find one winning reel."
-        )
+    if _AUD_ECOM_DESC_RE.search(blob) or re.search(
+        r"(?:\be-?com(?:merce)?\b|\bd2c\b|\bdtc\b|shopify|tiktok[\s_-]?shop|d2c_whatsapp|physical\s+product\w*)",
+        blob,
+    ):
+        return _d2c_pain(opener)
     if re.search(r"(?:медиа|\bmedia\b|podcast|newsletter|youtube|community|conference|event|hackathon|show\b)", blob):
         return (
             f"{opener} You're probably running into the same thing most media brands hit: "
@@ -606,6 +655,35 @@ def _product(product: str, russian: bool) -> str:
 def dm_allowed(user) -> bool:
     """True only for a Telegram user. Channels and groups are not DMs."""
     return type(user).__name__ == "User"
+
+
+_TG_HANDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{2,31}$")
+
+
+def normalize_tg_handle(raw: Any, *, strict: bool = False) -> str:
+    """Normalize a Telegram @handle or t.me/<handle> link; raise ValueError on bad chars when strict=True."""
+    if raw is None:
+        return ""
+    if isinstance(raw, (bool, dict, list)):
+        if strict:
+            raise ValueError("b2b.reverse_bridge_tg_handle должен быть строкой")
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    if re.match(r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/", text, flags=re.I):
+        text = re.sub(r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/", "", text, flags=re.I)
+        text = text.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+    text = text.lstrip("@").strip()
+    if not text:
+        return ""
+    if not _TG_HANDLE_RE.fullmatch(text):
+        if strict:
+            raise ValueError(
+                "b2b.reverse_bridge_tg_handle должен содержать корректный Telegram-username (3-32 символа: латиница, цифры, _)"
+            )
+        return ""
+    return text
 
 
 def sanitize_copy_text(text: str) -> str:
@@ -2366,6 +2444,74 @@ def build_ofm_vlad_copy_batch(rows: list[dict]) -> list[dict]:
             }
         )
     return out
+
+
+def build_reverse_bridge_draft(
+    lead: Mapping[str, Any],
+    *,
+    tg_handle: str = "",
+) -> dict[str, str]:
+    """Build tailored WhatsApp and Email reverse-bridge drafts pointing non-TG whales to Telegram."""
+    raw_comp = str(lead.get("company") or lead.get("project") or lead.get("brand") or "").strip()
+    raw_name = str(lead.get("name") or lead.get("founder_name") or "").strip()
+    site = str(lead.get("website") or lead.get("project_url") or lead.get("site") or lead.get("url") or "").strip()
+    angle = str(
+        lead.get("their_angle")
+        or lead.get("what_they_do")
+        or lead.get("one_liner")
+        or lead.get("note")
+        or ""
+    ).strip()
+    category = str(lead.get("category") or lead.get("niche") or "").strip()
+    source = str(lead.get("lead_source") or lead.get("source") or "").strip()
+    pool_usd = lead.get("pool_usd") if lead.get("pool_usd") is not None else lead.get("bounty_usd")
+
+    brand = clean_brand_name(raw_comp or raw_name, site=site, their_angle=angle)
+    first_name = _extract_personal_first_name(raw_name, brand)
+    whop_hook = (
+        whop_content_rewards_hook(brand=brand, pool_usd=pool_usd)
+        if source.lower() == "whop_content_rewards"
+        else ""
+    )
+    pain_para = whop_hook or _infer_subniche_pain(
+        brand=brand,
+        category=category,
+        their_angle=angle,
+        source=source,
+    )
+    pain_para = sanitize_copy_text(re.sub(r"\s*[—–]\s*", ", ", pain_para))
+    offer = sanitize_copy_text(render_whale_offer(brand))
+
+    clean_handle = normalize_tg_handle(tg_handle, strict=False)
+    tg_link = f"https://t.me/{clean_handle}" if clean_handle else ""
+
+    wa_greeting = f"Hey {first_name}," if first_name else "Hey,"
+    email_greeting = f"Hi {first_name}," if first_name else "Hi,"
+    target = brand or "your brand"
+
+    if tg_link:
+        wa_bridge = f"You can also check our demo showcase & ping me directly on Telegram: {tg_link}"
+        email_bridge = (
+            f"Feel free to reply here or message me directly on Telegram ({tg_link}) "
+            "and I will send over 3 demo reels."
+        )
+    else:
+        wa_bridge = "Happy to drop the demo reels here or connect via SoftUGC Telegram if easier."
+        email_bridge = (
+            "Feel free to reply here or reach us via SoftUGC Telegram "
+            "and I will send over 3 demo reels."
+        )
+
+    whatsapp_draft = sanitize_copy_text(f"{wa_greeting}\n\n{pain_para}\n\n{offer}\n\n{wa_bridge}")
+    email_subject = sanitize_copy_text(f"3 demo AI UGC reels for {target}")
+    email_body = sanitize_copy_text(f"{email_greeting}\n\n{pain_para}\n\n{offer}\n\n{email_bridge}")
+
+    return {
+        "whatsapp_draft": whatsapp_draft,
+        "email_subject": email_subject,
+        "email_body": email_body,
+        "tg_link": tg_link,
+    }
 
 
 def big_client_offer() -> str:
