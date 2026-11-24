@@ -56,6 +56,8 @@ DEFAULT_SESSION = (
     or "/Users/timofei/.claude/skill-telegram/tim3.session"
 )
 DEFAULT_SEEN_PATH = "leadgen_state/ad_spy_seen.json"
+MAX_DISCOVERED_AD_SPY_CHANNELS = 200
+_DISCOVERED_CHANNEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{2,31}$")
 DEFAULT_AD_SPY_CHANNELS: tuple[str, ...] = (
     # Core existing channels
     "gonzo_ML",
@@ -1017,11 +1019,103 @@ async def scan_ad_channels(
     return discovered
 
 
+def _normalize_discovered_channel(raw: str) -> str:
+    tok = str(raw or "").split("#", 1)[0].strip()
+    if not tok:
+        return ""
+    tok = re.sub(
+        r"^https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?",
+        "",
+        tok,
+        flags=re.IGNORECASE,
+    )
+    tok = tok.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].strip().lstrip("@")
+    if not tok or not _DISCOVERED_CHANNEL_RE.fullmatch(tok) or is_bot_handle(tok):
+        return ""
+    return tok
+
+
+def _load_discovered_ad_spy_channels(
+    state_dir: str | os.PathLike[str] | None = None,
+    *,
+    seen_path: str | os.PathLike[str] | None = None,
+    existing_keys: set[str] | None = None,
+    cap: int = MAX_DISCOVERED_AD_SPY_CHANNELS,
+) -> list[str]:
+    candidates: list[str] = []
+    explicit = str(state_dir or "").strip()
+    if explicit:
+        candidates.append(explicit)
+    else:
+        env_dir = (
+            os.environ.get("LEADGEN_STATE_DIR")
+            or os.environ.get("CRMTG_LEADGEN_STATE_DIR")
+            or ""
+        ).strip()
+        if env_dir:
+            candidates.append(env_dir)
+        seen_raw = str(seen_path or "").strip()
+        if seen_raw:
+            candidates.append(os.path.dirname(os.path.abspath(seen_raw)))
+
+    target_file = ""
+    for cand_dir in candidates:
+        cand_path = os.path.join(cand_dir, "discovered_ad_spy_channels.txt")
+        if os.path.isfile(cand_path):
+            target_file = cand_path
+            break
+    if not target_file:
+        return []
+
+    try:
+        lines = open(target_file, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return []
+
+    seen_low = set(existing_keys or ())
+    extra: list[str] = []
+    for raw in lines:
+        clean = _normalize_discovered_channel(raw)
+        if not clean:
+            continue
+        low = clean.lower()
+        if low in seen_low:
+            continue
+        seen_low.add(low)
+        extra.append(clean)
+
+    if cap > 0 and len(extra) > cap:
+        cursor = _load_spy_cursor(str(seen_path)) if seen_path else 0
+        shift = cursor % len(extra)
+        extra = [extra[(shift + idx) % len(extra)] for idx in range(cap)]
+    return extra
+
+
+def resolve_default_ad_spy_channels(
+    *,
+    state_dir: str | os.PathLike[str] | None = None,
+    seen_path: str | os.PathLike[str] | None = None,
+    cap: int = MAX_DISCOVERED_AD_SPY_CHANNELS,
+) -> list[str]:
+    base = list(DEFAULT_AD_SPY_CHANNELS)
+    existing = {c.strip().lstrip("@").lower() for c in base if c.strip()}
+    extra = _load_discovered_ad_spy_channels(
+        state_dir=state_dir,
+        seen_path=seen_path,
+        existing_keys=existing,
+        cap=cap,
+    )
+    return base + extra
+
+
 async def _async_main(args: argparse.Namespace) -> None:
     raw_channels = args.channels or os.getenv("TG_AD_SPY_CHANNELS", "")
     channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
     if not channels and not getattr(args, "no_default_channels", False):
-        channels = list(DEFAULT_AD_SPY_CHANNELS)
+        channels = resolve_default_ad_spy_channels(
+            state_dir=getattr(args, "state_dir", ""),
+            seen_path=getattr(args, "seen", DEFAULT_SEEN_PATH),
+        )
     if not channels:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8"):
@@ -1061,6 +1155,7 @@ def main() -> None:
     ap.add_argument("--session", default=DEFAULT_SESSION)
     ap.add_argument("--channels", default=os.getenv("TG_AD_SPY_CHANNELS", ""))
     ap.add_argument("--no-default-channels", action="store_true")
+    ap.add_argument("--state-dir", default="")
     ap.add_argument("--msg-limit", type=int, default=40)
     ap.add_argument("--seen", default=DEFAULT_SEEN_PATH)
     ap.add_argument("--output", required=True)
