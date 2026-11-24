@@ -597,6 +597,8 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
                     "tg_groups": False,
                     "channel_graph": False,
                     "tg_ad_spy": False,
+                    "tma_apps": False,
+                    "tg_catalog_discovery": False,
                 },
                 "limits": {"external_limit": 0},
             },
@@ -612,7 +614,17 @@ def test_vps_autonomous_replenish_check_treg_ready_full_sources_and_direct_x_spl
         leadgen_enabled=True,
     )
 
-    res_missing_treg = vps_autonomous_replenish.run_autonomous_replenish(conn)
+    with monkeypatch.context() as mp:
+        orig_run = subprocess.run
+
+        def _forbid_leadgen_subprocess(cmd, **kw):
+            joined = " ".join(str(x) for x in cmd) if isinstance(cmd, list) else str(cmd)
+            if "leadgen/" in joined or "leadgen\\" in joined:
+                raise AssertionError(f"Unexpected real leadgen subprocess when treg is missing: {cmd}")
+            return orig_run(cmd, **kw)
+
+        mp.setattr(subprocess, "run", _forbid_leadgen_subprocess)
+        res_missing_treg = vps_autonomous_replenish.run_autonomous_replenish(conn)
     assert res_missing_treg["ok"] is True
     assert "missing_treg_cli" in (res_missing_treg.get("reasons") or [])
     assert "missing_treg_cli" in (res_missing_treg["low_water_alert"]["reasons"])

@@ -799,10 +799,10 @@ def save_leadgen_config(
         isinstance(inner_sources, dict)
         and inner_sources.get("meta_ads") is False
         and inner_sources.get("social_x_reddit") is False
-        and not any(k in inner_sources for k in new_vein_keys)
     ):
         for new_k in new_vein_keys:
-            merged.setdefault("b2b", {}).setdefault("sources", {})[new_k] = False
+            if new_k not in inner_sources:
+                merged.setdefault("b2b", {}).setdefault("sources", {})[new_k] = False
     normalized = _normalize_config(merged)
 
     should_write_cases_file = bool(

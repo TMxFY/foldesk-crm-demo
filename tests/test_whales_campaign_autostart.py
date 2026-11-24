@@ -105,6 +105,8 @@ def test_meta_ad_leads_geo_rotation_and_max_runtime_sec_in_replenish(
                     "d2c_whatsapp": False,
                     "facebook_groups": False,
                     "ofm_groups": False,
+                    "tma_apps": False,
+                    "tg_catalog_discovery": False,
                 },
                 "limits": {"external_limit": 0},
             },
@@ -201,6 +203,8 @@ def test_retro_bridge_direct_x_leads_bounded_budget_live_verify_and_social_manua
                     "d2c_whatsapp": False,
                     "facebook_groups": False,
                     "ofm_groups": False,
+                    "tma_apps": False,
+                    "tg_catalog_discovery": False,
                 },
                 "limits": {"external_limit": 0},
             },
@@ -369,6 +373,11 @@ def test_retro_bridge_direct_x_leads_bounded_budget_live_verify_and_social_manua
                 access_hash=1,
             )
         return None
+
+    def _forbid_subprocess(cmd, **_kw):
+        raise AssertionError(f"Unexpected real subprocess in retro-bridge test: {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", _forbid_subprocess)
 
     # Test budget guard (paid_allowed=False when balance=0.10) passed to bridge_lead_to_telegram
     res = vps_autonomous_replenish.run_autonomous_replenish(
