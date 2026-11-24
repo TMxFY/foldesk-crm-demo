@@ -1739,12 +1739,380 @@ def audit_server_leadgen_readiness(
     }
 
 
+_DEFAULT_VPS_SCRAPER_SESSIONS_DIR = Path("/opt/crmtg/data/scraper_sessions")
+
+_FUNNEL_SOURCE_EXACT_ALIASES: dict[str, str] = {
+    "tg_channel_graph": "channel_graph",
+    "fb_groups": "facebook_groups",
+    "ofm_tg": "ofm_groups",
+    "tg_adspy": "tg_ad_spy",
+    "tg ad spy": "tg_ad_spy",
+    "meta ads": "meta_ads",
+}
+
+_FUNNEL_YC_PH_ALIASES: frozenset[str] = frozenset(
+    {"yc", "ph", "betalist", "microlaunch", "uneed", "indiehackers"}
+)
+_FUNNEL_SOCIAL_ALIASES: frozenset[str] = frozenset({"x", "twitter", "reddit", "treg_x"})
+
+
+def _resolve_scraper_sessions_dir(scraper_sessions_dir: Path | str | None = None) -> Path:
+    explicit = str(scraper_sessions_dir or "").strip()
+    if explicit:
+        return Path(os.path.expanduser(explicit))
+    env_dir = os.environ.get("SCRAPER_SESSIONS_DIR", "").strip()
+    if env_dir:
+        return Path(os.path.expanduser(env_dir))
+    local_dir = Path(__file__).resolve().parent.parent / "data" / "scraper_sessions"
+    if local_dir.is_dir():
+        return local_dir
+    return _DEFAULT_VPS_SCRAPER_SESSIONS_DIR
+
+
+def _stat_session_entry(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_file():
+            st = path.stat()
+            updated_at = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            return {
+                "name": path.name,
+                "present": True,
+                "size_bytes": int(st.st_size),
+                "updated_at": updated_at,
+            }
+    except OSError:
+        return {"name": path.name, "present": False, "size_bytes": 0, "updated_at": None}
+    return {"name": path.name, "present": False, "size_bytes": 0, "updated_at": None}
+
+
+def _count_jsonl_rows(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        return sum(1 for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip())
+    except OSError:
+        return 0
+
+
+def _read_source_yield_state_safe(state_dir: Path) -> dict[str, dict[str, Any]]:
+    path = state_dir / "source_yield_state.json"
+    if not path.is_file():
+        return {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    sources = parsed.get("sources")
+    if not isinstance(sources, dict):
+        return {}
+    return {
+        str(k): dict(v)
+        for k, v in sources.items()
+        if isinstance(k, str) and isinstance(v, dict)
+    }
+
+
+def _format_active_cooldown_until(raw_val: Any, now_dt: datetime) -> str | None:
+    if raw_val in (None, "", 0, 0.0, False):
+        return None
+    if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
+        ts_val = float(raw_val)
+        if ts_val <= now_dt.timestamp():
+            return None
+        return datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raw_str = str(raw_val).strip()
+    if not raw_str:
+        return None
+    try:
+        num = float(raw_str)
+    except ValueError:
+        num = None
+    if num is not None:
+        if num <= now_dt.timestamp():
+            return None
+        return datetime.fromtimestamp(num, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    parsed = _parse_iso_ts_utc(raw_str)
+    if parsed is None or parsed <= now_dt:
+        return None
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_ts_cmp(raw_ts: Any) -> str:
+    s = str(raw_ts or "").strip()
+    if not s:
+        return ""
+    return s[:19].replace("T", " ")
+
+
+def _normalize_funnel_source(raw_source: Any, known_raw_keys: set[str]) -> str:
+    low = str(raw_source or "").strip().lower()
+    if not low:
+        return ""
+    if low in known_raw_keys:
+        return low
+    mapped = _FUNNEL_SOURCE_EXACT_ALIASES.get(low)
+    if mapped:
+        return mapped
+    if low.startswith("catalog_"):
+        return "buyer_catalogs"
+    if low in _FUNNEL_YC_PH_ALIASES and "yc_ph" in known_raw_keys:
+        return "yc_ph"
+    if low in _FUNNEL_SOCIAL_ALIASES and "social_x_reddit" in known_raw_keys:
+        return "social_x_reddit"
+    return low
+
+
+def _extract_recipient_extra_source(raw_extra: Any) -> str:
+    if not raw_extra:
+        return ""
+    if isinstance(raw_extra, dict):
+        return str(raw_extra.get("lead_source") or raw_extra.get("source") or "").strip()
+    try:
+        parsed = json.loads(str(raw_extra))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if isinstance(parsed, dict):
+        return str(parsed.get("lead_source") or parsed.get("source") or "").strip()
+    return ""
+
+
+def _compute_source_funnel(
+    conn: sqlite3.Connection,
+    last_run: dict[str, Any],
+    yield_sources: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    now_dt = datetime.now(timezone.utc)
+    cutoff_24h = (now_dt - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_7d = (now_dt - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
+    per_source_raw = last_run.get("per_source_counts")
+    per_source_counts: dict[str, int] = {}
+    if isinstance(per_source_raw, dict):
+        for k, v in per_source_raw.items():
+            key = str(k or "").strip().lower()
+            if not key:
+                continue
+            try:
+                per_source_counts[key] = max(0, int(v or 0))
+            except (TypeError, ValueError):
+                per_source_counts[key] = 0
+
+    cooldown_by_src: dict[str, str] = {}
+    for k, entry in yield_sources.items():
+        key = str(k or "").strip().lower()
+        if not key:
+            continue
+        cd_iso = _format_active_cooldown_until(entry.get("cooldown_until"), now_dt)
+        if cd_iso:
+            cooldown_by_src[key] = cd_iso
+
+    known_raw_keys = set(per_source_counts.keys()) | {str(k).strip().lower() for k in yield_sources.keys() if str(k).strip()}
+
+    leads_24h_map: dict[str, int] = {}
+    leads_7d_map: dict[str, int] = {}
+    try:
+        lead_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(leads)").fetchall()}
+        if "lead_source" in lead_cols:
+            rows = conn.execute(
+                """
+                SELECT lead_source, created_at
+                FROM leads
+                WHERE lead_source IS NOT NULL
+                  AND trim(lead_source) != ''
+                  AND replace(substr(COALESCE(created_at, ''), 1, 19), 'T', ' ') >= ?
+                """,
+                (cutoff_7d,),
+            ).fetchall()
+            for r in rows:
+                src = _normalize_funnel_source(r["lead_source"], known_raw_keys)
+                if not src:
+                    continue
+                leads_7d_map[src] = leads_7d_map.get(src, 0) + 1
+                if _normalize_ts_cmp(r["created_at"]) >= cutoff_24h:
+                    leads_24h_map[src] = leads_24h_map.get(src, 0) + 1
+    except sqlite3.Error:
+        leads_24h_map = {}
+        leads_7d_map = {}
+
+    in_camp_seen: dict[str, set[int]] = {}
+    replied_seen: dict[str, set[int]] = {}
+    try:
+        lead_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(leads)").fetchall()}
+        src_sel = "l.lead_source AS lead_source" if "lead_source" in lead_cols else "'' AS lead_source"
+        cr_rows = conn.execute(
+            f"""
+            SELECT cr.id, cr.lead_id, cr.status, cr.created_at, cr.updated_at, cr.extra_json, {src_sel}
+            FROM campaign_recipients cr
+            LEFT JOIN leads l ON l.id = cr.lead_id
+            WHERE replace(substr(COALESCE(cr.created_at, ''), 1, 19), 'T', ' ') >= ?
+               OR (
+                   lower(COALESCE(cr.status, '')) = 'replied'
+                   AND replace(substr(COALESCE(NULLIF(cr.updated_at, ''), cr.created_at, ''), 1, 19), 'T', ' ') >= ?
+               )
+            """,
+            (cutoff_7d, cutoff_7d),
+        ).fetchall()
+        for r in cr_rows:
+            raw_src = r["lead_source"] or _extract_recipient_extra_source(r["extra_json"])
+            src = _normalize_funnel_source(raw_src, known_raw_keys)
+            if not src:
+                continue
+            uid = int(r["lead_id"]) if r["lead_id"] is not None else -int(r["id"])
+            created_cmp = _normalize_ts_cmp(r["created_at"])
+            updated_cmp = _normalize_ts_cmp(r["updated_at"] or r["created_at"])
+            if created_cmp >= cutoff_7d:
+                in_camp_seen.setdefault(src, set()).add(uid)
+            if str(r["status"] or "").strip().lower() == "replied" and updated_cmp >= cutoff_7d:
+                replied_seen.setdefault(src, set()).add(uid)
+    except sqlite3.Error:
+        in_camp_seen = {}
+        replied_seen = {}
+
+    all_sources = (
+        set(per_source_counts.keys())
+        | set(cooldown_by_src.keys())
+        | {str(k).strip().lower() for k in yield_sources.keys() if str(k).strip()}
+        | set(leads_7d_map.keys())
+        | set(in_camp_seen.keys())
+        | set(replied_seen.keys())
+    )
+
+    funnel: list[dict[str, Any]] = []
+    for src in all_sources:
+        if not src:
+            continue
+        raw_cnt = per_source_counts.get(src, 0)
+        l24 = leads_24h_map.get(src, 0)
+        l7 = leads_7d_map.get(src, 0)
+        in_camp = len(in_camp_seen.get(src) or ())
+        replied = len(replied_seen.get(src) or ())
+        conv_pct = round(min(100.0, (replied / in_camp) * 100.0), 1) if in_camp > 0 else 0.0
+        funnel.append(
+            {
+                "source": src,
+                "raw_last_run": raw_cnt,
+                "leads_24h": l24,
+                "leads_7d": l7,
+                "in_campaign_7d": in_camp,
+                "replied_7d": replied,
+                "conversion_pct": conv_pct,
+                "cooldown_until": cooldown_by_src.get(src),
+            }
+        )
+
+    funnel.sort(
+        key=lambda row: (
+            -int(row["leads_7d"]),
+            -int(row["in_campaign_7d"]),
+            -int(row["raw_last_run"]),
+            str(row["source"]),
+        )
+    )
+    return funnel
+
+
+def _compute_scraper_health(
+    st_dir: Path,
+    last_run: dict[str, Any],
+    stage_errors: list[dict[str, Any]],
+    yield_sources: dict[str, dict[str, Any]],
+    *,
+    scraper_sessions_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    sess_dir = _resolve_scraper_sessions_dir(scraper_sessions_dir)
+    ro_sessions: list[dict[str, Any]] = []
+    seen_ro: set[str] = set()
+    if sess_dir.is_dir():
+        for p in sorted(sess_dir.glob("signals_ro*.session")):
+            ro_sessions.append(_stat_session_entry(p))
+            seen_ro.add(p.name)
+
+    env_sess = os.environ.get("SCRAPER_TG_SESSION", "").strip()
+    if env_sess:
+        env_path = Path(os.path.expanduser(env_sess))
+        if env_path.name not in seen_ro and not env_path.name.startswith("phone_checker_"):
+            ro_sessions.append(_stat_session_entry(env_path))
+
+    phone_checker_sessions: list[dict[str, Any]] = []
+    if sess_dir.is_dir():
+        for p in sorted(sess_dir.glob("phone_checker_*.session")):
+            phone_checker_sessions.append(_stat_session_entry(p))
+
+    now_dt = datetime.now(timezone.utc)
+    cooldown_set: set[str] = set()
+    for src_k, entry in yield_sources.items():
+        if _format_active_cooldown_until(entry.get("cooldown_until"), now_dt):
+            cooldown_set.add(str(src_k).strip())
+    if not yield_sources and isinstance(last_run.get("cooldown_sources"), list):
+        for item in last_run.get("cooldown_sources") or []:
+            s = str(item or "").strip()
+            if s:
+                cooldown_set.add(s)
+
+    recent_errors: list[Any] = []
+    seen_err_sigs: set[str] = set()
+    for raw_err in [*(last_run.get("stage_errors") or []), *(stage_errors or [])]:
+        sig = json.dumps(raw_err, ensure_ascii=False, sort_keys=True) if isinstance(raw_err, dict) else str(raw_err)
+        if sig and sig not in seen_err_sigs:
+            seen_err_sigs.add(sig)
+            recent_errors.append(raw_err)
+
+    raw_ts = str(last_run.get("timestamp") or "").strip() or None
+    return {
+        "ro_sessions": ro_sessions,
+        "phone_checker_sessions": phone_checker_sessions,
+        "pending_tg_verify_count": _count_jsonl_rows(st_dir / "pending_tg_verify_queue.jsonl"),
+        "manual_join_queue_count": _count_jsonl_rows(st_dir / "manual_join_queue.jsonl"),
+        "cooldown_sources": sorted(cooldown_set),
+        "recent_errors": recent_errors[:20],
+        "last_run_timestamp": raw_ts,
+    }
+
+
+def _count_reverse_bridge_ready(st_dir: Path) -> int:
+    target = st_dir / "direct_x_leads.jsonl"
+    if not target.is_file():
+        return 0
+    ready = 0
+    try:
+        for raw_line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            has_email = bool(str(obj.get("email") or obj.get("work_email") or "").strip())
+            has_phone = bool(
+                str(
+                    obj.get("phone")
+                    or obj.get("whatsapp")
+                    or obj.get("wa_phone")
+                    or obj.get("contact_phone")
+                    or ""
+                ).strip()
+            )
+            if has_email or has_phone:
+                ready += 1
+    except OSError:
+        return 0
+    return ready
+
+
 def read_leadgen_health_summary(
     conn: sqlite3.Connection,
     *,
     state_dir: Path | None = None,
     direct_x_limit: int = 50,
     query: str = "",
+    scraper_sessions_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     st_dir = state_dir if state_dir is not None else _resolve_leadgen_state_dir()
     readiness = audit_server_leadgen_readiness(conn)
@@ -1754,6 +2122,16 @@ def read_leadgen_health_summary(
     if not last_run.get("stage_errors") and stage_errors:
         last_run["stage_errors"] = stage_errors
     dx_payload = read_direct_x_leads(st_dir, limit=direct_x_limit, query=query)
+    yield_sources = _read_source_yield_state_safe(st_dir)
+    source_funnel = _compute_source_funnel(conn, last_run, yield_sources)
+    scraper_health = _compute_scraper_health(
+        st_dir,
+        last_run,
+        stage_errors,
+        yield_sources,
+        scraper_sessions_dir=scraper_sessions_dir,
+    )
+    reverse_bridge_ready_count = _count_reverse_bridge_ready(st_dir)
     return {
         "ok": True,
         "readiness_ok": bool(readiness.get("ok", True)),
@@ -1780,6 +2158,9 @@ def read_leadgen_health_summary(
         "static_dump_alert": anomalies["static_dump_alert"],
         "direct_x_count": int(dx_payload.get("total") or 0),
         "direct_x_leads": dx_payload.get("items") or [],
+        "source_funnel": source_funnel,
+        "scraper_health": scraper_health,
+        "reverse_bridge_ready_count": reverse_bridge_ready_count,
         "readiness": readiness,
     }
 

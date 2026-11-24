@@ -9,9 +9,12 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 _runtime_logger = logging.getLogger("crmtg.runtime")
 
@@ -1011,6 +1014,481 @@ def _build_enrichment_budget_response(
         "stop_reason": "; ".join(stop_reasons),
         "cached": cached,
     }
+
+
+_BATCH_SCRAPE_MAX_TARGETS = 10
+_BATCH_SCRAPE_MAX_JOBS = 20
+_BATCH_TG_HANDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+_BATCH_TG_URL_PREFIX_RE = re.compile(
+    r"^https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?",
+    re.IGNORECASE,
+)
+_BATCH_TG_BARE_DOMAIN_RE = re.compile(
+    r"^(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?",
+    re.IGNORECASE,
+)
+_BATCH_TG_RESERVED_HANDLES = frozenset(
+    {"s", "joinchat", "share", "addstickers", "proxy", "iv", "login", "contact", "tg"}
+)
+_BATCH_MENTION_HANDLE_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b")
+_BATCH_TME_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,31})",
+    re.IGNORECASE,
+)
+_BATCH_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"')\]}]+", re.IGNORECASE)
+_BATCH_SOCIAL_HOSTS = (
+    "t.me",
+    "telegram.me",
+    "telegram.dog",
+    "x.com",
+    "twitter.com",
+    "instagram.com",
+    "tiktok.com",
+    "youtube.com",
+    "youtu.be",
+    "facebook.com",
+    "linkedin.com",
+)
+
+
+def _normalize_single_batch_target(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("Каждая цель должна быть строкой")
+    text = raw.strip()
+    if not text or any(ch.isspace() for ch in text):
+        raise ValueError(f"Некорректная ссылка или handle Telegram: {raw!r}")
+    if "://" in text:
+        if not _BATCH_TG_URL_PREFIX_RE.match(text):
+            raise ValueError(f"Разрешены только публичные ссылки t.me/... или @handle: {raw!r}")
+        text = _BATCH_TG_URL_PREFIX_RE.sub("", text, count=1)
+    elif _BATCH_TG_BARE_DOMAIN_RE.match(text):
+        text = _BATCH_TG_BARE_DOMAIN_RE.sub("", text, count=1)
+    elif "." in text.split("/", 1)[0]:
+        raise ValueError(f"Неподдерживаемый домен в цели: {raw!r}")
+    text = text.split("?", 1)[0].split("#", 1)[0].strip().lstrip("@").strip("/")
+    if not text or text.startswith("+") or text.lower().startswith("joinchat"):
+        raise ValueError(f"Приватные инвайт-ссылки не поддерживаются: {raw!r}")
+    if "/" in text:
+        head, tail = text.split("/", 1)
+        if not tail.isdigit():
+            raise ValueError(f"Ожидается публичный Telegram-канал/чат без подпутей: {raw!r}")
+        text = head
+    if text.lower() in _BATCH_TG_RESERVED_HANDLES or not _BATCH_TG_HANDLE_RE.fullmatch(text):
+        raise ValueError(f"Некорректный публичный Telegram handle: {raw!r}")
+    return text
+
+
+def _normalize_batch_scrape_targets(raw_targets: Any) -> list[str]:
+    if not isinstance(raw_targets, list):
+        raise ValueError("Поле targets должно быть списком строк (1..10)")
+    non_empty = [item for item in raw_targets if not (isinstance(item, str) and not item.strip())]
+    if not non_empty:
+        raise ValueError("Укажите хотя бы 1 публичный Telegram-канал или @handle")
+    if len(non_empty) > _BATCH_SCRAPE_MAX_TARGETS:
+        raise ValueError(f"Максимум {_BATCH_SCRAPE_MAX_TARGETS} целей за один запуск")
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for item in non_empty:
+        handle = _normalize_single_batch_target(item)
+        low = handle.lower()
+        if low not in seen_low:
+            seen_low.add(low)
+            out.append(handle)
+    return out
+
+
+def _extract_batch_candidate_handles(texts: list[str], *, ignore_handle: str = "") -> list[str]:
+    ignore_low = ignore_handle.strip().lstrip("@").lower()
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for pat in (_BATCH_MENTION_HANDLE_RE, _BATCH_TME_LINK_RE):
+            for match in pat.finditer(text):
+                cand = match.group(1).strip().lstrip("@")
+                low = cand.lower()
+                if (
+                    not cand
+                    or low == ignore_low
+                    or low in _BATCH_TG_RESERVED_HANDLES
+                    or low.endswith("bot")
+                    or not _BATCH_TG_HANDLE_RE.fullmatch(cand)
+                    or low in seen_low
+                ):
+                    continue
+                seen_low.add(low)
+                out.append(cand)
+    return out
+
+
+def _extract_batch_external_url(texts: list[str]) -> str:
+    for text in texts:
+        if not text:
+            continue
+        for match in _BATCH_HTTP_URL_RE.finditer(text):
+            cand = match.group(0).rstrip(".,;:!?)\"'>]")
+            host = (urllib.parse.urlparse(cand).hostname or "").lower().removeprefix("www.")
+            if not host or "." not in host:
+                continue
+            if any(host == h or host.endswith("." + h) for h in _BATCH_SOCIAL_HOSTS):
+                continue
+            return cand
+    return ""
+
+
+def _call_fetch_posts_web_safe(fetch_fn, channel: str, limit: int) -> tuple[dict, list[str]]:
+    try:
+        sig = inspect.signature(fetch_fn)
+        kw = {}
+        if "limit" in sig.parameters:
+            kw["limit"] = limit
+        if "allow_paid" in sig.parameters:
+            kw["allow_paid"] = False
+    except (TypeError, ValueError):
+        kw = {}
+    res = fetch_fn(channel, **kw) if kw else fetch_fn(channel)
+    if isinstance(res, tuple) and len(res) == 2:
+        info = dict(res[0] or {}) if isinstance(res[0], dict) else {}
+        posts = [str(p) for p in (res[1] or []) if str(p or "").strip()]
+        return info, posts
+    if isinstance(res, list):
+        return {}, [str(p) for p in res if str(p or "").strip()]
+    return {}, []
+
+
+def _call_probe_handle_web_safe(probe_fn, handle: str) -> dict:
+    res = probe_fn(handle)
+    return dict(res) if isinstance(res, dict) else {}
+
+
+def _build_batch_lead_record(
+    *,
+    username: str,
+    title: str,
+    bio: str,
+    source_channel: str,
+    channel_title: str,
+    channel_about: str,
+    snippet: str,
+    external_url: str,
+) -> dict:
+    clean_user = str(username or "").strip().lstrip("@")
+    display_name = str(title or "").strip() or clean_user
+    company = str(channel_title or "").strip() or display_name
+    angle = (bio or snippet or channel_about or "").strip()[:240]
+    return {
+        "name": display_name,
+        "username": clean_user,
+        "telegram_username": clean_user,
+        "provider": "telegram",
+        "company": company,
+        "bio": bio,
+        "url": external_url,
+        "website": external_url,
+        "their_angle": angle,
+        "what_they_do": angle,
+        "category": "SaaS / AI",
+        "lead_source": "batch_scrape",
+        "source": "batch_scrape",
+        "source_channel": source_channel,
+        "segment": "whale",
+        "language": "en",
+        "icp_score": 75,
+    }
+
+
+def _collect_web_batch_leads_sync(targets: list[str], limit: int) -> list[dict]:
+    from leadgen import tg_web_client as twc
+
+    leads: list[dict] = []
+    seen_users: set[str] = set()
+    for ch in targets:
+        if len(leads) >= limit:
+            break
+        info, posts = _call_fetch_posts_web_safe(twc.fetch_channel_posts_web, ch, limit)
+        ch_title = str(info.get("title") or "").strip()
+        ch_about = str(info.get("about") or info.get("bio") or "").strip()
+        channel_ext_url = _extract_batch_external_url([ch_about, *posts])
+        candidates = _extract_batch_candidate_handles([ch_about, *posts], ignore_handle=ch)
+        if not candidates and not posts and not ch_about:
+            candidates = [ch]
+        for cand in candidates:
+            if len(leads) >= limit:
+                break
+            if cand.lower().endswith("bot") or cand.lower() in seen_users:
+                continue
+            probe = _call_probe_handle_web_safe(twc.probe_tme_handle_web, cand)
+            if str(probe.get("kind") or "").strip().lower() != "user":
+                continue
+            resolved_user = str(probe.get("handle") or cand).strip().lstrip("@")
+            if not resolved_user or resolved_user.lower().endswith("bot"):
+                continue
+            if resolved_user.lower() in seen_users:
+                continue
+            seen_users.add(resolved_user.lower())
+            matching_post = next(
+                (p for p in posts if re.search(rf"(?:@|t\.me/){re.escape(cand)}\b", p, re.IGNORECASE)),
+                "",
+            )
+            post_ext_url = _extract_batch_external_url([str(probe.get("bio") or ""), matching_post])
+            leads.append(
+                _build_batch_lead_record(
+                    username=resolved_user,
+                    title=str(probe.get("title") or "").strip(),
+                    bio=str(probe.get("bio") or "").strip(),
+                    source_channel=ch,
+                    channel_title=ch_title,
+                    channel_about=ch_about,
+                    snippet=matching_post,
+                    external_url=post_ext_url or channel_ext_url,
+                )
+            )
+    return leads[:limit]
+
+
+async def _collect_hybrid_batch_leads(
+    conn: sqlite3.Connection,
+    targets: list[str],
+    limit: int,
+) -> tuple[list[dict], str]:
+    from leadgen.vps_autonomous_replenish import find_ro_scraper_sessions
+
+    with locked_conn(conn):
+        ro_sessions = find_ro_scraper_sessions(conn, allow_phone_checker_ro_fallback=True)
+    if not ro_sessions:
+        raise RuntimeError(
+            "Режим hybrid недоступен: не найдена изолированная RO-сессия "
+            "(signals_ro* или phone_checker_2+). Использование боевых аккаунтов запрещено."
+        )
+    ro_sess = ro_sessions[0]
+    leads = await asyncio.to_thread(_collect_web_batch_leads_sync, targets, limit)
+    seen_users = {str(r.get("username") or "").strip().lower() for r in leads if r.get("username")}
+
+    api_id_raw, api_hash = _resolve_tg_creds(conn)
+    if api_id_raw.isdigit() and int(api_id_raw) > 0 and api_hash and len(leads) < limit:
+        from telethon import TelegramClient
+        from leadgen.tg_scrape_posters import (
+            CURSOR_PATH,
+            PROFILE_CACHE_PATH,
+            load_entity_cache,
+            load_json_state,
+            save_json_state,
+            scrape_group,
+        )
+
+        client = TelegramClient(str(ro_sess), int(api_id_raw), api_hash)
+        entity_cache = load_entity_cache()
+        profile_cache = load_json_state(PROFILE_CACHE_PATH)
+        cursors = load_json_state(CURSOR_PATH)
+        try:
+            await client.start()
+            with open(os.devnull, "w", encoding="utf-8") as null_fh:
+                for ch in targets:
+                    if len(leads) >= limit:
+                        break
+                    rows = await scrape_group(
+                        client,
+                        ch,
+                        min(limit * 4, 400),
+                        1.0,
+                        null_fh,
+                        [],
+                        mode="hybrid",
+                        member_limit=min(limit, 150),
+                        send=False,
+                        entity_cache=entity_cache,
+                        profile_cache=profile_cache,
+                        cursors=cursors,
+                        allow_rule5_bypass=False,
+                    )
+                    for row in rows:
+                        if len(leads) >= limit:
+                            break
+                        uname = str(row.get("username") or "").strip().lstrip("@")
+                        if not uname or uname.lower().endswith("bot") or uname.lower() in seen_users:
+                            continue
+                        seen_users.add(uname.lower())
+                        ext_u = _extract_batch_external_url([str(row.get("bio") or ""), str(row.get("sample") or "")])
+                        leads.append(
+                            _build_batch_lead_record(
+                                username=uname,
+                                title=str(row.get("name") or "").strip(),
+                                bio=str(row.get("bio") or "").strip(),
+                                source_channel=ch,
+                                channel_title=ch,
+                                channel_about="",
+                                snippet=str(row.get("sample") or ""),
+                                external_url=ext_u,
+                            )
+                        )
+        finally:
+            save_json_state(PROFILE_CACHE_PATH, profile_cache)
+            save_json_state(CURSOR_PATH, cursors)
+            await client.disconnect()
+
+    return leads[:limit], ro_sess.name
+
+
+def _auto_ingest_batch_leads_with_rule5(
+    conn: sqlite3.Connection,
+    leads: list[dict],
+) -> tuple[int, dict, dict]:
+    from app.leadgen_settings import get_leadgen_config
+    from leadgen.vps_autonomous_replenish import ingest_v2_routed_leads
+
+    if not leads:
+        return 0, {}, {"forbidden_pattern_count": 0, "campaigns": [], "ok": True}
+
+    with locked_conn(conn):
+        cfg = get_leadgen_config(conn)
+        ingest_stats = ingest_v2_routed_leads(conn, leads, cfg=cfg, auto_push=True)
+        rule5_campaigns: list[dict] = []
+        forbidden_total = 0
+        for camp_obj in (ingest_stats.get("campaigns") or {}).values():
+            if not isinstance(camp_obj, dict) or not camp_obj.get("id"):
+                continue
+            prev = preview_outreach_batch(conn, int(camp_obj["id"]), sample_size=5, strict=False)
+            forb = int(prev.get("forbidden_pattern_count") or 0)
+            forbidden_total += forb
+            rule5_campaigns.append(
+                {
+                    "campaign_id": int(camp_obj["id"]),
+                    "campaign_name": camp_obj.get("name"),
+                    "sample_count": int(prev.get("sample_count") or 0),
+                    "forbidden_pattern_count": forb,
+                    "ok": bool(prev.get("ok", True)) and forb == 0,
+                }
+            )
+    ingested_count = (
+        int(ingest_stats.get("whales_ingested") or 0)
+        + int(ingest_stats.get("ru_experts_ingested") or 0)
+        + int(ingest_stats.get("vacancy_ingested") or 0)
+        + int(ingest_stats.get("social_manual_ingested") or 0)
+        + int(ingest_stats.get("vacancy_assisted_ingested") or 0)
+    )
+    rule5_summary = {
+        "forbidden_pattern_count": forbidden_total,
+        "campaigns": rule5_campaigns,
+        "ok": forbidden_total == 0,
+    }
+    return ingested_count, ingest_stats, rule5_summary
+
+
+async def _invoke_batch_scrape_runner(runner, app_obj: FastAPI, job: dict):
+    try:
+        sig = inspect.signature(runner)
+        params = list(sig.parameters.values())
+        param_names = {p.name for p in params}
+        has_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+    except (TypeError, ValueError):
+        params = []
+        param_names = set()
+        has_kw = False
+
+    if "job" in param_names or (len(params) in (1, 2) and not {"targets", "mode"} & param_names):
+        if len(params) >= 2 and ("app" in param_names or params[1].name in ("app", "app_obj")):
+            res = runner(job, app_obj)
+        else:
+            res = runner(job)
+    else:
+        kw: dict = {}
+        available = {
+            "job": job,
+            "job_id": job["job_id"],
+            "targets": list(job["targets"]),
+            "mode": job["mode"],
+            "limit": job["limit"],
+            "auto_ingest": job["auto_ingest"],
+            "conn": app_obj.state.conn,
+            "app": app_obj,
+        }
+        for k, v in available.items():
+            if has_kw or k in param_names:
+                kw[k] = v
+        res = runner(**kw)
+    if inspect.isawaitable(res):
+        res = await res
+    return res
+
+
+async def _execute_batch_scrape_job(app_obj: FastAPI, job: dict) -> None:
+    job["status"] = "running"
+    job["started_at"] = utc_now()
+    try:
+        custom_runner = getattr(app_obj.state, "_batch_scrape_runner", None)
+        if custom_runner is not None:
+            res = await _invoke_batch_scrape_runner(custom_runner, app_obj, job)
+            if isinstance(res, list):
+                job["leads"] = [dict(r) for r in res if isinstance(r, dict) and not str(r.get("username") or "").lower().endswith("bot")]
+                job["leads_found"] = len(job["leads"])
+            elif isinstance(res, dict):
+                if "leads" in res and isinstance(res["leads"], list):
+                    job["leads"] = [
+                        dict(r)
+                        for r in res["leads"]
+                        if isinstance(r, dict) and not str(r.get("username") or "").lower().endswith("bot")
+                    ]
+                    job["leads_found"] = len(job["leads"])
+                for key in ("leads_found", "ingested_count", "ingest_stats", "rule5_preview", "ro_session", "error"):
+                    if key in res and res[key] is not None:
+                        job[key] = res[key]
+            if job.get("auto_ingest") and job.get("leads") and job.get("rule5_preview") is None:
+                ing_cnt, ing_stats, r5 = await asyncio.to_thread(
+                    _auto_ingest_batch_leads_with_rule5,
+                    app_obj.state.conn,
+                    list(job["leads"]),
+                )
+                job["ingested_count"] = ing_cnt
+                job["ingest_stats"] = ing_stats
+                job["rule5_preview"] = r5
+            if job.get("error"):
+                job["status"] = "failed"
+            else:
+                job["status"] = "completed"
+            return
+
+        if job["mode"] == "hybrid":
+            leads, ro_name = await _collect_hybrid_batch_leads(
+                app_obj.state.conn,
+                list(job["targets"]),
+                int(job["limit"]),
+            )
+            job["ro_session"] = ro_name
+        else:
+            leads = await asyncio.to_thread(
+                _collect_web_batch_leads_sync,
+                list(job["targets"]),
+                int(job["limit"]),
+            )
+
+        clean_leads = [
+            r
+            for r in leads
+            if not str(r.get("username") or "").strip().lower().endswith("bot")
+        ]
+        job["leads"] = clean_leads
+        job["leads_found"] = len(clean_leads)
+        if job["auto_ingest"]:
+            ing_cnt, ing_stats, r5 = await asyncio.to_thread(
+                _auto_ingest_batch_leads_with_rule5,
+                app_obj.state.conn,
+                clean_leads,
+            )
+            job["ingested_count"] = ing_cnt
+            job["ingest_stats"] = ing_stats
+            job["rule5_preview"] = r5
+            if int(r5.get("forbidden_pattern_count") or 0) > 0:
+                job["status"] = "failed"
+                job["error"] = "Rule 5 violation: forbidden_pattern_count > 0"
+                return
+        job["status"] = "completed"
+    except Exception as exc:
+        _runtime_logger.warning("Batch scrape job %s failed: %s", job.get("job_id"), exc)
+        job["status"] = "failed"
+        job["error"] = str(exc) or "Ошибка batch-сбора"
+    finally:
+        job["finished_at"] = utc_now()
 
 
 def _resolve_tg_creds(conn=None) -> tuple[str, str]:
@@ -2270,6 +2748,14 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             await stop_airtable_sync_loop(app)
             await stop_autopilot_loop(app)
             await stop_inbox_watches(app)
+            batch_tasks = list(getattr(app.state, "_batch_scrape_tasks", set()) or ())
+            for bt_task in batch_tasks:
+                if bt_task is not None and not bt_task.done():
+                    bt_task.cancel()
+                    try:
+                        await bt_task
+                    except (asyncio.CancelledError, Exception) as exc:
+                        _runtime_logger.debug("Batch scrape task cancelled on shutdown: %s", exc)
             hb_t = getattr(app.state, "tg_lease_heartbeat_task", None)
             if hb_t is not None:
                 hb_t.cancel()
@@ -2387,6 +2873,9 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
     app.state.autopilot_error_count = 0
     app.state.autopilot_last_error = None
     app.state.autopilot_last_tick_at = None
+    app.state._batch_scrape_jobs = []
+    app.state._batch_scrape_tasks = set()
+    app.state._batch_scrape_runner = None
     app.state._needs_initial_session_backup = needs_initial_session_backup
     if needs_initial_session_backup:
         from app.cloud_persistence import schedule_cloud_backup
@@ -5640,6 +6129,104 @@ def create_app(conn=None, gateway=None, wa_gateway=None) -> FastAPI:
             ),
             request.app.state.conn,
         )
+
+    @app.post("/api/leadgen/batch-scrape")
+    async def leadgen_batch_scrape_post(request: Request):
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Ожидается объект JSON")
+
+        try:
+            targets = _normalize_batch_scrape_targets(payload.get("targets"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        mode = str(payload.get("mode") or "web").strip().lower()
+        if mode not in ("web", "hybrid"):
+            raise HTTPException(status_code=400, detail="mode должен быть 'web' или 'hybrid'")
+
+        raw_limit = payload.get("limit", 50)
+        if isinstance(raw_limit, bool):
+            raise HTTPException(status_code=400, detail="limit должен быть целым числом")
+        try:
+            limit = max(5, min(200, int(raw_limit)))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="limit должен быть целым числом от 5 до 200") from exc
+
+        auto_ingest = bool(payload.get("auto_ingest", False))
+        custom_runner = getattr(request.app.state, "_batch_scrape_runner", None)
+        if mode == "hybrid" and custom_runner is None:
+            from leadgen.vps_autonomous_replenish import find_ro_scraper_sessions
+
+            with locked_conn(request.app.state.conn):
+                ro_sessions = find_ro_scraper_sessions(
+                    request.app.state.conn,
+                    allow_phone_checker_ro_fallback=True,
+                )
+            if not ro_sessions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Режим hybrid недоступен: не найдена изолированная RO-сессия "
+                        "(signals_ro* или phone_checker_2+). Использование боевых аккаунтов запрещено."
+                    ),
+                )
+
+        jobs = getattr(request.app.state, "_batch_scrape_jobs", None)
+        if not isinstance(jobs, list):
+            jobs = []
+            request.app.state._batch_scrape_jobs = jobs
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "job_id": job_id,
+            "id": job_id,
+            "status": "queued",
+            "targets": targets,
+            "mode": mode,
+            "limit": limit,
+            "auto_ingest": auto_ingest,
+            "created_at": utc_now(),
+            "started_at": None,
+            "finished_at": None,
+            "leads_found": 0,
+            "ingested_count": 0,
+            "leads": [],
+            "ingest_stats": None,
+            "rule5_preview": None,
+            "ro_session": None,
+            "error": None,
+        }
+        jobs.append(job)
+        if len(jobs) > _BATCH_SCRAPE_MAX_JOBS:
+            del jobs[:-_BATCH_SCRAPE_MAX_JOBS]
+
+        tasks = getattr(request.app.state, "_batch_scrape_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            request.app.state._batch_scrape_tasks = tasks
+        task = asyncio.create_task(_execute_batch_scrape_job(request.app, job))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+        return {"ok": True, "job_id": job_id, "status": job["status"], "job": job}
+
+    @app.get("/api/leadgen/batch-scrape")
+    def leadgen_batch_scrape_list(request: Request):
+        jobs = list(getattr(request.app.state, "_batch_scrape_jobs", []) or [])
+        items = list(reversed(jobs))
+        return {"ok": True, "count": len(items), "jobs": items}
+
+    @app.get("/api/leadgen/batch-scrape/{job_id}")
+    def leadgen_batch_scrape_detail(job_id: str, request: Request):
+        jobs = list(getattr(request.app.state, "_batch_scrape_jobs", []) or [])
+        found = next((j for j in jobs if str(j.get("job_id")) == str(job_id)), None)
+        if found is None:
+            raise HTTPException(status_code=404, detail="Задача batch-сбора не найдена")
+        return {"ok": True, "job": found, **found}
 
     @app.get("/api/leadgen/ofm-review")
     def leadgen_ofm_review_get(request: Request, limit: int = 100, query: str = ""):
