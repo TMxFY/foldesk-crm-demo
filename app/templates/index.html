@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap&subset=cyrillic,latin">
   <link rel="stylesheet" href="/design/tokens.css">
-  <link rel="stylesheet" href="/static/app.css?v=20261122acc2">
+  <link rel="stylesheet" href="/static/app.css?v=20261124waveb">
   <link rel="stylesheet" href="/static/inbox-v2/inbox-v2.css?v=20261122acc2">
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
 </head>
@@ -748,6 +748,7 @@
             </div>
             <div class="row">
               <button type="button" id="open-leadgen-settings-btn" class="btn secondary sm">Настройки лидгена и шаблоны</button>
+              <button type="button" id="open-leadgen-funnel-btn" class="btn secondary sm">Воронка и Batch-сбор</button>
               <button type="button" id="outreach-open-social-queue-btn" class="btn ghost sm">Social Queue (<span id="outreach-social-queue-count">0</span>)</button>
               <button type="button" id="outreach-open-job-queue-btn" class="btn ghost sm">Job Queue (<span id="outreach-job-queue-count">0</span>)</button>
               <button type="button" id="leadgen-direct-x-btn" class="btn secondary sm" hidden>Direct X лиды (<span id="leadgen-direct-x-count">0</span>)</button>
@@ -1517,6 +1518,7 @@
         <button type="button" class="auth-tab-btn" id="lg-tab-vacancies" data-lg-tab="vacancies" role="tab" aria-selected="false">Вакансии и копирайтинг</button>
         <button type="button" class="auth-tab-btn" id="lg-tab-ru-experts" data-lg-tab="ru_experts" role="tab" aria-selected="false">РФ-Эксперты</button>
         <button type="button" class="auth-tab-btn" id="lg-tab-templates" data-lg-tab="templates" role="tab" aria-selected="false">Шаблоны кампаний</button>
+        <button type="button" class="auth-tab-btn" id="lg-tab-funnel" data-lg-tab="funnel" role="tab" aria-selected="false">Воронка и Batch-сбор</button>
       </div>
 
       <div id="leadgen-settings-body" class="accounts-modal-body lg-settings-body">
@@ -1532,7 +1534,7 @@
             <div class="lg-budget-metrics">
               <div class="lg-budget-metric">
                 <span class="hint">Расход за сегодня (UTC)</span>
-                <strong id="leadgen-budget-spent-value">$0.00 / $5.00</strong>
+                <strong id="leadgen-budget-spent-value">$0.00 / $10.00</strong>
                 <div class="lg-budget-bar" aria-hidden="true">
                   <span id="leadgen-budget-progress-fill" class="lg-budget-bar-fill" style="width: 0%"></span>
                 </div>
@@ -1552,7 +1554,7 @@
             </div>
             <div class="leadgen-form-row-3">
               <label for="leadgen-enrichment-daily-cap">Дневной потолок ($/сутки)
-                <input id="leadgen-enrichment-daily-cap" type="number" min="0" max="500" step="0.5" value="5.0">
+                <input id="leadgen-enrichment-daily-cap" type="number" min="0" max="500" step="0.5" value="10.0">
               </label>
               <label for="leadgen-enrichment-per-lead-cap">Лимит на лида ($)
                 <input id="leadgen-enrichment-per-lead-cap" type="number" min="0" max="5" step="0.01" value="0.05">
@@ -1588,6 +1590,15 @@
               <label for="leadgen-total-quota">Общая квота (лидов/сутки)
                 <input id="leadgen-total-quota" type="number" min="0" max="500" value="50">
               </label>
+            </div>
+            <div class="lg-two-col-grid">
+              <label for="leadgen-b2b-reverse-bridge-tg">Reverse Bridge TG (@handle для WA/Email → TG)
+                <input id="leadgen-b2b-reverse-bridge-tg" type="text" autocomplete="off" placeholder="@softugc_team">
+              </label>
+              <div class="lg-reverse-bridge-meta">
+                <span class="hint">Синхронно добавляет ссылку t.me/… в WA/Email-черновики для перевода Direct/X-лидов в Telegram</span>
+                <span id="lg-reverse-bridge-ready-badge" class="badge b-new">Готово к Reverse Bridge: 0</span>
+              </div>
             </div>
           </section>
 
@@ -1696,6 +1707,22 @@
                 <span class="leadgen-switch-copy">
                   <strong>TikTok Ads &amp; Shop</strong>
                   <span class="hint">Крупные D2C-бренды</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-b2b-source="tma_apps" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>Telegram Mini Apps</strong>
+                  <span class="hint">TMA / Stars (без тапалок и казино)</span>
+                </span>
+                <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
+              </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" data-b2b-source="tg_catalog_discovery" checked>
+                <span class="leadgen-switch-copy">
+                  <strong>TG Catalog Discovery</strong>
+                  <span class="hint">Автопополнение пула каналов (≤2 join/сут)</span>
                 </span>
                 <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
               </label>
@@ -1872,10 +1899,95 @@
             </div>
           </section>
         </div>
+
+        <div id="lg-pane-funnel" class="lg-tab-pane stack" hidden>
+          <section class="surface-subcard stack" aria-label="Здоровье скрейперов">
+            <div class="subcard-head">
+              <div class="pipeline-title-row">
+                <h3>Здоровье скрейперов</h3>
+                <span id="lg-scraper-last-run-badge" class="badge b-new">Проверка…</span>
+              </div>
+              <button type="button" id="lg-funnel-refresh-btn" class="btn ghost sm">↻ Обновить</button>
+            </div>
+            <div id="lg-scraper-health-grid" class="lg-scraper-health-grid">
+              <span class="hint">Загрузка телеметрии скрейперов…</span>
+            </div>
+            <div id="lg-scraper-recent-errors" class="lg-scraper-recent-errors" hidden></div>
+          </section>
+
+          <section class="surface-subcard stack" aria-label="Воронка конверсии по источникам">
+            <div class="subcard-head">
+              <div>
+                <h3>Воронка конверсии по источникам</h3>
+                <p class="hint">Сырьё последнего прогона → Лиды (24ч / 7д) → В TG-кампаниях → Ответы</p>
+              </div>
+              <span id="lg-source-funnel-count-badge" class="badge b-new">Источников: 0</span>
+            </div>
+            <div class="funnel-table-wrap">
+              <table id="lg-source-funnel-table" class="funnel-table lg-source-funnel-table">
+                <thead>
+                  <tr>
+                    <th>Источник</th>
+                    <th class="num-col">Сырьё</th>
+                    <th class="num-col">Лиды 24ч / 7д</th>
+                    <th class="num-col">В TG</th>
+                    <th class="num-col">Ответы</th>
+                    <th class="num-col">Конверсия</th>
+                    <th>Статус</th>
+                  </tr>
+                </thead>
+                <tbody id="lg-source-funnel-tbody">
+                  <tr>
+                    <td colspan="7" class="hint">Загрузка воронки…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="surface-subcard stack" aria-label="Batch-сбор из TG-чата или канала">
+            <div class="subcard-head">
+              <div>
+                <h3>Batch-сбор из TG-чата / канала</h3>
+                <p class="hint">1–10 публичных @handle или t.me/… ссылок. Режим Web — $0 без MTProto; Hybrid — только через изолированную RO-сессию.</p>
+              </div>
+            </div>
+            <form id="lg-batch-scrape-form" class="stack">
+              <label for="lg-batch-targets">Цели для сбора (1–10 каналов или чатов, по одному на строке или через запятую)
+                <textarea id="lg-batch-targets" rows="2" placeholder="@saasfounders&#10;https://t.me/productcircle_chat"></textarea>
+              </label>
+              <div class="leadgen-form-row-3 lg-batch-controls-row">
+                <label for="lg-batch-mode">Режим
+                  <select id="lg-batch-mode">
+                    <option value="web">Web ($0, без MTProto)</option>
+                    <option value="hybrid">Hybrid (RO-сессия)</option>
+                  </select>
+                </label>
+                <label for="lg-batch-limit">Лимит лидов (5–200)
+                  <input id="lg-batch-limit" type="number" min="5" max="200" value="50">
+                </label>
+                <label class="leadgen-switch-row lg-batch-ingest-toggle">
+                  <input type="checkbox" id="lg-batch-auto-ingest">
+                  <span class="leadgen-switch-copy">
+                    <strong>Автозаливка в CRM</strong>
+                    <span class="hint">С проверкой Rule 5</span>
+                  </span>
+                  <span class="badge b-off leadgen-row-badge">ВЫКЛ</span>
+                </label>
+              </div>
+              <div class="row">
+                <button type="submit" id="lg-batch-start-btn" class="btn primary sm">Запустить Batch-сбор</button>
+              </div>
+            </form>
+            <div id="lg-batch-scrape-status" class="lg-batch-scrape-status" role="status" aria-live="polite">
+              <span class="hint">Укажите каналы или чаты и запустите сбор.</span>
+            </div>
+          </section>
+        </div>
       </div>
     </div>
   </dialog>
-  <script src="/static/app.js?v=20261122acc2"></script>
+  <script src="/static/app.js?v=20261124waveb"></script>
   <script type="module" src="/static/inbox-v2/inbox-v2.js?v=20261122acc2"></script>
   <script>
     if ('serviceWorker' in navigator) {

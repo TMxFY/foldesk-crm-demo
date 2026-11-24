@@ -12859,7 +12859,7 @@ function ensureLeadgenState() {
       auto_push_to_crm: true,
       total_daily_quota: 50,
       enrichment: {
-        daily_budget_cap_usd: 5.0,
+        daily_budget_cap_usd: 10.0,
         per_lead_cap_usd: 0.05,
         super_whale_cap_usd: 0.15,
         super_whale_icp_min: 92,
@@ -12870,7 +12870,7 @@ function ensureLeadgenState() {
       whales: {
         tg_group_admins_enabled: true,
         whop_min_pool_usd: 5000,
-        max_dms_per_company: 2,
+        max_dms_per_company: 3,
         secondary_dm_wait_days: 6,
       },
       b2b: {
@@ -12878,6 +12878,7 @@ function ensureLeadgenState() {
         touch_mode: "direct",
         target_campaign_tg: "Whales EN — TG",
         target_campaign_wa: "Whales EN — WA",
+        reverse_bridge_tg_handle: "",
         campaign_daily_limit: 30,
         sources: {
           tg_groups: true,
@@ -12887,6 +12888,8 @@ function ensureLeadgenState() {
           whop_content_rewards: true,
           tiktok_ads: true,
           tiktok_shop: true,
+          tma_apps: true,
+          tg_catalog_discovery: true,
           app_stores: true,
           ats_hiring: true,
           ph_detailed: true,
@@ -13336,7 +13339,7 @@ function renderLeadgenConfig() {
   setCheck("#leadgen-autopush-toggle", cfg.auto_push_to_crm !== false);
   setVal("#leadgen-total-quota", cfg.total_daily_quota ?? 50);
 
-  setVal("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 5.0);
+  setVal("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 10.0);
   setVal("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.05);
   setVal("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15);
 
@@ -13345,6 +13348,10 @@ function renderLeadgenConfig() {
   setVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Whales EN — TG");
   setVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Whales EN — WA");
   setVal("#leadgen-b2b-daily-limit", b2b.campaign_daily_limit ?? 30);
+  setVal(
+    "#leadgen-b2b-reverse-bridge-tg",
+    b2b.reverse_bridge_tg_handle ?? b2b.reverse_bridge_tg ?? "",
+  );
 
   const b2bSources = b2b.sources || {};
   document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
@@ -13403,6 +13410,9 @@ function renderLeadgenConfig() {
   renderLeadgenGroupChips();
   renderLeadgenHarvest();
   syncLeadgenSwitchBadges();
+  if (typeof renderLeadgenFunnelPane === "function") {
+    renderLeadgenFunnelPane();
+  }
 }
 
 function collectLeadgenFormPayload() {
@@ -13462,7 +13472,7 @@ function collectLeadgenFormPayload() {
     total_daily_quota: getNum("#leadgen-total-quota", 50, 0, 500),
     enrichment: {
       ...enr,
-      daily_budget_cap_usd: getNum("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 5.0, 0, 500),
+      daily_budget_cap_usd: getNum("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 10.0, 0, 500),
       per_lead_cap_usd: getNum("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.05, 0, 10),
       super_whale_cap_usd: getNum("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15, 0, 10),
     },
@@ -13475,6 +13485,10 @@ function collectLeadgenFormPayload() {
       touch_mode: getVal("#leadgen-b2b-touch-mode", b2b.touch_mode || "direct"),
       target_campaign_tg: getVal("#leadgen-b2b-campaign-tg", b2b.target_campaign_tg || "Whales EN — TG"),
       target_campaign_wa: getVal("#leadgen-b2b-campaign-wa", b2b.target_campaign_wa || "Whales EN — WA"),
+      reverse_bridge_tg_handle: getVal(
+        "#leadgen-b2b-reverse-bridge-tg",
+        b2b.reverse_bridge_tg_handle || b2b.reverse_bridge_tg || "",
+      ).replace(/^@+/, ""),
       campaign_daily_limit: getNum("#leadgen-b2b-daily-limit", 30, 0, 500),
       sources,
       tg_groups_old: Array.isArray(b2b.tg_groups_old) ? b2b.tg_groups_old : [],
@@ -14970,6 +14984,9 @@ function renderLeadgenHealthStrip() {
       ]),
     );
   });
+  if (typeof renderLeadgenFunnelPane === "function") {
+    renderLeadgenFunnelPane();
+  }
 }
 
 async function loadLeadgenHealthSummary() {
@@ -14981,12 +14998,14 @@ async function loadLeadgenHealthSummary() {
         state.directXLeads = res.direct_x_leads;
       }
       renderLeadgenHealthStrip();
+      renderLeadgenFunnelPane();
       renderOutreachCampaigns();
       return res;
     }
   } catch (_err) {
     state.leadgenHealth = buildFallbackLeadgenHealthFromCampaigns();
     renderLeadgenHealthStrip();
+    renderLeadgenFunnelPane();
   }
   return state.leadgenHealth;
 }
@@ -16112,7 +16131,7 @@ function ensureManualQueueLoaded(queueType) {
 function renderEnrichmentBudget(data) {
   const b = data && typeof data === "object" ? data : {};
   const spent = Number(b.spent_usd ?? b.total_usd ?? 0) || 0;
-  const cap = Number(b.daily_cap_usd ?? 5.0) || 5.0;
+  const cap = Number(b.daily_cap_usd ?? 10.0) || 10.0;
   const tregBal = b.treg_balance_usd;
   const monidBal = b.monid_balance_usd;
   const paidAllowed = b.paid_allowed !== false;
@@ -16318,6 +16337,368 @@ async function saveCampaignTemplates(button) {
   }
 }
 
+let batchScrapePollTimer = 0;
+
+function _clearBatchScrapePoll() {
+  if (batchScrapePollTimer) {
+    window.clearTimeout(batchScrapePollTimer);
+    batchScrapePollTimer = 0;
+  }
+}
+
+function _formatBytesShort(bytes) {
+  const n = Number(bytes) || 0;
+  if (n <= 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  return `${(n / 1024).toFixed(1)} KB`;
+}
+
+function renderLeadgenFunnelPane() {
+  const data = state.leadgenHealth || {};
+  const sh = data.scraper_health || {};
+  const funnel = Array.isArray(data.source_funnel) ? data.source_funnel : [];
+  const revCount = Number(data.reverse_bridge_ready_count ?? 0) || 0;
+
+  const revBadge = document.querySelector("#lg-reverse-bridge-ready-badge");
+  if (revBadge) {
+    revBadge.textContent = `Готово к Reverse Bridge: ${revCount}`;
+    revBadge.className = `badge ${revCount > 0 ? "b-ok" : "b-new"}`;
+  }
+
+  const lastRunBadge = document.querySelector("#lg-scraper-last-run-badge");
+  if (lastRunBadge) {
+    const ts = sh.last_run_timestamp || (data.last_run && data.last_run.timestamp) || "";
+    const errCount = Array.isArray(sh.recent_errors) ? sh.recent_errors.length : 0;
+    if (errCount > 0) {
+      lastRunBadge.className = "badge b-bad";
+      lastRunBadge.textContent = `Ошибок: ${errCount}${ts ? ` · ${formatShortTime(ts)}` : ""}`;
+    } else if (ts) {
+      lastRunBadge.className = "badge b-ok";
+      lastRunBadge.textContent = `Прогон: ${formatShortTime(ts)}`;
+    } else {
+      lastRunBadge.className = "badge b-new";
+      lastRunBadge.textContent = "Нет данных о прогоне";
+    }
+  }
+
+  const healthGrid = document.querySelector("#lg-scraper-health-grid");
+  if (healthGrid) {
+    const roList = Array.isArray(sh.ro_sessions) ? sh.ro_sessions : [];
+    const roActive = roList.filter((s) => Boolean(s && s.present));
+    const pcList = Array.isArray(sh.phone_checker_sessions) ? sh.phone_checker_sessions : [];
+    const pcActive = pcList.filter((s) => Boolean(s && s.present));
+    const pendingVerify = Number(sh.pending_tg_verify_count ?? 0) || 0;
+    const manualJoin = Number(sh.manual_join_queue_count ?? 0) || 0;
+    const cooldowns = Array.isArray(sh.cooldown_sources) ? sh.cooldown_sources : [];
+
+    const makePill = (label, valText, metaText, toneCls) => el("div", {
+      className: `lg-scraper-pill ${toneCls || ""}`.trim(),
+    }, [
+      el("span", { className: "lg-scraper-pill-label" }, [label]),
+      el("strong", { className: "lg-scraper-pill-val" }, [valText]),
+      el("span", { className: "lg-scraper-pill-meta" }, [metaText]),
+    ]);
+
+    healthGrid.replaceChildren(
+      makePill(
+        "RO-сессии (signals_ro)",
+        roActive.length ? `${roActive.length} активн.` : "Нет сессии",
+        roActive.length
+          ? roActive.map((s) => `${s.name} (${_formatBytesShort(s.size_bytes)})`).join(", ")
+          : "Добавьте signals_ro*.session",
+        roActive.length ? "is-ok" : "is-warn",
+      ),
+      makePill(
+        "Phone Checker сессии",
+        pcActive.length ? `${pcActive.length} активн.` : "Нет сессии",
+        pcActive.length
+          ? pcActive.map((s) => `${s.name} (${_formatBytesShort(s.size_bytes)})`).join(", ")
+          : "phone_checker_*.session не найдены",
+        pcActive.length ? "is-ok" : "is-warn",
+      ),
+      makePill(
+        "Pending TG Verify",
+        String(pendingVerify),
+        pendingVerify > 0 ? "Ожидают повторной проверки" : "Очередь пуста",
+        pendingVerify > 0 ? "is-warn" : "is-ok",
+      ),
+      makePill(
+        "Manual Join Queue",
+        String(manualJoin),
+        manualJoin > 0 ? "Группы с капчей / заявкой" : "Очередь пуста",
+        manualJoin > 0 ? "is-warn" : "is-ok",
+      ),
+      makePill(
+        "Источники на Cooldown",
+        String(cooldowns.length),
+        cooldowns.length ? cooldowns.join(", ") : "Активных пауз нет",
+        cooldowns.length ? "is-warn" : "is-ok",
+      ),
+      makePill(
+        "Reverse Bridge (WA/Email)",
+        String(revCount),
+        "Email / WA для Bridge",
+        revCount > 0 ? "is-ok" : "",
+      ),
+    );
+  }
+
+  const errBox = document.querySelector("#lg-scraper-recent-errors");
+  if (errBox) {
+    const errs = Array.isArray(sh.recent_errors) ? sh.recent_errors : [];
+    errBox.replaceChildren();
+    if (!errs.length) {
+      errBox.hidden = true;
+    } else {
+      errBox.hidden = false;
+      errBox.append(el("strong", {}, [`Последние ошибки этапов (${errs.length})`]));
+      errs.slice(0, 6).forEach((item) => {
+        const line = typeof item === "string"
+          ? item
+          : [item.stage, item.error || item.message, item.at ? formatShortTime(item.at) : ""].filter(Boolean).join(" · ");
+        errBox.append(el("div", { className: "lg-scraper-error-item" }, [line || JSON.stringify(item)]));
+      });
+    }
+  }
+
+  const countBadge = document.querySelector("#lg-source-funnel-count-badge");
+  if (countBadge) {
+    countBadge.textContent = `Источников: ${funnel.length}`;
+  }
+
+  const tbody = document.querySelector("#lg-source-funnel-tbody");
+  if (tbody) {
+    tbody.replaceChildren();
+    if (!funnel.length) {
+      tbody.append(
+        el("tr", {}, [
+          el("td", { colspan: "7", className: "hint" }, [
+            "Нет данных воронки по источникам — выполните прогон лидгена или Batch-сбор.",
+          ]),
+        ]),
+      );
+      return;
+    }
+    funnel.forEach((row) => {
+      const rawCnt = Number(row.raw_last_run ?? 0) || 0;
+      const l24 = Number(row.leads_24h ?? 0) || 0;
+      const l7 = Number(row.leads_7d ?? 0) || 0;
+      const inCamp = Number(row.in_campaign_7d ?? 0) || 0;
+      const replied = Number(row.replied_7d ?? 0) || 0;
+      const conv = Number(row.conversion_pct ?? 0) || 0;
+      const cdUntil = row.cooldown_until ? String(row.cooldown_until) : "";
+      const statusBadge = cdUntil
+        ? el("span", { className: "badge b-wait", title: cdUntil }, [`Cooldown до ${formatShortTime(cdUntil) || cdUntil.slice(0, 16)}`])
+        : (l7 > 0 || rawCnt > 0
+          ? el("span", { className: "badge b-ok" }, ["Активен"])
+          : el("span", { className: "badge b-new" }, ["Ожидает"]));
+      tbody.append(
+        el("tr", {}, [
+          el("td", { className: "source-name-col" }, [String(row.source || "unknown")]),
+          el("td", { className: "num-col" }, [String(rawCnt)]),
+          el("td", { className: "num-col" }, [`${l24} / ${l7}`]),
+          el("td", { className: "num-col" }, [String(inCamp)]),
+          el("td", { className: "num-col" }, [String(replied)]),
+          el("td", { className: "num-col" }, [`${conv.toFixed(1)}%`]),
+          el("td", {}, [statusBadge]),
+        ]),
+      );
+    });
+  }
+}
+
+function renderBatchScrapeStatus(job, errorMessage = "") {
+  const host = document.querySelector("#lg-batch-scrape-status");
+  if (!host) return;
+  host.classList.remove("is-error");
+  host.replaceChildren();
+  if (errorMessage) {
+    host.classList.add("is-error");
+    host.append(el("div", { className: "msg", role: "alert" }, [errorMessage]));
+    return;
+  }
+  if (!job) {
+    host.append(el("span", { className: "hint" }, ["Укажите каналы или чаты и запустите сбор."]));
+    return;
+  }
+
+  const statusVal = String(job.status || "queued");
+  const badgeCls = statusVal === "completed"
+    ? "b-ok"
+    : (statusVal === "failed" ? "b-bad" : (statusVal === "running" ? "b-talk" : "b-wait"));
+  const statusLabel = statusVal === "completed"
+    ? "Завершено"
+    : (statusVal === "failed" ? "Ошибка" : (statusVal === "running" ? "Выполняется…" : "В очереди…"));
+
+  const targetsTxt = Array.isArray(job.targets) ? job.targets.map((t) => `@${t}`).join(", ") : "";
+  const rule5 = job.rule5_preview && typeof job.rule5_preview === "object" ? job.rule5_preview : null;
+  const leads = Array.isArray(job.leads) ? job.leads : [];
+  const leadsFound = Number(job.leads_found ?? leads.length ?? 0) || 0;
+  const ingestedCount = Number(job.ingested_count ?? 0) || 0;
+
+  host.append(
+    el("div", { className: "lg-batch-job-head" }, [
+      el("div", { className: "row" }, [
+        el("strong", {}, [`Задача #${job.job_id || job.id || ""}`]),
+        el("span", { className: `badge ${badgeCls}` }, [statusLabel]),
+        el("span", { className: "badge b-new" }, [String(job.mode || "web").toUpperCase()]),
+      ]),
+      el("span", { className: "hint" }, [targetsTxt]),
+    ]),
+  );
+
+  const metricsParts = [
+    `Лидов найдено: ${leadsFound}`,
+    `Залито в CRM: ${ingestedCount}`,
+  ];
+  if (job.ro_session) metricsParts.push(`RO-сессия: ${job.ro_session}`);
+  if (rule5) {
+    const forb = Number(rule5.forbidden_pattern_count ?? 0) || 0;
+    metricsParts.push(`Rule 5 запреты: ${forb}`);
+  }
+  host.append(el("div", { className: "lg-batch-job-metrics" }, metricsParts.map((m) => el("span", { className: "badge b-new" }, [m]))));
+
+  if (job.error) {
+    host.classList.add("is-error");
+    host.append(el("div", { className: "msg", role: "alert" }, [String(job.error)]));
+  }
+
+  if (leads.length) {
+    const listEl = el("div", { className: "lg-batch-leads-list" });
+    leads.slice(0, 25).forEach((ld) => {
+      const uname = String(ld.username || "").replace(/^@/, "");
+      const tgUrl = uname ? safeHref(`https://t.me/${uname}`) : "";
+      const leftNodes = [
+        el("strong", {}, [ld.name || uname || "Контакт"]),
+        el("span", { className: "hint" }, [" · "]),
+        tgUrl
+          ? el("a", { href: tgUrl, target: "_blank", rel: "noopener noreferrer" }, [`@${uname}`])
+          : el("span", { className: "hint" }, [uname ? `@${uname}` : "—"]),
+      ];
+      if (ld.company) {
+        leftNodes.push(el("span", { className: "hint" }, [` · ${ld.company}`]));
+      }
+      const extUrl = safeHref(ld.url || ld.website || "");
+      listEl.append(
+        el("div", { className: "lg-batch-lead-row" }, [
+          el("span", {}, leftNodes),
+          extUrl
+            ? el("a", { href: extUrl, target: "_blank", rel: "noopener noreferrer" }, ["Сайт ↗"])
+            : el("span", { className: "hint" }, [ld.source_channel ? `@${ld.source_channel}` : ""]),
+        ]),
+      );
+    });
+    host.append(listEl);
+  } else if (statusVal === "completed") {
+    host.append(el("span", { className: "hint" }, ["Персональные лиды в указанных каналах не найдены."]));
+  }
+}
+
+async function loadBatchScrapeJobs() {
+  try {
+    const res = await api("/api/leadgen/batch-scrape");
+    const jobs = Array.isArray(res && res.jobs) ? res.jobs : [];
+    state.batchScrapeJobs = jobs;
+    if (jobs.length) {
+      renderBatchScrapeStatus(jobs[0]);
+      if (jobs[0].status === "queued" || jobs[0].status === "running") {
+        pollBatchScrapeJob(jobs[0].job_id);
+      }
+    } else {
+      renderBatchScrapeStatus(null);
+    }
+    return jobs;
+  } catch (_err) {
+    return [];
+  }
+}
+
+function pollBatchScrapeJob(jobId) {
+  _clearBatchScrapePoll();
+  if (!jobId) return;
+  batchScrapePollTimer = window.setTimeout(async () => {
+    const modal = document.querySelector("#leadgen-settings-modal");
+    if (!modal || (!modal.open && modal.hidden)) return;
+    try {
+      const res = await api(`/api/leadgen/batch-scrape/${encodeURIComponent(String(jobId))}`);
+      const job = (res && res.job) ? res.job : res;
+      if (job) {
+        renderBatchScrapeStatus(job);
+        if (job.status === "queued" || job.status === "running") {
+          pollBatchScrapeJob(jobId);
+          return;
+        }
+        if (job.status === "completed") {
+          await loadLeadgenHealthSummary().catch(() => {});
+          if (job.auto_ingest && Number(job.ingested_count || 0) > 0) {
+            await loadLeads(state.leadQuery || "", state.selectedLeadId).catch(() => {});
+            await loadCampaigns().catch(() => {});
+          }
+          toast(`Batch-сбор завершён: найдено ${Number(job.leads_found || 0)} лидов`, "ok");
+        } else if (job.status === "failed") {
+          toast(job.error || "Ошибка Batch-сбора", "error");
+        }
+      }
+    } catch (err) {
+      renderBatchScrapeStatus(null, err.message || "Ошибка опроса статуса Batch-сбора");
+    }
+  }, 600);
+}
+
+async function submitBatchScrapeForm(event) {
+  if (event) event.preventDefault();
+  const targetsEl = document.querySelector("#lg-batch-targets");
+  const modeEl = document.querySelector("#lg-batch-mode");
+  const limitEl = document.querySelector("#lg-batch-limit");
+  const autoIngestEl = document.querySelector("#lg-batch-auto-ingest");
+  const startBtn = document.querySelector("#lg-batch-start-btn");
+
+  const targets = _splitListText(targetsEl ? targetsEl.value : "");
+  const mode = modeEl ? String(modeEl.value || "web") : "web";
+  const rawLimit = Number(limitEl ? limitEl.value : 50);
+  const limit = Number.isFinite(rawLimit) ? Math.max(5, Math.min(200, Math.round(rawLimit))) : 50;
+  const autoIngest = Boolean(autoIngestEl && autoIngestEl.checked);
+
+  if (!targets.length) {
+    renderBatchScrapeStatus(null, "Укажите 1–10 публичных Telegram-каналов или чатов");
+    return;
+  }
+  if (startBtn) startBtn.disabled = true;
+  _clearBatchScrapePoll();
+  renderBatchScrapeStatus({
+    job_id: "…",
+    status: "queued",
+    mode,
+    targets: targets.map((t) => t.replace(/^@+/, "")),
+    leads_found: 0,
+    ingested_count: 0,
+    leads: [],
+  });
+  try {
+    const res = await api("/api/leadgen/batch-scrape", {
+      method: "POST",
+      body: {
+        targets,
+        mode,
+        limit,
+        auto_ingest: autoIngest,
+      },
+    });
+    const job = (res && res.job) ? res.job : res;
+    renderBatchScrapeStatus(job);
+    if (job && (job.status === "queued" || job.status === "running")) {
+      pollBatchScrapeJob(job.job_id || res.job_id);
+    } else if (job && job.status === "completed") {
+      await loadLeadgenHealthSummary().catch(() => {});
+    }
+  } catch (error) {
+    renderBatchScrapeStatus(null, error.message || "Не удалось запустить Batch-сбор");
+    toast(error.message || "Не удалось запустить Batch-сбор", "error");
+  } finally {
+    if (startBtn) startBtn.disabled = false;
+  }
+}
+
 function switchLeadgenModalTab(tabKey = "budget") {
   document.querySelectorAll("[data-lg-tab]").forEach((btn) => {
     const isAct = btn.getAttribute("data-lg-tab") === tabKey;
@@ -16328,13 +16709,20 @@ function switchLeadgenModalTab(tabKey = "budget") {
     vacancies: document.querySelector("#lg-pane-vacancies"),
     ru_experts: document.querySelector("#lg-pane-ru-experts"),
     templates: document.querySelector("#lg-pane-templates"),
+    funnel: document.querySelector("#lg-pane-funnel"),
   };
   Object.entries(panes).forEach(([k, pane]) => {
     if (pane) pane.hidden = k !== tabKey;
   });
+  if (tabKey === "funnel") {
+    renderLeadgenFunnelPane();
+    loadLeadgenHealthSummary().catch(() => {});
+    loadBatchScrapeJobs().catch(() => {});
+  }
 }
 
 function closeLeadgenSettingsModal() {
+  _clearBatchScrapePoll();
   const modal = document.querySelector("#leadgen-settings-modal");
   if (!modal) return;
   if (typeof modal.close === "function" && modal.open) {
@@ -16358,9 +16746,11 @@ async function openLeadgenSettingsModal(defaultTab = "budget") {
   await Promise.all([
     loadLeadgenConfig(),
     loadEnrichmentBudget(),
+    loadLeadgenHealthSummary().catch(() => {}),
     (!state.campaigns || !state.campaigns.length) ? loadCampaigns().catch(() => {}) : Promise.resolve(),
   ]);
   populateCampaignTemplatesSelect();
+  renderLeadgenFunnelPane();
 }
 
 function bindOutreachV2Events() {
@@ -16417,6 +16807,16 @@ function bindOutreachV2Events() {
   document.querySelector("#open-leadgen-settings-btn")?.addEventListener("click", () => {
     openLeadgenSettingsModal("budget");
   });
+
+  document.querySelector("#open-leadgen-funnel-btn")?.addEventListener("click", () => {
+    openLeadgenSettingsModal("funnel");
+  });
+
+  document.querySelector("#lg-funnel-refresh-btn")?.addEventListener("click", () => {
+    Promise.all([loadLeadgenHealthSummary(), loadBatchScrapeJobs()]).then(() => toast("Воронка и статус обновлены", "ok"));
+  });
+
+  document.querySelector("#lg-batch-scrape-form")?.addEventListener("submit", submitBatchScrapeForm);
 
   document.querySelector("#leadgen-settings-close-btn")?.addEventListener("click", closeLeadgenSettingsModal);
   document.querySelector("#leadgen-budget-refresh-btn")?.addEventListener("click", () => {
