@@ -552,6 +552,24 @@ def _domain_matches(host: str, target_domain: str) -> bool:
     return host == target_domain or host.endswith("." + target_domain)
 
 
+def _safe_urlparse(url: str):
+    """Parse URL safely, returning None on malformed netloc/IPv6 ValueError."""
+    try:
+        return urlparse(url)
+    except ValueError:
+        return None
+
+
+def _safe_hostname(parsed) -> str:
+    """Return normalized lowercase hostname without www., or empty string on ValueError."""
+    if parsed is None:
+        return ""
+    try:
+        return (parsed.hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+
+
 def _normalize_target_domain(domain: str) -> str:
     raw = str(domain or "").strip().lower().removeprefix("www.")
     if not raw:
@@ -560,8 +578,8 @@ def _normalize_target_domain(domain: str) -> str:
         dom = domain_of(raw)
         if dom:
             return dom
-        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
-        return (parsed.hostname or "").lower().removeprefix("www.")
+        parsed = _safe_urlparse(raw if "://" in raw else f"https://{raw}")
+        return _safe_hostname(parsed)
     return raw
 
 
@@ -663,8 +681,8 @@ def _is_bio_hub_url(url: str) -> bool:
     raw = str(url or "").strip()
     if not raw:
         return False
-    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
-    host = (parsed.hostname or "").lower().removeprefix("www.")
+    parsed = _safe_urlparse(raw if "://" in raw else f"https://{raw}")
+    host = _safe_hostname(parsed)
     if not host:
         return False
     return any(host == hub or host.endswith("." + hub) for hub in BIO_HUB_HOSTS)
@@ -678,16 +696,20 @@ def _normalize_http_url(url: str) -> str:
         if ":" in raw.split("/", 1)[0]:
             return ""
         raw = "https://" + raw
-    parsed = urlparse(raw)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    parsed = _safe_urlparse(raw)
+    if parsed is None or parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if not _safe_hostname(parsed):
         return ""
     clean = parsed._replace(fragment="").geturl()
     return clean
 
 
 def _url_dedup_key(url: str) -> str:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower().removeprefix("www.")
+    parsed = _safe_urlparse(url)
+    if parsed is None:
+        return ""
+    host = _safe_hostname(parsed)
     path = (parsed.path or "").rstrip("/")
     query = f"?{parsed.query}" if parsed.query else ""
     return f"{host}{path}{query}"
@@ -837,7 +859,11 @@ def _discover_links_from_html(
         anchor_text = re.sub(r"<[^>]+>", " ", m.group(4) or "").strip().lower()
         if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
             continue
-        abs_url = _normalize_http_url(urljoin(base_url, raw_href))
+        try:
+            joined = urljoin(base_url, raw_href)
+        except ValueError:
+            continue
+        abs_url = _normalize_http_url(joined)
         if not abs_url:
             continue
 
@@ -850,9 +876,9 @@ def _discover_links_from_html(
 
         if not target_dom:
             continue
-        parsed = urlparse(abs_url)
-        host = (parsed.hostname or "").lower().removeprefix("www.")
-        if not _domain_matches(host, target_dom):
+        parsed = _safe_urlparse(abs_url)
+        host = _safe_hostname(parsed)
+        if parsed is None or not host or not _domain_matches(host, target_dom):
             continue
         path_low = (parsed.path or "").lower()
         if path_low.endswith(_IMAGE_OR_ASSET_EXTS):
@@ -890,8 +916,10 @@ def _is_external_contact_form_url(url: str) -> bool:
     norm = _normalize_http_url(url)
     if not norm:
         return False
-    parsed = urlparse(norm)
-    host = (parsed.hostname or "").lower().removeprefix("www.")
+    parsed = _safe_urlparse(norm)
+    host = _safe_hostname(parsed)
+    if parsed is None:
+        return False
     path_low = (parsed.path or "").lower()
     if not host or path_low.endswith(_IMAGE_OR_ASSET_EXTS) or "embed.js" in path_low:
         return False
@@ -932,7 +960,10 @@ def _looks_like_soft_404(html_text: str) -> bool:
 
 
 def _path_has_any_token(url: str, tokens: tuple[str, ...]) -> bool:
-    path_low = (urlparse(url).path or "").lower()
+    parsed = _safe_urlparse(url)
+    if parsed is None:
+        return False
+    path_low = (parsed.path or "").lower()
     return any(tok in path_low for tok in tokens)
 
 
@@ -1050,8 +1081,8 @@ def crawl_domain_and_bio_links(
             _enqueue_bio(bu)
 
         internal_queue: list[str] = list(discovered_internal[:MAX_DISCOVERED_INTERNAL])
-        if len(internal_queue) < MAX_DISCOVERED_INTERNAL:
-            parsed_root = urlparse(norm_root)
+        parsed_root = _safe_urlparse(norm_root)
+        if len(internal_queue) < MAX_DISCOVERED_INTERNAL and parsed_root is not None and parsed_root.scheme and parsed_root.netloc:
             origin = f"{parsed_root.scheme}://{parsed_root.netloc}"
             for suffix in _PROBE_PATHS:
                 if internal_count + len(internal_queue) >= MAX_INTERNAL_PAGES:

@@ -232,8 +232,11 @@ def _extract_x_handle(row: dict[str, Any]) -> str:
             if _X_HANDLE_RE.fullmatch(h) and h.casefold() not in _X_DENY:
                 return h
             continue
-        parsed = urlparse(val if "://" in val else f"https://{val}")
-        host = (parsed.hostname or "").lower().removeprefix("www.")
+        try:
+            parsed = urlparse(val if "://" in val else f"https://{val}")
+            host = (parsed.hostname or "").lower().removeprefix("www.")
+        except ValueError:
+            continue
         if host in {"x.com", "twitter.com", "mobile.twitter.com"}:
             parts = [p for p in (parsed.path or "").split("/") if p]
             if parts and _X_HANDLE_RE.fullmatch(parts[0]) and parts[0].casefold() not in _X_DENY:

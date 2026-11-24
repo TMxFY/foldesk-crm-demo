@@ -176,6 +176,8 @@ def backfill_direct_x_leads(
         "rule5_previews": {},
         "rule5_quarantined": {},
         "sample_resolved": [],
+        "stopped_reason": "",
+        "errors": [],
     }
     if not direct_x_path.is_file() or direct_x_path.stat().st_size == 0:
         return stats
@@ -239,97 +241,117 @@ def backfill_direct_x_leads(
     removed_indices: set[int] = set()
     stage_errors: list[dict[str, Any]] = []
 
-    for idx in eligible_indices:
-        stats["attempted"] += 1
-        row = dict(all_rows[idx])
-
-        # 1. Multi-DM contact waterfall (budget-guarded)
-        cw_out = _repl._call_with_supported_kwargs(
-            enrich_lead_contacts,
-            dict(row),
-            allow_paid_tier2=paid_allowed,
-            budget_usd=None,
-            http_get_fn=http_get_fn,
-            treg_fn=eff_treg_fn,
-            monid_fn=eff_monid_fn,
-            dm_finder_fn=dm_finder_fn,
-            dm_multi_finder_fn=dm_multi_finder_fn,
-            tg_bridge_fn=tg_bridge_fn,
-            budget_guard_fn=_guard_fn,
-            cost_record_fn=_cost_fn,
-            cfg=eff_cfg,
-        )
-        candidate = dict(cw_out) if isinstance(cw_out, Mapping) else dict(row)
-
-        # 2. Direct TG identity bridge fallback if still missing personal TG
-        if not _has_personal_tg_handle(candidate, _repl):
-            if tg_bridge_fn is not None:
-                bridged_b = _repl._call_with_supported_kwargs(
-                    tg_bridge_fn,
-                    dict(candidate),
-                    allow_paid=paid_allowed,
-                    budget_guard_fn=_guard_fn,
-                    cost_record_fn=_cost_fn,
-                    treg_fn=eff_treg_fn,
-                    monid_fn=eff_monid_fn,
-                )
-            else:
-                bridged_b = bridge_lead_to_telegram(
-                    dict(candidate),
-                    allow_paid=paid_allowed,
-                    budget_guard_fn=_guard_fn,
-                    cost_record_fn=_cost_fn,
-                    treg_fn=eff_treg_fn,
-                    monid_fn=eff_monid_fn,
-                )
-            if isinstance(bridged_b, Mapping):
-                candidate = _merge_candidate_fields(candidate, bridged_b)
-
-        # 3. $0 TG group/channel admin extraction if still missing TG
-        if not _has_personal_tg_handle(candidate, _repl):
-            adm_rows, adm_stats = _repl.enrich_whales_with_tg_group_admins(
-                [candidate],
-                client=tg_client,
-                scraper_session=isolated_session,
-                admin_extractor_fn=tg_admin_extractor_fn,
-            )
-            stats["tg_group_admins_promoted"] += int(adm_stats.get("leads_promoted") or 0)
-            if adm_rows:
-                candidate = dict(adm_rows[0])
-
-        # Live PeerType verification when resolver/client/isolated session is available
-        cand_u = _extract_tg_handle(candidate)
-        if cand_u and (
-            tg_client is not None
-            or tg_entity_resolver_fn is not None
-            or (isolated_session is not None and isolated_session.is_file())
-        ):
-            verified_rows, _v_stats = _repl.verify_personal_tg_handles_live(
-                [candidate],
-                client=tg_client,
-                scraper_session=isolated_session,
-                entity_resolver_fn=tg_entity_resolver_fn,
-            )
-            if verified_rows:
-                candidate = dict(verified_rows[0])
-
-        # 4. $0 Phone messenger resolution (WA + dedicated TG checker) when still missing TG
-        if not _has_personal_tg_handle(candidate, _repl) and str(
-            candidate.get("phone") or candidate.get("mobile_phone") or candidate.get("whatsapp") or ""
-        ).strip():
-            routed_rows, phone_stats = _repl.resolve_and_route_phone_leads(
+    for loop_i, idx in enumerate(eligible_indices):
+        if loop_i > 0 and loop_i % 5 == 0 and budget_state is None and paid_allowed:
+            eff_budget = check_balances_and_alert(
                 conn,
-                [candidate],
                 cfg=eff_cfg,
-                wa_gateway=wa_gateway,
-                tg_checker_client=tg_checker_client,
-                tg_checker_clients=tg_checker_clients,
-                scraper_sessions_dir=scraper_sessions_dir,
+                treg_balance_fn=treg_balance_fn,
+                monid_balance_fn=monid_balance_fn,
+                notify_fn=notify_fn,
+                allow_unavailable=False,
             )
-            stats["phones_checked"] += int(phone_stats.get("phones_checked") or 0)
-            if routed_rows:
-                candidate = dict(routed_rows[0])
+            if not eff_budget.paid_allowed:
+                paid_allowed = False
+                stats["paid_allowed"] = False
+                stats["stopped_reason"] = str(eff_budget.stop_reason or "budget_stopped")
+                break
+            _guard_fn, _cost_fn = _repl._make_budget_callbacks(conn, eff_cfg, eff_budget)
 
+        row = dict(all_rows[idx])
+        try:
+            # 1. Multi-DM contact waterfall (budget-guarded)
+            cw_out = _repl._call_with_supported_kwargs(
+                enrich_lead_contacts,
+                dict(row),
+                allow_paid_tier2=paid_allowed,
+                budget_usd=None,
+                http_get_fn=http_get_fn,
+                treg_fn=eff_treg_fn,
+                monid_fn=eff_monid_fn,
+                dm_finder_fn=dm_finder_fn,
+                dm_multi_finder_fn=dm_multi_finder_fn,
+                tg_bridge_fn=tg_bridge_fn,
+                budget_guard_fn=_guard_fn,
+                cost_record_fn=_cost_fn,
+                cfg=eff_cfg,
+            )
+            candidate = dict(cw_out) if isinstance(cw_out, Mapping) else dict(row)
+
+            # 2. Direct TG identity bridge fallback if still missing personal TG
+            if not _has_personal_tg_handle(candidate, _repl):
+                if tg_bridge_fn is not None:
+                    bridged_b = _repl._call_with_supported_kwargs(
+                        tg_bridge_fn,
+                        dict(candidate),
+                        allow_paid=paid_allowed,
+                        budget_guard_fn=_guard_fn,
+                        cost_record_fn=_cost_fn,
+                        treg_fn=eff_treg_fn,
+                        monid_fn=eff_monid_fn,
+                    )
+                else:
+                    bridged_b = bridge_lead_to_telegram(
+                        dict(candidate),
+                        allow_paid=paid_allowed,
+                        budget_guard_fn=_guard_fn,
+                        cost_record_fn=_cost_fn,
+                        treg_fn=eff_treg_fn,
+                        monid_fn=eff_monid_fn,
+                    )
+                if isinstance(bridged_b, Mapping):
+                    candidate = _merge_candidate_fields(candidate, bridged_b)
+
+            # 3. $0 TG group/channel admin extraction if still missing TG
+            if not _has_personal_tg_handle(candidate, _repl):
+                adm_rows, adm_stats = _repl.enrich_whales_with_tg_group_admins(
+                    [candidate],
+                    client=tg_client,
+                    scraper_session=isolated_session,
+                    admin_extractor_fn=tg_admin_extractor_fn,
+                )
+                stats["tg_group_admins_promoted"] += int(adm_stats.get("leads_promoted") or 0)
+                if adm_rows:
+                    candidate = dict(adm_rows[0])
+
+            # Live PeerType verification when resolver/client/isolated session is available
+            cand_u = _extract_tg_handle(candidate)
+            if cand_u and (
+                tg_client is not None
+                or tg_entity_resolver_fn is not None
+                or (isolated_session is not None and isolated_session.is_file())
+            ):
+                verified_rows, _v_stats = _repl.verify_personal_tg_handles_live(
+                    [candidate],
+                    client=tg_client,
+                    scraper_session=isolated_session,
+                    entity_resolver_fn=tg_entity_resolver_fn,
+                )
+                if verified_rows:
+                    candidate = dict(verified_rows[0])
+
+            # 4. $0 Phone messenger resolution (WA + dedicated TG checker) when still missing TG
+            if not _has_personal_tg_handle(candidate, _repl) and str(
+                candidate.get("phone") or candidate.get("mobile_phone") or candidate.get("whatsapp") or ""
+            ).strip():
+                routed_rows, phone_stats = _repl.resolve_and_route_phone_leads(
+                    conn,
+                    [candidate],
+                    cfg=eff_cfg,
+                    wa_gateway=wa_gateway,
+                    tg_checker_client=tg_checker_client,
+                    tg_checker_clients=tg_checker_clients,
+                    scraper_sessions_dir=scraper_sessions_dir,
+                )
+                stats["phones_checked"] += int(phone_stats.get("phones_checked") or 0)
+                if routed_rows:
+                    candidate = dict(routed_rows[0])
+        except ValueError as exc:
+            logger.warning("Skipping malformed backfill row %s (id=%s): %s", idx, row.get("id"), exc)
+            stats["errors"].append({"index": idx, "id": row.get("id"), "error": f"{type(exc).__name__}: {exc}"})
+            continue
+
+        stats["attempted"] += 1
         # Stamp v2 checkpoint
         candidate["tg_bridge_v2_attempted_at"] = utc_now()
         all_rows[idx] = candidate

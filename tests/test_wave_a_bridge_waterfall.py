@@ -821,3 +821,91 @@ def test_backfill_direct_x_writes_per_row_checkpoint_before_crash(
     assert not persisted["row_crash"].get("tg_bridge_v2_attempted_at")
     conn.close()
 
+
+def test_contact_waterfall_and_bridge_malformed_ipv6_urls_never_raise() -> None:
+    assert contact_waterfall._normalize_http_url("https://[invalid") == ""
+    assert contact_waterfall._is_bio_hub_url("https://[bad") is False
+    assert contact_waterfall._url_dedup_key("https://[bad") == ""
+    assert contact_waterfall._is_external_contact_form_url("https://[bad") is False
+    assert contact_waterfall._path_has_any_token("https://[bad", ("contact",)) is False
+
+    bad_html = (
+        '<html><body>'
+        '<a href="https://[broken]">Bad Link</a>'
+        '<a href="https://tally.so/r/[weird">Weird Form</a>'
+        '<a href="/contact">Contact Us</a>'
+        '<a href="https://linktr.ee/[bad">Bio Path Bracket</a>'
+        '<a href="https://[linktr.ee/broken">Bad Netloc Bio</a>'
+        '</body></html>'
+    )
+    internal, bio_hubs = contact_waterfall._discover_links_from_html(
+        bad_html, "https://acme-brand.io", "acme-brand.io"
+    )
+    assert "https://acme-brand.io/contact" in internal
+    assert bio_hubs == ["https://linktr.ee/[bad"]
+
+    def fake_get(url: str, **_kw: Any) -> SimpleNamespace:
+        if url.rstrip("/") == "https://acme-brand.io":
+            return SimpleNamespace(status_code=200, text=bad_html)
+        return SimpleNamespace(status_code=200, text="<html><body>contact@acme-brand.io</body></html>")
+
+    crawled = contact_waterfall.crawl_domain_and_bio_links("https://acme-brand.io", http_get_fn=fake_get)
+    assert isinstance(crawled, dict)
+    assert tg_identity_bridge._extract_x_handle({"x_url": "https://[bad"}) == ""
+
+
+def test_backfill_direct_x_stops_mid_batch_on_low_balance_without_stamping_remaining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, state_dir, _db_path = _setup_backfill_env(tmp_path, monkeypatch)
+    dx_path = state_dir / "direct_x_leads.jsonl"
+    dx_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "id": f"row_{i}",
+                    "company": f"Brand{i}",
+                    "project_url": f"https://brand{i}.io",
+                    "icp_score": 82,
+                }
+            )
+            for i in range(7)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bal_calls = {"n": 0}
+
+    def fake_treg_bal() -> float:
+        bal_calls["n"] += 1
+        return 2.00 if bal_calls["n"] == 1 else 0.20
+
+    res = backfill_direct_x.backfill_direct_x_leads(
+        conn,
+        state_dir=state_dir,
+        retry_v2=True,
+        dry_run=False,
+        budget_state=None,
+        treg_balance_fn=fake_treg_bal,
+        monid_balance_fn=lambda: 1.50,
+        http_get_fn=lambda _u, **_kw: SimpleNamespace(status_code=200, text="<html></html>"),
+        treg_fn=lambda _ep, **_kw: {},
+        tg_bridge_fn=lambda r, **_kw: r,
+    )
+
+    assert res["attempted"] == 5
+    assert res["paid_allowed"] is False
+    assert "treg=$0.20" in res["stopped_reason"]
+    persisted = {
+        r["id"]: r
+        for ln in dx_path.read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+        for r in [json.loads(ln)]
+    }
+    for i in range(5):
+        assert str(persisted[f"row_{i}"].get("tg_bridge_v2_attempted_at") or "").strip() != ""
+    for i in (5, 6):
+        assert not str(persisted[f"row_{i}"].get("tg_bridge_v2_attempted_at") or "").strip()
+    conn.close()
+
