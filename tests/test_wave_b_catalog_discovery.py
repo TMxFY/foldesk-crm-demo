@@ -765,3 +765,9 @@ def test_skeptic_group_a_ro_isolation_concurrent_cap_and_nonempty_frontier(tmp_p
     )
     assert "fresh_auto_seed" in visited_ne
 
+    # 5) Live Canary junk-channel regression assertions
+    for noisy in ("YourJuicyBets", "mines_ton", "slimeminigames", "GoblinMine", "TONDOGECHAT", "nobbygameru", "RocketCaseNews"):
+        assert tg_catalog_discovery._is_junk_channel(noisy) is True, f"Expected junk handle rejection: {noisy}"
+    for safe in tg_catalog_discovery.CURATED_CHANNEL_POOL:
+        assert tg_catalog_discovery._is_junk_channel(safe) is False, f"Curated channel falsely flagged as junk: {safe}"
+

@@ -613,3 +613,7 @@ def test_cli_help_and_jsonl_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert row["website"] == "https://smokeapp.io"
     assert row["lead_source"] == "tma_apps"
     assert seen_json.is_file()
+
+    # Telegram system/directory handles caught in live canary must never pass personal-handle filter
+    for sys_handle in ("business", "sensor", "wallet", "stars", "premium", "fragment", "findmini"):
+        assert tma_apps._is_real_personal_tg_handle(sys_handle) is False

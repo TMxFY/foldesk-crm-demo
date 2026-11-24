@@ -238,15 +238,34 @@ _NOISE_HANDLES = frozenset(
         "vote",
         "telegram",
         "tgstat",
+        "business",
+        "wallet",
+        "stars",
+        "premium",
+        "fragment",
+        "durov",
+        "apps",
+        "miniapps",
+        "tapps",
+        "findmini",
+        "sensor",
+        "contest",
+        "tips",
+        "faq",
+        "privacy",
     }
 )
 _JUNK_HANDLE_RE = re.compile(
     r"(?:^|_)(?:"
-    r"fragment|fragment_monitor|tonviewer|getgems|casino|slots|betting|"
+    r"fragment|fragment_monitor|tonviewer|getgems|casino|slots|betting|bets|"
     r"1win|1xbet|mostbet|pinup|pin_up|giveaway|airdrop|rozygrysh|"
     r"porn|porno|xxx|nsfw|escort|hentai|sex|sliv|onlyfans_leak|"
     r"scam|drainer|carding|obnal|darknet|hamster_kombat|tap_to_earn|tapalk"
-    r")(?:$|_)",
+    r")(?:$|_)|"
+    r"(?:casino|slots|roulette|gambl|betting|juicybets|bets$|minigame|goblinmine|"
+    r"mines_ton|ton_?mines|tondoge|dogechat|dogecoin|taptoearn|tap2earn|clicker|"
+    r"giveaway|airdrop|farmcoin|cryptofarm|hash2cash|footballlot|luckyknight|"
+    r"rocketcase|mooncards|tonjiggle|hamster|gameru$)",
     re.IGNORECASE,
 )
 _JUNK_TEXT_RE = re.compile(
@@ -256,11 +275,13 @@ _JUNK_TEXT_RE = re.compile(
     r"аукцион\w*\s+(?:юзернейм\w*|никнейм\w*|ников|номеров)|выкуп\w*\s+юзернейм\w*|"
     r"купить\s+юзернейм\w*|номер\w*\s+\+888|"
     r"casino|казино|slots|слоты|букмекер\w*|betting|sportsbook|ставки\s+на\s+спорт|"
+    r"gambl\w*|гембл\w*|mini[\s\-]*game\w*|мини[- ]?игр\w*|play[\s\-]*(?:to|2)[\s\-]*earn|"
     r"1win|1xbet|mostbet|pin-?up|фриспин\w*|freespin\w*|лудоман\w*|онлайн[- ]?казино|рулетк\w*|"
     r"porn|porno|порно|xxx|nsfw|escort|эскорт|hentai|хентай|интим\s+чат|секс[- ]?чат|"
     r"сливы?\s+(?:девушек|18\+|онлифанс)|onlyfans\s+leak|"
     r"giveaway\w*|розыгрыш\w*|гивэве\w*|airdrop\w*|аирдроп\w*|раздача\s+призов|"
-    r"tap[- ]to[- ]earn|тапалк\w*|carding|кардинг|obnal|обнал|wallet\s+drainer|крипто\s*скам"
+    r"tap[- ]?(?:to|2)[- ]?earn|тапалк\w*|clicker\w*|кликер\w*|meme[\s\-]*coin\w*|"
+    r"фарм\w*\s+монет|крипто[- ]?игр\w*|carding|кардинг|obnal|обнал|wallet\s+drainer|крипто\s*скам"
     r")\b)",
     re.IGNORECASE,
 )
@@ -724,7 +745,15 @@ def discover_and_replenish_catalogs(
     seen_candidates: set[str] = set()
     deferred_known: list[str] = []
 
-    for raw in (*tma_handles, *paid_handles, *graph_handles, *rotated_curated):
+    candidate_buckets = (
+        *tma_handles[:15],
+        *paid_handles[:15],
+        *rotated_curated,
+        *tma_handles[15:],
+        *paid_handles[15:],
+        *graph_handles,
+    )
+    for raw in candidate_buckets:
         clean = _normalize_tg_handle(raw)
         if not clean or _is_bot_handle(clean):
             continue
