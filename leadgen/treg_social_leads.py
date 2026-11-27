@@ -111,6 +111,13 @@ _CLASSIC_CORE = tuple(
         '("make money" OR "side income") (course OR ebook OR guide) (tiktok OR founder) -portfolio -"open to work"',
     )
 )
+_ARABIC_GCC_BUYER_QUERIES = (
+    '("صانع محتوى" OR "صناع محتوى" OR "مطلوب UGC") (براند OR متجر OR عطور OR عيادة) lang:ar',
+    '("تيك توك" OR "سناب شات") ("نبحث عن" OR "مطلوب") (اعلانات OR محتوى OR تسويق) lang:ar',
+    '("عيادة تجميل" OR "عيادة أسنان" OR "عيادات") (الرياض OR دبي OR جدة) (تيك توك OR ريلز OR محتوى) lang:ar',
+    '("متجر سلة" OR "براند سعودي" OR "عطور") (تسويق OR اعلانات OR مبيعات) lang:ar',
+    '("UGC" OR "short form" OR "TikTok") (Dubai OR Riyadh OR Saudi OR GCC) (brand OR clinic OR app) -portfolio -"open to work" lang:en',
+)
 
 _SOCIAL_NOISE_RE = re.compile(
     r"(?:"
@@ -190,13 +197,17 @@ def rotation_for(day: date) -> tuple[str, str]:
     return REDDIT_ROTATION[day.toordinal() % len(REDDIT_ROTATION)]
 
 
-def buyer_queries(day: date) -> list[str]:
+def buyer_queries(day: date, *, market_profile: str = "global") -> list[str]:
     """Every buyer query for this night, with a 7-day window. Not a rotation."""
     since = (day - timedelta(days=7)).isoformat()
-    return [
+    base = [
         f"{query} lang:en since:{since}"
         for query in (*_BUYER_CORE, *_GROW_CORE, *_LARGE_CORE, *_CLASSIC_CORE)
     ]
+    if str(market_profile or "global").strip().lower() == "gcc_december":
+        gcc = [f"{query} since:{since}" for query in _ARABIC_GCC_BUYER_QUERIES]
+        return [*gcc, *base]
+    return base
 
 
 def off_niche(text: str) -> bool:
@@ -737,7 +748,8 @@ def format_social_log(stats: dict) -> str:
 def discover(*, day: date, seen: dict[str, str], cap: int,
              search_x_fn=search_x, search_reddit_fn=search_reddit,
              search_comments_fn=search_comments, x_cap: int = X_QUERY_CAP,
-             comment_cap: int = X_COMMENT_CAP) -> tuple[list[dict], dict[str, str], dict]:
+             comment_cap: int = X_COMMENT_CAP,
+             market_profile: str = "global") -> tuple[list[dict], dict[str, str], dict]:
     """All buyer queries plus competitor comments. Reddit stays on its own rotation.
 
     `cap` is the Reddit cap (TREG_SOCIAL_CAP). X keywords and comments have
@@ -803,7 +815,7 @@ def discover(*, day: date, seen: dict[str, str], cap: int,
         return res_payloads
 
     x_cands: list[tuple[str, dict | None]] = []
-    b_queries = buyer_queries(day)
+    b_queries = buyer_queries(day, market_profile=market_profile)
     b_payloads = _run_x_queries(b_queries)
     for query, payload in zip(b_queries, b_payloads):
         if payload is None:
@@ -925,6 +937,7 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--seen", required=True)
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
+    parser.add_argument("--market-profile", default="global", choices=["global", "gcc_december"])
     args = parser.parse_args()
     day = date.fromisoformat(args.day) if args.day else date.today()
     cap = max(0, int(os.getenv("TREG_SOCIAL_CAP", "20")))
@@ -935,6 +948,7 @@ def main() -> None:
             day=day, seen=before, cap=cap,
             x_cap=_env_cap("X_QUERY_CAP", X_QUERY_CAP),
             comment_cap=_env_cap("X_COMMENT_CAP", X_COMMENT_CAP),
+            market_profile=args.market_profile,
         )
     except Exception as exc:
         print(f"social: posts=0 filtered=0 comments=0 supply=0 admitted=0 x_call_failed ({exc.__class__.__name__})", flush=True)

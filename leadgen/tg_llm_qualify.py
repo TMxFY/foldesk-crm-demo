@@ -18,7 +18,7 @@ Env (.env in project root):
     LLM_CONCURRENCY         parallel first_touch calls (default: 12)
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import faulthandler
 import inspect
 import json
@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 
 import requests
@@ -142,7 +143,8 @@ BASE_URL = (os.getenv("LLM_BASE_URL") or "https://relay.fast/v1").rstrip("/")
 API_KEY = os.getenv("RELAYFAST_API_KEY") or os.getenv("LLM_API_KEY") or ""
 
 BATCH_SIZE = 12
-TIMEOUT = 90
+TIMEOUT = max(15, int(os.getenv("LLM_QUALIFY_TIMEOUT", "35") or "35"))
+DEADLINE_SEC = max(60, int(os.getenv("LLM_QUALIFY_DEADLINE_SEC", "220") or "220"))
 
 CATEGORIES = ["SaaS / AI app", "E-com / D2C", "CEX / биржа", "Проп трейдинг", "DeFi / DEX",
               "Медиа / контент", "Gaming / AI", "Токен / мемкоин",
@@ -160,6 +162,7 @@ Golden ICP clusters (icp_score 70..100 when LTV $50-$100+ consumer/prosumer prod
 2. E-com / Shopify / TikTok Shop D2C brands (cosmetics/skincare, supplements/vitamins, health/wellness, consumer household/beauty/fitness brands) with paid ads or shop volume.
 3. Crypto B2C wallets, portfolio trackers, exchanges, fintech cards, payment apps, and prop trading challenges / options & trading platforms with deposit/subscription/challenge monetization.
 4. High-ticket info-products, coaching programs, and education businesses with paid cohorts/ads.
+5. Large aesthetic, dental, dermatology, telehealth, lab-testing, and multi-location medical clinics / health-tech brands (especially in GCC/MENA — Saudi Arabia, UAE, Qatar, Kuwait) running paid ads or scaling patient acquisition.
 
 Paid Scale Evidence rule (CRITICAL):
 - Active paid video advertising (source in ["meta_ads", "tiktok_ads", "tiktok_shop", "whop_content_rewards", "d2c_whatsapp"]), proven store traction (source="app_stores" with rating_count >= 300), active hiring for UGC/Short-Form/Paid Social (source="ats_hiring"), or monetized YC/PH consumer/prosumer products (subscription, app IAP, paid product) ALREADY prove commercial budget and monetization. Do NOT lower icp_score below 70 solely because an ad snippet or short bio does not print explicit MRR or LTV dollar numbers.
@@ -268,8 +271,14 @@ def call_llm_retry(batch):
                 print(f"    {model} unavailable ({status}), next model", file=sys.stderr)
                 continue
             raise
-        except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+        except (requests.RequestException, TimeoutError, ValueError, KeyError, IndexError) as exc:
             last = exc
+            if isinstance(exc, (requests.Timeout, TimeoutError, FuturesTimeoutError)):
+                # Immediately retire a timed-out model for this process so remaining batches jump to fast fallbacks.
+                note_failure(model, 408, "timeout")
+                note_failure(model, 408, "timeout")
+                print(f"    {model} timed out ({exc.__class__.__name__}), retiring for this run", file=sys.stderr)
+                continue
             if note_failure(model, 0, ""):
                 print(f"    {model} failed ({exc.__class__.__name__}), next model", file=sys.stderr)
                 continue
@@ -610,15 +619,24 @@ def qualify_loaded(
     batch_slices = [rows[start:start + batch_size] for start in range(0, total, batch_size)]
     nbatches = len(batch_slices)
     batch_outcomes: list[tuple[str, Any]] = []
+    qualify_started = time.monotonic()
     if nbatches > 1:
         chain()  # Warm catalog on main thread before submitting worker pool.
-        with ThreadPoolExecutor(max_workers=min(4, nbatches)) as pool:
+        pool = ThreadPoolExecutor(max_workers=min(6, nbatches))
+        try:
             futs = [pool.submit(call_llm_retry, b) for b in batch_slices]
             for fut in futs:
+                rem = max(0.05, DEADLINE_SEC - (time.monotonic() - qualify_started))
                 try:
-                    batch_outcomes.append(("ok", fut.result()))
+                    batch_outcomes.append(("ok", fut.result(timeout=rem)))
+                except (TimeoutError, FuturesTimeoutError):
+                    fut.cancel()
+                    batch_outcomes.append(("err", TimeoutError("qualify_wall_clock_deadline")))
                 except Exception as exc:
+                    fut.cancel()
                     batch_outcomes.append(("err", exc))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     elif nbatches == 1:
         try:
             batch_outcomes.append(("ok", call_llm_retry(batch_slices[0])))

@@ -2140,6 +2140,7 @@ def _run_phone_waterfall_for_dm(
     batch_budget_remaining_fn: Callable[[], float] | None = None,
     co_budget_remaining: list[float] | None = None,
     default_country: str = "",
+    jev_fit: float = 0.0,
 ) -> dict[str, Any]:
     """Run Layer 1 phone waterfall + free HLR mobile filter for one DM.
 
@@ -2277,12 +2278,13 @@ def _run_phone_waterfall_for_dm(
     co_cap = CONTACTOUT_VERIFIED_PHONE_CAP_USD if raw_co_cap is None else max(0.0, float(raw_co_cap))
     co_lead_rem_ok = co_budget_remaining is None or (len(co_budget_remaining) > 0 and co_budget_remaining[0] + 1e-9 >= co_cap)
     batch_rem_ok = batch_budget_remaining_fn is None or (max(0.0, batch_budget_remaining_fn() - spent) + 1e-9 >= co_cap)
+    allow_all_fit = bool(enr_cfg.get("contactout_for_all_fit_leads", False)) and float(jev_fit or 0.0) >= 1.5
     if (
         co_avail is True
         and dm_li
         and co_cap > 0.0
         and co_lead_rem_ok
-        and icp_score >= CONTACTOUT_VERIFIED_MIN_ICP
+        and (icp_score >= CONTACTOUT_VERIFIED_MIN_ICP or allow_all_fit)
         and batch_rem_ok
         and _check_budget_guard(budget_guard_fn, "treg", co_cap, endpoint="contactout.people.contact.phone")
     ):
@@ -3197,6 +3199,7 @@ def enrich_lead_contacts(
                         ),
                         co_budget_remaining=[0.0] if company_has_phone else co_lead_budget,
                         default_country=row_cc,
+                        jev_fit=float(out.get("jev_fit") or 0.0),
                     )
                     lead_cost += float(wf_res.get("cost") or 0.0)
                     if wf_res.get("phone"):

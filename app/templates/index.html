@@ -1592,6 +1592,17 @@
               </label>
             </div>
             <div class="lg-two-col-grid">
+              <label for="leadgen-market-profile">Режим рынка (1-кнопочный откат)
+                <select id="leadgen-market-profile">
+                  <option value="global">Global (US / EU / UK)</option>
+                  <option value="gcc_december">GCC Декабрь (SA / AE / QA / KW / BH / OM + AR)</option>
+                </select>
+              </label>
+              <div class="lg-reverse-bridge-meta">
+                <span class="hint">Переключает гео-веса, арабские запросы, сиды Follower API и белый список клиник без затирания настроек Global.</span>
+              </div>
+            </div>
+            <div class="lg-two-col-grid">
               <label for="leadgen-b2b-reverse-bridge-tg">Reverse Bridge TG (@handle для WA/Email → TG)
                 <input id="leadgen-b2b-reverse-bridge-tg" type="text" autocomplete="off" placeholder="@softugc_team">
               </label>
@@ -1726,6 +1737,14 @@
                 </span>
                 <span class="badge b-ok leadgen-row-badge">ВКЛ</span>
               </label>
+              <label class="leadgen-switch-row">
+                <input type="checkbox" id="leadgen-src-follower-graph" data-b2b-source="follower_graph">
+                <span class="leadgen-switch-copy">
+                  <strong>Follower API (X + IG)</strong>
+                  <span class="hint">treg × Jev разбор подписчиков сидов</span>
+                </span>
+                <span class="badge b-off leadgen-row-badge">ВЫКЛ</span>
+              </label>
             </div>
 
             <details class="leadgen-sources-spoiler">
@@ -1755,6 +1774,9 @@
                 </label>
                 <label for="leadgen-limit-yc">YC / PH limit
                   <input id="leadgen-limit-yc" type="number" min="0" max="5000" value="50">
+                </label>
+                <label for="leadgen-follower-graph-budget">Бюджет Follower API ($/сут)
+                  <input id="leadgen-follower-graph-budget" type="number" min="0" max="100" step="0.5" value="4.0">
                 </label>
               </div>
             </details>

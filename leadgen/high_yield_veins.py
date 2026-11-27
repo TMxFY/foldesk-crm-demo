@@ -65,6 +65,14 @@ TIKTOK_AD_QUERIES = (
     "supplement gummies",
     "skincare serum",
 )
+GCC_TIKTOK_AD_QUERIES = (
+    "عطور",
+    "عيادة تجميل",
+    "العناية بالبشرة",
+    "riyadh clinic",
+    "dubai skincare",
+    "saudi perfume",
+)
 
 TIKTOK_SHOP_QUERIES = (
     "sleep gummies",
@@ -72,6 +80,12 @@ TIKTOK_SHOP_QUERIES = (
     "mushroom supplement",
     "stain remover",
     "whitening strips",
+)
+GCC_TIKTOK_SHOP_QUERIES = (
+    "oud perfume",
+    "arabic skincare",
+    "collagen serum",
+    "عطور عربية",
 )
 
 _WHOP_PREFIX_RE = re.compile(
@@ -860,6 +874,7 @@ def collect_tiktok_creative_ads(
     enrich_fn=None,
     site_scrape_fn=None,
     call_budget: list[int] | None = None,
+    market_profile: str = "global",
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     today = day or date.today()
     current = fresh_seen(seen or {}, today)
@@ -873,8 +888,9 @@ def collect_tiktok_creative_ads(
 
     rows: list[dict[str, Any]] = []
     local_keys: set[str] = set()
+    query_pool = GCC_TIKTOK_AD_QUERIES if str(market_profile or "global").lower() == "gcc_december" else TIKTOK_AD_QUERIES
 
-    for keyword in _rotate_for_day(TIKTOK_AD_QUERIES, today, 3):
+    for keyword in _rotate_for_day(query_pool, today, 3):
         if len(rows) >= limit or budget[0] <= 0:
             break
         budget[0] -= 1
@@ -1132,6 +1148,7 @@ def collect_tiktok_shop_brands(
     enrich_fn=None,
     site_scrape_fn=None,
     call_budget: list[int] | None = None,
+    market_profile: str = "global",
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     today = day or date.today()
     current = fresh_seen(seen or {}, today)
@@ -1145,8 +1162,9 @@ def collect_tiktok_shop_brands(
 
     rows: list[dict[str, Any]] = []
     local_keys: set[str] = set()
+    shop_pool = GCC_TIKTOK_SHOP_QUERIES if str(market_profile or "global").lower() == "gcc_december" else TIKTOK_SHOP_QUERIES
 
-    for keyword in _rotate_for_day(TIKTOK_SHOP_QUERIES, today, 2):
+    for keyword in _rotate_for_day(shop_pool, today, 2):
         if len(rows) >= limit or budget[0] <= 0:
             break
         budget[0] -= 1
@@ -1747,6 +1765,14 @@ APP_STORE_VEIN_QUERIES = (
     "flashcards AI",
     "sleep meditation",
 )
+GCC_APP_STORE_VEIN_QUERIES = (
+    "saudi clinic booking",
+    "telehealth saudi",
+    "arabic AI tutor",
+    "riyadh delivery app",
+    "arabic workout tracker",
+    "halal finance app",
+)
 
 ATS_HIRING_QUERIES = (
     'site:jobs.ashbyhq.com ("UGC" OR "Short-Form" OR "TikTok" OR "Paid Social" OR "Creator Partnerships")',
@@ -1840,6 +1866,7 @@ def collect_scaling_store_apps(
     enrich_fn=None,
     site_scrape_fn=None,
     call_budget: list[int] | None = None,
+    market_profile: str = "global",
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Collect scaling subscription/IAP mobile apps in the 300..50,000 rating sweet spot."""
     today = day or date.today()
@@ -1855,9 +1882,10 @@ def collect_scaling_store_apps(
 
     rows: list[dict[str, Any]] = []
     local_keys: set[str] = set()
-    queries = _rotate_for_day(APP_STORE_VEIN_QUERIES, today, 2)
+    app_pool = GCC_APP_STORE_VEIN_QUERIES if str(market_profile or "global").lower() == "gcc_december" else APP_STORE_VEIN_QUERIES
+    queries = _rotate_for_day(app_pool, today, 2)
     extra_app_queries = [
-        q for q in _rotate_for_day(APP_STORE_VEIN_QUERIES, today, 2, cursor=1) if q not in queries
+        q for q in _rotate_for_day(app_pool, today, 2, cursor=1) if q not in queries
     ]
     queries.extend(extra_app_queries[:2])
 
@@ -2421,6 +2449,7 @@ def collect_all_veins(
     cursor: int = 0,
     max_runtime_sec: float = 180.0,
     whop_min_pool_usd: int = 0,
+    market_profile: str = "global",
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     global _ACTIVE_RUN_CURSOR
     today = day or date.today()
@@ -2451,13 +2480,13 @@ def collect_all_veins(
             call_budget=[20],
         ),
         "tiktok_ads": lambda rem, cur_seen: collect_tiktok_creative_ads(
-            limit=rem, day=today, seen=cur_seen, call_budget=[20]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20], market_profile=market_profile
         ),
         "tiktok_shop": lambda rem, cur_seen: collect_tiktok_shop_brands(
-            limit=rem, day=today, seen=cur_seen, call_budget=[20]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20], market_profile=market_profile
         ),
         "app_stores": lambda rem, cur_seen: collect_scaling_store_apps(
-            limit=rem, day=today, seen=cur_seen, call_budget=[20]
+            limit=rem, day=today, seen=cur_seen, call_budget=[20], market_profile=market_profile
         ),
         "ats_hiring": lambda rem, cur_seen: collect_ats_ugc_hiring(
             limit=rem, day=today, seen=cur_seen, call_budget=[20]
@@ -2550,6 +2579,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--day", default="", help="YYYY-MM-DD, defaults to today")
     parser.add_argument("--max-runtime-sec", type=float, default=180.0)
     parser.add_argument("--whop-min-pool-usd", type=int, default=5000)
+    parser.add_argument("--market-profile", default="global", choices=["global", "gcc_december"])
     args = parser.parse_args(argv)
 
     day = date.fromisoformat(args.day) if args.day else date.today()
@@ -2566,6 +2596,7 @@ def main(argv: list[str] | None = None) -> None:
             cursor=cursor,
             max_runtime_sec=float(args.max_runtime_sec),
             whop_min_pool_usd=max(0, int(args.whop_min_pool_usd)),
+            market_profile=args.market_profile,
         )
     except Exception:
         rows, updated = [], before

@@ -104,6 +104,25 @@ TARGET_COUNTRIES = (
     "CA",
     "AU",
 )
+GCC_COUNTRIES = ("SA", "AE", "QA", "KW", "BH", "OM")
+MENA_EXTENDED_COUNTRIES = ("EG", "JO")
+ARABIC_GCC_SEARCH_QUERIES = (
+    "عطور",
+    "العناية بالبشرة",
+    "عيادة تجميل",
+    "عيادة أسنان",
+    "عيادة جلدية",
+    "تحاليل طبية",
+    "مكملات غذائية",
+    "تطبيق ذكاء اصطناعي",
+    "متجر سلة",
+    "dubai aesthetic clinic",
+    "riyadh skincare brand",
+    "saudi perfume brand",
+    "dubai fitness app",
+    "telehealth saudi",
+    "weight loss clinic dubai",
+)
 CAP = int(os.getenv("META_ADS_CAP", "80"))
 SEEN_DAYS = 90
 _NON_PERSONAL_TG_SUFFIXES = (
@@ -217,7 +236,27 @@ _BARE_PHONE_RE = re.compile(r"^\s*\+?(\d[\d\s().\-]{7,18}\d)\s*$")
 _TOLLFREE_WA_PREFIXES = ("1800", "1833", "1844", "1855", "1866", "1877", "1888", "44800", "44808")
 
 
-def queries_for_day(day: date, count: int = 3, cursor: int = 0) -> list[str]:
+def queries_for_day(
+    day: date,
+    count: int = 3,
+    cursor: int = 0,
+    *,
+    market_profile: str = "global",
+) -> list[str]:
+    if str(market_profile or "global").strip().lower() == "gcc_december":
+        gcc_pool = list(ARABIC_GCC_SEARCH_QUERIES)
+        core_pool = list(SEARCH_QUERIES)
+        total_out = max(1, int(count))
+        gcc_n = max(1, int(round(total_out * 0.7)))
+        core_n = max(0, total_out - gcc_n)
+        g_start = ((day.toordinal() + max(0, int(cursor))) * gcc_n) % len(gcc_pool)
+        c_start = ((day.toordinal() + max(0, int(cursor))) * max(1, core_n)) % len(core_pool)
+        out = [gcc_pool[(g_start + i) % len(gcc_pool)] for i in range(min(gcc_n, len(gcc_pool)))]
+        for i in range(min(core_n, len(core_pool))):
+            q = core_pool[(c_start + i) % len(core_pool)]
+            if q not in out:
+                out.append(q)
+        return out[:total_out]
     total = len(SEARCH_QUERIES)
     if not total or count <= 0:
         return []
@@ -225,8 +264,22 @@ def queries_for_day(day: date, count: int = 3, cursor: int = 0) -> list[str]:
     return [SEARCH_QUERIES[(start + i) % total] for i in range(min(count, total))]
 
 
-def countries_for_day(day: date, count: int = 6, cursor: int = 0) -> list[str]:
+def countries_for_day(
+    day: date,
+    count: int = 6,
+    cursor: int = 0,
+    *,
+    market_profile: str = "global",
+) -> list[str]:
     """Return a deterministic daily slice of TARGET_COUNTRIES for multi-GEO rotation."""
+    if str(market_profile or "global").strip().lower() == "gcc_december":
+        weighted_pool = (
+            "SA", "AE", "QA", "KW", "SA", "AE", "BH", "OM",
+            "EG", "JO", "SA", "AE",
+        )
+        total_out = max(1, int(count))
+        start = ((day.toordinal() + max(0, int(cursor))) * total_out) % len(weighted_pool)
+        return [weighted_pool[(start + i) % len(weighted_pool)] for i in range(total_out)]
     total = len(TARGET_COUNTRIES)
     if not total or count <= 0:
         return []
@@ -981,6 +1034,7 @@ def collect(
     on_row: Callable[[dict], None] | None = None,
     rotate_countries: bool = False,
     max_countries: int | None = None,
+    market_profile: str = "global",
     search_fn=None,
     enrich_fn=None,
     store_resolver_fn=None,
@@ -1002,7 +1056,7 @@ def collect(
     local_keys: set[str] = set()
 
     q_count = int(query_count) if query_count is not None else (3 if countries is not None else 6)
-    selected_queries = queries_for_day(today, count=q_count, cursor=cursor)
+    selected_queries = queries_for_day(today, count=q_count, cursor=cursor, market_profile=market_profile)
     if countries is not None:
         selected_countries = [str(c).strip().upper() for c in countries if str(c).strip()]
         if rotate_countries or (max_countries is not None and int(max_countries) > 0):
@@ -1013,7 +1067,12 @@ def collect(
                 max_countries=window,
             )
     else:
-        selected_countries = countries_for_day(today, count=len(selected_queries) or 6, cursor=cursor)
+        selected_countries = countries_for_day(
+            today,
+            count=len(selected_queries) or 6,
+            cursor=cursor,
+            market_profile=market_profile,
+        )
     if not selected_countries:
         selected_countries = ["US"]
 
@@ -1052,6 +1111,13 @@ def collect(
                 if dom_key and (dom_key in current or dom_key in local_keys):
                     continue
                 if fb_key and (fb_key in current or fb_key in local_keys):
+                    continue
+                if (
+                    str(market_profile or "global").strip().lower() == "gcc_december"
+                    and cand.get("country_code") in MENA_EXTENDED_COUNTRIES
+                    and not store_url
+                    and not domain
+                ):
                     continue
 
                 store_info: dict = {}
@@ -1254,6 +1320,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--country", default="", help="Comma-separated 2-letter GEO codes (optional)")
     parser.add_argument("--max-runtime-sec", type=float, default=210.0)
     parser.add_argument("--max-countries", type=int, default=3)
+    parser.add_argument("--market-profile", default="global", choices=["global", "gcc_december"])
     args = parser.parse_args(argv)
 
     day = date.fromisoformat(args.day) if args.day else date.today()
@@ -1307,6 +1374,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     on_row=_emit_row,
                     rotate_countries=True,
                     max_countries=max(1, int(args.max_countries)),
+                    market_profile=args.market_profile,
                 )
                 updated = returned_updated
             except _SigtermInterrupt:

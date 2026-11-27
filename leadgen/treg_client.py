@@ -140,6 +140,61 @@ def call_status(
     return None, None
 
 
+def call_with_cost(
+    endpoint: str,
+    *,
+    method: str | None = None,
+    data: dict | list | None = None,
+    query: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> tuple[int | None, dict[str, Any] | None, float]:
+    """`treg --json call` with header support and exact settled cost_usd from `_treg.charged_micro`."""
+    binary = treg_bin()
+    if not binary or os.getenv("TREG_ENRICH", "1").lower() in {"0", "false", "no"}:
+        return None, None, 0.0
+    cmd = [binary, "--json", "call", endpoint]
+    if method:
+        cmd += ["--method", method]
+    for key, value in (query or {}).items():
+        cmd += ["--query", f"{key}={value}"]
+    for key, value in (headers or {}).items():
+        cmd += ["--header", f"{key}: {value}"]
+    if data is not None:
+        cmd += ["--data", json.dumps(data, ensure_ascii=False)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None, 0.0
+    parsed = _parse_stdout(proc.stdout)
+    if not isinstance(parsed, dict):
+        return None, None, 0.0
+    meta = parsed.get("_treg")
+    cost_usd = 0.0
+    if isinstance(meta, dict):
+        raw_micro = meta.get("charged_micro")
+        if raw_micro is not None:
+            try:
+                micro_val = int(raw_micro)
+                if micro_val >= 0:
+                    cost_usd = round(micro_val / 1_000_000.0, 6)
+            except (TypeError, ValueError):
+                cost_usd = 0.0
+        if meta.get("http_status") is not None:
+            try:
+                status = int(meta["http_status"])
+            except (TypeError, ValueError):
+                return None, None, cost_usd
+            result = parsed.get("result")
+            body = result if isinstance(result, dict) else ({"result": result} if result is not None else None)
+            if status >= 400:
+                return status, None, cost_usd
+            return status, body, cost_usd
+    if proc.returncode == 0:
+        return 200, parsed, cost_usd
+    return None, None, cost_usd
+
+
 def _parse_stdout(text: str) -> dict[str, Any] | None:
     raw = (text or "").strip()
     if not raw:
