@@ -1463,7 +1463,10 @@ def _make_budget_callbacks(
         ep_name = str(kwargs.get("endpoint") or (rest[0] if len(rest) >= 2 and isinstance(rest[0], str) else "")).strip()
         if ep_name == "contactout.people.contact.phone" and isinstance(cfg, Mapping):
             enr_sub = cfg.get("enrichment") if isinstance(cfg.get("enrichment"), Mapping) else {}
+            fg_sub = cfg.get("follower_graph") if isinstance(cfg.get("follower_graph"), Mapping) else {}
             raw_sub_cap = enr_sub.get("enrichment_sub_budget_usd")
+            if raw_sub_cap is None:
+                raw_sub_cap = fg_sub.get("enrichment_sub_budget_usd")
             if raw_sub_cap is not None and conn is not None:
                 try:
                     sub_cap = float(raw_sub_cap)

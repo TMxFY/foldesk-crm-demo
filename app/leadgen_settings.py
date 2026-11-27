@@ -245,11 +245,6 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "per_lead_cap_usd": 0.05,
         "super_whale_cap_usd": 0.15,
         "contactout_verified_cap_usd": 0.25,
-        "follower_api_budget_usd": 4.0,
-        "enrichment_sub_budget_usd": 4.0,
-        "discovery_sub_budget_usd": 2.0,
-        "cpl_stop_usd": 0.50,
-        "contactout_for_all_fit_leads": True,
         "super_whale_icp_min": 92,
         "super_whale_pool_min_usd": 10000,
         "low_balance_warn_usd": 2.0,
@@ -259,6 +254,8 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
     "follower_graph": {
         "enabled": False,
         "daily_budget_usd": 4.0,
+        "enrichment_sub_budget_usd": 4.0,
+        "discovery_sub_budget_usd": 2.0,
         "platforms": ["x", "instagram"],
         "platform_split": {"x": 0.5, "instagram": 0.5},
         "max_degree": 2,
@@ -267,6 +264,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "fit_threshold": 1.5,
         "ofm_share_pct": 20,
         "cpl_stop_usd": 0.50,
+        "contactout_for_all_fit_leads": True,
         "seeds_x_gcc": list(DEFAULT_FOLLOWER_SEEDS_X_GCC),
         "seeds_ig_gcc": list(DEFAULT_FOLLOWER_SEEDS_IG_GCC),
         "seeds_x_ofm": list(DEFAULT_FOLLOWER_SEEDS_X_OFM),
@@ -465,31 +463,6 @@ def _normalize_enrichment_config(raw: Any) -> dict[str, Any]:
             defaults["contactout_verified_cap_usd"],
             "enrichment.contactout_verified_cap_usd",
         ),
-        "follower_api_budget_usd": _parse_non_neg_float(
-            enr.get("follower_api_budget_usd"),
-            defaults["follower_api_budget_usd"],
-            "enrichment.follower_api_budget_usd",
-        ),
-        "enrichment_sub_budget_usd": _parse_non_neg_float(
-            enr.get("enrichment_sub_budget_usd"),
-            defaults["enrichment_sub_budget_usd"],
-            "enrichment.enrichment_sub_budget_usd",
-        ),
-        "discovery_sub_budget_usd": _parse_non_neg_float(
-            enr.get("discovery_sub_budget_usd"),
-            defaults["discovery_sub_budget_usd"],
-            "enrichment.discovery_sub_budget_usd",
-        ),
-        "cpl_stop_usd": _parse_non_neg_float(
-            enr.get("cpl_stop_usd"),
-            defaults["cpl_stop_usd"],
-            "enrichment.cpl_stop_usd",
-        ),
-        "contactout_for_all_fit_leads": _parse_bool_flag(
-            enr.get("contactout_for_all_fit_leads"),
-            defaults["contactout_for_all_fit_leads"],
-            "enrichment.contactout_for_all_fit_leads",
-        ),
         "super_whale_icp_min": _parse_int_range(
             enr.get("super_whale_icp_min"), defaults["super_whale_icp_min"], 0, 100, "enrichment.super_whale_icp_min"
         ),
@@ -546,6 +519,16 @@ def _normalize_follower_graph_config(raw: Any) -> dict[str, Any]:
         "daily_budget_usd": _parse_non_neg_float(
             fg.get("daily_budget_usd"), defaults["daily_budget_usd"], "follower_graph.daily_budget_usd"
         ),
+        "enrichment_sub_budget_usd": _parse_non_neg_float(
+            fg.get("enrichment_sub_budget_usd"),
+            defaults["enrichment_sub_budget_usd"],
+            "follower_graph.enrichment_sub_budget_usd",
+        ),
+        "discovery_sub_budget_usd": _parse_non_neg_float(
+            fg.get("discovery_sub_budget_usd"),
+            defaults["discovery_sub_budget_usd"],
+            "follower_graph.discovery_sub_budget_usd",
+        ),
         "platforms": platforms,
         "platform_split": split_norm,
         "max_degree": _parse_int_range(fg.get("max_degree"), defaults["max_degree"], 1, 3, "follower_graph.max_degree"),
@@ -571,6 +554,11 @@ def _normalize_follower_graph_config(raw: Any) -> dict[str, Any]:
         ),
         "cpl_stop_usd": _parse_non_neg_float(
             fg.get("cpl_stop_usd"), defaults["cpl_stop_usd"], "follower_graph.cpl_stop_usd"
+        ),
+        "contactout_for_all_fit_leads": _parse_bool_flag(
+            fg.get("contactout_for_all_fit_leads"),
+            defaults["contactout_for_all_fit_leads"],
+            "follower_graph.contactout_for_all_fit_leads",
         ),
         "seeds_x_gcc": _clean_social_handles(fg.get("seeds_x_gcc", defaults["seeds_x_gcc"])),
         "seeds_ig_gcc": _clean_social_handles(fg.get("seeds_ig_gcc", defaults["seeds_ig_gcc"])),
@@ -976,6 +964,15 @@ def resolve_effective_market_config(cfg: dict[str, Any] | None) -> dict[str, Any
 
     enr = base.setdefault("enrichment", {})
     enr["low_balance_warn_usd"] = max(5.0, float(enr.get("low_balance_warn_usd") or 2.0))
+    fg = base.get("follower_graph") if isinstance(base.get("follower_graph"), dict) else {}
+    fg_defaults = DEFAULT_LEADGEN_CONFIG["follower_graph"]
+    for fg_key in (
+        "enrichment_sub_budget_usd",
+        "discovery_sub_budget_usd",
+        "cpl_stop_usd",
+        "contactout_for_all_fit_leads",
+    ):
+        enr[fg_key] = fg.get(fg_key, enr.get(fg_key, fg_defaults[fg_key]))
 
     b2b = base.setdefault("b2b", {})
     existing_groups = list(b2b.get("tg_groups_new") or [])
