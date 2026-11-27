@@ -23,7 +23,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import os
@@ -129,13 +130,36 @@ _SOCIAL_HOSTS = frozenset(
         "taplink.cc",
         "bit.ly",
         "t.co",
+        "medium.com",
+        "substack.com",
+        "notion.site",
+        "notion.so",
+        "behance.net",
+        "dribbble.com",
+        "github.com",
+        "gitlab.com",
+        "carrd.co",
+        "gumroad.com",
+        "patreon.com",
+        "bio.site",
+        "campsite.bio",
+        "stan.store",
+        "solo.to",
+        "msha.ke",
     }
+)
+_BARE_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@/\-])"
+    r"([a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\."
+    r"(?:com|io|ai|co|sa|ae|qa|kw|bh|om|eg|jo|app|store|shop|health|tech|net|org|me|bio|vc|dev|xyz|online|site))\b",
+    re.I,
 )
 _APP_STORE_HOSTS = frozenset({"apps.apple.com", "itunes.apple.com", "play.google.com"})
 _NON_PERSONAL_TG = frozenset({"channel", "news", "bot", "_bot", "official", "announcements", "support", "help"})
 _NOISE_BIO_RE = re.compile(
     r"\b(?:for hire|open to work|seeking (?:a )?(?:job|role|work)|airdrop|giveaway|free mint|dm for promo|"
-    r"follow back|f4f|looking for (?:a )?job|ugc creator for hire|clipper for hire)\b",
+    r"follow back|f4f|looking for (?:a )?job|ugc creator for hire|clipper for hire|"
+    r"vape|vaping|hookah|shisha|e-?cig|cbd|casino|high\s*school|student)\b",
     re.I,
 )
 _EG_JO_HINT_RE = re.compile(
@@ -153,9 +177,9 @@ _PAID_ADS_SIGNAL_RE = re.compile(
 )
 
 _FIT_CRITERIA = [
-    "0 not a lead: agency, consultancy, freelancer, UGC creator for hire, student, job seeker, pure B2D dev CLI/SDK, small solo local salon/barbershop/cafe, bot/spam, or fan account with no monetized business.",
+    "0 not a lead: agency, consultancy, freelancer, UGC creator for hire, student/schoolkid/sports-fan hobby account without an established store domain, vape/shisha/gambling shop, mega-influencer (>150k followers), passive institutional employee sharing retweets, pure B2D dev CLI/SDK, small solo local salon/barbershop/cafe, bot/spam, or fan account with no monetized business.",
     "1 user or unclear potential: individual contributor, early/tiny project, or unclear buying authority.",
-    "2 decision maker: founder, CEO, owner, CMO, marketing/growth lead of a monetized B2C/prosumer SaaS or AI app, Shopify/Salla/Zid/D2C physical brand (skincare, perfume, supplements, consumer goods), large aesthetic/dental/dermatology/telehealth/lab-testing clinic or medical chain (especially GCC/MENA), crypto/fintech/prop platform, or OFM/creator agency buyer.",
+    "2 decision maker: active founder, CEO, owner, CMO, marketing/growth lead of a monetized B2C/prosumer SaaS or AI app, Shopify/Salla/Zid/D2C physical brand (skincare, perfume, oud, apparel, supplements, consumer goods), large aesthetic/dental/dermatology/telehealth/lab-testing clinic or medical chain (especially GCC/MENA), consumer crypto/fintech/prop platform, or OFM/creator agency buyer.",
 ]
 _ROLE_CRITERIA = {
     "founder_exec": "Founder, co-founder, CEO, owner, or executive decision maker",
@@ -179,8 +203,9 @@ PRODUCT_CONTEXT_GCC = (
     "SoftUGC provides high-volume AI short-form video user acquisition (1,000+ AI UGC reels/month across owned "
     "TikTok/Reels/Shorts/Snapchat account networks; 183.5M views in 90 days) for monetized brands that need "
     "predictable customer acquisition. Target buyers in GCC & global: large medical/aesthetic/dental/telehealth "
-    "clinics (like Adam Health), D2C physical brands (perfume, skincare, cosmetics, supplements on Salla/Zid/Shopify), "
+    "clinics (like Adam Health), D2C physical brands (perfume, oud, skincare, cosmetics, supplements on Salla/Zid/Shopify), "
     "consumer/AI subscription apps, and Dubai crypto/high-ticket businesses. Reject agencies, freelancers, job seekers, "
+    "schoolkids/teen hobby accounts, vape/tobacco/casino shops, mega-celebrities (>150k followers), passive corporate employees, "
     "and small solo neighborhood salons."
 )
 PRODUCT_CONTEXT_OFM = (
@@ -508,6 +533,29 @@ def _extract_follower_items(payload: Any, platform: str) -> tuple[list[dict[str,
     return items, next_cursor, more
 
 
+def _extract_raw_ig_user(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Dig into TikHub Instagram raw.data.data.user when normalized output omits bio/links."""
+    for top_key in ("raw", "result"):
+        cur: Any = payload.get(top_key) if top_key in payload else (payload if top_key == "raw" else None)
+        if not isinstance(cur, Mapping):
+            continue
+        if top_key == "result" and isinstance(cur.get("raw"), Mapping):
+            cur = cur["raw"]
+        elif top_key == "raw":
+            cur = payload.get("raw")
+        if not isinstance(cur, Mapping):
+            continue
+        for step in ("data", "data", "user"):
+            if isinstance(cur.get(step), Mapping):
+                cur = cur[step]
+            else:
+                cur = {}
+                break
+        if isinstance(cur, Mapping) and cur:
+            return cur
+    return {}
+
+
 def _merge_profile_payload(base: dict[str, Any], payload: Any, platform: str) -> dict[str, Any]:
     out = dict(base)
     if not isinstance(payload, Mapping):
@@ -523,7 +571,9 @@ def _merge_profile_payload(base: dict[str, Any], payload: Any, platform: str) ->
         out["name"] = str(node.get("name") or out.get("name") or "").strip()
         out["bio"] = str(node.get("description") or node.get("bio") or out.get("bio") or "").strip()
         out["location"] = str(node.get("location") or out.get("location") or "").strip()
-        out["followers_count"] = int(node.get("followers_count") or out.get("followers_count") or 0)
+        out["followers_count"] = int(
+            node.get("followers_count") or node.get("followers") or out.get("followers_count") or 0
+        )
         website = str(node.get("website") or node.get("url") or out.get("website") or "").strip()
         if not website:
             urls = ((node.get("entities") or {}).get("url") or {}).get("urls") or []
@@ -531,25 +581,80 @@ def _merge_profile_payload(base: dict[str, Any], payload: Any, platform: str) ->
                 website = str(urls[0].get("expanded_url") or urls[0].get("url") or "").strip()
         out["website"] = website
     else:
-        out["name"] = str(node.get("full_name") or node.get("name") or out.get("name") or "").strip()
-        out["bio"] = str(node.get("biography") or node.get("bio") or out.get("bio") or "").strip()
-        out["website"] = str(node.get("external_url") or node.get("website") or out.get("website") or "").strip()
-        out["location"] = str(node.get("city_name") or node.get("location") or out.get("location") or "").strip()
-        out["followers_count"] = int(node.get("follower_count") or node.get("followers_count") or out.get("followers_count") or 0)
-        out["business_category"] = str(node.get("category_name") or node.get("business_category_name") or out.get("business_category") or "").strip()
-        out["is_private"] = bool(node.get("is_private") or out.get("is_private"))
-        pub_phone = str(node.get("public_phone_number") or node.get("contact_phone_number") or "").strip()
+        raw_ig = _extract_raw_ig_user(payload)
+        out["name"] = str(node.get("full_name") or raw_ig.get("full_name") or node.get("name") or out.get("name") or "").strip()
+        out["bio"] = str(node.get("biography") or raw_ig.get("biography") or node.get("bio") or out.get("bio") or "").strip()
+        website = str(node.get("external_url") or raw_ig.get("external_url") or node.get("website") or out.get("website") or "").strip()
+        if not website and isinstance(raw_ig.get("bio_links"), list):
+            for bl in raw_ig["bio_links"]:
+                if isinstance(bl, Mapping) and str(bl.get("url") or "").strip():
+                    website = str(bl["url"]).strip()
+                    break
+        out["website"] = website
+        out["location"] = str(node.get("city_name") or raw_ig.get("city_name") or node.get("location") or out.get("location") or "").strip()
+        out["followers_count"] = int(
+            node.get("follower_count")
+            or node.get("followers_count")
+            or node.get("followers")
+            or raw_ig.get("follower_count")
+            or out.get("followers_count")
+            or 0
+        )
+        out["business_category"] = str(
+            node.get("category_name")
+            or node.get("business_category_name")
+            or raw_ig.get("category")
+            or out.get("business_category")
+            or ""
+        ).strip()
+        out["is_private"] = bool(node.get("is_private") or raw_ig.get("is_private") or out.get("is_private"))
+        pub_phone = str(
+            node.get("public_phone_number")
+            or node.get("contact_phone_number")
+            or raw_ig.get("public_phone_number")
+            or ""
+        ).strip()
         if pub_phone:
             out["phone"] = pub_phone
-        pub_email = str(node.get("public_email") or "").strip()
+        pub_email = str(node.get("public_email") or raw_ig.get("public_email") or "").strip()
         if pub_email:
             out["email"] = pub_email
     return out
 
 
-def _extract_posts_texts(payload: Any) -> list[str]:
+def _parse_post_timestamp(item: Mapping[str, Any]) -> float | None:
+    for key in ("createdUtc", "created_utc", "timestamp", "time_stamp"):
+        val = item.get(key)
+        if isinstance(val, (int, float)) and float(val) > 1_000_000_000:
+            return float(val)
+        if isinstance(val, str) and val.strip().isdigit():
+            parsed = float(val.strip())
+            if parsed > 1_000_000_000:
+                return parsed
+    raw_dt = str(item.get("created_at") or item.get("createdAt") or "").strip()
+    if raw_dt:
+        try:
+            return datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+        try:
+            return parsedate_to_datetime(raw_dt).timestamp()
+        except Exception:
+            pass
+    return None
+
+
+def _extract_posts_with_meta(payload: Any, *, now_ts: float | None = None) -> dict[str, Any]:
+    empty: dict[str, Any] = {
+        "all_texts": [],
+        "original_texts": [],
+        "newest_any_utc": None,
+        "newest_original_utc": None,
+        "original_age_days": None,
+        "all_retweets": False,
+    }
     if not isinstance(payload, Mapping):
-        return []
+        return empty
     candidates: list[Any] = []
     for container in (payload, payload.get("output"), payload.get("data"), payload.get("result")):
         if isinstance(container, list):
@@ -563,15 +668,60 @@ def _extract_posts_texts(payload: Any) -> list[str]:
                     break
         if candidates:
             break
-    texts: list[str] = []
-    for item in candidates[:10]:
+
+    all_texts: list[str] = []
+    original_texts: list[str] = []
+    newest_any: float | None = None
+    newest_orig: float | None = None
+    total_posts = 0
+    retweet_count = 0
+
+    for item in candidates[:12]:
         if isinstance(item, str) and item.strip():
-            texts.append(item.strip()[:280])
+            txt = item.strip()[:280]
+            total_posts += 1
+            all_texts.append(txt)
+            if txt.lstrip().startswith("RT @"):
+                retweet_count += 1
+            else:
+                original_texts.append(txt)
         elif isinstance(item, Mapping):
-            txt = str(item.get("text") or item.get("full_text") or item.get("caption") or "").strip()
-            if txt:
-                texts.append(txt[:280])
-    return texts
+            txt = str(item.get("text") or item.get("full_text") or item.get("caption") or "").strip()[:280]
+            if not txt:
+                continue
+            total_posts += 1
+            all_texts.append(txt)
+            is_rt = bool(item.get("isRetweet")) or txt.lstrip().startswith("RT @")
+            ts = _parse_post_timestamp(item)
+            if ts is not None and (newest_any is None or ts > newest_any):
+                newest_any = ts
+            if is_rt:
+                retweet_count += 1
+            else:
+                original_texts.append(txt)
+                if ts is not None and (newest_orig is None or ts > newest_orig):
+                    newest_orig = ts
+
+    ref_ts = time.time() if now_ts is None else float(now_ts)
+    age_days: float | None = None
+    if newest_orig is not None:
+        age_days = max(0.0, (ref_ts - newest_orig) / 86400.0)
+    elif total_posts > 0 and retweet_count == total_posts and newest_any is not None:
+        age_days = max(0.0, (ref_ts - newest_any) / 86400.0)
+
+    return {
+        "all_texts": all_texts[:10],
+        "original_texts": original_texts[:10],
+        "newest_any_utc": newest_any,
+        "newest_original_utc": newest_orig,
+        "original_age_days": round(age_days, 2) if age_days is not None else None,
+        "all_retweets": total_posts > 0 and retweet_count == total_posts,
+    }
+
+
+def _extract_posts_texts(payload: Any) -> list[str]:
+    meta = _extract_posts_with_meta(payload)
+    return list(meta["original_texts"] or meta["all_texts"])
 
 
 def _extract_company_fields(payload: Any) -> dict[str, Any]:
@@ -587,6 +737,18 @@ def _extract_company_fields(payload: Any) -> dict[str, Any]:
         "description": str(node.get("description") or "").strip(),
         "location": str(node.get("location") or "").strip(),
     }
+
+
+def _extract_bio_brand_hint(bio: str) -> str:
+    """Extract an owned @company or @brand handle from founder/CEO bio text."""
+    m = re.search(
+        r"(?:founder|co-founder|ceo|owner|building|founder\s*\||@)\s*(?:and\s+ceo|&\s*ceo|of|at|,|\|)?\s*(?:[^@\n]{0,24})?@([A-Za-z][A-Za-z0-9_.]{2,31})",
+        str(bio or ""),
+        re.I,
+    )
+    if m:
+        return m.group(1).strip("._").strip()
+    return ""
 
 
 def _extract_contact_signals(profile: Mapping[str, Any], posts: Sequence[str] = ()) -> dict[str, Any]:
@@ -623,7 +785,8 @@ def _extract_contact_signals(profile: Mapping[str, Any], posts: Sequence[str] = 
     clean_project_url = ""
     company_domain = ""
     is_app_store = False
-    for raw_url in ([website] if website else []) + _URL_RE.findall(blob):
+    url_candidates = ([website] if website else []) + _URL_RE.findall(blob) + _BARE_DOMAIN_RE.findall(bio)
+    for raw_url in url_candidates:
         u = str(raw_url or "").strip().rstrip(".,);")
         if not u:
             continue
@@ -643,14 +806,23 @@ def _extract_contact_signals(profile: Mapping[str, Any], posts: Sequence[str] = 
             company_domain = dom
             break
 
+    brand_hint = _extract_bio_brand_hint(bio)
+    fallback_website = ""
+    if website:
+        w_u = website if "://" in website else f"https://{website}"
+        w_host = (urlparse(w_u).hostname or "").lower().removeprefix("www.")
+        if w_host and not any(w_host == sh or w_host.endswith("." + sh) for sh in _SOCIAL_HOSTS):
+            fallback_website = website
+
     return {
         "email": email,
         "username": tg_username,
         "phone": phone,
         "whatsapp": whatsapp,
-        "project_url": clean_project_url or website,
+        "project_url": clean_project_url or fallback_website,
         "company_domain": company_domain,
         "is_app_store": is_app_store,
+        "brand_hint": brand_hint,
     }
 
 
@@ -829,6 +1001,8 @@ def collect_follower_leads(
     ofm_share_pct: int = 20,
     max_followers_per_seed: int = 400,
     max_followers_per_seed_total: int = 2500,
+    max_followers_lead: int = 150_000,
+    max_post_age_days: int = 90,
     max_degree: int = 2,
     fit_threshold: float = 1.5,
     cpl_stop_usd: float = 0.50,
@@ -875,6 +1049,8 @@ def collect_follower_leads(
         "jev_treg_spent_usd": 0.0,
         "followers_pulled": 0,
         "filtered_empty_or_seen": 0,
+        "dropped_mega_account": 0,
+        "dropped_inactive": 0,
         "profiles_fetched": 0,
         "jev_evaluated": 0,
         "jev_direct_hits": 0,
@@ -1098,6 +1274,9 @@ def collect_follower_leads(
                         if not profile.get("bio") and not profile.get("badge") and not profile.get("website"):
                             stats["filtered_empty_or_seen"] += 1
                             continue
+                        if not is_ofm and max_followers_lead > 0 and int(profile.get("followers_count") or 0) > max_followers_lead:
+                            stats["dropped_mega_account"] += 1
+                            continue
 
                         judgment = _judge_jev(
                             profile,
@@ -1113,6 +1292,7 @@ def collect_follower_leads(
                         lane_evals += 1
 
                         posts: list[str] = []
+                        posts_meta: dict[str, Any] = {}
                         company_info: dict[str, Any] = {}
                         prelim_contacts = _extract_contact_signals(profile)
                         need_pass2 = (
@@ -1132,7 +1312,15 @@ def collect_follower_leads(
                             plat_spent += c_posts
                             stats["posts_fetched"] += 1
                             if post_st == 200 and post_body:
-                                posts = _extract_posts_texts(post_body)
+                                posts_meta = _extract_posts_with_meta(post_body)
+                                posts = list(posts_meta.get("original_texts") or posts_meta.get("all_texts") or [])
+                                if posts_meta.get("all_retweets") or (
+                                    max_post_age_days > 0
+                                    and posts_meta.get("original_age_days") is not None
+                                    and float(posts_meta["original_age_days"]) > max_post_age_days
+                                ):
+                                    stats["dropped_inactive"] += 1
+                                    continue
                                 judgment = _judge_jev(
                                     profile,
                                     product_ctx=product_ctx,
@@ -1178,7 +1366,7 @@ def collect_follower_leads(
                         if final_fit < fit_threshold:
                             continue
 
-                        # Fetch recent posts for final leads if not yet read, for pain quote personalization
+                        # Fetch recent posts for final leads if not yet read, for recency gate + pain_quote
                         if not posts and plat == "x" and _can_spend(lane_spent[0], lane_cap, EST_COST_X_POSTS):
                             post_st, post_body, post_cost = caller(
                                 EP_X_POSTS,
@@ -1192,7 +1380,15 @@ def collect_follower_leads(
                             plat_spent += c_posts
                             stats["posts_fetched"] += 1
                             if post_st == 200 and post_body:
-                                posts = _extract_posts_texts(post_body)
+                                posts_meta = _extract_posts_with_meta(post_body)
+                                posts = list(posts_meta.get("original_texts") or posts_meta.get("all_texts") or [])
+                                if posts_meta.get("all_retweets") or (
+                                    max_post_age_days > 0
+                                    and posts_meta.get("original_age_days") is not None
+                                    and float(posts_meta["original_age_days"]) > max_post_age_days
+                                ):
+                                    stats["dropped_inactive"] += 1
+                                    continue
 
                         contacts = _extract_contact_signals(profile, posts=posts)
                         if not is_ofm and market_profile == "gcc_december":
@@ -1210,7 +1406,14 @@ def collect_follower_leads(
                         gcc_tone = "growth" if biz_type == "crypto_infobiz" else "brand"
                         offer_model = "fix_retainer" if biz_type in {"clinic_healthtech", "d2c_physical"} else "revshare_cpa"
                         pain_quote = _pick_pain_quote(posts, str(profile.get("bio") or ""))
-                        proj_name = str(company_info.get("name") or profile.get("name") or profile["handle"]).strip()[:80]
+                        dom_stem = (contacts["company_domain"].split(".")[0] if contacts["company_domain"] else "")
+                        proj_name = str(
+                            company_info.get("name")
+                            or contacts.get("brand_hint")
+                            or dom_stem
+                            or profile.get("name")
+                            or profile["handle"]
+                        ).strip()[:80]
                         icp_score = min(98, max(75, int(round(60 + final_fit * 19))))
 
                         links: list[str] = []
@@ -1231,6 +1434,7 @@ def collect_follower_leads(
                         row = {
                             "id": f"follower_graph:{plat}:{profile['handle'].casefold()}",
                             "name": profile.get("name") or profile["handle"],
+                            "founder_name": str(profile.get("name") or "").strip(),
                             "username": contacts["username"],
                             "telegram_username": contacts["username"],
                             "founder_x": social_profile_url if plat == "x" else "",
@@ -1359,6 +1563,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--ofm-share-pct", type=int, default=20)
     parser.add_argument("--max-followers-per-seed", type=int, default=400)
     parser.add_argument("--max-followers-per-seed-total", type=int, default=2500)
+    parser.add_argument("--max-followers-lead", type=int, default=150_000)
+    parser.add_argument("--max-post-age-days", type=int, default=90)
     parser.add_argument("--max-degree", type=int, default=2)
     parser.add_argument("--fit-threshold", type=float, default=1.5)
     parser.add_argument("--cpl-stop-usd", type=float, default=0.50)
@@ -1389,6 +1595,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             ofm_share_pct=args.ofm_share_pct,
             max_followers_per_seed=args.max_followers_per_seed,
             max_followers_per_seed_total=args.max_followers_per_seed_total,
+            max_followers_lead=args.max_followers_lead,
+            max_post_age_days=args.max_post_age_days,
             max_degree=args.max_degree,
             fit_threshold=args.fit_threshold,
             cpl_stop_usd=args.cpl_stop_usd,

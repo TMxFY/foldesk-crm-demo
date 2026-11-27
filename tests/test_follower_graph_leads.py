@@ -472,3 +472,144 @@ def test_collect_follower_leads_cpl_stop_loss(tmp_path: Path) -> None:
 
     assert leads == []
     assert stats["stop_reason"].startswith("cpl_stop_loss:")
+
+
+def test_canary_calibration_mega_ig_vape_inactive_and_contact_signals(tmp_path: Path) -> None:
+    import time as _time
+
+    # 1. Vape / schoolkid bio dropped at $0
+    assert fg._is_empty_follower_account(
+        {
+            "platform": "instagram",
+            "handle": "a7_fed",
+            "followers_count": 1421,
+            "bio": "I love football Founder | Vape Blaze Store @blazevapestore",
+            "profile_image": "https://cdn.example.com/pic.jpg",
+        }
+    )
+
+    # 2. visxa.medium.com excluded from company_domain; bare domain + @brand hint extracted
+    med_contacts = fg._extract_contact_signals(
+        {
+            "platform": "x",
+            "handle": "MoAboshanab_",
+            "name": "Mohamed Aboshanab",
+            "website": "https://visxa.medium.com",
+            "bio": "Founder & CEO, @VISXAHq | Building AI-powered visa application tech",
+        }
+    )
+    assert med_contacts["company_domain"] == ""
+    assert med_contacts["project_url"] == ""
+    assert med_contacts["brand_hint"] == "VISXAHq"
+
+    bare_contacts = fg._extract_contact_signals(
+        {
+            "platform": "instagram",
+            "handle": "brand_owner",
+            "name": "Sara",
+            "bio": "Founder @nawarahijab.uae Dubai contact: hi@gmail.com site: nawarahijab.com",
+        }
+    )
+    assert bare_contacts["company_domain"] == "nawarahijab.com"
+    assert bare_contacts["project_url"] == "https://nawarahijab.com"
+    assert bare_contacts["email"] == "hi@gmail.com"
+
+    # 3. Collector: IG output.followers 2.77M dropped (dropped_mega_account), X all-RT / >90d inactive dropped (dropped_inactive)
+    now_ts = _time.time()
+    old_ts = now_ts - (120 * 86400)
+    fresh_ts = now_ts - (2 * 86400)
+    conn = _make_ledger_conn()
+
+    def mock_treg(endpoint: str, *, method=None, data=None, query=None, headers=None, timeout=60):
+        if endpoint == fg.EP_X_FOLLOWERS:
+            return (
+                200,
+                {
+                    "data": {
+                        "followers": [
+                            {"screen_name": "rt_only_exec", "name": "Retweet Exec", "followers_count": 400},
+                            {"screen_name": "old_writer", "name": "Old Writer", "followers_count": 600},
+                            {"screen_name": "active_founder", "name": "Active Founder", "followers_count": 1200},
+                        ],
+                        "more_users": False,
+                    }
+                },
+                0.001,
+            )
+        if endpoint == fg.EP_IG_FOLLOWERS:
+            return (
+                200,
+                {
+                    "data": {
+                        "data": [
+                            {"username": "mega_celeb", "full_name": "Mega Celeb", "is_private": False, "follower_count": 0, "profile_pic_url": "https://cdn.example.com/celeb.jpg"},
+                        ],
+                        "pagination_token": "",
+                    }
+                },
+                0.002,
+            )
+        if endpoint == fg.EP_X_PROFILE:
+            uname = (data or {}).get("username")
+            return (
+                200,
+                {
+                    "output": {
+                        "name": uname,
+                        "description": f"Founder & CEO of @Corp_{uname} building AI consumer app in UAE",
+                        "location": "Dubai, UAE",
+                        "followers_count": 900,
+                    }
+                },
+                0.001,
+            )
+        if endpoint == fg.EP_IG_PROFILE:
+            return (
+                200,
+                {
+                    "output": {
+                        "username": "mega_celeb",
+                        "full_name": "Mega Celeb",
+                        "followers": 2_777_089,
+                        "biography": "Fashion founder Dubai",
+                    }
+                },
+                0.001,
+            )
+        if endpoint == fg.EP_X_POSTS:
+            uname = (data or {}).get("username")
+            if uname == "rt_only_exec":
+                return 200, {"output": {"posts": [{"text": "RT @someone: announcement", "createdUtc": fresh_ts}]}}, 0.001
+            if uname == "old_writer":
+                return 200, {"output": {"posts": [{"text": "Our original February post", "createdUtc": old_ts}]}}, 0.001
+            return 200, {"output": {"posts": [{"text": "Scaling our Dubai AI product", "createdUtc": fresh_ts}]}}, 0.001
+        return 404, {}, 0.0
+
+    leads, _, stats = fg.collect_follower_leads(
+        day=date(2026, 12, 4),
+        state={},
+        market_profile="gcc_december",
+        platforms=("x", "instagram"),
+        seeds_x=("Hub71AD",),
+        seeds_ig=("sallaapp",),
+        seeds_x_ofm=(),
+        seeds_ig_ofm=(),
+        budget_usd=2.0,
+        ofm_share_pct=0,
+        max_followers_per_seed=20,
+        max_followers_lead=150_000,
+        max_post_age_days=90,
+        max_degree=1,
+        fit_threshold=1.5,
+        conn=conn,
+        treg_call_fn=mock_treg,
+        jev_direct_fn=lambda _: {"fit": 1.8, "enough": 0.9, "business_type": "ai_saas_app", "role": "founder_exec", "is_gcc_mena": 0.95},
+        jev_cache_path=tmp_path / "jev_cache.json",
+    )
+
+    assert stats["dropped_mega_account"] == 1
+    assert stats["dropped_inactive"] == 2
+    assert len(leads) == 1
+    assert leads[0]["id"] == "follower_graph:x:active_founder"
+    assert leads[0]["founder_name"] == "active_founder"
+    assert leads[0]["company"] == "Corp_active_founder"
