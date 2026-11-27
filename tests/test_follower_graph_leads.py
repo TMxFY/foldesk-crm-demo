@@ -40,21 +40,60 @@ def test_escape_and_build_jev_state_neutralizes_prompt_injection() -> None:
 
 def test_is_empty_follower_account_filters_bots_and_private_ig() -> None:
     assert fg._is_empty_follower_account(
-        {"platform": "x", "handle": "bot1", "followers": 2, "default_profile_image": True, "bio": ""}
+        {
+            "platform": "x",
+            "handle": "bot1",
+            "followers_count": 2,
+            "profile_image": "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+            "bio": "",
+        }
     )
     assert fg._is_empty_follower_account(
-        {"platform": "instagram", "handle": "priv_ig", "followers": 500, "is_private": True, "bio": "CEO"}
+        {"platform": "instagram", "handle": "priv_ig", "followers_count": 500, "is_private": True, "bio": "CEO"}
     )
     assert not fg._is_empty_follower_account(
         {
             "platform": "x",
             "handle": "real_founder",
-            "followers": 4200,
-            "default_profile_image": False,
+            "followers_count": 4200,
+            "profile_image": "https://pbs.twimg.com/profile_images/123456/real_founder.jpg",
             "bio": "Founder building D2C skincare in Riyadh https://glow.sa",
             "website": "https://glow.sa",
         }
     )
+
+
+def test_extract_follower_items_x_url_fallback_and_skips_tco() -> None:
+    items, next_cur, more = fg._extract_follower_items(
+        {
+            "data": {
+                "followers": [
+                    {
+                        "screen_name": "direct_url_user",
+                        "name": "Direct",
+                        "description": "Brand",
+                        "followers_count": 1000,
+                        "url": "https://adamhealth.sa",
+                    },
+                    {
+                        "screen_name": "tco_only_user",
+                        "name": "TcoOnly",
+                        "description": "Brand",
+                        "followers_count": 1000,
+                        "url": "https://t.co/short123",
+                    },
+                ],
+                "more_users": False,
+                "next_cursor": "",
+            }
+        },
+        "x",
+    )
+    assert not more
+    assert next_cur == ""
+    by_handle = {row["handle"]: row for row in items}
+    assert by_handle["direct_url_user"]["website"] == "https://adamhealth.sa"
+    assert by_handle["tco_only_user"]["website"] == ""
 
 
 def test_passes_eg_jo_size_gate() -> None:
@@ -63,20 +102,36 @@ def test_passes_eg_jo_size_gate() -> None:
         "handle": "cairo_shop",
         "bio": "Handmade candles Cairo Egypt",
         "location": "Cairo, Egypt",
-        "followers": 1200,
+        "followers_count": 1200,
         "website": "https://smallcandles.eg",
     }
-    assert not fg.passes_eg_jo_size_gate(small_eg, {"domain": "smallcandles.eg"})
+    small_contacts = fg._extract_contact_signals(small_eg)
+    assert small_contacts["is_app_store"] is False
+    assert not fg.passes_eg_jo_size_gate(small_eg, small_contacts)
 
     big_eg = {
         "platform": "x",
         "handle": "cairo_app",
         "bio": "Leading telehealth app in Cairo Egypt",
         "location": "Cairo, Egypt",
-        "followers": 32000,
+        "followers_count": 32000,
         "website": "https://apps.apple.com/app/id123456",
     }
-    assert fg.passes_eg_jo_size_gate(big_eg, {"domain": "telehealth.eg"})
+    big_contacts = fg._extract_contact_signals(big_eg)
+    assert big_contacts["is_app_store"] is True
+    assert fg.passes_eg_jo_size_gate(big_eg, big_contacts)
+
+    small_eg_app = {
+        "platform": "x",
+        "handle": "cairo_app_small",
+        "bio": "Telehealth app in Cairo Egypt",
+        "location": "Cairo, Egypt",
+        "followers_count": 3500,
+        "website": "https://apps.apple.com/app/id999999",
+    }
+    small_app_contacts = fg._extract_contact_signals(small_eg_app)
+    assert small_app_contacts["is_app_store"] is True
+    assert fg.passes_eg_jo_size_gate(small_eg_app, small_app_contacts)
 
 
 def test_should_promote_to_second_degree_gates() -> None:
@@ -85,21 +140,28 @@ def test_should_promote_to_second_degree_gates() -> None:
         "handle": "RiyadhClinics",
         "bio": "Multi-location dermatology & aesthetics clinics in Riyadh Saudi Arabia",
         "location": "Riyadh, KSA",
-        "followers": 15000,
+        "followers_count": 15000,
         "website": "https://riyadhclinics.sa",
+    }
+    good_judgment = {
+        "fit": 1.95,
+        "enough": 0.9,
+        "business_type": "clinic_healthtech",
+        "role": "founder_exec",
+        "is_gcc_mena": 0.95,
     }
     assert fg.should_promote_to_second_degree(
         good_profile,
-        {"fit": 1.95, "enough": 0.9},
-        {"domain": "riyadhclinics.sa"},
+        good_judgment,
+        {"company_domain": "riyadhclinics.sa"},
         seen_seeds=set(),
         market_profile="gcc_december",
     )
     assert not fg.should_promote_to_second_degree(
         good_profile,
-        {"fit": 1.95, "enough": 0.9},
-        {"domain": "riyadhclinics.sa"},
-        seen_seeds={"x:riyadhclinics"},
+        good_judgment,
+        {"company_domain": "riyadhclinics.sa"},
+        seen_seeds={"riyadhclinics"},
         market_profile="gcc_december",
     )
     agency_profile = {
@@ -107,13 +169,13 @@ def test_should_promote_to_second_degree_gates() -> None:
         "handle": "gcc_smma",
         "bio": "UGC marketing agency for Saudi brands",
         "location": "Dubai, UAE",
-        "followers": 8000,
+        "followers_count": 8000,
         "website": "https://gccsmma.ae",
     }
     assert not fg.should_promote_to_second_degree(
         agency_profile,
-        {"fit": 1.95, "enough": 0.9},
-        {"domain": "gccsmma.ae"},
+        {"fit": 1.95, "enough": 0.9, "business_type": "agency_service", "role": "agency_freelancer", "is_gcc_mena": 0.95},
+        {"company_domain": "gccsmma.ae"},
         seen_seeds=set(),
         market_profile="gcc_december",
     )
@@ -206,21 +268,55 @@ def test_collect_follower_leads_x_and_ig_two_pass_ledger_and_ofm_isolation(tmp_p
         if endpoint == fg.EP_JEV_OPENROUTER:
             return (
                 200,
-                {"answers": {"fit": {"score": 1.8}, "enough": {"score": 0.9}}},
+                {
+                    "answers": {
+                        "fit": {"score": 1.8},
+                        "role": {"choice": "founder_exec"},
+                        "business_type": {"choice": "clinic_healthtech"},
+                        "is_gcc_mena": {"noul": 0.95},
+                        "enough": {"noul": 0.9},
+                    }
+                },
                 0.0001,
             )
         return 404, {}, 0.0
 
     def mock_jev(state_xml: str) -> dict | None:
         if "adamhealth_sa" in state_xml:
+            if "company lookup (source: treg)" in state_xml:
+                return {
+                    "fit": 1.85,
+                    "enough": 0.95,
+                    "business_type": "clinic_healthtech",
+                    "role": "founder_exec",
+                    "is_gcc_mena": 0.95,
+                }
             if "Scaling our Riyadh lab packages" in state_xml:
-                return {"fit": 1.85, "enough": 0.95}
-            return {"fit": 1.4, "enough": 0.25}  # triggers 2-pass posts + company enrich
+                return {
+                    "fit": 1.45,
+                    "enough": 0.35,
+                    "business_type": "clinic_healthtech",
+                    "role": "founder_exec",
+                    "is_gcc_mena": 0.95,
+                }
+            return {
+                "fit": 1.4,
+                "enough": 0.25,
+                "business_type": "clinic_healthtech",
+                "role": "founder_exec",
+                "is_gcc_mena": 0.95,
+            }  # triggers 2-pass posts + company enrich
         if "onlyfans_vip_model" in state_xml:
-            return {"fit": 1.75, "enough": 0.9}
-        return {"fit": 0.2, "enough": 0.9}
+            return {
+                "fit": 1.75,
+                "enough": 0.9,
+                "business_type": "ofm_creator_agency",
+                "role": "creator",
+                "is_gcc_mena": 0.1,
+            }
+        return {"fit": 0.2, "enough": 0.9, "business_type": "other", "role": "other", "is_gcc_mena": 0.0}
 
-    leads, summary, state = fg.collect_follower_leads(
+    leads, new_state, stats = fg.collect_follower_leads(
         day=date(2026, 12, 1),
         state={},
         market_profile="gcc_december",
@@ -240,22 +336,31 @@ def test_collect_follower_leads_x_and_ig_two_pass_ledger_and_ofm_isolation(tmp_p
         jev_cache_path=tmp_path / "jev_cache.json",
     )
 
-    handles = {lead.get("handle") for lead in leads}
-    assert "adamhealth_sa" in handles
-    assert "onlyfans_vip_model" in handles
-    assert "empty_bot" not in handles
-    assert "smma_agency" not in handles
-    assert "ig_private_user" not in handles
+    ids = {lead["id"] for lead in leads}
+    assert "follower_graph:x:adamhealth_sa" in ids
+    assert "follower_graph:instagram:onlyfans_vip_model" in ids
+    assert "follower_graph:x:empty_bot" not in ids
+    assert "follower_graph:x:smma_agency" not in ids
+    assert "follower_graph:instagram:ig_private_user" not in ids
 
-    by_handle = {lead["handle"]: lead for lead in leads}
-    assert by_handle["onlyfans_vip_model"]["segment"] == "ofm"
-    assert by_handle["onlyfans_vip_model"]["source"] == "follower_graph_ofm"
-    assert by_handle["adamhealth_sa"]["source"] == "follower_graph"
+    by_id = {lead["id"]: lead for lead in leads}
+    adam = by_id["follower_graph:x:adamhealth_sa"]
+    assert adam["founder_x"] == "https://x.com/adamhealth_sa"
+    assert adam["segment"] == "whale"
+    assert adam["source"] == "follower_graph"
+    assert adam["business_type"] == "clinic_healthtech"
+
+    ofm = by_id["follower_graph:instagram:onlyfans_vip_model"]
+    assert ofm["instagram_handle"] == "onlyfans_vip_model"
+    assert ofm["segment"] == "ofm"
+    assert ofm["source"] == "follower_graph_ofm"
 
     endpoints_called = [ep for ep, _ in calls]
     assert fg.EP_X_POSTS in endpoints_called
     assert fg.EP_COMPANY_ENRICH in endpoints_called
-    assert summary["spent_usd"] > 0
+    assert stats["spent_usd"] > 0
+    assert stats["stop_reason"] == ""
+    assert "seen" in new_state
 
     ledger_rows = conn.execute("SELECT provider, endpoint, cost_usd FROM enrichment_ledger").fetchall()
     assert len(ledger_rows) >= 2
@@ -273,7 +378,7 @@ def test_collect_follower_leads_openrouter_fallback_and_budget_stop(tmp_path: Pa
                     "name": f"Brand {i}",
                     "description": "D2C brand in Riyadh KSA scaling fast",
                     "followers_count": 3000 + i,
-                    "url": f"https://brand{i}.sa",
+                    "website": f"https://brand{i}.sa",
                     "location": "Riyadh, Saudi Arabia",
                 }
                 for i in range(6)
@@ -282,10 +387,22 @@ def test_collect_follower_leads_openrouter_fallback_and_budget_stop(tmp_path: Pa
         if endpoint == fg.EP_X_POSTS:
             return 200, {"tweets": [{"text": "We launched in KSA"}]}, 0.01
         if endpoint == fg.EP_JEV_OPENROUTER:
-            return 200, {"answers": {"fit": {"score": 1.8}, "enough": {"score": 0.9}}}, 0.03
+            return (
+                200,
+                {
+                    "answers": {
+                        "fit": {"score": 1.8},
+                        "role": {"choice": "founder_exec"},
+                        "business_type": {"choice": "d2c_physical"},
+                        "is_gcc_mena": {"noul": 0.95},
+                        "enough": {"noul": 0.9},
+                    }
+                },
+                0.03,
+            )
         return 404, {}, 0.0
 
-    leads, summary, _ = fg.collect_follower_leads(
+    leads, _, stats = fg.collect_follower_leads(
         day=date(2026, 12, 2),
         state={},
         market_profile="gcc_december",
@@ -302,13 +419,15 @@ def test_collect_follower_leads_openrouter_fallback_and_budget_stop(tmp_path: Pa
         cpl_stop_usd=5.0,
         conn=conn,
         treg_call_fn=mock_treg,
-        jev_direct_fn=None,  # force OpenRouter fallback
+        jev_direct_fn=lambda _: None,  # deterministically trigger OpenRouter fallback
         jev_cache_path=tmp_path / "jev_cache.json",
     )
 
-    assert summary["spent_usd"] <= 0.09  # stops right when budget ceiling reached
-    assert summary["stopped_reason"] in ("budget_cap", "")
+    assert stats["jev_treg_fallbacks"] >= 1
+    assert stats["spent_usd"] <= 0.09  # stops right when budget ceiling reached
+    assert stats["stop_reason"] in ("budget_cap", "")
     assert len(leads) >= 1
+    assert leads[0]["business_type"] == "d2c_physical"
 
 
 def test_collect_follower_leads_cpl_stop_loss(tmp_path: Path) -> None:
@@ -322,15 +441,15 @@ def test_collect_follower_leads_cpl_stop_loss(tmp_path: Path) -> None:
                     "name": f"User {i}",
                     "description": "Personal diary blog in Dubai",
                     "followers_count": 600,
-                    "url": f"https://blog{i}.ae",
+                    "website": f"https://blog{i}.ae",
                     "location": "Dubai",
                 }
-                for i in range(3)
+                for i in range(25)
             ]
             return 200, {"data": {"followers": followers, "more_users": False}}, 0.60
         return 404, {}, 0.0
 
-    leads, summary, _ = fg.collect_follower_leads(
+    leads, _, stats = fg.collect_follower_leads(
         day=date(2026, 12, 3),
         state={},
         market_profile="gcc_december",
@@ -341,15 +460,15 @@ def test_collect_follower_leads_cpl_stop_loss(tmp_path: Path) -> None:
         seeds_ig_ofm=(),
         budget_usd=5.0,
         ofm_share_pct=0,
-        max_followers_per_seed=10,
+        max_followers_per_seed=50,
         max_degree=1,
         fit_threshold=1.5,
         cpl_stop_usd=0.50,
         conn=conn,
         treg_call_fn=mock_treg,
-        jev_direct_fn=lambda _: {"fit": 0.1, "enough": 0.9},
+        jev_direct_fn=lambda _: {"fit": 0.1, "enough": 0.9, "business_type": "other", "role": "other", "is_gcc_mena": 0.0},
         jev_cache_path=tmp_path / "jev_cache.json",
     )
 
     assert leads == []
-    assert summary["stopped_reason"] == "cpl_stop_loss"
+    assert stats["stop_reason"].startswith("cpl_stop_loss:")
