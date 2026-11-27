@@ -67,6 +67,68 @@ DEFAULT_WHALES_GEOS: list[str] = [
     "CA",
     "AU",
 ]
+MARKET_PROFILES: tuple[str, ...] = ("global", "gcc_december")
+GCC_PRIMARY_GEOS: list[str] = ["SA", "AE", "QA", "KW", "BH", "OM"]
+GCC_EXTENDED_GEOS: list[str] = ["EG", "JO"]
+DEFAULT_GCC_TG_GROUPS: list[str] = [
+    "dubai_startups",
+    "dubaibusinesschat",
+    "uae_entrepreneurs",
+    "menastartups",
+    "dubaicryptochat",
+    "dubai_ecommerce",
+    "saudi_entrepreneurs",
+    "riyadh_startups",
+    "mena_founders",
+    "dubai_founders",
+    "gcc_ecommerce",
+    "dubai_marketing",
+    "uae_business_network",
+    "mena_tech_founders",
+    "arab_startups",
+]
+DEFAULT_FOLLOWER_SEEDS_X_GCC: list[str] = [
+    "sallaapp",
+    "zidapp",
+    "Hub71AD",
+    "Flat6Labs",
+    "WamdaME",
+    "TAQADAM",
+    "MonshaatSA",
+    "SanabilInvest",
+    "STV_VC",
+    "RaedVC",
+    "Impact46_sa",
+    "miskksa",
+    "magniTT",
+    "tabby_ai",
+    "tamara_co",
+    "arcads_ai",
+    "Creatify_AI",
+    "makeugc",
+    "Pamba_ai",
+    "UseFastlane",
+    "karolzdeb",
+]
+DEFAULT_FOLLOWER_SEEDS_IG_GCC: list[str] = [
+    "sallaapp",
+    "zidapp",
+    "hub71ad",
+    "flat6labs",
+    "wamdame",
+    "magnitt",
+    "tabby.ai",
+    "usetamara",
+    "arcads.ai",
+    "creatify.ai",
+]
+DEFAULT_FOLLOWER_SEEDS_X_OFM: list[str] = [
+    "OnlyFans",
+    "Fansly",
+]
+DEFAULT_FOLLOWER_SEEDS_IG_OFM: list[str] = [
+    "onlyfans",
+]
 DEFAULT_VPS_JOBS_SESSION = "/opt/crmtg/data/scraper_sessions/jobs_reader.session"
 
 
@@ -100,6 +162,7 @@ def _read_cases_bank() -> str:
 DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
     "enabled": True,
     "auto_push_to_crm": True,
+    "active_market_profile": "global",
     "total_daily_quota": 50,
     "b2b": {
         "enabled": True,
@@ -134,6 +197,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "buyer_catalogs": True,
             "linkedin_jobs": True,
             "tg_identity_bridge": True,
+            "follower_graph": False,
             "hh_ru": True,
             "profi_ru": True,
             "kwork": True,
@@ -150,6 +214,7 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
             "appfounders",
             "marketing_chat",
         ],
+        "gcc_tg_groups": list(DEFAULT_GCC_TG_GROUPS),
         "tg_comment_channels": [],
         "ofm_tg_groups": [
             "FranceOFM",
@@ -185,6 +250,25 @@ DEFAULT_LEADGEN_CONFIG: dict[str, Any] = {
         "low_balance_warn_usd": 2.0,
         "low_balance_stop_usd": 0.50,
         "alert_chat_id": "",
+    },
+    "follower_graph": {
+        "enabled": False,
+        "daily_budget_usd": 4.0,
+        "enrichment_sub_budget_usd": 4.0,
+        "discovery_sub_budget_usd": 2.0,
+        "platforms": ["x", "instagram"],
+        "platform_split": {"x": 0.5, "instagram": 0.5},
+        "max_degree": 2,
+        "followers_per_seed_cycle": 400,
+        "max_followers_per_seed_total": 2500,
+        "fit_threshold": 1.5,
+        "ofm_share_pct": 20,
+        "cpl_stop_usd": 0.50,
+        "contactout_for_all_fit_leads": True,
+        "seeds_x_gcc": list(DEFAULT_FOLLOWER_SEEDS_X_GCC),
+        "seeds_ig_gcc": list(DEFAULT_FOLLOWER_SEEDS_IG_GCC),
+        "seeds_x_ofm": list(DEFAULT_FOLLOWER_SEEDS_X_OFM),
+        "seeds_ig_ofm": list(DEFAULT_FOLLOWER_SEEDS_IG_OFM),
     },
     "whales": {
         "geos": list(DEFAULT_WHALES_GEOS),
@@ -399,6 +483,90 @@ def _normalize_enrichment_config(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_social_handles(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        parts = re.split(r"[\n,;]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(x) for x in raw]
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        val = str(p or "").strip().lstrip("@").strip("/")
+        if not val:
+            continue
+        low = val.casefold()
+        if low not in seen:
+            seen.add(low)
+            out.append(val)
+    return out
+
+
+def _normalize_follower_graph_config(raw: Any) -> dict[str, Any]:
+    fg = dict(raw) if isinstance(raw, dict) else {}
+    defaults = DEFAULT_LEADGEN_CONFIG["follower_graph"]
+    raw_platforms = [p.lower() for p in _clean_str_list(fg.get("platforms", defaults["platforms"]))]
+    platforms = [p for p in raw_platforms if p in {"x", "instagram", "tiktok"}] or ["x", "instagram"]
+    raw_split = fg.get("platform_split") if isinstance(fg.get("platform_split"), dict) else defaults["platform_split"]
+    split_norm: dict[str, float] = {}
+    for p in platforms:
+        split_norm[p] = _parse_non_neg_float(
+            raw_split.get(p), float(defaults["platform_split"].get(p, round(1.0 / len(platforms), 4))), f"follower_graph.platform_split.{p}"
+        )
+    return {
+        "enabled": _parse_bool_flag(fg.get("enabled"), defaults["enabled"], "follower_graph.enabled"),
+        "daily_budget_usd": _parse_non_neg_float(
+            fg.get("daily_budget_usd"), defaults["daily_budget_usd"], "follower_graph.daily_budget_usd"
+        ),
+        "enrichment_sub_budget_usd": _parse_non_neg_float(
+            fg.get("enrichment_sub_budget_usd"),
+            defaults["enrichment_sub_budget_usd"],
+            "follower_graph.enrichment_sub_budget_usd",
+        ),
+        "discovery_sub_budget_usd": _parse_non_neg_float(
+            fg.get("discovery_sub_budget_usd"),
+            defaults["discovery_sub_budget_usd"],
+            "follower_graph.discovery_sub_budget_usd",
+        ),
+        "platforms": platforms,
+        "platform_split": split_norm,
+        "max_degree": _parse_int_range(fg.get("max_degree"), defaults["max_degree"], 1, 3, "follower_graph.max_degree"),
+        "followers_per_seed_cycle": _parse_int_range(
+            fg.get("followers_per_seed_cycle"),
+            defaults["followers_per_seed_cycle"],
+            20,
+            5000,
+            "follower_graph.followers_per_seed_cycle",
+        ),
+        "max_followers_per_seed_total": _parse_int_range(
+            fg.get("max_followers_per_seed_total"),
+            defaults["max_followers_per_seed_total"],
+            50,
+            50000,
+            "follower_graph.max_followers_per_seed_total",
+        ),
+        "fit_threshold": _parse_non_neg_float(
+            fg.get("fit_threshold"), defaults["fit_threshold"], "follower_graph.fit_threshold"
+        ),
+        "ofm_share_pct": _parse_int_range(
+            fg.get("ofm_share_pct"), defaults["ofm_share_pct"], 0, 100, "follower_graph.ofm_share_pct"
+        ),
+        "cpl_stop_usd": _parse_non_neg_float(
+            fg.get("cpl_stop_usd"), defaults["cpl_stop_usd"], "follower_graph.cpl_stop_usd"
+        ),
+        "contactout_for_all_fit_leads": _parse_bool_flag(
+            fg.get("contactout_for_all_fit_leads"),
+            defaults["contactout_for_all_fit_leads"],
+            "follower_graph.contactout_for_all_fit_leads",
+        ),
+        "seeds_x_gcc": _clean_social_handles(fg.get("seeds_x_gcc", defaults["seeds_x_gcc"])),
+        "seeds_ig_gcc": _clean_social_handles(fg.get("seeds_ig_gcc", defaults["seeds_ig_gcc"])),
+        "seeds_x_ofm": _clean_social_handles(fg.get("seeds_x_ofm", defaults["seeds_x_ofm"])),
+        "seeds_ig_ofm": _clean_social_handles(fg.get("seeds_ig_ofm", defaults["seeds_ig_ofm"])),
+    }
+
+
 def _normalize_whales_config(raw: Any) -> dict[str, Any]:
     wh = dict(raw) if isinstance(raw, dict) else {}
     defaults = DEFAULT_LEADGEN_CONFIG["whales"]
@@ -482,6 +650,10 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merged = _deep_merge(DEFAULT_LEADGEN_CONFIG, cfg or {})
     merged["enabled"] = bool(merged.get("enabled", True))
     merged["auto_push_to_crm"] = bool(merged.get("auto_push_to_crm", True))
+    raw_profile = str(merged.get("active_market_profile") or "global").strip().lower()
+    if raw_profile not in MARKET_PROFILES:
+        raise ValueError(f"active_market_profile должен быть одним из {MARKET_PROFILES}")
+    merged["active_market_profile"] = raw_profile
 
     try:
         total_quota = int(merged.get("total_daily_quota", 50))
@@ -545,6 +717,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "d2c_whatsapp",
         "ofm_groups",
         "facebook_groups",
+        "follower_graph",
     }
     restricted_legacy_cfg = (
         isinstance(caller_sources, dict)
@@ -570,6 +743,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     b2b["tg_groups_new"] = [
         g for g in cleaned_new_groups if g.lower() not in REMOVED_LEGACY_TG_GROUPS
     ]
+    b2b["gcc_tg_groups"] = _clean_chat_list(b2b.get("gcc_tg_groups", DEFAULT_LEADGEN_CONFIG["b2b"]["gcc_tg_groups"]))
     b2b["tg_comment_channels"] = _clean_chat_list(b2b.get("tg_comment_channels", []))
     b2b["ofm_tg_groups"] = _clean_chat_list(b2b.get("ofm_tg_groups", DEFAULT_LEADGEN_CONFIG["b2b"]["ofm_tg_groups"]))
     raw_fb_urls = b2b.get("fb_group_urls", [])
@@ -602,6 +776,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merged["b2b"] = b2b
 
     merged["enrichment"] = _normalize_enrichment_config(merged.get("enrichment"))
+    merged["follower_graph"] = _normalize_follower_graph_config(merged.get("follower_graph"))
     merged["whales"] = _normalize_whales_config(merged.get("whales"))
     merged["ru_experts"] = _normalize_ru_experts_config(merged.get("ru_experts"))
 
@@ -768,6 +943,62 @@ def get_leadgen_config(conn: sqlite3.Connection | None = None) -> dict[str, Any]
     return cfg
 
 
+def resolve_effective_market_config(cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a non-mutating runtime overlay for `active_market_profile` (`global` | `gcc_december`)."""
+    base = copy.deepcopy(cfg) if isinstance(cfg, dict) else copy.deepcopy(DEFAULT_LEADGEN_CONFIG)
+    profile = str(base.get("active_market_profile") or "global").strip().lower()
+    if profile != "gcc_december":
+        base["active_market_profile"] = "global"
+        return base
+
+    base["active_market_profile"] = "gcc_december"
+    whales = base.setdefault("whales", {})
+    # 80% rich GCC six + EG/JO (size-gated) + 20% US/GB global tail
+    gcc_geos_weighted = [
+        "SA", "AE", "QA", "KW", "SA", "AE", "BH", "OM",
+        "EG", "JO", "US", "GB",
+    ]
+    whales["geos"] = gcc_geos_weighted
+    whales["gcc_eg_jo_strict_size"] = True
+    whales["gcc_clinic_whitelist"] = True
+
+    enr = base.setdefault("enrichment", {})
+    enr["low_balance_warn_usd"] = max(5.0, float(enr.get("low_balance_warn_usd") or 2.0))
+    fg = base.get("follower_graph") if isinstance(base.get("follower_graph"), dict) else {}
+    fg_defaults = DEFAULT_LEADGEN_CONFIG["follower_graph"]
+    for fg_key in (
+        "enrichment_sub_budget_usd",
+        "discovery_sub_budget_usd",
+        "cpl_stop_usd",
+        "contactout_for_all_fit_leads",
+    ):
+        enr[fg_key] = fg.get(fg_key, enr.get(fg_key, fg_defaults[fg_key]))
+
+    b2b = base.setdefault("b2b", {})
+    existing_groups = list(b2b.get("tg_groups_new") or [])
+    gcc_groups = list(b2b.get("gcc_tg_groups") or DEFAULT_GCC_TG_GROUPS)
+    seen_low = {str(g).strip().lower() for g in existing_groups}
+    for g in gcc_groups:
+        gl = str(g).strip().lower()
+        if gl and gl not in seen_low:
+            seen_low.add(gl)
+            existing_groups.append(g)
+    b2b["tg_groups_new"] = existing_groups
+
+    explicit_fg_off = bool(base.get("_explicit_follower_graph_off"))
+    sources = b2b.setdefault("sources", {})
+    fg_overlay = base.setdefault(
+        "follower_graph", copy.deepcopy(DEFAULT_LEADGEN_CONFIG["follower_graph"])
+    )
+    if explicit_fg_off:
+        sources["follower_graph"] = False
+        fg_overlay["enabled"] = False
+    else:
+        sources["follower_graph"] = True
+        fg_overlay["enabled"] = True
+    return base
+
+
 def save_leadgen_config(
     conn: sqlite3.Connection | None,
     payload: dict[str, Any],
@@ -794,6 +1025,7 @@ def save_leadgen_config(
         "d2c_whatsapp",
         "ofm_groups",
         "facebook_groups",
+        "follower_graph",
     )
     if (
         isinstance(inner_sources, dict)

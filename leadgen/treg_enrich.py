@@ -122,8 +122,22 @@ def root_company_domain(url_or_domain: str) -> str:
     return ".".join(parts)
 
 
+_GLUED_HTTP_SPLIT_RE = re.compile(r"(?i)(?<=.)(?=https?://)")
+_GLUED_TRAILING_HTTP_RE = re.compile(r"(\.[a-z]{2,10})https?$", re.IGNORECASE)
+
+
+def _iter_split_urls(text: str) -> Iterable[str]:
+    """Yield HTTP(S) URLs from text after splitting glued consecutive URLs."""
+    for chunk in _GLUED_HTTP_SPLIT_RE.split(str(text or "")):
+        for match in re.finditer(r"https?://[^\s<>\]\)\"']+", chunk):
+            yield match.group(0).rstrip(".,;:)")
+
+
 def domain_of(url: str) -> str:
     raw_in = str(url or "").strip()
+    if not raw_in:
+        return ""
+    raw_in = _GLUED_HTTP_SPLIT_RE.split(raw_in, maxsplit=1)[0].strip()
     if not raw_in:
         return ""
     if "://" in raw_in:
@@ -134,7 +148,8 @@ def domain_of(url: str) -> str:
         if ":" in raw_in.split("/", 1)[0]:
             return ""
         parsed = urlparse("https://" + raw_in)
-    host = (parsed.hostname or "").lower().removeprefix("www.")
+    host = (parsed.hostname or "").lower().removeprefix("www.").rstrip(".")
+    host = _GLUED_TRAILING_HTTP_RE.sub(r"\1", host)
     if not host or "." not in host:
         return ""
     if any(host == skip or host.endswith("." + skip) for skip in SKIP_HOSTS):
@@ -181,8 +196,7 @@ def _first_linkedin(payload: dict) -> str:
 
 def _first_project_url(payload: dict) -> str:
     for text in walk_strings(payload):
-        for match in re.finditer(r"https?://[^\s<>\]\)\"']+", text):
-            candidate = match.group(0).rstrip(".,;:)")
+        for candidate in _iter_split_urls(text):
             dom = domain_of(candidate)
             if dom:
                 return f"https://{dom}"
@@ -454,8 +468,7 @@ def _normalize_name_key(name: str) -> str:
 
 def _matching_project_url(payload: Any, tokens: list[str]) -> str:
     for text in walk_strings(payload):
-        for match in re.finditer(r"https?://[^\s<>\]\)\"']+", text):
-            candidate = match.group(0).rstrip(".,;:)")
+        for candidate in _iter_split_urls(text):
             dom = domain_of(candidate)
             if dom and any(
                 tok in dom or re.search(rf"\b{re.escape(tok)}\b", candidate.lower())

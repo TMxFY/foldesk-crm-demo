@@ -705,6 +705,25 @@ def _normalize_http_url(url: str) -> str:
     return clean
 
 
+def _sanitize_project_url(raw_url: Any) -> str:
+    """Split glued URLs and strip trailing TLD+http(s) glue into a clean project URL."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+    parts = re.split(r"(?i)(?<=.)(?=https?://)", raw, maxsplit=1)
+    first = parts[0].strip()
+    dom = domain_of(first)
+    if not dom:
+        return ""
+    norm = _normalize_http_url(first)
+    if norm:
+        parsed = _safe_urlparse(norm)
+        host = _safe_hostname(parsed)
+        if host == dom and len(parts) == 1:
+            return norm
+    return f"https://{dom}"
+
+
 def _url_dedup_key(url: str) -> str:
     parsed = _safe_urlparse(url)
     if parsed is None:
@@ -1558,8 +1577,9 @@ def _collect_urls_from_field(val: Any) -> list[str]:
     if isinstance(val, str):
         s = val.strip()
         if s:
-            for m in _URL_IN_TEXT_RE.finditer(s):
-                urls.append(m.group(0).rstrip(".,;:)'\""))
+            for chunk in re.split(r"(?i)(?<=.)(?=https?://)", s):
+                for m in _URL_IN_TEXT_RE.finditer(chunk):
+                    urls.append(m.group(0).rstrip(".,;:)'\""))
             if not urls:
                 norm = _normalize_http_url(s)
                 if norm:
@@ -2140,6 +2160,7 @@ def _run_phone_waterfall_for_dm(
     batch_budget_remaining_fn: Callable[[], float] | None = None,
     co_budget_remaining: list[float] | None = None,
     default_country: str = "",
+    jev_fit: float = 0.0,
 ) -> dict[str, Any]:
     """Run Layer 1 phone waterfall + free HLR mobile filter for one DM.
 
@@ -2273,16 +2294,18 @@ def _run_phone_waterfall_for_dm(
 
     # d) ContactOut verified fallback ($0.25/hit): ONLY when ContactOut pre-check confirmed phone exists
     enr_cfg = cfg.get("enrichment") if isinstance(cfg, Mapping) and isinstance(cfg.get("enrichment"), Mapping) else {}
+    fg_cfg = cfg.get("follower_graph") if isinstance(cfg, Mapping) and isinstance(cfg.get("follower_graph"), Mapping) else {}
     raw_co_cap = enr_cfg.get("contactout_verified_cap_usd", CONTACTOUT_VERIFIED_PHONE_CAP_USD)
     co_cap = CONTACTOUT_VERIFIED_PHONE_CAP_USD if raw_co_cap is None else max(0.0, float(raw_co_cap))
     co_lead_rem_ok = co_budget_remaining is None or (len(co_budget_remaining) > 0 and co_budget_remaining[0] + 1e-9 >= co_cap)
     batch_rem_ok = batch_budget_remaining_fn is None or (max(0.0, batch_budget_remaining_fn() - spent) + 1e-9 >= co_cap)
+    allow_all_fit = bool(enr_cfg.get("contactout_for_all_fit_leads", fg_cfg.get("contactout_for_all_fit_leads", False))) and float(jev_fit or 0.0) >= 1.5
     if (
         co_avail is True
         and dm_li
         and co_cap > 0.0
         and co_lead_rem_ok
-        and icp_score >= CONTACTOUT_VERIFIED_MIN_ICP
+        and (icp_score >= CONTACTOUT_VERIFIED_MIN_ICP or allow_all_fit)
         and batch_rem_ok
         and _check_budget_guard(budget_guard_fn, "treg", co_cap, endpoint="contactout.people.contact.phone")
     ):
@@ -2363,7 +2386,11 @@ def enrich_lead_contacts(
     else:
         links_list = []
 
-    project_url = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
+    raw_project_url = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
+    clean_project_url = _sanitize_project_url(raw_project_url)
+    project_url = clean_project_url or raw_project_url
+    if clean_project_url and str(out.get("project_url") or "").strip() and out.get("project_url") != clean_project_url:
+        out["project_url"] = clean_project_url
     raw_dom = domain_of(project_url) or domain_of(str(out.get("domain") or out.get("company_domain") or ""))
     dom = root_company_domain(raw_dom) or raw_dom
     if dom and not str(out.get("company_domain") or "").strip():
@@ -2502,11 +2529,13 @@ def enrich_lead_contacts(
                     links_list.append(u)
                     new_links_from_monid.append(u)
 
-            discovered_site = str(fb_ig.get("website") or "").strip()
+            discovered_site = _sanitize_project_url(fb_ig.get("website") or "")
             if discovered_site and not project_url:
                 project_url = discovered_site
                 out["project_url"] = discovered_site
                 dom = dom or root_company_domain(discovered_site) or domain_of(discovered_site)
+                if dom and not str(out.get("company_domain") or "").strip():
+                    out["company_domain"] = dom
                 row_cc = row_cc or _infer_row_country_code(out, dom or domain_of(discovered_site))
                 if monid_cost > 0:
                     tier2_unlocked_contact = True
@@ -2705,11 +2734,13 @@ def enrich_lead_contacts(
             dm_email = str(dm_found.get("work_email") or "").strip()
             if dm_email:
                 email_pool.append(dm_email)
-            dm_site = str(dm_found.get("project_url") or "").strip()
+            dm_site = _sanitize_project_url(dm_found.get("project_url") or "")
             if dm_site and not project_url:
                 project_url = dm_site
                 out["project_url"] = dm_site
-                dom = dom or domain_of(dm_site)
+                dom = dom or root_company_domain(dm_site) or domain_of(dm_site)
+                if dom and not str(out.get("company_domain") or "").strip():
+                    out["company_domain"] = dom
 
         if dm_candidates:
             primary_dm = dm_candidates[0]
@@ -3197,6 +3228,7 @@ def enrich_lead_contacts(
                         ),
                         co_budget_remaining=[0.0] if company_has_phone else co_lead_budget,
                         default_country=row_cc,
+                        jev_fit=float(out.get("jev_fit") or 0.0),
                     )
                     lead_cost += float(wf_res.get("cost") or 0.0)
                     if wf_res.get("phone"):

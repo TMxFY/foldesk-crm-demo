@@ -12857,15 +12857,27 @@ function ensureLeadgenState() {
     state.leadgenConfig = {
       enabled: true,
       auto_push_to_crm: true,
+      active_market_profile: "global",
       total_daily_quota: 50,
       enrichment: {
         daily_budget_cap_usd: 10.0,
         per_lead_cap_usd: 0.05,
         super_whale_cap_usd: 0.15,
+        contactout_verified_cap_usd: 0.25,
         super_whale_icp_min: 92,
         super_whale_pool_min_usd: 10000,
         low_balance_warn_usd: 2.0,
         low_balance_stop_usd: 0.50,
+        alert_chat_id: "",
+      },
+      follower_graph: {
+        enabled: false,
+        daily_budget_usd: 4.0,
+        enrichment_sub_budget_usd: 4.0,
+        discovery_sub_budget_usd: 2.0,
+        cpl_stop_usd: 0.50,
+        contactout_for_all_fit_leads: true,
+        platforms: ["x", "instagram"],
       },
       whales: {
         tg_group_admins_enabled: true,
@@ -12903,6 +12915,7 @@ function ensureLeadgenState() {
           linkedin_jobs: true,
           tg_identity_bridge: true,
           tg_group_admins: true,
+          follower_graph: false,
         },
         tg_groups_old: ["producthunt_heroes", "id1613398776"],
         tg_groups_new: ["productcircle_chat", "saasfounders"],
@@ -13337,7 +13350,11 @@ function renderLeadgenConfig() {
 
   setCheck("#leadgen-enabled-toggle", cfg.enabled !== false);
   setCheck("#leadgen-autopush-toggle", cfg.auto_push_to_crm !== false);
+  setVal("#leadgen-market-profile", cfg.active_market_profile || "global");
   setVal("#leadgen-total-quota", cfg.total_daily_quota ?? 50);
+
+  const fg = cfg.follower_graph || {};
+  setVal("#leadgen-follower-graph-budget", fg.daily_budget_usd ?? enr.follower_api_budget_usd ?? 4.0);
 
   setVal("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 10.0);
   setVal("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.05);
@@ -13356,7 +13373,11 @@ function renderLeadgenConfig() {
   const b2bSources = b2b.sources || {};
   document.querySelectorAll("[data-b2b-source]").forEach((cb) => {
     const key = cb.getAttribute("data-b2b-source");
-    cb.checked = b2bSources[key] !== false;
+    if (key === "follower_graph") {
+      cb.checked = Boolean(b2bSources[key]);
+    } else {
+      cb.checked = b2bSources[key] !== false;
+    }
   });
 
   setCheck("#leadgen-src-tg-group-admins", whales.tg_group_admins_enabled !== false && b2bSources.tg_group_admins !== false);
@@ -13466,15 +13487,23 @@ function collectLeadgenFormPayload() {
   const ruEnabled = getCheck("#leadgen-ru-experts-enabled", false);
   sources.ru_experts = ruEnabled;
 
+  const fg = cfg.follower_graph || {};
+  const fgBudget = getNum("#leadgen-follower-graph-budget", fg.daily_budget_usd ?? 4.0, 0, 100);
   return {
     enabled: getCheck("#leadgen-enabled-toggle", true),
     auto_push_to_crm: getCheck("#leadgen-autopush-toggle", true),
+    active_market_profile: getVal("#leadgen-market-profile", cfg.active_market_profile || "global"),
     total_daily_quota: getNum("#leadgen-total-quota", 50, 0, 500),
     enrichment: {
       ...enr,
       daily_budget_cap_usd: getNum("#leadgen-enrichment-daily-cap", enr.daily_budget_cap_usd ?? 10.0, 0, 500),
       per_lead_cap_usd: getNum("#leadgen-enrichment-per-lead-cap", enr.per_lead_cap_usd ?? 0.05, 0, 10),
       super_whale_cap_usd: getNum("#leadgen-enrichment-super-cap", enr.super_whale_cap_usd ?? 0.15, 0, 10),
+    },
+    follower_graph: {
+      ...fg,
+      enabled: Boolean(sources.follower_graph),
+      daily_budget_usd: fgBudget,
     },
     whales: {
       ...whales,

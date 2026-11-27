@@ -53,6 +53,8 @@ SUPPORTED_COPY_PROFILES = frozenset(
         "social_manual_bridge",
         "ofm",
         "b2b_legacy",
+        "gcc_mena_ar",
+        "gcc_mena_en",
     }
 )
 PROFILE_METADATA: dict[str, dict[str, Any]] = {
@@ -63,13 +65,16 @@ PROFILE_METADATA: dict[str, dict[str, Any]] = {
     "social_manual_bridge": {"language": None, "delays": (0,), "allows_step3_image": False},
     "ofm": {"language": "en", "delays": (0, 24, 24), "allows_step3_image": True},
     "b2b_legacy": {"language": "en", "delays": (0, 24, 24), "allows_step3_image": True},
+    "gcc_mena_ar": {"language": "ar", "delays": (0, 48, 96), "allows_step3_image": False},
+    "gcc_mena_en": {"language": "en", "delays": (0, 48, 96), "allows_step3_image": False},
 }
 
 _LEGACY_BRAND_RE = re.compile(r"\bCreator\s*OS\b", re.I)
 _REVSHARE_CPA_RE = re.compile(r"\b(?:rev[- ]?share|revenue[- ]?share|cpa)\b", re.I)
-_URL_STRIP_RE = re.compile(r"https?://\S+|t\.me/\S+|www\.\S+|@[A-Za-z0-9_]+", re.I)
+_URL_STRIP_RE = re.compile(r"https?://\S+|t\.me/\S+|www\.\S+|@[A-Za-z0-9_]+|\{[A-Za-z0-9_]+\}", re.I)
+_METRIC_STRIP_RE = re.compile(r"\b\d+(?:[.,]\d+)?[kKmMкКмМ%xх]*\b")
 _NEUTRAL_TECH_TOKENS_RE = re.compile(
-    r"\b(?:SoftUGC|AI|UGC|WhatsApp|Telegram|CPM|CTR|KPI|ROI|B2B|D2C|SaaS|IG|TikTok|Shorts|Reels|YouTube|Whop|Content\s+Rewards|Tim\s+RbM|RbM|faceless)\b",
+    r"\b(?:SoftUGC|AI|UGC|WhatsApp|Telegram|CPM|CTR|KPI|ROI|CPA|Revshare|B2B|D2C|SaaS|IG|TikTok|Snapchat|Shorts|Reels|Instagram|YouTube|Whop|Content\s+Rewards|Tim\s+RbM|RbM|faceless|GCC|MENA|KSA|UAE)\b",
     re.I,
 )
 
@@ -141,6 +146,7 @@ _PLACEHOLDER_RE = re.compile(
 )
 _HN_PREFIX_RE = re.compile(r"^(?:show|ask|launch|tell)\s+hn\s*:\s*", re.I)
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 _GENERIC_SITE_BASES = frozenset(
     {
         "t",
@@ -346,8 +352,9 @@ def clean_brand_name(
     their_angle: str = "",
     *,
     allow_cyrillic: bool = False,
+    allow_arabic: bool = False,
 ) -> str:
-    """Extract a clean product/brand name (Latin only by default, or Cyrillic when allow_cyrillic=True)."""
+    """Extract a clean product/brand name (Latin only by default, or Cyrillic/Arabic when enabled)."""
     raw = (raw_name or "").strip()
     raw = _PLACEHOLDER_RE.sub("", raw).strip()
     raw = _HN_PREFIX_RE.sub("", raw).strip()
@@ -372,7 +379,7 @@ def clean_brand_name(
     if raw.startswith("@") or "_" in raw or len(raw) > 36 or person_checker(raw):
         raw = ""
 
-    if raw and raw == raw.lower() and " " not in raw:
+    if raw and not _ARABIC_RE.search(raw) and raw == raw.lower() and " " not in raw:
         raw = _humanize_slug(raw, their_angle=their_angle)
 
     if not raw:
@@ -390,6 +397,8 @@ def clean_brand_name(
                 raw = _humanize_slug(cand, their_angle=their_angle)
 
     if not allow_cyrillic and _CYRILLIC_RE.search(raw):
+        return ""
+    if not allow_arabic and _ARABIC_RE.search(raw):
         return ""
     return raw.strip(" .,;:-/!?")
 
@@ -763,7 +772,8 @@ def resolve_copy_profile(
     del source
     cp = (copy_profile or "").strip().lower()
     seg = (segment or "").strip().lower()
-    lang = (language or "").strip().lower()
+    lang_raw = (language or "").strip().lower()
+    lang = "ar" if (lang_raw in ("ar", "ara", "arabic") or lang_raw.startswith(("ar-", "ar_"))) else lang_raw
 
     aliases = {
         "whale": "whale_mass",
@@ -782,9 +792,13 @@ def resolve_copy_profile(
         "b2b_legacy": "b2b_legacy",
         "legacy": "b2b_legacy",
         "revshare": "b2b_legacy",
+        "gcc_mena_ar": "gcc_mena_ar",
+        "gcc_mena_en": "gcc_mena_en",
     }
     if cp in aliases:
         return aliases[cp]
+    if cp == "gcc_mena":
+        return "gcc_mena_ar" if lang == "ar" else "gcc_mena_en"
     if cp in ("vacancy", "client_reels", "vacancy_assisted"):
         return "vacancy_ru" if lang == "ru" else "vacancy_en"
     if cp not in ("", "default", "auto"):
@@ -800,15 +814,22 @@ def resolve_copy_profile(
         return "vacancy_ru" if lang == "ru" else "vacancy_en"
     if seg == "ofm":
         return "ofm"
+    if seg == "gcc_mena":
+        return "gcc_mena_ar" if lang == "ar" else "gcc_mena_en"
+    if lang == "ar":
+        return "gcc_mena_ar"
     return default_profile
 
 
-def _infer_lead_lang_hint(lead: Mapping[str, Any] | None) -> Literal["ru", "en"]:
+def _infer_lead_lang_hint(lead: Mapping[str, Any] | None) -> Literal["ru", "en", "ar"]:
     if not lead:
         return "en"
-    explicit = str(lead.get("language") or "").strip().lower()
-    if explicit in ("ru", "en"):
-        return explicit  # type: ignore[return-value]
+    for key in ("language", "language_hint"):
+        explicit = str(lead.get(key) or "").strip().lower()
+        if explicit in ("ru", "en", "ar"):
+            return explicit  # type: ignore[return-value]
+        if explicit in ("ara", "arabic") or explicit.startswith(("ar-", "ar_")):
+            return "ar"
     src = str(lead.get("source") or lead.get("lead_source") or "").strip().lower()
     if src in {"hh_ru", "profi_ru", "kwork", "ru_experts", "tg_jobs_ru", "vacancies_ru", "tg_jobs"}:
         return "ru"
@@ -821,6 +842,8 @@ def _infer_lead_lang_hint(lead: Mapping[str, Any] | None) -> Literal["ru", "en"]
     )
     if _CYRILLIC_RE.search(probe):
         return "ru"
+    if _ARABIC_RE.search(probe):
+        return "ar"
     return "en"
 
 
@@ -830,34 +853,38 @@ def resolve_profile_language(
     *,
     lead: Mapping[str, Any] | None = None,
     russian: bool = False,
-) -> Literal["en", "ru"]:
+) -> Literal["en", "ru", "ar"]:
     """Resolve and strictly enforce copy language compatibility with copy_profile."""
     meta = PROFILE_METADATA.get(copy_profile)
     if meta is None:
         raise ValueError(f"Unknown copy_profile: {copy_profile!r}")
     fixed_lang: str | None = meta["language"]
     raw_lang = (language or "").strip().lower()
+    if raw_lang in ("ara", "arabic") or raw_lang.startswith(("ar-", "ar_")):
+        raw_lang = "ar"
     if raw_lang:
-        if raw_lang not in ("en", "ru"):
-            raise ValueError(f"Unsupported language {language!r}; expected 'en' or 'ru'")
+        if raw_lang not in ("en", "ru", "ar"):
+            raise ValueError(f"Unsupported language {language!r}; expected 'en', 'ru', or 'ar'")
         if fixed_lang is not None and raw_lang != fixed_lang:
             raise ValueError(
                 f"Language mismatch: copy_profile={copy_profile!r} requires language={fixed_lang!r}, got {raw_lang!r}"
             )
         return raw_lang  # type: ignore[return-value]
     if russian:
-        if fixed_lang == "en":
-            raise ValueError(f"Language mismatch: copy_profile={copy_profile!r} requires language='en', got russian=True")
+        if fixed_lang in ("en", "ar"):
+            raise ValueError(
+                f"Language mismatch: copy_profile={copy_profile!r} requires language={fixed_lang!r}, got russian=True"
+            )
         return "ru"
-    if fixed_lang in ("en", "ru"):
+    if fixed_lang in ("en", "ru", "ar"):
         return fixed_lang  # type: ignore[return-value]
     if copy_profile == "social_manual_bridge":
         return _infer_lead_lang_hint(lead)
     return "en"
 
 
-def check_copy_language(text: str, expected_language: Literal["en", "ru"]) -> tuple[bool, str]:
-    """Verify generated or customized outreach copy matches expected_language ('en' or 'ru')."""
+def check_copy_language(text: str, expected_language: Literal["en", "ru", "ar"]) -> tuple[bool, str]:
+    """Verify generated or customized outreach copy matches expected_language ('en', 'ru', or 'ar')."""
     s = str(text or "").strip()
     if not s:
         return True, ""
@@ -875,6 +902,17 @@ def check_copy_language(text: str, expected_language: Literal["en", "ru"]) -> tu
         lat_cnt = len(re.findall(r"[A-Za-z]", cleaned))
         if cyr_cnt < 4 or cyr_cnt < lat_cnt:
             return False, "English/non-Cyrillic text is not allowed in a Russian ('ru') campaign"
+        return True, ""
+    if expected_language == "ar":
+        if _CYRILLIC_RE.search(s):
+            return False, "Russian Cyrillic text is not allowed in an Arabic ('ar') campaign"
+        cleaned = _URL_STRIP_RE.sub(" ", s)
+        cleaned = _METRIC_STRIP_RE.sub(" ", cleaned)
+        cleaned = _NEUTRAL_TECH_TOKENS_RE.sub(" ", cleaned)
+        ar_cnt = len(_ARABIC_RE.findall(cleaned))
+        lat_cnt = len(re.findall(r"[A-Za-z]", cleaned))
+        if ar_cnt < 4 or (ar_cnt + lat_cnt > 0 and (ar_cnt / (ar_cnt + lat_cnt)) < 0.35):
+            return False, "Non-Arabic text is not allowed in an Arabic ('ar') campaign"
         return True, ""
     return False, f"Unsupported expected_language: {expected_language!r}"
 
@@ -1136,7 +1174,7 @@ def _build_ru_expert_steps(
 
 def _build_social_manual_bridge_step1(
     *,
-    language: Literal["en", "ru"],
+    language: Literal["en", "ru", "ar"],
     first_name: str,
     brand: str,
 ) -> str:
@@ -1147,12 +1185,246 @@ def _build_social_manual_bridge_step1(
             f"{greeting} Сделали короткий 15-сек пример ролика под {target}, "
             "куда удобнее скинуть, в WhatsApp или Telegram?"
         )
+    if language == "ar":
+        greeting = f"أهلاً {first_name}،" if first_name else "أهلاً،"
+        target = brand or "علامتكم"
+        return (
+            f"{greeting} جهزنا نموذج فيديو تجريبي قصير (15 ثانية) لـ {target}، "
+            "هل يناسبكم إرساله عبر WhatsApp أم Telegram؟"
+        )
     greeting = f"Hey {first_name}" if first_name else "Hey"
     target = brand or "your brand"
     return (
         f"{greeting}, put together a quick 15-sec custom sample reel for {target}, "
         "is WhatsApp or Telegram better to send it over?"
     )
+
+
+_GCC_FIX_RETAINER_RE = re.compile(
+    r"(?:clinic|dental|derma|aesthetic|medical|health|telehealth|lab|skincare|"
+    r"cosmetic|perfume|oud|fragrance|supplement|d2c|e-?com|shopify|salla|zid|"
+    r"عياد|طب|تجميل|بشرة|عطور|عود|متجر)",
+    re.I,
+)
+_GCC_GROWTH_TONE_RE = re.compile(
+    r"(?:crypto|web3|defi|prop|trading|exchange|infobiz|course|coaching|forex|كريبتو|تداول)",
+    re.I,
+)
+_AR_NON_PERSON_FIRST_RE = re.compile(
+    r"^(?:عيادة|مركز|مجمع|شركة|متجر|تطبيق|مؤسسة|أكاديمية|مستشفى|مختبر|براند|منصة)$"
+)
+
+
+def _extract_personal_first_name_ar(raw_name: str, raw_company: str = "") -> str:
+    """Extract a clean personal first name (Arabic or Latin) for Arabic DMs, or ''."""
+    latin_first = _extract_personal_first_name(raw_name, raw_company)
+    if latin_first:
+        return latin_first
+    text = (raw_name or "").strip()
+    if not text or _PLACEHOLDER_RE.search(text) or text.startswith("@") or "://" in text:
+        return ""
+    if re.search(r"\d", text) or "." in text or "_" in text or _NON_PERSON_RE.search(text):
+        return ""
+    tokens = [t for t in re.split(r"[\s|/,&\-]+", text) if t]
+    if not tokens or len(tokens) > 3:
+        return ""
+    first = tokens[0]
+    if _AR_NON_PERSON_FIRST_RE.match(first):
+        return ""
+    comp_clean = re.sub(r"\s+", "", (raw_company or "").strip())
+    if comp_clean and first in comp_clean:
+        return ""
+    if re.fullmatch(r"[\u0600-\u06FF]{2,14}", first):
+        return first
+    return ""
+
+
+def _infer_gcc_offer_model(lead: Mapping[str, Any] | None) -> Literal["fix_retainer", "revshare_cpa"]:
+    if not lead:
+        return "revshare_cpa"
+    explicit = str(lead.get("offer_model") or "").strip().lower()
+    if explicit in ("fix_retainer", "fix", "retainer"):
+        return "fix_retainer"
+    if explicit in ("revshare_cpa", "revshare", "cpa"):
+        return "revshare_cpa"
+    biz_type = str(lead.get("business_type") or "").strip().lower()
+    if biz_type in {"clinic_healthtech", "d2c_physical"}:
+        return "fix_retainer"
+    if biz_type in {"ai_saas_app", "crypto_infobiz"}:
+        return "revshare_cpa"
+    probe = " ".join(
+        str(lead.get(k) or "")
+        for k in ("category", "niche", "lead_niche", "their_angle", "what_they_do", "bio", "company", "project")
+    )
+    if _GCC_FIX_RETAINER_RE.search(probe):
+        return "fix_retainer"
+    return "revshare_cpa"
+
+
+def _infer_gcc_tone(lead: Mapping[str, Any] | None) -> Literal["brand", "growth"]:
+    if not lead:
+        return "brand"
+    explicit = str(lead.get("gcc_tone") or lead.get("tone") or "").strip().lower()
+    if explicit in ("brand", "growth"):
+        return explicit  # type: ignore[return-value]
+    biz_type = str(lead.get("business_type") or "").strip().lower()
+    if biz_type == "crypto_infobiz":
+        return "growth"
+    if biz_type in {"clinic_healthtech", "d2c_physical", "ai_saas_app"}:
+        return "brand"
+    probe = " ".join(
+        str(lead.get(k) or "")
+        for k in ("category", "niche", "lead_niche", "their_angle", "what_they_do", "bio")
+    )
+    if _GCC_GROWTH_TONE_RE.search(probe):
+        return "growth"
+    return "brand"
+
+
+def _build_gcc_mena_steps(
+    *,
+    lang: Literal["en", "ar"],
+    brand: str,
+    first_name: str,
+    lead: Mapping[str, Any] | None = None,
+) -> tuple[str, str, str]:
+    """Build tailored GCC/MENA 3-step sequence for (ar|en) x (fix_retainer|revshare_cpa) x (brand|growth)."""
+    offer_model = _infer_gcc_offer_model(lead)
+    tone = _infer_gcc_tone(lead)
+
+    if lang == "ar":
+        target_ar = brand.strip() or "علامتكم"
+        greeting_name = f" {first_name}" if first_name else ""
+        if offer_model == "fix_retainer":
+            step1 = (
+                f"السلام عليكم{greeting_name}،\n\n"
+                f"اطّلعنا على {target_ar} وحضوركم في السوق الخليجي. الاعتماد على الإعلانات المدفوعة فقط يرفع تكلفة العميل باستمرار، "
+                "بينما إنتاج ريلز يومية بتصوير تقليدي يستهلك وقت الفريق والميزانية.\n\n"
+                "نحن ندير منظومة SoftUGC: إنتاج وتوزيع فيديوهات AI UGC قصيرة عبر شبكة حساباتنا الخاصة على TikTok و Instagram و Snapchat، "
+                "وقد حققنا أكثر من 183.5M مشاهدة خلال 90 يوماً بدون تصوير ميداني.\n\n"
+                "نعمل مع العيادات والعلامات التجارية بنظام باقة شهرية متكاملة ($1.5k للشهر الأول ثم $1.2k شهرياً + CPA على النتائج). "
+                f"هل تودّون استلام 3 فيديوهات تجريبية مجانية مخصصة لـ {target_ar}؟"
+            )
+            step2 = (
+                f"مرحباً مجدداً{greeting_name}، متابعة سريعة بخصوص {target_ar}.\n\n"
+                "يمكننا تجهيز 3 فيديوهات تجريبية مجانية مخصصة لهوية علامتكم لتشاهدوا جودة الطرح والأداء على TikTok و Snapchat و Instagram "
+                "قبل أي التزام بالباقة ($1.5k للشهر الأول ثم $1.2k شهرياً + CPA).\n\n"
+                "هل يناسبكم إرسال النماذج هنا للاطلاع؟"
+            )
+            step3 = (
+                f"متابعة أخيرة بخصوص {target_ar} في حال ضاعت الرسالة بين المحادثات. "
+                "يسعدنا تجهيز 3 فيديوهات تجريبية مجانية لعلامتكم متى ما كان التوقيت مناسباً لكم."
+            )
+            return step1, step2, step3
+
+        if tone == "growth":
+            step1 = (
+                f"أهلاً{greeting_name}،\n\n"
+                f"تابعنا {target_ar}. الاعتماد على الإعلانات الممولة أو الحملات السريعة يرفع تكلفة الاستحواذ بسرعة ويوقف النمو بمجرد إيقاف الصرف.\n\n"
+                "عبر SoftUGC نشغّل توزيعاً يومياً لفيديوهات AI UGC قصيرة على شبكة حساباتنا المملوكة في TikTok و Instagram و Snapchat، "
+                "وحققنا 183.5M مشاهدة خلال 90 يوماً بتكلفة أقل بـ 13 إلى 40 مرة من الطرق التقليدية.\n\n"
+                f"نعمل بنظام revshare أو CPA وتغطون تكلفة الإنتاج فقط. هل نرسل لكم 3 فيديوهات تجريبية مجانية لـ {target_ar} لتروا النتائج عملياً؟"
+            )
+            step2 = (
+                f"أهلاً مجدداً{greeting_name}، نقدر نوصل لـ 500K-2M مشاهدة شهرية مستهدفة لـ {target_ar} "
+                "عبر نظام revshare أو CPA بدون مخاطرة ميزانية إعلانات.\n\n"
+                "هل تودّون استلام 3 فيديوهات تجريبية مجانية مخصصة لمشروعكم اليوم؟"
+            )
+            step3 = (
+                f"تذكير سريع بخصوص {target_ar}: عرض 3 فيديوهات تجريبية مجانية بنظام revshare / CPA ما زال متاحاً متى ما أردتم التجربة."
+            )
+            return step1, step2, step3
+
+        step1 = (
+            f"السلام عليكم{greeting_name}،\n\n"
+            f"اطّلعنا على {target_ar}. التوسع في اكتساب المستخدمين عبر الإعلانات المدفوعة يصبح مكلفاً مع تشبّع المحتوى، "
+            "بينما النشر من حساب واحد لا يكفي لصناعة زخم يومي.\n\n"
+            "نحن ندير منظومة SoftUGC للتوزيع العضوي عبر فيديوهات AI UGC قصيرة وشبكة حساباتنا الخاصة على TikTok و Instagram و Snapchat، "
+            "بإجمالي 183.5M مشاهدة خلال 90 يوماً وبدون تصوير.\n\n"
+            f"نعمل بنظام revshare أو CPA على النتائج مع تغطية تكلفة الإنتاج فقط. هل ترغبون في استلام 3 فيديوهات تجريبية مجانية لـ {target_ar}؟"
+        )
+        step2 = (
+            f"مرحباً مجدداً{greeting_name}، متابعة سريعة حول {target_ar}. "
+            "يمكننا تحقيق وصول عضوي بين 500K و 2M مشاهدة مستهدفة بنظام revshare أو CPA.\n\n"
+            "يسعدنا إرسال 3 فيديوهات تجريبية مجانية مخصصة لعلامتكم للاطلاع على الجودة، هل يناسبكم إرسالها هنا؟"
+        )
+        step3 = (
+            f"متابعة أخيرة بخصوص {target_ar}، يسعدنا مشاركة 3 فيديوهات تجريبية مجانية بنظام revshare / CPA متى ما كان الوقت مناسباً لفريقكم."
+        )
+        return step1, step2, step3
+
+    # lang == "en" (gcc_mena_en)
+    target_en = brand.strip() or "your brand"
+    hello_en = f"Hi {first_name}," if first_name else "Hi,"
+    if offer_model == "fix_retainer":
+        if tone == "growth":
+            step1 = (
+                f"{hello_en}\n\n"
+                f"Saw {target_en} scaling across the GCC. Paid social CPMs in KSA and UAE climb fast when creative fatigues, "
+                "and traditional studio shoots slow down daily testing.\n\n"
+                "We run SoftUGC: daily AI UGC reels distributed across our owned TikTok, Instagram, and Snapchat network, "
+                "driving 183.5M views in 90 days with zero live shoots.\n\n"
+                "We partner with GCC brands on a turnkey retainer ($1.5k first month, $1.2k/mo after + CPA). "
+                f"Want us to send over 3 free demo reels built for {target_en}?"
+            )
+        else:
+            step1 = (
+                f"{hello_en}\n\n"
+                f"Came across {target_en} in the GCC market. Relying solely on paid ads pushes acquisition costs higher each quarter, "
+                "while in-house video production takes weeks per batch.\n\n"
+                "We run SoftUGC: turnkey AI UGC short-form distribution across our owned TikTok, Instagram, and Snapchat accounts, "
+                "delivering 183.5M views in 90 days with zero shoots.\n\n"
+                "For GCC clinics and consumer brands we work on a dedicated monthly model ($1.5k month one, $1.2k/mo ongoing + CPA). "
+                f"Would you like to review 3 free demo reels tailored for {target_en}?"
+            )
+        step2 = (
+            f"Following up on my note for {target_en}. We can bring 500K-2M targeted GCC views/mo on TikTok, Instagram, and Snapchat "
+            "before scaling the $1.5k / $1.2k + CPA retainer.\n\n"
+            f"Happy to send 3 free custom demo reels for {target_en} if you'd like to take a look."
+        )
+        step3 = (
+            f"Quick final check-in regarding {target_en}. Whenever your team is ready to test organic GCC short-form, "
+            "just let me know and I will send over 3 free demo reels."
+        )
+        return step1, step2, step3
+
+    if tone == "growth":
+        step1 = (
+            f"Hey {first_name}," if first_name else "Hey,"
+        ) + (
+            f"\n\nSaw {target_en} pushing growth in MENA. Paid promos spike for a day and stall out, "
+            "while single-page posting rarely builds compounding user flow.\n\n"
+            "We run SoftUGC: daily AI short-form distribution on our owned TikTok, Instagram, and Snapchat account network, "
+            "delivering 183.5M views in 90 days at 13-40x lower cost than traditional clippers.\n\n"
+            f"We work on revshare or CPA where you only cover production costs. Want 3 free demo reels for {target_en}?"
+        )
+        step2 = (
+            f"Bumping this for {target_en}: we can drive 500K-2M targeted GCC/global views on revshare or CPA without ad spend risk.\n\n"
+            "Want me to drop 3 free demo reels here so you can check the angle?"
+        )
+        step3 = (
+            f"Last ping on {target_en} in case this got buried. Happy to send 3 free demo reels on revshare or CPA whenever you want to test."
+        )
+        return step1, step2, step3
+
+    step1 = (
+        f"{hello_en}\n\n"
+        f"Came across {target_en} in the GCC ecosystem. Paid acquisition costs keep rising across MENA, "
+        "and posting from one brand channel rarely delivers consistent daily discovery.\n\n"
+        "We run SoftUGC: organic distribution via AI short-form video and our owned TikTok, Instagram, and Snapchat network, "
+        "generating 183.5M views in 90 days with zero live shoots.\n\n"
+        "We partner on revshare or CPA with only production costs covered on your side. "
+        f"Would you like to see 3 free demo reels tailored for {target_en}?"
+    )
+    step2 = (
+        f"Following up briefly regarding {target_en}. We can generate 500K-2M targeted views across GCC and global audiences on revshare or CPA.\n\n"
+        f"Let me know if you'd like me to share 3 free demo reels for {target_en}."
+    )
+    step3 = (
+        f"Final follow-up for {target_en} in case my earlier message was missed. "
+        "Happy to share 3 free demo reels on revshare or CPA whenever the timing works."
+    )
+    return step1, step2, step3
 
 
 def first_touch(
@@ -1679,10 +1951,31 @@ RU_EXPERT_SYSTEM_PROMPT = (
 SOCIAL_MANUAL_BRIDGE_SYSTEM_PROMPT = (
     "You write a strict 1-line DM bridge for high-ICP leads without Telegram/WhatsApp found yet.\n"
     "Rules:\n"
-    "1. Strictly ONE line (no newlines), matching the requested language ('en' or 'ru').\n"
+    "1. Strictly ONE line (no newlines), matching the requested language ('en', 'ru', or 'ar').\n"
     "2. Ask whether WhatsApp or Telegram is better to send a 15-sec custom sample reel for their brand.\n"
     "3. NO em-dashes (— or –).\n"
     "Return ONLY a valid JSON array: [{\"i\": 0, \"step1_text\": \"...\", \"audience\": \"users\"}, ...]"
+)
+
+GCC_MENA_AR_SYSTEM_PROMPT = (
+    "You write natural modern Gulf business Arabic (فصحى بيضاء خليجية) cold DMs for SoftUGC targeting GCC/MENA brands.\n"
+    "Rules:\n"
+    "1. Natural Gulf business Arabic ONLY, ZERO Cyrillic, NO em-dashes (— or –), NO legacy brand names (only SoftUGC).\n"
+    "2. Mention SoftUGC, 183.5M views in 90 days across TikTok/Instagram/Snapchat owned accounts, zero live shoots.\n"
+    "3. Respect the lead's offer_model: if 'fix_retainer' (clinics/D2C), pitch $1.5k 1st month / $1.2k monthly + CPA; "
+    "if 'revshare_cpa' (apps/crypto/infobiz), pitch revshare or CPA covering production costs only.\n"
+    "4. Always end with a clear offer for 3 free demo reels ('3 فيديوهات تجريبية مجانية').\n"
+    "Return ONLY a valid JSON array: [{\"i\": 0, \"step1_text\": \"...\", \"audience\": \"buyers\"}, ...]"
+)
+
+GCC_MENA_EN_SYSTEM_PROMPT = (
+    "You write tailored GCC/MENA B2B cold DMs for SoftUGC in natural business English.\n"
+    "Rules:\n"
+    "1. English only, ZERO Cyrillic, NO em-dashes (— or –), NO legacy brand names (only SoftUGC).\n"
+    "2. Mention SoftUGC, 183.5M views in 90 days across owned TikTok/Instagram/Snapchat accounts, zero shoots.\n"
+    "3. Respect offer_model ('fix_retainer': $1.5k 1st month / $1.2k/mo + CPA; 'revshare_cpa': revshare or CPA) and tone ('brand' vs 'growth').\n"
+    "4. Offer 3 free demo reels tailored for their brand.\n"
+    "Return ONLY a valid JSON array: [{\"i\": 0, \"step1_text\": \"...\", \"audience\": \"buyers\"}, ...]"
 )
 
 
@@ -1735,7 +2028,7 @@ def _default_steps_for_profile(
     first_name: str,
     role: str,
     audience: str,
-    lang: Literal["en", "ru"],
+    lang: Literal["en", "ru", "ar"],
     prov: Literal["telegram", "whatsapp"],
     showcase: str,
 ) -> tuple[str, str, str]:
@@ -1745,6 +2038,10 @@ def _default_steps_for_profile(
     source = str(lead.get("source") or lead.get("lead_source") or "")
     pool_usd = lead.get("pool_usd") if lead.get("pool_usd") is not None else lead.get("bounty_usd")
 
+    if profile == "gcc_mena_ar":
+        return _build_gcc_mena_steps(lang="ar", brand=brand, first_name=first_name, lead=lead)
+    if profile == "gcc_mena_en":
+        return _build_gcc_mena_steps(lang="en", brand=brand, first_name=first_name, lead=lead)
     if profile == "whale_mass":
         return _build_whale_mass_steps(
             brand=brand,
@@ -1813,7 +2110,7 @@ def build_outreach_sequence(
     """Build complete validated Step 1..N sequence for any SoftUGC copy profile and provider."""
     prov = normalize_provider(provider or str(lead.get("provider") or "telegram"))
     req_lang_raw = (language or "").strip().lower() or None
-    lead_lang_raw = str(lead.get("language") or "").strip().lower() or None
+    lead_lang_raw = str(lead.get("language") or lead.get("language_hint") or "").strip().lower() or None
 
     profile = resolve_copy_profile(
         copy_profile if copy_profile is not None else lead.get("copy_profile"),
@@ -1833,6 +2130,7 @@ def build_outreach_sequence(
     showcase = _resolve_showcase_url(showcase_url=showcase_url, custom=custom, lead=lead)
 
     allow_cyr = lang == "ru"
+    allow_ar = lang == "ar"
     raw_comp = str(lead.get("company") or lead.get("project") or lead.get("brand") or "").strip()
     raw_name = str(lead.get("name") or lead.get("founder_name") or "").strip()
     site = str(lead.get("website") or lead.get("project_url") or lead.get("site") or lead.get("url") or "").strip()
@@ -1846,12 +2144,14 @@ def build_outreach_sequence(
         site=site,
         their_angle=angle,
         allow_cyrillic=allow_cyr,
+        allow_arabic=allow_ar,
     )
-    first_name = (
-        _extract_personal_first_name_ru(raw_name, brand)
-        if allow_cyr
-        else _extract_personal_first_name(raw_name, brand)
-    )
+    if allow_cyr:
+        first_name = _extract_personal_first_name_ru(raw_name, brand)
+    elif allow_ar:
+        first_name = _extract_personal_first_name_ar(raw_name, brand)
+    else:
+        first_name = _extract_personal_first_name(raw_name, brand)
     aud = str((llm_result or {}).get("audience") or lead.get("audience") or "").strip().lower()
     if aud not in VALID_AUDIENCES:
         aud = infer_lead_audience(category=category, company=brand or raw_comp, their_angle=angle, site=site)
@@ -2029,6 +2329,8 @@ def _system_prompt_for_profile(
         "vacancy_en": VACANCY_EN_SYSTEM_PROMPT,
         "ru_expert": RU_EXPERT_SYSTEM_PROMPT,
         "social_manual_bridge": SOCIAL_MANUAL_BRIDGE_SYSTEM_PROMPT,
+        "gcc_mena_ar": GCC_MENA_AR_SYSTEM_PROMPT,
+        "gcc_mena_en": GCC_MENA_EN_SYSTEM_PROMPT,
         "ofm": VLAD_SONNET_SYSTEM_PROMPT,
         "b2b_legacy": VLAD_SONNET_SYSTEM_PROMPT,
     }
@@ -2046,7 +2348,7 @@ def _system_prompt_for_profile(
 def _validate_and_assemble_llm_step1(
     *,
     profile: str,
-    lang: Literal["en", "ru"],
+    lang: Literal["en", "ru", "ar"],
     lead: Mapping[str, Any],
     brand: str,
     obj: Mapping[str, Any],
@@ -2131,6 +2433,18 @@ def _validate_and_assemble_llm_step1(
             elif profile == "ru_expert":
                 if not re.search(r"(?:100|200|300)\s*[kк]\s*₽", raw_s1, re.I):
                     return raw_s1, aud, True
+            elif profile in ("gcc_mena_ar", "gcc_mena_en"):
+                expected_offer = _infer_gcc_offer_model(lead)
+                has_retainer_num = bool(re.search(r"(?:1[.,]5\s*k|1,?500|1[.,]2\s*k|1,?200)", raw_s1, re.I))
+                has_revshare = bool(_REVSHARE_CPA_RE.search(raw_s1))
+                offer_ok = has_retainer_num if expected_offer == "fix_retainer" else has_revshare
+                demo_ok = (
+                    ("فيديوهات تجريبية" in raw_s1 or "تجريبية" in raw_s1)
+                    if profile == "gcc_mena_ar"
+                    else ("demo" in raw_s1.lower())
+                )
+                if offer_ok and demo_ok and "183.5" in raw_s1 and "softugc" in raw_s1.lower():
+                    return raw_s1, aud, True
 
     seq = build_outreach_sequence(
         lead,
@@ -2164,13 +2478,13 @@ def generate_vlad_sonnet_batch(
     custom = _parse_custom_step_templates(custom_step_templates)
 
     resolved_profiles: list[str] = []
-    resolved_langs: list[Literal["en", "ru"]] = []
+    resolved_langs: list[Literal["en", "ru", "ar"]] = []
     brands: list[str] = []
     showcases: list[str] = []
 
     for l in leads:
         req_lang = (language or "").strip().lower() or None
-        lead_lang = str(l.get("language") or "").strip().lower() or None
+        lead_lang = str(l.get("language") or l.get("language_hint") or "").strip().lower() or None
         prof = resolve_copy_profile(
             copy_profile or l.get("copy_profile"),
             segment=segment or l.get("segment"),
@@ -2180,16 +2494,23 @@ def generate_vlad_sonnet_batch(
         )
         lang = resolve_profile_language(prof, req_lang or lead_lang, lead=l)
         allow_cyr = lang == "ru"
+        allow_ar = lang == "ar"
         raw_comp = str(l.get("company") or l.get("project") or l.get("name") or "").strip()
         site = str(l.get("website") or l.get("project_url") or l.get("site") or "").strip()
         angle = str(l.get("their_angle") or l.get("one_liner") or "").strip()
-        brand = clean_brand_name(raw_comp, site=site, their_angle=angle, allow_cyrillic=allow_cyr)
+        brand = clean_brand_name(
+            raw_comp,
+            site=site,
+            their_angle=angle,
+            allow_cyrillic=allow_cyr,
+            allow_arabic=allow_ar,
+        )
         resolved_profiles.append(prof)
         resolved_langs.append(lang)
         brands.append(brand)
         showcases.append(_resolve_showcase_url(custom=custom, lead=l))
 
-    groups: dict[tuple[str, Literal["en", "ru"]], list[int]] = {}
+    groups: dict[tuple[str, Literal["en", "ru", "ar"]], list[int]] = {}
     for idx, (prof, lang) in enumerate(zip(resolved_profiles, resolved_langs)):
         groups.setdefault((prof, lang), []).append(idx)
 

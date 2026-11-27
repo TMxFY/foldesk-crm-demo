@@ -44,6 +44,7 @@ from app.leadgen_settings import (
     find_existing_softugc_tg_campaign,
     get_leadgen_config,
     push_discovered_now,
+    resolve_effective_market_config,
     resolve_target_b2b_tg_campaign_name,
 )
 from app.leads import create_lead as crm_create_lead
@@ -1459,6 +1460,24 @@ def _make_budget_callbacks(
             est_cost = float(rest[1])
         else:
             est_cost = float(estimated_cost or 0.0)
+        ep_name = str(kwargs.get("endpoint") or (rest[0] if len(rest) >= 2 and isinstance(rest[0], str) else "")).strip()
+        if ep_name == "contactout.people.contact.phone" and isinstance(cfg, Mapping):
+            enr_sub = cfg.get("enrichment") if isinstance(cfg.get("enrichment"), Mapping) else {}
+            fg_sub = cfg.get("follower_graph") if isinstance(cfg.get("follower_graph"), Mapping) else {}
+            raw_sub_cap = enr_sub.get("enrichment_sub_budget_usd")
+            if raw_sub_cap is None:
+                raw_sub_cap = fg_sub.get("enrichment_sub_budget_usd")
+            if raw_sub_cap is not None and conn is not None:
+                try:
+                    sub_cap = float(raw_sub_cap)
+                    row_spent = conn.execute(
+                        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM enrichment_ledger WHERE day = date('now') AND endpoint IN ('contactout.people.contact.phone','treg.people.phone.find','crawl4ai.people.phone.find','treg.people.email.find')"
+                    ).fetchone()
+                    spent_sub = float(row_spent[0] or 0.0) if row_spent else 0.0
+                    if spent_sub + est_cost > sub_cap + 1e-9:
+                        return False
+                except Exception:
+                    pass
         ok, _reason = check_and_reserve_budget(
             conn,
             provider=provider,
@@ -3293,10 +3312,75 @@ def _ensure_v2_campaign(
     )
 
 
+GCC_DRAFT_CAMPAIGNS: tuple[str, ...] = ("GCC / MENA — TG", "GCC / MENA — WA")
+
+
+def ensure_gcc_draft_campaigns(
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Idempotently ensure GCC / MENA draft campaigns exist when active_market_profile == 'gcc_december'.
+
+    Never modifies the status of an existing campaign and never auto-starts campaigns.
+    """
+    eff_cfg = dict(cfg) if isinstance(cfg, Mapping) else get_leadgen_config(conn)
+    profile = str(eff_cfg.get("active_market_profile") or "global").strip().lower()
+    if profile != "gcc_december":
+        return []
+
+    steps = [
+        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+        {"step_order": 2, "delay_hours": 24, "template_text": "{step2_text}"},
+        {"step_order": 3, "delay_hours": 72, "template_text": "{step3_text}"},
+    ]
+    ensured: list[dict[str, Any]] = []
+    for camp_name in GCC_DRAFT_CAMPAIGNS:
+        existing = _find_campaign_by_name(conn, camp_name)
+        if existing is not None:
+            ensured.append(existing)
+            continue
+        try:
+            created = create_campaign(
+                conn,
+                name=camp_name,
+                daily_limit=30,
+                steps=steps,
+                status="draft",
+                leadgen_enabled=True,
+                segment="gcc_mena",
+                language="ar",
+                copy_profile="gcc_mena_ar",
+            )
+        except ValueError as exc:
+            # Fallback before app/outreach.py merges language='ar' support
+            if "unsupported campaign language" not in str(exc).lower():
+                raise
+            created = create_campaign(
+                conn,
+                name=camp_name,
+                daily_limit=30,
+                steps=steps,
+                status="draft",
+                leadgen_enabled=True,
+                segment="gcc_mena",
+                language="en",
+                copy_profile="gcc_mena_ar",
+            )
+            conn.execute(
+                "UPDATE campaigns SET language = 'ar', updated_at = ? WHERE id = ?",
+                (utc_now(), int(created["id"])),
+            )
+            conn.commit()
+            created = _find_campaign_by_name(conn, camp_name) or created
+        ensured.append(created)
+    return ensured
+
+
 def _persist_lead_v2_columns(conn: sqlite3.Connection, lead_id: int, row: Mapping[str, Any]) -> None:
     """Persist v2 metadata columns (segment, language, Airtable isolation, manual queue fields) on `leads`."""
     seg = str(row.get("segment") or "").strip().lower() or "b2b"
-    lang = "ru" if str(row.get("language") or "").strip().lower() == "ru" else "en"
+    raw_lang = str(row.get("language") or row.get("language_hint") or "").strip().lower()
+    lang = raw_lang if raw_lang in ("ru", "en", "ar") else "en"
     excl = 1 if (seg == "ru_expert" or bool(row.get("exclude_from_airtable"))) else 0
     domain = str(row.get("company_domain") or row.get("domain") or "").strip() or None
     raw_pool = row.get("pool_usd") if row.get("pool_usd") is not None else row.get("bounty_usd")
@@ -3334,7 +3418,8 @@ def _persist_lead_v2_columns(conn: sqlite3.Connection, lead_id: int, row: Mappin
 def _insert_manual_queue_lead(conn: sqlite3.Connection, row: Mapping[str, Any]) -> int | None:
     """Insert or skip duplicate Manual Social / Assisted Job queue lead into CRM `leads` without auto-sending."""
     seg = str(row.get("segment") or "").strip().lower()
-    lang = "ru" if str(row.get("language") or "").strip().lower() == "ru" else "en"
+    raw_lang = str(row.get("language") or row.get("language_hint") or "").strip().lower()
+    lang = raw_lang if raw_lang in ("ru", "en", "ar") else "en"
     manual_url = str(row.get("manual_action_url") or "").strip()
     if not manual_url:
         return None
@@ -4235,6 +4320,17 @@ def _is_catalog_refresh_due(state_dir: Path, max_age_hours: float = 24.0) -> boo
     return age_sec >= max(0.0, float(max_age_hours)) * 3600.0
 
 
+def _resolve_conn_db_path(conn: sqlite3.Connection) -> str:
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            db_file = str(row[2] or "").strip()
+            if db_file:
+                return db_file
+    except Exception:
+        pass
+    return os.environ.get("CRMTG_DB", DEFAULT_DB_PATH)
+
+
 def _run_autonomous_replenish_locked(
     conn: sqlite3.Connection,
     *,
@@ -4269,6 +4365,7 @@ def _run_autonomous_replenish_locked(
 ) -> dict[str, Any]:
     is_real_subprocess_runner = runner is None or runner is subprocess.run
     active_runner = subprocess.run if runner is None else runner
+    db_path = _resolve_conn_db_path(conn)
 
     cfg = get_leadgen_config(conn)
     if not cfg.get("enabled"):
@@ -4285,9 +4382,13 @@ def _run_autonomous_replenish_locked(
         (os.environ.get("RELAYFAST_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
     )
 
-    # 2. Subtract quarantined sources
+    # 2. Subtract quarantined sources & apply active_market_profile overlay
     quarantined = load_quarantined_sources(conn)
-    eff_cfg = apply_quarantined_sources(cfg, quarantined)
+    eff_cfg = resolve_effective_market_config(apply_quarantined_sources(cfg, quarantined))
+    eff_market_profile = str(eff_cfg.get("active_market_profile") or "global").strip().lower()
+    market_profile = eff_market_profile
+    if eff_market_profile == "gcc_december":
+        ensure_gcc_draft_campaigns(conn, eff_cfg)
     b2b_cfg = eff_cfg["b2b"]
     vac_cfg = eff_cfg["vacancies"]
     whales_cfg = eff_cfg.get("whales") if isinstance(eff_cfg.get("whales"), Mapping) else {}
@@ -4597,6 +4698,7 @@ def _run_autonomous_replenish_locked(
                                 catalog_discovery_fn,
                                 state_dir,
                                 allow_paid=cat_paid_allowed,
+                                market_profile=eff_market_profile,
                             )
                         except Exception as exc:
                             with stage_lock:
@@ -4616,6 +4718,8 @@ def _run_autonomous_replenish_locked(
                             str(state_dir),
                             "--limit",
                             "40",
+                            "--market-profile",
+                            eff_market_profile,
                         ]
                         if not cat_paid_allowed:
                             cat_cmd.append("--no-paid")
@@ -4643,6 +4747,7 @@ def _run_autonomous_replenish_locked(
                     tma_apps_out = state_dir / f"tma_apps_{wave_ts}.jsonl"
                     fb_groups_out = state_dir / f"fb_groups_{wave_ts}.jsonl"
                     b2b_tg_groups_out = state_dir / f"b2b_tg_groups_{wave_ts}.jsonl"
+                    follower_graph_out = state_dir / f"follower_graph_{wave_ts}.jsonl"
                     ofm_review_path = state_dir / "ofm_review_leads.jsonl"
                     pre_ofm_count = _count_jsonl_lines(ofm_review_path) if ofm_review_path.is_file() else 0
 
@@ -4733,6 +4838,8 @@ def _run_autonomous_replenish_locked(
                                 str(max(0, whop_min_pool)),
                                 "--max-runtime-sec",
                                 str(min(220, max(60, int(stage_timeout) - 60))),
+                                "--market-profile",
+                                market_profile,
                             ]
                             web_tasks.append((
                                 "high_yield_veins",
@@ -4811,6 +4918,7 @@ def _run_autonomous_replenish_locked(
                                     for i in range(min(3, len(whales_geos)))
                                 ]
                                 meta_cmd.extend(["--country", ",".join(sliced_geos)])
+                            meta_cmd.extend(["--market-profile", market_profile])
                             wave_ran_sources.add("meta_ads")
                             web_tasks.append((
                                 "meta_ad_leads",
@@ -4831,12 +4939,58 @@ def _run_autonomous_replenish_locked(
                                 str(social_out),
                                 "--seen",
                                 str(state_dir / "treg_social_seen.json"),
+                                "--market-profile",
+                                market_profile,
                             ]
                             web_tasks.append((
                                 "treg_social_leads",
                                 lambda c=_soc_cmd: _exec_stage("treg_social_leads", c),
                             ))
                         elif is_real_subprocess_runner:
+                            _add_reason("missing_treg_cli")
+
+                    if sources_cfg.get("follower_graph", False) and "follower_graph" not in quarantined:
+                        if not paid_cli_discovery_allowed:
+                            _add_reason("budget_guard_skipped:follower_graph")
+                        elif treg_ready or not is_real_subprocess_runner:
+                            fg_cfg = eff_cfg.get("follower_graph") if isinstance(eff_cfg.get("follower_graph"), Mapping) else {}
+                            fg_budget = float(fg_cfg.get("daily_budget_usd") or 4.0)
+                            fg_cmd = [
+                                py_bin,
+                                str(ROOT / "leadgen" / "follower_graph_leads.py"),
+                                "--output",
+                                str(follower_graph_out),
+                                "--state",
+                                str(state_dir / "follower_graph_state.json"),
+                                "--summary-out",
+                                str(state_dir / "follower_graph_last_summary.json"),
+                                "--db",
+                                str(db_path),
+                                "--market-profile",
+                                market_profile,
+                                "--platforms",
+                                ",".join(fg_cfg.get("platforms") or ["x", "instagram"]),
+                                "--budget-usd",
+                                str(fg_budget),
+                                "--ofm-share-pct",
+                                str(int(fg_cfg.get("ofm_share_pct") or 20)),
+                                "--max-followers-per-seed",
+                                str(int(fg_cfg.get("followers_per_seed_cycle") or 400)),
+                                "--max-followers-per-seed-total",
+                                str(int(fg_cfg.get("max_followers_per_seed_total") or 2500)),
+                                "--max-degree",
+                                str(int(fg_cfg.get("max_degree") or 2)),
+                                "--fit-threshold",
+                                str(float(fg_cfg.get("fit_threshold") or 1.5)),
+                                "--cpl-stop-usd",
+                                str(float(fg_cfg.get("cpl_stop_usd") or 0.50)),
+                            ]
+                            wave_ran_sources.add("follower_graph")
+                            web_tasks.append((
+                                "follower_graph",
+                                lambda c=fg_cmd: _exec_stage("follower_graph", c),
+                            ))
+                        else:
                             _add_reason("missing_treg_cli")
 
                     if (
@@ -5136,6 +5290,7 @@ def _run_autonomous_replenish_locked(
                         ("tma_apps", tma_apps_out),
                         ("channel_graph", channel_graph_out),
                         ("tg_ad_spy", ad_spy_out),
+                        ("follower_graph", follower_graph_out),
                     ):
                         cnt_now = _count_jsonl_lines(src_path)
                         wave_source_counts[src_label] = cnt_now
@@ -5187,21 +5342,25 @@ def _run_autonomous_replenish_locked(
                     wave_ms_ingested = 0
                     wave_stamp_rows: list[dict[str, Any]] = []
                     wave_deferred_rows: list[dict[str, Any]] = []
-                    if has_new_rows or not is_real_subprocess_runner:
+                    has_fg_rows = follower_graph_out.is_file() and follower_graph_out.stat().st_size > 0
+                    if has_new_rows or has_fg_rows or not is_real_subprocess_runner:
                         enriched_jsonl = state_dir / f"raw_{wave_ts}.enriched.jsonl"
-                        enrich_ok = _exec_stage(
-                            "tg_enrich_leads",
-                            [
-                                py_bin,
-                                str(ROOT / "leadgen" / "tg_enrich_leads.py"),
-                                "--input",
-                                str(new_jsonl),
-                                "--output",
-                                str(enriched_jsonl),
-                                "--fetch",
-                                "--skip-copy",
-                            ],
-                        )
+                        if has_new_rows or not is_real_subprocess_runner:
+                            enrich_ok = _exec_stage(
+                                "tg_enrich_leads",
+                                [
+                                    py_bin,
+                                    str(ROOT / "leadgen" / "tg_enrich_leads.py"),
+                                    "--input",
+                                    str(new_jsonl),
+                                    "--output",
+                                    str(enriched_jsonl),
+                                    "--fetch",
+                                    "--skip-copy",
+                                ],
+                            )
+                        else:
+                            enrich_ok = True
                         if not enrich_ok:
                             if has_new_rows:
                                 _write_pending_qualify_queue(
@@ -5219,17 +5378,33 @@ def _run_autonomous_replenish_locked(
                                 qualified_jsonl = state_dir / f"raw_{wave_ts}.qualified.jsonl"
                                 curated_jsonl = state_dir / f"raw_{wave_ts}.curated_tmp.jsonl"
                                 final_jsonl = state_dir / f"raw_{wave_ts}.final.jsonl"
-                                qual_ok = _exec_stage(
-                                    "tg_llm_qualify",
-                                    [
-                                        py_bin,
-                                        str(ROOT / "leadgen" / "tg_llm_qualify.py"),
-                                        "--input",
-                                        str(enrich_src),
-                                        "--output",
-                                        str(qualified_jsonl),
-                                    ],
-                                )
+                                if has_new_rows or not is_real_subprocess_runner:
+                                    qual_ok = _exec_stage(
+                                        "tg_llm_qualify",
+                                        [
+                                            py_bin,
+                                            str(ROOT / "leadgen" / "tg_llm_qualify.py"),
+                                            "--input",
+                                            str(enrich_src),
+                                            "--output",
+                                            str(qualified_jsonl),
+                                        ],
+                                    )
+                                else:
+                                    qual_ok = True
+                                # Follower API rows are already Jev-qualified; append directly after tg_llm_qualify
+                                if has_fg_rows:
+                                    fg_rows = _read_jsonl_dicts(follower_graph_out)
+                                    if fg_rows:
+                                        existing_q = qualified_jsonl.read_text(encoding="utf-8") if qualified_jsonl.is_file() else ""
+                                        with qualified_jsonl.open("w", encoding="utf-8") as qfh:
+                                            if existing_q:
+                                                qfh.write(existing_q)
+                                                if not existing_q.endswith("\n"):
+                                                    qfh.write("\n")
+                                            for fg_r in fg_rows:
+                                                qfh.write(json.dumps(fg_r, ensure_ascii=False) + "\n")
+                                        qual_ok = True
                                 # Fail-Closed: if tg_llm_qualify failed or produced 0 qualified leads,
                                 # NEVER fall back to enrich_src — 0 leads advance to tg_curate / CRM!
                                 if (

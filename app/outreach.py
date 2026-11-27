@@ -689,13 +689,14 @@ BLOCKED_OUTREACH_HEALTHS: frozenset[str] = frozenset(
 )
 
 _CYRILLIC_CHAR_RE = re.compile(r"[\u0400-\u04FF]")
+_ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF]")
 _LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
 _INLINE_NON_PROSE_RE = re.compile(
     r"(?:https?://\S+|www\.\S+|t\.me/\S+|(?<!\w)@[A-Za-z0-9_]{2,}|\b[\w.+-]+@[\w-]+\.[\w.-]+\b|\{[^{}]+\}|\b\d+(?:[.,]\d+)?[kKmM%xх]*\b)",
     re.IGNORECASE,
 )
 _INLINE_NEUTRAL_BRAND_RE = re.compile(
-    r"\b(?:softugc|ai|ugc|ofm|tg|wa|ru|en|b2b|saas|d2c|ecom|e-com|crm|api|sdk|cpm|cpa|roi|ltv|ctr|kpi|hr|ceo|cmo|bd|ua|pr|smm|seo|kol|web3|defi|reels|shorts|tiktok|instagram|youtube|telegram|whatsapp|linkedin|upwork|kwork|profi|manychat|heygen|kling|seedance|omni|elevenlabs|higgsfield|faceless|whop|meta|shopify|airtable|stripe|founder|hh)\b",
+    r"\b(?:softugc|ai|ugc|ofm|tg|wa|ru|en|ar|b2b|saas|d2c|ecom|e-com|crm|api|sdk|cpm|cpa|roi|ltv|ctr|kpi|hr|ceo|cmo|bd|ua|pr|smm|seo|kol|web3|defi|revshare|reels|shorts|tiktok|snapchat|instagram|youtube|telegram|whatsapp|linkedin|upwork|kwork|profi|manychat|heygen|kling|seedance|omni|elevenlabs|higgsfield|faceless|whop|meta|shopify|salla|zid|airtable|stripe|founder|hh|gcc|mena|ksa|uae)\b",
     re.IGNORECASE,
 )
 
@@ -708,7 +709,7 @@ except ImportError:  # pragma: no cover
 
 
 _CYRILLIC_WORD_RE = re.compile(r"[А-Яа-яЁё]+")
-_ALPHA_CHAR_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+_ALPHA_CHAR_RE = re.compile(r"[A-Za-zА-Яа-яЁё\u0600-\u06FF]")
 _EN_DISALLOWED_CYRILLIC_WORDS: frozenset[str] = frozenset(
     {
         "привет",
@@ -742,11 +743,26 @@ def _inline_assert_copy_matches_language(
     allow_cyrillic_name: bool = True,
 ) -> tuple[bool, str]:
     lang = str(expected_language or "").strip().lower()
-    if lang not in ("ru", "en"):
+    if lang not in ("ru", "en", "ar"):
         return False, f"Unsupported expected_language: {expected_language!r}"
     raw = str(text or "").strip()
     if not raw:
         return False, "Outreach copy text is empty"
+    if lang == "ar":
+        prose = _INLINE_NEUTRAL_BRAND_RE.sub(" ", _INLINE_NON_PROSE_RE.sub(" ", raw))
+        if _CYRILLIC_CHAR_RE.search(prose):
+            return False, "AR campaign copy must not contain Cyrillic text"
+        ar_count = len(_ARABIC_CHAR_RE.findall(prose))
+        if ar_count < 4:
+            return False, "AR campaign copy must contain Arabic text"
+        lat_count = len(_LATIN_CHAR_RE.findall(prose))
+        ar_ratio = ar_count / (ar_count + lat_count)
+        if ar_ratio < 0.35:
+            return (
+                False,
+                f"AR campaign copy has predominantly non-Arabic text ({ar_ratio:.0%} Arabic)",
+            )
+        return True, ""
     if lang == "en":
         prose = _INLINE_NON_PROSE_RE.sub(" ", raw)
         cyr_words = _CYRILLIC_WORD_RE.findall(prose)
@@ -792,11 +808,18 @@ def assert_campaign_copy_language(
     *,
     allow_cyrillic_name: bool = True,
 ) -> tuple[bool, str]:
-    """Validate outreach copy against campaign.language ('ru' or 'en')."""
+    """Validate outreach copy against campaign.language ('ru', 'en', or 'ar')."""
     raw_lang = str(expected_language or "").strip().lower()
     if not raw_lang:
         return True, ""
-    lang = "ru" if raw_lang in ("ru", "rus", "russian") else ("en" if raw_lang in ("en", "eng", "english") else raw_lang)
+    if raw_lang in ("ru", "rus", "russian") or raw_lang.startswith(("ru-", "ru_")):
+        lang = "ru"
+    elif raw_lang in ("ar", "ara", "arabic") or raw_lang.startswith(("ar-", "ar_")):
+        lang = "ar"
+    elif raw_lang in ("en", "eng", "english") or raw_lang.startswith(("en-", "en_")):
+        lang = "en"
+    else:
+        lang = raw_lang
     if _router_assert_copy_matches_language is not None:
         try:
             return _router_assert_copy_matches_language(
@@ -881,7 +904,7 @@ def _validate_recipient_copy_language(
         if tok and tok != cleaned:
             cleaned = cleaned.replace(tok, " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.!?;:-")
-    if len(_LATIN_CHAR_RE.findall(cleaned)) + len(_CYRILLIC_CHAR_RE.findall(cleaned)) < 2:
+    if len(_LATIN_CHAR_RE.findall(cleaned)) + len(_CYRILLIC_CHAR_RE.findall(cleaned)) + len(_ARABIC_CHAR_RE.findall(cleaned)) < 2:
         return ok, reason
     if cleaned != raw:
         ok2, reason2 = assert_campaign_copy_language(cleaned, camp_lang)
@@ -1035,7 +1058,7 @@ def _validate_template_text_language(
     label: str = "шаблон",
 ) -> str | None:
     lang = str(expected_language or "").strip().lower()
-    if lang not in ("ru", "en"):
+    if lang not in ("ru", "en", "ar"):
         return None
     raw = str(text or "").strip()
     if not raw or not _has_non_placeholder_template_prose(raw):
@@ -3257,7 +3280,7 @@ def _render_step_text(
     else:
         has_csv_token = False
 
-    is_b2b_step0 = step_idx == 0 and _is_b2b_campaign_name(campaign_name) and camp_segment not in ("vacancy", "client_reels", "ru_expert")
+    is_b2b_step0 = step_idx == 0 and _is_b2b_campaign_name(campaign_name) and camp_segment not in ("vacancy", "client_reels", "ru_expert", "gcc_mena")
     sanitize_now = not is_b2b_step0
     is_default_placeholder = (not tmpl) or (tmpl_low in _DEFAULT_BOILERPLATE_TEMPLATES)
 
@@ -3267,7 +3290,7 @@ def _render_step_text(
     else:
         has_v2_profile = (
             camp_profile_raw not in ("", "default", "b2b_legacy")
-            or camp_segment in ("whale", "vacancy", "client_reels", "ru_expert", "ofm")
+            or camp_segment in ("whale", "vacancy", "client_reels", "ru_expert", "ofm", "gcc_mena")
         )
         if not csv_step_val and has_v2_profile and (has_csv_token or is_default_placeholder) and step_idx in (0, 1, 2):
             try:
@@ -3363,11 +3386,13 @@ def _normalize_steps(
     expected_language: str | None = None,
 ) -> list[dict]:
     if not steps:
-        eff_default_tmpl = (
-            "Hey {name}! Quick note about SoftUGC."
-            if str(default_language or "").strip().lower() == "en"
-            else "Привет, {name}! Пишу по поводу сотрудничества."
-        )
+        def_lang = str(default_language or "").strip().lower()
+        if def_lang == "en":
+            eff_default_tmpl = "Hey {name}! Quick note about SoftUGC."
+        elif def_lang == "ar":
+            eff_default_tmpl = "مرحباً {name}، تواصل سريع بخصوص SoftUGC."
+        else:
+            eff_default_tmpl = "Привет, {name}! Пишу по поводу сотрудничества."
         return [
             {
                 "step_order": 1,
@@ -3503,13 +3528,20 @@ def create_campaign(
     eff_copy_profile = str(copy_profile or "").strip().lower() or "default"
     if language is not None and str(language).strip():
         eff_language = str(language).strip().lower()
-        if eff_language not in ("en", "ru"):
+        if eff_language not in ("en", "ru", "ar"):
             raise ValueError(f"Unsupported campaign language: {language!r}")
     else:
         has_cyr_step = bool(
             steps
             and any(
                 isinstance(st, Mapping) and _CYRILLIC_CHAR_RE.search(str(st.get("template_text") or ""))
+                for st in steps
+            )
+        )
+        has_ar_step = bool(
+            steps
+            and any(
+                isinstance(st, Mapping) and _ARABIC_CHAR_RE.search(str(st.get("template_text") or ""))
                 for st in steps
             )
         )
@@ -3521,6 +3553,8 @@ def create_campaign(
             or is_ru_vacancy_name
         ):
             eff_language = "ru"
+        elif eff_copy_profile == "gcc_mena_ar" or has_ar_step:
+            eff_language = "ar"
         else:
             eff_language = "en"
 
@@ -3717,7 +3751,7 @@ def update_campaign(
         new_language = str(current.get("language") or "en").strip().lower() or "en"
     else:
         new_language = str(language).strip().lower()
-        if new_language not in ("en", "ru"):
+        if new_language not in ("en", "ru", "ar"):
             raise ValueError(f"Unsupported campaign language: {language!r}")
     new_copy_profile = (
         str(current.get("copy_profile") or "default")
@@ -4464,7 +4498,7 @@ def import_campaign_csv(
         step2_text = _sanitize_legacy_brand(item.get("step2_text")).strip() or None
         step3_text = _sanitize_legacy_brand(item.get("step3_text")).strip() or None
         camp_lang = str(camp.get("language") or "").strip().lower()
-        if not error_reason and camp_lang in ("ru", "en"):
+        if not error_reason and camp_lang in ("ru", "en", "ar"):
             for lbl, txt_val in (("step1_text", step1_text), ("step2_text", step2_text), ("step3_text", step3_text)):
                 if txt_val:
                     ok_lang, lang_reason = _validate_recipient_copy_language(
@@ -6382,7 +6416,7 @@ async def run_campaign_batch(
                 continue
 
             camp_lang = str(camp.get("language") or "").strip().lower()
-            if camp_lang in ("ru", "en") and (rendered_text.strip() or not step_image_url):
+            if camp_lang in ("ru", "en", "ar") and (rendered_text.strip() or not step_image_url):
                 lang_ok, lang_reason = _validate_recipient_copy_language(rendered_text, camp_lang, rec)
                 if not lang_ok:
                     conn.execute(
@@ -7954,7 +7988,7 @@ def _validate_campaign_steps_for_preview(camp: dict) -> tuple[list[dict], list[d
         )
 
     camp_lang = str(camp.get("language") or "").strip().lower()
-    if camp_lang in ("ru", "en"):
+    if camp_lang in ("ru", "en", "ar"):
         custom_dict = _parse_custom_step_templates_safe(camp.get("custom_step_templates_json"))
         for key_lbl, tmpl_txt in _iter_custom_template_step_texts(custom_dict):
             lang_err = _validate_template_text_language(
@@ -7985,7 +8019,7 @@ def _validate_campaign_steps_for_preview(camp: dict) -> tuple[list[dict], list[d
                     "message": "Step 1 содержит текст или токен follow-up (запрещено слать follow-up первым сообщением)",
                 }
             )
-        if camp_lang in ("ru", "en"):
+        if camp_lang in ("ru", "en", "ar"):
             lang_err = _validate_template_text_language(
                 tmpl, camp_lang, label=f"Step {order_val}"
             )
@@ -8201,7 +8235,7 @@ def preview_outreach_batch(
                     "message": f"Пустое сообщение Step 1 для получателя #{rec['id']}",
                 }
             )
-        elif camp_lang in ("ru", "en"):
+        elif camp_lang in ("ru", "en", "ar"):
             lang_ok, lang_reason = _validate_recipient_copy_language(rendered_text, camp_lang, rec)
             if not lang_ok:
                 row_violations.append("language_mismatch")
