@@ -447,6 +447,24 @@ def _extract_follower_items(payload: Any, platform: str) -> tuple[list[dict[str,
             if isinstance(aff, Mapping):
                 lbl = aff.get("label") if isinstance(aff.get("label"), Mapping) else {}
                 badge = str(lbl.get("description") or aff.get("description") or "").strip()
+            entities = raw.get("entities") if isinstance(raw.get("entities"), Mapping) else {}
+            url_ent = entities.get("url") if isinstance(entities.get("url"), Mapping) else {}
+            urls = url_ent.get("urls") if isinstance(url_ent.get("urls"), list) else []
+            first_ent = urls[0] if urls and isinstance(urls[0], Mapping) else {}
+            website = ""
+            for cand_raw in (
+                raw.get("website"),
+                first_ent.get("expanded_url"),
+                first_ent.get("url"),
+                raw.get("url"),
+            ):
+                cand = str(cand_raw or "").strip()
+                if not cand:
+                    continue
+                cand_host = (urlparse(cand if "://" in cand else f"https://{cand}").hostname or "").lower()
+                if cand_host not in {"t.co", "www.t.co"}:
+                    website = cand
+                    break
             items.append(
                 {
                     "platform": "x",
@@ -454,7 +472,7 @@ def _extract_follower_items(payload: Any, platform: str) -> tuple[list[dict[str,
                     "handle": handle,
                     "name": str(raw.get("name") or "").strip(),
                     "bio": str(raw.get("description") or "").strip(),
-                    "website": str(raw.get("website") or "").strip(),
+                    "website": website,
                     "location": str(raw.get("location") or "").strip(),
                     "followers_count": int(raw.get("followers_count") or 0),
                     "profile_image": str(raw.get("profile_image") or raw.get("profile_image_url_https") or "").strip(),
