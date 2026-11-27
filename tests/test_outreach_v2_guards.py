@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -356,6 +356,7 @@ def test_global_daily_limit_enforced_when_subscale_shared_between_ru_vacancies_a
         # Sharing subscale between RU Vacancies and RU Experts is valid (not B2B mixed)
         assert find_vacancy_account_pool_violations(conn, camp_vac["id"]) == []
 
+        fresh_created_at = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         for idx in range(5):
             _seed_recipient_and_lead(
                 conn,
@@ -366,6 +367,7 @@ def test_global_daily_limit_enforced_when_subscale_shared_between_ru_vacancies_a
                 niche="UGC маркетинг",
                 segment="vacancy",
                 language="ru",
+                created_at=fresh_created_at,
             )
             _seed_recipient_and_lead(
                 conn,
@@ -827,6 +829,7 @@ def test_custom_step_templates_json_and_copy_profile_and_language_rendering(
             custom_step_templates_json=vac_custom,
             steps=[{"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"}],
         )
+        fresh_created_at = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         _seed_recipient_and_lead(
             conn,
             camp_vac["id"],
@@ -836,6 +839,7 @@ def test_custom_step_templates_json_and_copy_profile_and_language_rendering(
             niche="Beauty D2C",
             segment="vacancy",
             language="ru",
+            created_at=fresh_created_at,
         )
         prev_vac = preview_outreach_batch(conn, camp_vac["id"], strict=True)
         assert prev_vac["ok"] is True

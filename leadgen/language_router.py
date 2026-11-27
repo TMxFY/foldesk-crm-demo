@@ -8,7 +8,7 @@ import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-LeadLanguage = Literal["ru", "en"]
+LeadLanguage = Literal["ru", "en", "ar"]
 
 CAMPAIGN_WHALES_EN_TG = "Whales EN — TG"
 CAMPAIGN_WHALES_EN_WA = "Whales EN — WA"
@@ -17,6 +17,8 @@ CAMPAIGN_VACANCY_RU_WA = "Client Reels & Вакансии RU — WA"
 CAMPAIGN_VACANCY_EN_TG = "Client Reels & Вакансии EN — TG"
 CAMPAIGN_RU_EXPERTS_TG = "РФ-Эксперты (Продюсирование) — TG"
 CAMPAIGN_OFM_TG = "SoftUGC — OFM (TG)"
+CAMPAIGN_GCC_MENA_TG = "GCC / MENA — TG"
+CAMPAIGN_GCC_MENA_WA = "GCC / MENA — WA"
 QUEUE_MANUAL_SOCIAL = "Manual Social Queue"
 QUEUE_ASSISTED_JOB = "Assisted Job Queue"
 
@@ -29,6 +31,7 @@ EXPLICIT_SEGMENTS: frozenset[str] = frozenset(
         "social_manual",
         "vacancy_assisted",
         "ofm",
+        "gcc_mena",
     }
 )
 
@@ -64,6 +67,8 @@ _DOMAIN_FIELDS: tuple[str, ...] = (
     "links",
 )
 _RU_DOMAIN_SUFFIXES: tuple[str, ...] = (".ru", ".рф", ".by", ".kz", ".xn--p1ai")
+_GCC_COUNTRY_CODES: frozenset[str] = frozenset({"SA", "AE", "QA", "KW", "BH", "OM", "EG", "JO"})
+_GCC_DOMAIN_SUFFIXES: tuple[str, ...] = (".sa", ".ae", ".qa", ".kw", ".bh", ".om", ".eg", ".jo")
 
 _RU_EXACT_SOURCES: frozenset[str] = frozenset(
     {
@@ -148,6 +153,7 @@ _WHALE_SOURCE_PREFIXES: tuple[str, ...] = (
 )
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _EN_MARKER_RE = re.compile(r"(?:^|[_\-\s:])en(?:$|[_\-\s:])")
 _TOKEN_SPLIT_RE = re.compile(r"[\s,;]+")
@@ -156,7 +162,7 @@ _URL_RE = re.compile(
     r"(?:https?://\S+|www\.\S+|"
     r"(?:t\.me|telegram\.me|wa\.me|youtube\.com|youtu\.be|"
     r"instagram\.com|tiktok\.com|linkedin\.com|hh\.ru|profi\.ru|kwork\.ru|softugc\.com)(?:/\S*)?|"
-    r"\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|io|ai|co|app|dev|org|net|ru|by|kz|me|рф)(?:/\S*)?)",
+    r"\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|io|ai|co|app|dev|org|net|ru|by|kz|me|рф|sa|ae|qa|kw|bh|om|eg|jo)(?:/\S*)?)",
     re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
@@ -165,19 +171,21 @@ _PLACEHOLDER_RE = re.compile(r"\{[A-Za-z0-9_]+\}")
 _METRIC_RE = re.compile(r"\b\d+(?:[.,]\d+)?[kKmMкКмМ%xх]*\b")
 _NEUTRAL_BRAND_RE = re.compile(
     r"\b(?:"
-    r"softugc|ai|ugc|ofm|tg|wa|ru|en|b2b|saas|d2c|ecom|e-com|crm|api|sdk|"
-    r"cpm|cpa|roi|ltv|ctr|kpi|hr|ceo|cmo|bd|ua|pr|smm|seo|kol|web3|defi|"
-    r"reels|shorts|tiktok|instagram|youtube|telegram|whatsapp|linkedin|"
+    r"softugc|ai|ugc|ofm|tg|wa|ru|en|ar|b2b|saas|d2c|ecom|e-com|crm|api|sdk|"
+    r"cpm|cpa|roi|ltv|ctr|kpi|hr|ceo|cmo|bd|ua|pr|smm|seo|kol|web3|defi|revshare|"
+    r"reels|shorts|tiktok|instagram|snapchat|youtube|telegram|whatsapp|linkedin|"
     r"upwork|kwork|profi|manychat|heygen|kling|seedance|omni|elevenlabs|"
     r"higgsfield|nano|banana|pro|faceless|runway|midjourney|chatgpt|claude|"
-    r"sora|veo|whop|meta|shopify|airtable|stripe|github|product|hunt|"
-    r"app|store|google|play|founder|hh"
+    r"sora|veo|whop|meta|shopify|salla|zid|airtable|stripe|github|product|hunt|"
+    r"app|store|google|play|founder|hh|gcc|mena|ksa|uae"
     r")\b",
     re.IGNORECASE,
 )
 
 _MIN_RU_CYRILLIC_CHARS = 2
 _MIN_RU_CYRILLIC_RATIO = 0.35
+_MIN_AR_CHARS = 4
+_MIN_AR_RATIO = 0.35
 _MIN_EN_LATIN_CHARS = 2
 
 
@@ -239,7 +247,7 @@ def _extract_hostname(token: str) -> str:
         return ""
 
 
-def _is_ru_hostname(host: str) -> bool:
+def _hostname_matches_suffixes(host: str, suffixes: tuple[str, ...]) -> bool:
     if not host:
         return False
     candidates = [host]
@@ -247,16 +255,24 @@ def _is_ru_hostname(host: str) -> bool:
         candidates.append(host.encode("ascii").decode("idna").casefold())
     except UnicodeError:
         pass
-    return any(cand.endswith(_RU_DOMAIN_SUFFIXES) for cand in candidates)
+    return any(cand.endswith(suffixes) for cand in candidates)
 
 
-def _row_has_ru_domain(row: Mapping[str, Any]) -> bool:
+def _row_has_domain_suffix(row: Mapping[str, Any], suffixes: tuple[str, ...]) -> bool:
     for field in _DOMAIN_FIELDS:
         for val in _iter_strings(_row_get(row, field)):
             for token in _TOKEN_SPLIT_RE.split(val):
-                if token and _is_ru_hostname(_extract_hostname(token)):
+                if token and _hostname_matches_suffixes(_extract_hostname(token), suffixes):
                     return True
     return False
+
+
+def _row_has_ru_domain(row: Mapping[str, Any]) -> bool:
+    return _row_has_domain_suffix(row, _RU_DOMAIN_SUFFIXES)
+
+
+def _row_has_gcc_domain(row: Mapping[str, Any]) -> bool:
+    return _row_has_domain_suffix(row, _GCC_DOMAIN_SUFFIXES)
 
 
 def _row_sources(row: Mapping[str, Any]) -> list[str]:
@@ -346,10 +362,17 @@ def _is_marked_vacancy_assisted(row: Mapping[str, Any], sources: list[str]) -> b
     return bool(manual_url and not (_has_tg_contact(row) or _has_wa_contact(row)))
 
 
+def _is_arabic_lang_tag(language: Any) -> bool:
+    raw = _clean_str(language).casefold()
+    return raw in {"ar", "ara", "arabic"} or raw.startswith(("ar-", "ar_"))
+
+
 def _normalize_language(language: str | None) -> LeadLanguage:
     raw = _clean_str(language).casefold()
     if raw in {"ru", "rus", "russian"} or raw.startswith(("ru-", "ru_")):
         return "ru"
+    if _is_arabic_lang_tag(raw):
+        return "ar"
     return "en"
 
 
@@ -369,8 +392,28 @@ def _cfg_nested_str(cfg: Mapping[str, Any] | None, section: str, key: str) -> st
     return _clean_str(sub.get(key))
 
 
+def is_gcc_mena_lead(row: Mapping[str, Any]) -> bool:
+    """Return True when a lead exhibits GCC/MENA country, domain, Arabic script, or AR hint signals."""
+    cc = _clean_str(_row_get(row, "country_code")).upper()
+    if cc in _GCC_COUNTRY_CODES:
+        return True
+    for key in ("language_hint", "language"):
+        if _is_arabic_lang_tag(_row_get(row, key)):
+            return True
+    for src in _row_sources(row):
+        if src == "ar" or src.startswith(("ar_", "ar-", "gcc", "mena")) or "_gcc" in src or "_mena" in src:
+            return True
+    if _row_has_gcc_domain(row):
+        return True
+    for field in _CYRILLIC_TEXT_FIELDS + ("pain_quote", "role"):
+        for text in _iter_strings(_row_get(row, field)):
+            if _ARABIC_RE.search(text):
+                return True
+    return False
+
+
 def detect_lead_language(row: Mapping[str, Any]) -> LeadLanguage:
-    """Detect whether a lead should receive RU or EN outreach based on text, domains, and source."""
+    """Detect whether a lead should receive RU, AR, or EN outreach based on text, domains, and source."""
     for field in _CYRILLIC_TEXT_FIELDS:
         for text in _iter_strings(_row_get(row, field)):
             if _CYRILLIC_RE.search(text):
@@ -380,6 +423,13 @@ def detect_lead_language(row: Mapping[str, Any]) -> LeadLanguage:
     for src in _row_sources(row):
         if _is_ru_source(src):
             return "ru"
+    for key in ("language", "language_hint"):
+        if _is_arabic_lang_tag(_row_get(row, key)):
+            return "ar"
+    for field in _CYRILLIC_TEXT_FIELDS:
+        for text in _iter_strings(_row_get(row, field)):
+            if _ARABIC_RE.search(text):
+                return "ar"
     return "en"
 
 
@@ -424,6 +474,8 @@ def resolve_target_campaign(
         return QUEUE_MANUAL_SOCIAL
     if seg == "vacancy_assisted":
         return QUEUE_ASSISTED_JOB
+    if seg == "gcc_mena" or lang == "ar":
+        return CAMPAIGN_GCC_MENA_WA if prov == "whatsapp" else CAMPAIGN_GCC_MENA_TG
     if seg == "whale":
         return CAMPAIGN_WHALES_EN_WA if prov == "whatsapp" else CAMPAIGN_WHALES_EN_TG
     if seg in {"vacancy", "client_reels"}:
@@ -489,12 +541,28 @@ def assert_copy_matches_language(
 ) -> tuple[bool, str]:
     """Validate that generated or template outreach copy matches the campaign's expected language."""
     lang = _clean_str(expected_language).casefold()
-    if lang not in {"ru", "en"}:
+    if lang not in {"ru", "en", "ar"}:
         return False, f"Unsupported expected_language: {expected_language!r}"
 
     raw = _clean_str(text)
     if not raw:
         return False, "Outreach copy text is empty"
+
+    if lang == "ar":
+        prose = _strip_neutral_tokens(raw)
+        if _CYRILLIC_RE.search(prose):
+            return False, "AR campaign copy must not contain Cyrillic text"
+        ar_count = len(_ARABIC_RE.findall(prose))
+        if ar_count < _MIN_AR_CHARS:
+            return False, "AR campaign copy must contain Arabic text"
+        latin_count = len(_LATIN_RE.findall(prose))
+        ar_ratio = ar_count / (ar_count + latin_count)
+        if ar_ratio < _MIN_AR_RATIO:
+            return (
+                False,
+                f"AR campaign copy has predominantly non-Arabic text ({ar_ratio:.0%} Arabic)",
+            )
+        return True, ""
 
     if lang == "en":
         prose = _strip_non_prose_tokens(raw)
@@ -547,6 +615,13 @@ def route_lead(
     """Compute language, segment, active provider, and target campaign in one typed call."""
     language = detect_lead_language(row)
     segment = detect_lead_segment(row)
+    if (
+        isinstance(cfg, Mapping)
+        and str(cfg.get("active_market_profile") or "").strip().lower() == "gcc_december"
+        and segment in {"whale", "b2b"}
+        and is_gcc_mena_lead(row)
+    ):
+        segment = "gcc_mena"
     if provider is not None:
         resolved_provider = _normalize_provider(provider)
     elif _has_tg_contact(row):
@@ -565,6 +640,8 @@ def route_lead(
 
 
 __all__ = [
+    "CAMPAIGN_GCC_MENA_TG",
+    "CAMPAIGN_GCC_MENA_WA",
     "CAMPAIGN_OFM_TG",
     "CAMPAIGN_RU_EXPERTS_TG",
     "CAMPAIGN_VACANCY_EN_TG",
@@ -580,6 +657,7 @@ __all__ = [
     "assert_copy_matches_language",
     "detect_lead_language",
     "detect_lead_segment",
+    "is_gcc_mena_lead",
     "resolve_target_campaign",
     "route_lead",
 ]
