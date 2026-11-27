@@ -5,6 +5,7 @@ import copy
 import time
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -58,7 +59,17 @@ def test_clinic_whitelist_admits_large_gcc_clinics_keeps_solo_salon_banned() -> 
             for _ in states
         ]
 
-    with patch.object(typesafe_leads, "_run", side_effect=fake_run):
+    with (
+        patch.object(typesafe_leads, "Noul", None),
+        patch.object(typesafe_leads, "Choice", None),
+    ):
+        assert asyncio.run(typesafe_leads.qualify_creator_rows([{"handle": "x"}])) == [None]
+
+    with (
+        patch.object(typesafe_leads, "Noul", lambda **kw: SimpleNamespace(**kw)),
+        patch.object(typesafe_leads, "Choice", lambda **kw: SimpleNamespace(**kw)),
+        patch.object(typesafe_leads, "_run", side_effect=fake_run),
+    ):
         res = asyncio.run(
             typesafe_leads.qualify_creator_rows(
                 [{"handle": "adamhealth", "name": "Adam Health", "bio": "Telehealth & lab tests in Riyadh"}]
