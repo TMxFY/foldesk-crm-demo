@@ -159,6 +159,8 @@ async def _run(states: list[tuple[str, dict[str, Any], dict[str, Any]]], cache_p
 
 
 async def qualify_creator_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+    if Noul is None or Choice is None:
+        return [None] * len(rows)
     categories = ["SaaS / AI app", "E-com / D2C", "CEX / биржа", "Проп трейдинг", "DeFi / DEX",
                   "Медиа / контент", "Gaming / AI", "Токен / мемкоин",
                   "Платёжки / финтех", "Web3 (общее)", "Сервис / агентство"]
@@ -181,6 +183,8 @@ async def qualify_creator_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 async def qualify_forex_channels(rows: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+    if Noul is None:
+        return [None] * len(rows)
     states = []
     for row in rows:
         state = {k: row.get(k, "") for k in ("channel", "name", "about", "subs", "youtube", "lichka")}
@@ -203,6 +207,8 @@ async def qualify_identity_candidates(rows: list[dict[str, Any]]) -> list[dict[s
     checks stay deterministic in Telethon, while Jev judges the evidence and
     prevents a coincidental shared handle from becoming a contact.
     """
+    if Noul is None:
+        return [None] * len(rows)
     states = []
     for row in rows:
         state = {
