@@ -152,6 +152,30 @@ CURATED_CHANNEL_POOL: tuple[str, ...] = (
     "telegram_dev_news",
 )
 
+# 20 curated GCC/MENA business, startup, e-commerce, crypto, and health-tech handles.
+CURATED_MENA_CHANNEL_POOL: tuple[str, ...] = (
+    "dubai_startups",
+    "dubaibusinesschat",
+    "uae_entrepreneurs",
+    "menastartups",
+    "dubaicryptochat",
+    "dubai_ecommerce",
+    "saudi_entrepreneurs",
+    "riyadh_startups",
+    "mena_founders",
+    "dubai_founders",
+    "gcc_ecommerce",
+    "dubai_marketing",
+    "uae_business_network",
+    "mena_tech_founders",
+    "arab_startups",
+    "abu_dhabi_founders",
+    "saudi_tech_hub",
+    "mena_healthtech",
+    "dubai_fintech",
+    "gcc_shopify_founders",
+)
+
 CAPTCHA_BOT_SIGNATURES: tuple[str, ...] = (
     "captcha",
     "shieldy",
@@ -192,6 +216,15 @@ PAID_SEARCH_QUERIES: tuple[str, ...] = (
     'site:tgstat.com/channel/ "SaaS" OR "AI" OR "startups" OR "mini app"',
     'site:t.me/ "Shopify" OR "D2C" OR "prop trading" OR "ASO" channel',
     'site:tgstat.com/channel/ "Telegram Mini Apps" OR "Telegram Stars" OR "TON" OR "mobile UA"',
+)
+
+MENA_PAID_SEARCH_QUERIES: tuple[str, ...] = (
+    "site:t.me/ dubai founders",
+    "site:t.me/ riyadh startups",
+    "site:t.me/ gcc ecommerce",
+    "site:t.me/ saudi entrepreneurs",
+    "site:t.me/ دبي مشاريع",
+    "site:t.me/ السعودية تجارة الكترونية",
 )
 
 _STATE_LOCK = threading.RLock()
@@ -616,20 +649,23 @@ def _collect_paid_search_handles(
     allow_paid: bool,
     treg_fn: Callable[..., Any] | None = None,
     search_cursor: int = 0,
+    market_profile: str = "global",
 ) -> tuple[list[str], int, bool]:
     if not _is_paid_search_allowed(allow_paid):
         return [], search_cursor, False
     if treg_fn is None and (treg_client is None or not treg_client.check_treg_ready()):
         return [], search_cursor, False
 
+    eff_profile = str(market_profile or "global").strip().lower()
+    queries = MENA_PAID_SEARCH_QUERIES if eff_profile == "gcc_december" else PAID_SEARCH_QUERIES
     handles: list[str] = []
     seen_low: set[str] = set()
     used_any = False
-    n_queries = len(PAID_SEARCH_QUERIES)
+    n_queries = len(queries)
     step = min(2, n_queries)
 
     for offset in range(step):
-        q = PAID_SEARCH_QUERIES[(search_cursor + offset) % n_queries]
+        q = queries[(search_cursor + offset) % n_queries]
         try:
             if treg_fn is not None:
                 payload = _call_with_supported_kwargs(
@@ -701,6 +737,7 @@ def discover_and_replenish_catalogs(
     *,
     limit: int = 40,
     allow_paid: bool = True,
+    market_profile: str = "global",
     http_get_fn: Callable[..., Any] | None = None,
     treg_fn: Callable[..., Any] | None = None,
     probe_fn: Callable[..., Any] | None = None,
@@ -709,6 +746,7 @@ def discover_and_replenish_catalogs(
     state_path = _resolve_state_dir(state_dir)
     state_path.mkdir(parents=True, exist_ok=True)
     eff_limit = max(0, int(limit))
+    eff_profile = "gcc_december" if str(market_profile or "global").strip().lower() == "gcc_december" else "global"
 
     catalog_state_path = state_path / "tg_catalog_state.json"
     ad_spy_path = state_path / "discovered_ad_spy_channels.txt"
@@ -720,6 +758,7 @@ def discover_and_replenish_catalogs(
         prev_state = {}
     search_cursor = max(0, int(prev_state.get("search_cursor") or 0))
     curated_cursor = max(0, int(prev_state.get("curated_cursor") or 0))
+    mena_cursor = max(0, int(prev_state.get("mena_curated_cursor") or 0))
 
     # 1. Gather candidate handles from external $0 + graph + optional paid search + curated pool
     tma_handles, tma_counts = _collect_tma_catalog_handles(http_get_fn=http_get_fn)
@@ -728,12 +767,19 @@ def discover_and_replenish_catalogs(
         allow_paid=allow_paid,
         treg_fn=treg_fn,
         search_cursor=search_cursor,
+        market_profile=eff_profile,
     )
 
     pool_len = len(CURATED_CHANNEL_POOL)
     rotated_curated = (
         [CURATED_CHANNEL_POOL[(curated_cursor + idx) % pool_len] for idx in range(pool_len)]
         if pool_len
+        else []
+    )
+    mena_len = len(CURATED_MENA_CHANNEL_POOL)
+    rotated_mena = (
+        [CURATED_MENA_CHANNEL_POOL[(mena_cursor + idx) % mena_len] for idx in range(mena_len)]
+        if mena_len
         else []
     )
 
@@ -745,14 +791,25 @@ def discover_and_replenish_catalogs(
     seen_candidates: set[str] = set()
     deferred_known: list[str] = []
 
-    candidate_buckets = (
-        *tma_handles[:15],
-        *paid_handles[:15],
-        *rotated_curated,
-        *tma_handles[15:],
-        *paid_handles[15:],
-        *graph_handles,
-    )
+    if eff_profile == "gcc_december":
+        candidate_buckets = (
+            *paid_handles[:15],
+            *rotated_mena,
+            *tma_handles[:15],
+            *rotated_curated,
+            *tma_handles[15:],
+            *paid_handles[15:],
+            *graph_handles,
+        )
+    else:
+        candidate_buckets = (
+            *tma_handles[:15],
+            *paid_handles[:15],
+            *rotated_curated,
+            *tma_handles[15:],
+            *paid_handles[15:],
+            *graph_handles,
+        )
     for raw in candidate_buckets:
         clean = _normalize_tg_handle(raw)
         if not clean or _is_bot_handle(clean):
@@ -811,11 +868,18 @@ def discover_and_replenish_catalogs(
 
     run_ts = _utc_now_iso()
     next_curated_cursor = (curated_cursor + max(1, min(eff_limit, pool_len))) % pool_len if (pool_len and eff_limit > 0) else curated_cursor
+    next_mena_cursor = (
+        (mena_cursor + max(1, min(eff_limit, mena_len))) % mena_len
+        if (eff_profile == "gcc_december" and mena_len and eff_limit > 0)
+        else mena_cursor
+    )
     state_payload = {
         "last_run_at": run_ts,
         "last_run_ts": time.time(),
+        "market_profile": eff_profile,
         "search_cursor": next_search_cursor,
         "curated_cursor": next_curated_cursor,
+        "mena_curated_cursor": next_mena_cursor,
         "paid_search_used": paid_search_used,
         "last_counts": {
             "candidates": len(ordered_candidates),
@@ -1423,6 +1487,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional comma-separated handles for --safe-join (defaults to discovered_comment_channels.txt)",
     )
+    ap.add_argument(
+        "--market-profile",
+        choices=["global", "gcc_december"],
+        default="global",
+        help="Market profile for channel & search discovery (default: global)",
+    )
     return ap
 
 
@@ -1435,6 +1505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_path,
         limit=args.limit,
         allow_paid=not args.no_paid,
+        market_profile=args.market_profile,
     )
 
     if args.safe_join:

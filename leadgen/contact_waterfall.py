@@ -705,6 +705,25 @@ def _normalize_http_url(url: str) -> str:
     return clean
 
 
+def _sanitize_project_url(raw_url: Any) -> str:
+    """Split glued URLs and strip trailing TLD+http(s) glue into a clean project URL."""
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+    parts = re.split(r"(?i)(?<=.)(?=https?://)", raw, maxsplit=1)
+    first = parts[0].strip()
+    dom = domain_of(first)
+    if not dom:
+        return ""
+    norm = _normalize_http_url(first)
+    if norm:
+        parsed = _safe_urlparse(norm)
+        host = _safe_hostname(parsed)
+        if host == dom and len(parts) == 1:
+            return norm
+    return f"https://{dom}"
+
+
 def _url_dedup_key(url: str) -> str:
     parsed = _safe_urlparse(url)
     if parsed is None:
@@ -1558,8 +1577,9 @@ def _collect_urls_from_field(val: Any) -> list[str]:
     if isinstance(val, str):
         s = val.strip()
         if s:
-            for m in _URL_IN_TEXT_RE.finditer(s):
-                urls.append(m.group(0).rstrip(".,;:)'\""))
+            for chunk in re.split(r"(?i)(?<=.)(?=https?://)", s):
+                for m in _URL_IN_TEXT_RE.finditer(chunk):
+                    urls.append(m.group(0).rstrip(".,;:)'\""))
             if not urls:
                 norm = _normalize_http_url(s)
                 if norm:
@@ -2366,7 +2386,11 @@ def enrich_lead_contacts(
     else:
         links_list = []
 
-    project_url = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
+    raw_project_url = str(out.get("project_url") or out.get("website") or out.get("site") or out.get("url") or "").strip()
+    clean_project_url = _sanitize_project_url(raw_project_url)
+    project_url = clean_project_url or raw_project_url
+    if clean_project_url and str(out.get("project_url") or "").strip() and out.get("project_url") != clean_project_url:
+        out["project_url"] = clean_project_url
     raw_dom = domain_of(project_url) or domain_of(str(out.get("domain") or out.get("company_domain") or ""))
     dom = root_company_domain(raw_dom) or raw_dom
     if dom and not str(out.get("company_domain") or "").strip():
@@ -2505,11 +2529,13 @@ def enrich_lead_contacts(
                     links_list.append(u)
                     new_links_from_monid.append(u)
 
-            discovered_site = str(fb_ig.get("website") or "").strip()
+            discovered_site = _sanitize_project_url(fb_ig.get("website") or "")
             if discovered_site and not project_url:
                 project_url = discovered_site
                 out["project_url"] = discovered_site
                 dom = dom or root_company_domain(discovered_site) or domain_of(discovered_site)
+                if dom and not str(out.get("company_domain") or "").strip():
+                    out["company_domain"] = dom
                 row_cc = row_cc or _infer_row_country_code(out, dom or domain_of(discovered_site))
                 if monid_cost > 0:
                     tier2_unlocked_contact = True
@@ -2708,11 +2734,13 @@ def enrich_lead_contacts(
             dm_email = str(dm_found.get("work_email") or "").strip()
             if dm_email:
                 email_pool.append(dm_email)
-            dm_site = str(dm_found.get("project_url") or "").strip()
+            dm_site = _sanitize_project_url(dm_found.get("project_url") or "")
             if dm_site and not project_url:
                 project_url = dm_site
                 out["project_url"] = dm_site
-                dom = dom or domain_of(dm_site)
+                dom = dom or root_company_domain(dm_site) or domain_of(dm_site)
+                if dom and not str(out.get("company_domain") or "").strip():
+                    out["company_domain"] = dom
 
         if dm_candidates:
             primary_dm = dm_candidates[0]

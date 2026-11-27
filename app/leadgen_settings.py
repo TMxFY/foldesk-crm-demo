@@ -984,6 +984,18 @@ def resolve_effective_market_config(cfg: dict[str, Any] | None) -> dict[str, Any
             seen_low.add(gl)
             existing_groups.append(g)
     b2b["tg_groups_new"] = existing_groups
+
+    explicit_fg_off = bool(base.get("_explicit_follower_graph_off"))
+    sources = b2b.setdefault("sources", {})
+    fg_overlay = base.setdefault(
+        "follower_graph", copy.deepcopy(DEFAULT_LEADGEN_CONFIG["follower_graph"])
+    )
+    if explicit_fg_off:
+        sources["follower_graph"] = False
+        fg_overlay["enabled"] = False
+    else:
+        sources["follower_graph"] = True
+        fg_overlay["enabled"] = True
     return base
 
 
