@@ -3312,10 +3312,75 @@ def _ensure_v2_campaign(
     )
 
 
+GCC_DRAFT_CAMPAIGNS: tuple[str, ...] = ("GCC / MENA — TG", "GCC / MENA — WA")
+
+
+def ensure_gcc_draft_campaigns(
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Idempotently ensure GCC / MENA draft campaigns exist when active_market_profile == 'gcc_december'.
+
+    Never modifies the status of an existing campaign and never auto-starts campaigns.
+    """
+    eff_cfg = dict(cfg) if isinstance(cfg, Mapping) else get_leadgen_config(conn)
+    profile = str(eff_cfg.get("active_market_profile") or "global").strip().lower()
+    if profile != "gcc_december":
+        return []
+
+    steps = [
+        {"step_order": 1, "delay_hours": 0, "template_text": "{step1_text}"},
+        {"step_order": 2, "delay_hours": 24, "template_text": "{step2_text}"},
+        {"step_order": 3, "delay_hours": 72, "template_text": "{step3_text}"},
+    ]
+    ensured: list[dict[str, Any]] = []
+    for camp_name in GCC_DRAFT_CAMPAIGNS:
+        existing = _find_campaign_by_name(conn, camp_name)
+        if existing is not None:
+            ensured.append(existing)
+            continue
+        try:
+            created = create_campaign(
+                conn,
+                name=camp_name,
+                daily_limit=30,
+                steps=steps,
+                status="draft",
+                leadgen_enabled=True,
+                segment="gcc_mena",
+                language="ar",
+                copy_profile="gcc_mena_ar",
+            )
+        except ValueError as exc:
+            # Fallback before app/outreach.py merges language='ar' support
+            if "unsupported campaign language" not in str(exc).lower():
+                raise
+            created = create_campaign(
+                conn,
+                name=camp_name,
+                daily_limit=30,
+                steps=steps,
+                status="draft",
+                leadgen_enabled=True,
+                segment="gcc_mena",
+                language="en",
+                copy_profile="gcc_mena_ar",
+            )
+            conn.execute(
+                "UPDATE campaigns SET language = 'ar', updated_at = ? WHERE id = ?",
+                (utc_now(), int(created["id"])),
+            )
+            conn.commit()
+            created = _find_campaign_by_name(conn, camp_name) or created
+        ensured.append(created)
+    return ensured
+
+
 def _persist_lead_v2_columns(conn: sqlite3.Connection, lead_id: int, row: Mapping[str, Any]) -> None:
     """Persist v2 metadata columns (segment, language, Airtable isolation, manual queue fields) on `leads`."""
     seg = str(row.get("segment") or "").strip().lower() or "b2b"
-    lang = "ru" if str(row.get("language") or "").strip().lower() == "ru" else "en"
+    raw_lang = str(row.get("language") or row.get("language_hint") or "").strip().lower()
+    lang = raw_lang if raw_lang in ("ru", "en", "ar") else "en"
     excl = 1 if (seg == "ru_expert" or bool(row.get("exclude_from_airtable"))) else 0
     domain = str(row.get("company_domain") or row.get("domain") or "").strip() or None
     raw_pool = row.get("pool_usd") if row.get("pool_usd") is not None else row.get("bounty_usd")
@@ -3353,7 +3418,8 @@ def _persist_lead_v2_columns(conn: sqlite3.Connection, lead_id: int, row: Mappin
 def _insert_manual_queue_lead(conn: sqlite3.Connection, row: Mapping[str, Any]) -> int | None:
     """Insert or skip duplicate Manual Social / Assisted Job queue lead into CRM `leads` without auto-sending."""
     seg = str(row.get("segment") or "").strip().lower()
-    lang = "ru" if str(row.get("language") or "").strip().lower() == "ru" else "en"
+    raw_lang = str(row.get("language") or row.get("language_hint") or "").strip().lower()
+    lang = raw_lang if raw_lang in ("ru", "en", "ar") else "en"
     manual_url = str(row.get("manual_action_url") or "").strip()
     if not manual_url:
         return None
@@ -4254,6 +4320,17 @@ def _is_catalog_refresh_due(state_dir: Path, max_age_hours: float = 24.0) -> boo
     return age_sec >= max(0.0, float(max_age_hours)) * 3600.0
 
 
+def _resolve_conn_db_path(conn: sqlite3.Connection) -> str:
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            db_file = str(row[2] or "").strip()
+            if db_file:
+                return db_file
+    except Exception:
+        pass
+    return os.environ.get("CRMTG_DB", DEFAULT_DB_PATH)
+
+
 def _run_autonomous_replenish_locked(
     conn: sqlite3.Connection,
     *,
@@ -4288,6 +4365,7 @@ def _run_autonomous_replenish_locked(
 ) -> dict[str, Any]:
     is_real_subprocess_runner = runner is None or runner is subprocess.run
     active_runner = subprocess.run if runner is None else runner
+    db_path = _resolve_conn_db_path(conn)
 
     cfg = get_leadgen_config(conn)
     if not cfg.get("enabled"):
@@ -4307,7 +4385,10 @@ def _run_autonomous_replenish_locked(
     # 2. Subtract quarantined sources & apply active_market_profile overlay
     quarantined = load_quarantined_sources(conn)
     eff_cfg = resolve_effective_market_config(apply_quarantined_sources(cfg, quarantined))
-    market_profile = str(eff_cfg.get("active_market_profile") or "global").strip().lower()
+    eff_market_profile = str(eff_cfg.get("active_market_profile") or "global").strip().lower()
+    market_profile = eff_market_profile
+    if eff_market_profile == "gcc_december":
+        ensure_gcc_draft_campaigns(conn, eff_cfg)
     b2b_cfg = eff_cfg["b2b"]
     vac_cfg = eff_cfg["vacancies"]
     whales_cfg = eff_cfg.get("whales") if isinstance(eff_cfg.get("whales"), Mapping) else {}
@@ -4617,6 +4698,7 @@ def _run_autonomous_replenish_locked(
                                 catalog_discovery_fn,
                                 state_dir,
                                 allow_paid=cat_paid_allowed,
+                                market_profile=eff_market_profile,
                             )
                         except Exception as exc:
                             with stage_lock:
@@ -4636,6 +4718,8 @@ def _run_autonomous_replenish_locked(
                             str(state_dir),
                             "--limit",
                             "40",
+                            "--market-profile",
+                            eff_market_profile,
                         ]
                         if not cat_paid_allowed:
                             cat_cmd.append("--no-paid")
