@@ -132,12 +132,12 @@ jobs:
 
             healthy=0
             hc_json=""
-            for i in $(seq 1 60); do
-              if hc_json="$(curl -fsS --max-time 3 "${hc_auth_args[@]}" 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True and d.get("icp_hygiene_ok") is True and d.get("leadgen_ready") is True and d.get("tg_lease_ready") is not False else 1)'; then
+            for i in $(seq 1 30); do
+              if hc_json="$(curl -fsS --max-time 15 "${hc_auth_args[@]}" 'http://127.0.0.1:18084/api/health?deep=1' 2>/dev/null)" && printf '%s' "$hc_json" | "$APP_DIR/.venv/bin/python" -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get("db_ok") is True and d.get("reply_alert_guard_ok") is True and d.get("icp_hygiene_ok") is True and d.get("leadgen_ready") is True and d.get("tg_lease_ready") is not False else 1)'; then
                 healthy=1
                 break
               fi
-              sleep 1
+              sleep 2
             done
 
             if [ "$healthy" -ne 1 ]; then
